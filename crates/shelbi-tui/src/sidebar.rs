@@ -296,6 +296,22 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
                 style,
             )]))
         }
+        Row::ConfigError { message } => {
+            // The project config is present but won't load. Surface the
+            // actionable message (from `shelbi_state::load_project`, same as
+            // the CLI) word-wrapped across the sidebar in red so it can't be
+            // mistaken for a normal row — the whole point is that a broken
+            // config is visible where the user is looking, not silently
+            // dropped. `!` marks the first line; continuation lines indent to
+            // align under it. Wrapping matches `row_height` so the click map
+            // (which skips this non-selectable row) and the drawing agree.
+            let style = Style::default().fg(Color::Red);
+            let lines: Vec<Line> = crate::app::config_error_lines(message, width)
+                .into_iter()
+                .map(|l| Line::from(Span::styled(l, style)))
+                .collect();
+            ListItem::new(lines)
+        }
         Row::Blank => ListItem::new(Line::raw("")),
         Row::MachineGroup {
             name,
@@ -1125,6 +1141,45 @@ mod tests {
             rows[alpha_y].starts_with("   "),
             "indented workspace rows expect ≥3 leading spaces (sidebar pad + indent), got: {:?}",
             rows[alpha_y]
+        );
+    }
+
+    /// A broken project config renders a visible red error row under the
+    /// Workspaces header — naming the file and the reason — instead of the
+    /// section vanishing. The `!` marker and the file path both land in the
+    /// rendered buffer (word-wrapped across the sidebar).
+    #[test]
+    fn config_error_renders_visible_row_naming_file_and_reason() {
+        let backend = TestBackend::new(40, 22);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new_sidebar("Shelbi");
+        app.config_error = Some(
+            "project config ~/.shelbi/projects/Shelbi.yaml has an invalid id `Shelbi` \
+             (only lowercase ASCII letters, digits, `-`, and `_` are allowed)"
+                .into(),
+        );
+        // No workspaces — the pre-fix behavior would drop the section entirely.
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let rows = dump(&term);
+        let joined = rows.join("\n");
+
+        assert!(
+            joined.contains("Workspaces"),
+            "the Workspaces header stays so the error reads in context, got:\n{joined}"
+        );
+        // Wrapping splits the text across lines, so assert on distinctive
+        // fragments that survive a word boundary rather than the whole string.
+        assert!(
+            joined.contains('!'),
+            "the error row carries a `!` marker, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("invalid"),
+            "the reason is visible, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("Shelbi.yaml"),
+            "the offending file is named, got:\n{joined}"
         );
     }
 

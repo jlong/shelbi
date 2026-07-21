@@ -148,6 +148,15 @@ pub struct App {
     pub display_name: Option<String>,
     pub agents: Vec<Agent>,
     pub workspaces: Vec<WorkspaceOverview>,
+    /// The project config's load error, surfaced inline in the Workspaces
+    /// section instead of silently dropping the section. `Some` only when a
+    /// config file for the project **exists on disk but fails to load**
+    /// (invalid id, schema/workspace validation, unparseable YAML) — a
+    /// genuinely missing config (fresh/half-set-up project) stays `None` so
+    /// the section is omitted as before rather than flagged as broken. Built
+    /// each refresh by [`App::refresh`]; carries the same actionable message
+    /// [`shelbi_state::load_project`] hands the `shelbi workspace list` CLI.
+    pub config_error: Option<String>,
     /// Tasks in the Review column that are **loaded on a review worktree** —
     /// the "Ready for Review" section (✓). Built each refresh by
     /// [`split_review_sections`]; each entry carries the `machine:port` URL
@@ -242,6 +251,7 @@ impl App {
             display_name: None,
             agents: Vec::new(),
             workspaces: Vec::new(),
+            config_error: None,
             ready_review: Vec::new(),
             queued_review: Vec::new(),
             sidebar_index: 0,
@@ -343,9 +353,14 @@ impl App {
             }
             return None;
         }
+        // The rest-of-list renders inside the 1-col horizontal padding on each
+        // side, so its inner width — the width the config-error row wraps to —
+        // is the list area minus two columns. Match the renderer's `rest.width`
+        // so a wrapped error row's height agrees between click map and drawing.
+        let inner_width = area.width.saturating_sub(2) as usize;
         let mut line = nav_lines;
         for (idx, r) in rows.iter().enumerate().skip(nav_n) {
-            let h = row_height(r);
+            let h = row_height(r, inner_width);
             if target < line + h {
                 return r.is_selectable().then_some(idx);
             }
@@ -383,7 +398,20 @@ impl App {
         // Every list section header gets exactly one blank line above it,
         // regardless of position, so all section breaks render as the same
         // uniform gap.
-        if !self.workspaces.is_empty() {
+        if let Some(message) = &self.config_error {
+            // The project config exists but won't load — surface the error
+            // where the workspaces would be instead of silently dropping the
+            // whole section (the user has no other clue the config is broken).
+            // The Workspaces header stays so the row reads as "this section
+            // couldn't load", not a free-floating error.
+            rows.push(Row::Blank);
+            rows.push(Row::Section {
+                label: "Workspaces".into(),
+            });
+            rows.push(Row::ConfigError {
+                message: message.clone(),
+            });
+        } else if !self.workspaces.is_empty() {
             rows.push(Row::Blank);
             rows.push(Row::Section {
                 label: "Workspaces".into(),
@@ -525,7 +553,22 @@ impl App {
         let (ready, queued) = split_review_sections(&self.project_name, review);
         self.ready_review = ready;
         self.queued_review = queued;
-        self.workspaces = load_workspaces(&self.project_name).unwrap_or_default();
+        match load_workspaces(&self.project_name) {
+            Ok(ws) => {
+                self.workspaces = ws;
+                self.config_error = None;
+            }
+            Err(e) => {
+                // A load failure with a config file present on disk is a
+                // broken config (invalid id / schema / YAML) — surface the
+                // message inline. A load failure with *no* config file is a
+                // fresh/half-set-up project: keep the section omitted, as
+                // before, rather than crying "config error" during setup.
+                self.workspaces = Vec::new();
+                self.config_error =
+                    project_config_present(&self.project_name).then(|| e.to_string());
+            }
+        }
         // A missing state.json is normal (fresh project): default to Off so
         // the pill stays hidden rather than flashing then disappearing.
         self.zen_mode = read_state(&self.project_name)
@@ -870,6 +913,12 @@ pub enum Row {
     },
     /// `— label —` separator. Not selectable.
     Section { label: String },
+    /// The project config failed to load — surfaced inline under the
+    /// Workspaces header instead of silently dropping the section. Carries
+    /// the actionable [`shelbi_state::load_project`] message (names the file
+    /// and the reason); the renderer word-wraps it across the sidebar width.
+    /// Not selectable — it's a message, not a destination.
+    ConfigError { message: String },
     /// Vertical spacing between sections. Renders as an empty line and
     /// can't be selected — purely for visual rhythm.
     Blank,
@@ -942,7 +991,10 @@ impl Row {
         // Machine group rows are selectable now — focusing one and
         // pressing Space/Enter toggles the collapse state. Section
         // headers and blank spacers stay inert (no useful action).
-        !matches!(self, Row::Section { .. } | Row::Blank)
+        !matches!(
+            self,
+            Row::Section { .. } | Row::Blank | Row::ConfigError { .. }
+        )
     }
 
     pub fn view(&self) -> Option<&View> {
@@ -951,7 +1003,10 @@ impl Row {
             | Row::Workspace { view, .. }
             | Row::Review { view, .. }
             | Row::LegacyAgent { view, .. } => Some(view),
-            Row::Section { .. } | Row::Blank | Row::MachineGroup { .. } => None,
+            Row::Section { .. }
+            | Row::Blank
+            | Row::MachineGroup { .. }
+            | Row::ConfigError { .. } => None,
         }
     }
 
@@ -981,7 +1036,13 @@ impl Row {
                 }
             }),
             Row::LegacyAgent { status, .. } => Some(status_decoration(*status)),
-            Row::Section { .. } | Row::Blank | Row::MachineGroup { .. } => None,
+            // The config-error row's `!` marker is painted directly by the
+            // renderer (it's not a palette destination), so no shared
+            // decoration here — same as the inert section/blank rows.
+            Row::Section { .. }
+            | Row::Blank
+            | Row::MachineGroup { .. }
+            | Row::ConfigError { .. } => None,
         }
     }
 }
@@ -1000,14 +1061,87 @@ pub struct ReviewEntry {
     pub location: Option<String>,
 }
 
-/// Height in list lines a row occupies. Review rows are two-line (title +
-/// branch); everything else is one. Used by [`App::row_at`] to map a click
-/// back to a row index now that rows are variable-height.
-fn row_height(row: &Row) -> usize {
+/// Height in list lines a row occupies at the given inner list `width`.
+/// Review rows are two-line (title + branch); a config-error row word-wraps
+/// its message across `width` (so its height depends on the sidebar width);
+/// everything else is one line. Used by [`App::row_at`] to map a click back
+/// to a row index now that rows are variable-height, and by the renderer so
+/// the click map and the drawing agree.
+fn row_height(row: &Row, width: usize) -> usize {
     match row {
         Row::Review { .. } => 2,
+        Row::ConfigError { message } => config_error_lines(message, width).len(),
         _ => 1,
     }
+}
+
+/// Word-wrap a config-error message into sidebar list lines at the given
+/// inner `width`. The first line carries a `! ` marker; continuation lines
+/// indent two columns to align under the text. Long words (paths, ids) hard-
+/// split rather than overflow. Shared by [`row_height`] and the renderer so
+/// the click map and the drawing never disagree on the row's height.
+pub(crate) fn config_error_lines(message: &str, width: usize) -> Vec<String> {
+    // Reserve two columns for the `! ` marker / continuation indent.
+    let body_width = width.saturating_sub(2).max(1);
+    let wrapped = wrap_words(message, body_width);
+    if wrapped.is_empty() {
+        return vec!["! ".to_string()];
+    }
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                format!("! {line}")
+            } else {
+                format!("  {line}")
+            }
+        })
+        .collect()
+}
+
+/// Greedy word-wrap `text` to `width` columns (by char count). A single word
+/// longer than `width` is hard-split across lines rather than allowed to
+/// overflow the sidebar.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if word.chars().count() > width {
+            // Flush the in-progress line, then hard-split the long word.
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if chunk.chars().count() == width {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(ch);
+            }
+            current = chunk;
+            continue;
+        }
+        let need = if current.is_empty() {
+            word.chars().count()
+        } else {
+            current.chars().count() + 1 + word.chars().count()
+        };
+        if need > width {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 /// Split the Review column into the two sidebar sections (spec §16):
@@ -1085,13 +1219,15 @@ fn split_review_sections(
 /// Build the sidebar's view of declared workspaces from the project YAML, the
 /// in-progress task column, and the review column (the latter only so a review
 /// slot serving a loaded task reads active rather than idle — §16). One disk
-/// read per workspace for the `status.yaml` lookup. Returns an empty vec if the
-/// project YAML or task dir is missing.
+/// read per workspace for the `status.yaml` lookup. Errors when the project
+/// config can't be loaded (missing, invalid id, bad schema); the caller keys
+/// off that to distinguish "not set up" from "broken config".
 fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
-    let p = match shelbi_state::load_project(project) {
-        Ok(p) => p,
-        Err(_) => return Ok(Vec::new()),
-    };
+    // Propagate a load failure (invalid id, bad schema, unparseable YAML) so
+    // the caller can surface it inline in the sidebar. The caller decides
+    // whether an error means "broken config" (file present) or "not set up
+    // yet" (file absent) — see [`App::refresh`] / [`project_config_present`].
+    let p = shelbi_state::load_project(project)?;
     let in_progress = shelbi_state::list_column(project, Column::in_progress()).unwrap_or_default();
     let mut out = Vec::with_capacity(p.workspaces.len());
     for workspace in &p.workspaces {
@@ -1138,6 +1274,20 @@ fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
         });
     }
     Ok(out)
+}
+
+/// Whether a config file for `project` exists on disk in either supported
+/// layout — the flat global `<name>.yaml` or the split in-repo
+/// `<name>/local.yaml`. Deliberately does **not** validate the name: the whole
+/// point is to detect a config that is *present but invalid* (e.g. a
+/// capitalized stem like `Shelbi.yaml` that fails id validation), which the
+/// name-guarding [`shelbi_state::has_project_registration`] would itself
+/// reject. Read-only existence check, so an odd name is harmless here.
+fn project_config_present(project: &str) -> bool {
+    let Ok(dir) = shelbi_state::projects_dir() else {
+        return false;
+    };
+    dir.join(format!("{project}.yaml")).is_file() || dir.join(project).join("local.yaml").is_file()
 }
 
 /// Default agent surfaced when a task has no explicit `agent:` in its
@@ -1505,6 +1655,141 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
+    /// A `config_error` renders an inline error row under a still-present
+    /// `Workspaces` header instead of dropping the whole section — the core
+    /// of AC1. Pure `rows()` check, no disk.
+    #[test]
+    fn rows_surface_config_error_under_workspaces_header() {
+        let mut app = App::new_sidebar("Shelbi");
+        app.config_error = Some(
+            "project config ~/.shelbi/projects/Shelbi.yaml has an invalid id `Shelbi`".into(),
+        );
+        let rows = app.rows();
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r, Row::Section { label } if label == "Workspaces")),
+            "the Workspaces header must stay so the error reads in context"
+        );
+        let err = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::ConfigError { message } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("a ConfigError row must be present when config_error is set");
+        assert!(err.contains("Shelbi.yaml"), "error names the file: {err}");
+        // The error row is inert — it can't be focused or activated.
+        let err_row = rows
+            .iter()
+            .find(|r| matches!(r, Row::ConfigError { .. }))
+            .unwrap();
+        assert!(!err_row.is_selectable());
+        assert!(err_row.view().is_none());
+    }
+
+    /// AC1 + AC2: a config file that is **present but fails validation** (a
+    /// capitalized stem is not a valid shelbi id) sets `config_error` to the
+    /// same actionable message the CLI produces — naming the file and reason —
+    /// rather than silently emptying the workspaces list.
+    #[test]
+    fn refresh_flags_present_but_invalid_config() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        let _home_env = EnvVarGuard::set("SHELBI_HOME", &home);
+
+        // Write `Shelbi.yaml` directly — `save_project` keys the filename off
+        // `p.name`, and the on-disk `name:` is ignored on load (the id is the
+        // stem), so this lands a parseable config under an invalid id.
+        let mut proj = fixture_project();
+        proj.name = "Shelbi".into();
+        shelbi_state::save_project(&proj).unwrap();
+
+        let mut app = App::new_sidebar("Shelbi");
+        app.refresh().unwrap();
+
+        let err = app
+            .config_error
+            .as_deref()
+            .expect("a present-but-invalid config must set config_error");
+        assert!(err.contains("Shelbi.yaml"), "names the offending file: {err}");
+        assert!(err.contains("invalid id"), "states the reason: {err}");
+        assert!(
+            app.workspaces.is_empty(),
+            "no workspaces load when the config is broken"
+        );
+        assert!(
+            app.rows()
+                .iter()
+                .any(|r| matches!(r, Row::ConfigError { .. })),
+            "the error surfaces as a ConfigError row"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// AC3: fixing the YAML makes the workspaces section reappear on the next
+    /// ordinary refresh — no TUI restart. One long-lived `App` observes the
+    /// broken config, then the repaired one.
+    #[test]
+    fn refresh_clears_config_error_when_yaml_fixed() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        let _home_env = EnvVarGuard::set("SHELBI_HOME", &home);
+
+        // Broken first: unparseable YAML at the project's own (valid) stem.
+        let projects = shelbi_state::projects_dir().unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("demo.yaml"), "name: demo\n: this is not: valid").unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        assert!(
+            app.config_error.is_some(),
+            "a present but unparseable config is flagged"
+        );
+        assert!(app.workspaces.is_empty());
+
+        // Repair it in place, then refresh the same App — the section returns.
+        shelbi_state::save_project(&fixture_project()).unwrap();
+        app.refresh().unwrap();
+        assert!(
+            app.config_error.is_none(),
+            "fixing the YAML clears the error without restart"
+        );
+        assert!(
+            !app.workspaces.is_empty(),
+            "workspaces reappear once the config loads"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A genuinely missing project (no config file at all) is a fresh /
+    /// half-set-up project, not a broken one: `config_error` stays `None` so
+    /// the section is omitted quietly rather than flagged.
+    #[test]
+    fn refresh_ignores_genuinely_missing_project() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        let _home_env = EnvVarGuard::set("SHELBI_HOME", &home);
+
+        let mut app = App::new_sidebar("ghost");
+        app.refresh().unwrap();
+        assert!(
+            app.config_error.is_none(),
+            "a missing config must not masquerade as a broken one"
+        );
+        assert!(app.workspaces.is_empty());
+        assert!(
+            !app.rows()
+                .iter()
+                .any(|r| matches!(r, Row::ConfigError { .. })),
+            "no error row for a project that simply isn't set up yet"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// AC1: a `review`-tagged slot never appears under `— Workspaces —`; only
     /// dev workspaces list there, whether or not the project declares review
     /// slots.
@@ -1841,7 +2126,7 @@ mod tests {
             rest_start
                 + rows[nav_n..idx]
                     .iter()
-                    .map(|r| row_height(r) as u16)
+                    .map(|r| row_height(r, 38) as u16)
                     .sum::<u16>()
         };
 
