@@ -710,7 +710,12 @@ fn entry_from_row(row: &Row, workspaces: &[WorkspaceOverview]) -> Option<Entry> 
             decoration,
             hidden_until_query: false,
         }),
-        Row::Section { .. } | Row::Blank | Row::MachineGroup { .. } => None,
+        // Section headers, blanks, machine-group toggles, and the inline
+        // config-error message have no destination to activate in the palette.
+        Row::Section { .. }
+        | Row::Blank
+        | Row::MachineGroup { .. }
+        | Row::ConfigError { .. } => None,
     }
 }
 
