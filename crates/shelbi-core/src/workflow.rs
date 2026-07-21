@@ -113,6 +113,21 @@ pub struct Workflow {
     /// (`Plans/workflows.md` §Decisions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zen: Option<WorkflowZenConfig>,
+
+    /// Workflow-scoped recipe for how the Review agent boots this project's
+    /// branch so a human can run it. Workflow-scoped on purpose: in a monorepo
+    /// the `app` / `site` / `docs` workflows each build and serve a different
+    /// subdirectory, so the "how to boot this" knowledge belongs on the
+    /// workflow, not guessed by a generic agent.
+    ///
+    /// shelbi resolves the recipe's `$SLOT` / `$PORT` placeholders against the
+    /// review workspace's slot and injects the resolved recipe into the Review
+    /// agent's dispatch prompt (see [`Workflow::resolved_review_recipe`]); the
+    /// agent runs it verbatim and no longer auto-detects a framework or a port.
+    /// `None` means a diff-only review — the agent reports the diff and does
+    /// **not** boot a default-port server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewServe>,
 }
 
 impl Workflow {
@@ -197,11 +212,43 @@ impl Workflow {
     /// action. Returns the raw string; `$PORT` / `$SLOT` substitution is
     /// the caller's job (see [`crate::substitute_review_url`]).
     pub fn review_url_for_status(&self, status_id: &str) -> Option<&str> {
+        // The workflow's dedicated `review:` block is the canonical home for
+        // the serve recipe (including its `url:`); prefer it. Fall back to a
+        // `url:` on the incoming transition so a workflow that still declares
+        // its serve recipe on the review-entering transition keeps rendering
+        // the "Open Browser" action.
+        if let Some(url) = self.review.as_ref().and_then(|r| r.url.as_deref()) {
+            return Some(url);
+        }
         self.transitions
             .as_ref()?
             .iter()
             .find(|t| t.to == status_id && t.url.is_some())
             .and_then(|t| t.url.as_deref())
+    }
+
+    /// Resolve this workflow's review serve recipe with `$SLOT` / `$PORT`
+    /// (both `$X` and `${X}` spellings) substituted to the review slot's
+    /// `port` — ready to inject verbatim into the Review agent's dispatch
+    /// prompt so the agent runs it without re-deriving a port.
+    ///
+    /// Returns `None` when the workflow declares no `review:` block (a
+    /// diff-only review). When a block *is* declared but `port` is `None`
+    /// (the review workspace has no assigned slot), the placeholders are left
+    /// unresolved and the carried [`ResolvedReviewRecipe::port`] is `None`, so
+    /// the prompt renderer can tell the agent to stop and report the
+    /// misconfiguration rather than guess a port.
+    pub fn resolved_review_recipe(&self, port: Option<u16>) -> Option<ResolvedReviewRecipe> {
+        let r = self.review.as_ref()?;
+        let sub = |s: &str| substitute_review_url(s, port);
+        Some(ResolvedReviewRecipe {
+            workdir: r.workdir.clone(),
+            setup: r.setup.as_deref().map(&sub),
+            serve: sub(&r.serve),
+            ready: r.ready.as_deref().map(&sub),
+            url: r.url.as_deref().map(&sub),
+            port,
+        })
     }
 
     /// True iff `from -> to` is a legal status move. Both arguments are
@@ -644,6 +691,7 @@ pub fn default_workflow() -> Workflow {
         transitions: None,
         git: None,
         zen: None,
+        review: None,
     }
 }
 
@@ -753,6 +801,7 @@ pub fn task_workflow() -> Workflow {
             merge_strategy: crate::MergeStrategy::Squash,
         }),
         zen: None,
+        review: None,
     }
 }
 
@@ -840,6 +889,7 @@ pub fn subtask_workflow() -> Workflow {
             merge_strategy: crate::MergeStrategy::Squash,
         }),
         zen: None,
+        review: None,
     }
 }
 
@@ -1315,6 +1365,72 @@ mod opt_duration_secs {
 }
 
 // ---------------------------------------------------------------------------
+// ReviewServe + ResolvedReviewRecipe
+
+/// The workflow-scoped recipe the Review agent runs to boot a branch for a
+/// human to click through. Declared under `review:` on the workflow.
+///
+/// Every command may reference the review slot's port as `$SLOT` (or `$PORT`);
+/// shelbi substitutes it before injecting the recipe into the Review agent's
+/// dispatch prompt (see [`Workflow::resolved_review_recipe`]). The agent runs
+/// the recipe verbatim — it does not auto-detect a framework or re-derive a
+/// port.
+///
+/// Monorepo support falls out for free: each workflow declares its own
+/// `workdir` + commands, so two workflows in one repo can serve different
+/// subdirectories on the same review slot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewServe {
+    /// Subdirectory to run the recipe in, relative to the worktree root
+    /// (e.g. `site`). `None` runs at the worktree root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+
+    /// One-shot install/build command that must exit 0 before serving
+    /// (e.g. `npm install --no-audit --no-fund`). `None` skips setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<String>,
+
+    /// The command that starts the dev server, bound to the slot's port via
+    /// `$SLOT` (e.g. `npm run dev -- -p $SLOT`). Required — a `review:` block
+    /// with no way to serve is meaningless.
+    pub serve: String,
+
+    /// Optional readiness probe polled until it exits 0 (e.g.
+    /// `curl -sf http://localhost:$SLOT`). `None` means no HTTP probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<String>,
+
+    /// The reviewable URL handed to the human once the server is up (e.g.
+    /// `http://localhost:$SLOT`). Also what gates the review interface's
+    /// "Open Browser" action (see [`Workflow::review_url_for_status`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// A [`ReviewServe`] recipe with `$SLOT` / `$PORT` substituted to a concrete
+/// `port` — the shape injected into the Review agent's dispatch prompt.
+/// Produced by [`Workflow::resolved_review_recipe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedReviewRecipe {
+    /// Subdirectory to run in, relative to the worktree root. `None` = root.
+    pub workdir: Option<String>,
+    /// One-shot setup command (must exit 0 before serving). `None` = skip.
+    pub setup: Option<String>,
+    /// The resolved serve command.
+    pub serve: String,
+    /// Optional resolved readiness probe.
+    pub ready: Option<String>,
+    /// Optional resolved reviewable URL.
+    pub url: Option<String>,
+    /// The port the placeholders were resolved to, or `None` when the review
+    /// workspace had no assigned slot (in which case the strings above still
+    /// carry unresolved `$SLOT` / `$PORT` and the agent must stop and report
+    /// rather than guess a port).
+    pub port: Option<u16>,
+}
+
+// ---------------------------------------------------------------------------
 // Raw parsing types + legacy migration
 
 /// Lenient raw shape used for YAML deserialization. Every field that
@@ -1335,6 +1451,8 @@ struct RawWorkflow {
     git: Option<GitConfig>,
     #[serde(default)]
     zen: Option<WorkflowZenConfig>,
+    #[serde(default)]
+    review: Option<ReviewServe>,
 }
 
 #[derive(Deserialize)]
@@ -1435,6 +1553,7 @@ fn convert_raw_workflow(raw: RawWorkflow) -> crate::Result<(Workflow, Vec<Status
             transitions: raw.transitions,
             git: raw.git,
             zen: raw.zen,
+            review: raw.review,
         },
         migrations,
     ))
@@ -2523,6 +2642,7 @@ statuses:
             transitions: None,
             git: None,
             zen: None,
+            review: None,
         };
         let err = wf.validate().unwrap_err();
         match &err {
@@ -3181,6 +3301,74 @@ transitions:
         assert_eq!(
             substitute_review_url("http://localhost:$PORT", None),
             "http://localhost:$PORT"
+        );
+    }
+
+    const REVIEW_BLOCK_YAML: &str = r#"
+name: site
+statuses:
+  - { id: in-progress, name: InProgress, category: active,  owner: agent, agent: developer }
+  - { id: review,      name: Review,     category: handoff, owner: user,  agent: orchestrator }
+  - { id: done,        name: Done,       category: done,    owner: user }
+review:
+  workdir: site
+  setup: npm install --no-audit --no-fund
+  serve: npm run dev -- -p $SLOT
+  ready: curl -sf http://localhost:$SLOT
+  url: http://localhost:$SLOT
+"#;
+
+    #[test]
+    fn review_block_parses_and_round_trips() {
+        let wf = Workflow::from_yaml_str(REVIEW_BLOCK_YAML).expect("parse review block");
+        let review = wf.review.as_ref().expect("review block present");
+        assert_eq!(review.workdir.as_deref(), Some("site"));
+        assert_eq!(review.setup.as_deref(), Some("npm install --no-audit --no-fund"));
+        assert_eq!(review.serve, "npm run dev -- -p $SLOT");
+        assert_eq!(review.ready.as_deref(), Some("curl -sf http://localhost:$SLOT"));
+        assert_eq!(review.url.as_deref(), Some("http://localhost:$SLOT"));
+
+        // Round-trips through serde without losing the block.
+        let yaml = serde_yaml::to_string(&wf).unwrap();
+        let back = Workflow::from_yaml_str(&yaml).unwrap();
+        assert_eq!(back.review, wf.review);
+    }
+
+    #[test]
+    fn resolved_review_recipe_substitutes_slot() {
+        let wf = Workflow::from_yaml_str(REVIEW_BLOCK_YAML).unwrap();
+        let recipe = wf.resolved_review_recipe(Some(4310)).expect("recipe resolved");
+        assert_eq!(recipe.workdir.as_deref(), Some("site"));
+        assert_eq!(recipe.setup.as_deref(), Some("npm install --no-audit --no-fund"));
+        assert_eq!(recipe.serve, "npm run dev -- -p 4310");
+        assert_eq!(recipe.ready.as_deref(), Some("curl -sf http://localhost:4310"));
+        assert_eq!(recipe.url.as_deref(), Some("http://localhost:4310"));
+        assert_eq!(recipe.port, Some(4310));
+    }
+
+    #[test]
+    fn resolved_review_recipe_is_none_without_a_block() {
+        // The shipped task workflow declares no `review:` block → diff-only.
+        assert!(task_workflow().resolved_review_recipe(Some(4310)).is_none());
+    }
+
+    #[test]
+    fn resolved_review_recipe_leaves_placeholders_unresolved_without_a_port() {
+        // A declared block but no slot: placeholders stay literal and `port`
+        // is None, the signal the prompt renderer uses to make the agent stop
+        // and report rather than guess a port.
+        let wf = Workflow::from_yaml_str(REVIEW_BLOCK_YAML).unwrap();
+        let recipe = wf.resolved_review_recipe(None).expect("recipe still present");
+        assert_eq!(recipe.serve, "npm run dev -- -p $SLOT");
+        assert_eq!(recipe.port, None);
+    }
+
+    #[test]
+    fn review_url_for_status_prefers_the_review_block() {
+        let wf = Workflow::from_yaml_str(REVIEW_BLOCK_YAML).unwrap();
+        assert_eq!(
+            wf.review_url_for_status("review"),
+            Some("http://localhost:$SLOT")
         );
     }
 }

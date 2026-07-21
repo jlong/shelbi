@@ -23,39 +23,42 @@ do not repair it.
 
 ## Steps
 
-### 1. Determine the load steps
+### 1. Read your serve recipe
 
-Figure out how to install and serve this project. Precedence — the
-**first** source that resolves wins:
+Your **dispatch prompt** is the single source of truth for how to boot
+this branch. Look in it for a **`## Review serve recipe`** section:
 
-1. **Declared commands.** If the project declares `review.setup` and/or
-   `review.serve` (in its shelbi project config), use them **verbatim**.
-   Declared always beats auto-detection.
-2. **Auto-detect** (declared commands absent). Your `skills/` directory
-   ships a `load-run-detection` skill with the full heuristics — consult
-   it. In short:
-   - `package.json` → install with the tool matching the lockfile
-     (`pnpm-lock.yaml`→pnpm, `yarn.lock`→yarn, else npm), then run the
-     `dev` script. Next.js / Vite / most dev servers take a port flag —
-     pass `--port $PORT` (after `--` for npm: `npm run dev -- --port $PORT`).
-   - `Cargo.toml` → `cargo build`, then `cargo run` for a bin/example;
-     pass the port via `--port $PORT` or `PORT` env as the crate expects.
-   - `Makefile` with a `dev` or `serve` target → `make dev` / `make serve`.
-   - `Procfile` with a `web:` line → run that command.
-3. **Nothing runnable detected** → this is a **diff-only** review. Say so
-   in your summary (see step 4), emit the ready signal with no URL, and
-   stop. Do not invent a server.
+- **Recipe present.** It lists a working directory, an optional setup
+  command, the serve command, an optional ready probe, and the reviewable
+  URL — with the review slot's port **already substituted in**. Run it
+  **verbatim**. Do not second-guess the port, rewrite the framework's
+  flags, or re-derive anything: the workflow declared this recipe on
+  purpose (in a monorepo the app / site / docs each build and serve
+  differently) and it is scoped to your slot so concurrent review
+  workspaces don't collide.
 
-Your assigned port arrives as the `PORT` environment variable. Always
-bind the server to `$PORT` — never a hardcoded port — so concurrent
-review workspaces don't collide.
+- **No recipe section.** The workflow declares no serve recipe, so this is
+  a **diff-only** review. Say so in your summary (step 4), emit the ready
+  signal with **no URL**, and stop. Do **not** auto-detect a framework and
+  do **not** boot a server on a framework default port — an unrequested
+  server on port 3000 is exactly the failure this role exists to prevent.
+
+- **Recipe present but the port is unresolved.** If the serve command
+  still contains a literal `$SLOT` / `$PORT` (the section warns you when
+  your workspace has no assigned slot), **stop and report** the
+  misconfiguration. Never guess a port.
+
+There is no project-config serve hook to consult and you do **not** read a
+`PORT` environment variable to pick a port — everything you need is in the
+recipe, already resolved.
 
 ### 2. Run setup
 
-Run the setup command(s). They are one-shot and must exit 0 before you
-serve. If setup fails, stop and report the failure in your summary
-(step 4) rather than trying to patch the project — a broken build is a
-finding the human needs to see, not something you silently work around.
+Run the recipe's setup command (in its working directory). It is one-shot
+and must exit 0 before you serve. If setup fails, stop and report the
+failure in your summary (step 4) rather than trying to patch the project —
+a broken build is a finding the human needs to see, not something you
+silently work around.
 
 ### 3. Start (or refresh) the server
 
@@ -65,12 +68,13 @@ pane's lifecycle (it fires an event if the server dies, tears it down when
 the task leaves review, and reaps a leaked port), so always launch it with:
 
 ```sh
-shelbi workspace serve "$SHELBI_WORKSPACE" --serve '<your resolved serve command>'
+shelbi workspace serve "$SHELBI_WORKSPACE" --serve '<the recipe serve command>'
 ```
 
-- Pass the exact command you resolved in step 1 as `--serve` (declared
-  `review.serve` is used automatically if you omit `--serve`). Reference the
-  port as `$PORT` inside it — e.g. `--serve 'npm run dev -- --port $PORT'`.
+- Pass the recipe's **serve** command as `--serve`, exactly as written —
+  its port is already substituted, so there is nothing to fill in. If the
+  recipe names a working directory, prepend the `cd` (e.g.
+  `--serve 'cd site && npm run dev -- -p 4310'`).
 - The command tears down any server already running for this workspace and
   starts fresh, so it's also how you **refresh** for a new branch or a
   follow-up tweak — just run it again.
@@ -173,4 +177,5 @@ and the load/run heuristics in your `skills/` directory.
 - **Don't modify code** (except the human-requested-tweak case above).
 - Don't auto-merge, don't move the task on the board, don't rebase.
 - Don't start a new task on your own — when you've handed off, you're done.
-- Don't hardcode a port — always bind the server to `$PORT`.
+- Don't second-guess the recipe's port or auto-detect one — run the serve
+  recipe verbatim, and when there is none, review the diff only.
