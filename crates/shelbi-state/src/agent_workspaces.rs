@@ -97,6 +97,17 @@ pub const HANDOFF_FILE: &str = "handoff.md";
 /// running orchestrator sees in its filesystem.
 pub const ORCHESTRATOR_HANDOFF_REL: &str = "agents/orchestrator/handoff.md";
 
+/// The pre-rename hook-command path prefix a per-agent `settings.json`
+/// written by an older shelbi still references (e.g.
+/// `.shelbi/hooks/claude.pane-working`). Those scripts were renamed to the
+/// runner-neutral `<name>.sh` form (`pane-working.sh`), so a settings file
+/// carrying this marker points every hook at a file that no longer exists and
+/// Claude Code fails each hook with `No such file or directory`. The current
+/// template never emits it, so its presence is an unambiguous stale-shelbi
+/// fingerprint — a safe signal to refresh the file to the current default
+/// instead of deploying a dead block.
+pub const STALE_HOOK_COMMAND_MARKER: &str = ".shelbi/hooks/claude.";
+
 /// Bundled orchestrator `instructions.md` content. Source of truth for
 /// both the agent workspace materialize/self-heal path and the legacy
 /// `shelbi_orchestrator::DEFAULT_SYSTEM_PROMPT` re-export.
@@ -1027,13 +1038,27 @@ fn write_bundled_skill(project: &str, agent: &str, skill: &BundledSkill) -> Resu
 /// workspace-settings template is treated: missing → drop the bundled
 /// default; present-and-divergent → leave the user's customization
 /// alone. Returns silently for roles that don't ship a settings file.
+///
+/// One exception to "leave the user's file alone": a file that still
+/// references the pre-rename hook script paths ([`STALE_HOOK_COMMAND_MARKER`])
+/// is broken debris from an older shelbi — those files no longer exist on
+/// disk, so every hook fails `No such file or directory`. The current
+/// template never emits that marker, so it can only be stale-shelbi output,
+/// never a live user customization; upgrade it in place to the current
+/// default rather than preserve a dead block.
 fn ensure_agent_settings_present(project: &str, agent: &BundledAgent) -> Result<()> {
     let Some(default) = agent.settings_template else {
         return Ok(());
     };
     let path = agent_settings_path(project, agent.name)?;
-    if path.exists() {
-        return Ok(());
+    match std::fs::read_to_string(&path) {
+        // Present but referencing dead pre-rename hook paths → upgrade.
+        Ok(existing) if existing.contains(STALE_HOOK_COMMAND_MARKER) => {}
+        // Present and either current or a genuine (live-path) customization →
+        // leave it alone.
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Io(e)),
     }
     // Atomic write — a torn `settings.json` from a mid-write crash would
     // drop the message-tail hooks silently (Shelbi ContextStore
@@ -1361,6 +1386,63 @@ mod tests {
                 .get(ORCHESTRATOR_AGENT)
                 .map(String::as_str),
             Some(content_hash(DEFAULT_ORCHESTRATOR_INSTRUCTIONS).as_str()),
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A per-agent `settings.json` left by an older shelbi that still points at
+    /// the pre-rename hook scripts (`.shelbi/hooks/claude.*`, now `<x>.sh`) is
+    /// dead debris — every hook fires `No such file or directory`. Self-heal
+    /// must refresh it to the current default rather than preserve it.
+    #[test]
+    fn self_heal_refreshes_a_settings_json_with_stale_hook_paths() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+
+        let path = agent_settings_path("p", REVIEW_AGENT).unwrap();
+        let stale = "{\n  \"hooks\": {\n    \"Stop\": [{ \"hooks\": [{ \"type\": \
+                     \"command\", \"command\": \".shelbi/hooks/claude.stop\" }] }]\n  }\n}\n";
+        fs::write(&path, stale).unwrap();
+        assert!(stale.contains(STALE_HOOK_COMMAND_MARKER));
+
+        self_heal_default_agents("p").unwrap();
+
+        // Rewritten to the current default (neutral `<name>.sh` paths); the
+        // dead marker is gone.
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            !after.contains(STALE_HOOK_COMMAND_MARKER),
+            "stale hook paths must be rewritten: {after}"
+        );
+        assert_eq!(after, DEFAULT_WORKSPACE_SETTINGS_TEMPLATE);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A settings.json customization that uses the *current* hook paths (no
+    /// stale marker) is a live user edit and must be left untouched.
+    #[test]
+    fn self_heal_preserves_a_settings_json_with_live_hook_paths() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+
+        let path = agent_settings_path("p", REVIEW_AGENT).unwrap();
+        let custom = "{\n  \"hooks\": {},\n  \"env\": { \"MY\": \"1\" }\n}\n";
+        fs::write(&path, custom).unwrap();
+
+        self_heal_default_agents("p").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            custom,
+            "a live-path customization must be preserved",
         );
 
         std::env::remove_var("SHELBI_HOME");

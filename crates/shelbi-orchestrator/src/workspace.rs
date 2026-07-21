@@ -2016,6 +2016,15 @@ pub fn render_workspace_settings_preferring_agent(
             .map_err(|e| Error::Other(format!("{e}")))?,
         None => None,
     };
+    // A per-agent `settings.json` written by an older shelbi references the
+    // pre-rename hook paths (`.shelbi/hooks/claude.<x>`), which no longer exist
+    // on disk (`<x>.sh` now) — deploying that block makes every hook fire `No
+    // such file or directory`. Those files are content-refreshed only on
+    // `shelbi reload`, so at dispatch time discard a stale block and fall back
+    // to the current project-wide template, whose hook paths match the deployed
+    // scripts. The marker never appears in the current template, so this only
+    // ever drops dead debris, never a live customization.
+    let body = body.filter(|b| !b.contains(shelbi_state::STALE_HOOK_COMMAND_MARKER));
     let template = match body {
         Some(b) => b,
         None => shelbi_state::render_workspace_settings(project)
@@ -5609,6 +5618,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// A per-role settings.json left by an older shelbi that references the
+    /// pre-rename hook scripts (`.shelbi/hooks/claude.*`) is dead debris — the
+    /// deployed session would fire every hook against a missing file. The
+    /// dispatch-time render must discard that stale block and fall back to the
+    /// current project-wide template (whose paths match the deployed scripts),
+    /// so the review pane sees no `No such file or directory` hook errors.
+    #[test]
+    fn render_workspace_settings_discards_a_stale_per_role_block() {
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("render-stale-role");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        install_default_agents_under_home(&home, "myapp");
+
+        // Stale review settings.json pointing at the dead `claude.*` paths.
+        let role_settings = home.join("projects/myapp/agents/review/settings.json");
+        std::fs::create_dir_all(role_settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &role_settings,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":".shelbi/hooks/claude.stop"}]}]}}"#,
+        )
+        .unwrap();
+
+        let project = fixture_project();
+        let rendered =
+            render_workspace_settings_preferring_agent(&project, Some("review")).unwrap();
+        assert!(
+            !rendered.contains(shelbi_state::STALE_HOOK_COMMAND_MARKER),
+            "stale hook block must not be deployed: {rendered}",
+        );
+        // Fell back to the project-wide template (neutral `<name>.sh` hooks).
+        assert!(
+            rendered.contains(".shelbi/hooks/pane-working.sh"),
+            "fallback must carry the current neutral hook paths: {rendered}",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// `{{workspace_permissions_mode}}` substitution still works for
     /// the per-role file (so a user-authored template with the legacy
     /// placeholder doesn't ship an unsubstituted literal into the
@@ -5672,6 +5722,78 @@ mod tests {
             "# skill: debug\n",
             "developer's skills/ contents must mirror into .claude/skills/",
         );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// End-to-end at the deploy layer for a review-slot load: materializing a
+    /// project's default agents and deploying the review dispatch onto a
+    /// worktree lands the *Review agent's* charter (load-and-serve, no coding)
+    /// and wires hooks that point at scripts that actually exist — never a
+    /// `.shelbi/hooks/claude.*: No such file or directory`. This is the
+    /// deterministic stand-in for the runtime review click-through: it proves
+    /// the fix at the exact layer a review load touches, short of driving tmux
+    /// and a real claude binary (which CI covers). Guards acceptance criteria
+    /// 1 (Review agent, not developer) and 4 (no missing-file hook errors).
+    #[test]
+    fn review_dispatch_deploys_the_review_charter_and_live_hooks() {
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("review-dispatch-e2e");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        // Real materialization → the actual Review charter + a per-role
+        // settings.json carrying the current neutral hook paths.
+        shelbi_state::materialize_default_agents("myapp").unwrap();
+
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        // Deploy the runner hooks (the neutral scripts) + the review context —
+        // the same two steps the spawn path runs for a review load.
+        deploy_runner_hooks(&Host::Local, &worktree).unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "myapp", shelbi_state::REVIEW_AGENT).unwrap();
+
+        // The Review charter landed — not the developer's. It serves; it does
+        // not code, so this pane never rebases or opens a PR.
+        let instructions =
+            std::fs::read_to_string(worktree.join(".claude/agent-instructions.md")).unwrap();
+        assert!(
+            instructions.contains("Review agent") && instructions.contains("do **not** keep coding"),
+            "review worktree must carry the Review charter: {instructions}",
+        );
+
+        // Wire the review settings block the dispatch would deploy, then assert
+        // every hook command points at a script that exists on disk.
+        let project = fixture_project();
+        let block =
+            render_workspace_settings_preferring_agent(&project, Some(shelbi_state::REVIEW_AGENT))
+                .unwrap();
+        wire_settings_local(&Host::Local, &worktree, "review", &block).unwrap();
+
+        let deployed =
+            std::fs::read_to_string(worktree.join(".claude/settings.local.json")).unwrap();
+        assert!(
+            !deployed.contains(shelbi_state::STALE_HOOK_COMMAND_MARKER),
+            "no dead pre-rename hook paths may be deployed: {deployed}",
+        );
+        assert!(
+            deployed.contains(".shelbi/hooks/pane-working.sh"),
+            "deployed hooks must use the current neutral paths: {deployed}",
+        );
+        for name in [
+            "session-start.sh",
+            "stop.sh",
+            "pane-idle.sh",
+            "pane-working.sh",
+            "pane-blocked.sh",
+        ] {
+            assert!(
+                worktree.join(format!(".shelbi/hooks/{name}")).exists(),
+                "hook script {name} must exist so Claude Code doesn't hit `No such file`",
+            );
+        }
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
