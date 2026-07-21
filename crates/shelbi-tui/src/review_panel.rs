@@ -158,11 +158,13 @@ impl ReviewPanel {
     }
 
     fn rows(&self) -> Vec<PanelRow> {
+        // The Chat / Edit / Browser switches render as a full-width nav block
+        // (separator lines + half-block selection bleed) that stands on its
+        // own the way the main sidebar nav does — no leading section header.
         let mut rows = vec![
             PanelRow::Status,
             PanelRow::Folder,
             PanelRow::Blank,
-            PanelRow::Section("Actions"),
             PanelRow::Switch(SwitchItem::Chat),
             PanelRow::Switch(SwitchItem::Vim),
         ];
@@ -174,6 +176,45 @@ impl ReviewPanel {
         rows.push(PanelRow::Approve);
         rows.push(PanelRow::Reject);
         rows
+    }
+
+    /// Start index and count of the contiguous `Switch` run in [`rows`]. The
+    /// switches render as a full-width nav block; everything else is a plain
+    /// one-line list row, so this span is all the renderer and the click map
+    /// need to agree on where the nav block sits.
+    fn switch_span(&self) -> (usize, usize) {
+        let rows = self.rows();
+        let start = rows
+            .iter()
+            .position(|r| matches!(r, PanelRow::Switch(_)))
+            .unwrap_or(rows.len());
+        let count = rows
+            .iter()
+            .skip(start)
+            .take_while(|r| matches!(r, PanelRow::Switch(_)))
+            .count();
+        (start, count)
+    }
+
+    /// Map a rendered-line offset (from the top of the list area) back to a
+    /// row index. Rows before and after the switch group are one line each;
+    /// the switch group renders as a nav block whose item `j` sits on line
+    /// `sstart + 2j + 1` with inert separators on the even lines between.
+    /// Mirrors [`crate::app::App::row_at`] so drawing and clicks agree.
+    fn row_at_line(&self, target: usize) -> Option<usize> {
+        let rows = self.rows();
+        let (sstart, scount) = self.switch_span();
+        if target < sstart {
+            return Some(target);
+        }
+        let nav_lines = crate::sidebar::nav_lines(scount);
+        if target < sstart + nav_lines {
+            let offset = target - sstart;
+            // Odd offsets are item rows; even offsets are inert separators.
+            return (offset % 2 == 1).then_some(sstart + offset / 2);
+        }
+        let idx = sstart + scount + (target - sstart - nav_lines);
+        (idx < rows.len()).then_some(idx)
     }
 
     pub fn nav_up(&mut self) {
@@ -258,9 +299,11 @@ impl ReviewPanel {
         {
             return PanelEffect::None;
         }
-        // Every panel row is one list line, so the clicked line maps directly
-        // to a row index.
-        let idx = (row - area.y) as usize;
+        // The switch group renders as a nav block (separators between/around
+        // each item), so a clicked line no longer maps 1:1 to a row index.
+        let Some(idx) = self.row_at_line((row - area.y) as usize) else {
+            return PanelEffect::None;
+        };
         let rows = self.rows();
         match rows.get(idx) {
             Some(r) if r.is_selectable() => {
@@ -329,26 +372,176 @@ pub fn truncate_left(path: &str, width: usize) -> String {
     format!("...{tail}")
 }
 
+/// 1-col horizontal padding shared by every non-nav row. The switch nav block
+/// deliberately bypasses it (its fill and half-block bleed paint edge to edge)
+/// while its label text re-applies the same indent, so labels stay aligned
+/// with the rows above and below — the same split the main sidebar uses.
+const LIST_INDENT: Margin = Margin {
+    horizontal: 1,
+    vertical: 0,
+};
+
 pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
-    let inner = area.inner(Margin {
-        horizontal: 1,
-        vertical: 0,
-    });
-    app.list_area = inner;
-    let width = inner.width as usize;
+    // The list spans the full pane width so the switch nav block's selection
+    // fill and half-block bleed can paint edge to edge; the plain rows above
+    // and below re-apply the 1-col indent themselves.
+    app.list_area = area;
     let rows = app.rows();
-    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
-    for (i, row) in rows.iter().enumerate() {
-        let selected = i == app.selected && row.is_selectable();
-        items.push(render_row(app, row, selected, width));
+    let (sstart, scount) = app.switch_span();
+    let nav_h = crate::sidebar::nav_lines(scount) as u16;
+
+    // Region above the switches (status / folder / blank), one line each.
+    let a_h = (sstart as u16).min(area.height);
+    let a_area = Rect {
+        height: a_h,
+        ..area
+    };
+    render_row_list(f, app, &rows[..sstart], 0, a_area.inner(LIST_INDENT));
+
+    // The switch group itself — a full-width nav block: a separator line
+    // between (and bracketing) each item, the selected item filling edge to
+    // edge with its adjacent separators carrying the half-block bleed. Same
+    // treatment as the main sidebar nav.
+    if area.height > a_h {
+        let nav_area = Rect {
+            y: area.y + a_h,
+            height: nav_h.min(area.height - a_h),
+            ..area
+        };
+        render_switch_nav(f, app, nav_area, sstart, scount);
+
+        // Region below the switches (blank, Actions header, Approve / Reject).
+        let used = a_h + nav_h;
+        if area.height > used {
+            let rest = Rect {
+                y: area.y + used,
+                height: area.height - used,
+                ..area
+            }
+            .inner(LIST_INDENT);
+            let offset = sstart + scount;
+            render_row_list(f, app, &rows[offset..], offset, rest);
+        }
     }
-    let mut state = ListState::default();
-    state.select(Some(app.selected));
-    let list = List::new(items).highlight_style(Style::default().bg(crate::theme::SELECTION_BG));
-    f.render_stateful_widget(list, inner, &mut state);
 
     if app.dialog.is_some() {
         render_reject_dialog(f, app, area);
+    }
+}
+
+/// Render a slice of one-line rows as an indented `List`, highlighting the row
+/// at `app.selected` (a global row index; `offset` is where this slice starts
+/// in the full row list) with the same full-row selection fill the sidebar's
+/// rest-of-list uses.
+fn render_row_list(
+    f: &mut Frame,
+    app: &ReviewPanel,
+    rows: &[PanelRow],
+    offset: usize,
+    area: Rect,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = area.width as usize;
+    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        let selected = offset + i == app.selected && row.is_selectable();
+        items.push(render_row(app, row, selected, width));
+    }
+    let mut state = ListState::default();
+    if app.selected >= offset && app.selected < offset + rows.len() {
+        state.select(Some(app.selected - offset));
+    }
+    let list = List::new(items).highlight_style(Style::default().bg(crate::theme::SELECTION_BG));
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+/// Render the Chat / Edit / Browser switches as a full-width nav block,
+/// mirroring the main sidebar's `render_nav`: a separator line between (and
+/// bracketing) each item, with the selected item's fill spanning edge to edge
+/// and its adjacent separators carrying the half-block bleed. Text keeps the
+/// same 1-col indent as the rest of the list.
+fn render_switch_nav(f: &mut Frame, app: &ReviewPanel, area: Rect, sstart: usize, scount: usize) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let rows = app.rows();
+    // Which switch (0-indexed within the group) is focused, if any.
+    let selected =
+        (app.selected >= sstart && app.selected < sstart + scount).then(|| app.selected - sstart);
+    let width = area.width as usize;
+    let bleed = crate::theme::SELECTION_BG;
+
+    let mut lines: Vec<Line> = Vec::with_capacity(crate::sidebar::nav_lines(scount));
+    for p in 0..=scount {
+        // Separator `p` sits between item `p-1` (above) and item `p` (below).
+        // It shows the lower half-block when the item below it is selected and
+        // the upper half-block when the item above it is selected; blank
+        // otherwise. Only one item is ever selected, so the cases are exclusive.
+        let glyph = if selected == Some(p) {
+            Some(crate::sidebar::BLEED_ABOVE)
+        } else if p > 0 && selected == Some(p - 1) {
+            Some(crate::sidebar::BLEED_BELOW)
+        } else {
+            None
+        };
+        lines.push(match glyph {
+            Some(g) => Line::from(Span::styled(g.repeat(width), Style::default().fg(bleed))),
+            None => Line::raw(""),
+        });
+        if let Some(PanelRow::Switch(item)) = rows.get(sstart + p) {
+            lines.push(switch_nav_line(app, *item, selected == Some(p), width, bleed));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// One switch nav row. Selected rows fill edge to edge with the selection
+/// background (label padded out to the full width) and render white/bold;
+/// the active middle-pane view keeps its leading `▸` marker and cyan/bold
+/// tint when unselected; other rows are plain gray. The single leading space
+/// keeps the label aligned with the 1-col-indented rows above and below.
+fn switch_nav_line(
+    app: &ReviewPanel,
+    item: SwitchItem,
+    selected: bool,
+    width: usize,
+    bg: Color,
+) -> Line<'static> {
+    let (glyph, label, active) = match item {
+        SwitchItem::Chat => (
+            "🤓",
+            "Chat with Reviewer".to_string(),
+            app.active_view == ActiveView::Chat,
+        ),
+        SwitchItem::Vim => (
+            "✍️",
+            format!("Edit in {}", app.editor_name),
+            app.active_view == ActiveView::Vim,
+        ),
+        SwitchItem::Browser => ("🌐", "Open Browser".to_string(), false),
+    };
+    // The active middle-pane view is marked with a leading `▸`; the leading
+    // space matches the 1-col indent the sidebar nav labels use.
+    let marker = if active { "▸ " } else { "  " };
+    let text = format!(" {marker}{glyph} {label}");
+    if selected {
+        let pad = width.saturating_sub(text.chars().count());
+        Line::from(Span::styled(
+            format!("{text}{}", " ".repeat(pad)),
+            Style::default()
+                .fg(Color::White)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else if active {
+        Line::from(Span::styled(
+            text,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(text, Style::default().fg(Color::Gray)))
     }
 }
 
@@ -372,36 +565,9 @@ fn render_row(app: &ReviewPanel, row: &PanelRow, selected: bool, width: usize) -
             format!("— {label} —"),
             Style::default().fg(Color::DarkGray),
         ))),
-        PanelRow::Switch(item) => {
-            let (glyph, label, active) = match item {
-                SwitchItem::Chat => (
-                    "🤓",
-                    "Chat with Reviewer".to_string(),
-                    app.active_view == ActiveView::Chat,
-                ),
-                SwitchItem::Vim => (
-                    "✍️",
-                    format!("Edit in {}", app.editor_name),
-                    app.active_view == ActiveView::Vim,
-                ),
-                SwitchItem::Browser => ("🌐", "Open Browser".to_string(), false),
-            };
-            // The active middle-pane view is marked with a leading `▸` and
-            // bold; the selected (focused) row gets white-bold on the
-            // selection band.
-            let marker = if active { "▸ " } else { "  " };
-            let style = if selected {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-            } else if active {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            ListItem::new(Line::from(Span::styled(
-                format!("{marker}{glyph} {label}"),
-                style,
-            )))
-        }
+        // Switch rows are drawn by `render_switch_nav` as a full-width nav
+        // block, never through this per-row list renderer.
+        PanelRow::Switch(_) => unreachable!("switch rows render via the nav block"),
         PanelRow::Approve => button_item("✅ Approve", Color::Green, selected),
         PanelRow::Reject => button_item("❌ Reject", Color::Red, selected),
     }
@@ -738,6 +904,18 @@ mod tests {
         dump(&term)
     }
 
+    /// Render and split into per-row strings — the nav-treatment tests assert
+    /// on separator / bleed geometry, which needs line-by-line access.
+    fn render_lines(app: &mut ReviewPanel, w: u16, h: u16) -> Vec<String> {
+        render(app, w, h).split('\n').map(str::to_string).collect()
+    }
+
+    fn row_y(rows: &[String], needle: &str) -> usize {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("expected row containing {needle:?} in:\n{}", rows.join("\n")))
+    }
+
     #[test]
     fn truncate_left_prefixes_ellipsis_and_keeps_the_tail() {
         // width includes the "..." so a 12-wide budget keeps the last 9 chars.
@@ -760,6 +938,125 @@ mod tests {
         assert!(out.contains("Open Browser"), "browser switch when url set: {out}");
         assert!(out.contains("Approve"), "approve button: {out}");
         assert!(out.contains("Reject"), "reject button: {out}");
+    }
+
+    /// The leading "Actions" header above the switches is gone — the three
+    /// action items stand on their own the way the main nav does. The switch
+    /// group renders before any remaining section header.
+    #[test]
+    fn leading_actions_header_no_longer_renders_above_the_switches() {
+        let mut app = panel(true);
+        let rows = render_lines(&mut app, 44, 16);
+        // The Chat switch is the first action, sitting directly under the
+        // folder row with no "Actions" divider above it.
+        let chat_y = row_y(&rows, "Chat with Reviewer");
+        let actions_ys: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.contains("Actions"))
+            .map(|(y, _)| y)
+            .collect();
+        // Only the Approve/Reject group keeps a header, and it sits below the
+        // switches — nothing labelled "Actions" renders above them.
+        assert!(
+            actions_ys.iter().all(|&y| y > chat_y),
+            "no 'Actions' header may render above the switches, got headers at {actions_ys:?}, chat at {chat_y}"
+        );
+    }
+
+    /// The selected switch's adjacent lines carry the half-block bleed — a
+    /// full-width row of U+2584 directly above and U+2580 directly below, both
+    /// spanning the pane edge to edge — exactly like the main sidebar nav.
+    #[test]
+    fn selected_switch_renders_full_width_half_block_bleed() {
+        let width = 30u16;
+        let mut app = panel(true);
+        // Move focus to the Edit switch (the middle of the three) so both a
+        // separator-above and separator-below are asserted.
+        app.nav_down();
+        let rows = render_lines(&mut app, width, 16);
+        let edit_y = row_y(&rows, "Edit in Vim");
+        assert_eq!(
+            rows[edit_y - 1],
+            crate::sidebar::BLEED_ABOVE.repeat(width as usize),
+            "line above the selected switch is full-width U+2584"
+        );
+        assert_eq!(
+            rows[edit_y + 1],
+            crate::sidebar::BLEED_BELOW.repeat(width as usize),
+            "line below the selected switch is full-width U+2580"
+        );
+        // A switch that isn't adjacent to the selection keeps a blank
+        // separator — no bleed leaks onto it.
+        let browser_y = row_y(&rows, "Open Browser");
+        assert!(
+            rows[browser_y + 1].trim().is_empty(),
+            "the line below the unselected Browser switch stays blank, got: {:?}",
+            rows[browser_y + 1]
+        );
+    }
+
+    /// A blank separator line sits between every pair of switches (and above
+    /// the first / below the last), so moving the selection never shifts where
+    /// the labels land — the same rhythm as the main nav.
+    #[test]
+    fn switch_separators_keep_labels_from_shifting_across_selection() {
+        let mut chat = panel(true); // Chat focused by default
+        let chat_rows = render_lines(&mut chat, 30, 16);
+
+        let mut edit = panel(true);
+        edit.nav_down(); // focus Edit
+        let edit_rows = render_lines(&mut edit, 30, 16);
+
+        for label in ["Chat with Reviewer", "Edit in Vim", "Open Browser"] {
+            assert_eq!(
+                row_y(&chat_rows, label),
+                row_y(&edit_rows, label),
+                "'{label}' must not move when the selection changes"
+            );
+        }
+        // Adjacent switches are one separator line apart.
+        assert_eq!(
+            row_y(&chat_rows, "Edit in Vim") - row_y(&chat_rows, "Chat with Reviewer"),
+            2,
+            "one separator line always sits between adjacent switches"
+        );
+    }
+
+    /// The selected switch's fill spans the pane edge to edge (column 0) while
+    /// the label keeps the 1-col indent, matching the main nav's fill.
+    #[test]
+    fn selected_switch_fill_spans_full_width() {
+        let width = 30u16;
+        let mut term = Terminal::new(TestBackend::new(width, 16)).unwrap();
+        let mut app = panel(true); // Chat focused by default
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term)
+            .split('\n')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let chat_y = row_y(&rows, "Chat with Reviewer") as u16;
+
+        // Both the left gutter (column 0) and the trailing padding carry the
+        // selection fill.
+        assert_eq!(
+            buf[(0, chat_y)].bg,
+            crate::theme::SELECTION_BG,
+            "left edge (indent gutter) must carry the selection fill"
+        );
+        for x in (width - 4)..width {
+            assert_eq!(
+                buf[(x, chat_y)].bg,
+                crate::theme::SELECTION_BG,
+                "right edge padding must carry the selection fill, col {x}"
+            );
+        }
+        assert_eq!(
+            buf[(0, chat_y)].symbol(),
+            " ",
+            "column 0 is the indent gutter, not the label"
+        );
     }
 
     #[test]

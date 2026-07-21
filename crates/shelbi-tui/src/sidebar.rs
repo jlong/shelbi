@@ -203,8 +203,8 @@ pub fn nav_lines(nav_n: usize) -> usize {
 /// cell above and below the selected nav row. Drawn with their *foreground*
 /// set to the selection background colour so the eye reads the fill as
 /// continuing past the row's edges.
-const BLEED_ABOVE: &str = "▄"; // U+2584 LOWER HALF BLOCK — sits above the row
-const BLEED_BELOW: &str = "▀"; // U+2580 UPPER HALF BLOCK — sits below the row
+pub(crate) const BLEED_ABOVE: &str = "▄"; // U+2584 LOWER HALF BLOCK — sits above the row
+pub(crate) const BLEED_BELOW: &str = "▀"; // U+2580 UPPER HALF BLOCK — sits below the row
 
 /// Render the Chat / Tasks / Activity nav as a full-width block: a separator
 /// line between (and bracketing) each item, with the selected item's fill
