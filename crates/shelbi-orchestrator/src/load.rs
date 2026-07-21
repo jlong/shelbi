@@ -148,6 +148,66 @@ pub fn load_review_task(project_name: &str, task_id: &str, workspace_name: &str)
     dispatch_task_onto(project_name, &project, &workflow, tf, &ws, agent)
 }
 
+/// Load `task_id` onto the review slot it should serve on, for callers that
+/// only hold a task id (the command palette, the review-interface fallback).
+///
+/// The id-only counterpart to [`load_review_task`]: reuse the review-tagged
+/// slot the task is already on, else the first free review slot. Unlike the
+/// generic [`load_task_by_id`], it never reuses a task's *dev* `assigned_to`
+/// (a handoff task still points at the workspace that built it) and never
+/// depends on the workflow declaring `tags: [review]` on its handoff status —
+/// the live `site`/`app` workflows don't. Routing purely through the
+/// `review`-tag query keeps a review load off the dev slot, and dispatch
+/// through [`dispatch_task_onto`] launches the Review agent.
+pub fn load_task_for_review(project_name: &str, task_id: &str) -> Result<String> {
+    let project = shelbi_state::load_project(project_name)?;
+    let tf = shelbi_state::load_task(project_name, task_id)?;
+    let already = tf
+        .task
+        .assigned_to
+        .as_deref()
+        .and_then(|name| project.workspace(name))
+        .filter(|w| project.effective_tags(w).contains("review"))
+        .map(|w| w.name.clone());
+    let target = match already {
+        Some(name) => name,
+        None => free_review_workspaces(project_name)?
+            .into_iter()
+            .next()
+            .map(|w| w.name)
+            .ok_or_else(|| {
+                Error::Other(
+                    "no free review workspace to load onto — free one or wait".to_string(),
+                )
+            })?,
+    };
+    load_review_task(project_name, task_id, &target)
+}
+
+/// Resolve which agent a load dispatches onto `ws`, given the workflow
+/// status's declared `agent:` (`status_agent`).
+///
+/// A review-tagged workspace exists to *serve* the branch for a human to run —
+/// that is the Review agent's job (install / build / boot / health-check), and
+/// it explicitly does not rebase or open a PR. The status's `agent:` is NOT who
+/// serves there: on a `user`-owned review status it is a Zen-automation hint
+/// ("who may auto-accept under Zen", commonly `orchestrator`), which the
+/// generic loader would otherwise dispatch onto the review slot — launching the
+/// orchestrator/developer instead of the reviewer (the bug this fixes). So any
+/// load onto a review slot dispatches the Review agent regardless of the
+/// status's declared agent. Non-review loads keep the status's agent untouched.
+fn dispatch_agent_for(
+    project: &Project,
+    ws: &WorkspaceSpec,
+    status_agent: Option<String>,
+) -> Option<String> {
+    if project.effective_tags(ws).contains("review") {
+        Some(shelbi_state::REVIEW_AGENT.to_string())
+    } else {
+        status_agent
+    }
+}
+
 /// Persist the assignment of `tf`'s task to `ws`, resolve its branch, and
 /// dispatch `agent` there. The assignment is written before dispatch so a
 /// concurrent load can't grab the same slot, and rolled back if the dispatch
@@ -162,6 +222,8 @@ fn dispatch_task_onto(
     agent: Option<String>,
 ) -> Result<String> {
     let branch = branch::branch_name_for_task(project, Some(workflow), &tf.task)?;
+
+    let agent = dispatch_agent_for(project, ws, agent);
 
     // Persist the assignment before dispatch so a concurrent load can't pick
     // the same slot, and roll it back on a dispatch failure.
@@ -364,6 +426,67 @@ mod tests {
         );
         // The task is untouched: still assigned to the dev slot, no branch
         // written by the aborted load.
+        let after = shelbi_state::load_task("demo", "t-queued").unwrap();
+        assert_eq!(after.task.assigned_to.as_deref(), Some("alpha"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn dispatch_agent_for_review_slot_forces_the_review_agent() {
+        let project = tagged_project();
+        let review = project.workspace("review-1").unwrap();
+
+        // The status's declared agent (a Zen hint like `orchestrator`, or even
+        // `developer`, or none) is overridden: a review-slot load always
+        // dispatches the Review agent that serves the branch.
+        for status_agent in [
+            Some("orchestrator".to_string()),
+            Some("developer".to_string()),
+            None,
+        ] {
+            assert_eq!(
+                dispatch_agent_for(&project, review, status_agent),
+                Some(shelbi_state::REVIEW_AGENT.to_string()),
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_agent_for_non_review_slot_keeps_the_status_agent() {
+        let project = tagged_project();
+        let dev = project.workspace("alpha").unwrap();
+
+        // A non-review load is untouched — the generic status agent flows
+        // through exactly as declared.
+        assert_eq!(
+            dispatch_agent_for(&project, dev, Some("developer".to_string())),
+            Some("developer".to_string()),
+        );
+        assert_eq!(dispatch_agent_for(&project, dev, None), None);
+    }
+
+    #[test]
+    fn load_task_for_review_needs_a_free_review_slot() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+
+        // Both review slots busy with *other* tasks; the queued task can't be
+        // placed, so the id-only review loader reports it rather than silently
+        // re-seeding the dev slot.
+        shelbi_state::save_task("demo", &review_task("t-a", "review-1"), "body").unwrap();
+        shelbi_state::save_task("demo", &review_task("t-b", "review-2"), "body").unwrap();
+        shelbi_state::save_task("demo", &review_task("t-queued", "alpha"), "body").unwrap();
+
+        let err = load_task_for_review("demo", "t-queued").unwrap_err();
+        assert!(
+            err.to_string().contains("no free review workspace"),
+            "got: {err}"
+        );
+        // Untouched: still on the dev slot, never bounced back to a dev pane.
         let after = shelbi_state::load_task("demo", "t-queued").unwrap();
         assert_eq!(after.task.assigned_to.as_deref(), Some("alpha"));
 

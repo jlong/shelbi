@@ -190,7 +190,11 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
     let Some(ws) = review_ws else {
         // Queued: load it onto a free review slot in the background. The
         // start path creates the pane detached, so nothing steals focus.
-        load::load_task_by_id(project_name, task_id)?;
+        // Routed through the review-specific loader (not the generic
+        // `load_task_by_id`) so a handoff task pinned to its dev slot is never
+        // re-seeded there, and the Review agent — not the review status's Zen
+        // agent — is dispatched onto the slot.
+        load::load_task_for_review(project_name, task_id)?;
         return Ok(ReviewOpenOutcome::Loading);
     };
 
