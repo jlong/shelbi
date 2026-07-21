@@ -5,6 +5,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,6 +16,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use serde::Serialize;
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
 use super::require_project;
 
@@ -54,8 +57,24 @@ pub enum OrchestratorEventsCmd {
         /// an unacknowledged batch is re-delivered verbatim on restart
         /// (at-least-once). This is the Claude orchestrator's durable
         /// replacement for a raw `shelbi events tail --follow` watch.
+        ///
+        /// The feed runs indefinitely. When it does stop on its own terms — a
+        /// catchable termination signal (SIGTERM/SIGHUP/SIGINT) or the optional
+        /// `--max-lifetime` cap below — it prints a terminal
+        /// `{"feed":"expired"|"terminated", ...}` notice on stdout and exits 0,
+        /// so a supervisor can tell a clean stream end from a crash (which
+        /// prints no such notice). Any batch left unacked at exit re-delivers
+        /// to the next follower.
         #[arg(long)]
         follow: bool,
+        /// Optional self-imposed wall-clock lifetime for `--follow`, e.g.
+        /// `4h`. When set, the feed exits cleanly with a `feed=expired` stdout
+        /// notice after this long instead of running forever — a deterministic
+        /// recycle point that beats an environment reaper (even an uncatchable
+        /// SIGKILL) so the death is never silent. Ignored without `--follow`;
+        /// omit to run indefinitely.
+        #[arg(long)]
+        max_lifetime: Option<String>,
     },
     /// Advance the durable cursor past an acknowledged batch delivery id.
     ///
@@ -81,9 +100,14 @@ pub fn run(project_opt: Option<String>, cmd: OrchestratorCmd) -> Result<()> {
                 cursor,
                 timeout,
                 follow,
+                max_lifetime,
             } => {
                 if follow {
-                    run_feed(&project)
+                    let max_lifetime = max_lifetime
+                        .as_deref()
+                        .map(super::events::parse_duration)
+                        .transpose()?;
+                    run_feed(&project, max_lifetime)
                 } else {
                     let timeout = timeout.ok_or_else(|| {
                         anyhow!("`events next` requires --timeout unless --follow is set")
@@ -141,13 +165,71 @@ const FEED_POLL: Duration = Duration::from_millis(250);
 /// which is what makes the restart identity hold. The whole pending tail is
 /// delivered as a single batch (same read shape as `drain`); memory is bounded
 /// by the log's own rotation, not by this command.
-fn run_feed(project: &str) -> Result<()> {
+///
+/// # Lifetime and death
+///
+/// The loop is a pure filesystem poll of the persisted cursor and
+/// `events.log` — it holds no long-lived hub connection, so nothing on the hub
+/// side can recycle it out from under the consumer. Left alone it runs
+/// forever. It stops on its own terms only two ways, both of which emit a
+/// terminal [`FeedNotice`] on stdout (and a line on stderr) and exit 0:
+///
+/// * a catchable termination signal — SIGTERM/SIGHUP/SIGINT, e.g. an
+///   environment reaper or a supervisor recycling the process; and
+/// * the optional `max_lifetime` wall-clock cap, a deterministic self-recycle
+///   a supervisor can set below its reaper's threshold so the exit is always a
+///   clean, message-bearing one rather than a silent kill.
+///
+/// Either way the in-flight (unacked) batch is left exactly where it was, so
+/// the next follower re-derives and re-delivers it verbatim (at-least-once).
+/// An uncatchable `SIGKILL` still ends the process without a notice, but the
+/// same redelivery guarantee holds — no event is lost, only a restart is
+/// spent. The distinguishing notice is what lets a supervisor tell an expected
+/// recycle from a genuine crash.
+fn run_feed(project: &str, max_lifetime: Option<Duration>) -> Result<()> {
+    // Turn the catchable termination signals a reaper or supervisor sends into
+    // a clean, message-bearing exit instead of a silently truncated stdout
+    // stream. Each handler records its own signal number so the notice can name
+    // the cause; the loop polls the flag every FEED_POLL.
+    let signal = Arc::new(AtomicUsize::new(0));
+    for sig in [SIGTERM, SIGHUP, SIGINT] {
+        signal_hook::flag::register_usize(sig, Arc::clone(&signal), sig as usize).map_err(|e| {
+            anyhow!("failed to install signal handler {sig} for the event feed: {e}")
+        })?;
+    }
+    let outcome = feed_loop(project, max_lifetime, &signal)?;
+    emit_feed_notice(project, &outcome)
+}
+
+/// The `--follow` poll loop, factored out of [`run_feed`] so it is testable
+/// without installing process-wide signal handlers: the caller owns the
+/// `signal` flag and can pre-set it (or pass a zero flag with a short
+/// `max_lifetime`) to drive either exit path deterministically.
+///
+/// Returns only on a self-determined stop — a non-zero `signal` flag or an
+/// elapsed `max_lifetime`. With `max_lifetime = None` and no signal it loops
+/// forever, which is the default indefinite feed.
+fn feed_loop(
+    project: &str,
+    max_lifetime: Option<Duration>,
+    signal: &AtomicUsize,
+) -> Result<FeedOutcome> {
+    let start = Instant::now();
     // The cursor value we have already emitted a batch for. While it matches
     // the persisted cursor we hold the in-flight batch instead of re-scanning,
     // so new events wait for the ack rather than growing the batch under a
     // churning delivery id.
     let mut emitted_at: Option<u64> = None;
     loop {
+        let sig = signal.load(Ordering::Relaxed);
+        if sig != 0 {
+            return Ok(FeedOutcome::Terminated { signal: sig as i32 });
+        }
+        if let Some(limit) = max_lifetime {
+            if start.elapsed() >= limit {
+                return Ok(FeedOutcome::Expired { after: limit });
+            }
+        }
         let cursor = read_persisted_cursor(project)?;
         if emitted_at != Some(cursor) {
             if let Some(batch) = scan_feed_batch(project, cursor)? {
@@ -157,6 +239,80 @@ fn run_feed(project: &str) -> Result<()> {
         }
         thread::sleep(FEED_POLL);
     }
+}
+
+/// Why the `--follow` loop returned instead of streaming forever. Both variants
+/// are clean exits (status 0) that print a [`FeedNotice`]; a genuine crash
+/// returns an `Err` up to `main` and prints no notice.
+#[derive(Debug, PartialEq, Eq)]
+enum FeedOutcome {
+    /// The optional `--max-lifetime` wall-clock cap elapsed.
+    Expired { after: Duration },
+    /// A catchable termination signal arrived (SIGTERM/SIGHUP/SIGINT).
+    Terminated { signal: i32 },
+}
+
+/// The recovery instruction spelled out on every terminal notice so the
+/// supervising agent needn't infer it.
+const FEED_RECOVERY_NOTE: &str = "unacked batches re-deliver on the next run; \
+     re-run `shelbi orchestrator events next --follow` to continue";
+
+/// Terminal notice printed when a `--follow` feed stops on its own terms. Its
+/// `feed` discriminant (`"expired"` or `"terminated"`) never appears on a
+/// [`FeedBatch`], so a supervisor watching stdout can tell a clean stream end
+/// from a crash (which emits no notice at all).
+#[derive(Debug, Serialize)]
+struct FeedNotice {
+    feed: &'static str,
+    project: String,
+    reason: String,
+    note: &'static str,
+}
+
+fn emit_feed_notice(project: &str, outcome: &FeedOutcome) -> Result<()> {
+    let notice = match outcome {
+        FeedOutcome::Expired { after } => FeedNotice {
+            feed: "expired",
+            project: project.to_string(),
+            reason: format!("--max-lifetime of {} reached", format_duration(*after)),
+            note: FEED_RECOVERY_NOTE,
+        },
+        FeedOutcome::Terminated { signal } => FeedNotice {
+            feed: "terminated",
+            project: project.to_string(),
+            reason: format!("received signal {signal}"),
+            note: FEED_RECOVERY_NOTE,
+        },
+    };
+    // A human-readable line on stderr for log scans; the machine notice rides
+    // stdout, the same stream the supervisor already parses for batches.
+    eprintln!(
+        "shelbi orchestrator events feed stopped: {} — {}",
+        notice.reason, notice.note
+    );
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer_pretty(&mut stdout, &notice)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Render a duration as a compact `1h30m` / `45s` string for the notice
+/// `reason`. Zero collapses to `0s` rather than the empty string.
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let mut out = String::new();
+    if h > 0 {
+        out.push_str(&format!("{h}h"));
+    }
+    if m > 0 {
+        out.push_str(&format!("{m}m"));
+    }
+    if s > 0 || out.is_empty() {
+        out.push_str(&format!("{s}s"));
+    }
+    out
 }
 
 /// Scan the next deliverable batch starting at `cursor` WITHOUT advancing the
@@ -1304,6 +1460,96 @@ mod tests {
         assert_eq!(read_cursor("demo"), before, "feed read must not advance the cursor");
         assert_eq!(first.delivery_id, replay.delivery_id);
         assert_eq!(first.events, replay.events);
+    }
+
+    #[test]
+    fn feed_loop_exits_cleanly_when_max_lifetime_elapses() {
+        let (_guard, _tmp) = setup_home();
+        // A zero flag never trips the signal path; a zero lifetime is already
+        // elapsed on the first iteration, so the loop returns immediately
+        // without sleeping or blocking forever.
+        let signal = AtomicUsize::new(0);
+        let outcome = feed_loop("demo", Some(Duration::ZERO), &signal).unwrap();
+        assert_eq!(outcome, FeedOutcome::Expired { after: Duration::ZERO });
+    }
+
+    #[test]
+    fn feed_loop_exits_cleanly_on_termination_signal() {
+        let (_guard, _tmp) = setup_home();
+        // Pre-set the flag the way a real signal handler would; the loop must
+        // report the signal number and stop rather than stream on.
+        let signal = AtomicUsize::new(SIGTERM as usize);
+        // No lifetime cap: only the signal can end this loop.
+        let outcome = feed_loop("demo", None, &signal).unwrap();
+        assert_eq!(outcome, FeedOutcome::Terminated { signal: SIGTERM });
+    }
+
+    #[test]
+    fn follower_death_redelivers_the_unacked_batch() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task("demo", "first");
+        append_task_event(
+            "demo",
+            "first",
+            "default",
+            Column::todo(),
+            Column::done(),
+            "one",
+        )
+        .unwrap();
+
+        // Run a real feed loop that emits one batch, then dies on its
+        // self-imposed lifetime cap without ever acking — the exact shape of a
+        // follower reaped mid-flight. The short cap trips on the second poll.
+        let before = read_cursor("demo");
+        let signal = AtomicUsize::new(0);
+        let outcome = feed_loop("demo", Some(Duration::from_millis(1)), &signal).unwrap();
+        assert!(matches!(outcome, FeedOutcome::Expired { .. }));
+
+        // Death left the cursor untouched, so the next follower re-derives the
+        // identical batch — no event dropped, only a restart spent.
+        assert_eq!(read_cursor("demo"), before, "a dead follower must not advance the cursor");
+        let redelivered = scan_feed_batch("demo", read_cursor("demo")).unwrap().unwrap();
+        assert_eq!(redelivered.cursor.from, before.to_string());
+        assert_eq!(redelivered.events.len(), 1);
+        assert_eq!(redelivered.events[0].task.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn feed_notice_is_distinguishable_from_a_batch() {
+        // A supervisor watching stdout keys off the `feed` discriminant, which
+        // a batch never carries, and a batch's `delivery_id`, which a notice
+        // never carries.
+        let expired = serde_json::to_value(FeedNotice {
+            feed: "expired",
+            project: "demo".to_string(),
+            reason: "--max-lifetime of 4h reached".to_string(),
+            note: FEED_RECOVERY_NOTE,
+        })
+        .unwrap();
+        assert_eq!(expired["feed"], "expired");
+        assert!(expired.get("delivery_id").is_none());
+        assert!(expired["note"].as_str().unwrap().contains("re-deliver"));
+
+        let batch = FeedBatch {
+            delivery_id: "shelbi-event/demo/0-10".to_string(),
+            project: "demo".to_string(),
+            cursor: FeedCursor { from: "0".to_string(), through: "10".to_string() },
+            ack: "shelbi orchestrator events ack shelbi-event/demo/0-10".to_string(),
+            events: Vec::new(),
+        };
+        let batch = serde_json::to_value(batch).unwrap();
+        assert!(batch.get("feed").is_none());
+        assert_eq!(batch["delivery_id"], "shelbi-event/demo/0-10");
+    }
+
+    #[test]
+    fn format_duration_humanizes_common_spans() {
+        assert_eq!(format_duration(Duration::ZERO), "0s");
+        assert_eq!(format_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(format_duration(Duration::from_secs(90)), "1m30s");
+        assert_eq!(format_duration(Duration::from_secs(4 * 3600)), "4h");
+        assert_eq!(format_duration(Duration::from_secs(3600 + 60)), "1h1m");
     }
 
     #[test]
