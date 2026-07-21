@@ -1149,7 +1149,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // 2–7. Deploy the agent context, reset the pane, launch the runner, wait
     //       for readiness, and send the loop-closing dev prompt. Dev
     //       workspaces inject no `PORT` (that's a review-workspace concern).
-    let prompt = compose_prompt(
+    let mut prompt = compose_prompt(
         spec.task_id,
         spec.branch,
         spec.task_body,
@@ -1158,6 +1158,15 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         &spec.project.name,
         shelbi_agent::polls_for_messages(&runner),
     );
+    // Review dispatch: pin the review slot's port into the pane env (finally
+    // wiring the long-stubbed `SpawnArgs.port`) and append the workflow's
+    // resolved serve recipe to the prompt so the Review agent runs it verbatim
+    // instead of auto-detecting a framework/port. A dev dispatch gets neither.
+    let (review_port, review_section) =
+        review_dispatch_extras(spec.project, spec.workspace, spec.task_id);
+    if let Some(section) = &review_section {
+        prompt.push_str(section);
+    }
     deploy_and_spawn(SpawnArgs {
         project: spec.project,
         workspace: spec.workspace,
@@ -1167,7 +1176,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         addr: &addr,
         task_id: spec.task_id,
         agent: spec.agent,
-        port: None,
+        port: review_port,
         resume: false,
         prompt: &prompt,
     })?;
@@ -3277,6 +3286,87 @@ fn compose_prompt(
     )
 }
 
+/// For a dispatch onto a review-tagged workspace, resolve `(port, recipe)`:
+///
+/// - **port** — the deterministic dev-server port pinned into the pane env
+///   (`SpawnArgs.port` → `PORT`). It's the workspace's explicit slot, matching
+///   the review interface's `review_url` derivation. An unset slot yields
+///   `None`.
+/// - **recipe** — the workflow's `review:` serve recipe, `$SLOT`/`$PORT`
+///   resolved against `port`, rendered as a prompt section (see
+///   [`render_review_recipe_section`]). `None` when the workflow declares no
+///   `review:` block (a diff-only review).
+///
+/// Returns `(None, None)` for a non-review dispatch — dev workspaces get no
+/// `PORT` and no recipe. A failure to load the task/workflow degrades to no
+/// recipe rather than blocking the dispatch (the agent then falls back to a
+/// diff-only review per its charter).
+fn review_dispatch_extras(
+    project: &Project,
+    workspace: &WorkspaceSpec,
+    task_id: &str,
+) -> (Option<u16>, Option<String>) {
+    if !project.effective_tags(workspace).contains("review") {
+        return (None, None);
+    }
+    let port = workspace.slot.and_then(|s| u16::try_from(s).ok());
+    let section = review_recipe_section(project, task_id, port);
+    (port, section)
+}
+
+/// Load the task's workflow, resolve its `review:` recipe against `port`, and
+/// render it as a prompt section — or `None` when there's no recipe (diff-only)
+/// or the task/workflow can't be loaded.
+fn review_recipe_section(project: &Project, task_id: &str, port: Option<u16>) -> Option<String> {
+    let tf = shelbi_state::load_task(&project.name, task_id).ok()?;
+    let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task).ok()?;
+    let recipe = workflow.resolved_review_recipe(port)?;
+    Some(render_review_recipe_section(&recipe))
+}
+
+/// Render a resolved review serve recipe as a prompt section the Review agent
+/// runs verbatim. The `## Review serve recipe` heading is the anchor the Review
+/// charter keys off to tell "serve this branch" apart from a diff-only review.
+fn render_review_recipe_section(r: &shelbi_core::ResolvedReviewRecipe) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::from(
+        "\n\n---\n## Review serve recipe\n\n\
+         The workflow declares how to boot this branch for review. Run it \
+         verbatim — do NOT auto-detect a framework or a port; the review slot's \
+         port is already substituted below.\n\n",
+    );
+    if let Some(wd) = &r.workdir {
+        let _ = writeln!(
+            s,
+            "- Working directory (relative to the worktree root): `{wd}`"
+        );
+    }
+    if let Some(setup) = &r.setup {
+        let _ = writeln!(s, "- Setup (run once, must exit 0 before serving): `{setup}`");
+    }
+    let _ = writeln!(s, "- Serve: `{}`", r.serve);
+    if let Some(ready) = &r.ready {
+        let _ = writeln!(s, "- Ready probe (poll until it exits 0): `{ready}`");
+    }
+    if let Some(url) = &r.url {
+        let _ = writeln!(s, "- Reviewable URL: {url}");
+    }
+    if r.port.is_none() {
+        s.push_str(
+            "\n**This review workspace has no assigned slot**, so the `$SLOT` / \
+             `$PORT` placeholders above are unresolved. Do NOT guess a port — \
+             stop and report this misconfiguration instead of serving.\n",
+        );
+    }
+    s.push_str(
+        "\nRun the setup command first (it must exit 0), then start the serve \
+         command as a managed background server, poll the ready probe until it \
+         succeeds, and hand the reviewable URL to the human. If setup or the \
+         serve fails, stop and report the failure — do not patch the project.\n",
+    );
+    s
+}
+
 /// Build the prompt sent into a **resumed** pane (`shelbi task resume`). It's
 /// [`compose_prompt`]'s output — the task body plus the identical rebase +
 /// review-marker handoff — with a short resume banner prepended so the worker
@@ -4004,8 +4094,46 @@ pub fn detach_workspace_worktree(host: &Host, worktree: &Path) -> DetachOutcome 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shelbi_core::{AgentRunnerSpec, MachineKind, OrchestratorSpec};
+    use shelbi_core::{AgentRunnerSpec, MachineKind, OrchestratorSpec, ResolvedReviewRecipe};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn review_recipe_section_renders_resolved_commands_under_the_anchor() {
+        let recipe = ResolvedReviewRecipe {
+            workdir: Some("site".into()),
+            setup: Some("npm install --no-audit --no-fund".into()),
+            serve: "npm run dev -- -p 4310".into(),
+            ready: Some("curl -sf http://localhost:4310".into()),
+            url: Some("http://localhost:4310".into()),
+            port: Some(4310),
+        };
+        let section = render_review_recipe_section(&recipe);
+        // The charter keys off this exact heading to tell "serve" from diff-only.
+        assert!(section.contains("## Review serve recipe"), "{section}");
+        assert!(section.contains("`site`"), "{section}");
+        assert!(section.contains("npm run dev -- -p 4310"), "{section}");
+        assert!(section.contains("curl -sf http://localhost:4310"), "{section}");
+        assert!(section.contains("http://localhost:4310"), "{section}");
+        // Port resolved → no misconfiguration warning.
+        assert!(!section.contains("no assigned slot"), "{section}");
+    }
+
+    #[test]
+    fn review_recipe_section_warns_loudly_when_the_slot_port_is_missing() {
+        // A declared recipe but no slot: placeholders stay literal and the
+        // agent is told to stop and report rather than guess a port.
+        let recipe = ResolvedReviewRecipe {
+            workdir: None,
+            setup: None,
+            serve: "npm run dev -- -p $SLOT".into(),
+            ready: None,
+            url: None,
+            port: None,
+        };
+        let section = render_review_recipe_section(&recipe);
+        assert!(section.contains("no assigned slot"), "{section}");
+        assert!(section.contains("Do NOT guess a port"), "{section}");
+    }
 
     fn fixture_project() -> Project {
         let mut runners = BTreeMap::new();

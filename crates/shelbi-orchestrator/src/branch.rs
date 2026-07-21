@@ -235,6 +235,7 @@ mod tests {
             transitions: None,
             git,
             zen: None,
+            review: None,
         }
     }
 

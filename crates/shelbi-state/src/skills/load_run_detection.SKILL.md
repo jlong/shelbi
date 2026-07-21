@@ -1,128 +1,85 @@
 ---
 name: load-run-detection
 description: >
-  How the Review agent figures out how to install and serve an unknown
-  project — the auto-detect heuristics and their precedence. Use when a
-  review workspace has a branch checked out and you need to boot its dev
-  server on $PORT so a human can run it.
+  How the Review agent boots a branch for review: run the workflow's serve
+  recipe (handed to you in your dispatch prompt, fully resolved) verbatim,
+  health-check it, and hand a URL to the human. Use when a review workspace
+  has a branch checked out and you need to stand up its dev server.
 ---
 
-# Load / run auto-detection
+# Running the review serve recipe
 
 You are on a review workspace and need to make the checked-out branch
-**runnable** on your assigned `$PORT`. This skill is the decision
-procedure for *how*. It is heuristics, not Rust — adapt per repo.
+**runnable** for a human. The *how* is not yours to guess — it is declared
+by the workflow and handed to you, already resolved, in your dispatch
+prompt.
 
-## Precedence (first match wins)
+## The recipe is the source of truth
 
-1. **Declared commands** — `review.setup` / `review.serve` in the project
-   config. If present, use them **verbatim** and skip everything below.
-   Declared always beats detection.
-2. **Framework heuristic** — inferred from manifest + lockfile (below).
-3. **Generic runner** — `Makefile` `dev`/`serve` target, then `Procfile`
-   `web:` line.
-4. **Diff-only** — nothing runnable detected. Report it; do not fabricate
-   a server.
+Look in your dispatch prompt for a **`## Review serve recipe`** section. It
+carries, with the review slot's port **already substituted in**:
 
-Always bind to `$PORT`. Never hardcode a port — concurrent review
-workspaces share a host and will collide.
+- a **working directory** (relative to the worktree root),
+- an optional **setup** command (install/build — must exit 0),
+- the **serve** command (the dev server, bound to your slot's port),
+- an optional **ready** probe, and
+- the **reviewable URL**.
 
-## Node / JavaScript — `package.json` present
+Run it **verbatim**. Do not auto-detect the framework, do not rewrite the
+port flag, and do not read a `PORT` environment variable to pick a port —
+the workflow already made these decisions, workflow-scoped, so a monorepo's
+app / site / docs each serve correctly and concurrent review slots don't
+collide on a port.
 
-Pick the package manager from the lockfile, not from habit:
+## No recipe → diff-only
 
-| Lockfile            | Install            | Run dev            |
-| ------------------- | ------------------ | ------------------ |
-| `pnpm-lock.yaml`    | `pnpm install`     | `pnpm dev`         |
-| `yarn.lock`         | `yarn install`     | `yarn dev`         |
-| `package-lock.json` | `npm install`      | `npm run dev`      |
-| none                | `npm install`      | `npm run dev`      |
+If your dispatch prompt has **no** `## Review serve recipe` section, the
+workflow declares no way to serve this branch. That is a **diff-only**
+review: report it in your summary, emit the ready signal with no URL, and
+stop. **Never** fabricate a server or fall back to a framework default
+port — an unrequested server on port 3000 is the exact failure this
+prevents.
 
-Read `package.json` `scripts` to confirm the serve script — it is usually
-`dev`, sometimes `start` or `serve`. Prefer `dev` for a dev server.
+## Unresolved port → stop and report
 
-**Passing the port.** Most JS dev servers accept `--port`:
-
-- Next.js: `next dev --port $PORT` → `npm run dev -- --port $PORT`
-- Vite: `vite --port $PORT` → `npm run dev -- --port $PORT`
-- With pnpm/yarn the `--` is not needed: `pnpm dev --port $PORT`.
-
-Some frameworks read `PORT` from the environment instead (Create React
-App, many Express apps). If `--port` is not recognized, export
-`PORT=$PORT` before the serve command. When in doubt, set both — export
-`PORT` **and** pass `--port $PORT`.
-
-## Rust — `Cargo.toml` present
-
-1. `cargo build` (setup — must exit 0).
-2. Serve: `cargo run` for a single binary; `cargo run --bin <name>` or
-   `cargo run --example <name>` when there are several. Inspect
-   `Cargo.toml` `[[bin]]` / `[[example]]` and `src/bin/` to choose.
-3. Port: most Rust web servers read `PORT` from the environment — export
-   `PORT=$PORT`. If the crate takes a `--port` flag, pass it after `--`:
-   `cargo run -- --port $PORT`.
-
-## Generic runners
-
-- **Makefile** with a `dev` or `serve` target → `make dev` / `make serve`.
-  Grep the Makefile for the target before assuming it exists.
-- **Procfile** with a `web:` process line → run that command, substituting
-  `$PORT` (Procfile-style apps already expect `$PORT` in the environment).
-
-## Other ecosystems (quick reference)
-
-- `pyproject.toml` / `requirements.txt` → create/activate a venv, install,
-  then the project's documented run command (`uvicorn app:app --port $PORT`,
-  `flask run --port $PORT`, `python manage.py runserver 0.0.0.0:$PORT`).
-- `go.mod` → `go run .`, port via `PORT` env or a documented flag.
-- `Gemfile` → `bundle install`, then `bundle exec rails server -p $PORT`
-  or the Procfile `web:` line.
-
-If you recognize the ecosystem but not the exact serve command, read the
-project's README for the canonical "how to run locally" instructions
-before guessing.
+If the serve command still contains a literal `$SLOT` / `$PORT`, your
+review workspace has no assigned slot. Do **not** guess a port — stop and
+report the misconfiguration.
 
 ## Launching (managed pane)
 
-Once you've resolved the serve command, don't run it yourself as a
-background job — hand it to shelbi so it runs in a **managed server pane**
-that shelbi can watch and reap:
+Hand the serve command to shelbi so it runs in a **managed server pane**
+shelbi can watch and reap, not a bare background job:
 
 ```sh
-shelbi workspace serve "$SHELBI_WORKSPACE" --serve '<resolved serve command>'
+shelbi workspace serve "$SHELBI_WORKSPACE" --serve '<the recipe serve command>'
 ```
 
-Reference the port as `$PORT` inside the command (e.g. `--serve 'npm run
-dev -- --port $PORT'`). If the project declares `review.serve`, you may
-omit `--serve` and shelbi uses it. Running the command again tears down any
-existing server and starts fresh (that's how you refresh for a new branch
-or a tweak). shelbi runs the HTTP ready-probe for you and prints the URL.
+Prepend the recipe's working directory when it names one (e.g.
+`--serve 'cd site && npm run dev -- -p 4310'`). The port is already in the
+command — there is nothing to fill in. Running it again tears down any
+existing server and starts fresh, which is also how you refresh for a new
+branch or a follow-up tweak. shelbi runs the HTTP ready-probe for you and
+prints the URL.
 
 ## Readiness
 
-`shelbi workspace serve` blocks on the HTTP ready-probe below before it
-returns, so for a normal HTTP app you just wait for it to report the URL.
-The heuristics here are what that probe does — and your fallback when the
-app has no HTTP surface (`--no-wait`, then confirm manually):
+`shelbi workspace serve` blocks on the HTTP ready-probe before it returns,
+so for a normal web app you just wait for it to report the URL. When the
+recipe supplies its own `ready` probe, that is the authoritative check —
+poll it until it exits 0 (or times out). Your fallbacks when the app has no
+HTTP surface (`--no-wait`, then confirm manually):
 
-1. **HTTP probe** — poll `http://localhost:$PORT` (or the declared
-   `review.ready_probe.http`) for any non-connection-refused response
-   (200s ideal; a 3xx/4xx still means it's listening). Retry with backoff
-   up to a timeout (~90s default).
-2. **Log match** — if there's no HTTP surface, watch the server log for
-   its "listening on…" / "compiled successfully" line.
+1. **HTTP probe** — poll the reviewable URL for any non-connection-refused
+   response (200s ideal; a 3xx/4xx still means it's listening). Retry with
+   backoff up to a timeout (~90s default).
+2. **Log match** — if there's no HTTP surface, watch the server log for its
+   "listening on…" / "compiled successfully" line.
 3. **Settle** — as a last resort, wait a fixed interval and proceed.
-
-## When you can't run it
-
-If none of the above resolves — no manifest, no Makefile/Procfile, no
-documented run command — it's a **diff-only** review. Do not fabricate a
-server. Report clearly in your ready summary what you looked for and why
-nothing booted, emit the ready signal without a `url`, and stop.
 
 ## Guardrails
 
-- Setup commands are one-shot and must exit 0 before you serve.
+- The setup command is one-shot and must exit 0 before you serve.
 - If setup or the build **fails**, that is a finding — report it, don't
   patch the project. Loading is your job; fixing is not.
-- Bind to `$PORT`, always.
+- Run the recipe verbatim; never invent a port.

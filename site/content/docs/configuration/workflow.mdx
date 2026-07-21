@@ -180,6 +180,51 @@ task on such an edge is an error, not a silent hub-side run.
 
 </Callout>
 
+## review
+
+A workflow-scoped recipe for how the [Review agent](/docs/concepts/review-workspaces)
+boots this branch so a human can run it. This is the recommended way to stand
+up a review server: Shelbi resolves the recipe's `$SLOT` / `$PORT` against the
+review workspace's slot and injects it into the Review agent's prompt, and the
+agent runs it verbatim, health-checking it and handing back a URL. Because the
+recipe lives on the workflow, a monorepo's `app` / `site` / `docs` workflows
+each serve their own subdirectory on the review slot's port without colliding.
+
+When a workflow declares no `review:` block, the Review agent does a
+**diff-only** review: it does not auto-detect a framework or boot a
+default-port server.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `workdir` | string | no | worktree root | Directory to run the recipe in, relative to the worktree root. |
+| `setup` | string | no | — | One-shot install/build command; must exit 0 before serving. |
+| `serve` | string | yes | — | Command that starts the dev server, bound to the slot's port via `$SLOT`. |
+| `ready` | string | no | — | Readiness probe polled until it exits 0. |
+| `url` | string | no | — | Reviewable URL handed to the human; also gates the review interface's "Open Browser" action. |
+
+Every field may reference the review slot's port as `$SLOT` or `$PORT` (both
+`$X` and `${X}` spellings); Shelbi substitutes the resolved port before the
+recipe reaches the agent.
+
+```yaml
+review:
+  workdir: site
+  setup: npm install --no-audit --no-fund
+  serve: npm run dev -- -p $SLOT
+  ready: curl -sf http://localhost:$SLOT
+  url: http://localhost:$SLOT
+```
+
+<Callout type="note" title="review: vs. a transition run: serve block">
+
+The [`run` / `ready`](#run-ready-and-teardown) block on a review-entering
+transition also boots a server, but it runs **hub-side** and declaratively.
+Prefer `review:` for a serve recipe: the Review agent executes it, so it can
+health-check, summarize failures, and apply a human's tweak. Keep transition
+`run:` for hub-side side-effects that aren't the review server itself.
+
+</Callout>
+
 ## git
 
 Per-workflow override of the project's [`git:`](/docs/configuration/project#git)

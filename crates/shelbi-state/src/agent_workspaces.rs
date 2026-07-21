@@ -1891,9 +1891,10 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
     }
 
     /// The review charter (§6) must be explicit that the agent loads and
-    /// serves and does NOT modify code — plus carry the load/serve
-    /// mechanics (setup/serve, $PORT, ready probe, the ready signal) so a
-    /// copy edit can't quietly gut the role's contract.
+    /// serves and does NOT modify code — plus carry the recipe-driven
+    /// load/serve mechanics (run the injected serve recipe verbatim, diff-only
+    /// when there is none, the ready signal) so a copy edit can't quietly gut
+    /// the role's contract.
     #[test]
     fn review_template_contains_required_charter_language() {
         // Load-and-serve, not keep-coding — the whole point of the role.
@@ -1902,11 +1903,22 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
         // The human-requested-tweak carve-out must survive edits — it's the
         // sole case the review agent touches code.
         assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("tweak"));
-        // Load/serve mechanics.
-        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("review.setup"));
-        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("review.serve"));
-        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("$PORT"));
+        // Load/serve mechanics: the workflow's serve recipe (injected into the
+        // dispatch prompt) is the single source of truth, run verbatim.
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("Review serve recipe"));
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("verbatim"));
         assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("diff-only"));
+        // The phantom project-config hook and the "$PORT arrives in the env"
+        // contract are gone — an unset port must fail loudly, not silently
+        // serve on a framework default.
+        assert!(
+            !DEFAULT_REVIEW_INSTRUCTIONS.contains("review.setup"),
+            "phantom review.setup config hook must be gone from the charter"
+        );
+        assert!(
+            !DEFAULT_REVIEW_INSTRUCTIONS.contains("review.serve"),
+            "phantom review.serve config hook must be gone from the charter"
+        );
         // The ready signal + its verbs the board/orchestrator watch for.
         assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("$SHELBI_HUB_SOCK"));
         assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("review_ready"));
@@ -1915,19 +1927,18 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
         assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("skills"));
     }
 
-    /// The bundled load/run detection skill ships with valid frontmatter
-    /// (Claude Code needs `name:` + `description:` to load it) and the
-    /// auto-detect precedence the plan (§7) calls out.
+    /// The bundled load/run skill ships with valid frontmatter (Claude Code
+    /// needs `name:` + `description:` to load it) and teaches the recipe-driven
+    /// contract: run the injected serve recipe verbatim, diff-only when there
+    /// is none, never auto-detect a framework default port.
     #[test]
-    fn review_load_run_skill_has_frontmatter_and_precedence() {
+    fn review_load_run_skill_has_frontmatter_and_recipe_contract() {
         assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.starts_with("---"));
         assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("name: load-run-detection"));
         assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("description:"));
-        // Precedence: declared > framework > generic > diff-only.
-        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("package.json"));
-        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("Cargo.toml"));
-        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("Makefile"));
-        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("Procfile"));
+        // Recipe-driven: the serve recipe is the source of truth, run verbatim.
+        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("Review serve recipe"));
+        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("verbatim"));
         assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("diff-only"));
     }
 

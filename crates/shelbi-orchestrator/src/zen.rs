@@ -11635,6 +11635,7 @@ mod dry_run_tests {
             transitions: None,
             git: None,
             zen: None,
+            review: None,
         }
     }
 

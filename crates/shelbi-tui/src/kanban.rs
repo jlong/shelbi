@@ -3963,6 +3963,7 @@ mod tests {
             transitions: None,
             git: None,
             zen: None,
+            review: None,
         }
     }
 
@@ -4029,6 +4030,7 @@ mod tests {
             transitions: None,
             git: None,
             zen: None,
+            review: None,
         }
     }
 
@@ -4935,6 +4937,7 @@ mod tests {
                 ..Default::default()
             }),
             zen: None,
+            review: None,
         }
     }
 
