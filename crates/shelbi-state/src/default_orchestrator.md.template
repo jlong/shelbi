@@ -199,9 +199,22 @@ before answering the user:
    un-acked heartbeat batch stalls the feed.)
 
 Keep the snapshot in your head and update it as batches arrive. If the feed
-process dies (Monitor reports the task ended), restart it on your next turn;
+process ends (Monitor reports the task ended), restart it on your next turn;
 it resumes from the durable cursor, so any batch you had not acked is
-re-delivered.
+re-delivered — a feed death never loses an event, it only costs a restart.
+Two kinds of ending look different on stdout:
+
+- **Clean stop** — the feed's last stdout line is a
+  `{"feed":"expired"|"terminated", ...}` notice (never a batch: a notice has no
+  `delivery_id`). `expired` means it hit an optional `--max-lifetime` recycle
+  cap; `terminated` means a signal (a reaper or `shelbi reload`) stopped it.
+  Both are expected — just re-run the feed.
+- **Silent stop** — stdout ends on a batch with no notice, or the process was
+  `SIGKILL`ed. Still safe (unacked batches re-deliver), still just re-run it.
+
+If your runner reaps long-lived background processes on a fixed interval, start
+the feed with `--max-lifetime <span>` (e.g. `4h`) set below that interval so it
+self-recycles with a clean `expired` notice instead of being killed mid-stream.
 
 If the Workspaces snapshot shows the pool is **empty**, run the first-boot
 workspace-provisioning interview below before you start dispatching — a project
