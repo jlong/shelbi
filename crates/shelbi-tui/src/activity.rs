@@ -137,12 +137,88 @@ pub enum Event {
         project: String,
         raw: String,
     },
-    /// Recognized timestamp but the rest doesn't match the task/workspace
-    /// shape — render the original line verbatim so nothing vanishes.
+    /// A classified system / infra event: everything that isn't a task
+    /// transition, workspace-state ping, zen dry-run, or heartbeat. Covers
+    /// the `ssh`, `dispatch`, `rebase`, `worktree-detach`, `closed`,
+    /// `handoff`, `send`, `message`, `mode=zen`, `supervision`, and
+    /// pane-death line kinds — each parsed into structured fields so the
+    /// renderer can build a human row (never raw wire syntax) and so
+    /// consecutive near-duplicates can be folded into one summary row.
+    System(SystemEvent),
+    /// Recognized timestamp but the rest doesn't match any known shape.
+    /// Genuine last resort — rendered as a cleaned-up row (the leading ISO
+    /// timestamp stripped, relative time on the right) so nothing vanishes
+    /// and nothing shows raw wire syntax with a full timestamp.
     Unknown {
         ts: Option<DateTime<Utc>>,
         raw: String,
     },
+}
+
+/// The classified kind of a [`SystemEvent`]. Drives both the renderer's
+/// per-kind verb/glyph choice and — together with the event's target and
+/// status — the fold key that collapses a flapping infra loop into one row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SystemKind {
+    /// `ssh reverse-forward host=… status=…` — a reverse-tunnel attempt.
+    Ssh,
+    /// `dispatch task=… workspace=… status=…` — a task handed to a worker.
+    Dispatch,
+    /// `rebase task=… workspace=… status=…` — a branch rebased onto base.
+    Rebase,
+    /// `worktree-detach task=… workspace=… status=…` — a worktree released.
+    WorktreeDetach,
+    /// `project=… closed reason=…` — a project torn down.
+    Closed,
+    /// `project=… handoff outcome=…` — an orchestrator handoff attempt.
+    Handoff,
+    /// `send project=… workspace=… status=…` — a `shelbi send` delivery.
+    Send,
+    /// `message=… task=… push=…|ack=…` — a worker message push / ack.
+    Message,
+    /// `project=… mode=zen <prev> -> <new>` — a Zen Mode toggle.
+    Mode,
+    /// `project=… supervision=…` — a pane restart / crash-loop give-up.
+    Supervision,
+    /// `[project=…] workspace=… pane_alive=<bool>` — a pane liveness change.
+    PaneDeath,
+    /// A project-scoped verb we don't model individually — still rendered
+    /// as a clean human row (verb + humanized detail), never raw.
+    Other,
+}
+
+/// One parsed system / infra event. Every field the renderer needs is
+/// lifted out of the wire line so it never has to fall back to the raw
+/// string. `target` and `status` are the stable identity of the event
+/// (host / task / workspace and the status token) and form the fold key
+/// together with `kind`; `detail` is the volatile tail and is excluded
+/// from that key so a flapping loop still collapses when only its detail
+/// text jitters.
+#[derive(Debug, Clone)]
+pub struct SystemEvent {
+    pub ts: DateTime<Utc>,
+    pub kind: SystemKind,
+    /// Project scope, when the line carried a `project=<name>` prefix.
+    pub project: Option<String>,
+    /// The primary subject — host (ssh), task id (dispatch/rebase/detach/
+    /// message), workspace (send/pane), or project (closed/handoff/mode).
+    pub target: Option<String>,
+    /// A short status / outcome token (`failed`, `established`, `ok`,
+    /// `up-to-date`, `written`, …) when the line carries one.
+    pub status: Option<String>,
+    /// The dim detail tail — a humanized fragment (never raw `key=value`),
+    /// or `None`. Excluded from the fold key.
+    pub detail: Option<String>,
+    pub raw: String,
+}
+
+impl SystemEvent {
+    /// The identity used to fold consecutive near-duplicates: the triple of
+    /// kind, target, and status, deliberately ignoring the timestamp and the
+    /// volatile detail tail (per the task spec's dedup definition).
+    fn fold_key(&self) -> (SystemKind, Option<&str>, Option<&str>) {
+        (self.kind, self.target.as_deref(), self.status.as_deref())
+    }
 }
 
 impl Event {
@@ -152,6 +228,7 @@ impl Event {
             | Event::Workspace { ts, .. }
             | Event::ZenDryRun { ts, .. }
             | Event::Heartbeat { ts, .. } => Some(*ts),
+            Event::System(sys) => Some(sys.ts),
             Event::Unknown { ts, .. } => *ts,
         }
     }
@@ -571,14 +648,33 @@ fn read_tail(path: &PathBuf, offset: u64) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Parse one `events.log` line into an [`Event`]. Best-effort: any
-/// unrecognized shape lands in [`Event::Unknown`] so the renderer
-/// still prints the raw text rather than silently dropping the line.
+/// Split an optional leading `project=<name> ` scope off an event body.
+/// Most hub-emitted lines are prefixed with the project the event belongs
+/// to (`project=shelbi task=…`, `project=shelbi workspace=…`,
+/// `project=shelbi closed …`); a handful of infra kinds (`ssh`, `dispatch`,
+/// `rebase`, `worktree-detach`, `message=…`) are not, and `send` carries
+/// its `project=` as a later field. Returns the parsed project name (if the
+/// prefix was present) and the remainder to classify.
+fn strip_project_prefix(rest: &str) -> (Option<String>, &str) {
+    match rest.strip_prefix("project=") {
+        Some(after) => match after.split_once(' ') {
+            Some((name, tail)) => (Some(name.to_string()), tail),
+            None => (Some(after.to_string()), ""),
+        },
+        None => (None, rest),
+    }
+}
+
+/// Parse one `events.log` line into an [`Event`]. Best-effort: every
+/// emitted kind is classified into a first-class, human-renderable shape.
+/// Only a genuinely unrecognized line lands in [`Event::Unknown`], and even
+/// that renders cleaned up (no raw leading ISO timestamp) rather than being
+/// dropped.
 pub fn parse_event_line(line: &str) -> Event {
     let raw = line.to_string();
     let mut parts = line.splitn(2, ' ');
     let ts_str = parts.next().unwrap_or("");
-    let rest = parts.next().unwrap_or("");
+    let after_ts = parts.next().unwrap_or("");
     let ts = DateTime::parse_from_rfc3339(ts_str)
         .ok()
         .map(|t| t.with_timezone(&Utc));
@@ -586,6 +682,10 @@ pub fn parse_event_line(line: &str) -> Event {
     let Some(ts) = ts else {
         return Event::Unknown { ts: None, raw };
     };
+
+    // Peel the `project=<name>` scope so both prefixed and legacy-bare
+    // task/workspace lines route through the same classifier below.
+    let (project, rest) = strip_project_prefix(after_ts);
 
     if let Some(rest) = rest.strip_prefix("task=") {
         // Two on-the-wire shapes coexist (`Plans/workflows.md` §10):
@@ -670,40 +770,53 @@ pub fn parse_event_line(line: &str) -> Event {
         return Event::Unknown { ts: Some(ts), raw };
     }
 
-    if let Some(rest) = rest.strip_prefix("project=") {
-        // Heartbeat shape: `project=<name> heartbeat zen_eligible=<N>
-        // idle_workspaces=<M>`. We recognize it here so the parser doesn't
-        // fall through to `Unknown` (which would render a `?`-prefixed raw
-        // line if the filter were ever bypassed). We match on the keyword
-        // token alone — the trailing `zen_eligible=`/`idle_workspaces=`
-        // counts are for the orchestrator's react rule, not the activity
-        // feed, so they don't change how this row is classified. Other
-        // `project=...` lines fall through to the existing Unknown handling.
-        let mut tokens = rest.split_whitespace();
-        let name = tokens.next().unwrap_or("");
-        let action = tokens.next().unwrap_or("");
-        if !name.is_empty() && action == "heartbeat" {
+    // Heartbeat shape (project-scoped): `heartbeat zen_eligible=<N>
+    // idle_workspaces=<M>`. We match on the keyword token alone — the
+    // trailing counts are for the orchestrator's react rule, not the feed.
+    if rest == "heartbeat" || rest.starts_with("heartbeat ") {
+        if let Some(name) = &project {
             return Event::Heartbeat {
                 ts,
-                project: name.to_string(),
+                project: name.clone(),
                 raw,
             };
         }
-        return Event::Unknown { ts: Some(ts), raw };
     }
 
-    // Workspace state transition lines. New emissions use `workspace=<name>`;
-    // legacy lines (and one-release tooling that still emits the old form)
-    // use `worker=<name>` — we accept both. Phase 2 will drop the `worker=`
-    // fallback once enough time has passed.
+    // Workspace lines. New emissions use `workspace=<name>`; legacy lines
+    // (and one-release tooling that lags the rename) use `worker=<name>` —
+    // both accepted. A `workspace=<name>` line is one of three shapes: a
+    // state transition (`<prev> -> <new>`), a pane-liveness change
+    // (`pane_alive=<bool>`), or a supervision line (handled below); we
+    // disambiguate on the fields present.
     let ws_rest = rest
         .strip_prefix("workspace=")
         .or_else(|| rest.strip_prefix("worker="));
-    if let Some(rest) = ws_rest {
-        // Format: `<name> <prev> -> <new>`
-        let mut tokens = rest.splitn(4, ' ');
+    if let Some(ws_rest) = ws_rest {
+        let mut tokens = ws_rest.split(' ');
         let name = tokens.next().unwrap_or("");
-        let prev_s = tokens.next().unwrap_or("");
+        let second = tokens.next().unwrap_or("");
+        // `workspace=<name> pane_alive=<bool> reason=<r>` — a pane death /
+        // recovery, not a state transition.
+        if let Some(alive) = second.strip_prefix("pane_alive=") {
+            let kv = parse_kv(ws_rest);
+            return Event::System(SystemEvent {
+                ts,
+                kind: SystemKind::PaneDeath,
+                project,
+                target: Some(name.to_string()),
+                status: Some(alive.to_string()),
+                detail: kv.get("reason").map(|r| humanize_token(r)),
+                raw,
+            });
+        }
+        // `workspace=<name> supervision=<action> …` — a supervisor action
+        // scoped to a workspace pane.
+        if second.starts_with("supervision=") {
+            return parse_supervision(ts, project, Some(name.to_string()), ws_rest, raw);
+        }
+        // Otherwise a state transition: `<prev> -> <new> [reason=…]`.
+        let prev_s = second;
         let arrow = tokens.next().unwrap_or("");
         let new_s = tokens.next().unwrap_or("");
         if arrow == "->" {
@@ -725,7 +838,196 @@ pub fn parse_event_line(line: &str) -> Event {
         return Event::Unknown { ts: Some(ts), raw };
     }
 
+    // -- Infra kinds carrying no `project=` prefix ------------------------
+
+    if let Some(body) = rest.strip_prefix("ssh reverse-forward ") {
+        let kv = parse_kv(body);
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Ssh,
+            project,
+            target: kv.get("host").cloned(),
+            status: kv.get("status").cloned(),
+            detail: kv.get("detail").map(|d| humanize_token(d)),
+            raw,
+        });
+    }
+
+    if let Some(body) = rest.strip_prefix("dispatch ") {
+        let kv = parse_kv(body);
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Dispatch,
+            project,
+            target: kv.get("task").cloned(),
+            status: kv.get("status").cloned(),
+            detail: kv.get("workspace").cloned(),
+            raw,
+        });
+    }
+
+    if let Some(body) = rest.strip_prefix("rebase ") {
+        let kv = parse_kv(body);
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Rebase,
+            project,
+            target: kv.get("task").cloned(),
+            status: kv.get("status").cloned(),
+            detail: kv.get("workspace").cloned(),
+            raw,
+        });
+    }
+
+    if let Some(body) = rest.strip_prefix("worktree-detach ") {
+        let kv = parse_kv(body);
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::WorktreeDetach,
+            project,
+            target: kv.get("task").cloned(),
+            status: kv.get("status").cloned(),
+            detail: kv.get("workspace").cloned(),
+            raw,
+        });
+    }
+
+    // `send project=<p> workspace=<name> status=<s> detail=<d>` — the
+    // `project=` here is a field, not the leading scope, so it survived the
+    // prefix peel and we read it back out of the k=v tail.
+    if let Some(body) = rest.strip_prefix("send ") {
+        let kv = parse_kv(body);
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Send,
+            project: kv.get("project").cloned(),
+            target: kv.get("workspace").cloned(),
+            status: kv.get("status").cloned(),
+            detail: kv.get("detail").map(|d| humanize_token(d)),
+            raw,
+        });
+    }
+
+    if let Some(body) = rest.strip_prefix("message=") {
+        // `message=<id> task=<id> push=ok` or `… ack=<kind>`.
+        let kv = parse_kv(body);
+        let (status, verb) = if let Some(p) = kv.get("push") {
+            (Some(p.clone()), "push")
+        } else if let Some(a) = kv.get("ack") {
+            (Some(a.clone()), "ack")
+        } else {
+            (None, "message")
+        };
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Message,
+            project,
+            target: kv.get("task").cloned(),
+            status,
+            detail: Some(verb.to_string()),
+            raw,
+        });
+    }
+
+    // -- Project-scoped verbs (prefix already peeled) ---------------------
+
+    if let Some(reason) = rest.strip_prefix("closed") {
+        let kv = parse_kv(reason);
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Closed,
+            project: project.clone(),
+            target: project,
+            status: None,
+            detail: kv.get("reason").map(|r| humanize_token(r)),
+            raw,
+        });
+    }
+
+    if let Some(body) = rest.strip_prefix("handoff ") {
+        let kv = parse_kv(body);
+        let detail = kv
+            .get("detail")
+            .filter(|d| d.as_str() != "-")
+            .map(|d| humanize_token(d));
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Handoff,
+            project: project.clone(),
+            target: project,
+            status: kv.get("outcome").cloned(),
+            detail,
+            raw,
+        });
+    }
+
+    if let Some(body) = rest.strip_prefix("mode=zen ") {
+        // `<prev> -> <new> reason=<source>`.
+        let mut tokens = body.split(' ');
+        let prev = tokens.next().unwrap_or("");
+        let _arrow = tokens.next();
+        let new = tokens.next().unwrap_or("");
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Mode,
+            project: project.clone(),
+            target: project,
+            status: Some(new.to_string()),
+            detail: Some(format!("{prev} → {new}")),
+            raw,
+        });
+    }
+
+    if rest.starts_with("supervision=") {
+        return parse_supervision(ts, project, None, rest, raw);
+    }
+
+    // Any remaining project-scoped line: keep it human (verb + humanized
+    // tail) rather than dumping raw wire syntax. Non-project lines with no
+    // recognized shape are the genuine last resort → cleaned Unknown.
+    if project.is_some() {
+        let verb = rest.split(' ').next().unwrap_or("").to_string();
+        let detail = rest
+            .split_once(' ')
+            .map(|(_, tail)| humanize_token(tail))
+            .filter(|d| !d.is_empty());
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Other,
+            project,
+            target: None,
+            status: None,
+            detail: detail.or(Some(verb)),
+            raw,
+        });
+    }
+
     Event::Unknown { ts: Some(ts), raw }
+}
+
+/// Parse a supervision line body (`supervision=<action> [target=orchestrator]
+/// reason=<r>`) into a [`SystemEvent`]. Shared by the workspace-scoped form
+/// (`workspace=<name> supervision=…`) and the orchestrator-scoped form
+/// (`supervision=… target=orchestrator …`).
+fn parse_supervision(
+    ts: DateTime<Utc>,
+    project: Option<String>,
+    workspace: Option<String>,
+    body: &str,
+    raw: String,
+) -> Event {
+    let kv = parse_kv(body);
+    // Prefer the explicit workspace, else the `target=` field (orchestrator).
+    let target = workspace.or_else(|| kv.get("target").cloned());
+    Event::System(SystemEvent {
+        ts,
+        kind: SystemKind::Supervision,
+        project,
+        target,
+        status: kv.get("supervision").cloned(),
+        detail: kv.get("reason").map(|r| humanize_token(r)),
+        raw,
+    })
 }
 
 fn parse_workspace_state(s: &str) -> Option<WorkspaceState> {
@@ -733,8 +1035,24 @@ fn parse_workspace_state(s: &str) -> Option<WorkspaceState> {
         "working" => Some(WorkspaceState::Working),
         "awaiting_input" => Some(WorkspaceState::AwaitingInput),
         "blocked" => Some(WorkspaceState::Blocked),
+        "paused" => Some(WorkspaceState::Paused),
         _ => None,
     }
+}
+
+/// Turn a wire token into a human fragment: underscores and hyphens become
+/// spaces so `master_open_failed` reads `master open failed` and
+/// `up-to-date` reads `up to date`. Any residual `key=value` pairs are
+/// dropped so a row never shows raw wire syntax; if that empties the string,
+/// the caller falls back to its own label.
+fn humanize_token(s: &str) -> String {
+    s.split_whitespace()
+        .filter(|tok| !tok.contains('='))
+        .map(|tok| tok.replace(['_', '-'], " "))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -920,7 +1238,15 @@ fn build_lines(app: &mut ActivityApp, width: usize, now: DateTime<Utc>) -> Vec<L
         return lines;
     }
 
-    for idx in order {
+    // Walk the filtered order newest → oldest. Consecutive system events
+    // sharing a fold key (kind + target + status) on the same local day are
+    // collapsed into a single row so a flapping infra loop (e.g. an offline
+    // host's ssh reverse-forward retrying every couple minutes) can't bury
+    // the real activity below it. Because `order` is newest-first, the run's
+    // first element is the most recent — its timestamp is the "last seen".
+    let mut pos = 0;
+    while pos < order.len() {
+        let idx = order[pos];
         let ev = app.events[idx].clone();
         let day = ev.ts().map(|t| t.with_timezone(&Local).date_naive());
 
@@ -937,6 +1263,30 @@ fn build_lines(app: &mut ActivityApp, width: usize, now: DateTime<Utc>) -> Vec<L
             lines.push(date_header(&label, width));
             lines.push(Line::raw(""));
             last_day = day;
+        }
+
+        if let Event::System(sys) = &ev {
+            // How many following events fold into this one — same key, same
+            // day, contiguous in the filtered stream.
+            let key = sys.fold_key();
+            let mut run_end = pos + 1;
+            while run_end < order.len() {
+                let next = &app.events[order[run_end]];
+                let next_day = next.ts().map(|t| t.with_timezone(&Local).date_naive());
+                match next {
+                    Event::System(s2) if s2.fold_key() == key && next_day == day => {
+                        run_end += 1;
+                    }
+                    _ => break,
+                }
+            }
+            let count = run_end - pos;
+            for l in render_system_event(app, sys, width, now, count) {
+                lines.push(l);
+            }
+            lines.push(Line::raw(""));
+            pos = run_end;
+            continue;
         }
 
         // Review handoff (in_progress → review) is the only event
@@ -956,6 +1306,7 @@ fn build_lines(app: &mut ActivityApp, width: usize, now: DateTime<Utc>) -> Vec<L
             lines.push(l);
         }
         lines.push(Line::raw(""));
+        pos += 1;
     }
 
     lines
@@ -1284,12 +1635,258 @@ fn render_event(
         // matching keeps a future "show internal events" toggle from
         // silently dropping them.
         Event::Heartbeat { .. } => Vec::new(),
+        // A single (unfolded) system event. Folded runs are rendered by
+        // `build_lines` calling `render_system_event` directly with a count.
+        Event::System(sys) => render_system_event(app, sys, width, now, 1),
         Event::Unknown { ts, raw } => {
             let when = ts.map(|t| relative_time(t, now)).unwrap_or_default();
-            let mut row = Row::new(Marker::System, "", raw.to_string(), when);
+            // Strip the leading ISO timestamp so the row never shows raw
+            // wire syntax with a full timestamp — the relative time on the
+            // right is the row's only clock. Lines with no parseable
+            // timestamp (the true last resort) show verbatim.
+            let body = if ts.is_some() {
+                raw.split_once(' ').map(|x| x.1).unwrap_or(raw).to_string()
+            } else {
+                raw.to_string()
+            };
+            let mut row = Row::new(Marker::System, "", body, when);
             row.title_style = Style::default().fg(Color::DarkGray);
             paint_row(row, width)
         }
+    }
+}
+
+/// Render a system / infra event into feed lines. `count` is the number of
+/// consecutive near-duplicate events this row stands for (1 = a lone event);
+/// when `count > 1` the row gains a dim `(N attempts)` / `(×N)` trailer and
+/// the right-aligned time reads as the most-recent occurrence ("last seen").
+fn render_system_event(
+    app: &mut ActivityApp,
+    sys: &SystemEvent,
+    width: usize,
+    now: DateTime<Utc>,
+    count: usize,
+) -> Vec<Line<'static>> {
+    let when = relative_time(sys.ts, now);
+    let status = sys.status.as_deref();
+
+    // Per-kind identity / verb / glyph / title. `identity` is the left-hand
+    // subject label (a tinted workspace name where one applies, else a
+    // neutral gray label); `title` is the human summary the row centers on.
+    let (identity, verb, glyph, glyph_color, title): (
+        Vec<Span<'static>>,
+        &str,
+        &'static str,
+        Color,
+        String,
+    ) = match sys.kind {
+        SystemKind::Ssh => {
+            let host = sys.target.as_deref().unwrap_or("host");
+            let failed = status == Some("failed");
+            let (verb, color) = if failed {
+                ("unreachable", Color::LightRed)
+            } else if status == Some("established") {
+                ("connected", Color::Green)
+            } else {
+                ("ssh", Color::DarkGray)
+            };
+            let title = sys
+                .detail
+                .clone()
+                .unwrap_or_else(|| "reverse-forward".to_string());
+            (
+                system_identity(host),
+                verb,
+                if failed { GLYPH_AWAITING } else { GLYPH_MOVED },
+                color,
+                title,
+            )
+        }
+        SystemKind::Dispatch => {
+            let (name, color) = agent_display(sys.detail.as_deref());
+            (
+                agent_identity(&name, color, None),
+                "dispatched",
+                GLYPH_STARTED,
+                category_color(StatusCategory::Active),
+                system_task_title(app, sys.target.as_deref()),
+            )
+        }
+        SystemKind::Rebase => {
+            let (name, color) = agent_display(sys.detail.as_deref());
+            (
+                agent_identity(&name, color, None),
+                "rebased",
+                GLYPH_MOVED,
+                rebase_status_color(status),
+                system_task_title(app, sys.target.as_deref()),
+            )
+        }
+        SystemKind::WorktreeDetach => {
+            let (name, color) = agent_display(sys.detail.as_deref());
+            let ok = status == Some("ok");
+            (
+                agent_identity(&name, color, None),
+                "detached",
+                GLYPH_DONE,
+                if ok { Color::Gray } else { Color::LightRed },
+                system_task_title(app, sys.target.as_deref()),
+            )
+        }
+        SystemKind::Send => {
+            let (name, color) = agent_display(sys.target.as_deref());
+            let stuck = status == Some("stuck");
+            (
+                agent_identity(&name, color, None),
+                "sent",
+                if stuck { GLYPH_AWAITING } else { GLYPH_PROMOTED },
+                if stuck { Color::Yellow } else { Color::Blue },
+                send_title(status),
+            )
+        }
+        SystemKind::Message => {
+            let verb = if sys.detail.as_deref() == Some("ack") {
+                "ack"
+            } else {
+                "delivered"
+            };
+            (
+                system_identity("message"),
+                verb,
+                GLYPH_PROMOTED,
+                Color::Blue,
+                system_task_title(app, sys.target.as_deref()),
+            )
+        }
+        SystemKind::Closed => (
+            system_identity(sys.target.as_deref().unwrap_or("project")),
+            "closed",
+            GLYPH_DONE,
+            Color::DarkGray,
+            sys.detail.clone().unwrap_or_else(|| "project closed".into()),
+        ),
+        SystemKind::Handoff => (
+            system_identity(sys.target.as_deref().unwrap_or("orchestrator")),
+            "handoff",
+            GLYPH_MOVED,
+            handoff_status_color(status),
+            format!("handoff {}", status.unwrap_or("attempted")),
+        ),
+        SystemKind::Mode => (
+            system_identity(sys.target.as_deref().unwrap_or("project")),
+            "zen",
+            GLYPH_MOVED,
+            Color::Green,
+            sys.detail.clone().unwrap_or_else(|| "zen mode".into()),
+        ),
+        SystemKind::Supervision => {
+            let gave_up = status == Some("gave-up");
+            (
+                system_identity(sys.target.as_deref().unwrap_or("orchestrator")),
+                "supervisor",
+                GLYPH_AWAITING,
+                if gave_up { Color::LightRed } else { Color::Yellow },
+                humanize_token(status.unwrap_or("supervised")),
+            )
+        }
+        SystemKind::PaneDeath => {
+            let alive = status == Some("true");
+            (
+                system_identity(sys.target.as_deref().unwrap_or("pane")),
+                "pane",
+                GLYPH_AWAITING,
+                if alive { Color::Gray } else { Color::LightRed },
+                if alive {
+                    "pane back".to_string()
+                } else {
+                    "pane died".to_string()
+                },
+            )
+        }
+        SystemKind::Other => (
+            system_identity(sys.target.as_deref().unwrap_or("")),
+            "event",
+            GLYPH_MOVED,
+            Color::DarkGray,
+            sys.detail.clone().unwrap_or_else(|| "event".into()),
+        ),
+    };
+
+    // Fold trailer + last-seen time. The count is the number of collapsed
+    // occurrences; ssh reads more naturally as "attempts".
+    let (trail, time) = if count > 1 {
+        let label = if matches!(sys.kind, SystemKind::Ssh) {
+            format!(" ({count} attempts)")
+        } else {
+            format!(" (×{count})")
+        };
+        let trail = vec![Span::styled(label, Style::default().fg(Color::DarkGray))];
+        (trail, format!("last {when}"))
+    } else {
+        (Vec::new(), when)
+    };
+
+    let mut row = Row::new(Marker::System, verb, title, time);
+    row.identity = identity;
+    row.glyph = glyph;
+    row.glyph_color = glyph_color;
+    row.trail = trail;
+    // The volatile detail already fed the title for most kinds; only append
+    // it as a secondary when it isn't the title (dispatch/rebase/detach/
+    // message carry a task title up top and a status detail below).
+    if let Some(detail) = detail_secondary(sys) {
+        row.secondary = Some(SecondaryLine::Detail(detail));
+    }
+    paint_row(row, width)
+}
+
+/// The dim second line for a system row, when its detail isn't already the
+/// title. Task-scoped rows (dispatch/rebase/detach) show the status token
+/// under the task title; others fold their detail into the title.
+fn detail_secondary(sys: &SystemEvent) -> Option<String> {
+    match sys.kind {
+        SystemKind::Dispatch | SystemKind::Rebase | SystemKind::WorktreeDetach => {
+            sys.status.as_deref().map(humanize_token)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a task id to its human title via the cache, falling back to the
+/// id (or a neutral placeholder) when the task file is gone.
+fn system_task_title(app: &mut ActivityApp, task_id: Option<&str>) -> String {
+    match task_id {
+        Some(id) => app
+            .task_meta(id)
+            .map(|m| m.title.clone())
+            .unwrap_or_else(|| id.to_string()),
+        None => "task".to_string(),
+    }
+}
+
+fn send_title(status: Option<&str>) -> String {
+    match status {
+        Some("submitted") | Some("queued") => "message delivered".to_string(),
+        Some("stuck") => "delivery stuck".to_string(),
+        Some("unverified") => "delivery unverified".to_string(),
+        Some(s) => format!("message {s}"),
+        None => "message sent".to_string(),
+    }
+}
+
+fn rebase_status_color(status: Option<&str>) -> Color {
+    match status {
+        Some("conflict") => Color::LightRed,
+        Some("succeeded") => Color::Green,
+        _ => Color::Gray,
+    }
+}
+
+fn handoff_status_color(status: Option<&str>) -> Color {
+    match status {
+        Some("written") | Some("native-thread") => Color::Green,
+        Some("timeout") | Some("send-failed") | Some("unconfirmed") => Color::Yellow,
+        _ => Color::Gray,
     }
 }
 
@@ -2057,6 +2654,238 @@ mod tests {
             }
             other => panic!("expected unknown, got {other:?}"),
         }
+    }
+
+    // --- System / infra event classification --------------------------
+
+    #[test]
+    fn parses_project_scoped_task_transition() {
+        // The real on-disk shape carries a leading `project=<name>` scope.
+        // It must route to a first-class Task event (the review handoff the
+        // feed centers on), not fall into Unknown as raw wire syntax.
+        let line = "2026-07-22T14:00:00+00:00 project=shelbi task=foo workflow=app \
+                    in_progress -> review reason=workspace:ready-marker \
+                    from_category=active to_category=handoff";
+        match parse_event_line(line) {
+            Event::Task { id, from, to, .. } => {
+                assert_eq!(id, "foo");
+                assert_eq!(from, Column::in_progress());
+                assert_eq!(to, Column::review());
+            }
+            other => panic!("expected Task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_project_scoped_workspace_transition() {
+        let line = "2026-07-22T14:00:00+00:00 project=shelbi workspace=alpha working -> awaiting_input";
+        match parse_event_line(line) {
+            Event::Workspace { name, new, .. } => {
+                assert_eq!(name, "alpha");
+                assert_eq!(new, WorkspaceState::AwaitingInput);
+            }
+            other => panic!("expected Workspace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_paused_workspace_transition() {
+        // `-> paused` (usage-limit) must parse — previously `paused` was not
+        // in the state map, so these lines fell through to Unknown.
+        let line = "2026-07-22T14:00:00+00:00 project=demo workspace=alpha working -> paused reason=usage-limit";
+        match parse_event_line(line) {
+            Event::Workspace { new, .. } => assert_eq!(new, WorkspaceState::Paused),
+            other => panic!("expected Workspace paused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ssh_reverse_forward_event() {
+        let line = "2026-07-22T14:26:16.430059+00:00 ssh reverse-forward \
+                    host=devbox mode=tcp status=failed detail=master_open_failed";
+        match parse_event_line(line) {
+            Event::System(sys) => {
+                assert_eq!(sys.kind, SystemKind::Ssh);
+                assert_eq!(sys.target.as_deref(), Some("devbox"));
+                assert_eq!(sys.status.as_deref(), Some("failed"));
+                assert_eq!(sys.detail.as_deref(), Some("master open failed"));
+            }
+            other => panic!("expected System(Ssh), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_the_required_infra_kinds_without_unknown_fallback() {
+        // Acceptance — ssh/dispatch/rebase/worktree-detach/closed/handoff
+        // each classify to a structured System event, never Unknown.
+        let cases: &[(&str, SystemKind, Option<&str>, Option<&str>)] = &[
+            (
+                "2026-07-22T14:00:00+00:00 dispatch task=t workspace=alpha status=confirmed detail=busy_observed",
+                SystemKind::Dispatch,
+                Some("t"),
+                Some("confirmed"),
+            ),
+            (
+                "2026-07-22T14:00:00+00:00 rebase task=t workspace=alpha branch=b status=up-to-date detail=default=abc",
+                SystemKind::Rebase,
+                Some("t"),
+                Some("up-to-date"),
+            ),
+            (
+                "2026-07-22T14:00:00+00:00 worktree-detach task=t workspace=alpha detached-from=b status=ok",
+                SystemKind::WorktreeDetach,
+                Some("t"),
+                Some("ok"),
+            ),
+            (
+                "2026-07-22T14:00:00+00:00 project=shelbi closed reason=user:quit-shelbi",
+                SystemKind::Closed,
+                Some("shelbi"),
+                None,
+            ),
+            (
+                "2026-07-22T14:00:00+00:00 project=shelbi handoff outcome=written detail=/tmp/h.md",
+                SystemKind::Handoff,
+                Some("shelbi"),
+                Some("written"),
+            ),
+        ];
+        for (line, kind, target, status) in cases {
+            match parse_event_line(line) {
+                Event::System(sys) => {
+                    assert_eq!(sys.kind, *kind, "kind for {line}");
+                    assert_eq!(sys.target.as_deref(), *target, "target for {line}");
+                    assert_eq!(sys.status.as_deref(), *status, "status for {line}");
+                }
+                other => panic!("expected System for {line}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_pane_death_event() {
+        let line = "2026-07-22T14:00:00+00:00 project=demo workspace=alpha pane_alive=false reason=worktree-missing";
+        match parse_event_line(line) {
+            Event::System(sys) => {
+                assert_eq!(sys.kind, SystemKind::PaneDeath);
+                assert_eq!(sys.target.as_deref(), Some("alpha"));
+                assert_eq!(sys.status.as_deref(), Some("false"));
+            }
+            other => panic!("expected System(PaneDeath), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_send_event_reading_project_from_field() {
+        // `send` keeps its `project=` as a later field, not the leading
+        // scope, so the parser reads it back out of the k=v tail.
+        let line = "2026-07-22T14:00:00+00:00 send project=demo workspace=alpha status=submitted detail=busy_observed";
+        match parse_event_line(line) {
+            Event::System(sys) => {
+                assert_eq!(sys.kind, SystemKind::Send);
+                assert_eq!(sys.project.as_deref(), Some("demo"));
+                assert_eq!(sys.target.as_deref(), Some("alpha"));
+                assert_eq!(sys.status.as_deref(), Some("submitted"));
+            }
+            other => panic!("expected System(Send), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ssh_fold_key_ignores_volatile_detail() {
+        // Dedup is (kind + target + status), ignoring the detail tail — so a
+        // flapping host whose detail text jitters still collapses.
+        let a = parse_event_line(
+            "2026-07-22T14:00:00+00:00 ssh reverse-forward host=devbox mode=tcp status=failed detail=master_open_failed",
+        );
+        let b = parse_event_line(
+            "2026-07-22T14:02:00+00:00 ssh reverse-forward host=devbox mode=tcp status=failed detail=tcp_forward_failed",
+        );
+        match (a, b) {
+            (Event::System(a), Event::System(b)) => {
+                assert_eq!(a.fold_key(), b.fold_key());
+            }
+            _ => panic!("expected two System events"),
+        }
+    }
+
+    #[test]
+    fn system_rows_never_render_raw_wire_syntax() {
+        // Acceptance — no structured row shows a raw ISO timestamp or raw
+        // `key=value` wire syntax.
+        let mut app = ActivityApp::new("demo");
+        let now = Utc.with_ymd_and_hms(2026, 7, 22, 15, 0, 0).unwrap();
+        let raw_lines = [
+            "2026-07-22T14:26:16.430059+00:00 ssh reverse-forward host=devbox mode=tcp status=failed detail=master_open_failed",
+            "2026-07-22T14:20:00+00:00 dispatch task=fix-login workspace=alpha status=confirmed detail=busy_observed",
+            "2026-07-22T14:19:00+00:00 rebase task=fix-login workspace=alpha branch=b status=up-to-date detail=default=abc123",
+            "2026-07-22T14:18:00+00:00 worktree-detach task=fix-login workspace=alpha detached-from=b status=ok",
+            "2026-07-22T14:17:00+00:00 project=demo closed reason=user:quit-shelbi",
+            "2026-07-22T14:16:00+00:00 project=demo handoff outcome=written detail=/tmp/handoff.md",
+        ];
+        for raw in raw_lines {
+            let ev = parse_event_line(raw);
+            let lines = render_event(&ev, &mut app, 100, now, None);
+            for l in &lines {
+                let text = line_text(l);
+                assert!(!text.contains("2026-07-22T"), "raw ISO in row: {text:?}");
+                assert!(!text.contains("status="), "raw kv in row: {text:?}");
+                assert!(!text.contains("reason="), "raw kv in row: {text:?}");
+                assert!(!text.contains(" -> "), "raw arrow in row: {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_row_strips_leading_iso_timestamp() {
+        // A genuinely unrecognized line is the last resort — still cleaned
+        // up so it never leads with a raw ISO timestamp.
+        let mut app = ActivityApp::new("demo");
+        let now = Utc.with_ymd_and_hms(2026, 6, 23, 13, 0, 0).unwrap();
+        let ev = parse_event_line("2026-06-23T12:00:00+00:00 frobnicate=xyz weird");
+        assert!(matches!(ev, Event::Unknown { .. }), "expected Unknown: {ev:?}");
+        let lines = render_event(&ev, &mut app, 80, now, None);
+        let l0 = line_text(&lines[0]);
+        assert!(!l0.contains("2026-06-23T12:00:00"), "raw ISO leaked: {l0:?}");
+        assert!(l0.contains("frobnicate=xyz"), "body missing: {l0:?}");
+        assert!(l0.contains("ago"), "relative time missing: {l0:?}");
+    }
+
+    #[test]
+    fn consecutive_ssh_failures_fold_and_real_events_stay_visible() {
+        // Acceptance — a repeating system event collapses to one row with an
+        // attempt count and a last-seen time, and the real task activity from
+        // the same window stays visible instead of being buried.
+        let mut app = ActivityApp::new("demo");
+        let now = Utc.with_ymd_and_hms(2026, 7, 22, 15, 0, 0).unwrap();
+        // Oldest: a real review handoff.
+        app.events.push(parse_event_line(
+            "2026-07-22T14:00:00+00:00 project=demo task=fix-login workflow=app \
+             in_progress -> review reason=workspace:ready-marker \
+             from_category=active to_category=handoff",
+        ));
+        // Then a flood of 18 identical ssh failures on the same host.
+        for i in 0..18 {
+            let line = format!(
+                "2026-07-22T14:{:02}:00+00:00 ssh reverse-forward host=devbox mode=tcp status=failed detail=master_open_failed",
+                10 + i
+            );
+            app.events.push(parse_event_line(&line));
+        }
+        let lines = build_lines(&mut app, 100, now);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        let joined = text.join("\n");
+
+        let ssh_rows = text.iter().filter(|t| t.contains("devbox")).count();
+        assert_eq!(ssh_rows, 1, "ssh flood should fold to one row:\n{joined}");
+        assert!(
+            joined.contains("18 attempts"),
+            "folded attempt count missing:\n{joined}"
+        );
+        assert!(
+            text.iter().any(|t| t.contains("finished")),
+            "real review handoff was buried by the flood:\n{joined}"
+        );
     }
 
     #[test]
