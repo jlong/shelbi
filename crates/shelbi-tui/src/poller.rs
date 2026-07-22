@@ -350,6 +350,15 @@ struct HeartbeatSchedule {
     /// When the next emission attempt is due. `None` means "not yet seeded"
     /// (first tick after start / after `off → on`).
     next_attempt: Option<Instant>,
+    /// When the current cadence window opened — the last time we actually
+    /// emitted, or the seed if we never have. The reset-on-event debounce may
+    /// reschedule an emission *within* this window, but it can never push the
+    /// next attempt past `window_start + standard`: that hard deadline is what
+    /// stops a continuously-active board (whose every tick trips the debounce)
+    /// from starving the safety-net heartbeat forever. `None` until the first
+    /// seed fixes it; a legacy schema that predates the field falls back to
+    /// "one interval ago" so it still bounds the debounce.
+    window_start: Option<Instant>,
     /// The interval currently in effect. Grows (doubles, capped at `max`) each
     /// idle tick while quiescent; snaps back to `standard` on any real event or
     /// whenever work is in flight. `None` until the first emission fixes it.
@@ -382,16 +391,29 @@ struct HeartbeatSchedule {
 ///    after the poller observed the config (not from the wall clock or the
 ///    previous run's last write), so a restart mid-interval doesn't catch up
 ///    missed slots.
-/// 3. **Reset on any real event** — if `events.log` advanced past our own last
-///    heartbeat write, a real event (task transition, workspace state change,
-///    dispatch, user action) already woke the orchestrator: skip this emission
-///    *and* reset the back-off to standard so the sweep is prompt again.
+/// 3. **Reset on any real event, but bounded** — if `events.log` advanced past
+///    our own last heartbeat write, a real event (task transition, workspace
+///    state change, dispatch, user action) already woke the orchestrator: skip
+///    this emission *and* reset the back-off to standard so the sweep is prompt
+///    again. Crucially this skip is bounded by a hard deadline of
+///    `window_start + standard` — the emission can be *deferred* within the
+///    current window but never *starved*. On a continuously-active board every
+///    tick trips this branch, and an unbounded skip is exactly the regression
+///    that left a busy hub with zero heartbeats for 30+ hours; the deadline
+///    guarantees a heartbeat still lands at least every `standard` while work
+///    flows. Past the deadline we fall through and emit despite the activity.
 /// 4. **Adaptive back-off** — otherwise emit, then choose the next interval:
 ///    `standard` while any supervisable work is in flight (an active/ready/
 ///    review task — even one emitting no events, which is exactly when the
 ///    sweep earns its keep), or `min(interval * 2, max)` while the board is
 ///    quiescent. So a fully idle board relaxes `standard → 2× → 4× → … → max`.
-/// 5. **Paused while offline** — if `is_online()` returns false at emit time,
+///    Each emission re-anchors `window_start` to "now", opening a fresh window.
+/// 5. **Self-heal a wedged schedule** — before anything else, a `next_attempt`
+///    sitting more than `max` in the future (a legacy/stuck state, a resumed
+///    clock oddity) is clamped back to `now + max`, so "next due" can never
+///    recede indefinitely and the emitter recovers on the next tick without a
+///    manual state edit.
+/// 6. **Paused while offline** — if `is_online()` returns false at emit time,
 ///    skip silently. The schedule still advances (by the current interval, no
 ///    back-off change) so we don't probe every tick, and emission resumes on
 ///    the first due tick after connectivity is back.
@@ -412,33 +434,58 @@ fn maybe_emit_heartbeat(
 
     let now = Instant::now();
     let current_interval = schedule.interval.unwrap_or(standard);
-    let due = match schedule.next_attempt {
-        None => {
-            // First tick after start (or after the config flipped from
-            // off → on): schedule the first attempt one standard interval out.
-            // Record the current log mtime as the baseline so pre-existing
-            // history isn't later mistaken for a fresh event.
-            schedule.next_attempt = Some(now + standard);
-            schedule.interval = Some(standard);
-            schedule.last_log_mtime = events_log_mtime();
-            return;
-        }
-        Some(t) => now >= t,
+    let Some(mut next) = schedule.next_attempt else {
+        // First tick after start (or after the config flipped from
+        // off → on): schedule the first attempt one standard interval out.
+        // Record the current log mtime as the baseline so pre-existing
+        // history isn't later mistaken for a fresh event, and anchor the
+        // cadence window at "now" so the debounce below has a deadline.
+        schedule.next_attempt = Some(now + standard);
+        schedule.interval = Some(standard);
+        schedule.window_start = Some(now);
+        schedule.last_log_mtime = events_log_mtime();
+        return;
     };
-    if !due {
+
+    // Self-heal: a `next_attempt` more than `max` in the future can never
+    // become due on a sane cadence — a wedged/legacy schedule or a clock
+    // oddity across a resume. Clamp it so "next due" can never recede past one
+    // `max` from now; the emitter then recovers on the next tick with no
+    // manual state edit.
+    if next > now + max {
+        next = now + max;
+        schedule.next_attempt = Some(next);
+    }
+
+    if now < next {
         return;
     }
 
-    // Reset on any real event: if events.log advanced past our baseline,
-    // something real happened since our last action. That event already serves
-    // as the orchestrator's trigger, so we skip this emission (debounce) and
-    // reset the cadence to standard. Advance the baseline to the event's mtime
-    // so the same event doesn't re-trigger a reset next tick.
+    // Reset on any real event, bounded: if events.log advanced past our
+    // baseline, something real happened since our last action and already
+    // served as the orchestrator's trigger — so skip this emission (debounce)
+    // and snap the cadence back to standard. But only *defer*, never *starve*:
+    // the skip is capped at `window_start + standard`. On a busy board every
+    // tick trips this branch, and pushing the attempt out unconditionally (the
+    // old behaviour) is what silently killed the heartbeat for 30+ hours. Once
+    // that deadline passes we fall through and emit despite the activity, so a
+    // continuously-active board still gets a heartbeat every `standard`.
     if external_event_since(schedule.last_log_mtime) {
-        schedule.interval = Some(standard);
-        schedule.next_attempt = Some(now + standard);
-        schedule.last_log_mtime = events_log_mtime();
-        return;
+        // Legacy schedules that predate `window_start` fall back to
+        // "one interval ago" so the deadline is still bounded.
+        let window_start = schedule.window_start.unwrap_or(now - current_interval);
+        let deadline = window_start + standard;
+        if now < deadline {
+            schedule.interval = Some(standard);
+            // Clamp to the window deadline so repeated events can't push the
+            // attempt forward forever; `now + standard` only matters when the
+            // window opened so recently that the deadline is still ahead of it.
+            schedule.next_attempt = Some(deadline.min(now + standard));
+            schedule.last_log_mtime = events_log_mtime();
+            return;
+        }
+        // Deadline passed — the safety net wins over the debounce. Fall
+        // through and emit; the emission re-anchors the window below.
     }
 
     if !is_online() {
@@ -472,8 +519,10 @@ fn maybe_emit_heartbeat(
         );
     }
     // Advance the baseline to our own write's mtime so the next tick can tell
-    // it apart from a real event.
+    // it apart from a real event, and re-anchor the cadence window at "now" so
+    // the reset-on-event deadline is measured from this emission.
     schedule.last_log_mtime = events_log_mtime();
+    schedule.window_start = Some(now);
 
     // Choose the next cadence: hold at standard while there's supervisable
     // work in flight, back off (double, capped at max) while quiescent.
@@ -4724,6 +4773,119 @@ transitions:
             hb_line_count(),
             before,
             "reset tick must not emit its own heartbeat (debounced by the event)"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn maybe_emit_heartbeat_still_emits_on_a_continuously_active_board() {
+        // Regression for the 30-hour heartbeat outage: a board with a fresh
+        // event landing before *every* attempt must not starve the safety-net
+        // heartbeat. The old reset-on-event branch pushed `next_attempt` one
+        // standard interval further out on every tripped tick, so a busy hub —
+        // where events never stop — went silent for over a day. The bounded
+        // `window_start + standard` deadline guarantees a heartbeat still lands
+        // at roughly the standard cadence while work flows.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-hb-busy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        // Standard 30ms with a generous cap: the back-off would happily relax
+        // toward the cap, but the debounce deadline is pinned to `standard`, so
+        // the continuous activity must keep heartbeats arriving ~every 30ms.
+        project.heartbeat = shelbi_core::HeartbeatConfig::On {
+            interval: Duration::from_millis(30),
+            max: Duration::from_secs(1),
+        };
+
+        let mut hb = HeartbeatSchedule::default();
+        maybe_emit_heartbeat(&project, &mut hb, || true); // seed
+
+        // Twelve rounds of "event, then a due tick" spanning ~240ms of activity
+        // at a 30ms floor. Under the old unbounded skip this loop emitted zero
+        // heartbeats; the fix must produce several.
+        for _ in 0..12 {
+            shelbi_state::append_workspace_event("demo", "alpha", None, WorkspaceState::Working)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            hb.next_attempt = Some(Instant::now());
+            maybe_emit_heartbeat(&project, &mut hb, || true);
+        }
+
+        let count = hb_line_count();
+        assert!(
+            count >= 3,
+            "continuous activity starved the heartbeat: only {count} emitted"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn maybe_emit_heartbeat_self_heals_a_wedged_far_future_schedule() {
+        // A `next_attempt` stuck far in the future (a wedged/legacy schedule, a
+        // resumed clock oddity) must not permanently block emission. The clamp
+        // pulls it back to within `max`, so the emitter recovers on its own —
+        // no manual state edit.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-hb-wedge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.heartbeat = shelbi_core::HeartbeatConfig::On {
+            interval: Duration::from_millis(1),
+            max: Duration::from_millis(20),
+        };
+
+        let mut hb = HeartbeatSchedule::default();
+        maybe_emit_heartbeat(&project, &mut hb, || true); // seed
+
+        // Wedge the schedule an hour into the future — far past any sane
+        // cadence. With no clamp this would never become due.
+        hb.next_attempt = Some(Instant::now() + Duration::from_secs(3600));
+
+        // First tick clamps the wedged attempt back to within `max` and returns
+        // without emitting (not yet due).
+        maybe_emit_heartbeat(&project, &mut hb, || true);
+        let clamped = hb.next_attempt.expect("schedule stays seeded");
+        assert!(
+            clamped < Instant::now() + Duration::from_secs(60),
+            "a far-future next_attempt must be clamped back to within max"
+        );
+
+        // Once the clamped (≤ max) delay elapses, the next tick self-heals into
+        // an emission with no manual intervention.
+        std::thread::sleep(Duration::from_millis(25));
+        let before = hb_line_count();
+        maybe_emit_heartbeat(&project, &mut hb, || true);
+        assert_eq!(
+            hb_line_count(),
+            before + 1,
+            "wedged schedule must self-heal and emit on the next due tick"
         );
 
         std::env::remove_var("SHELBI_HOME");
