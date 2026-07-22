@@ -45,6 +45,7 @@ nucleo-matcher = "0.3"
 inquire = "0.7"
 unicode-width = "0.1"
 libc = "0.2"
+regex = "1"
 tungstenite = "0.29"
 
 # internal crates

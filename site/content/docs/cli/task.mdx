@@ -237,10 +237,52 @@ opening the TUI.
 ## edit
 
 ```text
-shelbi task edit <ID>
+shelbi task edit <ID> [OPTIONS]
 ```
 
-Open the task's markdown file in `$EDITOR` for free-form edits.
+With no flags, opens the task's markdown file in `$EDITOR` for free-form
+edits. Any field flag switches to non-interactive mode, the path for the
+orchestrator, CI, or a script to revise a task after creation. A
+non-interactive edit bumps `updated_at`, validates the touched fields
+before writing, and emits an `edited` event so the change is visible to
+the board and the activity feed. Fields that already have a dedicated
+command (`move`, `prio`, `assign`, `depends`) are out of scope; use those.
+
+| Flag | Type | Description |
+| --- | --- | --- |
+| `--title <TITLE>` | string | Change the display title. The task's `id` stays stable (never re-slugged). |
+| `--body <TEXT>` | string | Replace the body with this text. |
+| `--body-file <PATH>` | path | Replace the body with a file's contents. |
+| (stdin) | pipe | Pipe the body: `shelbi task edit <id> <<EOF … EOF`. |
+| `--append` | flag | Append the body source to the existing body instead of replacing it. |
+| `--workflow <NAME>` | string | Set the workflow. Must name an existing `workflows/<NAME>.yaml`. |
+| `--branch <BRANCH>` | string | Set the `branch:` override. |
+| `--prefers-machine <NAME>` | string | Set the machine-affinity hint. |
+| `--no-prefers-machine` | flag | Clear the machine-affinity hint. |
+| `--sub <OLD> <NEW>` | 2× string | Literal in-place body substitution. Repeatable. |
+| `--sub-regex <PATTERN> <REPLACEMENT>` | 2× string | Regex body substitution; `REPLACEMENT` may reference capture groups (`$1`). Repeatable. |
+| `--allow-no-match` | flag | Permit a substitution that matches zero occurrences (default: error, writing nothing). |
+| `--reason <REASON>` | string | Annotation recorded in the emitted `edited` event. Defaults to `user:cli`. |
+
+The body sources (`--body`, `--body-file`, stdin) are mutually exclusive
+with each other and with the substitution flags. Substitutions replace
+**all** occurrences of each match and report a per-substitution count;
+multiple `--sub`/`--sub-regex` apply in command-line order, each operating
+on the previous one's output. Editing a task whose column is an active
+status (e.g. `in_progress`) prints a warning: the running worker won't see
+the change until the task is re-dispatched with `shelbi task start`.
+
+```bash
+# Fix a stale path and swap a value in place, before dispatch.
+shelbi task edit fix-login-flow \
+    --sub "src/old_auth.rs" "src/auth.rs" \
+    --sub-regex "timeout=([0-9]+)" "timeout=30"
+
+# Append a late acceptance criterion without rewriting the body.
+shelbi task edit fix-login-flow --append <<'EOF'
+- [ ] Session cookies are cleared on logout.
+EOF
+```
 
 ## rm
 
