@@ -914,6 +914,45 @@ pub fn append_task_event(
     }
 }
 
+/// Append a non-interactive `task edit` event to `~/.shelbi/events.log`:
+///
+/// ```text
+/// <rfc3339> project=<p> task=<id> edited fields=<comma-list> reason=<reason>
+/// ```
+///
+/// Emitted by `shelbi task edit` when it revises a task's content (title,
+/// body, or a frontmatter field) rather than moving it between statuses — so a
+/// content revision is observable to the activity feed and any poller, the same
+/// way a status transition is via [`append_task_event`]. `fields` is a
+/// comma-separated list of the frontmatter/body fields that changed (e.g.
+/// `title,body`); `reason` is the caller's optional annotation, defaulting to
+/// `user:cli` when none is supplied. The line carries `task=<id>` so
+/// [`EventKind::from_body`] classifies it as a [`EventKind::Task`] event.
+/// Shares [`append_task_event`]'s permission-denied socket fallback.
+pub fn append_task_edit_event(
+    project: &str,
+    task_id: &str,
+    fields: &str,
+    reason: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let task_id = sanitize_field(task_id);
+    // `fields` is already a comma-joined token list with no whitespace, but run
+    // it through the reason sanitizer so a stray space can never split the
+    // record into two fields on the wire.
+    let fields = sanitize_reason(fields);
+    let reason = sanitize_reason(reason);
+    let body =
+        format!("project={project} task={task_id} edited fields={fields} reason={reason}");
+    let line = format!("{ts} {body}");
+    match append_event_line(&line) {
+        Ok(()) => Ok(()),
+        Err(e) if is_permission_denied(&e) => emit_event_body(&body),
+        Err(e) => Err(e),
+    }
+}
+
 /// Format the body of a task-transition event line — everything after the
 /// leading `<rfc3339>` timestamp. Single source of truth for the wire shape,
 /// shared by [`append_task_event`] (both its direct-append and socket-fallback

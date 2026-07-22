@@ -38,6 +38,7 @@ tracing-subscriber = { workspace = true }
 nucleo-matcher = { workspace = true }
 inquire = { workspace = true }
 unicode-width = { workspace = true }
+regex = { workspace = true }
 signal-hook = "0.3"
 libc = { workspace = true }
 

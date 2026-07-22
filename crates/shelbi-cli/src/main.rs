@@ -751,6 +751,61 @@ mod cli_tests {
         }
     }
 
+    /// `shelbi task edit <id>` with no field flags parses into an `EditArgs`
+    /// whose optional fields are all unset — the signal `edit` uses to fall
+    /// back to `$EDITOR`. With field flags, the two-value `--sub`/`--sub-regex`
+    /// options parse their pairs and the frontmatter flags populate.
+    #[test]
+    fn task_edit_parses_bare_and_with_field_flags() {
+        use commands::task::TaskCmd;
+
+        let bare = Cli::parse_from(["shelbi", "task", "edit", "t1"]);
+        match bare.cmd {
+            Some(Cmd::Task {
+                cmd: TaskCmd::Edit(args),
+            }) => {
+                assert_eq!(args.id, "t1");
+                assert!(args.title.is_none());
+                assert!(args.body.is_none());
+                assert!(!args.append);
+                assert!(args.sub.is_empty());
+                assert!(args.sub_regex.is_empty());
+            }
+            other => panic!("expected Task::Edit, got {other:?}"),
+        }
+
+        let flags = Cli::parse_from([
+            "shelbi",
+            "task",
+            "edit",
+            "t2",
+            "--title",
+            "New",
+            "--sub",
+            "a",
+            "b",
+            "--sub-regex",
+            "c(\\d)",
+            "d$1",
+            "--branch",
+            "feat/x",
+        ]);
+        match flags.cmd {
+            Some(Cmd::Task {
+                cmd: TaskCmd::Edit(args),
+            }) => {
+                assert_eq!(args.title.as_deref(), Some("New"));
+                assert_eq!(args.branch.as_deref(), Some("feat/x"));
+                assert_eq!(args.sub, vec!["a", "b"]);
+                assert_eq!(args.sub_regex, vec!["c(\\d)", "d$1"]);
+            }
+            other => panic!("expected Task::Edit, got {other:?}"),
+        }
+
+        // `--sub` requires exactly two values.
+        assert!(Cli::try_parse_from(["shelbi", "task", "edit", "t3", "--sub", "only"]).is_err());
+    }
+
     /// `shelbi workspace list` is the canonical form and parses into
     /// `Cmd::Workspace` (no alias path).
     #[test]

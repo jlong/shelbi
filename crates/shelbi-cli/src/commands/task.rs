@@ -15,8 +15,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use clap::{Args as ClapArgs, Subcommand};
 use shelbi_core::{
-    default_workflow, validate_task_id, validate_workflow_name, Column, Task, Workflow,
-    MAX_TASK_ID_LEN,
+    default_workflow, validate_branch, validate_task_id, validate_workflow_name, Column,
+    StatusCategory, Task, Workflow, MAX_TASK_ID_LEN,
 };
 
 use super::require_project;
@@ -107,8 +107,15 @@ pub enum TaskCmd {
     },
     /// Re-order a task within its column.
     Prio(PrioArgs),
-    /// Open the task file in `$EDITOR`.
-    Edit { id: String },
+    /// Revise a task's content. With NO flags, opens the task file in
+    /// `$EDITOR` (the historical behavior). Any field flag switches to
+    /// non-interactive mode: `--title`, a body source
+    /// (`--body`/`--body-file`/stdin, optionally `--append`), a frontmatter
+    /// field (`--workflow`/`--branch`/`--prefers-machine`/`--no-prefers-machine`),
+    /// or in-place body substitutions (`--sub`/`--sub-regex`). Fields with a
+    /// dedicated command — `move`, `prio`, `assign`, `depends` — are out of
+    /// scope; use those instead.
+    Edit(EditArgs),
     /// Delete a task.
     Rm { id: String },
 }
@@ -191,6 +198,85 @@ pub struct PrioArgs {
     pub set: Option<u32>,
 }
 
+#[derive(Debug, ClapArgs)]
+pub struct EditArgs {
+    /// Task to edit.
+    pub id: String,
+    /// New display title. The task's `id` stays stable — it is never
+    /// re-slugified from a new title.
+    #[arg(long, value_name = "TITLE")]
+    pub title: Option<String>,
+    /// Replace the body with this text. Mutually exclusive with
+    /// `--body-file`, piped stdin, and the substitution flags.
+    #[arg(long, value_name = "TEXT")]
+    pub body: Option<String>,
+    /// Replace the body with the contents of a file. Mutually exclusive with
+    /// `--body`, piped stdin, and the substitution flags.
+    #[arg(long = "body-file", value_name = "PATH")]
+    pub body_file: Option<std::path::PathBuf>,
+    /// Append the body source (`--body`/`--body-file`/stdin) to the existing
+    /// body instead of replacing it. Mutually exclusive with the substitution
+    /// flags.
+    #[arg(long)]
+    pub append: bool,
+    /// Set the task's workflow. Must name an existing `workflows/<NAME>.yaml`.
+    #[arg(long = "workflow", value_name = "NAME")]
+    pub workflow: Option<String>,
+    /// Set the task's `branch:` override.
+    #[arg(long = "branch", value_name = "BRANCH")]
+    pub branch: Option<String>,
+    /// Set the prefers-machine hint. Mutually exclusive with
+    /// `--no-prefers-machine`.
+    #[arg(long = "prefers-machine", value_name = "NAME")]
+    pub prefers_machine: Option<String>,
+    /// Clear the prefers-machine hint. Mutually exclusive with
+    /// `--prefers-machine`.
+    #[arg(long = "no-prefers-machine")]
+    pub no_prefers_machine: bool,
+    /// Literal in-place substitution in the body: replace every occurrence of
+    /// OLD with NEW. Repeatable; multiple `--sub`/`--sub-regex` apply in
+    /// command-line order, each on the previous result. Two values (not
+    /// `OLD=NEW`) so the strings may contain `=`, `,`, or shell
+    /// metacharacters.
+    #[arg(
+        long,
+        value_names = ["OLD", "NEW"],
+        num_args = 2,
+        action = clap::ArgAction::Append,
+        allow_hyphen_values = true
+    )]
+    pub sub: Vec<String>,
+    /// Regex in-place substitution in the body: replace every match of PATTERN
+    /// with REPLACEMENT. REPLACEMENT may reference capture groups (`$1`,
+    /// `${name}`). Repeatable and interleaves with `--sub` in command-line
+    /// order.
+    #[arg(
+        long = "sub-regex",
+        value_names = ["PATTERN", "REPLACEMENT"],
+        num_args = 2,
+        action = clap::ArgAction::Append,
+        allow_hyphen_values = true
+    )]
+    pub sub_regex: Vec<String>,
+    /// Don't error when a substitution matches zero occurrences (the default
+    /// is to reject a stale OLD/PATTERN, writing nothing).
+    #[arg(long = "allow-no-match")]
+    pub allow_no_match: bool,
+    /// Optional reason recorded in the emitted `edited` event. Defaults to
+    /// `user:cli`.
+    #[arg(long, value_name = "REASON")]
+    pub reason: Option<String>,
+}
+
+/// One in-place body substitution, in command-line order. Literal and regex
+/// variants interleave, so they share a single ordered list rather than two
+/// per-kind vectors — see [`ordered_substitutions`].
+#[derive(Debug, Clone, PartialEq)]
+enum SubOp {
+    Literal { from: String, to: String },
+    Regex { pattern: String, replacement: String },
+}
+
 pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
     let project = require_project(project_opt)?;
     // Version gate: board mutations against a stale daemon (old binary
@@ -230,7 +316,7 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
             reason,
         } => resume(&project, &id, workspace.as_deref(), reason.as_deref()),
         TaskCmd::Prio(args) => prio(&project, args),
-        TaskCmd::Edit { id } => edit(&project, &id),
+        TaskCmd::Edit(args) => edit(&project, args),
         TaskCmd::Rm { id } => rm(&project, &id),
     }
 }
@@ -1268,12 +1354,339 @@ fn resume(
     Ok(())
 }
 
-fn edit(project: &str, id: &str) -> Result<()> {
-    let path = shelbi_state::task_path(project, id).map_err(|e| anyhow!(e))?;
-    if !path.exists() {
-        bail!("task `{id}` not found");
+/// Whether any non-interactive field flag was supplied. When none were (and no
+/// body arrived on stdin), `edit` falls back to opening `$EDITOR` — the
+/// historical zero-flag behavior.
+fn edit_has_field_flags(args: &EditArgs, stdin_body: &Option<String>) -> bool {
+    args.title.is_some()
+        || args.body.is_some()
+        || args.body_file.is_some()
+        || args.append
+        || args.workflow.is_some()
+        || args.branch.is_some()
+        || args.prefers_machine.is_some()
+        || args.no_prefers_machine
+        || !args.sub.is_empty()
+        || !args.sub_regex.is_empty()
+        || stdin_body.is_some()
+}
+
+/// Reconstruct the command-line order of `--sub` / `--sub-regex` occurrences.
+///
+/// clap's derive can't preserve the *relative* order of two distinct
+/// repeatable options into typed fields, but substitutions must apply in the
+/// exact order the user typed them (each seeing the previous one's output). So
+/// we recover that order by scanning the raw argv: each flag is followed by
+/// exactly its two values (clap already validated arity and
+/// `allow_hyphen_values` lets a value start with `-`), so we consume the two
+/// tokens after each occurrence and skip everything else.
+///
+/// If the scan doesn't reproduce the clap-parsed multiset — the only way that
+/// happens is an exotic attached-value form the tests don't use — we fall back
+/// to a deterministic order (all `--sub` in parse order, then all
+/// `--sub-regex`), which still satisfies "each sub sees the previous result".
+fn ordered_substitutions<I, S>(argv: I, args: &EditArgs) -> Vec<SubOp>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let toks: Vec<String> = argv.into_iter().map(|s| s.as_ref().to_string()).collect();
+    let mut scanned: Vec<SubOp> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let is_literal = toks[i] == "--sub";
+        let is_regex = toks[i] == "--sub-regex";
+        if (is_literal || is_regex) && i + 2 < toks.len() {
+            let a = toks[i + 1].clone();
+            let b = toks[i + 2].clone();
+            scanned.push(if is_literal {
+                SubOp::Literal { from: a, to: b }
+            } else {
+                SubOp::Regex {
+                    pattern: a,
+                    replacement: b,
+                }
+            });
+            i += 3;
+        } else {
+            i += 1;
+        }
     }
-    super::launch_editor(&path)
+
+    let scanned_literals = scanned
+        .iter()
+        .filter(|op| matches!(op, SubOp::Literal { .. }))
+        .count();
+    let scanned_regex = scanned.len() - scanned_literals;
+    if scanned_literals == args.sub.len() / 2 && scanned_regex == args.sub_regex.len() / 2 {
+        return scanned;
+    }
+
+    // Fallback: reconstruct from the parsed pairs in a stable order.
+    let mut ops = Vec::new();
+    for pair in args.sub.chunks_exact(2) {
+        ops.push(SubOp::Literal {
+            from: pair[0].clone(),
+            to: pair[1].clone(),
+        });
+    }
+    for pair in args.sub_regex.chunks_exact(2) {
+        ops.push(SubOp::Regex {
+            pattern: pair[0].clone(),
+            replacement: pair[1].clone(),
+        });
+    }
+    ops
+}
+
+fn edit(project: &str, args: EditArgs) -> Result<()> {
+    let stdin_body = read_piped_stdin()?;
+    // Zero-flag invocation preserves the historical behavior: open the file in
+    // `$EDITOR`. Any field flag (or a piped body) switches to non-interactive
+    // mode.
+    if !edit_has_field_flags(&args, &stdin_body) {
+        let path = shelbi_state::task_path(project, &args.id).map_err(|e| anyhow!(e))?;
+        if !path.exists() {
+            bail!("task `{}` not found", args.id);
+        }
+        return super::launch_editor(&path);
+    }
+    let ordering = ordered_substitutions(
+        std::env::args_os().map(|s| s.to_string_lossy().into_owned()),
+        &args,
+    );
+    edit_non_interactive(project, args, stdin_body, ordering)
+}
+
+/// Apply one or more literal/regex substitutions to `body` in order, returning
+/// the new body plus a per-op replacement count. Errors (writing nothing) on an
+/// invalid regex, an empty literal/pattern, or — unless `allow_no_match` — a
+/// substitution that matched zero occurrences.
+fn apply_substitutions(
+    body: &str,
+    ops: &[SubOp],
+    allow_no_match: bool,
+) -> Result<(String, Vec<(String, usize)>)> {
+    let mut current = body.to_string();
+    let mut report: Vec<(String, usize)> = Vec::new();
+    for op in ops {
+        let (label, count, next) = match op {
+            SubOp::Literal { from, to } => {
+                if from.is_empty() {
+                    bail!("--sub OLD must not be empty");
+                }
+                let count = current.matches(from.as_str()).count();
+                let next = current.replace(from.as_str(), to);
+                (format!("`{from}` → `{to}`"), count, next)
+            }
+            SubOp::Regex {
+                pattern,
+                replacement,
+            } => {
+                if pattern.is_empty() {
+                    bail!("--sub-regex PATTERN must not be empty");
+                }
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| anyhow!("invalid --sub-regex pattern `{pattern}`: {e}"))?;
+                let count = re.find_iter(&current).count();
+                let next = re.replace_all(&current, replacement.as_str()).into_owned();
+                (
+                    format!("/{pattern}/ → `{replacement}`"),
+                    count,
+                    next,
+                )
+            }
+        };
+        if count == 0 && !allow_no_match {
+            bail!(
+                "substitution {label} matched zero occurrences — the task body is \
+                 unchanged (pass --allow-no-match to permit a no-op substitution)"
+            );
+        }
+        current = next;
+        report.push((label, count));
+    }
+    Ok((current, report))
+}
+
+/// Compose the new body from the body sources (`--body`/`--body-file`/stdin),
+/// honoring `--append`. Returns `None` when no body source was supplied (a
+/// title-only or field-only edit leaves the body untouched). At most one body
+/// source may be given.
+fn resolve_body_edit(
+    args: &EditArgs,
+    stdin_body: &Option<String>,
+    existing: &str,
+) -> Result<Option<String>> {
+    let file_body = match &args.body_file {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading --body-file {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let sources = [
+        args.body.clone(),
+        file_body,
+        stdin_body.clone(),
+    ];
+    let provided: Vec<String> = sources.into_iter().flatten().collect();
+    if provided.len() > 1 {
+        bail!(
+            "multiple body sources given — pass the body exactly one way \
+             (--body, --body-file, or piped stdin)"
+        );
+    }
+    let source = provided.into_iter().next();
+    match source {
+        None => {
+            if args.append {
+                bail!("--append needs a body source (--body, --body-file, or piped stdin)");
+            }
+            Ok(None)
+        }
+        Some(text) => {
+            let text = text.trim_end();
+            if args.append {
+                let mut b = existing.to_string();
+                if !b.is_empty() {
+                    if !b.ends_with('\n') {
+                        b.push('\n');
+                    }
+                    // Blank-line separator so an appended acceptance criterion
+                    // reads as its own paragraph rather than joining the prior
+                    // line.
+                    if !b.ends_with("\n\n") {
+                        b.push('\n');
+                    }
+                }
+                b.push_str(text);
+                b.push('\n');
+                Ok(Some(b))
+            } else {
+                Ok(Some(format!("{text}\n")))
+            }
+        }
+    }
+}
+
+/// Whether the task's current column is an `active`-category status under its
+/// workflow (e.g. `in_progress`). A body/field edit to such a task won't reach
+/// the already-running worker until it is re-dispatched.
+fn task_column_is_active(project: &str, task: &Task) -> bool {
+    // Stock status ids carry their category directly, so a routine edit on a
+    // project without materialized workflow files doesn't emit a spurious
+    // workflow-load warning just to compute this hint.
+    if Column::core().contains(&task.column) {
+        return task.column.category() == StatusCategory::Active;
+    }
+    // Custom status id: resolve its category through the task's workflow.
+    resolve_task_workflow(project, task)
+        .ok()
+        .and_then(|wf| {
+            wf.status(task.column.as_str())
+                .map(|s| s.category == StatusCategory::Active)
+        })
+        .unwrap_or(false)
+}
+
+fn edit_non_interactive(
+    project: &str,
+    args: EditArgs,
+    stdin_body: Option<String>,
+    ordering: Vec<SubOp>,
+) -> Result<()> {
+    if args.prefers_machine.is_some() && args.no_prefers_machine {
+        bail!("--prefers-machine and --no-prefers-machine are mutually exclusive");
+    }
+    let has_body_source =
+        args.body.is_some() || args.body_file.is_some() || stdin_body.is_some() || args.append;
+    if !ordering.is_empty() && has_body_source {
+        bail!(
+            "--sub/--sub-regex operate in place and can't be combined with a whole-body \
+             edit (--body/--body-file/stdin/--append)"
+        );
+    }
+
+    let mut tf = shelbi_state::load_task(project, &args.id).map_err(|e| anyhow!(e))?;
+    let mut fields: Vec<&str> = Vec::new();
+
+    // --- validate every touched field BEFORE mutating, so an invalid input
+    // leaves the task file untouched. ---
+    if let Some(name) = args.workflow.as_deref() {
+        validate_workflow_name(name).map_err(|e| anyhow!(e))?;
+        let path = shelbi_state::workflow_path(project, name).map_err(|e| anyhow!(e))?;
+        if !path.exists() {
+            bail!(
+                "workflow `{name}` does not exist (no {}) — create it first or pick an \
+                 existing workflow",
+                path.display()
+            );
+        }
+    }
+    if let Some(branch) = args.branch.as_deref() {
+        validate_branch(branch).map_err(|e| anyhow!(e))?;
+    }
+
+    // --- compute the new body (substitutions OR a whole-body source). ---
+    if !ordering.is_empty() {
+        let (new_body, report) =
+            apply_substitutions(&tf.body, &ordering, args.allow_no_match)?;
+        for (label, count) in &report {
+            println!("  {label}: {count} replacement(s)");
+        }
+        tf.body = new_body;
+        fields.push("body");
+    } else if let Some(new_body) = resolve_body_edit(&args, &stdin_body, &tf.body)? {
+        tf.body = new_body;
+        fields.push("body");
+    }
+
+    // --- apply the frontmatter field edits. ---
+    if let Some(title) = &args.title {
+        tf.task.title = title.clone();
+        fields.push("title");
+    }
+    if let Some(name) = &args.workflow {
+        tf.task.workflow = Some(name.clone());
+        fields.push("workflow");
+    }
+    if let Some(branch) = &args.branch {
+        tf.task.branch = Some(branch.clone());
+        fields.push("branch");
+    }
+    if let Some(machine) = &args.prefers_machine {
+        tf.task.prefers_machine = Some(machine.clone());
+        fields.push("prefers_machine");
+    } else if args.no_prefers_machine {
+        tf.task.prefers_machine = None;
+        fields.push("prefers_machine");
+    }
+
+    if fields.is_empty() {
+        // Every supplied flag resolved to a no-op (e.g. only --allow-no-match).
+        println!("(no change)");
+        return Ok(());
+    }
+
+    tf.task.updated_at = Utc::now();
+    shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
+
+    let fields_csv = fields.join(",");
+    let reason = args.reason.as_deref().unwrap_or("user:cli");
+    if let Err(e) = shelbi_state::append_task_edit_event(project, &args.id, &fields_csv, reason) {
+        eprintln!("warning: append_task_edit_event failed: {e}");
+    }
+
+    println!("✓ {} edited ({fields_csv})", args.id);
+    if task_column_is_active(project, &tf.task) {
+        eprintln!(
+            "warning: `{}` is in an active status ({}) — this edit will NOT reach the \
+             running worker until the task is re-dispatched (`shelbi task start`)",
+            args.id, tf.task.column
+        );
+    }
+    Ok(())
 }
 
 fn rm(project: &str, id: &str) -> Result<()> {
@@ -2180,5 +2593,392 @@ statuses:
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -------------------------------------------------------------------
+    // task edit (non-interactive)
+
+    fn edit_args(id: &str) -> EditArgs {
+        EditArgs {
+            id: id.into(),
+            title: None,
+            body: None,
+            body_file: None,
+            append: false,
+            workflow: None,
+            branch: None,
+            prefers_machine: None,
+            no_prefers_machine: false,
+            sub: Vec::new(),
+            sub_regex: Vec::new(),
+            allow_no_match: false,
+            reason: None,
+        }
+    }
+
+    /// Seed a task with a body and an `updated_at` in the past so an edit's
+    /// timestamp bump is observable.
+    fn seed_task(project: &str, id: &str, column: Column, body: &str) {
+        let mut task = task_in(column, id);
+        task.updated_at = "2000-01-01T00:00:00Z".parse().unwrap();
+        shelbi_state::save_task(project, &task, body).unwrap();
+    }
+
+    #[test]
+    fn edit_title_leaves_id_stable_and_bumps_updated_at() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        seed_task("p", "task-one", Column::backlog(), "# Task\n\nbody\n");
+        let mut args = edit_args("task-one");
+        args.title = Some("A brand new title".into());
+        edit_non_interactive("p", args, None, Vec::new()).unwrap();
+
+        let tf = shelbi_state::load_task("p", "task-one").unwrap();
+        assert_eq!(tf.task.id, "task-one", "id must never be re-slugged");
+        assert_eq!(tf.task.title, "A brand new title");
+        assert_eq!(tf.body, "# Task\n\nbody\n", "title-only edit leaves body");
+        assert!(
+            tf.task.updated_at > "2000-01-01T00:00:00Z".parse::<chrono::DateTime<Utc>>().unwrap(),
+            "updated_at must be bumped",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn edit_body_sources_replace_and_conflict() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // --body replaces.
+        seed_task("p", "b1", Column::backlog(), "old\n");
+        let mut a = edit_args("b1");
+        a.body = Some("fresh body".into());
+        edit_non_interactive("p", a, None, Vec::new()).unwrap();
+        assert_eq!(shelbi_state::load_task("p", "b1").unwrap().body, "fresh body\n");
+
+        // --body-file replaces.
+        seed_task("p", "b2", Column::backlog(), "old\n");
+        let file = home.join("body.md");
+        std::fs::write(&file, "from file\n").unwrap();
+        let mut a = edit_args("b2");
+        a.body_file = Some(file.clone());
+        edit_non_interactive("p", a, None, Vec::new()).unwrap();
+        assert_eq!(shelbi_state::load_task("p", "b2").unwrap().body, "from file\n");
+
+        // stdin replaces.
+        seed_task("p", "b3", Column::backlog(), "old\n");
+        edit_non_interactive("p", edit_args("b3"), Some("piped\n".into()), Vec::new()).unwrap();
+        assert_eq!(shelbi_state::load_task("p", "b3").unwrap().body, "piped\n");
+
+        // Two body sources at once is an error; the file stays untouched.
+        seed_task("p", "b4", Column::backlog(), "keep\n");
+        let mut a = edit_args("b4");
+        a.body = Some("one".into());
+        let err = edit_non_interactive("p", a, Some("two".into()), Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("multiple body sources"), "err: {err}");
+        assert_eq!(shelbi_state::load_task("p", "b4").unwrap().body, "keep\n");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn edit_append_keeps_prior_content() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        seed_task("p", "app", Column::backlog(), "# Task\n\nOriginal.\n");
+        let mut a = edit_args("app");
+        a.append = true;
+        edit_non_interactive("p", a, Some("- [ ] new criterion\n".into()), Vec::new()).unwrap();
+
+        let body = shelbi_state::load_task("p", "app").unwrap().body;
+        assert!(body.starts_with("# Task\n\nOriginal.\n"), "prior kept: {body:?}");
+        assert!(body.contains("- [ ] new criterion"), "appended: {body:?}");
+
+        // --append with no body source is an error.
+        seed_task("p", "app2", Column::backlog(), "x\n");
+        let mut a = edit_args("app2");
+        a.append = true;
+        let err = edit_non_interactive("p", a, None, Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--append needs a body source"), "err: {err}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn edit_frontmatter_fields_and_unknown_workflow_rejected() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Materialize a real workflow file so the existence check passes.
+        let wf_dir = shelbi_state::workflows_dir("p").unwrap();
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(wf_dir.join("research.yaml"), "name: research\n").unwrap();
+
+        seed_task("p", "fm", Column::backlog(), "b\n");
+        let mut a = edit_args("fm");
+        a.workflow = Some("research".into());
+        a.branch = Some("feature/fm".into());
+        a.prefers_machine = Some("alpha".into());
+        edit_non_interactive("p", a, None, Vec::new()).unwrap();
+        let tf = shelbi_state::load_task("p", "fm").unwrap();
+        assert_eq!(tf.task.workflow.as_deref(), Some("research"));
+        assert_eq!(tf.task.branch.as_deref(), Some("feature/fm"));
+        assert_eq!(tf.task.prefers_machine.as_deref(), Some("alpha"));
+
+        // --no-prefers-machine clears the hint.
+        let mut a = edit_args("fm");
+        a.no_prefers_machine = true;
+        edit_non_interactive("p", a, None, Vec::new()).unwrap();
+        assert_eq!(
+            shelbi_state::load_task("p", "fm").unwrap().task.prefers_machine,
+            None
+        );
+
+        // An unknown workflow is rejected without touching the file.
+        seed_task("p", "fm2", Column::backlog(), "b\n");
+        let mut a = edit_args("fm2");
+        a.workflow = Some("ghost".into());
+        a.title = Some("should not persist".into());
+        let err = edit_non_interactive("p", a, None, Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("workflow `ghost` does not exist"), "err: {err}");
+        let tf = shelbi_state::load_task("p", "fm2").unwrap();
+        assert_eq!(tf.task.title, "fm2", "title must not have changed");
+        assert_eq!(tf.task.workflow, None);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn edit_prefers_machine_flags_are_mutually_exclusive() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        seed_task("p", "pm", Column::backlog(), "b\n");
+        let mut a = edit_args("pm");
+        a.prefers_machine = Some("alpha".into());
+        a.no_prefers_machine = true;
+        let err = edit_non_interactive("p", a, None, Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "err: {err}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn apply_substitutions_literal_counts_and_replaces_all() {
+        let ops = vec![SubOp::Literal {
+            from: "foo".into(),
+            to: "bar".into(),
+        }];
+        let (out, report) = apply_substitutions("foo foo baz foo", &ops, false).unwrap();
+        assert_eq!(out, "bar bar baz bar");
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].1, 3, "reports 3 replacements");
+    }
+
+    #[test]
+    fn apply_substitutions_chain_in_order_with_regex_capture() {
+        // Later subs see earlier subs' output; regex replacement references a
+        // capture group.
+        let ops = vec![
+            SubOp::Literal {
+                from: "cat".into(),
+                to: "dog".into(),
+            },
+            SubOp::Regex {
+                pattern: r"dog-(\d+)".into(),
+                replacement: "hound-$1".into(),
+            },
+        ];
+        let (out, _) = apply_substitutions("cat-7 and cat-9", &ops, false).unwrap();
+        assert_eq!(out, "hound-7 and hound-9");
+    }
+
+    #[test]
+    fn apply_substitutions_zero_match_errors_unless_allowed() {
+        let ops = vec![SubOp::Literal {
+            from: "absent".into(),
+            to: "x".into(),
+        }];
+        let err = apply_substitutions("body text", &ops, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("zero occurrences"), "err: {err}");
+
+        // With --allow-no-match the no-op is tolerated and the body is unchanged.
+        let (out, report) = apply_substitutions("body text", &ops, true).unwrap();
+        assert_eq!(out, "body text");
+        assert_eq!(report[0].1, 0);
+    }
+
+    #[test]
+    fn apply_substitutions_invalid_regex_errors() {
+        let ops = vec![SubOp::Regex {
+            pattern: "(".into(),
+            replacement: "x".into(),
+        }];
+        let err = apply_substitutions("body", &ops, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid --sub-regex pattern"), "err: {err}");
+    }
+
+    #[test]
+    fn edit_substitution_persists_and_rejects_body_combo() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        seed_task("p", "s1", Column::backlog(), "path/to/old.rs\n");
+        let mut a = edit_args("s1");
+        a.sub = vec!["old.rs".into(), "new.rs".into()];
+        let ops = vec![SubOp::Literal {
+            from: "old.rs".into(),
+            to: "new.rs".into(),
+        }];
+        edit_non_interactive("p", a, None, ops).unwrap();
+        assert_eq!(
+            shelbi_state::load_task("p", "s1").unwrap().body,
+            "path/to/new.rs\n"
+        );
+
+        // Substitutions can't combine with a whole-body edit.
+        seed_task("p", "s2", Column::backlog(), "old\n");
+        let mut a = edit_args("s2");
+        a.body = Some("whole".into());
+        let ops = vec![SubOp::Literal {
+            from: "old".into(),
+            to: "new".into(),
+        }];
+        let err = edit_non_interactive("p", a, None, ops)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("can't be combined"), "err: {err}");
+        assert_eq!(shelbi_state::load_task("p", "s2").unwrap().body, "old\n");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn edit_emits_task_edit_event() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        seed_task("p", "ev", Column::backlog(), "b\n");
+        let mut a = edit_args("ev");
+        a.title = Some("New".into());
+        a.reason = Some("fixing typo".into());
+        edit_non_interactive("p", a, None, Vec::new()).unwrap();
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(log.contains(" task=ev "), "log: {log}");
+        assert!(log.contains(" edited "), "log: {log}");
+        assert!(log.contains("fields=title"), "log: {log}");
+        assert!(log.contains("reason=fixing_typo"), "log: {log}");
+        // Classified as a Task event so the feed/poller observe it.
+        let line = log.lines().next().unwrap();
+        assert_eq!(
+            shelbi_state::EventEnvelope::from_log_line(line).kind,
+            shelbi_state::EventKind::Task,
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn edit_missing_id_errors() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut a = edit_args("ghost");
+        a.title = Some("x".into());
+        let err = edit_non_interactive("p", a, None, Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ghost"), "err names the id: {err}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn task_column_is_active_true_for_in_progress() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let active = task_in(Column::in_progress(), "z");
+        assert!(task_column_is_active("p", &active));
+        let idle = task_in(Column::todo(), "z");
+        assert!(!task_column_is_active("p", &idle));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ordered_substitutions_recovers_interleaved_cli_order() {
+        // Pure function — no SHELBI_HOME / env setup needed.
+        let mut args = edit_args("x");
+        // Two --sub and one --sub-regex, interleaved on the command line.
+        args.sub = vec!["a".into(), "b".into(), "e".into(), "f".into()];
+        args.sub_regex = vec!["c".into(), "d".into()];
+        let argv = [
+            "shelbi",
+            "task",
+            "edit",
+            "x",
+            "--sub",
+            "a",
+            "b",
+            "--sub-regex",
+            "c",
+            "d",
+            "--sub",
+            "e",
+            "f",
+        ];
+        let ops = ordered_substitutions(argv, &args);
+        assert_eq!(
+            ops,
+            vec![
+                SubOp::Literal {
+                    from: "a".into(),
+                    to: "b".into()
+                },
+                SubOp::Regex {
+                    pattern: "c".into(),
+                    replacement: "d".into()
+                },
+                SubOp::Literal {
+                    from: "e".into(),
+                    to: "f".into()
+                },
+            ]
+        );
     }
 }
