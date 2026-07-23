@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use shelbi_palette::DecorationColor;
@@ -38,76 +38,9 @@ pub fn render_full(f: &mut Frame, app: &mut App, area: Rect) {
     // render_footer does for the zen band.
     render_list(f, app, outer[0]);
     render_footer(f, app, outer[1]);
-
-    // The review-load confirm floats over the whole sidebar so it reads as a
-    // modal, not a footer line. Drawn last so it sits on top of the list.
-    if app.review_prompt_open() {
-        render_review_prompt(f, app, area);
-    }
-}
-
-/// Centered "Load onto a review workspace?" confirm. Names the free review
-/// slot the load will target (or reports none free). Mirrors the reject
-/// dialog's modal geometry so the two read as the same kind of surface.
-fn render_review_prompt(f: &mut Frame, app: &App, area: Rect) {
-    let Some(prompt) = app.review_prompt.as_ref() else {
-        return;
-    };
-    let w = area.width.saturating_sub(2).clamp(10, 52).min(area.width);
-    let h = 8u16.min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-    f.render_widget(Clear, modal);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" Load for review ");
-    let inner = block.inner(modal);
-    f.render_widget(block, modal);
-
-    let title_line = Line::from(Span::styled(
-        prompt.task_title.clone(),
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-    ));
-    let body = match &prompt.workspace {
-        Some(ws) => vec![
-            title_line,
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled("Load onto review workspace ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    ws.clone(),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("?", Style::default().fg(Color::Gray)),
-            ]),
-            Line::raw(""),
-            Line::from(Span::styled(
-                "Enter / y  confirm    Esc / n  cancel",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ],
-        None => vec![
-            title_line,
-            Line::raw(""),
-            Line::from(Span::styled(
-                "No review workspace is free.",
-                Style::default().fg(Color::Yellow),
-            )),
-            Line::raw(""),
-            Line::from(Span::styled(
-                "Free a review slot, then try again.  Esc dismiss",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ],
-    };
-    f.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), inner);
+    // The review-load confirm is no longer drawn here — it renders as a
+    // centered `tmux display-popup` (see `App::open_review_load_prompt`), so it
+    // reads as a full-terminal modal instead of a box inside the sidebar rect.
 }
 
 /// 1-col horizontal padding shared by the title, the nav labels, and the

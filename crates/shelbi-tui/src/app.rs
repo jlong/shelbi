@@ -3,7 +3,6 @@ use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use shelbi_core::{Agent, Column, Status};
 use shelbi_palette::{Decoration, DecorationColor};
@@ -210,28 +209,11 @@ pub struct App {
     /// True when the probed daemon version differs from this binary —
     /// the footer paints [`App::daemon_version_line`] red instead of dim.
     pub daemon_version_mismatch: bool,
-    /// The open "Load onto a review workspace?" confirm, raised when the
-    /// user activates a Queued-for-Review row. A modal: while `Some`, the
-    /// sidebar swallows keys/clicks and routes them to
-    /// [`App::review_prompt_key`]. `None` when nothing is being confirmed.
-    pub review_prompt: Option<ReviewLoadPrompt>,
     /// An in-flight review load running on a background thread, so the git
     /// checkout / install / dispatch round-trip never blocks the UI thread.
     /// [`App::poll_review_load`] drains its channel each loop tick and swaps
     /// the outcome (or an animated spinner) into [`App::status_line`].
     review_job: Option<ReviewLoadJob>,
-}
-
-/// A pending "Load onto a review workspace?" confirmation. Resolved by a
-/// keypress: y/Enter confirms (only when a slot is free), n/Esc dismisses.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewLoadPrompt {
-    pub task_id: String,
-    pub task_title: String,
-    /// The free `review`-tagged workspace the load will target, resolved
-    /// when the prompt is raised. `None` when every review slot is busy —
-    /// the dialog then only reports "none free" and any key dismisses it.
-    pub workspace: Option<String>,
 }
 
 /// A review load running on a worker thread. Holds the channel the thread
@@ -266,7 +248,6 @@ impl App {
             collapsed_machines: BTreeSet::new(),
             daemon_version_line: None,
             daemon_version_mismatch: false,
-            review_prompt: None,
             review_job: None,
         }
     }
@@ -702,11 +683,14 @@ impl App {
         }
     }
 
-    /// Raise the "Load onto a review workspace?" confirm for a Queued row.
-    /// Resolves a free `review`-tagged slot up front so the dialog can name
-    /// the target (or report none free). Nothing is loaded here — that waits
-    /// for [`App::review_prompt_key`] to see a confirmation. A no-op when a
-    /// prior load is still running, so two clicks can't stack dispatches.
+    /// Raise the "Load onto a review workspace?" confirm for a Queued row as a
+    /// centered tmux `display-popup` (the same surface style as the palette
+    /// popup), rather than an overlay boxed inside the sidebar rect. Resolves a
+    /// free `review`-tagged slot up front so the popup can name the target (or
+    /// report none free), then launches the confirm. Only a confirming exit
+    /// starts the load, onto that same slot — so the dev pane is never
+    /// dispatched to and cancel is a no-op. A no-op when a prior load is still
+    /// running, so two clicks can't stack dispatches.
     fn open_review_load_prompt(&mut self, id: &str) {
         if self.review_job.is_some() {
             self.status_line = "a review load is already in progress…".into();
@@ -725,56 +709,20 @@ impl App {
                 return;
             }
         };
-        self.review_prompt = Some(ReviewLoadPrompt {
-            task_id: id.to_string(),
-            task_title,
-            workspace,
-        });
-    }
-
-    /// Feed one key to the open review-load confirm. Returns `true` when a
-    /// prompt was open (the key is consumed by the modal); `false` lets the
-    /// normal keymap dispatch run. y/Enter confirms when a slot is free;
-    /// everything else — including any key when no slot is free — dismisses.
-    pub fn review_prompt_key(&mut self, key: KeyEvent) -> bool {
-        let Some(prompt) = self.review_prompt.as_ref() else {
-            return false;
-        };
-        let confirm = matches!(key.code, KeyCode::Char('y' | 'Y') | KeyCode::Enter);
-        if confirm && prompt.workspace.is_some() {
-            self.confirm_review_load();
-        } else {
-            self.review_prompt = None;
+        // The confirm renders in a centered tmux popup whose exit code carries
+        // the decision (0 = confirm, non-zero = cancel / none-free). Blocking
+        // the sidebar loop here is fine: the popup is modal, exactly as the
+        // palette popup blocks its launcher until it closes.
+        if review_confirm_popup(&task_title, workspace.as_deref()) {
+            if let Some(workspace) = workspace {
+                self.start_review_load(id.to_string(), workspace);
+            }
         }
-        true
-    }
-
-    /// Whether the modal review-load confirm is currently open. Read by the
-    /// mouse handler (to swallow clicks) and the renderer (to draw the
-    /// overlay).
-    pub fn review_prompt_open(&self) -> bool {
-        self.review_prompt.is_some()
-    }
-
-    /// Kick off the review load on a worker thread so the UI thread never
-    /// blocks on the checkout / install / dispatch round-trip. The target is
-    /// the free review slot named in the prompt, so the dev workspace is
-    /// never dispatched to. Progress surfaces as a spinner in the status
-    /// line; [`App::poll_review_load`] swaps the outcome in when the thread
-    /// finishes.
-    fn confirm_review_load(&mut self) {
-        let Some(prompt) = self.review_prompt.take() else {
-            return;
-        };
-        let Some(workspace) = prompt.workspace else {
-            return;
-        };
-        self.start_review_load(prompt.task_id, workspace);
     }
 
     /// Kick off a background load of `task_id` onto the review slot
     /// `workspace`, showing a spinner and switching focus when it lands.
-    /// Shared by the Queued-for-Review confirm ([`App::confirm_review_load`])
+    /// Shared by the Queued-for-Review confirm ([`App::open_review_load_prompt`])
     /// and the Ready-but-unlaunched path ([`App::open_ready_review`]) so the
     /// two dispatch through one code path. A no-op when a prior load is still
     /// running, so two clicks can't stack dispatches. Emits a `dispatch`
@@ -1396,6 +1344,31 @@ fn status_order(s: Status) -> u8 {
         Status::Error => 4,
         Status::Archived => 5,
     }
+}
+
+/// Launch the review-load confirm as a centered `tmux display-popup` running
+/// `shelbi __review-confirm` — the same popup surface the palette uses, so the
+/// confirm reads as a full-terminal modal rather than a box inside the sidebar
+/// column. Sized smaller than the palette (70%×60%) since it's a short yes/no.
+///
+/// Returns `true` only when the popup exits 0 (the user confirmed and a slot
+/// was free); a cancel, an informational "none free" dismiss, or any tmux
+/// failure all map to `false`, the safe no-op. Blocks until the popup closes,
+/// which is exactly the modal behavior we want.
+fn review_confirm_popup(title: &str, workspace: Option<&str>) -> bool {
+    let Ok(bin) = std::env::current_exe() else {
+        return false;
+    };
+    let bin = bin.to_string_lossy();
+    let mut cmd = format!(
+        "{} __review-confirm --title {}",
+        shelbi_agent::shell_escape(&bin),
+        shelbi_agent::shell_escape(title),
+    );
+    if let Some(ws) = workspace {
+        cmd.push_str(&format!(" --workspace {}", shelbi_agent::shell_escape(ws)));
+    }
+    run_tmux(["display-popup", "-E", "-w", "60", "-h", "9", cmd.as_str()])
 }
 
 /// Run `tmux ARGS`. Returns true on success.
@@ -3278,52 +3251,6 @@ mod tests {
         assert_eq!(app.zen_mode, shelbi_state::ZenModeState::On);
 
         std::env::remove_var("SHELBI_HOME");
-    }
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
-    }
-
-    fn prompt(workspace: Option<&str>) -> ReviewLoadPrompt {
-        ReviewLoadPrompt {
-            task_id: "t-1".into(),
-            task_title: "Fix the thing".into(),
-            workspace: workspace.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn review_prompt_key_is_a_no_op_when_no_prompt_is_open() {
-        let mut app = App::new_sidebar("demo");
-        // No modal up: the key isn't consumed, so normal dispatch still runs.
-        assert!(!app.review_prompt_key(key(KeyCode::Enter)));
-        assert!(app.review_prompt.is_none());
-        assert!(app.review_job.is_none());
-    }
-
-    #[test]
-    fn review_prompt_esc_and_n_dismiss_without_loading() {
-        for code in [KeyCode::Esc, KeyCode::Char('n')] {
-            let mut app = App::new_sidebar("demo");
-            app.review_prompt = Some(prompt(Some("review-1")));
-            assert!(app.review_prompt_key(key(code)));
-            assert!(app.review_prompt.is_none(), "{code:?} should close the modal");
-            // Declining never spawns a load.
-            assert!(app.review_job.is_none(), "{code:?} must not dispatch");
-        }
-    }
-
-    #[test]
-    fn review_prompt_any_key_dismisses_when_no_slot_is_free() {
-        // With no free review workspace the dialog is informational — even the
-        // confirm keys just dismiss it, and nothing is ever loaded.
-        for code in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Esc] {
-            let mut app = App::new_sidebar("demo");
-            app.review_prompt = Some(prompt(None));
-            assert!(app.review_prompt_key(key(code)));
-            assert!(app.review_prompt.is_none());
-            assert!(app.review_job.is_none(), "{code:?} must not dispatch with no free slot");
-        }
     }
 
     #[test]

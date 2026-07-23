@@ -22,6 +22,7 @@ pub mod project;
 pub mod quit_project;
 pub mod quit_shelbi;
 pub mod reload;
+pub mod review_confirm;
 pub mod send;
 pub mod spawn;
 pub mod status;
