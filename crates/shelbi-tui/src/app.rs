@@ -819,14 +819,20 @@ impl App {
         };
         match job.rx.try_recv() {
             Ok(Ok(target)) => {
-                // The review workspace's window now holds the server pane;
-                // switch to it so the review is on screen (the traveling
-                // sidebar follows via the `after-select-window` hook). The
-                // next refresh moves the card into the Ready-for-Review
-                // section. Best-effort: a failed switch just leaves focus put.
-                let _ = run_tmux(["select-window", "-t", &target]);
-                self.status_line = format!("▶ reviewing {}", job.task_id);
+                let task_id = job.task_id.clone();
                 self.review_job = None;
+                // The review workspace's window now holds the booted review
+                // agent/server pane. Build the three-column review interface
+                // (sidebar | agent | panel) inside it and switch to it, so the
+                // same click that started the review agent also opens the
+                // review panel — the load/serve state and branch/server
+                // details — instead of leaving the user on a bare agent window
+                // that only grows the panel on a *second* activation. This is
+                // the missing half of a Ready-for-Review click that had to
+                // launch the slot's window first (e.g. the row was already
+                // Ready when Shelbi restarted); the already-live path builds
+                // the same interface synchronously in `open_ready_review`.
+                self.open_loaded_review_interface(&task_id, &target);
             }
             Ok(Err(e)) => {
                 self.status_line = format!("review load failed: {e}");
@@ -842,6 +848,38 @@ impl App {
                 let idx = (job.started.elapsed().as_millis() / 100) as usize % FRAMES.len();
                 self.status_line =
                     format!("{} loading {} onto {}…", FRAMES[idx], job.task_id, job.workspace);
+            }
+        }
+    }
+
+    /// Build (and focus) the review interface for a task whose review slot has
+    /// just finished loading, falling back to a plain window switch when the
+    /// embed can't be constructed. Split out of [`App::poll_review_load`] so
+    /// the borrow of the in-flight job is released before the tmux round-trip.
+    ///
+    /// This closes the gap where clicking a Ready-for-Review row whose slot had
+    /// to be launched first booted the review agent but left the review panel
+    /// unopened: the click and the panel now land in one action, matching the
+    /// already-live click path in [`App::open_ready_review`]. Reusing
+    /// [`shelbi_orchestrator::review_ui::open_review_interface`] means the panel
+    /// shows the same review sub-state and branch/server details either way.
+    fn open_loaded_review_interface(&mut self, task_id: &str, target: &str) {
+        use shelbi_orchestrator::review_ui::ReviewOpenOutcome;
+        match shelbi_orchestrator::review_ui::open_review_interface(&self.project_name, task_id) {
+            Ok(ReviewOpenOutcome::Opened(_)) => {
+                self.status_line = format!("▶ reviewing {task_id}");
+            }
+            // Remote slot: the workspace window was already focused by
+            // `open_review_interface`; surface its note rather than re-focusing.
+            Ok(ReviewOpenOutcome::RemoteFallback(note)) => self.status_line = note,
+            // Loading / NeedsLaunch / an error (including the unit-test env with
+            // no tmux) mean the interface couldn't be embedded here. Don't kick
+            // off another load — that risks a launch loop — just focus the
+            // freshly loaded window so the review is at least on screen (the
+            // traveling sidebar follows via the `after-select-window` hook).
+            _ => {
+                let _ = run_tmux(["select-window", "-t", target]);
+                self.status_line = format!("▶ reviewing {task_id}");
             }
         }
     }
