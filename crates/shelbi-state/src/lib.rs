@@ -3078,17 +3078,19 @@ mod tests {
     fn default_workspace_settings_template_is_thin_claude_adapter() {
         let v: serde_json::Value =
             serde_json::from_str(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE).unwrap();
+        // Commands anchor the hook path with $CLAUDE_PROJECT_DIR so they
+        // resolve from any CWD, not just the worktree root.
         assert_eq!(
             v["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-            ".shelbi/hooks/session-start.sh",
+            "$CLAUDE_PROJECT_DIR/.shelbi/hooks/session-start.sh",
         );
         assert_eq!(
             v["hooks"]["Stop"][0]["hooks"][0]["command"],
-            ".shelbi/hooks/pane-idle.sh",
+            "$CLAUDE_PROJECT_DIR/.shelbi/hooks/pane-idle.sh",
         );
         assert_eq!(
             v["hooks"]["Stop"][1]["hooks"][0]["command"],
-            ".shelbi/hooks/stop.sh",
+            "$CLAUDE_PROJECT_DIR/.shelbi/hooks/stop.sh",
         );
     }
 

@@ -2039,10 +2039,36 @@ pub fn render_workspace_settings_preferring_agent(
         None => shelbi_state::render_workspace_settings(project)
             .map_err(|e| Error::Other(format!("{e}")))?,
     };
-    Ok(template.replace(
+    let template = template.replace(
         "{{workspace_permissions_mode}}",
         &project.workspace_permissions_mode,
-    ))
+    );
+    // Deploy-time migration: anchor any relative `.shelbi/hooks/…` hook command
+    // against `$CLAUDE_PROJECT_DIR` so it resolves from any CWD. A relative path
+    // breaks the moment the agent `cd`s out of the worktree root (`/bin/sh:
+    // .shelbi/hooks/pane-working.sh: No such file or directory`), silencing the
+    // pane-state title signal. Normalizing here — not just in the shipped
+    // template — heals every legacy source in one place: a per-agent
+    // `settings.json` or a project-wide `workspace-settings.json.template` left
+    // on disk by an older shelbi still carries the relative form, and both flow
+    // through this function before deploy.
+    Ok(anchor_shelbi_hook_paths(&template))
+}
+
+/// Rewrite relative Shelbi hook commands (`".shelbi/hooks/…"`) to the
+/// CWD-independent `"$CLAUDE_PROJECT_DIR/.shelbi/hooks/…"` form. Matches on the
+/// opening quote of the JSON string value so it only touches a *relative* hook
+/// path (one whose value begins with `.shelbi/hooks/`); the already-anchored
+/// form has a `/` before `.shelbi/hooks/`, never a quote, so this is idempotent
+/// and never double-prefixes. `.shelbi/hooks/` is Shelbi's exclusive scratch
+/// namespace, so any command under it is Shelbi's own — anchoring it is strictly
+/// a correctness fix and never rewrites a user-authored hook (those point
+/// elsewhere, e.g. `./my-hook.sh`).
+fn anchor_shelbi_hook_paths(settings: &str) -> String {
+    settings.replace(
+        "\".shelbi/hooks/",
+        "\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/",
+    )
 }
 
 /// Relative path (from the worktree root) of Claude Code's local settings
@@ -2053,11 +2079,15 @@ pub const WORKTREE_SETTINGS_LOCAL_REL: &str = ".claude/settings.local.json";
 
 /// The identifying marker for Shelbi's injected hooks: every command Shelbi
 /// wires references a script under this worktree-relative directory. Because
-/// the prefix is exclusive to Shelbi's own scratch namespace, its presence in a
-/// hook command is a reliable, version-stable signal that a given hook is
-/// Shelbi's — even after the block has been merged into a larger user-authored
-/// file. Refreshing the block never depends on byte-for-byte template equality,
-/// so template changes across shelbi versions don't misclassify.
+/// the substring is exclusive to Shelbi's own scratch namespace, its presence
+/// anywhere in a hook command is a reliable, version-stable signal that a given
+/// hook is Shelbi's — even after the block has been merged into a larger
+/// user-authored file. Classifiers match with `contains`, not `starts_with`,
+/// because the shipped command anchors the path with a `$CLAUDE_PROJECT_DIR/`
+/// prefix (so the hook resolves regardless of the agent's CWD) — the marker sits
+/// mid-string there, not at the head. Refreshing the block never depends on
+/// byte-for-byte template equality, so template changes across shelbi versions
+/// don't misclassify.
 const SHELBI_HOOK_COMMAND_PREFIX: &str = ".shelbi/hooks/";
 
 /// Outcome of [`wire_settings_local`].
@@ -2186,7 +2216,7 @@ fn is_shelbi_only_settings(value: &serde_json::Value) -> bool {
     let mut saw_command = false;
     let all_shelbi = for_each_hook_command(hooks, &mut |cmd| {
         saw_command = true;
-        cmd.starts_with(SHELBI_HOOK_COMMAND_PREFIX)
+        cmd.contains(SHELBI_HOOK_COMMAND_PREFIX)
     });
     all_shelbi && saw_command
 }
@@ -2203,7 +2233,7 @@ fn settings_contain_shelbi_hooks(value: &serde_json::Value) -> bool {
     let mut found = false;
     // Return `true` from the visitor to keep scanning; we only need one hit.
     for_each_hook_command(hooks, &mut |cmd| {
-        if cmd.starts_with(SHELBI_HOOK_COMMAND_PREFIX) {
+        if cmd.contains(SHELBI_HOOK_COMMAND_PREFIX) {
             found = true;
         }
         true
@@ -4817,11 +4847,23 @@ mod tests {
     }
 
     /// A minimal Shelbi hook block — the marker is the exclusive
-    /// `.shelbi/hooks/` command prefix, not byte-for-byte template identity.
+    /// `.shelbi/hooks/` command substring, not byte-for-byte template identity.
     const TEST_SHELBI_BLOCK: &str = r#"{
   "hooks": {
     "SessionStart": [
       { "hooks": [ { "type": "command", "command": ".shelbi/hooks/session-start.sh" } ] }
+    ]
+  }
+}
+"#;
+
+    /// The shipped block anchors each hook path with `$CLAUDE_PROJECT_DIR/` so
+    /// it resolves from any CWD. The marker then sits mid-string, not at the
+    /// head — the classifiers must match it with `contains`, not `starts_with`.
+    const TEST_SHELBI_BLOCK_ANCHORED: &str = r#"{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.shelbi/hooks/session-start.sh" } ] }
     ]
   }
 }
@@ -4832,6 +4874,69 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(TEST_SHELBI_BLOCK).unwrap();
         assert!(is_shelbi_only_settings(&v));
         assert!(settings_contain_shelbi_hooks(&v));
+    }
+
+    #[test]
+    fn anchor_shelbi_hook_paths_migrates_relative_and_is_idempotent() {
+        // Relative Shelbi hook path → anchored.
+        let relative = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":".shelbi/hooks/pane-working.sh"}]}]}}"#;
+        let anchored = anchor_shelbi_hook_paths(relative);
+        assert!(anchored.contains("\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/pane-working.sh\""));
+        assert!(
+            !anchored.contains("\".shelbi/hooks/"),
+            "no relative Shelbi command should survive: {anchored}"
+        );
+        // Idempotent: a second pass never double-prefixes.
+        assert_eq!(anchor_shelbi_hook_paths(&anchored), anchored);
+        // A user-authored hook outside Shelbi's namespace is untouched.
+        let user = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"./my-hook.sh"}]}]}}"#;
+        assert_eq!(anchor_shelbi_hook_paths(user), user);
+    }
+
+    #[test]
+    fn classifiers_recognize_cwd_anchored_command_form() {
+        // Regression: the shipped command is now
+        // `$CLAUDE_PROJECT_DIR/.shelbi/hooks/…`, where the Shelbi marker is not a
+        // prefix. Both classifiers must still recognize it as Shelbi-owned, or a
+        // relaunch would fail to refresh (case 2) and instead re-merge the block,
+        // duplicating it.
+        let v: serde_json::Value =
+            serde_json::from_str(TEST_SHELBI_BLOCK_ANCHORED).unwrap();
+        assert!(is_shelbi_only_settings(&v));
+        assert!(settings_contain_shelbi_hooks(&v));
+    }
+
+    #[test]
+    fn wire_settings_local_migrates_relative_hooks_to_anchored_form() {
+        // A worktree deployed by an older shelbi has a Shelbi-only
+        // settings.local.json with *relative* hook commands
+        // (`.shelbi/hooks/…`), which break the moment the agent `cd`s out of the
+        // worktree root. On the next launch, the relative file is still
+        // classified as Shelbi-only (case 2) and refreshed in place to the
+        // current CWD-anchored block.
+        let wt = wiring_tmp_worktree("migrate");
+        let path = wt.join(".claude/settings.local.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":".shelbi/hooks/pane-working.sh"}]}]}}"#,
+        )
+        .unwrap();
+        let res =
+            wire_settings_local(&Host::Local, &wt, "alpha", TEST_SHELBI_BLOCK_ANCHORED).unwrap();
+        assert!(matches!(res, SettingsWireResult::Wired));
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, TEST_SHELBI_BLOCK_ANCHORED);
+        assert!(
+            written.contains("$CLAUDE_PROJECT_DIR/.shelbi/hooks/session-start.sh"),
+            "migrated file must carry the anchored command: {written}"
+        );
+        // Idempotent: re-wiring the now-anchored file is a clean refresh, not a
+        // duplicating re-merge.
+        let res2 =
+            wire_settings_local(&Host::Local, &wt, "alpha", TEST_SHELBI_BLOCK_ANCHORED).unwrap();
+        assert!(matches!(res2, SettingsWireResult::Wired));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), TEST_SHELBI_BLOCK_ANCHORED);
+        let _ = std::fs::remove_dir_all(wt.parent().unwrap());
     }
 
     #[test]
@@ -5777,10 +5882,15 @@ mod tests {
             !rendered.contains(shelbi_state::STALE_HOOK_COMMAND_MARKER),
             "stale hook block must not be deployed: {rendered}",
         );
-        // Fell back to the project-wide template (neutral `<name>.sh` hooks).
+        // Fell back to the project-wide template (neutral `<name>.sh` hooks),
+        // anchored against $CLAUDE_PROJECT_DIR so they resolve from any CWD.
         assert!(
-            rendered.contains(".shelbi/hooks/pane-working.sh"),
-            "fallback must carry the current neutral hook paths: {rendered}",
+            rendered.contains("$CLAUDE_PROJECT_DIR/.shelbi/hooks/pane-working.sh"),
+            "fallback must carry the current anchored hook paths: {rendered}",
+        );
+        assert!(
+            !rendered.contains("\".shelbi/hooks/"),
+            "no relative Shelbi hook command should be deployed: {rendered}",
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -5906,9 +6016,17 @@ mod tests {
             !deployed.contains(shelbi_state::STALE_HOOK_COMMAND_MARKER),
             "no dead pre-rename hook paths may be deployed: {deployed}",
         );
+        // Hook commands are anchored against $CLAUDE_PROJECT_DIR so they resolve
+        // even when a tool call runs with a CWD other than the worktree root
+        // (e.g. after the agent `cd`s into `site/`). A relative command would
+        // fire `No such file or directory` and silence the pane-state signal.
         assert!(
-            deployed.contains(".shelbi/hooks/pane-working.sh"),
-            "deployed hooks must use the current neutral paths: {deployed}",
+            deployed.contains("$CLAUDE_PROJECT_DIR/.shelbi/hooks/pane-working.sh"),
+            "deployed hooks must be anchored against $CLAUDE_PROJECT_DIR: {deployed}",
+        );
+        assert!(
+            !deployed.contains("\".shelbi/hooks/"),
+            "no relative Shelbi hook command may be deployed: {deployed}",
         );
         for name in [
             "session-start.sh",
