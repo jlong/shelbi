@@ -139,13 +139,14 @@ export function Footer() {
               MIT License
             </Link>
             <span className="px-2 text-gray-5">&middot;</span>
+            Sponsored by{" "}
             <Link
               href="https://32pixels.co"
               target="_blank"
               rel="noopener noreferrer"
               className="transition-colors hover:text-fg"
             >
-              Sponsored by 32pixels
+              32pixels
             </Link>
           </p>
         </div>
