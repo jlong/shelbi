@@ -367,6 +367,17 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__palette")]
     Palette { project: String },
+    /// (internal) Render the "Load for review" yes/no confirm — meant to be
+    /// invoked inside a `tmux display-popup` by the sidebar. Exits 0 on
+    /// confirm, non-zero on cancel / no free slot. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__review-confirm")]
+    ReviewConfirm {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        workspace: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -462,6 +473,12 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Popup) => commands::popup::run(),
         Some(Cmd::Palette { project }) => commands::palette::run(project),
+        Some(Cmd::ReviewConfirm { title, workspace }) => {
+            // The sidebar reads our exit code as the decision: 0 = confirm,
+            // non-zero = cancel / no free slot.
+            let confirmed = commands::review_confirm::run(title, workspace)?;
+            std::process::exit(if confirmed { 0 } else { 1 });
+        }
         Some(Cmd::ZenOrchStart { project }) => commands::zen_lifecycle::orch_start(&project),
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),
         Some(Cmd::ZenOrchExit { project }) => commands::zen_lifecycle::orch_exit(&project),
