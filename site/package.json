@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "predev": "contentlayer2 build",
-    "dev": "concurrently -n content,next -c magenta,cyan \"contentlayer2 dev\" \"next dev\"",
+    "dev": "concurrently --passthrough-arguments -n content,next -c magenta,cyan \"contentlayer2 dev\" \"next dev {@}\" --",
     "prebuild": "contentlayer2 build",
     "build": "next build",
     "start": "next start",
