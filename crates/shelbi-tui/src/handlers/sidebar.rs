@@ -1,4 +1,6 @@
-use std::time::Duration;
+use std::any::Any;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -32,7 +34,7 @@ pub fn sidebar_loop<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> Result
         // shows up on the next frame without the UI thread ever blocking.
         app.poll_review_load();
 
-        term.draw(|f| sidebar::render_full(f, app, f.area()))?;
+        draw_sidebar_self_healing(term, app)?;
 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
@@ -51,6 +53,73 @@ pub fn sidebar_loop<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> Result
         }
     }
     Ok(())
+}
+
+/// Draw one sidebar frame, self-healing instead of dying on a render fault.
+///
+/// The sidebar is the persistent left pane, and — unlike the tasks/activity
+/// panes — a render-pass panic that unwound out of `run_sidebar` would drop
+/// the whole process, leaving the pane blank with no crash event for the
+/// supervisor to catch. So the draw is wrapped in [`catch_unwind`]: on a
+/// caught panic we log it, ask [`App::recover_render_panic`] to count the
+/// recovery, and force a full repaint on the next frame (the panicked frame
+/// may have left ratatui's back buffer half-updated). Genuine backend I/O
+/// errors still propagate — those aren't render faults.
+///
+/// A separate invariant check emits an observable signal when tmux hands the
+/// pane a degenerate (zero/one-column) size, so a "sidebar vanished" report
+/// is diagnosable from `tui.log` even though the pane repaints itself once a
+/// usable size returns.
+fn draw_sidebar_self_healing<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> Result<()> {
+    if let Ok(size) = term.size() {
+        if let Some(signal) = app.note_sidebar_area(size.width, size.height, Instant::now()) {
+            tracing::warn!("{signal}");
+        }
+    }
+    guarded_draw(term, app, |f, app| {
+        sidebar::render_full(f, app, f.area());
+    })
+}
+
+/// The panic-guarded core of [`draw_sidebar_self_healing`], parameterized on
+/// the render pass so a test can force it to panic and assert the self-heal
+/// (count the recovery, repaint, keep drawing) without a live terminal.
+/// Production passes [`sidebar::render_full`].
+fn guarded_draw<B, R>(term: &mut Terminal<B>, app: &mut App, mut render: R) -> Result<()>
+where
+    B: Backend,
+    R: FnMut(&mut ratatui::Frame, &mut App),
+{
+    // Discard the `CompletedFrame` inside the closure — it borrows `term`, so
+    // it can't escape the `catch_unwind` boundary.
+    let drew = catch_unwind(AssertUnwindSafe(|| {
+        term.draw(|f| render(f, app)).map(|_| ())
+    }));
+    match drew {
+        // Clean frame, or a real backend write error (propagate the latter —
+        // it's a dead terminal, not a recoverable render fault).
+        Ok(res) => res.map_err(Into::into),
+        Err(payload) => {
+            let signal = app.recover_render_panic(&panic_message(payload.as_ref()));
+            tracing::error!("{signal}");
+            // Repaint from scratch next frame — the aborted draw may have left
+            // the back buffer inconsistent with what's on the pane.
+            let _ = term.clear();
+            Ok(())
+        }
+    }
+}
+
+/// Best-effort human string for a caught panic payload. `panic!`/`assert!`
+/// carry a `&str` or `String`; anything else is opaque.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
 }
 
 /// Dispatch a key press through the merged keymaps. Global chords (Quit,
@@ -118,7 +187,35 @@ mod tests {
     use super::*;
     use crate::test_support::ENV_LOCK;
     use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::{backend::TestBackend, Terminal};
     use shelbi_state::keymap::load_keymaps;
+
+    /// Forcing the failure condition from the task: a panic in the sidebar
+    /// render pass must be caught and healed, not unwound out of the loop
+    /// (which would drop the process and leave the pane blank). The recovery
+    /// is counted and the next clean draw succeeds against the same terminal.
+    #[test]
+    fn guarded_draw_recovers_from_a_render_panic() {
+        // Silence the panic hook for this thread's forced panic so the test
+        // log stays clean; restore it afterwards.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let mut term = Terminal::new(TestBackend::new(24, 12)).unwrap();
+        let mut app = App::new_sidebar("demo");
+
+        let healed = guarded_draw(&mut term, &mut app, |_f, _app| panic!("render boom"));
+        std::panic::set_hook(prev);
+
+        assert!(healed.is_ok(), "a render panic must be caught, not propagated");
+        assert_eq!(app.render_panics, 1, "the recovery is counted");
+
+        // The pane keeps drawing: a subsequent clean frame renders fine.
+        let ok = guarded_draw(&mut term, &mut app, |f, app| {
+            sidebar::render_full(f, app, f.area());
+        });
+        assert!(ok.is_ok(), "the loop draws normally after recovery");
+    }
 
     fn fresh_home() -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(

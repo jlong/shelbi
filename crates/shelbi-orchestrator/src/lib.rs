@@ -1317,9 +1317,18 @@ fn current_exe_string() -> Result<String> {
         .into_owned())
 }
 
+// The sidebar is a real ratatui app (`shelbi __sidebar <p>`) and, until this
+// fix, the only persistent dashboard pane that ran it bare. If the process
+// ever exits — a render-pass panic that escapes the loop, an accidental
+// Ctrl-C, an OOM — tmux closes the pane and the sidebar simply vanishes with
+// no crash event for the supervisor to catch: the supervisor relaunches dead
+// *panes*, but the surviving orchestrator pane keeps the dashboard window
+// alive so tmux only drops the sidebar's own pane, and nothing respawns it.
+// Wrap it in the same `while true` respawn loop tasks/activity use so a dead
+// sidebar process relaunches in place instead of leaving the pane empty.
 fn sidebar_cmd(shelbi_bin: &str, project_name: &str) -> String {
     format!(
-        "{bin} __sidebar {proj}",
+        "while true; do {bin} __sidebar {proj}; sleep 1; done",
         bin = shelbi_agent::shell_escape(shelbi_bin),
         proj = shelbi_agent::shell_escape(project_name),
     )
@@ -2188,9 +2197,15 @@ mod pane_cmd_tests {
     // disagree on what the pane runs.
 
     #[test]
-    fn sidebar_cmd_is_invocation_of_internal_subcommand() {
+    fn sidebar_cmd_wraps_in_respawn_loop() {
+        // The sidebar must respawn like tasks/activity — a dead sidebar
+        // process would otherwise leave its pane empty with nothing to
+        // reload it (see the self-heal fix in the pane cmd builder).
         let out = sidebar_cmd("/usr/local/bin/shelbi", "myapp");
-        assert_eq!(out, "/usr/local/bin/shelbi __sidebar myapp");
+        assert_eq!(
+            out,
+            "while true; do /usr/local/bin/shelbi __sidebar myapp; sleep 1; done"
+        );
     }
 
     #[test]
@@ -2756,7 +2771,10 @@ mod pane_cmd_tests {
         // A binary path with spaces (`/Users/jane doe/.cargo/bin/shelbi`)
         // would tear apart in `sh -c` without quoting.
         let out = sidebar_cmd("/Users/jane doe/.cargo/bin/shelbi", "myapp");
-        assert_eq!(out, "'/Users/jane doe/.cargo/bin/shelbi' __sidebar myapp");
+        assert_eq!(
+            out,
+            "while true; do '/Users/jane doe/.cargo/bin/shelbi' __sidebar myapp; sleep 1; done"
+        );
     }
 
     #[test]
