@@ -271,6 +271,21 @@ enum Cmd {
         #[arg(value_name = "NAME")]
         name: Option<String>,
     },
+    /// Cleanly tear down the running project from the command line — the
+    /// teardown counterpart to `shelbi reload`. Closes the orchestrator
+    /// pane, the shelbi-owned TUI panes (sidebar + tasks/machines), and
+    /// both of the project's tmux sessions (`shelbi-<project>` and the
+    /// hidden `_shelbi-<project>` views stash).
+    ///
+    /// Workspace worktrees and branches are left intact: a workspace
+    /// mid-task keeps its durable worktree + branch on disk, so the work
+    /// resumes on the next launch and only the panes are stopped. If any
+    /// workspace still holds an active task you're warned and asked to
+    /// confirm — pass `-y` to skip. Before its pane is torn down the
+    /// orchestrator is given the chance to write
+    /// `agents/orchestrator/handoff.md`, so a later relaunch resumes with
+    /// context. Running it on an already-stopped project is a clean no-op.
+    Quit,
     /// (internal) Run the sidebar ratatui process inside the dashboard's
     /// left pane. Not for direct use.
     #[command(hide = true)]
@@ -431,6 +446,7 @@ fn main() -> Result<()> {
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
         Some(Cmd::Orchestrator { cmd }) => commands::orchestrator::run(cli.project, cmd),
         Some(Cmd::Reload { target, name }) => commands::reload::run(cli.project, target, name),
+        Some(Cmd::Quit) => commands::quit::run(cli.project, cli.yes),
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
         Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),
         Some(Cmd::Activity { project }) => shelbi_tui::run_activity(&project).context("activity"),
