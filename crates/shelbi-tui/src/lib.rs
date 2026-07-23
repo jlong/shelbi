@@ -229,6 +229,16 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     // exit path we took.
     let _poller = WorkspacePoller::start(project_name);
 
+    // Route panic diagnostics to `tui.log`. The render loop catches a
+    // render-pass panic and repaints (see `draw_sidebar_self_healing`), but
+    // the panic hook still runs first — the *default* hook writes to stderr,
+    // which on this pane is the shared ratatui TTY and would bleed the panic
+    // message across the sidebar until the next full repaint. Sink it to
+    // `tracing` (→ `~/.shelbi/logs/tui.log`) instead so recovery stays clean.
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!("sidebar panic: {info}");
+    }));
+
     let result = handlers::sidebar::sidebar_loop(&mut term, &mut app);
 
     restore_terminal(&mut term).context("restoring terminal")?;

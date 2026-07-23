@@ -12,6 +12,18 @@ use shelbi_state::{
     toggle_sidebar_machine_collapsed, TaskFile, WorkspaceState, ZenModeState, ZenToggleChord,
 };
 
+/// Sidebar render area floor. Below two columns / two rows the pane can't
+/// fit the 1-col horizontal padding plus a content cell — it renders as an
+/// empty sliver that reads as "the sidebar is gone". Used by
+/// [`App::note_sidebar_area`] to emit an observable collapse signal.
+const MIN_SIDEBAR_WIDTH: u16 = 2;
+const MIN_SIDEBAR_HEIGHT: u16 = 2;
+
+/// How long to suppress repeat "sidebar area collapsed" diagnostics while
+/// the pane stays degenerate — the render loop ticks every 200ms, so an
+/// unthrottled warning would flood `tui.log`.
+const COLLAPSE_WARN_THROTTLE: Duration = Duration::from_secs(3);
+
 /// What's currently highlighted in the sidebar — drives selection logic
 /// only; the right pane (orchestrator / agent) is a real tmux pane, not
 /// rendered by this process.
@@ -214,6 +226,16 @@ pub struct App {
     /// [`App::poll_review_load`] drains its channel each loop tick and swaps
     /// the outcome (or an animated spinner) into [`App::status_line`].
     review_job: Option<ReviewLoadJob>,
+    /// Count of render-pass panics the sidebar loop has caught and healed
+    /// from. Purely diagnostic — surfaced in the recovery log line so a
+    /// repeatedly-panicking frame is distinguishable from a one-off in
+    /// `tui.log`. See [`App::recover_render_panic`].
+    pub render_panics: u32,
+    /// Throttle for the "sidebar area collapsed" diagnostic. Holds the last
+    /// instant a degenerate render size was logged so a persistently tiny
+    /// pane doesn't flood `tui.log` at the 200ms render cadence; cleared
+    /// once the size recovers. See [`App::note_sidebar_area`].
+    last_collapse_warn: Option<Instant>,
 }
 
 /// A review load running on a worker thread. Holds the channel the thread
@@ -249,6 +271,8 @@ impl App {
             daemon_version_line: None,
             daemon_version_mismatch: false,
             review_job: None,
+            render_panics: 0,
+            last_collapse_warn: None,
         }
     }
 
@@ -718,6 +742,55 @@ impl App {
                 self.start_review_load(id.to_string(), workspace);
             }
         }
+    }
+
+    /// Recover sidebar state after the render pass panicked. A panic while
+    /// drawing must not blank the pane, so the loop catches the unwind and
+    /// calls this to self-heal: bump the diagnostic counter and hand back a
+    /// description of what was reset for the caller to log, so the next frame
+    /// repaints the sidebar from scratch instead of leaving the region gone.
+    /// Pure / no-IO so the self-heal path is unit-testable without a live
+    /// terminal.
+    ///
+    /// (Before PR #465 this also dropped an in-sidebar review-load modal
+    /// overlay — the surface implicated in the drag-drop / large-paste-burst
+    /// repro. That confirm now renders in a centered tmux popup outside this
+    /// process, so there is no in-sidebar overlay left to drop; recovery is
+    /// simply repaint + count + log.)
+    pub fn recover_render_panic(&mut self, panic_msg: &str) -> String {
+        self.render_panics = self.render_panics.saturating_add(1);
+        format!(
+            "sidebar render panicked ({panic_msg}); repainting (recovery #{})",
+            self.render_panics
+        )
+    }
+
+    /// Note the terminal size the sidebar is about to render into. Returns a
+    /// diagnostic message when the pane has collapsed below the usable floor
+    /// — a zero/one-column sidebar renders blank and reads as "gone" — so the
+    /// caller can log an observable signal. Rate-limited to once every few
+    /// seconds (`now` is injected for testability) so a persistently tiny
+    /// pane can't flood `tui.log` at the render cadence; returns `None` when
+    /// the size is healthy, clearing the throttle so the next collapse logs
+    /// immediately. The pane self-heals on its own once tmux restores a sane
+    /// size — the next render repaints — so this is a signal, not a fix.
+    pub fn note_sidebar_area(&mut self, width: u16, height: u16, now: Instant) -> Option<String> {
+        let degenerate = width < MIN_SIDEBAR_WIDTH || height < MIN_SIDEBAR_HEIGHT;
+        if !degenerate {
+            self.last_collapse_warn = None;
+            return None;
+        }
+        let throttled = self
+            .last_collapse_warn
+            .is_some_and(|t| now.duration_since(t) < COLLAPSE_WARN_THROTTLE);
+        if throttled {
+            return None;
+        }
+        self.last_collapse_warn = Some(now);
+        Some(format!(
+            "sidebar render area collapsed to {width}x{height}; \
+             pane will repaint when tmux restores a usable size"
+        ))
     }
 
     /// Kick off a background load of `task_id` onto the review slot
@@ -3251,6 +3324,61 @@ mod tests {
         assert_eq!(app.zen_mode, shelbi_state::ZenModeState::On);
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn recover_render_panic_counts_the_recovery_and_carries_the_panic_text() {
+        let mut app = App::new_sidebar("demo");
+        let msg = app.recover_render_panic("index out of bounds");
+        assert_eq!(app.render_panics, 1);
+        assert!(msg.contains("index out of bounds"), "carries the panic text: {msg}");
+        assert!(msg.contains("repainting"), "names the recovery action: {msg}");
+        assert!(msg.contains("recovery #1"), "carries the counter: {msg}");
+    }
+
+    #[test]
+    fn recover_render_panic_bumps_the_counter_each_time() {
+        let mut app = App::new_sidebar("demo");
+        let first = app.recover_render_panic("boom");
+        let second = app.recover_render_panic("boom again");
+        assert_eq!(app.render_panics, 2, "each caught panic bumps the counter");
+        assert!(first.contains("recovery #1"), "first recovery: {first}");
+        assert!(second.contains("recovery #2"), "counter climbs: {second}");
+    }
+
+    #[test]
+    fn note_sidebar_area_signals_only_on_a_collapsed_pane() {
+        let mut app = App::new_sidebar("demo");
+        let t0 = Instant::now();
+        // A healthy pane is silent.
+        assert!(app.note_sidebar_area(40, 24, t0).is_none());
+        // A zero/one-column pane reads as "gone" — emit a diagnostic.
+        let signal = app.note_sidebar_area(0, 24, t0).expect("collapse must signal");
+        assert!(signal.contains("collapsed to 0x24"), "got: {signal}");
+    }
+
+    #[test]
+    fn note_sidebar_area_throttles_repeat_collapse_signals() {
+        let mut app = App::new_sidebar("demo");
+        let t0 = Instant::now();
+        // First collapse logs; a rapid repeat within the throttle window is
+        // suppressed so the 200ms render cadence can't flood tui.log.
+        assert!(app.note_sidebar_area(1, 24, t0).is_some());
+        assert!(app
+            .note_sidebar_area(1, 24, t0 + Duration::from_millis(200))
+            .is_none());
+        // Past the throttle window it logs again.
+        assert!(app
+            .note_sidebar_area(1, 24, t0 + COLLAPSE_WARN_THROTTLE + Duration::from_millis(1))
+            .is_some());
+        // A recovery to a healthy size clears the throttle so the next
+        // collapse signals immediately.
+        assert!(app
+            .note_sidebar_area(40, 24, t0 + Duration::from_secs(10))
+            .is_none());
+        assert!(app
+            .note_sidebar_area(1, 24, t0 + Duration::from_secs(10))
+            .is_some());
     }
 
     #[test]
