@@ -19,6 +19,7 @@ pub mod orchestrator;
 pub mod palette;
 pub mod popup;
 pub mod project;
+pub mod quit;
 pub mod quit_project;
 pub mod quit_shelbi;
 pub mod reload;
