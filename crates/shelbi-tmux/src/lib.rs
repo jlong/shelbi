@@ -210,6 +210,29 @@ fn interpret_has_session(code: Option<i32>) -> Option<bool> {
 pub fn has_session(host: &Host, name: &str) -> Result<bool> {
     let argv = has_session_argv(name);
     let out = shelbi_ssh::run(host, &argv).map_err(Error::Io)?;
+    classify_has_session(&argv, &out)
+}
+
+/// Like [`has_session`], but bounds the underlying `ssh`/`tmux` call at
+/// `deadline` wall-clock (via [`shelbi_ssh::run_with_deadline`]). A wedged SSH
+/// transport is killed and reported as `ErrorKind::TimedOut` rather than
+/// blocking forever. Used on the poller supervisor/heartbeat thread
+/// (`orchestrator_pane_alive`), where an un-timed call could freeze the same
+/// thread that emits the project heartbeat.
+pub fn has_session_with_deadline(
+    host: &Host,
+    name: &str,
+    deadline: std::time::Duration,
+) -> Result<bool> {
+    let argv = has_session_argv(name);
+    let out = shelbi_ssh::run_with_deadline(host, &argv, deadline).map_err(Error::Io)?;
+    classify_has_session(&argv, &out)
+}
+
+/// Shared result classifier for [`has_session`] / [`has_session_with_deadline`]:
+/// tmux exits 0 (exists) / 1 (absent); any other code (a transport failure) is
+/// an error, not `Ok(false)`, so callers don't silently skip on a blip.
+fn classify_has_session(argv: &[String], out: &std::process::Output) -> Result<bool> {
     match interpret_has_session(out.status.code()) {
         Some(exists) => Ok(exists),
         None => Err(Error::Command {

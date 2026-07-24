@@ -259,17 +259,25 @@ pub fn orchestrator_pane_alive(project_name: &str) -> Result<bool> {
     };
     let host = hub.host();
     let session = dashboard_addr(project_name).session;
-    if !shelbi_tmux::has_session(&host, &session)? {
+    // This runs on the poller supervisor/heartbeat thread. Bound every remote
+    // call with a wall-clock deadline: on a remote-hub (or a wedged local tmux
+    // server) an un-timed `ssh`/`tmux` here could freeze the very thread that
+    // emits the project heartbeat. `crate::workspace::probe_deadline` is the
+    // same bound the workspace-liveness probes use.
+    let deadline = crate::workspace::probe_deadline();
+    if !shelbi_tmux::has_session_with_deadline(&host, &session, deadline)? {
         // Session gone (the user quit the project / shelbi) — the whole
         // dashboard is down by design, not a crash to paper over.
         return Ok(true);
     }
-    let Some(pane_id) = read_session_env_var(&host, &session, "SHELBI_PANE_orch")? else {
+    let Some(pane_id) =
+        read_session_env_var_with_deadline(&host, &session, "SHELBI_PANE_orch", deadline)?
+    else {
         // Never stashed (a session that pre-dates the pin, or one still
         // bootstrapping) — don't second-guess it.
         return Ok(true);
     };
-    pane_id_alive(&host, &pane_id)
+    pane_id_alive_with_deadline(&host, &pane_id, deadline)
 }
 
 /// Is `pane_id` (a stable tmux `%N`) among the server's live panes? A failed
@@ -278,11 +286,37 @@ pub fn orchestrator_pane_alive(project_name: &str) -> Result<bool> {
 fn pane_id_alive(host: &Host, pane_id: &str) -> Result<bool> {
     let out = shelbi_ssh::run(host, ["tmux", "list-panes", "-a", "-F", "#{pane_id}"])
         .map_err(Error::Io)?;
+    Ok(pane_in_list_output(&out, pane_id))
+}
+
+/// [`pane_id_alive`], but bounds the underlying `ssh`/`tmux` call at `deadline`
+/// so a wedged transport on the supervisor/heartbeat thread can't freeze it. A
+/// timeout surfaces as `Err` (the caller in `crate::supervision` treats that
+/// conservatively — assume alive, don't relaunch).
+fn pane_id_alive_with_deadline(
+    host: &Host,
+    pane_id: &str,
+    deadline: std::time::Duration,
+) -> Result<bool> {
+    let out = shelbi_ssh::run_with_deadline(
+        host,
+        ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+        deadline,
+    )
+    .map_err(Error::Io)?;
+    Ok(pane_in_list_output(&out, pane_id))
+}
+
+/// Shared parse for [`pane_id_alive`] / [`pane_id_alive_with_deadline`]: a
+/// non-zero exit is treated as "not found" (dead), matching the conservative
+/// liveness convention.
+fn pane_in_list_output(out: &std::process::Output, pane_id: &str) -> bool {
     if !out.status.success() {
-        return Ok(false);
+        return false;
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(stdout.lines().any(|p| p.trim() == pane_id))
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|p| p.trim() == pane_id)
 }
 
 /// Swap the named view's pane into the dashboard's right slot. `view` is
@@ -914,18 +948,44 @@ fn read_session_env_var(
     let target = shelbi_tmux::session_target(session);
     let out = shelbi_ssh::run(host, ["tmux", "show-environment", "-t", &target, key])
         .map_err(Error::Io)?;
+    Ok(parse_session_env_var(&out))
+}
+
+/// [`read_session_env_var`], but bounds the `ssh`/`tmux` call at `deadline` so a
+/// wedged transport on the supervisor/heartbeat thread can't freeze it (see
+/// [`orchestrator_pane_alive`]).
+fn read_session_env_var_with_deadline(
+    host: &shelbi_core::Host,
+    session: &str,
+    key: &str,
+    deadline: std::time::Duration,
+) -> Result<Option<String>> {
+    let target = shelbi_tmux::session_target(session);
+    let out = shelbi_ssh::run_with_deadline(
+        host,
+        ["tmux", "show-environment", "-t", &target, key],
+        deadline,
+    )
+    .map_err(Error::Io)?;
+    Ok(parse_session_env_var(&out))
+}
+
+/// Shared parse for the `read_session_env_var*` pair. tmux exits non-zero for an
+/// unknown variable — a legitimate "unset", not an error — and prints `-KEY`
+/// when the variable is explicitly cleared; both map to `None`.
+fn parse_session_env_var(out: &std::process::Output) -> Option<String> {
     if !out.status.success() {
-        return Ok(None);
+        return None;
     }
     let line = String::from_utf8_lossy(&out.stdout);
     let line = line.trim();
     // `-KEY` form means the variable is explicitly unset on this session.
     if line.starts_with('-') {
-        return Ok(None);
+        return None;
     }
     match line.split_once('=') {
-        Some((_, value)) if !value.is_empty() => Ok(Some(value.to_string())),
-        _ => Ok(None),
+        Some((_, value)) if !value.is_empty() => Some(value.to_string()),
+        _ => None,
     }
 }
 
