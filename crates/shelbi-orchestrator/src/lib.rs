@@ -74,8 +74,17 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = shelbi_state::DEFAULT_ORCHESTRATOR_INSTR
 // orchestrator gets noticeably more room on both narrow and wide
 // terminals than the previous fixed 30% split.
 const SIDEBAR_MIN_COLS: u32 = 24;
-const SIDEBAR_MAX_COLS: u32 = 40;
+pub(crate) const SIDEBAR_MAX_COLS: u32 = 40;
 const SIDEBAR_TARGET_PCT: u32 = 25;
+
+/// The canonical sidebar column width for a window of `window_width` columns:
+/// `SIDEBAR_TARGET_PCT%` of the window, clamped to `[MIN, MAX]`. This is the
+/// Rust twin of the formula baked into [`sidebar_clamp_script`]; callers that
+/// need the sidebar's *default opening* width (e.g. the review panel's initial
+/// split) share this one policy so the two never drift.
+pub(crate) fn sidebar_cols_for(window_width: u32) -> u32 {
+    (window_width * SIDEBAR_TARGET_PCT / 100).clamp(SIDEBAR_MIN_COLS, SIDEBAR_MAX_COLS)
+}
 
 /// Session env var pinning the stable tmux pane id (`%N`) of the single
 /// *traveling* sidebar pane. Unlike `SHELBI_PANE_orch` (a stashed view the
@@ -2284,6 +2293,16 @@ mod pane_cmd_tests {
             out,
             "while true; do /usr/local/bin/shelbi __activity myapp; sleep 1; done"
         );
+    }
+
+    #[test]
+    fn sidebar_cols_for_clamps_to_the_band() {
+        // Below the min: a narrow window still yields at least MIN cols.
+        assert_eq!(sidebar_cols_for(40), SIDEBAR_MIN_COLS); // 40*25/100 = 10 -> 24
+        // Within the band: tracks SIDEBAR_TARGET_PCT of the window width.
+        assert_eq!(sidebar_cols_for(120), 30); // 120*25/100 = 30
+        // Above the max: a wide window is capped at MAX cols.
+        assert_eq!(sidebar_cols_for(400), SIDEBAR_MAX_COLS); // 400*25/100 = 100 -> 40
     }
 
     #[test]
