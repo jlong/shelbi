@@ -413,10 +413,14 @@ struct HeartbeatSchedule {
 ///    clock oddity) is clamped back to `now + max`, so "next due" can never
 ///    recede indefinitely and the emitter recovers on the next tick without a
 ///    manual state edit.
-/// 6. **Paused while offline** — if `is_online()` returns false at emit time,
-///    skip silently. The schedule still advances (by the current interval, no
-///    back-off change) so we don't probe every tick, and emission resumes on
-///    the first due tick after connectivity is back.
+/// 6. **Paused while offline, but bounded** — if `is_online()` returns false at
+///    emit time, skip silently (a heartbeat the orchestrator can't act on is
+///    noise). The schedule advances so we don't probe every tick, but the defer
+///    is capped at the same `window_start + standard` deadline the event
+///    debounce uses and the cadence snaps back to standard: a single
+///    connectivity blip on a quiescent board backed off toward `max` costs at
+///    most one `standard`, never a full `max`. Emission resumes on the first due
+///    tick after connectivity is back.
 fn maybe_emit_heartbeat(
     project: &Project,
     schedule: &mut HeartbeatSchedule,
@@ -491,8 +495,21 @@ fn maybe_emit_heartbeat(
     if !is_online() {
         // Offline: emit nothing (a heartbeat the orchestrator can't act on is
         // pure noise) but keep the schedule advancing so we don't probe every
-        // supervisor tick. Leave the back-off level untouched.
-        schedule.next_attempt = Some(now + current_interval);
+        // supervisor tick. Bound the defer by the *same* reset-on-event window
+        // deadline the debounce above uses: on a quiescent board backed off
+        // toward `max`, advancing by `current_interval` (which can be `max`)
+        // let a single connectivity blip suppress the heartbeat for a whole
+        // `max` interval. Snap the cadence back to standard and retry within
+        // one `standard` (never past the window deadline) so a brief blip costs
+        // at most a standard interval, not a full `max`.
+        let window_start = schedule.window_start.unwrap_or(now - current_interval);
+        let deadline = window_start + standard;
+        schedule.interval = Some(standard);
+        schedule.next_attempt = Some(if now < deadline {
+            deadline.min(now + standard)
+        } else {
+            now + standard
+        });
         return;
     }
 
@@ -4513,6 +4530,71 @@ transitions:
             online_hb_lines.len(),
             1,
             "exactly one heartbeat after reconnect, got: {body:?}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn offline_blip_on_a_backed_off_board_does_not_starve_for_a_full_max() {
+        // Regression: a quiescent board backs off toward `max`, then a single
+        // supervisor tick sees the box briefly offline (e.g. an unreachable
+        // declared machine's health check just wedged the link). The offline
+        // defer must be bounded by `standard`, not the current (max) interval —
+        // otherwise one blip suppresses the heartbeat for a whole `max`.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-hb-blip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        let standard = Duration::from_secs(1);
+        let max = Duration::from_secs(64);
+        project.heartbeat = shelbi_core::HeartbeatConfig::On {
+            interval: standard,
+            max,
+        };
+
+        // Drive the quiescent (empty board) back-off up to the cap.
+        let mut hb = HeartbeatSchedule::default();
+        maybe_emit_heartbeat(&project, &mut hb, || true); // seed
+        for _ in 0..8 {
+            force_tick(&project, &mut hb);
+        }
+        assert_eq!(hb.interval, Some(max), "backed off to the cap");
+        let lines_before = hb_line_count();
+
+        // One due tick, but the box is offline: the defer must be bounded to a
+        // *standard* interval out (not `max`), and the cadence must snap back to
+        // standard so recovery is prompt.
+        let before = Instant::now();
+        hb.next_attempt = Some(before);
+        maybe_emit_heartbeat(&project, &mut hb, || false);
+        assert_eq!(
+            hb.interval,
+            Some(standard),
+            "an offline blip must snap the cadence back to standard, not hold at max"
+        );
+        let next = hb.next_attempt.expect("schedule keeps advancing while offline");
+        assert!(
+            next <= before + standard + Duration::from_millis(50),
+            "offline defer must be bounded by ~standard, not a full max"
+        );
+        // Nothing new was emitted while offline.
+        assert_eq!(
+            hb_line_count(),
+            lines_before,
+            "offline windows never emit a heartbeat"
         );
 
         std::env::remove_var("SHELBI_HOME");

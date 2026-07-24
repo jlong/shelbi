@@ -672,6 +672,58 @@ fn log_eperm_once(hostname: &str, remote_sock: &str) {
     }
 }
 
+/// Per-host reverse-forward health as last *reported to the shared board log*.
+/// The forward health check runs on a ~120s cadence per workspace; without this
+/// gate a declared-but-unreachable machine appends a `status=failed` line to the
+/// shared `events.log` every cycle. That both floods the board feed and starves
+/// the project heartbeat, whose emitter debounces against any `events.log`
+/// advance — one unreachable box was observed dropping the heartbeat to one beat
+/// per ~4.5h. We instead append to `events.log` only on a health *state change*
+/// (ok→fail, fail→ok, or a change of failure detail) and mirror every cycle's
+/// result to `tui.log` via tracing so a recurring failure stays diagnosable.
+///
+/// Value is a short signature: `"ok"` for healthy, `"fail:<detail>"` otherwise.
+fn forward_health() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static HEALTH: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+    HEALTH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record `hostname`'s latest forward-health `signature` and report whether it
+/// differs from the previous cycle's. `true` means the state changed and the
+/// caller should append to `events.log`; `false` means suppress the append (the
+/// same result already surfaced last cycle).
+fn forward_health_changed(hostname: &str, signature: &str) -> bool {
+    let mut map = forward_health().lock().unwrap_or_else(|p| p.into_inner());
+    match map.get(hostname) {
+        Some(prev) if prev == signature => false,
+        _ => {
+            map.insert(hostname.to_string(), signature.to_string());
+            true
+        }
+    }
+}
+
+/// A reverse-forward health check *failed*. Always mirror it to `tui.log` so a
+/// recurring failure stays diagnosable, but append to the shared `events.log`
+/// only on a state change — see [`forward_health`]. `signature` distinguishes
+/// failure kinds (`master_open_failed`, `loopback_port_exhausted`, …) so a
+/// change in the failure *shape* still re-emits.
+fn report_forward_failure(hostname: &str, signature: &str, body: &str) {
+    tracing::warn!(host = %hostname, signature, "reverse-forward health check failed: {body}");
+    if forward_health_changed(hostname, signature) {
+        let _ = shelbi_state::emit_event_body(body);
+    }
+}
+
+/// Record that `hostname`'s forward is healthy, without emitting anything. Call
+/// on every clean success so a later failure is seen as a fresh state change and
+/// re-emits (a fail→ok→fail sequence must produce two failure lines, not one).
+fn mark_forward_ok(hostname: &str) {
+    let _ = forward_health_changed(hostname, "ok");
+}
+
 /// Outcome of the Unix-socket forward attempt, so the caller can tell a
 /// transient network failure (don't fall back) from the Tailscale-SSH wedge
 /// (do fall back to TCP loopback when allowed).
@@ -819,10 +871,14 @@ fn ensure_tcp_forward(hostname: &str) -> shelbi_core::Result<u16> {
         || {},
     );
     let Some(gate_attempt) = reached_on else {
-        let _ = shelbi_state::emit_event_body(&format!(
-            "ssh reverse-forward host={hostname} mode=tcp status=failed \
-             detail=master_open_failed attempts={attempts}"
-        ));
+        report_forward_failure(
+            hostname,
+            "fail:tcp:master_open_failed",
+            &format!(
+                "ssh reverse-forward host={hostname} mode=tcp status=failed \
+                 detail=master_open_failed attempts={attempts}"
+            ),
+        );
         return Err(shelbi_core::Error::Other(format!(
             "ssh reverse forward to {hostname} could not be established over TCP loopback \
              (host unreachable after {attempts} attempts); worker→hub messages will not be delivered"
@@ -868,6 +924,9 @@ fn ensure_tcp_forward(hostname: &str) -> shelbi_core::Result<u16> {
                     port: Some(port),
                 }),
             );
+            // Healthy: record it so a later failure is seen as a state change
+            // and re-emits (without this, fail→ok→fail would emit only once).
+            mark_forward_ok(hostname);
             return Ok(port);
         }
         // Network was already proven reachable, so a failure here is a bind
@@ -882,10 +941,14 @@ fn ensure_tcp_forward(hostname: &str) -> shelbi_core::Result<u16> {
     // moving it (SHELBI_TCP_FORWARD_PORT_BASE) is the remedy this points at.
     let base = shelbi_state::tcp_forward_port_base();
     let band_hi = base as u32 + band_len.saturating_sub(1) as u32;
-    let _ = shelbi_state::emit_event_body(&format!(
-        "ssh reverse-forward host={hostname} mode=tcp status=failed \
-         detail=loopback_port_exhausted band={base}-{band_hi} tried={band_len}"
-    ));
+    report_forward_failure(
+        hostname,
+        "fail:tcp:loopback_port_exhausted",
+        &format!(
+            "ssh reverse-forward host={hostname} mode=tcp status=failed \
+             detail=loopback_port_exhausted band={base}-{band_hi} tried={band_len}"
+        ),
+    );
     Err(shelbi_core::Error::Other(format!(
         "ssh reverse forward to {hostname} could not bind a TCP loopback port \
          (all {band_len} ports in band {base}-{band_hi} in use); \
@@ -941,19 +1004,28 @@ pub fn ensure_reverse_forward(
     }
 
     match ensure_unix_forward(host, &hostname, &remote_sock) {
-        UnixForwardOutcome::Ok => Ok(()),
+        UnixForwardOutcome::Ok => {
+            // Healthy: record it so a later failure re-emits (state change).
+            mark_forward_ok(&hostname);
+            Ok(())
+        }
         UnixForwardOutcome::MasterOpenFailed => {
             // Transient / network — surface, never fall back (a connect
             // timeout is not the wedge). We only reach here after the retry
             // budget in `ensure_unix_forward` is exhausted, so record how many
             // attempts we burned: a `master_open_failed attempts=3` that keeps
             // recurring is a real outage, not a one-off blip the retry would
-            // have caught.
+            // have caught. State-change gated so a steadily-unreachable host
+            // logs once (not once per 120s cycle) — see `forward_health`.
             let attempts = forward_retry_attempts();
-            let _ = shelbi_state::emit_event_body(&format!(
-                "ssh reverse-forward host={hostname} remote_sock={remote_sock} \
-                 status=failed detail=master_open_failed attempts={attempts}"
-            ));
+            report_forward_failure(
+                &hostname,
+                "fail:unix:master_open_failed",
+                &format!(
+                    "ssh reverse-forward host={hostname} remote_sock={remote_sock} \
+                     status=failed detail=master_open_failed attempts={attempts}"
+                ),
+            );
             Err(shelbi_core::Error::Other(format!(
                 "ssh reverse forward to {hostname} could not be verified (master_open_failed); \
                  worker→hub messages via {remote_sock} will not be delivered"
@@ -965,7 +1037,9 @@ pub fn ensure_reverse_forward(
                 // remember it so we stop re-attempting (and re-leaking) Unix.
                 // Log the transition once (subsequent rechecks find the mode
                 // already persisted and go straight to TCP without re-entering
-                // this branch).
+                // this branch). `ensure_tcp_forward` marks the host healthy on
+                // success, so the established line here follows the same
+                // state-change discipline as every other outcome.
                 match ensure_tcp_forward(&hostname) {
                     Ok(port) => {
                         let _ = shelbi_state::emit_event_body(&format!(
@@ -979,10 +1053,16 @@ pub fn ensure_reverse_forward(
                 }
             } else {
                 // `forward: unix` pinned — respect it, don't silently switch.
-                let _ = shelbi_state::emit_event_body(&format!(
-                    "ssh reverse-forward host={hostname} remote_sock={remote_sock} \
-                     status=failed detail={detail}"
-                ));
+                // State-change gated so a persistently-wedged pinned host logs
+                // once, not every cycle.
+                report_forward_failure(
+                    &hostname,
+                    &format!("fail:unix:{detail}"),
+                    &format!(
+                        "ssh reverse-forward host={hostname} remote_sock={remote_sock} \
+                         status=failed detail={detail}"
+                    ),
+                );
                 Err(shelbi_core::Error::Other(format!(
                     "ssh reverse forward to {hostname} could not be verified ({detail}); \
                      worker→hub messages via {remote_sock} will not be delivered"
@@ -1499,5 +1579,48 @@ mod tests {
             Duration::from_millis(DEFAULT_FORWARD_RETRY_BACKOFF_MS)
         );
         std::env::remove_var("SHELBI_FORWARD_RETRY_BACKOFF_MS");
+    }
+
+    /// A steadily-unreachable declared machine must not append a
+    /// `status=failed` line to the shared `events.log` on every ~120s health
+    /// check — that flood is what starved the project heartbeat (whose emitter
+    /// debounces against any `events.log` advance). The state-change gate under
+    /// `report_forward_failure` collapses a recurring identical failure to a
+    /// single board-log append; a genuine transition (fail→ok→fail, or a change
+    /// of failure shape) is the only thing that re-emits.
+    #[test]
+    fn forward_health_gate_emits_once_per_state_change() {
+        // Unique host so the process-global health map starts clean for this
+        // test regardless of what else ran (the map is keyed by hostname).
+        let host = format!("unreachable-devbox-{}", std::process::id());
+
+        // First failure of a given shape is a state change → emit.
+        assert!(
+            forward_health_changed(&host, "fail:tcp:master_open_failed"),
+            "first sighting of a failure must emit"
+        );
+        // The next four cycles report the *same* failure → all suppressed. This
+        // is the anti-flood guarantee: 5 cycles, 1 board-log line.
+        for _ in 0..4 {
+            assert!(
+                !forward_health_changed(&host, "fail:tcp:master_open_failed"),
+                "a steady, unchanged failure must not re-emit every cycle"
+            );
+        }
+
+        // Recovery is a state change (fail→ok)…
+        assert!(forward_health_changed(&host, "ok"));
+        assert!(!forward_health_changed(&host, "ok"), "steady health is quiet");
+        // …and a fresh failure after recovery re-emits (ok→fail).
+        assert!(
+            forward_health_changed(&host, "fail:tcp:master_open_failed"),
+            "a failure after recovery must emit again"
+        );
+        // A change of failure *shape* (different detail) also re-emits, so an
+        // exhaustion doesn't hide behind a prior master-open failure.
+        assert!(
+            forward_health_changed(&host, "fail:tcp:loopback_port_exhausted"),
+            "a different failure detail must emit"
+        );
     }
 }
