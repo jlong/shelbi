@@ -1,7 +1,7 @@
 ---
 title: Set up review workspaces
 order: 15
-summary: "Tag a workspace, require that tag on your review status, and boot a dev server in the status's enter transition — the end-to-end path from a `review` tag in your YAML to clicking through a change on a live server, all from generic workflow primitives."
+summary: "Tag a workspace, require that tag on your review status, and give the workflow a `review:` serve recipe — the end-to-end path from a `review` tag in your YAML to clicking through a change on a live server and accepting or rejecting it from the review interface."
 ---
 
 The [multi-workspace loop](/docs/guides/getting-started/multi-workspace) gets
@@ -9,10 +9,12 @@ finished branches back to you. But reading a diff isn't the same as *running*
 the change. Most real review of an app or a site means booting the dev server,
 opening a URL, and clicking through it.
 
-Shelbi has no special "review mode" for this — you assemble it from three
-generic primitives: a **workspace carries a tag**, a **status requires that
-tag**, and a **transition runs commands**. This page wires them together end
-to end. For the model underneath, see the reference:
+The *routing* that gets a task to a review slot is assembled from generic
+primitives: a **workspace carries a tag** and a **status requires that tag**.
+On top of that, the workflow's **`review:` block** tells the Review agent how
+to boot the branch, and Shelbi's **review interface** lets you run the change
+and accept or reject it. This page wires them together end to end. For the model
+underneath, see the reference:
 [Review workspaces](/docs/concepts/review-workspaces).
 
 <Callout type="note" title="You need a working pool first">
@@ -39,28 +41,30 @@ machine so every slot on it inherits the tag:
 workspaces:
   - { name: alpha,    machine: hub, runner: claude }
   - { name: bravo,    machine: hub, runner: claude }
-  - { name: review-0, machine: hub, runner: claude, tags: [review], slot: 0 }
+  - { name: review-0, machine: hub, runner: claude, tags: [review], slot: 3000 }
 ```
 
-`tags` accepts a bare string as shorthand (`tags: review`). The `slot: 0` makes
-the numeric slot explicit so the transition commands below can derive a stable
-port from `$SLOT`; leave it out and it defaults to the slot's index among the
-machine's workspaces.
+`tags` accepts a bare string as shorthand (`tags: review`). The `slot: 3000`
+sets the numeric slot the `review:` recipe below resolves `$PORT` to — so the
+dev server binds `:3000`. Leave `slot:` out and it defaults to the slot's
+zero-based index among the machine's workspaces, which is why an explicit,
+port-shaped value is worth setting on a review slot.
 
 <Callout type="tip" title="One review slot is plenty to start">
 
-Each review slot may hold a running server bound to a port, so give the port a
-per-slot offset (`$((3000 + $SLOT))`) if you add a second. One is enough for a
-first pass.
+Each review slot holds one running server bound to its port, so give a second
+review slot a different `slot:` value (`3010`) to avoid a collision. One is
+enough for a first pass.
 
 </Callout>
 
 </Step>
-<Step title="Require the tag on your review status and boot a server">
+<Step title="Require the tag and add a review: serve recipe">
 
 In your [workflow file](/docs/configuration/workflow), require the `review` tag
-on the review status so tasks route to the tagged slot, and add transitions
-that boot the dev server on entry and tear it down on exit:
+on the review status so tasks route to the tagged slot, then add a
+[`review:`](/docs/configuration/workflow#review) block telling the Review agent
+how to boot the branch:
 
 ```yaml
 statuses:
@@ -69,28 +73,26 @@ statuses:
   - { id: done,        owner: user }
 
 transitions:
-  - from: in-progress
-    to: review
-    run:
-      - npm install
-      - npm run dev -- --port $((3000 + $SLOT)) &
-    ready: curl -fsS http://localhost:$((3000 + $SLOT)) > /dev/null
-    ready_timeout: 120
-  - from: review
-    to: done
-    actions: [merge, delete_branch]
-    run:
-      - pkill -f "port $((3000 + $SLOT))" || true
-  - from: review
-    to: in-progress
-    run:
-      - pkill -f "port $((3000 + $SLOT))" || true
+  - from: review, to: done, actions: [merge, delete_branch]
+
+review:
+  setup: npm install --no-audit --no-fund
+  serve: npm run dev -- -p $PORT
+  ready: curl -sf http://localhost:$PORT
+  url: http://localhost:$PORT
 ```
 
-The enter transition installs deps, launches the server (backgrounded, so the
-command returns), and `ready` polls the URL until it answers. Both exit edges
-tear the server back down. Swap the `npm` lines for whatever your project
-needs — `cargo run`, a `Makefile` target, a `Procfile web:` line.
+Shelbi resolves `$PORT` (equivalently `$SLOT`) to the review slot's port —
+`3000` here — and injects the recipe into the Review agent's prompt. The agent
+runs `setup`, launches `serve`, polls `ready` until the server answers, and
+hands back the `url`. Swap the `npm` lines for whatever your project needs —
+`cargo run`, a `Makefile` target, a `Procfile web:` line. For a monorepo, add
+`workdir: site` (or `app`, `docs`) so each workflow serves its own
+subdirectory on the slot's port.
+
+The `review → done` transition is the accept edge: it merges the branch and
+deletes it. Omit the `review:` block entirely and the Review agent falls back
+to a **diff-only** review, booting nothing.
 
 </Step>
 <Step title="Reload to pick it up">
@@ -99,8 +101,9 @@ needs — `cargo run`, a `Makefile` target, a `Procfile web:` line.
 shelbi reload
 ```
 
-The tagged slot appears under **Workspaces** in the sidebar, grouped under its
-machine and reading `idle` until a task routes onto it.
+The tagged slot does **not** show up under **Workspaces** — a review slot's
+capacity surfaces through the review sections instead, and only once a task is
+routed to it.
 
 </Step>
 <Step title="Get a task to the review status">
@@ -111,21 +114,21 @@ finishes it writes its review-ready marker; the hub poller rebases the branch
 onto the base branch and moves the task into the **Review** status.
 
 Because that status requires `tags: [review]`, the orchestrator routes the task
-onto a free `review`-tagged slot (preferring the one it ran on) and fires the
-enter transition: install, boot the server on the slot's port, wait for
-`ready`. If every matching slot is busy the task waits in Review until one
-frees — nothing is preempted.
+onto a free `review`-tagged slot (preferring the one it ran on) and the Review
+agent boots the server from the `review:` recipe. If every matching slot is
+busy the task waits under **Queued for Review** until one frees — nothing is
+preempted.
 
 The finishing dev workspace closes its own session and returns to `idle`. Its
 work is now waiting to be *run*, not edited.
 
 </Step>
-<Step title="Open the served URL and click through">
+<Step title="Open the review interface and click through">
 
-Select the task under **Review** in the sidebar (or press `Enter` on its
-workspace row) to focus that workspace's window. Open the served URL —
-`http://localhost:3000` for `slot: 0` here — and click through the running
-change the way a user would.
+The task appears in the sidebar under **Ready for Review** (`✓`) with a
+`machine:workspace` badge showing the slot it's loaded on. Select it (or press
+`Enter` on its row) to open the **review interface**: the sidebar on the left, a
+swappable content pane in the middle, and a review panel on the right.
 
 <AppMockup
   terminalTitle="you@hub — myapp"
@@ -155,30 +158,44 @@ change the way a user would.
       workspaces: [
         { name: "alpha", state: "working", agent: "Developer" },
         { name: "bravo", state: "idle" },
-        { name: "review-0", state: "working", agent: "Review" },
       ],
+    },
+  ]}
+  readyReview={[
+    {
+      title: "Polish dark-mode toggle",
+      branch: "jlong/dark-mode-toggle-polish",
+      location: "hub:review-0",
     },
   ]}
 />
 
-If you named the built-in `review` agent on the status, its charter is narrow:
-**load and serve, don't code.** It won't modify the branch or move the card.
-Point `agent:` at an agent you've authored to change what runs there.
+From the review panel you can:
+
+- **🤓 Chat with Reviewer** — talk to the Review agent (the default view).
+- **✍️ Edit in `<editor>`** — open the review worktree in your
+  [configured editor](/docs/configuration/global#configyaml).
+- **🌐 Open Browser** — open the served `url` in your system browser. This
+  action only appears when the workflow declares a review URL.
+
+The built-in `review` agent's charter is narrow: **load and serve, don't
+code.** It won't modify the branch or move the card. Point `agent:` at an agent
+you've authored to change what runs there.
 
 </Step>
-<Step title="Accept or bounce">
+<Step title="Approve or reject">
 
-You own the decision. Moving the task out of Review is the signal, and each
-move fires that edge's transitions — including the teardown `run`:
+You own the decision, and you make it from the review panel's **Actions**:
 
-- **Accept** — move the card to **Done** (`L` in the kanban view, or
-  `shelbi task move dark-mode-toggle-polish --to done`). Per the transitions
-  above, that edge merges the branch, deletes it, and tears the server down.
-- **Bounce** — send it back to **In Progress** (or **To Do**) for another pass;
-  that edge tears the server down too.
+- **✅ Approve** — moves the card one column forward (`review → done`), firing
+  that edge's `actions`: per the workflow above, it merges the branch and
+  deletes it. The interface tears down and focus returns to the dashboard.
+- **❌ Reject** — opens a type-the-reason dialog. On submit, the reason is
+  appended to the task body and the card bounces back to the ready status for
+  another pass. An empty reason can't submit.
 
-Either move returns the workspace to `idle`, which loads the next task routed
-for review, if any.
+Either decision frees the review slot for the next task routed for review, if
+any.
 
 </Step>
 </Steps>
@@ -196,8 +213,11 @@ backlog and auto-merge finished branches that clear a confidence bar you define.
 ## See also
 
 - [Review workspaces](/docs/concepts/review-workspaces) — the full model: tags,
-  status-tag routing, `$SLOT`, and transition `run` / `ready` / teardown.
-- [Workflow config](/docs/configuration/workflow) — status `tags` and the
-  transition command fields.
+  status-tag routing, the `review:` serve recipe, the review sidebar, and the
+  review interface.
+- [Workflow config](/docs/configuration/workflow) — status `tags`, the
+  `review:` block, and the transition command fields.
 - [Project config](/docs/configuration/project) — machine and workspace `tags`,
   and workspace `slot`.
+- [Global config](/docs/configuration/global) — the hub-wide `editor` the
+  "Edit in `<editor>`" view launches.
