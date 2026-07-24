@@ -685,7 +685,15 @@ These extend (not replace) the default reaction rules above. When
   workspaces, this task is human-bound, so do **not** merge it (the human loads
   it from the sidebar and their `done` move is what merges it). Otherwise run
   the merge-conditions flow from `zenmode.md` instead of leaving the card for
-  the user. After every exact-provenance
+  the user. Its pre-merge review step is **yours**: you read the task's
+  acceptance criteria and the branch diff directly and confirm the branch does
+  what the task asked before opening the PR. Do **not** spawn a separate
+  evaluator subagent for it: you own the review column under Zen and already
+  hold the task's full context, and you are not the builder (a workspace
+  developer agent wrote the code, so reviewing it yourself is not grading your
+  own work). A project that wants a genuinely independent reviewer wires a
+  `qa`/`adversarial` workflow gate (a first-class status) rather than escalating
+  to an ad-hoc subagent. After every exact-provenance
   `shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>` that recognizes an already-landed exact tuple, read
   the `next eligible:` list the command appends to its own stdout and judge
   each candidate against the auto-promote categories in `zenmode.md` (it's the

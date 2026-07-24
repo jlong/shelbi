@@ -128,7 +128,7 @@ project:
     crates/shelbi-state/src/default_zenmode.md.template */}
 
 ```markdown
-Zen: auto-promote eligible backlog and run the exact-provenance merge flow on handoff without asking.
+Zen: auto-promote eligible backlog, review each handoff yourself (diff vs the task's acceptance criteria + scope), and run the exact-provenance merge flow without asking.
 
 # Zen Mode policy
 
@@ -198,7 +198,9 @@ auto-merge", the case the rest of this section covers.
 
 When a task enters `handoff` and Zen is on (and the project has no review
 workspaces), run `shelbi zen probe <task-id>` to get a JSON report covering
-local checks, merge conflicts, diff size, and danger-path matches. Apply these
+local checks, merge conflicts, diff size, and danger-path matches. A passing
+mechanical probe is necessary but not sufficient; your own review of the diff
+(step 5) is what checks the branch against the task's intent. Apply these
 conditions to the report:
 
 1. **All `local_checks` must have `exit_code == 0`.** If any failed, leave in
@@ -211,9 +213,31 @@ conditions to the report:
 4. **`danger_paths.matched` must be empty.** Otherwise emit
    `reason=zen:danger-path` with the paths.
 
-If all pre-PR conditions pass:
+If all four pre-PR probe conditions pass, review the diff against the task
+yourself before opening a PR; only if your review passes do the
+pr-create/ci-watch/pr-merge steps run:
 
-5. Freeze the probe's `repository`, `repository_id`, `base_branch`, `base_sha`,
+5. **Review the diff against the task.** A green mechanical probe proves the
+   branch builds and does not conflict; it does not prove the branch does what
+   the task asked. Read the task's acceptance criteria and the branch diff
+   (`git diff <base_branch>...<branch>`) yourself and confirm:
+   - the diff satisfies every acceptance criterion the task states;
+   - the diff stays within the task's declared scope, with no unrelated files
+     and, in particular, no large deletions or reverts of code the task never
+     mentions (the signature of a branch cut from a stale base);
+   - the branch carries real new commits ahead of `<base_branch>` and its
+     content is not already present in the base under a different commit (a
+     branch whose diff is dominated by undoing recently-merged work, or whose
+     change is already merged under another SHA, must never be merged).
+   You are the reviewer here, not the builder: a workspace developer agent
+   wrote this code, so reviewing it yourself is not grading your own work.
+   Read the criteria and diff with fresh eyes and don't wave a branch through
+   just because you dispatched it. If it fails any check, bounce the task to
+   `ready` with concrete findings and emit `reason=zen:review-reject` with a
+   one-line summary. For a project that wants a genuinely independent,
+   de-biased reviewer instead of this self-review, wire a `qa`/`adversarial`
+   gate into the workflow (a first-class status) rather than reviewing here.
+6. Freeze the probe's `repository`, `repository_id`, `base_branch`, `base_sha`,
    `integration_sha`, and `head_sha`. Run `shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
    using those exact values, and also pass `--match-published-head-commit <published_head_sha>`
    from the probe's `published_head_sha` field. When the probe rebased the branch
@@ -224,12 +248,12 @@ If all pre-PR conditions pass:
    but GitHub's PR view had not caught up yet: re-run the exact same command (it
    is idempotent). Exit code 1 is a real mismatch: leave the task in `handoff`
    and re-probe.
-6. Run `shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --timeout 15m`
+7. Run `shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --timeout 15m`
    using that same probe identity. Stdout is `green`,
    `red:<check>:<summary>`, or `timeout`. The condition: must be `green`.
    Any identity movement fails closed; never recompute or substitute a probe
    field after CI begins.
-7. If green, run `shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
+8. If green, run `shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
    with that same identity. The command verifies the candidate has sole parent
    `base_sha` and the exact tree of `head_sha`, then atomically advances only
    `refs/heads/<base_branch>` from `base_sha` to `integration_sha` with Git's
@@ -238,7 +262,7 @@ If all pre-PR conditions pass:
    leave the task in `handoff` and follow the command's human-review action.
    Only after a candidate SHA result, move the task into `done` and emit
    `reason=orchestrator:zen-merge` with the merge SHA.
-8. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
+9. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
    or `reason=zen:ci-timeout`.
 
 ## Customization
@@ -262,6 +286,45 @@ top.
 
 The default ships with these categories and conditions filled in. Edit
 the sections in place to reshape them.
+
+### Pre-merge review is the orchestrator's own
+
+Step 5 of the merge conditions is a **self-review**: the orchestrator reads
+the task's acceptance criteria and the branch diff itself and confirms the
+branch does what the task asked before opening a PR. It does not spawn a
+separate evaluator subagent for this. The "don't let the builder grade its
+own work" worry does not apply, because the orchestrator is not the builder:
+a workspace [developer agent](/docs/concepts/agents) wrote the code, and the
+orchestrator already owns the review column under Zen and holds the task's
+full context. A green mechanical probe proves the branch builds and does not
+conflict; the self-review is what proves it satisfies the task's intent and
+stays in scope. On failure the orchestrator bounces the task back to `ready`
+with findings (`reason=zen:review-reject`).
+
+If you want a genuinely **independent, de-biased reviewer** rather than the
+orchestrator reviewing its own dispatch, that is a first-class
+[`qa`/`adversarial` agent](/docs/guides/doing-more-with-agents/adversarial-review-agent)
+wired into the workflow as a **dedicated status**, not an ad-hoc subagent.
+Give the status `owner: agent` and `agent: qa` (or `adversarial-review`), with
+a pass edge forward and a plain bounce edge back to `in-progress`:
+
+```yaml
+# workflows/default.yaml
+statuses:
+  - { id: in-progress,   owner: agent, agent: developer }
+  - { id: qa-review,     owner: agent, agent: qa }        # the gate
+  - { id: review,        owner: user,  agent: orchestrator }
+transitions:
+  - { from: in-progress, to: qa-review,   actions: [push_branch, open_pr] }
+  - { from: qa-review,   to: review,      actions: [] }   # pass: forward
+  - { from: qa-review,   to: in-progress, actions: [] }   # bounce: back
+```
+
+The full walkthrough (declaring the status in
+[`statuses.yaml`](/docs/configuration/statuses), referencing it from the
+[workflow](/docs/configuration/workflow), and why the bounce edge must be
+listed) is in
+[Add it to a workflow](/docs/guides/doing-more-with-agents/add-to-workflow).
 
 ### Relationship to the orchestrator prompt
 
