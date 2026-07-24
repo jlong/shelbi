@@ -650,6 +650,290 @@ pub fn rebase_workspace_branch_onto_default(
     }
 }
 
+/// Outcome of [`push_workspace_branch_to_origin`]. Pure data — the caller logs
+/// it and decides whether to block the handoff. Only [`PushOutcome::Failed`]
+/// blocks; every other variant means `origin/<branch>` now carries the exact
+/// local tip that will be handed off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// `origin/<branch>` already matched the local tip — nothing to push.
+    UpToDate { local_sha: String },
+    /// Pushed the local tip to `origin/<branch>`. `forced` is true when the
+    /// branch had been rewritten (a rebase or `commit --amend`) so its old
+    /// remote tip was not an ancestor of the new tip and the push had to
+    /// overwrite it with `--force-with-lease`. `remote_before` is the tip the
+    /// push replaced (`None` when the branch was brand new on origin).
+    Pushed {
+        local_sha: String,
+        remote_before: Option<String>,
+        forced: bool,
+    },
+    /// The worktree has no `origin` remote at all — a local-only repo that
+    /// never had anything to push. Non-blocking: there is no remote tip to go
+    /// stale, so the handoff proceeds (this preserves the pre-existing
+    /// behavior for remoteless projects, where the handoff never depended on a
+    /// push landing). Distinct from [`PushOutcome::Failed`], which is a
+    /// configured origin that couldn't be reached or rejected the push.
+    NoRemote,
+    /// The push couldn't be performed or was rejected against a configured
+    /// origin. `reason` explains why so the events.log row (and the blocked
+    /// handoff) are actionable.
+    Failed { reason: String },
+}
+
+impl PushOutcome {
+    /// Short status token for the `events.log` `status=` field.
+    pub fn status_token(&self) -> &'static str {
+        match self {
+            PushOutcome::UpToDate { .. } => "up-to-date",
+            PushOutcome::Pushed { forced: false, .. } => "pushed",
+            PushOutcome::Pushed { forced: true, .. } => "force-pushed",
+            PushOutcome::NoRemote => "no-remote",
+            PushOutcome::Failed { .. } => "failed",
+        }
+    }
+
+    /// Compact one-line detail for the `events.log` `detail=` field.
+    pub fn detail(&self) -> String {
+        fn short(sha: &str) -> &str {
+            sha.get(..7).unwrap_or(sha)
+        }
+        match self {
+            PushOutcome::UpToDate { local_sha } => format!("local={}", short(local_sha)),
+            PushOutcome::Pushed {
+                local_sha,
+                remote_before,
+                forced,
+            } => {
+                let from = remote_before.as_deref().map(short).unwrap_or("(new)");
+                let verb = if *forced { "forced" } else { "ff" };
+                format!("{verb}_{from}..{}", short(local_sha))
+            }
+            PushOutcome::NoRemote => "no_origin_remote".to_string(),
+            PushOutcome::Failed { reason } => reason.clone(),
+        }
+    }
+
+    /// True when the handoff may proceed: either the remote now carries the
+    /// local tip, or there is no remote to strand it on. Only
+    /// [`PushOutcome::Failed`] returns false.
+    pub fn handed_off_local_tip(&self) -> bool {
+        !matches!(self, PushOutcome::Failed { .. })
+    }
+}
+
+/// Read the exact tip `origin/<branch>` currently points at, querying the
+/// remote itself (`git ls-remote`) rather than the possibly-stale local
+/// remote-tracking ref. `Ok(None)` when origin has no such branch yet (never
+/// pushed, or a local-only repo). `Err(reason)` when the query itself failed.
+fn origin_branch_tip(host: &Host, wt: &str, branch: &str) -> std::result::Result<Option<String>, String> {
+    let out = shelbi_ssh::run(
+        host,
+        ["git", "-C", wt, "ls-remote", "--heads", "origin", branch],
+    )
+    .map_err(|e| format!("ls_remote_spawn_failed:{e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let first = stderr
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("git ls-remote failed");
+        return Err(format!("ls_remote_failed:{first}"));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Each row is `<sha>\trefs/heads/<branch>`. A branch name is a glob to
+    // ls-remote, so filter to the exact ref before trusting the first row.
+    for line in stdout.lines() {
+        let mut cols = line.split_whitespace();
+        let (Some(sha), Some(name)) = (cols.next(), cols.next()) else {
+            continue;
+        };
+        if name == format!("refs/heads/{branch}") {
+            return Ok(Some(sha.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Read the local remote-tracking ref `refs/remotes/origin/<branch>` — our
+/// last-known state of the remote, used as the `--force-with-lease` anchor.
+/// `None` when there's no tracking ref (branch never pushed with `-u` from this
+/// worktree, or a fetch never populated it).
+fn tracking_ref_sha(host: &Host, wt: &str, branch: &str) -> Option<String> {
+    let out = shelbi_ssh::run(
+        host,
+        [
+            "git",
+            "-C",
+            wt,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/origin/{branch}^{{commit}}"),
+        ],
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Push `worktree`'s local `branch` tip to `origin` so a handoff hands off the
+/// reconciled commit — never the stale remote tip.
+///
+/// Why this exists: a developer re-dispatched to rework a task may rebase and
+/// `commit --amend` in its worktree. That rewrites the branch so its local tip
+/// is *not* a fast-forward of the pre-rework remote tip. A plain
+/// `git push` (what the `push_branch` action does) is then rejected as a
+/// non-fast-forward, and the branch is silently left on origin at the stale
+/// pre-rework commit — the exact bug this guards against, where a review and PR
+/// were opened against work that had already been reworked away locally.
+///
+/// Behaviour:
+///
+/// - Local tip already on origin → [`PushOutcome::UpToDate`], no push.
+/// - Remote tip is an ancestor of the local tip (ordinary progress) or the
+///   branch is new on origin → fast-forward `git push`.
+/// - Remote tip is *not* an ancestor (rebase/amend rewrote the branch) →
+///   `git push --force-with-lease=<branch>:<observed-remote-tip>`. The lease
+///   pins the exact tip just observed, so a concurrent push landing between the
+///   observation and our push aborts the force instead of being clobbered.
+/// - Any failure (rejected push, lease stale, git error) →
+///   [`PushOutcome::Failed`]; the caller must NOT hand the task off on the
+///   stale remote tip.
+///
+/// Pushes the durable branch ref (`refs/heads/<branch>`), not `HEAD` — a prior
+/// step may have detached the worktree's HEAD, but the branch ref is what the
+/// review checkout and PR read.
+pub fn push_workspace_branch_to_origin(host: &Host, worktree: &Path, branch: &str) -> PushOutcome {
+    let wt = worktree.to_string_lossy().into_owned();
+
+    // A repo with no `origin` remote is local-only — there's no remote tip to
+    // go stale, so nothing to push. Distinguish this from a reachable origin
+    // that rejects the push (which must block the handoff).
+    match shelbi_ssh::run(host, ["git", "-C", &wt, "remote", "get-url", "origin"]) {
+        Ok(o) if o.status.success() => {}
+        Ok(_) => return PushOutcome::NoRemote,
+        Err(e) => {
+            return PushOutcome::Failed {
+                reason: format!("remote_get_url_failed:{e}"),
+            };
+        }
+    }
+
+    let local_sha = match shelbi_ssh::run(
+        host,
+        [
+            "git",
+            "-C",
+            &wt,
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ],
+    ) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(_) => {
+            return PushOutcome::Failed {
+                reason: format!("local_branch_{branch}_not_found"),
+            };
+        }
+        Err(e) => {
+            return PushOutcome::Failed {
+                reason: format!("rev_parse_local_failed:{e}"),
+            };
+        }
+    };
+
+    let remote_sha = match origin_branch_tip(host, &wt, branch) {
+        Ok(v) => v,
+        Err(reason) => return PushOutcome::Failed { reason },
+    };
+
+    if remote_sha.as_deref() == Some(local_sha.as_str()) {
+        return PushOutcome::UpToDate { local_sha };
+    }
+
+    // Force only when the remote tip exists and is not an ancestor of the local
+    // tip — i.e. the branch was rewritten. A new branch or an ordinary
+    // fast-forward pushes without force.
+    let forced = match &remote_sha {
+        None => false,
+        Some(remote) => {
+            let is_ancestor = shelbi_ssh::run(
+                host,
+                [
+                    "git",
+                    "-C",
+                    &wt,
+                    "merge-base",
+                    "--is-ancestor",
+                    remote,
+                    &local_sha,
+                ],
+            );
+            !matches!(is_ancestor, Ok(ref o) if o.status.success())
+        }
+    };
+
+    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    let mut argv: Vec<String> = vec!["git".into(), "-C".into(), wt.clone(), "push".into()];
+    if forced {
+        // Lease against our *last-known* remote state — the remote-tracking ref
+        // `refs/remotes/origin/<branch>`, which after the workspace's initial
+        // `push -u` (and an un-fetched local rebase/amend) still holds the tip
+        // we ourselves last published. Leasing against that, NOT the fresh
+        // `origin_branch_tip` read above, is what makes the force safe: if a
+        // *different* clone advanced origin since our last push, the tracking
+        // ref won't match the live tip and git aborts the force instead of
+        // clobbering the unseen commit. Leasing against the just-read live tip
+        // would defeat that guard (it would always match). Fall back to the
+        // observed tip only when there is no tracking ref to lease against
+        // (best-effort; still guards the read→push window).
+        let lease = tracking_ref_sha(host, &wt, branch)
+            .or_else(|| remote_sha.clone())
+            .unwrap_or_default();
+        argv.push(format!("--force-with-lease={branch}:{lease}"));
+    }
+    argv.push("origin".into());
+    argv.push(refspec);
+
+    match shelbi_ssh::run(host, &argv) {
+        Ok(o) if o.status.success() => PushOutcome::Pushed {
+            local_sha,
+            remote_before: remote_sha,
+            forced,
+        },
+        Ok(o) => {
+            // Surface the informative line — the `! [rejected]` / `error:` /
+            // `stale info` line git prints — not the `To <remote>` header that
+            // leads its push output.
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let reason = stderr
+                .lines()
+                .map(str::trim)
+                .find(|l| {
+                    let lc = l.to_ascii_lowercase();
+                    lc.contains("rejected")
+                        || lc.contains("error")
+                        || lc.contains("stale info")
+                        || lc.starts_with('!')
+                })
+                .or_else(|| stderr.lines().map(str::trim).find(|l| !l.is_empty()))
+                .unwrap_or("git push failed");
+            PushOutcome::Failed {
+                reason: format!("push_rejected:{reason}"),
+            }
+        }
+        Err(e) => PushOutcome::Failed {
+            reason: format!("push_spawn_failed:{e}"),
+        },
+    }
+}
+
 /// Argv for the local slot-liveness probe: list the project session's
 /// windows so the caller can look for the workspace's window among them.
 fn list_windows_argv(addr: &TmuxAddr) -> Vec<String> {
@@ -6580,7 +6864,7 @@ mod rebase_git_tests {
     //! repo with a working tree is enough fidelity.
     use super::*;
 
-    fn git_available() -> bool {
+    pub(super) fn git_available() -> bool {
         std::process::Command::new("git")
             .arg("--version")
             .output()
@@ -6588,7 +6872,7 @@ mod rebase_git_tests {
             .unwrap_or(false)
     }
 
-    fn run_git_in(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
+    pub(super) fn run_git_in(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
         let mut cmd = std::process::Command::new("git");
         cmd.arg("-C").arg(repo);
         for a in args {
@@ -6608,7 +6892,7 @@ mod rebase_git_tests {
     /// Create a fresh repo with `main` as the default branch and one
     /// committed README so that branching is meaningful. Returns the
     /// repo path.
-    fn init_repo(label: &str) -> std::path::PathBuf {
+    pub(super) fn init_repo(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "shelbi-rebase-{label}-{}-{}",
             std::process::id(),
@@ -6636,7 +6920,7 @@ mod rebase_git_tests {
         dir
     }
 
-    fn commit_file(repo: &std::path::Path, name: &str, contents: &str, message: &str) {
+    pub(super) fn commit_file(repo: &std::path::Path, name: &str, contents: &str, message: &str) {
         std::fs::write(repo.join(name), contents).unwrap();
         let add = run_git_in(repo, &["add", name]);
         assert!(add.status.success());
@@ -6648,13 +6932,13 @@ mod rebase_git_tests {
         );
     }
 
-    fn head_sha(repo: &std::path::Path) -> String {
+    pub(super) fn head_sha(repo: &std::path::Path) -> String {
         let out = run_git_in(repo, &["rev-parse", "HEAD"]);
         assert!(out.status.success());
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    fn branch_sha(repo: &std::path::Path, branch: &str) -> String {
+    pub(super) fn branch_sha(repo: &std::path::Path, branch: &str) -> String {
         let out = run_git_in(repo, &["rev-parse", branch]);
         assert!(out.status.success());
         String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -7191,6 +7475,279 @@ mod rebase_git_tests {
             "intended skills dir not removed — wire: {wire}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod push_git_tests {
+    //! Real-git tests for [`push_workspace_branch_to_origin`]. Each provisions
+    //! a bare `origin` and a working clone, then exercises one push outcome —
+    //! the load-bearing one being the rebase/amend case that a plain
+    //! `git push` would reject as a non-fast-forward, silently stranding the
+    //! reworked commit locally (the bug this function exists to fix).
+    //! Skipped silently when `git` isn't on PATH.
+    use super::rebase_git_tests::{
+        branch_sha, commit_file, git_available, head_sha, init_repo, run_git_in,
+    };
+    use super::*;
+
+    /// A working repo (from [`init_repo`]) wired to a fresh bare `origin`, with
+    /// `main` already pushed. Returns `(repo, bare_origin)`.
+    fn init_repo_with_origin(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let repo = init_repo(label);
+        let bare = repo.with_file_name(format!(
+            "{}-origin.git",
+            repo.file_name().unwrap().to_string_lossy()
+        ));
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .expect("git init --bare failed to spawn");
+        assert!(init.status.success(), "git init --bare failed");
+        let bare_str = bare.to_string_lossy().into_owned();
+        assert!(run_git_in(&repo, &["remote", "add", "origin", &bare_str])
+            .status
+            .success());
+        assert!(run_git_in(&repo, &["push", "-q", "-u", "origin", "main"])
+            .status
+            .success());
+        (repo, bare)
+    }
+
+    fn origin_tip(bare: &std::path::Path, branch: &str) -> String {
+        let out = run_git_in(bare, &["rev-parse", branch]);
+        assert!(
+            out.status.success(),
+            "origin rev-parse {branch} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn force_pushes_a_rebased_amended_branch_over_the_stale_remote_tip() {
+        // The regression: a branch rewritten by a rebase (local tip is NOT a
+        // fast-forward of the pushed remote tip) must still be handed off. A
+        // plain push would be rejected; this must force-with-lease and land the
+        // reworked commit on origin.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, bare) = init_repo_with_origin("forcepush");
+
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "feature\n", "feature work");
+        assert!(run_git_in(&repo, &["push", "-q", "-u", "origin", "feature"])
+            .status
+            .success());
+        let stale_remote = origin_tip(&bare, "feature");
+        assert_eq!(stale_remote, branch_sha(&repo, "feature"));
+
+        // Advance main and rebase feature onto it — rewrites the feature commit
+        // so its new sha is not a descendant of `stale_remote`.
+        run_git_in(&repo, &["checkout", "-q", "main"]);
+        commit_file(&repo, "prereq.txt", "prereq\n", "prereq landed");
+        run_git_in(&repo, &["checkout", "-q", "feature"]);
+        assert!(run_git_in(&repo, &["rebase", "-q", "main"]).status.success());
+        let reworked = head_sha(&repo);
+        assert_ne!(reworked, stale_remote, "rebase must rewrite the tip");
+
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        match &outcome {
+            PushOutcome::Pushed {
+                local_sha,
+                remote_before,
+                forced,
+            } => {
+                assert!(*forced, "a rewritten branch must force-push");
+                assert_eq!(local_sha, &reworked);
+                assert_eq!(remote_before.as_deref(), Some(stale_remote.as_str()));
+            }
+            other => panic!("expected forced Pushed, got {other:?}"),
+        }
+        assert_eq!(
+            origin_tip(&bare, "feature"),
+            reworked,
+            "origin must now carry the reworked tip, not the stale one"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn fast_forward_push_when_branch_only_advanced() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, bare) = init_repo_with_origin("ffpush");
+
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "v0\n", "feature v0");
+        assert!(run_git_in(&repo, &["push", "-q", "-u", "origin", "feature"])
+            .status
+            .success());
+        // Ordinary progress: one more commit on top of the pushed tip.
+        commit_file(&repo, "feature.txt", "v1\n", "feature v1");
+        let local = head_sha(&repo);
+
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        assert!(
+            matches!(&outcome, PushOutcome::Pushed { forced: false, .. }),
+            "expected non-forced Pushed, got {outcome:?}"
+        );
+        assert_eq!(origin_tip(&bare, "feature"), local);
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn up_to_date_when_remote_already_has_the_local_tip() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, bare) = init_repo_with_origin("uptodate-push");
+
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "v0\n", "feature v0");
+        assert!(run_git_in(&repo, &["push", "-q", "-u", "origin", "feature"])
+            .status
+            .success());
+        let local = head_sha(&repo);
+
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        match &outcome {
+            PushOutcome::UpToDate { local_sha } => assert_eq!(local_sha, &local),
+            other => panic!("expected UpToDate, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn pushes_a_branch_that_is_new_on_origin() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, bare) = init_repo_with_origin("newbranch-push");
+
+        // Feature exists only locally — never pushed.
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "v0\n", "feature v0");
+        let local = head_sha(&repo);
+
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        match &outcome {
+            PushOutcome::Pushed {
+                remote_before,
+                forced,
+                ..
+            } => {
+                assert!(!*forced, "a brand-new branch is not a force-push");
+                assert!(remote_before.is_none(), "no prior remote tip");
+            }
+            other => panic!("expected Pushed for a new branch, got {other:?}"),
+        }
+        assert_eq!(origin_tip(&bare, "feature"), local);
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn no_origin_remote_is_non_blocking() {
+        // A local-only repo (no origin) has no remote tip to strand — the
+        // handoff must proceed rather than wedge on a push it can't make.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("no-origin-push");
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "v0\n", "feature v0");
+
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        assert_eq!(outcome, PushOutcome::NoRemote);
+        assert!(outcome.handed_off_local_tip(), "no-remote must not block");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn failed_push_blocks_the_handoff() {
+        assert!(!PushOutcome::Failed {
+            reason: "push_rejected:stale info".into()
+        }
+        .handed_off_local_tip());
+    }
+
+    #[test]
+    fn force_with_lease_refuses_to_clobber_a_concurrent_push() {
+        // The lease pins the tip we observed. If a *different* clone advances
+        // origin between our observation and our push, the force must be
+        // rejected (not silently overwrite the other push) so the handoff
+        // blocks rather than losing a concurrent commit.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, bare) = init_repo_with_origin("lease-race");
+
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "v0\n", "feature v0");
+        assert!(run_git_in(&repo, &["push", "-q", "-u", "origin", "feature"])
+            .status
+            .success());
+
+        // Rewrite our local branch so a push would need to force.
+        run_git_in(&repo, &["checkout", "-q", "main"]);
+        commit_file(&repo, "prereq.txt", "prereq\n", "prereq");
+        run_git_in(&repo, &["checkout", "-q", "feature"]);
+        assert!(run_git_in(&repo, &["rebase", "-q", "main"]).status.success());
+
+        // A second clone advances origin/feature out from under us — this is
+        // the concurrent push the lease exists to detect.
+        let other = repo.with_file_name(format!(
+            "{}-other",
+            repo.file_name().unwrap().to_string_lossy()
+        ));
+        let bare_str = bare.to_string_lossy().into_owned();
+        assert!(std::process::Command::new("git")
+            .args(["clone", "-q", &bare_str])
+            .arg(&other)
+            .output()
+            .expect("git clone failed")
+            .status
+            .success());
+        run_git_in(&other, &["checkout", "-q", "feature"]);
+        commit_file(&other, "concurrent.txt", "other\n", "concurrent work");
+        assert!(run_git_in(&other, &["push", "-q", "origin", "feature"])
+            .status
+            .success());
+        let concurrent_tip = origin_tip(&bare, "feature");
+
+        // Our push observed the pre-race tip; the lease must now fail.
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        assert!(
+            matches!(&outcome, PushOutcome::Failed { .. }),
+            "stale lease must fail the push, got {outcome:?}"
+        );
+        assert_eq!(
+            origin_tip(&bare, "feature"),
+            concurrent_tip,
+            "the concurrent push must be preserved, not clobbered"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&other);
     }
 }
 

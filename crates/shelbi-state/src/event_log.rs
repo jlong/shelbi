@@ -1398,6 +1398,35 @@ pub fn append_rebase_event(
     ))
 }
 
+/// Append `<rfc3339> push task=<id> workspace=<name> branch=<branch> status=<status> detail=<detail>`
+/// to `~/.shelbi/events.log`. Emitted by the poller's ready-marker handoff
+/// after it rebases a workspace's branch: the (possibly rewritten) local tip is
+/// pushed to `origin` so the review / PR see the reconciled commit rather than
+/// a stale pre-rework remote tip. `status` is `up-to-date`, `pushed`,
+/// `force-pushed`, or `failed`; a `failed` push blocks the handoff, so this
+/// line is the trail explaining why a task didn't advance to review.
+///
+/// Same task-scoped shape (no leading `project=`) as [`append_rebase_event`];
+/// whitespace in every field folds to underscores so the record stays a single
+/// parseable line.
+pub fn append_push_event(
+    task_id: &str,
+    workspace: &str,
+    branch: &str,
+    status: &str,
+    detail: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let task_id = sanitize_field(task_id);
+    let workspace = sanitize_field(workspace);
+    let branch = sanitize_reason(branch);
+    let status = sanitize_reason(status);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} push task={task_id} workspace={workspace} branch={branch} status={status} detail={detail}"
+    ))
+}
+
 /// Append a worktree-detach line to `~/.shelbi/events.log`. Emitted by the
 /// poller's ready-marker handoff after it promotes a task: the finishing
 /// worker's worktree is detached from the task branch so nothing holds it,

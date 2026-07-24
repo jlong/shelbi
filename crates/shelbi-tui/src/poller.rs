@@ -71,7 +71,7 @@ use chrono::{DateTime, Utc};
 use shelbi_core::{default_workflow, Column, Project, StatusCategory, Workflow};
 use shelbi_orchestrator::supervision::{SupervisionAction, SupervisionInputs, SupervisionState};
 use shelbi_state::{
-    append_heartbeat_event, append_limit_resume_event, append_rebase_event,
+    append_heartbeat_event, append_limit_resume_event, append_push_event, append_rebase_event,
     append_workspace_dialog_event, append_workspace_event, append_workspace_pause_event,
     append_worktree_detach_event, events_log_path, load_workspace_status, parse_pane_title_marker,
     read_state, read_zenmode_summary, save_workspace_status, WorkspaceState, WorkspaceStatus,
@@ -1749,6 +1749,24 @@ fn maybe_apply_ready_handoff(
             // is logged but doesn't block the handoff.
             rebase_workspace_branch_before_handoff(project, workspace, machine, host, &task_id);
 
+            // Push the workspace's (possibly rebased/amended) local branch tip
+            // to origin BEFORE the column move, force-with-lease when the branch
+            // was rewritten. This is the handoff of record: the review checkout,
+            // Zen probe, and PR all read `origin/<branch>`, so a stale remote tip
+            // strands the reconciled work locally and hands off the old commit.
+            // Unlike the advisory rebase above, a failed push is load-bearing:
+            // leave the marker in place (so we retry next tick) and return
+            // WITHOUT moving the task, rather than silently advancing to review
+            // on the stale tip. The push step logs its own event either way.
+            if !push_workspace_branch_before_handoff(project, workspace, machine, host, &task_id) {
+                tracing::warn!(
+                    workspace = %workspace.name,
+                    task = %task_id,
+                    "handoff push failed; leaving ready marker in place and NOT advancing to review",
+                );
+                return;
+            }
+
             match shelbi_state::move_task(&project.name, &task_id, to_column) {
                 Ok(Some((from, to, workflow))) => {
                     if let Err(e) = shelbi_state::append_task_event(
@@ -2236,6 +2254,86 @@ fn rebase_workspace_branch_before_handoff(
                 "auto-rebase outcome",
             );
         }
+    }
+}
+
+/// Push the workspace's local branch tip to `origin` before the handoff's
+/// column move, so review / the PR see the exact reconciled commit rather than
+/// a stale pre-rework remote tip.
+///
+/// Returns `true` when the handoff may proceed — the remote now carries the
+/// local tip (`up-to-date`, `pushed`, `force-pushed`) or the repo has no origin
+/// to strand it on (`no-remote`). Returns `false` on a genuine push failure
+/// (rejected, lease stale, network), in which case the caller must NOT advance
+/// the task: the ready marker is left in place so the push retries next tick.
+/// Every outcome is written to `events.log` so a blocked handoff is traceable.
+///
+/// Resolution mirrors [`rebase_workspace_branch_before_handoff`]; a resolution
+/// failure (unloadable task/workflow/branch) is treated as non-blocking — there
+/// is no branch we could push, so blocking would only wedge the handoff.
+fn push_workspace_branch_before_handoff(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    machine: &shelbi_core::Machine,
+    host: &shelbi_core::Host,
+    task_id: &str,
+) -> bool {
+    let task_file = match shelbi_state::load_task(&project.name, task_id) {
+        Ok(tf) => tf,
+        Err(e) => {
+            tracing::debug!(workspace = %workspace.name, task = %task_id, error = %e, "skip push: load_task failed");
+            return true;
+        }
+    };
+    // Fall back to the default workflow when the task's own can't be loaded —
+    // the same tolerance the enclosing handoff path applies. Bailing here would
+    // silently skip the push and re-strand the local tip (the very bug this
+    // guards against), so branch resolution, not workflow loading, is the only
+    // thing that can legitimately skip the push.
+    let workflow = shelbi_state::load_task_workflow(&project.name, project, &task_file.task)
+        .unwrap_or_else(|_| default_workflow());
+    let branch = match shelbi_orchestrator::branch::branch_name_for_task(
+        project,
+        Some(&workflow),
+        &task_file.task,
+    ) {
+        Ok(branch) => branch,
+        Err(e) => {
+            tracing::debug!(workspace = %workspace.name, task = %task_id, error = %e, "skip push: branch resolution failed");
+            return true;
+        }
+    };
+
+    let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
+    let outcome = shelbi_orchestrator::workspace::push_workspace_branch_to_origin(
+        host, &worktree, &branch,
+    );
+
+    let status = outcome.status_token();
+    let detail = outcome.detail();
+    if let Err(e) = append_push_event(task_id, &workspace.name, &branch, status, &detail) {
+        tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_push_event failed");
+    }
+
+    if outcome.handed_off_local_tip() {
+        tracing::info!(
+            workspace = %workspace.name,
+            task = %task_id,
+            branch = %branch,
+            status = %status,
+            detail = %detail,
+            "handoff push outcome",
+        );
+        true
+    } else {
+        tracing::warn!(
+            workspace = %workspace.name,
+            task = %task_id,
+            branch = %branch,
+            detail = %detail,
+            "handoff push failed; the local branch tip was NOT handed off to origin",
+        );
+        false
     }
 }
 
@@ -3920,6 +4018,171 @@ while :; do sleep 60; done
                 && detach_lines[0].contains(" status=ok"),
             "line: {}",
             detach_lines[0]
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn review_marker_blocks_handoff_when_push_to_origin_fails() {
+        // A failed push (here: a stale force-with-lease because origin was
+        // advanced by a concurrent clone) must NOT hand the task off on the
+        // stale remote tip: the task stays in-progress, the ready marker is left
+        // in place to retry, and a `push ... status=failed` line is emitted.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-pushfail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Main clone + a bare origin it pushes `main` to.
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        assert!(git_in(&work_dir, &["init", "-q", "-b", "main"])
+            .status
+            .success());
+        std::fs::write(work_dir.join("README.md"), "# repo\n").unwrap();
+        assert!(git_in(&work_dir, &["add", "README.md"]).status.success());
+        assert!(git_in(&work_dir, &["commit", "-q", "-m", "init"])
+            .status
+            .success());
+        let bare = home.join("origin.git");
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let bare_str = bare.to_string_lossy().into_owned();
+        assert!(git_in(&work_dir, &["remote", "add", "origin", &bare_str])
+            .status
+            .success());
+        assert!(git_in(&work_dir, &["push", "-q", "-u", "origin", "main"])
+            .status
+            .success());
+
+        // Workspace worktree checked out on the task branch, then pushed so
+        // origin has the branch and the worktree has a remote-tracking ref.
+        let project = local_project(&work_dir);
+        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        assert!(git_in(
+            &work_dir,
+            &[
+                "worktree", "add", "-q", "-b", "shelbi/fix-login",
+                wt.to_str().unwrap(), "main"
+            ],
+        )
+        .status
+        .success());
+        std::fs::write(wt.join("work.txt"), "v0\n").unwrap();
+        assert!(git_in(&wt, &["add", "work.txt"]).status.success());
+        assert!(git_in(&wt, &["commit", "-q", "-m", "task work"])
+            .status
+            .success());
+        assert!(git_in(&wt, &["push", "-q", "-u", "origin", "shelbi/fix-login"])
+            .status
+            .success());
+
+        // A concurrent clone advances origin/shelbi/fix-login out from under us.
+        let other = home.join("other");
+        assert!(std::process::Command::new("git")
+            .args(["clone", "-q", &bare_str])
+            .arg(&other)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(git_in(&other, &["checkout", "-q", "shelbi/fix-login"])
+            .status
+            .success());
+        std::fs::write(other.join("concurrent.txt"), "other\n").unwrap();
+        assert!(git_in(&other, &["add", "concurrent.txt"]).status.success());
+        assert!(git_in(&other, &["commit", "-q", "-m", "concurrent"])
+            .status
+            .success());
+        assert!(git_in(&other, &["push", "-q", "origin", "shelbi/fix-login"])
+            .status
+            .success());
+        let concurrent_tip =
+            String::from_utf8_lossy(&git_in(&bare, &["rev-parse", "shelbi/fix-login"]).stdout)
+                .trim()
+                .to_string();
+
+        // Rewrite our worktree branch (amend) so the push must force — and the
+        // stale lease (our tracking ref, pre-concurrent) will reject it.
+        std::fs::write(wt.join("work.txt"), "v1\n").unwrap();
+        assert!(git_in(&wt, &["add", "work.txt"]).status.success());
+        assert!(git_in(&wt, &["commit", "-q", "--amend", "-m", "task work v1"])
+            .status
+            .success());
+
+        // Pin the task branch so it matches the worktree's branch (the default
+        // template would render `<gh-login>/fix-login`, which no local ref
+        // holds).
+        let mut task = in_progress_task("fix-login", "alpha");
+        task.branch = Some("shelbi/fix-login".into());
+        shelbi_state::save_task("demo", &task, "body").unwrap();
+        let marker = write_marker(&project, "fix-login\n");
+
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
+        );
+
+        // The task must NOT have advanced, and the marker must be retained.
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login")
+                .unwrap()
+                .task
+                .column,
+            Column::in_progress(),
+            "a failed push must leave the task in-progress, not hand it off",
+        );
+        assert!(
+            marker.exists(),
+            "the ready marker must be left in place so the push retries next tick",
+        );
+        // Origin still carries the concurrent commit — nothing was clobbered.
+        assert_eq!(
+            String::from_utf8_lossy(&git_in(&bare, &["rev-parse", "shelbi/fix-login"]).stdout)
+                .trim(),
+            concurrent_tip,
+            "the concurrent push must survive; our force must have been rejected",
+        );
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.lines().any(|l| l.contains(" push ")
+                && l.contains(" task=fix-login ")
+                && l.contains(" status=failed ")),
+            "a failed push event must be emitted; log: {log:?}",
+        );
+        assert!(
+            !log.lines().any(|l| l.contains(" task=fix-login ")
+                && l.contains(" in_progress -> review ")),
+            "no review transition must be logged; log: {log:?}",
         );
 
         std::env::remove_var("SHELBI_HOME");
