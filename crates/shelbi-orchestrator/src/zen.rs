@@ -4882,11 +4882,15 @@ pub struct ProbeReport {
     pub published_head_sha: String,
     pub local_checks: Vec<LocalCheck>,
     pub merge_conflict: ConflictProbe,
-    /// Outcome of rebasing the branch onto the exact resolved task base before the
-    /// probe ran. Populated only under [`RebasePolicy::RebaseOntoDefault`];
-    /// always clean under `AsIs`. When `conflicts` is true the rebase was
-    /// aborted (the durable task ref stays at its pre-rebase commit) and the
-    /// local checks were skipped — `files` names the conflicting paths.
+    /// Outcome of rebasing the branch onto the exact resolved task base before
+    /// the probe ran. Under [`RebasePolicy::RebaseOntoDefault`] this is the
+    /// landed rebase; under `AsIs` it is a *detect-only* rebase run in a
+    /// throwaway worktree (no fetch, no task-ref rewrite) so the read-only
+    /// preview still surfaces a branch that a sequential rebase cannot cleanly
+    /// replay — the delete/modify divergence that [`probe_merge_conflict`]'s
+    /// squash-merge model silently auto-resolves. When `conflicts` is true the
+    /// rebase was aborted (the durable task ref stays at its pre-rebase commit)
+    /// and the local checks were skipped — `files` names the conflicting paths.
     pub rebase_conflict: ConflictProbe,
     pub diff_size: DiffSize,
     /// Ahead/behind and patch-id redundancy of the published branch head
@@ -5063,7 +5067,16 @@ fn probe_isolated_task_ref(
     };
 
     let rebase_conflict = match policy {
-        RebasePolicy::AsIs => ConflictProbe::default(),
+        // AsIs never lands a rebase, but it must still tell the truth about
+        // whether one *would* conflict. `probe_merge_conflict` (below) models
+        // GitHub's squash-merge, which can silently auto-resolve a delete/modify
+        // divergence as a clean tree; a sequential rebase surfaces that same
+        // divergence as a conflict. Detect it here — in a throwaway worktree,
+        // no fetch, no task-ref rewrite — so a branch a rebase cannot cleanly
+        // replay is reported as needs-rebase rather than mergeable.
+        RebasePolicy::AsIs => {
+            probe_rebase_would_conflict(host, repository_anchor, initial_head, &base_sha)?
+        }
         RebasePolicy::RebaseOntoDefault => {
             match rebase_workspace_branch_onto_default(host, probe_worktree, &base_sha) {
                 RebaseOutcome::AlreadyUpToDate { .. } | RebaseOutcome::Rebased { .. } => {
@@ -7290,6 +7303,138 @@ fn probe_merge_conflict(
 }
 
 // ---------------------------------------------------------------------------
+// rebase divergence
+
+/// Detect — without landing anything — whether replaying `head` onto `base`
+/// with a sequential `git rebase` conflicts.
+///
+/// [`probe_merge_conflict`] models the mechanical, endpoint-to-endpoint 3-way
+/// merge that GitHub's squash-merge (`gh pr merge --squash`) performs: it
+/// collapses the whole branch to a single tree and merges that against the base
+/// against their common merge-base. That collapse can silently auto-resolve a
+/// delete/modify divergence — content the base *deleted* after the branch's
+/// merge-base, which the branch still carries or touches — as a *non-conflict*,
+/// yielding a tree that reintroduces what the base removed (a silent semantic
+/// revert of a sibling change). A sequential `git rebase`, which replays each
+/// branch commit in turn, still surfaces that same divergence as a conflict.
+///
+/// So a clean `merge-tree` is *not* sufficient evidence that the branch
+/// integrates safely: the merge can undo a sibling change a rebase would refuse
+/// to apply. This runs the rebase in a throwaway detached worktree — it never
+/// fetches and never rewrites the durable task ref, so it is safe under
+/// [`RebasePolicy::AsIs`], whose landing path skips the real rebase and would
+/// otherwise report such a branch as cleanly mergeable — and returns the
+/// conflicting paths so the dry-run's existing `rebase-conflict` gate can block
+/// it instead of waving it through.
+fn probe_rebase_would_conflict(
+    host: &Host,
+    repository_anchor: &std::path::Path,
+    head: &str,
+    base: &str,
+) -> Result<ConflictProbe> {
+    let anchor = repository_anchor.to_string_lossy().into_owned();
+
+    // A branch that already contains the base tip cannot diverge from it: a
+    // rebase would be a no-op. Skip the worktree churn for the common
+    // up-to-date case (and for a stale base that is itself the merge-base,
+    // where there is nothing to replay and nothing to detect).
+    let ancestor = shelbi_ssh::run(
+        host,
+        [
+            "git",
+            "-C",
+            anchor.as_str(),
+            "merge-base",
+            "--is-ancestor",
+            base,
+            head,
+        ],
+    )
+    .map_err(Error::Io)?;
+    if ancestor.status.success() {
+        return Ok(ConflictProbe::default());
+    }
+
+    let scratch = unique_probe_worktree_path(repository_anchor, "rebase-divergence");
+    add_probe_worktree(host, repository_anchor, &scratch, head)?;
+    let detect = probe_rebase_would_conflict_in(host, &scratch, base);
+    let cleanup = remove_probe_worktree(host, repository_anchor, &scratch);
+    match (detect, cleanup) {
+        (Ok(probe), Ok(())) => Ok(probe),
+        (Err(detect_err), _) => Err(detect_err),
+        (Ok(_), Err(cleanup_err)) => Err(cleanup_err),
+    }
+}
+
+/// Run and evaluate the detached rebase inside an already-added scratch
+/// worktree. Split out so [`probe_rebase_would_conflict`] can always remove the
+/// worktree afterward regardless of the rebase outcome.
+fn probe_rebase_would_conflict_in(
+    host: &Host,
+    scratch: &std::path::Path,
+    base: &str,
+) -> Result<ConflictProbe> {
+    let wt = scratch.to_string_lossy().into_owned();
+    // `--no-update-refs` so a user's `rebase.updateRefs=true` never rewrites a
+    // sibling ref that happens to point into this detached history.
+    let out = shelbi_ssh::run(
+        host,
+        [
+            "git",
+            "-C",
+            wt.as_str(),
+            "rebase",
+            "--no-update-refs",
+            base,
+        ],
+    )
+    .map_err(Error::Io)?;
+    if out.status.success() {
+        return Ok(ConflictProbe::default());
+    }
+
+    // Capture the unmerged paths before aborting — `git rebase --abort` forgets
+    // them. `--diff-filter=U` lists exactly the conflicted files.
+    let files: Vec<String> = shelbi_ssh::run_capture(
+        host,
+        [
+            "git",
+            "-C",
+            wt.as_str(),
+            "diff",
+            "--name-only",
+            "--diff-filter=U",
+        ],
+    )
+    .map(|s| {
+        s.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+    .unwrap_or_default();
+
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let _ = shelbi_ssh::run(host, ["git", "-C", wt.as_str(), "rebase", "--abort"]);
+
+    if files.is_empty() {
+        // A non-zero rebase with no unmerged paths is not a content conflict —
+        // it is some other failure (a missing committer identity, a hook, an
+        // empty-commit stop). Surface it rather than mislabel it a conflict or,
+        // worse, swallow it and imply the branch integrates cleanly.
+        return Err(Error::Command {
+            cmd: format!("git -C {wt} rebase --no-update-refs {base}"),
+            status: out.status.to_string(),
+            stderr,
+        });
+    }
+    Ok(ConflictProbe {
+        conflicts: true,
+        files,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // diff_size
 
 fn probe_diff_size(
@@ -7702,6 +7847,16 @@ mod probe_tests {
         assert!(status.success(), "git {args:?} failed in {}", cwd.display());
     }
 
+    fn git_stdout(cwd: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed in {}", cwd.display());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     #[test]
     fn diff_size_against_real_repo() {
         let (_tmp, repo) = fixture_repo(|r| {
@@ -7833,6 +7988,130 @@ mod probe_tests {
             .output()
             .unwrap();
         assert!(status_out.stdout.is_empty(), "worktree must be clean");
+    }
+
+    /// The core regression: a multi-commit branch whose *net* change is benign
+    /// but whose intermediate commits touch a region the base has since deleted.
+    /// GitHub's squash-merge (modelled by `probe_merge_conflict`) collapses the
+    /// branch to one endpoint and merges cleanly; a sequential `git rebase`
+    /// replays the touch-then-restore and conflicts on the delete/modify. The
+    /// probe must report the branch as needs-rebase, not mergeable, so the
+    /// mechanical merge does not silently land a tree a rebase would refuse.
+    fn setup_delete_modify_divergence_repo() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        run_git(&repo, &["init", "-q", "-b", "main", "."]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test"]);
+        // base: a symbol both the base deletion and the branch touch.
+        std::fs::write(repo.join("app.rs"), "a\nb\nSYMBOL_X\nc\nd\n").unwrap();
+        run_git(&repo, &["add", "app.rs"]);
+        run_git(&repo, &["commit", "-q", "-m", "base: has SYMBOL_X"]);
+
+        // A sibling PR lands on main and deletes SYMBOL_X.
+        std::fs::write(repo.join("app.rs"), "a\nb\nc\nd\n").unwrap();
+        run_git(&repo, &["commit", "-q", "-am", "#465: delete SYMBOL_X"]);
+
+        // The branch was cut *before* that deletion. Two commits: the first
+        // touches the SYMBOL_X line, the second restores it and adds unrelated
+        // content — so the branch's net diff no longer touches SYMBOL_X, but a
+        // replay of the first commit collides with main's deletion.
+        run_git(&repo, &["checkout", "-q", "-b", "feature", "HEAD~1"]);
+        std::fs::write(repo.join("app.rs"), "a\nb\nSYMBOL_X_touched\nc\nd\n").unwrap();
+        run_git(&repo, &["commit", "-q", "-am", "c1: touch SYMBOL_X"]);
+        std::fs::write(repo.join("app.rs"), "a\nb\nSYMBOL_X\nc\nNEW_at_end\n").unwrap();
+        run_git(&repo, &["commit", "-q", "-am", "c2: restore SYMBOL_X, add tail"]);
+        run_git(&repo, &["checkout", "-q", "main"]);
+        (tmp, repo)
+    }
+
+    #[test]
+    fn merge_tree_is_clean_but_rebase_diverges_on_delete_modify() {
+        let (_tmp, repo) = setup_delete_modify_divergence_repo();
+
+        // The mechanical squash-merge model reports no textual conflict...
+        let merge = probe_merge_conflict(&Host::Local, &repo, "feature", "main").unwrap();
+        assert!(
+            !merge.conflicts,
+            "merge-tree should auto-resolve the delete/modify as a clean merge, got {merge:?}"
+        );
+
+        // ...yet a sequential rebase conflicts, so the branch is not safe to
+        // land as-is: `gh pr merge --squash` would silently revert the sibling.
+        let rebase =
+            probe_rebase_would_conflict(&Host::Local, &repo, "feature", "main").unwrap();
+        assert!(
+            rebase.conflicts,
+            "a sequential rebase must surface the delete/modify divergence"
+        );
+        assert!(
+            rebase.files.iter().any(|f| f == "app.rs"),
+            "expected app.rs among the conflicting paths, got {:?}",
+            rebase.files
+        );
+
+        // The detection left no worktree behind and never rewrote a ref.
+        let worktrees = git_stdout(&repo, &["worktree", "list", "--porcelain"]);
+        assert_eq!(
+            worktrees
+                .lines()
+                .filter(|l| l.starts_with("worktree "))
+                .count(),
+            1,
+            "the scratch rebase worktree must be removed:\n{worktrees}"
+        );
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", "feature"]),
+            git_stdout(&repo, &["rev-parse", "refs/heads/feature"]),
+            "the task branch ref must be untouched"
+        );
+    }
+
+    #[test]
+    fn rebase_divergence_reports_clean_for_a_cleanly_rebasable_branch() {
+        // A branch that touches an unrelated region rebases cleanly onto a moved
+        // base — no false positive.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        run_git(repo, &["init", "-q", "-b", "main", "."]);
+        run_git(repo, &["config", "user.email", "test@example.com"]);
+        run_git(repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("a.txt"), "1\n2\n3\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "x\n").unwrap();
+        run_git(repo, &["add", "-A"]);
+        run_git(repo, &["commit", "-q", "-m", "init"]);
+        // main advances an unrelated file.
+        run_git(repo, &["checkout", "-q", "-b", "feature", "HEAD"]);
+        std::fs::write(repo.join("b.txt"), "feature\n").unwrap();
+        run_git(repo, &["commit", "-q", "-am", "feature: edit b"]);
+        run_git(repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("a.txt"), "1\n2\n3\n4\n").unwrap();
+        run_git(repo, &["commit", "-q", "-am", "main: edit a"]);
+
+        let rebase = probe_rebase_would_conflict(&Host::Local, repo, "feature", "main").unwrap();
+        assert!(!rebase.conflicts, "clean rebase must not be flagged, got {rebase:?}");
+    }
+
+    #[test]
+    fn rebase_divergence_short_circuits_when_base_is_already_an_ancestor() {
+        // Branch already contains the base tip: a rebase is a no-op, so no
+        // scratch worktree is created and the result is clean.
+        let (_tmp, repo) = fixture_repo(|r| {
+            std::fs::write(r.join("a.txt"), "added on feature\n").unwrap();
+        });
+        // `feature` was cut from `main` and `main` has not moved, so main is an
+        // ancestor of feature.
+        let rebase = probe_rebase_would_conflict(&Host::Local, &repo, "feature", "main").unwrap();
+        assert!(!rebase.conflicts);
+        let worktrees = git_stdout(&repo, &["worktree", "list", "--porcelain"]);
+        assert_eq!(
+            worktrees
+                .lines()
+                .filter(|l| l.starts_with("worktree "))
+                .count(),
+            1,
+            "no scratch worktree should be added for an up-to-date branch"
+        );
     }
 
     #[test]
@@ -8861,6 +9140,91 @@ mod probe_tests {
             status.stdout.is_empty(),
             "worktree must be clean after the aborted rebase"
         );
+    }
+
+    #[test]
+    fn asis_dry_run_flags_a_branch_the_squash_merge_would_silently_revert() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        // A sibling PR deleted SYMBOL_X on the default branch after this branch
+        // was cut. The branch's *net* diff no longer touches SYMBOL_X, so
+        // GitHub's squash-merge (modelled by `merge-tree`) integrates cleanly —
+        // yet a sequential rebase conflicts on the intermediate commit that
+        // touched the now-deleted region. The AsIs dry-run never lands a rebase,
+        // so before this fix it reported the branch as cleanly mergeable and
+        // `gh pr merge --squash` would have silently reverted the sibling. It
+        // must now surface the divergence as a rebase conflict.
+        let (base, _origin, wt) = setup_origin_and_worktree();
+
+        // Base commit carrying SYMBOL_X.
+        run_git(&wt, &["checkout", "-q", "main"]);
+        std::fs::write(wt.join("app.rs"), "a\nb\nSYMBOL_X\nc\nd\n").unwrap();
+        run_git(&wt, &["add", "app.rs"]);
+        run_git(&wt, &["commit", "-q", "-m", "base: has SYMBOL_X"]);
+
+        // Branch cut from that base: touch then restore SYMBOL_X, add a tail, so
+        // the net diff is benign but a replay of the first commit collides with
+        // the deletion.
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("app.rs"), "a\nb\nSYMBOL_X_touched\nc\nd\n").unwrap();
+        run_git(&wt, &["commit", "-q", "-am", "c1: touch SYMBOL_X"]);
+        std::fs::write(wt.join("app.rs"), "a\nb\nSYMBOL_X\nc\nNEW_at_end\n").unwrap();
+        run_git(&wt, &["commit", "-q", "-am", "c2: restore SYMBOL_X, add tail"]);
+        let task_head = branch_sha(&wt, "shelbi/task1");
+
+        // The sibling deletion lands on the *local* default branch — AsIs reads
+        // its base locally and never fetches.
+        run_git(&wt, &["checkout", "-q", "main"]);
+        std::fs::write(wt.join("app.rs"), "a\nb\nc\nd\n").unwrap();
+        run_git(&wt, &["commit", "-q", "-am", "#465: delete SYMBOL_X"]);
+
+        // Detach from the task branch to model handoff, then probe as-is.
+        run_git(&wt, &["checkout", "-q", "shelbi/task1"]);
+        detach_for_handoff(&wt, "shelbi/task1");
+
+        let project = probe_project(base.path(), &["true"]);
+        let task = probe_task("shelbi/task1");
+        let report =
+            probe_in_workflow(&project, None, &task, "shelbi/task1", RebasePolicy::AsIs).unwrap();
+
+        // The mechanical squash-merge model sees no textual conflict...
+        assert!(
+            !report.merge_conflict.conflicts,
+            "merge-tree should report the delete/modify as clean, got {:?}",
+            report.merge_conflict
+        );
+        // ...but the detect-only rebase surfaces the divergence.
+        assert!(
+            report.rebase_conflict.conflicts,
+            "AsIs must detect that a rebase would conflict"
+        );
+        assert!(
+            report.rebase_conflict.files.iter().any(|f| f == "app.rs"),
+            "conflict files should name app.rs, got {:?}",
+            report.rebase_conflict.files
+        );
+        // A branch reported as needs-rebase must not have its stale content
+        // tested and reported green.
+        assert!(
+            report.local_checks.is_empty(),
+            "local checks must be skipped when a rebase would conflict, got {:?}",
+            report.local_checks
+        );
+        // The behind count is truthful: the branch does not contain the tip that
+        // deleted SYMBOL_X, so it is not `behind: 0`.
+        assert!(
+            report.branch_divergence.behind >= 1,
+            "branch is behind the base that deleted SYMBOL_X, got {:?}",
+            report.branch_divergence
+        );
+        // The AsIs contract holds: the durable task ref never moved.
+        assert_eq!(branch_sha(&wt, "shelbi/task1"), task_head);
+
+        // End to end: the dry-run gate blocks the merge with a rebase-conflict
+        // reason rather than waving the silent revert through.
+        let decision = evaluate_probe("task1", &report);
+        assert_eq!(decision.action, DryRunAction::BlockMerge);
+        assert_eq!(decision.detail, "rebase-conflict");
     }
 
     #[test]
