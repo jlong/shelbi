@@ -1420,9 +1420,11 @@ fn status_order(s: Status) -> u8 {
 }
 
 /// Launch the review-load confirm as a centered `tmux display-popup` running
-/// `shelbi __review-confirm` — the same popup surface the palette uses, so the
-/// confirm reads as a full-terminal modal rather than a box inside the sidebar
-/// column. Sized smaller than the palette (70%×60%) since it's a short yes/no.
+/// `shelbi __review-confirm`, so the confirm reads as a full-terminal modal
+/// rather than a box inside the sidebar column. Sized smaller than the palette
+/// (70%×60%) since it's a short yes/no. Unlike the palette, this popup passes
+/// `-B` and lets the widget draw its own cyan titled border, so exactly one
+/// frame shows.
 ///
 /// Returns `true` only when the popup exits 0 (the user confirmed and a slot
 /// was free); a cancel, an informational "none free" dismiss, or any tmux
@@ -1441,7 +1443,19 @@ fn review_confirm_popup(title: &str, workspace: Option<&str>) -> bool {
     if let Some(ws) = workspace {
         cmd.push_str(&format!(" --workspace {}", shelbi_agent::shell_escape(ws)));
     }
-    run_tmux(["display-popup", "-E", "-w", "60", "-h", "9", cmd.as_str()])
+    // `-B` suppresses tmux's own popup border so only the widget's cyan
+    // titled block frames the modal (one border, not two). `-h 9` leaves room
+    // for the title, question, and button row without clipping.
+    run_tmux([
+        "display-popup",
+        "-B",
+        "-E",
+        "-w",
+        "60",
+        "-h",
+        "9",
+        cmd.as_str(),
+    ])
 }
 
 /// Run `tmux ARGS`. Returns true on success.
