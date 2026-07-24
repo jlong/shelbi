@@ -319,10 +319,14 @@ pub fn show_review_view(project_name: &str, task_id: &str, view: ReviewMidView) 
 }
 
 /// Create the editor pane in the review worktree if it doesn't exist yet,
-/// returning its pane id. Parked in a **hidden window** (not a fourth visible
-/// dashboard pane) so the caller can swap it into the middle without ever
-/// showing four columns. The editor is resolved hub-wide via
-/// [`shelbi_state::resolve_editor`].
+/// returning its pane id. The pane is parked in its own `__review-editor`
+/// window inside the **hidden stash session** `_{session}` — the same detached
+/// session that holds the `__views` panes — so it never appears in the user's
+/// visible window list (tmux has no hidden-*window* concept; hiding means
+/// living in a detached session no one is attached to). [`show_review_view`]
+/// swaps it into the middle column on demand; pane ids are global in tmux, so
+/// the cross-session swap works exactly like a within-session one. The editor
+/// is resolved hub-wide via [`shelbi_state::resolve_editor`].
 fn ensure_editor_pane(
     project: &shelbi_core::Project,
     ws: &shelbi_core::WorkspaceSpec,
@@ -345,7 +349,17 @@ fn ensure_editor_pane(
         shelbi_core::shell_escape(&worktree.to_string_lossy()),
         editor,
     );
-    let win = format!("{session}:__review-editor");
+    // Park the editor in the hidden stash session, not the visible one, so no
+    // `__review-editor` window shows in the user's window list. Bootstrap
+    // builds the stash, but the editor can be opened before/without a full
+    // dashboard rebuild, so ensure it exists first (building it whole — with
+    // its `views` window — rather than failing).
+    ensure_stash_session(project, session)?;
+    let stash = format!("_{session}");
+    // Its own window inside the stash (not spliced into the `views` window) so
+    // it tears down independently — killing this window on close leaves the
+    // `views` panes untouched.
+    let win = format!("{stash}:__review-editor");
     let editor_id = tmux_capture(&[
         "new-window",
         "-d",
@@ -353,7 +367,7 @@ fn ensure_editor_pane(
         "-F",
         "#{pane_id}",
         "-t",
-        &format!("{session}:"),
+        &format!("{stash}:"),
         "-n",
         "__review-editor",
         "sh",
@@ -363,6 +377,23 @@ fn ensure_editor_pane(
     .map_err(|e| Error::Other(format!("could not open editor window {win}: {e}")))?;
     set_session_var(session, EDITOR_KEY, &editor_id)?;
     Ok(editor_id)
+}
+
+/// Make sure the hidden stash session `_{session}` exists before we park the
+/// editor window in it. Bootstrap's [`crate::ensure_hidden_views`] builds it,
+/// but the editor view can be opened before/without a full dashboard rebuild,
+/// so if the stash is missing we build it whole (which seeds its `views`
+/// window) rather than failing. A bare `new-session` here would leave the
+/// stash without the `views` window the heal path later assumes, so we route
+/// through the same ensure path the bootstrap uses. Local-only: remote review
+/// slots never reach here (they degrade to focusing their window).
+fn ensure_stash_session(project: &shelbi_core::Project, session: &str) -> Result<()> {
+    let stash = format!("_{session}");
+    if tmux_run(&["has-session", "-t", &stash]).is_ok() {
+        return Ok(());
+    }
+    let shelbi_bin = crate::current_exe_string()?;
+    crate::ensure_hidden_views(&Host::Local, session, &project.name, &shelbi_bin)
 }
 
 /// Tear the review interface back down: bring the agent/chat pane back to the
@@ -379,14 +410,16 @@ pub fn close_review_interface(project_name: &str) -> Result<()> {
     let mid = read_session_var(&session, MID_KEY);
 
     // If the editor is currently in the middle, swap the chat pane back so the
-    // agent pane returns to the review window before the editor's hidden
+    // agent pane returns to the review window before the editor's stash-session
     // window is destroyed by the kill below.
     if let (Some(chat), Some(mid)) = (chat.as_deref(), mid.as_deref()) {
         if mid != chat {
             let _ = tmux_run(&["swap-pane", "-s", chat, "-t", mid]);
         }
     }
-    // Kill the editor (its hidden window closes with it) and the review panel.
+    // Kill the editor pane. It is the sole pane of its own `__review-editor`
+    // window in the hidden stash session, so this closes that window only —
+    // the stash session and its `views` panes (swapped out elsewhere) survive.
     if let Some(editor) = read_session_var(&session, EDITOR_KEY) {
         let _ = tmux_run(&["kill-pane", "-t", &editor]);
     }
