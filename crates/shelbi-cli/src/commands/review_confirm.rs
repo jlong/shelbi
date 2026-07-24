@@ -24,28 +24,56 @@ use ratatui::{
     Frame, Terminal,
 };
 
+/// Which button currently has focus in the confirm variant. `Confirm` (the
+/// `[ Load ]` button) is the default focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Confirm,
+    Cancel,
+}
+
+impl Focus {
+    /// Flip focus between the two buttons (used by `Tab` / `BackTab`).
+    fn toggled(self) -> Focus {
+        match self {
+            Focus::Confirm => Focus::Cancel,
+            Focus::Cancel => Focus::Confirm,
+        }
+    }
+}
+
 /// What a key press means in the confirm popup. Split from the event loop so
-/// the decision table is unit-testable without a terminal.
+/// the decision table is unit-testable without a terminal. `Activate` resolves
+/// against the currently focused button (`Enter` / `Space`); the `Focus*`
+/// variants only move the highlight without closing the popup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Decision {
     Confirm,
     Cancel,
+    Activate,
+    FocusConfirm,
+    FocusCancel,
+    ToggleFocus,
     Ignore,
 }
 
 /// Map a key to a decision. When no review slot is free (`has_workspace`
-/// false) the popup is informational, so every key dismisses it (cancel) and
-/// nothing is ever loaded — mirroring the old in-sidebar modal's behavior.
+/// false) the popup is informational — a single `[ Dismiss ]` button — so
+/// every key dismisses it (cancel) and nothing is ever loaded, mirroring the
+/// old in-sidebar modal's behavior.
 fn decide(code: KeyCode, has_workspace: bool) -> Decision {
     if !has_workspace {
         return Decision::Cancel;
     }
     match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Decision::Confirm,
-        KeyCode::Char('n')
-        | KeyCode::Char('N')
-        | KeyCode::Char('q')
-        | KeyCode::Esc => Decision::Cancel,
+        KeyCode::Char('y') | KeyCode::Char('Y') => Decision::Confirm,
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') | KeyCode::Esc => {
+            Decision::Cancel
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => Decision::Activate,
+        KeyCode::Left => Decision::FocusConfirm,
+        KeyCode::Right => Decision::FocusCancel,
+        KeyCode::Tab | KeyCode::BackTab => Decision::ToggleFocus,
         _ => Decision::Ignore,
     }
 }
@@ -60,9 +88,10 @@ pub fn run(title: String, workspace: Option<String>) -> Result<bool> {
     // a normal one that just closes.
     let _guard = TerminalGuard;
     let has_ws = workspace.is_some();
+    let mut focus = Focus::Confirm;
 
     let confirmed = loop {
-        term.draw(|f| render(f, &title, workspace.as_deref()))?;
+        term.draw(|f| render(f, &title, workspace.as_deref(), focus))?;
         if event::poll(Duration::from_millis(150))? {
             if let Event::Key(k) = event::read()? {
                 if k.kind != KeyEventKind::Press {
@@ -71,6 +100,10 @@ pub fn run(title: String, workspace: Option<String>) -> Result<bool> {
                 match decide(k.code, has_ws) {
                     Decision::Confirm => break true,
                     Decision::Cancel => break false,
+                    Decision::Activate => break focus == Focus::Confirm,
+                    Decision::FocusConfirm => focus = Focus::Confirm,
+                    Decision::FocusCancel => focus = Focus::Cancel,
+                    Decision::ToggleFocus => focus = focus.toggled(),
                     Decision::Ignore => {}
                 }
             }
@@ -81,9 +114,10 @@ pub fn run(title: String, workspace: Option<String>) -> Result<bool> {
     Ok(confirmed)
 }
 
-fn render(f: &mut Frame, title: &str, workspace: Option<&str>) {
+fn render(f: &mut Frame, title: &str, workspace: Option<&str>, focus: Focus) {
     // The popup pane is the whole "screen" from here; tmux has already
-    // centered and sized it. Draw a bordered modal that fills it.
+    // centered and sized it (and, with `-B`, drawn no border of its own). Draw
+    // the single bordered modal that fills it.
     let area = f.area();
     f.render_widget(Clear, area);
     let block = Block::default()
@@ -117,10 +151,12 @@ fn render(f: &mut Frame, title: &str, workspace: Option<&str>) {
                 Span::styled("?", Style::default().fg(Color::Gray)),
             ]),
             Line::raw(""),
-            Line::from(Span::styled(
-                "Enter / y  confirm    Esc / n  cancel",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(vec![
+                button("[ Load ]", focus == Focus::Confirm),
+                Span::raw("      "),
+                button("[ Cancel ]", focus == Focus::Cancel),
+            ])
+            .centered(),
         ],
         None => vec![
             title_line,
@@ -130,13 +166,25 @@ fn render(f: &mut Frame, title: &str, workspace: Option<&str>) {
                 Style::default().fg(Color::Yellow),
             )),
             Line::raw(""),
-            Line::from(Span::styled(
-                "Free a review slot, then try again.  Esc dismiss",
-                Style::default().fg(Color::DarkGray),
-            )),
+            // Informational variant: a single button, always focused, that any
+            // key dismisses.
+            Line::from(button("[ Dismiss ]", true)).centered(),
         ],
     };
     f.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), inner);
+}
+
+/// A button span. The focused button is reverse-video + bold (a solid
+/// highlighted block); an unfocused button is plain cyan text.
+fn button(label: &str, focused: bool) -> Span<'_> {
+    let style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    Span::styled(label.to_string(), style)
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -173,8 +221,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn confirm_keys_confirm_only_when_a_slot_is_free() {
-        for code in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Char('Y')] {
+    fn confirm_shortcut_keys_confirm_immediately_when_a_slot_is_free() {
+        // The `y`/`Y` shortcuts short-circuit to confirm regardless of focus.
+        for code in [KeyCode::Char('y'), KeyCode::Char('Y')] {
             assert_eq!(decide(code, true), Decision::Confirm, "{code:?}");
         }
     }
@@ -192,19 +241,47 @@ mod tests {
     }
 
     #[test]
+    fn enter_and_space_activate_the_focused_button() {
+        for code in [KeyCode::Enter, KeyCode::Char(' ')] {
+            assert_eq!(decide(code, true), Decision::Activate, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn focus_keys_move_focus_when_a_slot_is_free() {
+        assert_eq!(decide(KeyCode::Left, true), Decision::FocusConfirm);
+        assert_eq!(decide(KeyCode::Right, true), Decision::FocusCancel);
+        assert_eq!(decide(KeyCode::Tab, true), Decision::ToggleFocus);
+        assert_eq!(decide(KeyCode::BackTab, true), Decision::ToggleFocus);
+    }
+
+    #[test]
+    fn activate_resolves_against_focus() {
+        // Default focus is `[ Load ]`, so Enter confirms; once focus moves to
+        // `[ Cancel ]`, the same Enter cancels. This is the loop's resolution
+        // step, mirrored here without a terminal.
+        assert!(Focus::Confirm == Focus::Confirm);
+        assert_eq!(Focus::Confirm.toggled(), Focus::Cancel);
+        assert_eq!(Focus::Cancel.toggled(), Focus::Confirm);
+    }
+
+    #[test]
     fn unrelated_keys_are_ignored_when_a_slot_is_free() {
-        for code in [KeyCode::Char('x'), KeyCode::Down, KeyCode::Tab] {
+        for code in [KeyCode::Char('x'), KeyCode::Down, KeyCode::Up] {
             assert_eq!(decide(code, true), Decision::Ignore, "{code:?}");
         }
     }
 
     #[test]
     fn every_key_dismisses_when_no_slot_is_free() {
-        // Informational popup: even the confirm keys just cancel, so nothing
-        // is loaded — same guarantee the old in-sidebar modal made.
+        // Informational popup: even the confirm/focus keys just cancel, so
+        // nothing is loaded — same guarantee the old in-sidebar modal made.
         for code in [
             KeyCode::Enter,
+            KeyCode::Char(' '),
             KeyCode::Char('y'),
+            KeyCode::Tab,
+            KeyCode::Left,
             KeyCode::Esc,
             KeyCode::Char('x'),
         ] {
