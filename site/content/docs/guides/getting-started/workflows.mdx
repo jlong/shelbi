@@ -654,7 +654,7 @@ doesn't run a `shelbi` command. The orchestrator doesn't watch the
 workspace's pane. Instead:
 
 1. The workspace, when done, writes its task id into
-   `<worktree>/.claude/shelbi-review-ready`. This instruction is part
+   `<worktree>/.claude/shelbi-ready`. This instruction is part
    of the initial prompt every task ships with (see `compose_prompt`
    in `crates/shelbi-orchestrator/src/workspace.rs`).
 2. The hub poller `cat`s that file on every tick (locally for hub

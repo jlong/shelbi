@@ -102,6 +102,17 @@ filled. A busy slot shows which [agent](/docs/concepts/agents) role it's
 running, which is how you tell at a glance that `delta` is doing a QA pass,
 not writing code.
 
+Each machine group can be collapsed (Space / Enter on its header). The set of
+collapsed machine names persists to `~/.shelbi/state.json` under
+`sidebar.collapsed_machines` (the `SidebarPrefs` struct), so the choice
+survives a sidebar respawn and follows you across projects that share a machine
+name. A collapsed machine keeps its `(total, active)` count on the header so
+capacity stays visible at a glance.
+
+[Review](/docs/concepts/review-workspaces)-tagged slots are the exception:
+they never render here. Their capacity surfaces under the sidebar's
+*Ready for Review* and *Queued for Review* sections instead.
+
 ## Machine-aware routing
 
 A task can hint where it wants to run with `prefers_machine`:
@@ -193,7 +204,7 @@ A workspace reports task completion by writing its task id into a marker file
 in the worktree:
 
 ```text
-<worktree>/.claude/shelbi-review-ready
+<worktree>/.claude/shelbi-ready
 ```
 
 The hub poller `cat`s this file on each tick (locally or over SSH), and when
