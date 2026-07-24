@@ -94,6 +94,13 @@ pub fn run(project: String) -> Result<()> {
                 let target = run_project_picker(&mut term, &project, &keymaps)?;
                 break (chosen, target, false);
             }
+            // Inline "Switch to <project>" shortcut — the target slug is
+            // carried in the id, so we skip the sub-picker and switch
+            // directly via the same post-loop `switch_to_project` path.
+            Ok(Some(entry)) if switch_target_from_id(&entry.id).is_some() => {
+                let target = switch_target_from_id(&entry.id).map(str::to_string);
+                break (chosen, target, false);
+            }
             Ok(Some(entry)) if entry.id == "action:quit-project" => {
                 if run_quit_project_confirm(&mut term, &project, &keymaps)? {
                     break (chosen, None, true);
@@ -412,6 +419,37 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
 
 fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
+    // Switch Project leads the list: it's the most common cross-project
+    // action, so it sits ahead of the sidebar/nav destinations. Selecting
+    // it still opens the fuzzy sub-picker (see `run_project_picker`).
+    out.push(Entry {
+        id: "action:switch-project".into(),
+        label: "Switch Project".into(),
+        kind: EntryKind::Action,
+        subtitle: Some("fuzzy-pick another project and swap the dashboard".into()),
+        shortcut: None,
+        decoration: None,
+        hidden_until_query: false,
+    });
+    // Inline per-project shortcuts. Hidden until the user types, they let
+    // `web` surface "Switch to Website project" and switch directly without
+    // stepping through the sub-picker. Enumerated + filtered the same way the
+    // sub-picker is (skip the current project); each carries the target slug
+    // in its id so dispatch reuses `switch_to_project`.
+    if let Ok(projects) = shelbi_state::list_projects() {
+        for p in projects.into_iter().filter(|p| p.name != app.project_name) {
+            let display = p.display_label();
+            out.push(Entry {
+                id: format!("action:switch-project:{}", p.name),
+                label: format!("Switch to {display} project"),
+                kind: EntryKind::Action,
+                subtitle: Some("swap the dashboard to this project".into()),
+                shortcut: None,
+                decoration: None,
+                hidden_until_query: true,
+            });
+        }
+    }
     // First pass: every sidebar row becomes an entry with the row's
     // own decoration attached. Section headers and blanks have no
     // decoration and are skipped.
@@ -436,22 +474,13 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
     // `E` / `Edit` / `settings` surfaces them. Placed ahead of the global
     // action trail so "Quit Shelbi" stays the structurally-last entry.
     out.extend(edit_entries(&app.project_name));
-    // Sits with the other project actions. Placed ahead of Switch/Quit so
-    // an empty-query palette reads Add → Switch → Quit top-to-bottom.
+    // Sits with the other project actions. Switch Project now leads the whole
+    // list (pushed first, above the nav rows), so this trails Add → Quit.
     out.push(Entry {
         id: "action:add-project".into(),
         label: "Add project".into(),
         kind: EntryKind::Action,
         subtitle: Some("create + register a new project (same as `shelbi init`)".into()),
-        shortcut: None,
-        decoration: None,
-        hidden_until_query: false,
-    });
-    out.push(Entry {
-        id: "action:switch-project".into(),
-        label: "Switch Project".into(),
-        kind: EntryKind::Action,
-        subtitle: Some("fuzzy-pick another project and swap the dashboard".into()),
         shortcut: None,
         decoration: None,
         hidden_until_query: false,
@@ -1474,6 +1503,16 @@ fn create_and_open_project(form: super::add_project::AddProjectForm) -> Result<(
     switch_to_project(&resolved.name)
 }
 
+/// Extract the target project slug from an inline "Switch to X" entry id.
+/// Returns `Some(name)` for `action:switch-project:{name}` and `None` for the
+/// bare `action:switch-project` (which opens the sub-picker) or any other id.
+/// Keeps the id→target mapping in one place so the dispatch can't drift from
+/// how `build_entries` mints these ids.
+fn switch_target_from_id(id: &str) -> Option<&str> {
+    id.strip_prefix("action:switch-project:")
+        .filter(|name| !name.is_empty())
+}
+
 /// Launch (or focus) `target`'s dashboard and move the attached client to it.
 /// The `attach`/`switch-client` call must inherit the terminal's stdio (it's
 /// interactive), so it deliberately does NOT go through the capturing
@@ -1553,29 +1592,123 @@ mod tests {
     }
 
     #[test]
-    fn build_entries_places_zen_toggle_directly_after_view_block() {
+    fn build_entries_places_switch_project_first_then_zen_toggle_after_view_block() {
         // A fresh `App` (no `refresh`) carries empty workspace / review / agent
         // lists, so `rows()` is just the three nav entries — perfect for
-        // pinning the inline-actions order without touching the disk.
+        // pinning the inline-actions order. Isolate `SHELBI_HOME` to an empty
+        // home so `list_projects()` (now read by `build_entries` for the inline
+        // "Switch to X" entries) finds no other projects and can't inject them.
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
         let app = App::new_sidebar("demo");
         let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
-        // View block first (Chat/Tasks/Activity), then the mode toggle,
-        // then the global actions trail (Add → Switch → Quit). Workspaces/
-        // reviews/agents are empty in this fixture so they don't appear.
+        // Switch Project leads, then the view block (Chat/Tasks/Activity), then
+        // the mode toggle, then the global actions trail (Add → Quit).
+        // Workspaces/reviews/agents are empty in this fixture so they don't
+        // appear, and no other projects exist so no inline "Switch to X" rows.
         assert_eq!(
             ids,
             vec![
+                "action:switch-project",
                 "view:orch",
                 "view:tasks",
                 "view:activity",
                 "action:toggle-zen",
                 "action:add-project",
-                "action:switch-project",
                 "action:quit-project",
                 "action:quit-shelbi",
             ]
         );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Write a minimal valid global-mode project YAML under `home`. The id is
+    /// the filename stem (`id`); `display` becomes the YAML `name:` label when
+    /// `Some`, otherwise the project has no label and falls back to its id.
+    fn write_switch_project(home: &std::path::Path, id: &str, display: Option<&str>) {
+        let dir = home.join("projects");
+        std::fs::create_dir_all(&dir).unwrap();
+        let label_line = display.map(|d| format!("name: {d}\n")).unwrap_or_default();
+        let yaml = format!(
+            "{label_line}\
+             repo: /tmp/{id}\n\
+             machines:\n\
+             \x20\x20- {{ name: hub, kind: local, work_dir: /tmp }}\n\
+             orchestrator: {{ runner: claude }}\n\
+             agent_runners:\n\
+             \x20\x20claude: {{ command: claude, flags: [] }}\n\
+             workspaces: []\n"
+        );
+        std::fs::write(dir.join(format!("{id}.yaml")), yaml).unwrap();
+    }
+
+    #[test]
+    fn build_entries_adds_hidden_switch_to_entries_for_other_projects_only() {
+        // With `portal` current and three other registered projects, the palette
+        // should mint hidden inline "Switch to <display> project" entries for the
+        // others (using their display names) and never for the current one.
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_switch_project(&home, "portal", Some("Portal"));
+        write_switch_project(&home, "web", Some("Website"));
+        write_switch_project(&home, "api", Some("API Server"));
+        // Legacy project with no label — falls back to its slug.
+        write_switch_project(&home, "legacy", None);
+
+        let app = App::new_sidebar("portal");
+        let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
+
+        // The current project is never offered as a switch target.
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.id == "action:switch-project:portal"),
+            "current project must not get an inline switch entry"
+        );
+
+        let api = entries
+            .iter()
+            .find(|e| e.id == "action:switch-project:api")
+            .expect("missing inline switch entry for api");
+        assert_eq!(api.label, "Switch to API Server project");
+        assert!(api.hidden_until_query, "inline switch entries stay hidden");
+
+        let legacy = entries
+            .iter()
+            .find(|e| e.id == "action:switch-project:legacy")
+            .expect("missing inline switch entry for legacy");
+        assert_eq!(legacy.label, "Switch to legacy project");
+
+        // The example from the request: typing `web` surfaces the exact label.
+        let hits = shelbi_palette::search(&entries, "web");
+        assert!(
+            hits.iter().any(|(e, _)| e.label == "Switch to Website project"
+                && e.id == "action:switch-project:web"),
+            "typing `web` should surface \"Switch to Website project\""
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn switch_target_from_id_extracts_slug_only_for_inline_entries() {
+        // Inline entries carry the target slug; the bare action opens the
+        // sub-picker instead and must not be treated as a direct target.
+        assert_eq!(
+            switch_target_from_id("action:switch-project:web"),
+            Some("web")
+        );
+        assert_eq!(
+            switch_target_from_id("action:switch-project:my-proj"),
+            Some("my-proj")
+        );
+        assert_eq!(switch_target_from_id("action:switch-project"), None);
+        assert_eq!(switch_target_from_id("action:switch-project:"), None);
+        assert_eq!(switch_target_from_id("action:quit-shelbi"), None);
+        assert_eq!(switch_target_from_id("view:orch"), None);
     }
 
     #[test]
