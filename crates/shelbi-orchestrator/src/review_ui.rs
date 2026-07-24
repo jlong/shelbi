@@ -257,9 +257,23 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
     //    left of *that* focused pane, yielding `sidebar | agent | panel`).
     let shelbi_bin = crate::current_exe_string()?;
     let panel_cmd = review_panel_cmd(&shelbi_bin, project_name, task_id);
+    // Open the panel at the nav sidebar's canonical width (SIDEBAR_TARGET_PCT of
+    // the window, clamped to [MIN, MAX]) instead of tmux's default 50/50 split
+    // of the agent pane. The clamp hook only tracks the traveling SHELBI_SIDEBAR
+    // pane, so the panel keeps whatever width it's created with — hence the
+    // initial split width is what matters. A failed `#{window_width}` query
+    // falls back to the max sidebar width, never the 50% default.
+    let panel_cols = tmux_capture(&["display-message", "-p", "-t", &chat, "#{window_width}"])
+        .ok()
+        .and_then(|w| w.trim().parse::<u32>().ok())
+        .map(crate::sidebar_cols_for)
+        .unwrap_or(crate::SIDEBAR_MAX_COLS);
+    let panel_cols = panel_cols.to_string();
     let panel_id = tmux_capture(&[
         "split-window",
         "-h",
+        "-l",
+        &panel_cols,
         "-d",
         "-t",
         &chat,
