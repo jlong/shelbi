@@ -168,13 +168,15 @@ pub struct App {
     /// each refresh by [`App::refresh`]; carries the same actionable message
     /// [`shelbi_state::load_project`] hands the `shelbi workspace list` CLI.
     pub config_error: Option<String>,
-    /// Tasks in the Review column that are **loaded on a review worktree** —
-    /// the "Ready for Review" section (✓). Built each refresh by
+    /// Tasks in the Review column whose review server is **confirmed serving**
+    /// — the "Ready for Review" section (✓). Built each refresh by
     /// [`split_review_sections`]; each entry carries the `machine:port` URL
     /// the human can open.
     pub ready_review: Vec<ReviewEntry>,
-    /// Tasks in the Review column **waiting for a free review workspace** —
-    /// the "Queued for Review" section (·). No location yet (nothing serving).
+    /// Tasks in the Review column **not yet serving** — the "Queued for Review"
+    /// section: assigned but still booting ([`ReviewState::Loading`], ▶) or
+    /// waiting for a free review slot ([`ReviewState::Pending`], ·). No
+    /// location yet (nothing serving).
     pub queued_review: Vec<ReviewEntry>,
     pub sidebar_index: usize,
     pub last_refresh: Instant,
@@ -490,8 +492,8 @@ impl App {
                 }
             }
         }
-        // Ready for Review — tasks loaded on a review worktree (✓). Line 1
-        // carries the `machine:port` URL badge; line 2 the branch.
+        // Ready for Review — tasks whose review server is confirmed serving
+        // (✓). Line 1 carries the `machine:port` URL badge; line 2 the branch.
         if !self.ready_review.is_empty() {
             rows.push(Row::Blank);
             rows.push(Row::Section {
@@ -502,13 +504,15 @@ impl App {
                     title: e.title.clone(),
                     branch: e.branch.clone(),
                     location: e.location.clone(),
-                    ready: true,
+                    state: e.state,
                     view: View::ReviewTask(e.task_id.clone()),
                 });
             }
         }
-        // Queued for Review — Review-status tasks waiting for a free review
-        // workspace (·). No location yet (nothing serving); branch on line 2.
+        // Queued for Review — Review-status tasks not yet serving: assigned but
+        // still booting (▶) or waiting for a free review slot (·). No location
+        // yet (nothing serving); branch on line 2. The per-entry `state` picks
+        // the glyph.
         if !self.queued_review.is_empty() {
             rows.push(Row::Blank);
             rows.push(Row::Section {
@@ -518,8 +522,8 @@ impl App {
                 rows.push(Row::Review {
                     title: e.title.clone(),
                     branch: e.branch.clone(),
-                    location: None,
-                    ready: false,
+                    location: e.location.clone(),
+                    state: e.state,
                     view: View::ReviewTask(e.task_id.clone()),
                 });
             }
@@ -1020,20 +1024,20 @@ pub enum Row {
     },
     /// A task sitting in the Review column, rendered as a two-line entry:
     /// line 1 = title (+ a right-aligned `machine:port` URL badge when
-    /// loaded); line 2 = branch, dim. Appears in one of two sidebar
-    /// sections keyed by [`Row::Review::ready`]:
-    /// **Ready for Review** (`ready: true`, ✓ — loaded on a review worktree,
-    /// serving) or **Queued for Review** (`ready: false`, · — waiting for a
-    /// free review workspace). See spec §16.
+    /// serving); line 2 = branch, dim. Its [`ReviewState`] picks the section
+    /// and glyph: **Ready for Review** (`Serving`, ✓ — the review server is
+    /// confirmed up) or **Queued for Review** (`Loading`, ▶ — assigned but the
+    /// server is still coming up; or `Pending`, · — waiting for a free review
+    /// slot). See spec §16.
     Review {
         title: String,
         /// Branch name shown dim on line 2.
         branch: String,
-        /// `machine:port` URL the human can open — `Some` only for a Ready
-        /// (loaded) task; `None` for a Queued one (nothing serving yet).
+        /// `machine:port` URL the human can open — `Some` only for a `Serving`
+        /// task; `None` while Loading / Pending (nothing serving yet).
         location: Option<String>,
-        /// Loaded on a review worktree (Ready, ✓) vs waiting (Queued, ·).
-        ready: bool,
+        /// Serving (Ready, ✓) vs Loading (Queued, ▶) vs Pending (Queued, ·).
+        state: ReviewState,
         view: View,
     },
     /// Legacy `shelbi spawn` agent row — pre-task-board flow.
@@ -1080,19 +1084,25 @@ impl Row {
                 color: DecorationColor::Default,
             }),
             Row::Workspace { badge, .. } => Some(badge.decoration()),
-            // Ready → cyan ✓ (loaded, human can look); Queued → dim ·
-            // (waiting for a review workspace). Single source of truth for
+            // Serving → cyan ✓ (server up, human can look); Loading → yellow ▶
+            // (assigned, server still coming up); Pending → dim · (waiting for
+            // a review slot). `▶` (U+25B6) is free to use here — the "active
+            // workspace" Working badge is a *different* glyph, `⏵` (U+23F5) —
+            // so the two never collide on screen. Single source of truth for
             // both the sidebar renderer and the palette.
-            Row::Review { ready, .. } => Some(if *ready {
-                Decoration {
+            Row::Review { state, .. } => Some(match state {
+                ReviewState::Serving => Decoration {
                     glyph: "✓".into(),
                     color: DecorationColor::Cyan,
-                }
-            } else {
-                Decoration {
+                },
+                ReviewState::Loading => Decoration {
+                    glyph: "▶".into(),
+                    color: DecorationColor::Yellow,
+                },
+                ReviewState::Pending => Decoration {
                     glyph: "·".into(),
                     color: DecorationColor::DarkGray,
-                }
+                },
             }),
             Row::LegacyAgent { status, .. } => Some(status_decoration(*status)),
             // The config-error row's `!` marker is painted directly by the
@@ -1106,18 +1116,38 @@ impl Row {
     }
 }
 
+/// Which of the three review lifecycle states a [`ReviewEntry`] / [`Row::Review`]
+/// is in. Serving is the only one that reads "Ready for Review"; the other two
+/// share the "Queued for Review" section but paint distinct glyphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewState {
+    /// The review slot's dev server is confirmed up (its `ready:` health check
+    /// passed, recorded by the review-loaded marker). **Ready for Review**, ✓,
+    /// with the `machine:port` location.
+    Serving,
+    /// Assigned to a review slot but the server isn't confirmed serving yet —
+    /// checkout / install / build / boot still in progress. **Queued for
+    /// Review**, ▶, no clickable location.
+    Loading,
+    /// In Review but not yet assigned to any review slot (waiting for a free
+    /// one). **Queued for Review**, ·.
+    Pending,
+}
+
 /// A rendered review-section entry: the data the sidebar needs to draw one
 /// two-line review row. Built each refresh by [`split_review_sections`] from
 /// the Review column + project config. `location` is `Some("machine:port")`
-/// only for a Ready (loaded) task; a Queued one has none.
+/// only for a Serving task; Loading / Pending have none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewEntry {
     pub task_id: String,
     pub title: String,
     /// Branch shown dim on line 2.
     pub branch: String,
-    /// `machine:port` URL badge (Ready only); `None` when queued.
+    /// `machine:port` URL badge (Serving only); `None` while Loading / Pending.
     pub location: Option<String>,
+    /// Which lifecycle state drives this row's section + glyph.
+    pub state: ReviewState,
 }
 
 /// Height in list lines a row occupies at the given inner list `width`.
@@ -1203,42 +1233,57 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Split the Review column into the two sidebar sections (spec §16):
+/// Split the Review column into the two sidebar sections (spec §16), gating
+/// **Ready** on the review server actually serving rather than mere assignment:
 ///
-/// - **Ready** — the task's `assigned_to` names a `review`-tagged workspace,
-///   so it's loaded onto a review slot. The location is the review workspace
-///   holding it.
-/// - **Queued** — every other Review-status task (unassigned, or still pinned
-///   to the dev workspace that produced it): waiting for a free review slot.
+/// - **Ready** (`Serving`) — the task is assigned to a `review`-tagged
+///   workspace *and* that slot's dev server is confirmed up (its review-loaded
+///   marker names this task). The location is the review workspace holding it.
+/// - **Queued / `Loading`** — assigned to a review slot but the server isn't
+///   confirmed serving yet (checkout / install / build / boot in flight). No
+///   location; rendered with a ▶ glyph.
+/// - **Queued / `Pending`** — every other Review-status task (unassigned, or
+///   still pinned to the dev workspace that produced it): waiting for a free
+///   review slot. No location; rendered with a · glyph.
 ///
 /// Membership is driven by the `review` tag — the workspace-neutral marker for
 /// "this slot is a review surface". If the project can't be loaded we can't
-/// classify, so everything falls back to Queued (no location).
+/// classify, so everything falls back to Queued/Pending (no location).
+///
+/// The serving signal is the review workspace's `.claude/shelbi-review-loaded`
+/// marker (see [`shelbi_orchestrator::workspace::read_review_loaded_marker`]):
+/// the Review agent writes it once the serve recipe's `ready:` health check
+/// passes, so it's the same "server is up" signal the review lifecycle uses to
+/// gate serving — just consulted here instead of ignored. It carries the task
+/// id, so a slot reused between tasks (its marker still naming the *previous*
+/// task) correctly reads as Loading for the new one.
 fn split_review_sections(
     project_name: &str,
     queue: Vec<TaskFile>,
 ) -> (Vec<ReviewEntry>, Vec<ReviewEntry>) {
-    let fallback_entry = |task: &shelbi_core::Task, location: Option<String>| ReviewEntry {
-        task_id: task.id.clone(),
-        title: task.title.clone(),
-        branch: task
-            .branch
-            .clone()
-            .unwrap_or_else(|| format!("user/{}", task.id)),
-        location,
-    };
+    let fallback_entry =
+        |task: &shelbi_core::Task, location: Option<String>, state: ReviewState| ReviewEntry {
+            task_id: task.id.clone(),
+            title: task.title.clone(),
+            branch: task
+                .branch
+                .clone()
+                .unwrap_or_else(|| format!("user/{}", task.id)),
+            location,
+            state,
+        };
 
     let project = match shelbi_state::load_project(project_name) {
         Ok(p) => p,
         Err(_) => {
             let queued = queue
                 .iter()
-                .map(|tf| fallback_entry(&tf.task, None))
+                .map(|tf| fallback_entry(&tf.task, None, ReviewState::Pending))
                 .collect();
             return (Vec::new(), queued);
         }
     };
-    let entry = |task: &shelbi_core::Task, location: Option<String>| {
+    let entry = |task: &shelbi_core::Task, location: Option<String>, state: ReviewState| {
         let workflow = shelbi_state::load_task_workflow(project_name, &project, task).ok();
         let branch =
             shelbi_orchestrator::branch::branch_name_for_task(&project, workflow.as_ref(), task)
@@ -1252,6 +1297,7 @@ fn split_review_sections(
             title: task.title.clone(),
             branch,
             location,
+            state,
         }
     };
 
@@ -1265,14 +1311,39 @@ fn split_review_sections(
             .and_then(|name| project.workspace(name))
             .filter(|w| project.effective_tags(w).contains("review"));
         match loaded_on {
-            Some(ws) => {
+            Some(ws) if review_workspace_is_serving(&project, ws, &tf.task.id) => {
                 let location = Some(format!("{}:{}", ws.machine, ws.name));
-                ready.push(entry(&tf.task, location));
+                ready.push(entry(&tf.task, location, ReviewState::Serving));
             }
-            None => queued.push(entry(&tf.task, None)),
+            // Assigned to a review slot but the server hasn't confirmed serving
+            // yet — loading, not ready. No location until it's actually up.
+            Some(_) => queued.push(entry(&tf.task, None, ReviewState::Loading)),
+            // Not on a review slot at all — waiting for a free one.
+            None => queued.push(entry(&tf.task, None, ReviewState::Pending)),
         }
     }
     (ready, queued)
+}
+
+/// Whether `task_id`'s review slot is confirmed serving: its
+/// `.claude/shelbi-review-loaded` marker exists and names this task. A missing
+/// marker, a marker naming a different task (slot reused before the new server
+/// came up), a mis-configured machine, or a read error all read as "not serving
+/// yet" — the conservative call, since under-claiming ready (task shows Loading)
+/// is strictly safer than pointing a human at a dead server.
+fn review_workspace_is_serving(
+    project: &shelbi_core::Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    task_id: &str,
+) -> bool {
+    let Some(machine) = project.machine(&workspace.machine) else {
+        return false;
+    };
+    let marker = shelbi_orchestrator::workspace::workspace_review_loaded_marker(machine, workspace);
+    matches!(
+        shelbi_orchestrator::workspace::read_review_loaded_marker(&machine.host(), &marker),
+        Ok(Some(marked)) if marked == task_id
+    )
 }
 
 /// Build the sidebar's view of declared workspaces from the project YAML, the
@@ -2021,60 +2092,111 @@ mod tests {
         p
     }
 
+    /// [`review_fixture_project`] with the hub machine repointed at `work_dir`
+    /// (so review-loaded markers land in a test sandbox rather than the shared
+    /// `/tmp/demo`) and a second review slot (`review-2`), letting a test place
+    /// one task on a serving slot and another on a still-loading slot.
+    fn review_serving_fixture(work_dir: &std::path::Path) -> Project {
+        let mut p = review_fixture_project();
+        if let Some(hub) = p.machines.iter_mut().find(|m| m.name == "hub") {
+            hub.work_dir = work_dir.to_path_buf();
+        }
+        p.workspaces.push(shelbi_core::WorkspaceSpec {
+            name: "review-2".into(),
+            machine: "hub".into(),
+            runner: "claude".into(),
+            tags: vec!["review".to_string()],
+            slot: None,
+        });
+        p
+    }
+
+    /// Write the `.claude/shelbi-review-loaded` serving marker for `workspace`
+    /// under `work_dir`, standing in for the Review agent's write once its dev
+    /// server is confirmed up. Body mirrors the real marker: `<task-id> <url>`.
+    fn write_review_loaded_marker(work_dir: &std::path::Path, workspace: &str, task_id: &str) {
+        let dir = work_dir
+            .join(".shelbi")
+            .join("wt")
+            .join(workspace)
+            .join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("shelbi-review-loaded"),
+            format!("{task_id} http://localhost:3000\n"),
+        )
+        .unwrap();
+    }
+
+    fn review_task(id: &str, title: &str, assigned_to: Option<&str>, branch: Option<&str>) -> Task {
+        let now = Utc::now();
+        Task {
+            id: id.into(),
+            title: title.into(),
+            column: Column::review(),
+            priority: 0,
+            assigned_to: assigned_to.map(str::to_string),
+            workflow: None,
+            branch: branch.map(str::to_string),
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            created_at: now,
+            updated_at: now,
+            params: std::collections::BTreeMap::new(),
+        }
+    }
+
     #[test]
-    fn review_tasks_split_into_ready_and_queued_sections() {
-        // Spec §16: a Review-status task loaded on a review workspace lands in
-        // "Ready for Review" (✓) with its `machine:workspace` location; a
-        // Review-status task still pinned to a dev workspace (or unassigned)
-        // lands in "Queued for Review" (·) with no location. Both are two-line
-        // rows carrying the branch.
+    fn review_tasks_split_by_serving_state() {
+        // The Ready/Queued split is gated on the review server actually
+        // serving, not merely on assignment (spec §16). Three states:
+        //   - Serving: assigned to a review slot whose review-loaded marker
+        //     names this task → "Ready for Review" (✓) with `machine:workspace`.
+        //   - Loading: assigned to a review slot but no serving marker yet →
+        //     "Queued for Review" (▶), no location.
+        //   - Pending: not on a review slot at all → "Queued for Review" (·).
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
+        // A dedicated work_dir so the marker write lands in this test's sandbox.
+        let work_dir = home.join("work");
 
-        let project = review_fixture_project();
+        let project = review_serving_fixture(&work_dir);
         shelbi_state::save_project(&project).unwrap();
 
-        let now = Utc::now();
-        // Loaded: assigned to the review workspace → Ready, location hub:review-1.
+        // Serving: on review-1 AND its server is confirmed up (marker present).
         shelbi_state::save_task(
             "demo",
-            &Task {
-                id: "loaded".into(),
-                title: "Palette fuzzy-match fix".into(),
-                column: Column::review(),
-                priority: 0,
-                assigned_to: Some("review-1".into()),
-                workflow: None,
-                branch: Some("shelbi/palette-fix".into()),
-                depends_on: Vec::new(),
-                prefers_machine: None,
-                zen: None,
-                created_at: now,
-                updated_at: now,
-                params: std::collections::BTreeMap::new(),
-            },
+            &review_task(
+                "serving",
+                "Palette fuzzy-match fix",
+                Some("review-1"),
+                Some("shelbi/palette-fix"),
+            ),
             "",
         )
         .unwrap();
-        // Waiting: still on a dev workspace → Queued, no URL, branch fallback.
+        write_review_loaded_marker(&work_dir, "review-1", "serving");
+
+        // Loading: on review-2 but the server hasn't confirmed serving (no
+        // marker), so it must NOT read as Ready.
         shelbi_state::save_task(
             "demo",
-            &Task {
-                id: "waiting".into(),
-                title: "Rework onboarding copy".into(),
-                column: Column::review(),
-                priority: 0,
-                assigned_to: Some("alpha".into()),
-                workflow: None,
-                branch: None,
-                depends_on: Vec::new(),
-                prefers_machine: None,
-                zen: None,
-                created_at: now,
-                updated_at: now,
-                params: std::collections::BTreeMap::new(),
-            },
+            &review_task(
+                "loading",
+                "Homepage nav fix",
+                Some("review-2"),
+                Some("shelbi/nav-fix"),
+            ),
+            "",
+        )
+        .unwrap();
+
+        // Pending: still pinned to a dev workspace → waiting for a review slot.
+        shelbi_state::save_task(
+            "demo",
+            &review_task("pending", "Rework onboarding copy", Some("alpha"), None),
             "",
         )
         .unwrap();
@@ -2082,31 +2204,45 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
 
-        assert_eq!(
-            app.ready_review.len(),
-            1,
-            "one task loaded on a review worktree"
-        );
+        // Only the serving task is Ready, and it carries its location.
+        assert_eq!(app.ready_review.len(), 1, "only the serving task is Ready");
         let ready = &app.ready_review[0];
-        assert_eq!(ready.task_id, "loaded");
+        assert_eq!(ready.task_id, "serving");
+        assert_eq!(ready.state, ReviewState::Serving);
         assert_eq!(ready.branch, "shelbi/palette-fix");
         assert_eq!(ready.location.as_deref(), Some("hub:review-1"));
 
+        // Both the loading and pending tasks sit under Queued, distinguished by
+        // state; neither has a clickable location yet.
+        assert_eq!(app.queued_review.len(), 2, "loading + pending are queued");
+        let loading = app
+            .queued_review
+            .iter()
+            .find(|e| e.task_id == "loading")
+            .expect("loading task is queued");
         assert_eq!(
-            app.queued_review.len(),
-            1,
-            "one task still waiting for a slot"
+            loading.state,
+            ReviewState::Loading,
+            "assigned but not yet serving → Loading"
         );
-        let queued = &app.queued_review[0];
-        assert_eq!(queued.task_id, "waiting");
+        assert!(
+            loading.location.is_none(),
+            "a loading task has no clickable location"
+        );
+        let pending = app
+            .queued_review
+            .iter()
+            .find(|e| e.task_id == "pending")
+            .expect("pending task is queued");
         assert_eq!(
-            queued.branch, "shelbi/waiting",
-            "branch falls back to the configured prefix"
+            pending.state,
+            ReviewState::Pending,
+            "not on a review slot → Pending"
         );
-        assert!(queued.location.is_none(), "queued tasks have no URL yet");
+        assert!(pending.location.is_none());
 
-        // Row layout: a Ready section (✓, loaded row) precedes a Queued
-        // section (·, waiting row); each review row carries its branch + flag.
+        // Row layout + glyphs: a Ready section (✓) precedes a Queued section
+        // holding a ▶ loading row and a · pending row.
         let rows = app.rows();
         let ready_hdr = rows
             .iter()
@@ -2119,14 +2255,73 @@ mod tests {
         assert!(ready_hdr < queued_hdr, "Ready section sits above Queued");
         assert!(matches!(
             &rows[ready_hdr + 1],
-            Row::Review { ready: true, location: Some(loc), branch, .. }
+            Row::Review { state: ReviewState::Serving, location: Some(loc), branch, .. }
                 if loc == "hub:review-1" && branch == "shelbi/palette-fix"
         ));
+        // The serving row paints a cyan ✓; the loading row a yellow ▶; the
+        // pending row a dim ·.
+        let serving_dec = rows[ready_hdr + 1].decoration().unwrap();
+        assert_eq!(serving_dec.glyph, "✓");
+        assert_eq!(serving_dec.color, shelbi_palette::DecorationColor::Cyan);
+
+        let loading_row = rows
+            .iter()
+            .find(|r| matches!(r, Row::Review { view: View::ReviewTask(id), .. } if id == "loading"))
+            .expect("loading row renders");
         assert!(matches!(
-            &rows[queued_hdr + 1],
-            Row::Review { ready: false, location: None, branch, .. }
-                if branch == "shelbi/waiting"
+            loading_row,
+            Row::Review { state: ReviewState::Loading, location: None, .. }
         ));
+        let loading_dec = loading_row.decoration().unwrap();
+        assert_eq!(loading_dec.glyph, "▶", "loading row uses the play triangle");
+        assert_eq!(loading_dec.color, shelbi_palette::DecorationColor::Yellow);
+
+        let pending_row = rows
+            .iter()
+            .find(|r| matches!(r, Row::Review { view: View::ReviewTask(id), .. } if id == "pending"))
+            .expect("pending row renders");
+        assert!(matches!(
+            pending_row,
+            Row::Review { state: ReviewState::Pending, location: None, .. }
+        ));
+        assert_eq!(pending_row.decoration().unwrap().glyph, "·");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn review_task_leaves_ready_when_its_slot_marker_names_another_task() {
+        // A review slot reused between tasks keeps the *previous* task's
+        // review-loaded marker until the new server comes up. The new task must
+        // read as Loading (its id doesn't match the marker), never inherit the
+        // stale "serving" from the slot it landed on.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("work");
+
+        let project = review_serving_fixture(&work_dir);
+        shelbi_state::save_project(&project).unwrap();
+
+        shelbi_state::save_task(
+            "demo",
+            &review_task("fresh", "New review", Some("review-1"), Some("shelbi/fresh")),
+            "",
+        )
+        .unwrap();
+        // Marker on review-1 still names a previous, unrelated task.
+        write_review_loaded_marker(&work_dir, "review-1", "stale-previous");
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+
+        assert!(
+            app.ready_review.is_empty(),
+            "a stale marker for another task must not make this one Ready"
+        );
+        assert_eq!(app.queued_review.len(), 1);
+        assert_eq!(app.queued_review[0].task_id, "fresh");
+        assert_eq!(app.queued_review[0].state, ReviewState::Loading);
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -2189,12 +2384,14 @@ mod tests {
             title: "Ready task".into(),
             branch: "shelbi/r".into(),
             location: Some("hub:3000".into()),
+            state: ReviewState::Serving,
         }];
         app.queued_review = vec![ReviewEntry {
             task_id: "q".into(),
             title: "Queued task".into(),
             branch: "shelbi/q".into(),
             location: None,
+            state: ReviewState::Pending,
         }];
         // No workspaces/agents so the row layout is exactly: 3 nav, blank,
         // Ready header, Ready review (h2), blank, Queued header, Queued
@@ -2209,11 +2406,11 @@ mod tests {
             .count();
         let ready_idx = rows
             .iter()
-            .position(|r| matches!(r, Row::Review { ready: true, .. }))
+            .position(|r| matches!(r, Row::Review { state: ReviewState::Serving, .. }))
             .unwrap();
         let queued_idx = rows
             .iter()
-            .position(|r| matches!(r, Row::Review { ready: false, .. }))
+            .position(|r| matches!(r, Row::Review { state: ReviewState::Pending, .. }))
             .unwrap();
 
         // The nav block renders as `2n + 1` lines (item + bracketing/between
@@ -3114,11 +3311,11 @@ mod tests {
             .expect("populated review queue must render the section header");
         assert!(matches!(
             &rows[section_idx + 1],
-            Row::Review { title, branch, location, ready, .. }
+            Row::Review { title, branch, location, state, .. }
                 if title == "Fix login"
                     && branch == "shelbi/ready"
                     && location.is_none()
-                    && !*ready
+                    && *state == ReviewState::Pending
         ));
         // No Ready section — the task is queued, not loaded on a review slot.
         assert!(
@@ -3221,24 +3418,36 @@ mod tests {
         assert_eq!(d.glyph, WorkspaceBadge::AwaitingPermission.glyph());
         assert_eq!(d.color, DecorationColor::Red);
 
-        // Ready (loaded) → cyan ✓.
+        // Serving (server up) → cyan ✓.
         let review = Row::Review {
             title: "Fix login".into(),
             branch: "shelbi/ready".into(),
             location: Some("hub:3000".into()),
-            ready: true,
+            state: ReviewState::Serving,
             view: View::ReviewTask("ready".into()),
         };
         let d = review.decoration().unwrap();
         assert_eq!(d.glyph, "✓");
         assert_eq!(d.color, DecorationColor::Cyan);
 
-        // Queued (waiting) → dim ·.
+        // Loading (assigned, server still coming up) → yellow ▶.
+        let loading = Row::Review {
+            title: "Homepage nav".into(),
+            branch: "shelbi/nav".into(),
+            location: None,
+            state: ReviewState::Loading,
+            view: View::ReviewTask("nav".into()),
+        };
+        let d = loading.decoration().unwrap();
+        assert_eq!(d.glyph, "▶");
+        assert_eq!(d.color, DecorationColor::Yellow);
+
+        // Pending (waiting for a review slot) → dim ·.
         let queued = Row::Review {
             title: "Rework onboarding".into(),
             branch: "shelbi/rework".into(),
             location: None,
-            ready: false,
+            state: ReviewState::Pending,
             view: View::ReviewTask("rework".into()),
         };
         let d = queued.decoration().unwrap();
