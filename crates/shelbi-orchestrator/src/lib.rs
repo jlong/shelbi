@@ -1145,6 +1145,13 @@ fn sidebar_clamp_script(session: &str) -> String {
 /// belongs to exactly one window, there is a single sidebar instance that
 /// moves rather than N copies.
 ///
+/// One exception: a window hosting the review interface (its `SHELBI_REVIEW_PANEL`
+/// pane) is skipped. That window already has its own review panel serving as
+/// its navigation, so the sidebar stays docked in the dashboard rather than
+/// migrating in — which would both strip the dashboard of its sidebar and
+/// squish the review panel to a 1-col orphan. The skip is keyed off the live
+/// panel pin, so it clears itself the moment the interface closes.
+///
 /// Width preservation across the *move itself*: the pane's live
 /// `#{pane_width}` is captured before the join and reapplied with
 /// `join-pane -l`, so the relocation never flashes through a default 50/50
@@ -1153,9 +1160,9 @@ fn sidebar_clamp_script(session: &str) -> String {
 /// as the dashboard regardless of the destination window's geometry.
 ///
 /// Re-clamp on arrival: window switches are the *only* layout events that
-/// re-run the clamp, so entering a differently-shaped window (notably the
-/// review window, which reflowed the sidebar to a non-canonical width) snaps
-/// the sidebar back to `[MIN, MAX]`. Intra-view layout events (a dev-server
+/// re-run the clamp, so entering a differently-shaped window (e.g. a workspace
+/// window whose dev-server split reflowed the sidebar to a non-canonical width)
+/// snaps the sidebar back to `[MIN, MAX]`. Intra-view layout events (a dev-server
 /// pane appearing, an interface/editor swap) don't fire this hook, so a
 /// deliberate manual drag survives *within* a view — it's only reset when the
 /// user leaves and returns. The clamp is invoked by path, after the join, in
@@ -1176,6 +1183,17 @@ fn sidebar_travel_script(session: &str, clamp_script_path: &std::path::Path) -> 
          [ -z \"$aw\" ] || [ -z \"$sw\" ] && exit 0\n\
          # Already beside the active window — nothing to move.\n\
          [ \"$sw\" = \"$aw\" ] && exit 0\n\
+         # Don't relocate into a window hosting the review interface: its own\n\
+         # review panel is that window's navigation, so the global sidebar\n\
+         # stays docked in the dashboard rather than migrating in (which would\n\
+         # also squish the panel to a 1-col orphan). Self-clearing — the pin is\n\
+         # unset and the panel pane killed when the interface closes, after\n\
+         # which the window travels like any other.\n\
+         panel=$(tmux show-environment -t \"$sess\" {panel_env} 2>/dev/null | sed -n 's/^{panel_env}=//p')\n\
+         if [ -n \"$panel\" ]; then\n\
+         \tpw=$(tmux display-message -p -t \"$panel\" '#{{window_id}}' 2>/dev/null)\n\
+         \t[ -n \"$pw\" ] && [ \"$pw\" = \"$aw\" ] && exit 0\n\
+         fi\n\
          # Preserve the sidebar's exact current width across the move, and\n\
          # remember the active window's focused pane so focus stays on the\n\
          # agent/orchestrator rather than snapping to the sidebar.\n\
@@ -1195,6 +1213,7 @@ fn sidebar_travel_script(session: &str, clamp_script_path: &std::path::Path) -> 
          sh {clamp} 2>/dev/null || true\n",
         sess = session,
         env = SIDEBAR_ENV_KEY,
+        panel_env = review_ui::PANEL_KEY,
         clamp = clamp_esc,
     )
 }
@@ -2335,6 +2354,17 @@ mod pane_cmd_tests {
         assert!(
             out.contains("[ \"$sw\" = \"$aw\" ] && exit 0"),
             "no-op when already beside the active window: {out}"
+        );
+        // Skips a window hosting the review interface so the sidebar stays
+        // docked in the dashboard instead of migrating into (and squishing) the
+        // review panel. Keyed off the live panel pin so it self-clears on close.
+        assert!(
+            out.contains(review_ui::PANEL_KEY),
+            "reads the review-panel pin to detect a review window: {out}"
+        );
+        assert!(
+            out.contains("[ \"$pw\" = \"$aw\" ] && exit 0"),
+            "skips travel when the active window hosts the review panel: {out}"
         );
         // Refocuses the prior pane so the switch never snaps focus onto the
         // sidebar.
