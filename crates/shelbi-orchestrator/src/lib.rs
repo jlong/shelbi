@@ -1933,8 +1933,8 @@ fn request_orchestrator_handoff_best_effort(
 /// the agent with `--continue` so the worker keeps its conversation
 /// (mirroring how `chat` carries the orchestrator handoff). tmux preserves
 /// the pane's injected `TASK_ID` / `PROJECT` / `SHELBI_HUB_SOCK` (and any
-/// review-slot `PORT` / `SHELBI_WORKSPACE`) env across `respawn-pane`, so
-/// the resumed wrapper stays wired to the same task and hub socket. An
+/// review-slot `PORT`) env across `respawn-pane`, so the resumed wrapper
+/// stays wired to the same task and hub socket. An
 /// expected-teardown mark is set first so the SIGHUP `respawn-pane -k`
 /// delivers to the old wrapper doesn't fire a spurious `pane_alive=false`
 /// event (the fresh wrapper clears any leftover mark on startup).

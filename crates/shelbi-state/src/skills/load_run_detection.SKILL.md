@@ -46,29 +46,31 @@ If the serve command still contains a literal `$SLOT` / `$PORT`, your
 review workspace has no assigned slot. Do **not** guess a port — stop and
 report the misconfiguration.
 
-## Launching (managed pane)
+## Launching (durable background process)
 
-Hand the serve command to shelbi so it runs in a **managed server pane**
-shelbi can watch and reap, not a bare background job:
+There is **no `shelbi workspace serve` command** — once you've resolved the
+serve command, launch it yourself as a **durable background process** that
+outlives your turn (not a foreground command, and not a job that dies with
+your shell):
 
 ```sh
-shelbi workspace serve "$SHELBI_WORKSPACE" --serve '<the recipe serve command>'
+setsid sh -c '<resolved serve command>' >/tmp/review-serve.log 2>&1 &
+#   (or a dedicated tmux window: tmux new-window -d -n serve '<serve cmd>')
 ```
 
-Prepend the recipe's working directory when it names one (e.g.
-`--serve 'cd site && npm run dev -- -p 4310'`). The port is already in the
-command — there is nothing to fill in. Running it again tears down any
-existing server and starts fresh, which is also how you refresh for a new
-branch or a follow-up tweak. shelbi runs the HTTP ready-probe for you and
-prints the URL.
+The recipe's serve command already has its port substituted — there is
+nothing to fill in. To **refresh** for a new branch or a tweak, kill the
+running server first
+(`lsof -ti tcp:<port> | xargs kill 2>/dev/null || true`), then start it
+again, so you never stack two servers on one port. You do not reap the port
+at review end — the workflow's review-exit transition kills it by port.
 
 ## Readiness
 
-`shelbi workspace serve` blocks on the HTTP ready-probe before it returns,
-so for a normal web app you just wait for it to report the URL. When the
-recipe supplies its own `ready` probe, that is the authoritative check —
-poll it until it exits 0 (or times out). Your fallbacks when the app has no
-HTTP surface (`--no-wait`, then confirm manually):
+Poll the recipe's `ready` probe until it exits 0 (or times out) — that is
+the authoritative check for a normal HTTP app. The heuristics here are what
+that probe does — and your fallback when the app has no HTTP surface
+(confirm the process is alive, then verify manually):
 
 1. **HTTP probe** — poll the reviewable URL for any non-connection-refused
    response (200s ideal; a 3xx/4xx still means it's listening). Retry with

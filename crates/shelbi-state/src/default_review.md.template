@@ -62,34 +62,47 @@ silently work around.
 
 ### 3. Start (or refresh) the server
 
-Start the dev server through shelbi so it runs in a **dedicated, managed
-server pane** beside you — not as a bare background job. shelbi owns that
-pane's lifecycle (it fires an event if the server dies, tears it down when
-the task leaves review, and reaps a leaked port), so always launch it with:
+Start the dev server yourself as a **durable background process**: it must
+keep running after your turn ends so the human can click through it. Run the
+recipe's **serve** command exactly as written (its port is already
+substituted) — do **not** run it as a foreground command that blocks you, and
+do **not** leave it as a job that dies when your shell exits.
+
+There is **no `shelbi workspace serve` command** — you launch the server
+directly. Two reliable ways to make it durable:
 
 ```sh
-shelbi workspace serve "$SHELBI_WORKSPACE" --serve '<the recipe serve command>'
+# a) Detached process, output to a log you can tail on failure:
+setsid sh -c 'cd site && npm run dev -- -p 4310' >/tmp/review-serve.log 2>&1 &
+#    (use `nohup … >log 2>&1 &` where setsid is unavailable)
+
+# b) Or a dedicated, inspectable tmux window in your session:
+tmux new-window -d -n serve 'cd site && npm run dev -- -p 4310'
 ```
 
-- Pass the recipe's **serve** command as `--serve`, exactly as written —
-  its port is already substituted, so there is nothing to fill in. If the
-  recipe names a working directory, prepend the `cd` (e.g.
-  `--serve 'cd site && npm run dev -- -p 4310'`).
-- The command tears down any server already running for this workspace and
-  starts fresh, so it's also how you **refresh** for a new branch or a
-  follow-up tweak — just run it again.
-- It waits for the HTTP ready-probe and prints the serving URL. Pass
-  `--no-wait` only if the app has no HTTP endpoint to probe.
+- If the recipe names a working directory, prepend the `cd` (as shown). The
+  port is already resolved in the serve command — do not fill anything in.
+- **To refresh** for a new branch or a follow-up tweak, kill the running
+  server first, then start it again, so you never stack two servers on one
+  port:
 
-The server keeps running in its pane after you stop, so the human can hit
-it. Never start the server as a plain `&` background process — shelbi
-wouldn't know about it and couldn't reap its port.
+  ```sh
+  lsof -ti tcp:<port> | xargs kill 2>/dev/null || true
+  ```
+
+You do **not** reap the port when the review ends — the workflow's
+review-exit transition tears the server down by port (the
+`lsof -ti tcp:$SLOT | xargs kill` run block on review→done / review→todo /
+review→canceled). Your job is only to get the server up and keep it up while
+the task is in review.
 
 ### 4. Wait for ready, then summarize
 
-`shelbi workspace serve` already blocked on the ready-probe and printed the
-URL, so once it reports the server is up, post a concise **ready summary**
-to the human containing:
+Poll the recipe's **ready** probe until it exits 0 (e.g.
+`until curl -sf http://localhost:<port> >/dev/null; do sleep 1; done`); for a
+recipe with no ready probe, just confirm the serve process is still alive.
+Once the server responds, post a concise **ready summary** to the human
+containing:
 
 - the URL — `http://<machine-host>:<port>` (use the reachable host for the
   machine, not bare `localhost`, when the workspace is remote);
