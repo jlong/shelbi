@@ -253,11 +253,11 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
             active,
         } => {
             // `▾` when expanded (workspace rows follow), `▸` when
-            // collapsed (rows hidden). `▶` stays reserved for an active
-            // workspace row's Working badge, so the two never collide on
-            // screen. The header is dim by default and brightens to
-            // white-bold when focused so the user can see what Space /
-            // Enter will toggle.
+            // collapsed (rows hidden) — both distinct from the Working
+            // badge's `⏵` (U+23F5) and the loading-review row's `▶`
+            // (U+25B6), so no glyph collides on screen. The header is dim
+            // by default and brightens to white-bold when focused so the
+            // user can see what Space / Enter will toggle.
             let glyph = if *collapsed { "▸" } else { "▾" };
             let header_style = if selected {
                 Style::default()
@@ -333,11 +333,11 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
             ..
         } => {
             // Two-line review entry (spec §16). Line 1: decoration badge +
-            // title, with the `machine:port` URL right-aligned when the task
-            // is loaded on a review worktree (Ready — cyan ✓); a Queued task
-            // (dim ·) has no location yet. Line 2: branch, dim. The badge
-            // glyph/color come from `row.decoration()`, the single source
-            // shared with the palette.
+            // title, with the `machine:port` URL right-aligned only when the
+            // review server is confirmed serving (Ready — cyan ✓); a Queued
+            // task (loading ▶ or pending ·) has no location yet. Line 2:
+            // branch, dim. The badge glyph/color come from `row.decoration()`,
+            // the single source shared with the palette.
             let dec = row
                 .decoration()
                 .expect("review rows always have a decoration");
@@ -1303,12 +1303,14 @@ mod tests {
             title: "Palette fuzzy-match fix".into(),
             branch: "shelbi/palette-fuzzy-match-fix".into(),
             location: Some("hub:3000".into()),
+            state: crate::app::ReviewState::Serving,
         }];
         app.queued_review = vec![crate::app::ReviewEntry {
             task_id: "onboarding".into(),
             title: "Rework onboarding copy".into(),
             branch: "shelbi/rework-onboarding-copy".into(),
             location: None,
+            state: crate::app::ReviewState::Pending,
         }];
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         let rows = dump(&term);

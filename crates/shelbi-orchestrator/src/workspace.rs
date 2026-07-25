@@ -176,6 +176,70 @@ pub fn read_ready_marker(host: &Host, marker: &Path) -> Result<Option<String>> {
     Ok(Some(content))
 }
 
+/// The review-serving file marker for a review workspace:
+/// `<worktree>/.claude/shelbi-review-loaded`.
+///
+/// A Review agent writes this once its dev server is confirmed up (the
+/// serve recipe's `ready` probe has passed) — or once it has determined the
+/// review is diff-only. Where [`workspace_ready_marker`] is the dev worker's
+/// "I'm done, hand me off" signal, this is the review slot's "the branch is
+/// actually serving now" signal: the durable, UI-proof handoff the sidebar
+/// gates **Ready for Review** on, so a task claims "ready" only once a human
+/// can really open it (see [`read_review_loaded_marker`]).
+///
+/// Body is the task id, optionally followed by the serving URL
+/// (`<task-id> http://host:port`); a diff-only review writes the id alone.
+/// It lives under `.claude/` for the same reason as the other markers: that
+/// directory is shelbi's gitignored deploy footprint, so the marker never
+/// dirties the worktree between tasks.
+pub fn workspace_review_loaded_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
+    workspace_worktree(machine, workspace)
+        .join(".claude")
+        .join("shelbi-review-loaded")
+}
+
+/// Read the review-loaded marker, returning the task id the review workspace
+/// wrote (the first whitespace-delimited token — the trailing URL, if any, is
+/// not needed here) or `None` when the marker is absent or empty.
+///
+/// Unlike [`read_ready_marker`], a **local** review slot (the common case —
+/// hub-hosted review workspaces) is read straight off the filesystem so the
+/// sidebar's refresh loop never forks a `cat` per review task; a **remote**
+/// slot routes `cat` through `shelbi-ssh`, matching the ready marker. A body
+/// whose leading token isn't a valid task id surfaces as an `Err` (the caller
+/// treats that as "not serving" and leaves the marker untouched) rather than
+/// driving a UI state off a torn or hostile write.
+pub fn read_review_loaded_marker(host: &Host, marker: &Path) -> Result<Option<String>> {
+    let content = if host.is_local() {
+        match std::fs::read_to_string(marker) {
+            Ok(s) => s,
+            // Missing marker → the review slot simply hasn't confirmed serving
+            // yet. Not an error for us.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::Io(e)),
+        }
+    } else {
+        let path = marker.to_string_lossy().into_owned();
+        let out = shelbi_ssh::run(host, ["cat", path.as_str()]).map_err(Error::Io)?;
+        if !out.status.success() {
+            // Missing file → cat exits non-zero. Not an error: the review slot
+            // hasn't signalled it's serving yet.
+            return Ok(None);
+        }
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let Some(task_id) = content.split_whitespace().next() else {
+        return Ok(None);
+    };
+    validate_task_id(task_id).map_err(|_| {
+        Error::Other(format!(
+            "review-loaded marker at {} holds an invalid task id ({task_id:?}); ignoring it",
+            marker.display()
+        ))
+    })?;
+    Ok(Some(task_id.to_string()))
+}
+
 /// Remove the ready-handoff marker (idempotent — `rm -f` succeeds if absent).
 /// Called once the poller has consumed the signal, and again at task start to
 /// clear any stale marker before the worktree is reused.
@@ -4957,6 +5021,70 @@ mod tests {
         assert!(read_ready_marker(&Host::Local, &marker).is_err());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_review_loaded_marker_takes_leading_task_id_and_rejects_garbage() {
+        // The review-loaded marker body is `<task-id> [url]`. A local review
+        // slot reads it straight off disk: the leading token is the serving
+        // task id (the URL, if any, is ignored here); absent/empty → None; a
+        // leading token that isn't a valid task id → Err.
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-review-loaded-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("shelbi-review-loaded");
+
+        // Absent → None.
+        assert!(read_review_loaded_marker(&Host::Local, &marker)
+            .unwrap()
+            .is_none());
+
+        // `<task-id> <url>` → the leading task id, URL dropped.
+        std::fs::write(&marker, "fix-homepage-nav http://localhost:3000\n").unwrap();
+        assert_eq!(
+            read_review_loaded_marker(&Host::Local, &marker)
+                .unwrap()
+                .as_deref(),
+            Some("fix-homepage-nav")
+        );
+
+        // Diff-only review: the id alone (no URL) still resolves.
+        std::fs::write(&marker, "fix-homepage-nav\n").unwrap();
+        assert_eq!(
+            read_review_loaded_marker(&Host::Local, &marker)
+                .unwrap()
+                .as_deref(),
+            Some("fix-homepage-nav")
+        );
+
+        // Empty / whitespace-only → None, not an error.
+        std::fs::write(&marker, "   \n").unwrap();
+        assert!(read_review_loaded_marker(&Host::Local, &marker)
+            .unwrap()
+            .is_none());
+
+        // A leading token that isn't a valid task id (hostile / torn) → Err, so
+        // the sidebar reads it as "not serving" rather than trusting it.
+        std::fs::write(&marker, "../../etc http://x").unwrap();
+        assert!(read_review_loaded_marker(&Host::Local, &marker).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workspace_review_loaded_marker_path_is_under_the_claude_dir() {
+        let p = fixture_with_tagged_workspaces();
+        let review = p.workspaces.iter().find(|w| w.name == "review-1").unwrap();
+        assert_eq!(
+            workspace_review_loaded_marker(&p.machines[0], review),
+            PathBuf::from("/tmp/myapp/.shelbi/wt/review-1/.claude/shelbi-review-loaded")
+        );
     }
 
     /// Build a project fixture with two `review`-tagged workspaces on `hub`
