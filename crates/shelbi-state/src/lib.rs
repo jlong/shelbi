@@ -633,6 +633,27 @@ pub fn lock_workspace(project: &str, workspace: &str) -> Result<WorkspaceLock> {
     Ok(WorkspaceLock(acquire_file_lock(&path)?))
 }
 
+/// Public RAII handle for the project-scoped review-load lock. Released when
+/// dropped.
+#[must_use = "the review-load lock is released as soon as the guard is dropped"]
+pub struct ReviewLoadLock(#[allow(dead_code)] FileLockGuard);
+
+/// Block until the exclusive project-scoped review-load lock is held.
+///
+/// Serializes the "pick a free review slot and claim it for a queued task"
+/// critical section across every party that loads onto a review slot: the
+/// daemon's auto-loader and any manual sidebar / palette load. Without it, two
+/// concurrent evaluations (a poller tick and a human pressing Enter) could each
+/// read the same slot as free and both persist an assignment onto it — loading
+/// two tasks onto one slot, or the same task onto two. One project-wide lock
+/// (rather than a per-workspace one) is what makes the multi-slot slot-selection
+/// step atomic. The lock file is a sibling of the project's other locks under
+/// `<project_dir>/`.
+pub fn lock_review_load(project: &str) -> Result<ReviewLoadLock> {
+    let path = project_dir(project)?.join("review-load.lock");
+    Ok(ReviewLoadLock(acquire_file_lock(&path)?))
+}
+
 /// Public RAII handle for the per-project Git worktree/ref lock.
 ///
 /// This lock coordinates named-branch checkout with ref rewrites across all

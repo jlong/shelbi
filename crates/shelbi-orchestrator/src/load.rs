@@ -129,6 +129,24 @@ pub fn free_review_workspaces(project_name: &str) -> Result<Vec<WorkspaceSpec>> 
 /// exactly as [`load_task_by_id`] does.
 pub fn load_review_task(project_name: &str, task_id: &str, workspace_name: &str) -> Result<String> {
     shelbi_state::ensure_daemon_matches_for_mutation()?;
+    // Serialize the claim against the daemon auto-loader and any other manual
+    // load so two evaluations can't load two tasks onto one slot (or this task
+    // onto two). The guards inside the locked body then reject a slot already
+    // taken, or a task already serving elsewhere, that a race snuck in.
+    let _guard = shelbi_state::lock_review_load(project_name)?;
+    load_review_task_locked(project_name, task_id, workspace_name)
+}
+
+/// The body of [`load_review_task`], run with the project-scoped review-load
+/// lock already held. Split out so the daemon auto-loader
+/// ([`autoload_review_queue`]) can hold the lock once across a whole batch of
+/// loads and call this per task without re-acquiring it (a second `flock` on the
+/// same file from the same process would deadlock, not recurse).
+fn load_review_task_locked(
+    project_name: &str,
+    task_id: &str,
+    workspace_name: &str,
+) -> Result<String> {
     let project = shelbi_state::load_project(project_name)?;
     let ws = project
         .workspace(workspace_name)
@@ -140,12 +158,151 @@ pub fn load_review_task(project_name: &str, task_id: &str, workspace_name: &str)
             ))
         })?;
     let tf = shelbi_state::load_task(project_name, task_id)?;
+
+    // Guard: this task is already serving on a review slot. A race (the
+    // auto-loader placed it between a human opening the confirm and pressing
+    // Enter) must not re-dispatch it onto a second slot. Reject rather than
+    // move it — the card is already loaded where it is.
+    if let Some(serving_on) = tf
+        .task
+        .assigned_to
+        .as_deref()
+        .and_then(|name| project.workspace(name))
+        .filter(|w| project.effective_tags(w).contains("review"))
+    {
+        return Err(Error::Other(format!(
+            "`{task_id}` is already loaded on review slot `{}`",
+            serving_on.name
+        )));
+    }
+
+    // Guard: the target slot is already serving a *different* active task. The
+    // slot-selection that picked it may have raced another claim; refuse rather
+    // than clobber the pane already running there.
+    if review_slot_busy_with_other(project_name, workspace_name, task_id)? {
+        return Err(Error::Other(format!(
+            "review slot `{workspace_name}` is already serving another task"
+        )));
+    }
+
     let workflow = shelbi_state::load_task_workflow(project_name, &project, &tf.task)
         .unwrap_or_else(|_| shelbi_core::default_workflow());
     let agent = workflow
         .status(tf.task.column.as_str())
         .and_then(|s| s.agent.clone());
     dispatch_task_onto(project_name, &project, &workflow, tf, &ws, agent)
+}
+
+/// True iff `workspace_name` is currently assigned to an active
+/// (in-progress or review-column) task other than `task_id`. The same "busy"
+/// definition [`free_review_workspaces`] uses, but asked of one slot — the
+/// race guard for a targeted load.
+fn review_slot_busy_with_other(
+    project_name: &str,
+    workspace_name: &str,
+    task_id: &str,
+) -> Result<bool> {
+    let mut active = shelbi_state::list_column(project_name, Column::in_progress())?;
+    active.extend(shelbi_state::list_column(project_name, Column::review())?);
+    Ok(active.iter().any(|t| {
+        t.task.id != task_id && t.task.assigned_to.as_deref() == Some(workspace_name)
+    }))
+}
+
+/// Auto-load queued review tasks onto idle review slots, one claim per free
+/// slot in board order, until slots or queued tasks run out. Returns the
+/// `(task, workspace)` pairs actually loaded.
+///
+/// This is the daemon's headless equivalent of a human pressing Enter on each
+/// Queued-for-Review row: it re-derives state from disk (task board +
+/// assignments), so it works identically on a fresh poller tick, after
+/// `shelbi reload`, and after `shelbi quit` + restart — no live TUI session
+/// need have witnessed anything. "Queued" is a review-column task not already
+/// assigned to a review-tagged slot (a handoff card still pinned to the dev
+/// slot that built it, or one with no assignment yet); a task already serving
+/// on a review slot is skipped. It holds the project-scoped review-load lock
+/// across the whole batch and dispatches through the same
+/// [`load_review_task_locked`] the manual path uses, so the emitted events and
+/// the booted Review agent are identical, and a concurrent manual Enter can't
+/// interleave to double-load a slot.
+pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>> {
+    shelbi_state::ensure_daemon_matches_for_mutation()?;
+    // One lock across the whole batch: the free slots computed below stay valid
+    // for the duration because no other claim (manual or a second tick) can
+    // proceed until we release it.
+    let _guard = shelbi_state::lock_review_load(project_name)?;
+
+    let project = shelbi_state::load_project(project_name)?;
+    // Board order (priority, then id) — the same order the sidebar shows.
+    let review_tasks = shelbi_state::list_column(project_name, Column::review())?;
+    // Idle review slots in declaration order (never lists a dev slot).
+    let free = free_review_workspaces(project_name)?;
+    let plan = plan_review_autoload(&review_tasks, &project, &free);
+    if plan.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut loaded = Vec::with_capacity(plan.len());
+    for (task_id, workspace) in plan {
+        // Mirror the manual path's observable event exactly (`dispatch task=…
+        // workspace=… status=review-load …`) so the two are indistinguishable
+        // in `events.log`.
+        let _ = shelbi_state::append_dispatch_event(
+            &task_id,
+            &workspace,
+            "review-load",
+            "auto-loading branch onto idle review slot",
+        );
+        match load_review_task_locked(project_name, &task_id, &workspace) {
+            Ok(_) => loaded.push(AutoLoadedReview {
+                task_id,
+                workspace,
+            }),
+            Err(e) => tracing::warn!(
+                project = %project_name,
+                task = %task_id,
+                workspace = %workspace,
+                error = %e,
+                "auto review-load failed for one slot",
+            ),
+        }
+    }
+    Ok(loaded)
+}
+
+/// Pure slot-selection for [`autoload_review_queue`]: pair each queued review
+/// task (board order) with one idle review slot (declaration order), capping at
+/// `min(queued, free)`. "Queued" is a review-column task not already assigned to
+/// a review-tagged slot — a handoff card still pinned to the dev slot that built
+/// it, or one with no assignment; a task already serving on a review slot is
+/// dropped. Split out with no I/O so board order and capacity limiting are
+/// unit-testable on in-memory fixtures.
+fn plan_review_autoload(
+    review_tasks: &[TaskFile],
+    project: &Project,
+    free: &[WorkspaceSpec],
+) -> Vec<(String, String)> {
+    review_tasks
+        .iter()
+        .filter(|tf| {
+            let on_review_slot = tf
+                .task
+                .assigned_to
+                .as_deref()
+                .and_then(|name| project.workspace(name))
+                .is_some_and(|w| project.effective_tags(w).contains("review"));
+            !on_review_slot
+        })
+        .map(|tf| tf.task.id.clone())
+        .zip(free.iter().map(|w| w.name.clone()))
+        .collect()
+}
+
+/// One task auto-loaded onto a review slot by [`autoload_review_queue`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoLoadedReview {
+    pub task_id: String,
+    pub workspace: String,
 }
 
 /// Load `task_id` onto the review slot it should serve on, for callers that
@@ -489,6 +646,198 @@ mod tests {
         // Untouched: still on the dev slot, never bounced back to a dev pane.
         let after = shelbi_state::load_task("demo", "t-queued").unwrap();
         assert_eq!(after.task.assigned_to.as_deref(), Some("alpha"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A review-column task with a chosen priority and optional assignment —
+    /// lets a test spell out board order and the queued-vs-serving shape.
+    fn review_task_pri(id: &str, assigned_to: Option<&str>, priority: u32) -> Task {
+        let now = chrono::Utc::now();
+        Task {
+            id: id.into(),
+            title: id.into(),
+            column: Column::review(),
+            priority,
+            assigned_to: assigned_to.map(Into::into),
+            workflow: None,
+            branch: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            params: BTreeMap::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn tf(task: Task) -> TaskFile {
+        TaskFile {
+            task,
+            body: "body".into(),
+        }
+    }
+
+    // -- auto-load selection (pure) -----------------------------------------
+
+    #[test]
+    fn plan_pairs_queued_tasks_with_free_slots_in_board_order() {
+        let project = tagged_project();
+        // Two queued review cards (one still on the dev slot, one unassigned)
+        // and two idle review slots → both pair up, input (board) order kept.
+        let review = [
+            tf(review_task_pri("t-1", Some("alpha"), 0)),
+            tf(review_task_pri("t-2", None, 1)),
+        ];
+        let free = vec![
+            project.workspace("review-1").unwrap().clone(),
+            project.workspace("review-2").unwrap().clone(),
+        ];
+        let plan = plan_review_autoload(&review, &project, &free);
+        assert_eq!(
+            plan,
+            vec![
+                ("t-1".to_string(), "review-1".to_string()),
+                ("t-2".to_string(), "review-2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_skips_tasks_already_serving_on_a_review_slot() {
+        let project = tagged_project();
+        // `t-serving` is already on review-1 (serving) → dropped; only the
+        // genuinely queued `t-queued` is paired, onto the one free slot.
+        let review = [
+            tf(review_task_pri("t-serving", Some("review-1"), 0)),
+            tf(review_task_pri("t-queued", Some("alpha"), 1)),
+        ];
+        let free = vec![project.workspace("review-2").unwrap().clone()];
+        let plan = plan_review_autoload(&review, &project, &free);
+        assert_eq!(plan, vec![("t-queued".to_string(), "review-2".to_string())]);
+    }
+
+    #[test]
+    fn plan_caps_at_min_of_slots_and_queued() {
+        let project = tagged_project();
+        // Three queued cards, one free slot → only the first (board order) is
+        // paired; the rest stay queued.
+        let review = [
+            tf(review_task_pri("t-1", None, 0)),
+            tf(review_task_pri("t-2", None, 1)),
+            tf(review_task_pri("t-3", None, 2)),
+        ];
+        let free = vec![project.workspace("review-1").unwrap().clone()];
+        let plan = plan_review_autoload(&review, &project, &free);
+        assert_eq!(plan, vec![("t-1".to_string(), "review-1".to_string())]);
+
+        // No free slots → nothing planned even with queued work.
+        assert!(plan_review_autoload(&review, &project, &[]).is_empty());
+        // No queued work → nothing planned even with free slots.
+        let serving = [tf(review_task_pri("t-x", Some("review-1"), 0))];
+        assert!(plan_review_autoload(&serving, &project, &free).is_empty());
+    }
+
+    // -- auto-load / manual race guards (on disk, reject before dispatch) ----
+
+    #[test]
+    fn load_review_task_rejects_a_task_already_serving_on_a_review_slot() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+
+        // The task was auto-loaded onto review-1 between a human opening the
+        // confirm and pressing Enter. A manual load targeting review-2 must not
+        // re-dispatch it onto a second slot — the guard rejects before dispatch.
+        shelbi_state::save_task("demo", &review_task("t-x", "review-1"), "body").unwrap();
+
+        let err = load_review_task("demo", "t-x", "review-2").unwrap_err();
+        assert!(
+            err.to_string().contains("already loaded on review slot"),
+            "got: {err}"
+        );
+        // Untouched: still on the slot it was already serving from.
+        let after = shelbi_state::load_task("demo", "t-x").unwrap();
+        assert_eq!(after.task.assigned_to.as_deref(), Some("review-1"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn load_review_task_rejects_a_slot_already_serving_another_task() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+
+        // review-1 is already busy with another review task; a second claim of
+        // it (a poller tick and a human racing for the same slot) is refused
+        // before dispatch, so two tasks can't land on one slot.
+        shelbi_state::save_task("demo", &review_task("t-loaded", "review-1"), "body").unwrap();
+        shelbi_state::save_task("demo", &review_task("t-queued", "alpha"), "body").unwrap();
+
+        let err = load_review_task("demo", "t-queued", "review-1").unwrap_err();
+        assert!(
+            err.to_string().contains("already serving another task"),
+            "got: {err}"
+        );
+        // The queued task is untouched — still on the dev slot, no branch written.
+        let after = shelbi_state::load_task("demo", "t-queued").unwrap();
+        assert_eq!(after.task.assigned_to.as_deref(), Some("alpha"));
+        assert!(after.task.branch.is_none());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- startup / reload re-evaluation (disk-derived, no live session) ------
+
+    #[test]
+    fn autoload_review_queue_is_a_noop_when_every_review_slot_is_busy() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+
+        // Both review slots already serving, plus a queued card that can't be
+        // placed. Capacity is respected: nothing loads (no dispatch attempted),
+        // and the queued card is left untouched for a later free slot.
+        shelbi_state::save_task("demo", &review_task("t-a", "review-1"), "body").unwrap();
+        shelbi_state::save_task("demo", &review_task("t-b", "review-2"), "body").unwrap();
+        shelbi_state::save_task("demo", &review_task("t-queued", "alpha"), "body").unwrap();
+
+        let loaded = autoload_review_queue("demo").unwrap();
+        assert!(loaded.is_empty(), "expected no auto-loads, got {loaded:?}");
+        let after = shelbi_state::load_task("demo", "t-queued").unwrap();
+        assert_eq!(after.task.assigned_to.as_deref(), Some("alpha"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn autoload_review_queue_plans_from_disk_on_a_fresh_evaluation() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+
+        // The state a poller sees on the first tick after `shelbi reload` /
+        // `quit`+restart: a queued review card and a free slot, re-derived from
+        // disk with no live TUI session. The disk-derived plan (list_column +
+        // free_review_workspaces, exactly what `autoload_review_queue` runs)
+        // pairs them, proving the startup path would load without a keystroke.
+        shelbi_state::save_task("demo", &review_task_pri("t-queued", Some("alpha"), 0), "body")
+            .unwrap();
+
+        let project = shelbi_state::load_project("demo").unwrap();
+        let review = shelbi_state::list_column("demo", Column::review()).unwrap();
+        let free = free_review_workspaces("demo").unwrap();
+        let plan = plan_review_autoload(&review, &project, &free);
+        assert_eq!(plan, vec![("t-queued".to_string(), "review-1".to_string())]);
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

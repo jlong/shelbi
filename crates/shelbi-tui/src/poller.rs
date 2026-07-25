@@ -202,6 +202,16 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
                 // Relaunch the orchestrator pane if it crashed (Zen stays off after
                 // the restart via its own `__zen-orch-start` crash-recovery step).
                 maybe_supervise_orchestrator(&project, &mut orch_supervision);
+
+                // Auto-load any queued review task onto an idle review slot.
+                // Project-wide (needs the whole review column + every review
+                // slot), so it lives on the supervisor tick, not a per-workspace
+                // loop. Runs on the first tick after start / `shelbi reload` /
+                // `quit`+restart and every tick after, re-deriving from disk, so
+                // a review task waiting on a free slot loads without a human
+                // keystroke. Idempotent and race-guarded against a manual Enter
+                // by the project-scoped lock inside the loader.
+                maybe_autoload_review_queue(&project);
             }
             Err(e) => tracing::debug!(
                 project = %project.name,
@@ -2624,6 +2634,36 @@ fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState)
             }
             tracing::warn!(project = %project.name, "supervisor gave up relaunching orchestrator pane after the crash-loop cap");
         }
+    }
+}
+
+/// Auto-load queued review tasks onto idle review slots, once per supervisor
+/// tick. The headless counterpart to a human pressing Enter on a
+/// Queued-for-Review row: while a task sits in Review and a `review`-tagged
+/// slot is idle, [`shelbi_orchestrator::load::autoload_review_queue`] claims
+/// the slot and boots the Review agent — the same dispatch and events as the
+/// manual path. Re-derives everything from disk, so it fires correctly on the
+/// first tick after start / `shelbi reload` / `quit`+restart without any live
+/// TUI session having witnessed the enter. The loader holds a project-scoped
+/// lock across the batch, so a concurrent manual Enter can't double-load a slot.
+/// Best-effort: a failure is logged, not fatal — the next tick retries.
+fn maybe_autoload_review_queue(project: &Project) {
+    match shelbi_orchestrator::load::autoload_review_queue(&project.name) {
+        Ok(loaded) => {
+            for l in loaded {
+                tracing::info!(
+                    project = %project.name,
+                    task = %l.task_id,
+                    workspace = %l.workspace,
+                    "auto-loaded queued review task onto idle review slot",
+                );
+            }
+        }
+        Err(e) => tracing::debug!(
+            project = %project.name,
+            error = %e,
+            "auto review-load pass skipped",
+        ),
     }
 }
 
