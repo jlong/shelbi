@@ -9,7 +9,9 @@
 //!   *Edit in <editor>* / *Open Browser* (the last only when the workflow
 //!   declares a review URL), the active middle-pane view highlighted, and
 //! - an **Approve** / **Reject** action group, Reject opening a
-//!   type-the-reason dialog.
+//!   type-the-reason popover (a centered `tmux display-popup` with a bordered
+//!   textbox and [ Reject ] / [ Cancel ] buttons — see
+//!   [`reject_reason_popup`]), rather than an in-pane modal.
 //!
 //! The state machine here is pure and side-effect free: [`ReviewPanel`]
 //! methods return a [`PanelEffect`] describing what the host loop should do
@@ -22,14 +24,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::{
     backend::Backend,
     layout::{Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
 
@@ -76,7 +78,7 @@ impl PanelRow {
 /// performs side effects itself so its logic stays unit-testable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PanelEffect {
-    /// Nothing to do (e.g. moved the selection, opened/typed in the dialog).
+    /// Nothing to do (e.g. moved the selection).
     None,
     /// Swap the reviewer-chat pane into the middle slot.
     ShowChat,
@@ -89,16 +91,13 @@ pub enum PanelEffect {
     /// Accept: move the task out of review via the normal accept transition,
     /// tear down the interface, and quit the panel.
     Approve,
-    /// Reject with the typed reason: append it to the task body, bounce the
-    /// task to the ready status, tear down the interface, and quit.
-    Reject(String),
-}
-
-/// In-progress Reject dialog: the reviewer types the reason for bouncing the
-/// task. An empty reason can't submit.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RejectDialog {
-    pub reason: String,
+    /// Open the reject-reason popover (a centered `tmux display-popup`). The
+    /// host loop launches the popup, and on submit performs the review-reject
+    /// with the typed reason, then tears down the interface and quits. The
+    /// reason itself is collected outside this process (a `display-popup`
+    /// child's output can't return here directly), so it isn't carried on the
+    /// effect — see [`reject_reason_popup`].
+    RejectPrompt,
 }
 
 /// The review panel's full state. Built once from the task's config
@@ -118,8 +117,6 @@ pub struct ReviewPanel {
     pub active_view: ActiveView,
     /// Selected panel row.
     pub selected: usize,
-    /// Open Reject dialog, if any.
-    pub dialog: Option<RejectDialog>,
     pub should_quit: bool,
     pub status_line: String,
     /// Screen rect of the rendered row list — written each frame, read by the
@@ -141,7 +138,6 @@ impl ReviewPanel {
             has_review_url,
             active_view: ActiveView::Chat,
             selected: 0,
-            dialog: None,
             should_quit: false,
             status_line: String::new(),
             list_area: Rect::default(),
@@ -249,12 +245,8 @@ impl ReviewPanel {
         }
     }
 
-    /// Activate the selected row (Enter / Space). No-op when a dialog is open
-    /// — dialog keys are routed through [`ReviewPanel::dialog_key`] instead.
+    /// Activate the selected row (Enter / Space).
     pub fn activate(&mut self) -> PanelEffect {
-        if self.dialog.is_some() {
-            return PanelEffect::None;
-        }
         let rows = self.rows();
         let Some(row) = rows.get(self.selected) else {
             return PanelEffect::None;
@@ -275,10 +267,7 @@ impl ReviewPanel {
             }
             PanelRow::Switch(SwitchItem::Browser) => PanelEffect::OpenBrowser,
             PanelRow::Approve => PanelEffect::Approve,
-            PanelRow::Reject => {
-                self.dialog = Some(RejectDialog::default());
-                PanelEffect::None
-            }
+            PanelRow::Reject => PanelEffect::RejectPrompt,
             PanelRow::Status | PanelRow::Blank | PanelRow::Section(_) => PanelEffect::None,
         }
     }
@@ -286,9 +275,6 @@ impl ReviewPanel {
     /// Map a click at (`column`, `row`) to a row activation. Returns `None`
     /// when the click misses the list or lands on an inert row.
     pub fn click(&mut self, column: u16, row: u16) -> PanelEffect {
-        if self.dialog.is_some() {
-            return PanelEffect::None;
-        }
         let area = self.list_area;
         if area.width == 0
             || area.height == 0
@@ -314,45 +300,6 @@ impl ReviewPanel {
         }
     }
 
-    /// Feed one key to the open Reject dialog. Enter submits (only when the
-    /// reason is non-blank), Esc cancels, Backspace deletes, printable chars
-    /// append. Returns `Reject(reason)` on submit, else `None`.
-    pub fn dialog_key(&mut self, key: KeyEvent) -> PanelEffect {
-        let Some(dialog) = self.dialog.as_mut() else {
-            return PanelEffect::None;
-        };
-        match key.code {
-            KeyCode::Esc => {
-                self.dialog = None;
-                PanelEffect::None
-            }
-            KeyCode::Enter => {
-                let reason = dialog.reason.trim().to_string();
-                if reason.is_empty() {
-                    // Empty reason must not submit — keep the dialog open.
-                    self.status_line = "type a reason to reject (Esc to cancel)".into();
-                    PanelEffect::None
-                } else {
-                    self.dialog = None;
-                    PanelEffect::Reject(reason)
-                }
-            }
-            KeyCode::Backspace => {
-                dialog.reason.pop();
-                PanelEffect::None
-            }
-            KeyCode::Char(c) => {
-                dialog.reason.push(c);
-                PanelEffect::None
-            }
-            _ => PanelEffect::None,
-        }
-    }
-
-    /// Whether a Reject dialog is currently open.
-    pub fn dialog_open(&self) -> bool {
-        self.dialog.is_some()
-    }
 }
 
 /// Left-truncate `path` to at most `width` columns, prefixing `...` when it's
@@ -422,10 +369,6 @@ pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
             let offset = sstart + scount;
             render_row_list(f, app, &rows[offset..], offset, rest);
         }
-    }
-
-    if app.dialog.is_some() {
-        render_reject_dialog(f, app, area);
     }
 }
 
@@ -582,54 +525,6 @@ fn button_item(label: &str, tint: Color, selected: bool) -> ListItem<'static> {
     ListItem::new(Line::from(Span::styled(format!("[ {label} ]"), style)))
 }
 
-fn render_reject_dialog(f: &mut Frame, app: &ReviewPanel, area: Rect) {
-    let reason = app.dialog.as_ref().map(|d| d.reason.as_str()).unwrap_or("");
-    // Centered modal, capped so it stays readable on a narrow review pane
-    // and never wider than the pane itself.
-    let w = area
-        .width
-        .saturating_sub(2)
-        .clamp(10, 48)
-        .min(area.width);
-    let h = 7u16.min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-    f.render_widget(Clear, modal);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
-        .title(" Reject task ");
-    let inner = block.inner(modal);
-    f.render_widget(block, modal);
-
-    let can_submit = !reason.trim().is_empty();
-    let hint = if can_submit {
-        "Enter submit · Esc cancel"
-    } else {
-        "type a reason · Esc cancel"
-    };
-    let body = Paragraph::new(vec![
-        Line::from(Span::styled(
-            "Reason for rejecting:",
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(Span::styled(
-            format!("{reason}▌"),
-            Style::default().fg(Color::White),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
-    ])
-    .wrap(Wrap { trim: false });
-    f.render_widget(body, inner);
-}
-
 // ---------------------------------------------------------------------------
 // Platform open/reveal command builders (pure, unit-tested)
 
@@ -749,28 +644,22 @@ fn review_panel_loop<B: Backend>(
             continue;
         }
         let effect = match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => {
-                if app.dialog_open() {
-                    app.dialog_key(k)
-                } else {
-                    match k.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            app.should_quit = true;
-                            PanelEffect::None
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            app.nav_up();
-                            PanelEffect::None
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            app.nav_down();
-                            PanelEffect::None
-                        }
-                        KeyCode::Enter | KeyCode::Char(' ') => app.activate(),
-                        _ => PanelEffect::None,
-                    }
+            Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    app.should_quit = true;
+                    PanelEffect::None
                 }
-            }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.nav_up();
+                    PanelEffect::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.nav_down();
+                    PanelEffect::None
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => app.activate(),
+                _ => PanelEffect::None,
+            },
             Event::Mouse(m) => handle_mouse(app, m),
             _ => PanelEffect::None,
         };
@@ -837,17 +726,83 @@ fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect
                 Err(e) => app.status_line = format!("approve failed: {e}"),
             }
         }
-        PanelEffect::Reject(reason) => {
-            match shelbi_orchestrator::review_ui::reject_review_task(
-                project_name,
-                &app.task_id,
-                &reason,
-            ) {
-                Ok(()) => app.should_quit = true,
-                Err(e) => app.status_line = format!("reject failed: {e}"),
+        // Reject opens the reason popover (a centered tmux display-popup). A
+        // submitted reason drives the same review-reject transition the old
+        // inline prompt did; a cancel (or a failed popup launch) leaves the
+        // task untouched.
+        PanelEffect::RejectPrompt => {
+            if let Some(reason) = reject_reason_popup() {
+                match shelbi_orchestrator::review_ui::reject_review_task(
+                    project_name,
+                    &app.task_id,
+                    &reason,
+                ) {
+                    Ok(()) => app.should_quit = true,
+                    Err(e) => app.status_line = format!("reject failed: {e}"),
+                }
             }
         }
     }
+}
+
+/// Launch the reject-reason prompt as a centered `tmux display-popup` running
+/// `shelbi __review-reject-reason`, returning the typed reason on submit or
+/// `None` on cancel / launch failure.
+///
+/// The reason round-trips through a temp file: a `display-popup -E` child's
+/// stdout goes to the popup pane, not back to us, so the popup writes the
+/// reason to `--out PATH` on submit and exits 0; we read it back. The file is
+/// removed before launch (so a stale one can't masquerade as a submit) and
+/// after read. Mirrors the launch pattern of `App::review_confirm_popup` in
+/// `app.rs` — `-B` suppresses tmux's own border so only the widget's frame
+/// shows. Any tmux/IO failure degrades to `None` (a no-op), never a crash.
+fn reject_reason_popup() -> Option<String> {
+    let bin = std::env::current_exe().ok()?;
+    let bin = bin.to_string_lossy();
+    // Per-process temp path — the review panel handles one reject at a time
+    // (the popup blocks its loop), so the pid alone keeps concurrent review
+    // panels from colliding on the round-trip file.
+    let out = std::env::temp_dir().join(format!("shelbi-reject-reason-{}.txt", std::process::id()));
+    let cmd = format!(
+        "{} __review-reject-reason --out {}",
+        shelbi_agent::shell_escape(&bin),
+        shelbi_agent::shell_escape(&out.to_string_lossy()),
+    );
+    let _ = std::fs::remove_file(&out);
+    // `-h 11` leaves room for the label, bordered textbox, button row, and
+    // hint without clipping.
+    let ok = run_tmux([
+        "display-popup",
+        "-B",
+        "-E",
+        "-w",
+        "60",
+        "-h",
+        "11",
+        cmd.as_str(),
+    ]);
+    let reason = ok.then(|| std::fs::read_to_string(&out).ok()).flatten();
+    let _ = std::fs::remove_file(&out);
+    reason
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+}
+
+/// Run `tmux ARGS`, returning whether it exited successfully. Mirrors
+/// `app::run_tmux`; kept local so the review panel's popup launch doesn't
+/// reach across modules.
+fn run_tmux<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    std::process::Command::new("tmux")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Resolve the concrete review URL to open for `task_id` (with `$PORT` /
@@ -870,12 +825,7 @@ fn review_url(project_name: &str, task_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
 
     fn panel(has_url: bool) -> ReviewPanel {
         ReviewPanel::new(
@@ -1091,57 +1041,14 @@ mod tests {
     }
 
     #[test]
-    fn reject_requires_a_non_empty_reason_before_it_submits() {
-        let mut app = panel(false);
-        // Select and activate Reject → opens the dialog, no effect yet.
-        while !matches!(app.rows().get(app.selected), Some(PanelRow::Reject)) {
-            app.nav_down();
-        }
-        assert_eq!(app.activate(), PanelEffect::None);
-        assert!(app.dialog_open(), "reject opens the reason dialog");
-
-        // Enter on an empty reason must not submit.
-        assert_eq!(app.dialog_key(key(KeyCode::Enter)), PanelEffect::None);
-        assert!(app.dialog_open(), "empty reason keeps the dialog open");
-
-        // Type a reason, then Enter submits it.
-        for c in "please fix the null deref".chars() {
-            assert_eq!(app.dialog_key(key(KeyCode::Char(c))), PanelEffect::None);
-        }
-        assert_eq!(
-            app.dialog_key(key(KeyCode::Enter)),
-            PanelEffect::Reject("please fix the null deref".to_string())
-        );
-        assert!(!app.dialog_open(), "dialog closes on submit");
-    }
-
-    #[test]
-    fn reject_dialog_esc_cancels_without_submitting() {
+    fn reject_row_activation_requests_the_reason_popover() {
+        // The reason is now collected in a tmux display-popup outside this
+        // process; activating Reject just asks the host loop to launch it.
         let mut app = panel(false);
         while !matches!(app.rows().get(app.selected), Some(PanelRow::Reject)) {
             app.nav_down();
         }
-        app.activate();
-        app.dialog_key(key(KeyCode::Char('x')));
-        assert_eq!(app.dialog_key(key(KeyCode::Esc)), PanelEffect::None);
-        assert!(!app.dialog_open(), "Esc closes the dialog");
-    }
-
-    #[test]
-    fn reject_reason_backspace_edits_the_buffer() {
-        let mut app = panel(false);
-        while !matches!(app.rows().get(app.selected), Some(PanelRow::Reject)) {
-            app.nav_down();
-        }
-        app.activate();
-        for c in "abc".chars() {
-            app.dialog_key(key(KeyCode::Char(c)));
-        }
-        app.dialog_key(key(KeyCode::Backspace));
-        assert_eq!(
-            app.dialog_key(key(KeyCode::Enter)),
-            PanelEffect::Reject("ab".to_string())
-        );
+        assert_eq!(app.activate(), PanelEffect::RejectPrompt);
     }
 
     #[test]
@@ -1206,15 +1113,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dialog_swallows_activation_of_underlying_rows() {
-        let mut app = panel(true);
-        while !matches!(app.rows().get(app.selected), Some(PanelRow::Reject)) {
-            app.nav_down();
-        }
-        app.activate(); // open dialog
-        // Enter would normally activate a row, but the dialog is open, so
-        // activate() is inert (dialog_key owns the keys now).
-        assert_eq!(app.activate(), PanelEffect::None);
-    }
 }
