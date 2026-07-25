@@ -499,9 +499,9 @@ fn render_switch_nav(f: &mut Frame, app: &ReviewPanel, area: Rect, sstart: usize
 
 /// One switch nav row. Selected rows fill edge to edge with the selection
 /// background (label padded out to the full width) and render white/bold;
-/// the active middle-pane view keeps its leading `▸` marker and cyan/bold
-/// tint when unselected; other rows are plain gray. The single leading space
-/// keeps the label aligned with the 1-col-indented rows above and below.
+/// the active middle-pane view is distinguished by its cyan/bold tint when
+/// unselected; other rows are plain gray. The single leading space keeps the
+/// label aligned with the 1-col-indented rows above and below.
 fn switch_nav_line(
     app: &ReviewPanel,
     item: SwitchItem,
@@ -522,9 +522,11 @@ fn switch_nav_line(
         ),
         SwitchItem::Browser => ("🌐", "Open Browser".to_string(), false),
     };
-    // The active middle-pane view is marked with a leading `▸`; the leading
-    // space matches the 1-col indent the sidebar nav labels use.
-    let marker = if active { "▸ " } else { "  " };
+    // Two-space placeholder keeps the glyph column aligned; the active view is
+    // distinguished by cyan/bold styling and the selection background, not a
+    // leading marker glyph. The leading space matches the 1-col indent the
+    // sidebar nav labels use.
+    let marker = "  ";
     let text = format!(" {marker}{glyph} {label}");
     if selected {
         let pad = width.saturating_sub(text.chars().count());
