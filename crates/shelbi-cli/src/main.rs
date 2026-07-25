@@ -378,6 +378,16 @@ enum Cmd {
         #[arg(long)]
         workspace: Option<String>,
     },
+    /// (internal) Render the reject-reason prompt — a bordered textbox plus
+    /// `[ Reject ]` / `[ Cancel ]` buttons, meant to be invoked inside a
+    /// `tmux display-popup` by the review panel. Writes the typed reason to
+    /// `--out` and exits 0 on submit, non-zero on cancel. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__review-reject-reason")]
+    ReviewRejectReason {
+        #[arg(long)]
+        out: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -478,6 +488,12 @@ fn main() -> Result<()> {
             // non-zero = cancel / no free slot.
             let confirmed = commands::review_confirm::run(title, workspace)?;
             std::process::exit(if confirmed { 0 } else { 1 });
+        }
+        Some(Cmd::ReviewRejectReason { out }) => {
+            // The review panel reads our exit code (0 = submitted, non-zero =
+            // cancelled) and, on submit, the reason written to `--out`.
+            let submitted = commands::review_reject::run(out)?;
+            std::process::exit(if submitted { 0 } else { 1 });
         }
         Some(Cmd::ZenOrchStart { project }) => commands::zen_lifecycle::orch_start(&project),
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),
