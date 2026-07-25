@@ -745,6 +745,22 @@ fn poll_one(
         return;
     }
 
+    // Orphaned-pane reconciliation. A dev workspace whose task left the active
+    // category by a path that doesn't tear the pane down — a *manual* board move
+    // (the TUI or `shelbi task move`, `reason=user:*`), which bypasses both the
+    // ready-marker promotion and the agent-transition marker that would normally
+    // close the pane — is left running but detached from any active task (an
+    // `orphaned session`). Nothing else reclaims it: it isn't a crash, so the
+    // supervisor ignores it, and the orchestrator won't stop workspaces on its
+    // own. Reap it here and return the slot to idle. Runs only on a live pane
+    // (we just returned on a dead one) and short-circuits the rest of the tick
+    // when it reaps — there's nothing left to observe.
+    if maybe_reconcile_orphaned_pane(project, workspace, &host, &addr) {
+        *last_dialog = None;
+        *limit_resume = LimitResumeState::Idle;
+        return;
+    }
+
     // Pane-stall detection. One `capture-pane` sample feeds both detectors,
     // run on the same tick as the title read because a stalled pane keeps a
     // stale `shelbi:working` title — no hook fires — so the title path alone
@@ -2609,6 +2625,116 @@ fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState)
             tracing::warn!(project = %project.name, "supervisor gave up relaunching orchestrator pane after the crash-loop cap");
         }
     }
+}
+
+/// Reap a dev workspace pane orphaned by a manual board move. Fires when a
+/// live, non-user-shell pane on a non-`review` workspace has no active
+/// (`active`-category) task assigned to it — the state a hand move out of
+/// `in_progress` (to review / todo / canceled / backlog) leaves behind, since
+/// that path bypasses the ready-marker promotion ([`maybe_apply_ready_handoff`])
+/// and the agent-transition marker ([`maybe_apply_transition`]) that would
+/// otherwise close the pane. It also catches a workspace left orphaned by any
+/// earlier path (its task since reassigned or deleted): the condition is simply
+/// "a live agent slot no active task points at", the same thing
+/// `shelbi workspace list` renders as `orphaned session`. Returns `true` when
+/// it reaped the pane so the caller can short-circuit the tick.
+///
+/// This does NOT gate on there being committed work to rebase/push: teardown is
+/// about the *pane*, not the branch, so a worker that produced zero commits is
+/// reaped just the same.
+///
+/// Called only on a live pane (the caller returned on a dead one). Guards, each
+/// erring toward leaving the pane alone:
+///  - **`review` workspaces are skipped** — a review slot legitimately holds a
+///    loaded (handoff-category) task and keeps its pane; its own lifecycle owns
+///    teardown. (The review-load pane bug is tracked separately.)
+///  - **A read failure is not "no task."** [`current_task_for`] collapses a
+///    `list_tasks` error into `None`; here we read explicitly and bail on `Err`
+///    so a transient FS hiccup never reaps a healthy worker.
+///  - **User shells are never reaped** — the sidebar's open-idle-workspace pane
+///    carries [`USER_SHELL_OPTION`]; a probe that can't tell is treated as
+///    "might be one" and skipped.
+///
+/// No start-up race: dispatch persists a task as `in_progress` + assigned
+/// *before* it spawns the pane, so a freshly launched worker already has an
+/// active task by the time it's alive.
+fn maybe_reconcile_orphaned_pane(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    host: &shelbi_core::Host,
+    addr: &shelbi_core::TmuxAddr,
+) -> bool {
+    // Read the board explicitly so a transient failure stays distinguishable
+    // from a genuinely empty result — never reap on an unreadable board.
+    let Ok(tasks) = shelbi_state::list_tasks(&project.name) else {
+        return false;
+    };
+    if !workspace_orphaned_by_board(project, workspace, &tasks) {
+        return false;
+    }
+
+    // No active task points at this slot. One bounded probe settles both
+    // questions that gate a reap: is the slot genuinely alive (the caller only
+    // reaches us on a live pane, but re-probing keeps this self-contained and
+    // safe if the pane died mid-tick), and is it a genuine agent pane rather
+    // than the sidebar's deliberate user shell? Reap ONLY on a live,
+    // non-user-shell slot; a dead / unreachable / user-shell verdict leaves it
+    // untouched.
+    match shelbi_orchestrator::workspace::probe_workspace_slot(
+        host,
+        addr,
+        shelbi_orchestrator::workspace::probe_deadline(),
+    ) {
+        shelbi_orchestrator::workspace::SlotProbe::Alive { user_shell: false } => {}
+        shelbi_orchestrator::workspace::SlotProbe::Alive { user_shell: true }
+        | shelbi_orchestrator::workspace::SlotProbe::Dead
+        | shelbi_orchestrator::workspace::SlotProbe::Unreachable { .. } => return false,
+    }
+
+    // Orphan confirmed. Close the slot and record the reap. `kill_workspace_pane`
+    // marks the expected-teardown so the lifecycle wrapper doesn't also emit a
+    // spurious `pane_alive=false reason=signal:SIGHUP`; our own
+    // `pane_alive=false reason=orphaned-slot-reaped` is the trail the
+    // orchestrator (and `shelbi events tail`) sees for the freed slot.
+    match shelbi_orchestrator::workspace::kill_workspace_pane(host, addr, &workspace.name) {
+        Ok(()) => {
+            if let Err(e) = shelbi_state::append_workspace_pane_event(
+                &project.name,
+                &workspace.name,
+                false,
+                "orphaned-slot-reaped",
+            ) {
+                tracing::warn!(workspace = %workspace.name, error = %e, "append_workspace_pane_event failed");
+            }
+            tracing::info!(
+                workspace = %workspace.name,
+                "reaped orphaned dev pane (no active task assigned); slot returned to idle",
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(workspace = %workspace.name, error = %e, "reap of orphaned dev pane failed");
+            false
+        }
+    }
+}
+
+/// Pure board-side half of [`maybe_reconcile_orphaned_pane`]: is `workspace` a
+/// dev slot with no active task pointing at it? A `review`-tagged workspace is
+/// never orphaned by this rule (it holds a loaded handoff-category task). Split
+/// out so the decision is unit-testable without touching tmux.
+fn workspace_orphaned_by_board(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    tasks: &[shelbi_state::TaskFile],
+) -> bool {
+    if project.effective_tags(workspace).contains("review") {
+        return false;
+    }
+    !tasks.iter().any(|tf| {
+        tf.task.assigned_to.as_deref() == Some(workspace.name.as_str())
+            && task_is_active(project, &tf.task)
+    })
 }
 
 fn current_task_for(project: &Project, workspace_name: &str) -> Option<String> {
@@ -4916,6 +5042,165 @@ transitions:
             }),
             tf(review_task("v")),
         ]));
+    }
+
+    /// A `local_project` variant whose sole workspace carries `tags`, so a
+    /// `review`-tagged slot can be exercised against the orphan rule.
+    fn tagged_project(work_dir: &std::path::Path, tags: &[&str]) -> Project {
+        let mut project = local_project(work_dir);
+        project.workspaces[0].tags = tags.iter().map(|t| t.to_string()).collect();
+        project
+    }
+
+    fn assigned(mut task: Task, workspace: &str) -> Task {
+        task.assigned_to = Some(workspace.into());
+        task
+    }
+
+    #[test]
+    fn workspace_orphaned_when_no_active_task_points_at_a_dev_slot() {
+        // `task_is_active` resolves through the (default) workflow, which for a
+        // `workflow: None` task falls back to the built-in default even without
+        // a project on disk — but pin SHELBI_HOME so the resolution is
+        // deterministic regardless of the ambient environment.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-orphan-board-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let dev = local_project(&work_dir);
+        let dev_ws = &dev.workspaces[0]; // "alpha", no tags
+
+        // A live pane whose task is still `in_progress` + assigned is a normal
+        // worker — NOT orphaned.
+        assert!(!workspace_orphaned_by_board(
+            &dev,
+            dev_ws,
+            &[tf(in_progress_task("a", "alpha"))],
+        ));
+
+        // Manual move out of the active category (review / todo / done) leaves
+        // the task assigned to the dev slot but no longer active → orphaned. The
+        // move needn't have produced any commits; that never enters into it.
+        for column in [Column::review(), Column::todo(), Column::done()] {
+            let mut task = in_progress_task("a", "alpha");
+            task.column = column.clone();
+            assert!(
+                workspace_orphaned_by_board(&dev, dev_ws, &[tf(task)]),
+                "a task manually moved to {column:?} must orphan the dev slot",
+            );
+        }
+
+        // A workspace no task points at all (task reassigned elsewhere, or
+        // deleted) is orphaned too — the pre-existing `orphaned session` case.
+        assert!(workspace_orphaned_by_board(
+            &dev,
+            dev_ws,
+            &[tf(assigned(in_progress_task("a", "beta"), "beta"))],
+        ));
+        assert!(workspace_orphaned_by_board(&dev, dev_ws, &[]));
+
+        // A `review`-tagged workspace holding a loaded review task is NEVER
+        // reaped by this rule — its own lifecycle owns teardown.
+        let review = tagged_project(&work_dir, &["review"]);
+        let review_ws = &review.workspaces[0];
+        assert!(!workspace_orphaned_by_board(
+            &review,
+            review_ws,
+            &[tf(assigned(review_task("v"), "alpha"))],
+        ));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// End-to-end reap: a real tmux slot for a dev workspace whose task was
+    /// hand-moved to `review` is closed by the reconciler, the slot returns to
+    /// idle, and a `pane_alive=false reason=orphaned-slot-reaped` line lands.
+    #[test]
+    fn reconcile_reaps_orphaned_dev_pane_and_logs_it() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project_name = format!("orphan-reap-{nonce}");
+        let session = format!("shelbi-{project_name}");
+        let home = std::env::temp_dir().join(&project_name);
+        std::fs::create_dir_all(&home).unwrap();
+        let _cleanup = LimitResumeTmuxCleanup {
+            session: session.clone(),
+            home: home.clone(),
+            prior_home: std::env::var_os("SHELBI_HOME"),
+            prior_hub_sock: std::env::var_os("SHELBI_HUB_SOCK"),
+        };
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.name.clone_from(&project_name);
+        shelbi_state::save_project(&project).unwrap();
+
+        // The task was hand-moved to review but is still assigned to the dev
+        // workspace (a manual `move_task` doesn't unassign). Its pane is a
+        // long-lived agent process that nothing tore down.
+        let mut task = in_progress_task("orphaned-task", "alpha");
+        task.column = Column::review();
+        shelbi_state::save_task(&project.name, &task, "no commits").unwrap();
+
+        let idle_script = home.join("idle.sh");
+        std::fs::write(&idle_script, "while :; do sleep 60; done\n").unwrap();
+        start_limit_resume_tmux_session(&session, &idle_script, &home.join("unused.receipt"));
+
+        let host = Host::Local;
+        let addr = TmuxAddr {
+            session: session.clone(),
+            window: "alpha".into(),
+        };
+        assert!(
+            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            "the orphaned agent pane must be alive before the reap",
+        );
+
+        let reaped = maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr);
+        assert!(reaped, "a live dev pane with no active task must be reaped");
+        assert!(
+            !shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            "the pane must be gone after the reap",
+        );
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.lines().any(|l| l.contains(&format!("project={project_name}"))
+                && l.contains("workspace=alpha")
+                && l.contains("pane_alive=false")
+                && l.contains("reason=orphaned-slot-reaped")),
+            "expected an orphan-reap pane event; log: {log:?}",
+        );
+
+        // Idempotent: with the pane gone, a second pass is a no-op.
+        assert!(
+            !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr),
+            "a dead slot must not be re-reaped",
+        );
     }
 
     /// Force `hb` due and run one consideration. Returns the interval that is
