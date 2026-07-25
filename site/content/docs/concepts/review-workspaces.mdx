@@ -6,76 +6,47 @@ summary: "Review routing is ordinary tag primitives: a status requires a tag, a 
 
 Most real review of an app or a site means **running it**: booting the dev
 server, hitting a URL, clicking through the change, not just reading a diff.
-The *routing* that gets a task to a review slot is assembled from generic
-primitives any status can use: a **status requires tags**, a **workspace
-carries tags**, and a **transition runs commands**. On top of that routing,
-Shelbi ships three pieces of review-specific machinery: a workflow `review:`
-**serve recipe** that boots the branch, a **review sidebar** listing tasks
-Ready and Queued for review, and a **review interface** for running the change
-and accepting or rejecting it.
+The *routing* that gets a task to a review slot is ordinary
+[tag routing](/docs/concepts/workspaces#tags-capability-labels): a **status
+requires tags**, a **workspace carries tags**, and the task loads onto a free
+slot whose effective tags match. On top of that generic routing, Shelbi ships
+three pieces of review-specific machinery: a workflow `review:` **serve recipe**
+that boots the branch, a **review sidebar** listing tasks Ready and Queued for
+review, and a **review interface** for running the change and accepting or
+rejecting it.
 
-This page walks the routing primitives, the serve recipe, and the review
-surfaces in the TUI.
+This page covers the review tag, the serve recipe, and the review surfaces in
+the TUI. The generic tag and slot mechanics they build on — effective tags,
+superset routing, and `$SLOT` — live in
+[Workspaces](/docs/concepts/workspaces#tags-capability-labels).
 
-## Tags
+## The review tag
 
-Every machine and every workspace can carry a free-form `tags` list. A
-workspace's **effective tags** are its own tags **unioned** with its
-machine's tags — a tag declared once on a machine applies to all of its
-slots without repeating it per workspace.
+Review routing uses one tag by convention: `review`. A workflow's review
+[status](/docs/configuration/workflow#statuses) requires it, and every slot
+meant to run review work carries it:
 
 ```yaml
+# workflows/default.yaml — the review status requires the tag
+statuses:
+  - { id: review, owner: user, agent: review, tags: [review] }
+```
+
+```yaml
+# project.yaml — tag the machine (or individual slots) so its slots carry it
 machines:
   - name: hub
     kind: local
     work_dir: ~/Workspaces/myapp
     tags: [review]              # every slot on hub inherits `review`
-
-workspaces:
-  - { name: alpha, machine: hub, runner: claude }                 # effective: {review}
-  - { name: bravo, machine: hub, runner: claude, tags: [gpu] }    # effective: {review, gpu}
 ```
 
-Both fields accept a scalar `tag:` alias and a bare string as shorthand for a
-one-element list (`tags: review` ≡ `tags: [review]`). Both are elided from the
-on-disk form when empty, so existing project YAMLs round-trip unchanged.
-
-## Status-tag routing
-
-A workflow [status](/docs/configuration/workflow#statuses) declares the tags a
-task needs while it sits there:
-
-```yaml
-statuses:
-  - { id: review, owner: user, agent: review, tags: [review] }
-```
-
-When a task enters that status, the orchestrator routes it to a **free
-workspace whose effective tags are a superset of the status's required set**
-(set-AND). Empty required tags — the default — match any free workspace, so
-any idle slot qualifies. `tags: [review]` on the status
-plus `tags: [review]` on a machine is all it takes to pin review work to
-review slots. Nothing in the routing branches on the literal word "review" —
-it's the same superset query every tag uses.
-
-If no declared workspace matches the required tags, the load fails loudly
-rather than silently running review work on a general slot.
-
-## Slots and `$SLOT`
-
-Each workspace has a numeric **slot**. Set it explicitly with `slot:`, or let
-it default to the workspace's zero-based index among its machine's slots. The
-slot is exported to transition commands as **`$SLOT`**, which is how two
-review workspaces on one machine avoid colliding on a port:
-
-```yaml
-workspaces:
-  - { name: review-0, machine: hub, runner: claude, tags: [review], slot: 0 }
-  - { name: review-1, machine: hub, runner: claude, tags: [review], slot: 1 }
-```
-
-Alongside `$SLOT`, every transition command also gets `$SHELBI_TASK`,
-`$SHELBI_BRANCH`, `$SHELBI_WORKTREE`, and `$SHELBI_MACHINE`.
+When a task enters the review status, the orchestrator routes it to a free
+workspace whose effective tags are a superset of `{review}` — the same
+[superset routing](/docs/concepts/workspaces#status-tag-routing) every tag uses.
+Nothing branches on the literal word "review"; it is just the tag this workflow
+happens to require. If no declared workspace carries it, the load fails loudly
+rather than running review work on a general slot.
 
 ## Serving the branch: the `review:` block
 
