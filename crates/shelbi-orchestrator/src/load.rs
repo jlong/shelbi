@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use shelbi_core::{Column, Error, Project, Result, WorkspaceSpec, Workflow};
+use shelbi_core::{Column, Error, Project, Result, Task, WorkspaceSpec, Workflow};
 use shelbi_state::TaskFile;
 
 use crate::branch;
@@ -159,20 +159,20 @@ fn load_review_task_locked(
         })?;
     let tf = shelbi_state::load_task(project_name, task_id)?;
 
-    // Guard: this task is already serving on a review slot. A race (the
-    // auto-loader placed it between a human opening the confirm and pressing
-    // Enter) must not re-dispatch it onto a second slot. Reject rather than
-    // move it — the card is already loaded where it is.
-    if let Some(serving_on) = tf
-        .task
-        .assigned_to
-        .as_deref()
-        .and_then(|name| project.workspace(name))
-        .filter(|w| project.effective_tags(w).contains("review"))
-    {
+    // Guard: this task is already assigned to a review slot *other than* the
+    // target. A race (the auto-loader placed it between a human opening the
+    // confirm and pressing Enter) must not re-dispatch it onto a *second*
+    // slot. Reject rather than move it — the card is already loaded where it
+    // is. Re-loading onto the SAME slot it already owns is NOT a conflict: it
+    // is a resume of a stranded slot (its pane died on `quit`/crash while the
+    // assignment persisted on disk), and `start_workspace_on_task` kills any
+    // stale pane and relaunches, so a same-slot re-load is safe and
+    // idempotent. Callers only reach it for a genuinely dead slot — the
+    // auto-loader gates on pane liveness, and the sidebar only re-loads a
+    // Ready row whose window needs launching.
+    if let Some(other) = conflicting_review_slot(&project, &tf.task, workspace_name) {
         return Err(Error::Other(format!(
-            "`{task_id}` is already loaded on review slot `{}`",
-            serving_on.name
+            "`{task_id}` is already loaded on review slot `{other}`"
         )));
     }
 
@@ -191,6 +191,24 @@ fn load_review_task_locked(
         .status(tf.task.column.as_str())
         .and_then(|s| s.agent.clone());
     dispatch_task_onto(project_name, &project, &workflow, tf, &ws, agent)
+}
+
+/// If `task` is currently assigned to a review slot *other than* `target`,
+/// return that slot's name — loading here would give the same task a second,
+/// conflicting review slot and must be rejected.
+///
+/// Returns `None` when the task is unassigned, assigned to a non-review (dev)
+/// slot, or assigned to `target` itself. That last case is the load-bearing
+/// one: a task whose `assigned_to` already names `target` is being re-loaded
+/// onto the SAME slot it owns — a resume of a stranded review slot whose pane
+/// died on `quit`/crash — which is allowed, not a double-load.
+fn conflicting_review_slot(project: &Project, task: &Task, target: &str) -> Option<String> {
+    task.assigned_to
+        .as_deref()
+        .filter(|name| *name != target)
+        .and_then(|name| project.workspace(name))
+        .filter(|w| project.effective_tags(w).contains("review"))
+        .map(|w| w.name.clone())
 }
 
 /// True iff `workspace_name` is currently assigned to an active
@@ -258,13 +276,28 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
                 task_id,
                 workspace,
             }),
-            Err(e) => tracing::warn!(
-                project = %project_name,
-                task = %task_id,
-                workspace = %workspace,
-                error = %e,
-                "auto review-load failed for one slot",
-            ),
+            Err(e) => {
+                // Surface the failure in events.log, not just the logs: an
+                // auto-load that rejects a slot (busy, conflicting assignment)
+                // or fails to dispatch is otherwise invisible to the
+                // orchestrator, which is exactly the "no observable event"
+                // gap that let a stalled review-load go unnoticed. The
+                // dispatch primitive already logs sync/branch failures; this
+                // covers every other rejection before it.
+                let _ = shelbi_state::append_dispatch_event(
+                    &task_id,
+                    &workspace,
+                    "review-load-failed",
+                    &e.to_string(),
+                );
+                tracing::warn!(
+                    project = %project_name,
+                    task = %task_id,
+                    workspace = %workspace,
+                    error = %e,
+                    "auto review-load failed for one slot",
+                );
+            }
         }
     }
     Ok(loaded)
@@ -737,6 +770,65 @@ mod tests {
         // No queued work → nothing planned even with free slots.
         let serving = [tf(review_task_pri("t-x", Some("review-1"), 0))];
         assert!(plan_review_autoload(&serving, &project, &free).is_empty());
+    }
+
+    // -- conflicting-slot guard (pure) --------------------------------------
+
+    #[test]
+    fn conflicting_review_slot_flags_only_a_different_review_slot() {
+        let project = tagged_project();
+
+        // Assigned to a DIFFERENT review slot → conflict (a second slot).
+        let on_review_1 = review_task("t", "review-1");
+        assert_eq!(
+            conflicting_review_slot(&project, &on_review_1, "review-2"),
+            Some("review-1".to_string()),
+        );
+
+        // Assigned to the SAME slot we're targeting → NOT a conflict: this is
+        // the resume-onto-the-same-slot case a stranded (dead-pane) review
+        // slot needs, so it must be allowed through to dispatch.
+        assert_eq!(
+            conflicting_review_slot(&project, &on_review_1, "review-1"),
+            None,
+        );
+
+        // Assigned to a dev slot (a queued handoff card still pinned to the
+        // slot that built it) → not a review-slot conflict.
+        let on_dev = review_task("t", "alpha");
+        assert_eq!(conflicting_review_slot(&project, &on_dev, "review-1"), None);
+
+        // Unassigned → nothing to conflict with.
+        let mut unassigned = review_task("t", "alpha");
+        unassigned.assigned_to = None;
+        assert_eq!(
+            conflicting_review_slot(&project, &unassigned, "review-1"),
+            None,
+        );
+    }
+
+    #[test]
+    fn load_review_task_allows_resume_onto_the_same_slot() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+
+        // A task stranded on review-1 (its pane died on quit) is still
+        // assigned there on disk. Re-loading onto review-1 is a resume, so the
+        // "already loaded on review slot" guard must NOT fire — the load
+        // proceeds past the guard and only fails later at dispatch (no tmux in
+        // the test env), never with the conflicting-slot rejection.
+        shelbi_state::save_task("demo", &review_task("t-stranded", "review-1"), "body").unwrap();
+
+        let err = load_review_task("demo", "t-stranded", "review-1").unwrap_err();
+        assert!(
+            !err.to_string().contains("already loaded on review slot"),
+            "same-slot resume must clear the conflicting-slot guard, got: {err}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // -- auto-load / manual race guards (on disk, reject before dispatch) ----
