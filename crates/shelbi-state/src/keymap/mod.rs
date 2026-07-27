@@ -13,5 +13,6 @@ pub use actions::{
 pub use chord::{ChordParseError, KeyChord};
 pub use display::{format_chord, DisplayStyle};
 pub use loader::{
-    load_keymaps, ErrorKind, KeymapDiagnostic, Keymaps, ModeKeymap, WarningKind, KEYS_FILENAME,
+    load_keymaps, validate_keymaps_yaml, ErrorKind, KeymapDiagnostic, Keymaps, ModeKeymap,
+    WarningKind, KEYS_FILENAME,
 };
