@@ -30,6 +30,7 @@ pub mod ready;
 pub mod review_ui;
 pub mod submit;
 pub mod supervision;
+pub mod system_plugin;
 pub mod transition;
 pub mod wake;
 pub mod workspace;

@@ -47,11 +47,13 @@ Each tarball must contain:
 shelbi
 LICENSE
 README.md
+plugins/update-shelbi-configuration/
 ```
 
-The generated formula installs `shelbi`, declares the MIT license, depends on
-`tmux`, points at the GitHub release tarballs, verifies SHA256, selects arm64
-vs x86_64 only when both artifacts exist, and tests `shelbi --version`.
+The generated formula installs `shelbi` and its system plugin assets, declares
+the MIT license, depends on `tmux`, points at the GitHub release tarballs,
+verifies SHA256, selects arm64 vs x86_64 only when both artifacts exist, and
+tests `shelbi --version`.
 
 ## Unresolved Naming Decision
 

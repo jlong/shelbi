@@ -1,0 +1,25 @@
+{
+  "name": "update-shelbi-configuration",
+  "version": "1.0.0",
+  "description": "Safely preview, validate, and apply Shelbi configuration changes.",
+  "author": {
+    "name": "Shelbi"
+  },
+  "homepage": "https://shelbi.dev",
+  "repository": "https://github.com/jlong/shelbi",
+  "license": "MIT",
+  "keywords": ["shelbi", "configuration", "orchestration"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Update Shelbi Configuration",
+    "shortDescription": "Safely update Shelbi configuration",
+    "longDescription": "Inventory, stage, lint, preview, confirm, and apply changes across Shelbi-owned configuration.",
+    "developerName": "Shelbi",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://shelbi.dev",
+    "defaultPrompt": [
+      "Update my Shelbi configuration safely."
+    ]
+  }
+}

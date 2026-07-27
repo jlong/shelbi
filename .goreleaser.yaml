@@ -28,6 +28,7 @@ archives:
     files:
       - LICENSE
       - README.md
+      - plugins/update-shelbi-configuration
 
 nfpms:
   - id: shelbi-deb
@@ -54,6 +55,8 @@ nfpms:
         dst: /usr/share/doc/shelbi/README.md
       - src: LICENSE
         dst: /usr/share/doc/shelbi/copyright
+      - src: plugins/update-shelbi-configuration
+        dst: /usr/share/shelbi/plugins/update-shelbi-configuration
     overrides:
       deb:
         file_name_template: "{{ .ProjectName }}_{{ .Version }}_amd64"
