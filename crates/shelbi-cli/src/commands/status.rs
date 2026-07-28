@@ -221,6 +221,9 @@ fn orchestrator_integration_line(
         return format!("orchestrator  integration={}", IntegrationMode::Conventional);
     };
     let mut line = format!("orchestrator  integration={}", health.mode());
+    if let Some(injection) = &health.system_skill_injection {
+        line.push_str(&format!(" system_skill={injection}"));
+    }
     match &health.inactive_reason {
         Some(reason) => line.push_str(&format!(" reason={reason}")),
         // A disengaged bridge with no recorded reason predates reason tracking;
@@ -509,12 +512,13 @@ mod tests {
         let health = shelbi_orchestrator::wake::CodexIntegrationHealth {
             native_active: true,
             inactive_reason: None,
+            system_skill_injection: Some("codex-native-skill-root".into()),
             pending_batches: 0,
             oldest_pending_timestamp: None,
         };
         assert_eq!(
             orchestrator_integration_line(Some(&health)),
-            "orchestrator  integration=structured"
+            "orchestrator  integration=structured system_skill=codex-native-skill-root"
         );
     }
 
@@ -523,12 +527,14 @@ mod tests {
         let health = shelbi_orchestrator::wake::CodexIntegrationHealth {
             native_active: false,
             inactive_reason: Some("protocol-incompatible".into()),
+            system_skill_injection: Some("developer-instructions-fallback".into()),
             pending_batches: 2,
             oldest_pending_timestamp: Some("2026-07-15T09:00:00+00:00".into()),
         };
         assert_eq!(
             orchestrator_integration_line(Some(&health)),
-            "orchestrator  integration=degraded reason=protocol-incompatible \
+            "orchestrator  integration=degraded \
+             system_skill=developer-instructions-fallback reason=protocol-incompatible \
              pending_batches=2 oldest=2026-07-15T09:00:00+00:00"
         );
     }
@@ -540,6 +546,7 @@ mod tests {
         let health = shelbi_orchestrator::wake::CodexIntegrationHealth {
             native_active: false,
             inactive_reason: None,
+            system_skill_injection: None,
             pending_batches: 0,
             oldest_pending_timestamp: None,
         };

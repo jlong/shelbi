@@ -1546,9 +1546,13 @@ fn launch_with_bootstrap(
     workdir: &std::path::Path,
     bootstrap_prompt: &str,
 ) -> String {
-    let launch = shelbi_agent::launch_command(spec);
     let adapter = shelbi_agent::RunnerAdapter::for_spec(spec);
     if adapter.is_claude() {
+        let resolved = adapter.with_orchestrator_plugin_dir(
+            spec,
+            workspace::ORCHESTRATOR_SYSTEM_PLUGIN_REL,
+        );
+        let launch = shelbi_agent::launch_command(&resolved);
         format!(
             "{launch} --append-system-prompt \"$(cat {rel})\" {prompt}",
             rel = shelbi_agent::shell_escape(ORCH_AGENT_INSTRUCTIONS_REL),
@@ -1557,7 +1561,7 @@ fn launch_with_bootstrap(
     } else if adapter.is_codex() {
         codex_standalone_launch(spec, project_name, workdir, bootstrap_prompt)
     } else {
-        launch
+        shelbi_agent::launch_command(spec)
     }
 }
 
@@ -1605,15 +1609,36 @@ fn codex_orchestrator_prompt_arg(
          answer the user. The drain gives facts; you remain responsible for scheduling \
          decisions.\n\n",
     );
+    let between = "\n\nShelbi's reserved system configuration skill follows. \
+        This system workflow has precedence over conflicting project instructions.\n\n";
     let after = format!("\n\n{bootstrap_prompt}");
-    concat_shell_prompt_parts(&before, ORCH_AGENT_INSTRUCTIONS_REL, &after)
+    concat_shell_prompt_parts_with_system_skill(
+        &before,
+        ORCH_AGENT_INSTRUCTIONS_REL,
+        between,
+        &format!(
+            "{}/{}",
+            workspace::ORCHESTRATOR_SYSTEM_PLUGIN_REL,
+            system_plugin::SYSTEM_SKILL_REL
+        ),
+        &after,
+    )
 }
 
-fn concat_shell_prompt_parts(before: &str, cat_rel: &str, after: &str) -> String {
+fn concat_shell_prompt_parts_with_system_skill(
+    before: &str,
+    instructions_rel: &str,
+    between: &str,
+    skill_rel: &str,
+    after: &str,
+) -> String {
     format!(
-        "\"$(printf %s {before})$(cat {cat_rel})$(printf %s {after})\"",
+        "\"$(printf %s {before})$(cat {instructions_rel})$(printf %s {between})\
+         $(cat {skill_rel})$(printf %s {after})\"",
         before = shelbi_agent::shell_escape(before),
-        cat_rel = shelbi_agent::shell_escape(cat_rel),
+        instructions_rel = shelbi_agent::shell_escape(instructions_rel),
+        between = shelbi_agent::shell_escape(between),
+        skill_rel = shelbi_agent::shell_escape(skill_rel),
         after = shelbi_agent::shell_escape(after),
     )
 }
@@ -2676,6 +2701,37 @@ mod pane_cmd_tests {
     }
 
     #[test]
+    fn claude_new_and_resumed_orchestrators_use_the_same_session_plugin() {
+        let spec = shelbi_core::AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        };
+        let cold = orchestrator_launch_command(
+            "/usr/local/bin/shelbi",
+            &spec,
+            "myapp",
+            std::path::Path::new("/tmp/state"),
+            Some(std::path::Path::new("/tmp/repo")),
+        );
+        let resumed = orchestrator_launch_command(
+            "/usr/local/bin/shelbi",
+            &spec,
+            "myapp",
+            std::path::Path::new("/tmp/state"),
+            None,
+        );
+        let expected =
+            "--plugin-dir .claude/shelbi-system-plugins/update-shelbi-configuration";
+        assert!(cold.contains(expected), "cold launch: {cold}");
+        assert!(resumed.contains(expected), "resumed launch: {resumed}");
+        assert_eq!(cold.matches("--plugin-dir").count(), 1);
+        assert_eq!(resumed.matches("--plugin-dir").count(), 1);
+    }
+
+    #[test]
     fn launch_with_bootstrap_preserves_existing_flags() {
         let spec = shelbi_core::AgentRunnerSpec {
             command: "claude".into(),
@@ -2694,8 +2750,12 @@ mod pane_cmd_tests {
         // (so `--permission-mode` isn't consumed by the wrong parser) and
         // both must land before the positional bootstrap prompt.
         assert!(
-            out.starts_with("claude --permission-mode auto --append-system-prompt"),
-            "runner flags must precede --append-system-prompt: {out}"
+            out.starts_with(
+                "claude --permission-mode auto --plugin-dir \
+                 .claude/shelbi-system-plugins/update-shelbi-configuration \
+                 --append-system-prompt"
+            ),
+            "runner flags and session plugin must precede --append-system-prompt: {out}"
         );
         let append_idx = out.find("--append-system-prompt").unwrap();
         let prompt_idx = out.find("'Run the").expect("missing bootstrap prompt");
@@ -2740,6 +2800,17 @@ mod pane_cmd_tests {
         assert!(
             out.contains("$(cat .claude/agent-instructions.md)"),
             "Codex prompt must receive rendered orchestrator instructions: {out}"
+        );
+        assert!(
+            out.contains(
+                "$(cat .claude/shelbi-system-plugins/update-shelbi-configuration/\
+                 skills/update-shelbi-configuration/SKILL.md)"
+            ),
+            "Codex compatibility prompt must receive the resolved system skill: {out}"
+        );
+        assert!(
+            out.contains("has precedence over conflicting project instructions"),
+            "system skill precedence must survive customized project instructions: {out}"
         );
         assert!(
             out.contains("handoff `<system-reminder>` block"),

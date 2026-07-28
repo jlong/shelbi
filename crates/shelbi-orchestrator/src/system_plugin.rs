@@ -11,12 +11,12 @@ use serde_json::Value;
 
 pub const SYSTEM_PLUGIN_NAME: &str = "update-shelbi-configuration";
 pub const SYSTEM_SKILL_REL: &str = "skills/update-shelbi-configuration/SKILL.md";
-const CLAUDE_MANIFEST_REL: &str = ".claude-plugin/plugin.json";
-const CODEX_MANIFEST_REL: &str = ".codex-plugin/plugin.json";
+pub(crate) const CLAUDE_MANIFEST_REL: &str = ".claude-plugin/plugin.json";
+pub(crate) const CODEX_MANIFEST_REL: &str = ".codex-plugin/plugin.json";
 
-const EMBEDDED_CLAUDE_MANIFEST: &str =
+pub(crate) const EMBEDDED_CLAUDE_MANIFEST: &str =
     include_str!("../../../plugins/update-shelbi-configuration/.claude-plugin/plugin.json");
-const EMBEDDED_CODEX_MANIFEST: &str =
+pub(crate) const EMBEDDED_CODEX_MANIFEST: &str =
     include_str!("../../../plugins/update-shelbi-configuration/.codex-plugin/plugin.json");
 const EMBEDDED_SKILL: &str = include_str!(
     "../../../plugins/update-shelbi-configuration/skills/update-shelbi-configuration/SKILL.md"
@@ -41,6 +41,8 @@ pub enum PluginSource {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedSystemPlugin {
+    pub(crate) claude_manifest: String,
+    pub(crate) codex_manifest: String,
     pub skill: String,
     pub source: PluginSource,
     pub warnings: Vec<String>,
@@ -49,6 +51,8 @@ pub struct ResolvedSystemPlugin {
 impl ResolvedSystemPlugin {
     fn embedded(warning: String) -> Self {
         Self {
+            claude_manifest: EMBEDDED_CLAUDE_MANIFEST.to_string(),
+            codex_manifest: EMBEDDED_CODEX_MANIFEST.to_string(),
             skill: EMBEDDED_SKILL.to_string(),
             source: PluginSource::Embedded,
             warnings: vec![warning],
@@ -115,6 +119,8 @@ pub(crate) fn resolve_system_plugin_at(root: &Path) -> ResolvedSystemPlugin {
         )]
     };
     ResolvedSystemPlugin {
+        claude_manifest: claude,
+        codex_manifest: codex,
         skill,
         source: PluginSource::Installed,
         warnings,

@@ -2785,6 +2785,12 @@ fn write_worktree_text(
 /// gitignored together and there's exactly one place to look when
 /// debugging an agent that loaded the wrong prompt.
 pub const WORKTREE_AGENT_INSTRUCTIONS_REL: &str = ".claude/agent-instructions.md";
+/// Shelbi-owned, session-scoped plugin bundle staged for built-in
+/// orchestrators. It is deliberately separate from runner registries.
+pub const ORCHESTRATOR_SYSTEM_PLUGIN_REL: &str =
+    ".claude/shelbi-system-plugins/update-shelbi-configuration";
+pub const ORCHESTRATOR_SYSTEM_SKILLS_REL: &str =
+    ".claude/shelbi-system-plugins/update-shelbi-configuration/skills";
 pub const WORKTREE_STARTUP_PROMPT_REL: &str = ".shelbi/startup-prompt.md";
 
 /// Relative path (from the worktree root) where the dispatched agent's
@@ -3039,9 +3045,33 @@ fn deploy_orchestrator_system_skill(
         );
     }
 
-    // Claude discovers project skills under `.claude/skills`; Codex discovers
-    // repository/CWD skills under `.agents/skills`. Both receive identical
-    // bytes from the one resolved plugin bundle.
+    // Materialize the complete resolved bundle in a Shelbi-owned path. Claude
+    // receives this root through `--plugin-dir`; Codex receives its `skills/`
+    // child through app-server's process-scoped extra-root API. Neither path
+    // installs the plugin or mutates a runner-owned registry.
+    for (rel, body) in [
+        (
+            PathBuf::from(ORCHESTRATOR_SYSTEM_PLUGIN_REL)
+                .join(crate::system_plugin::CLAUDE_MANIFEST_REL),
+            plugin.claude_manifest.as_str(),
+        ),
+        (
+            PathBuf::from(ORCHESTRATOR_SYSTEM_PLUGIN_REL)
+                .join(crate::system_plugin::CODEX_MANIFEST_REL),
+            plugin.codex_manifest.as_str(),
+        ),
+        (
+            PathBuf::from(ORCHESTRATOR_SYSTEM_PLUGIN_REL)
+                .join(crate::system_plugin::SYSTEM_SKILL_REL),
+            plugin.skill.as_str(),
+        ),
+    ] {
+        write_worktree_text(host, &worktree.join(rel), body, "system-plugin")?;
+    }
+
+    // Keep the reserved discovery copies installed last as a compatibility
+    // layer for runner versions predating session injection. The isolated
+    // bundle above remains the authoritative source used by built-in sessions.
     for rel in [
         PathBuf::from(".claude")
             .join("skills")
@@ -6626,6 +6656,10 @@ mod tests {
                 .exists(),
             "non-orchestrator agents must not receive the system skill"
         );
+        assert!(
+            !worktree.join(ORCHESTRATOR_SYSTEM_PLUGIN_REL).exists(),
+            "non-orchestrator agents must not receive the session plugin bundle"
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -6704,6 +6738,21 @@ mod tests {
             std::fs::read_to_string(&claude_system).unwrap(),
             std::fs::read_to_string(&codex_system).unwrap(),
         );
+        let session_plugin = worktree.join(ORCHESTRATOR_SYSTEM_PLUGIN_REL);
+        assert!(session_plugin.join(".claude-plugin/plugin.json").is_file());
+        assert!(session_plugin.join(".codex-plugin/plugin.json").is_file());
+        let staged_skill =
+            session_plugin.join("skills/update-shelbi-configuration/SKILL.md");
+        assert_eq!(
+            std::fs::read_to_string(&staged_skill).unwrap(),
+            std::fs::read_to_string(&claude_system).unwrap(),
+        );
+
+        // A resumed/reloaded orchestrator re-resolves and re-stages the same
+        // bundle rather than inheriting mutable session state.
+        let first_bytes = std::fs::read(&staged_skill).unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+        assert_eq!(std::fs::read(&staged_skill).unwrap(), first_bytes);
         assert!(std::fs::read_to_string(&instructions)
             .unwrap()
             .contains("orchestrator"));
@@ -6746,6 +6795,9 @@ mod tests {
         for skill in [
             worktree.join(".claude/skills/update-shelbi-configuration/SKILL.md"),
             worktree.join(".agents/skills/update-shelbi-configuration/SKILL.md"),
+            worktree
+                .join(ORCHESTRATOR_SYSTEM_PLUGIN_REL)
+                .join("skills/update-shelbi-configuration/SKILL.md"),
         ] {
             let body = std::fs::read_to_string(skill).unwrap();
             assert!(body.contains("# Update Shelbi configuration"));
