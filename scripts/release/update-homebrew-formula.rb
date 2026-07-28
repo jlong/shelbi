@@ -89,6 +89,9 @@ formula = <<~RUBY
 
     test do
       assert_match version.to_s, shell_output("\#{bin}/shelbi --version")
+      assert_path_exists pkgshare/"plugins/update-shelbi-configuration/.claude-plugin/plugin.json"
+      assert_path_exists pkgshare/"plugins/update-shelbi-configuration/.codex-plugin/plugin.json"
+      assert_path_exists pkgshare/"plugins/update-shelbi-configuration/skills/update-shelbi-configuration/SKILL.md"
     end
   end
 RUBY

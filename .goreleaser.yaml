@@ -28,7 +28,9 @@ archives:
     files:
       - LICENSE
       - README.md
-      - plugins/update-shelbi-configuration
+      - plugins/update-shelbi-configuration/.claude-plugin/plugin.json
+      - plugins/update-shelbi-configuration/.codex-plugin/plugin.json
+      - plugins/update-shelbi-configuration/skills/update-shelbi-configuration/SKILL.md
 
 nfpms:
   - id: shelbi-deb
@@ -55,8 +57,12 @@ nfpms:
         dst: /usr/share/doc/shelbi/README.md
       - src: LICENSE
         dst: /usr/share/doc/shelbi/copyright
-      - src: plugins/update-shelbi-configuration
-        dst: /usr/share/shelbi/plugins/update-shelbi-configuration
+      - src: plugins/update-shelbi-configuration/.claude-plugin/plugin.json
+        dst: /usr/share/shelbi/plugins/update-shelbi-configuration/.claude-plugin/plugin.json
+      - src: plugins/update-shelbi-configuration/.codex-plugin/plugin.json
+        dst: /usr/share/shelbi/plugins/update-shelbi-configuration/.codex-plugin/plugin.json
+      - src: plugins/update-shelbi-configuration/skills/update-shelbi-configuration/SKILL.md
+        dst: /usr/share/shelbi/plugins/update-shelbi-configuration/skills/update-shelbi-configuration/SKILL.md
     overrides:
       deb:
         file_name_template: "{{ .ProjectName }}_{{ .Version }}_amd64"

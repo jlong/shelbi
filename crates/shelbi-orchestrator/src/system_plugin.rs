@@ -125,18 +125,33 @@ fn installed_plugin_candidates() -> Vec<PathBuf> {
     let Ok(exe) = std::env::current_exe() else {
         return Vec::new();
     };
+    installed_plugin_candidates_for_exe(&exe)
+}
+
+fn installed_plugin_candidates_for_exe(exe: &Path) -> Vec<PathBuf> {
     let Some(bin_dir) = exe.parent() else {
         return Vec::new();
     };
-    let mut candidates = vec![
-        bin_dir.join("plugins").join(SYSTEM_PLUGIN_NAME),
-        bin_dir
-            .join("..")
-            .join("share")
-            .join("shelbi")
-            .join("plugins")
-            .join(SYSTEM_PLUGIN_NAME),
-    ];
+    let adjacent = bin_dir.join("plugins").join(SYSTEM_PLUGIN_NAME);
+    let shared = bin_dir
+        .parent()
+        .unwrap_or(bin_dir)
+        .join("share")
+        .join("shelbi")
+        .join("plugins")
+        .join(SYSTEM_PLUGIN_NAME);
+
+    // Package managers and the source installer place executables in a `bin`
+    // directory and assets under the same prefix's `share`. Prefer that path
+    // so an obsolete archive-style `bin/plugins` directory cannot shadow an
+    // upgraded package. Standalone release archives have the binary and
+    // `plugins` directory beside one another, so prefer the adjacent layout
+    // everywhere else.
+    let mut candidates = if bin_dir.file_name().is_some_and(|name| name == "bin") {
+        vec![shared, adjacent]
+    } else {
+        vec![adjacent, shared]
+    };
     // Cargo development builds live under <repo>/target/{debug,release}.
     // This is a compile-layout convenience, not an environment/user override.
     if bin_dir
@@ -306,5 +321,48 @@ mod tests {
             EMBEDDED_SKILL,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn release_archive_resolves_plugins_beside_binary() {
+        let candidates =
+            installed_plugin_candidates_for_exe(Path::new("/tmp/shelbi-release/shelbi"));
+        assert_eq!(
+            candidates[0],
+            Path::new("/tmp/shelbi-release/plugins").join(SYSTEM_PLUGIN_NAME)
+        );
+    }
+
+    #[test]
+    fn linux_package_resolves_shared_data_before_adjacent_stale_copy() {
+        let candidates = installed_plugin_candidates_for_exe(Path::new("/usr/bin/shelbi"));
+        assert_eq!(
+            candidates,
+            [
+                Path::new("/usr/share/shelbi/plugins").join(SYSTEM_PLUGIN_NAME),
+                Path::new("/usr/bin/plugins").join(SYSTEM_PLUGIN_NAME),
+            ]
+        );
+    }
+
+    #[test]
+    fn homebrew_resolves_formula_versioned_pkgshare() {
+        let candidates = installed_plugin_candidates_for_exe(Path::new(
+            "/opt/homebrew/Cellar/shelbi/0.6.0/bin/shelbi",
+        ));
+        assert_eq!(
+            candidates[0],
+            Path::new("/opt/homebrew/Cellar/shelbi/0.6.0/share/shelbi/plugins")
+                .join(SYSTEM_PLUGIN_NAME)
+        );
+    }
+
+    #[test]
+    fn source_installer_resolves_custom_prefix_share() {
+        let candidates = installed_plugin_candidates_for_exe(Path::new("/srv/shelbi/bin/shelbi"));
+        assert_eq!(
+            candidates[0],
+            Path::new("/srv/shelbi/share/shelbi/plugins").join(SYSTEM_PLUGIN_NAME)
+        );
     }
 }
