@@ -153,6 +153,9 @@ jobs:
       - name: Verify .deb package exists
         run: test -n "$(find dist -maxdepth 1 -name 'shelbi_*_amd64.deb' -print -quit)"
 
+      - name: Verify system plugin package layouts
+        run: scripts/release/verify-system-plugin-packages.sh dist
+
   release:
     name: Publish GitHub release
     needs:
@@ -203,6 +206,9 @@ jobs:
 
       - name: Verify .deb package exists
         run: test -n "$(find dist -maxdepth 1 -name 'shelbi_*_amd64.deb' -print -quit)"
+
+      - name: Verify system plugin package layouts
+        run: scripts/release/verify-system-plugin-packages.sh dist
 
       - name: Attest release artifacts
         uses: actions/attest@v4
@@ -383,6 +389,9 @@ jobs:
 
           sudo apt-get install -y shelbi
           shelbi --version
+          test -f /usr/share/shelbi/plugins/update-shelbi-configuration/.claude-plugin/plugin.json
+          test -f /usr/share/shelbi/plugins/update-shelbi-configuration/.codex-plugin/plugin.json
+          test -f /usr/share/shelbi/plugins/update-shelbi-configuration/skills/update-shelbi-configuration/SKILL.md
 
   downstream-publication:
     name: Prepare downstream publication

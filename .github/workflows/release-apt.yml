@@ -152,3 +152,6 @@ jobs:
 
           sudo apt-get install -y shelbi
           shelbi --version
+          test -f /usr/share/shelbi/plugins/update-shelbi-configuration/.claude-plugin/plugin.json
+          test -f /usr/share/shelbi/plugins/update-shelbi-configuration/.codex-plugin/plugin.json
+          test -f /usr/share/shelbi/plugins/update-shelbi-configuration/skills/update-shelbi-configuration/SKILL.md
