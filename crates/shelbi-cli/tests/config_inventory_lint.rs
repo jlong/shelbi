@@ -183,6 +183,42 @@ fn valid_global_inventory_materializes_and_lints() {
 }
 
 #[test]
+fn global_template_override_does_not_move_other_config_surfaces() {
+    let (fixture, root) = scaffold_root(false);
+    let custom_template = fixture.path().join("custom-workspace-settings.json");
+    write(&custom_template, "{}\n");
+    let registration = fs::read_to_string(root.join("projects/demo.yaml")).unwrap();
+    write(
+        root.join("projects/demo.yaml"),
+        &format!(
+            "{registration}workspace_settings_template: {}\n",
+            custom_template.display()
+        ),
+    );
+
+    let inventory = inventory(&root);
+    let entries = inventory["entries"].as_array().unwrap();
+    let workflow = entries
+        .iter()
+        .find(|entry| entry["logical_id"] == "project.demo.workflow.task")
+        .unwrap();
+    assert_eq!(
+        workflow["canonical_path"],
+        root.join("projects/demo/workflows/task.yaml")
+            .to_string_lossy()
+            .as_ref()
+    );
+    let template = entries
+        .iter()
+        .find(|entry| entry["logical_id"] == "project.demo.workspace-settings-template")
+        .unwrap();
+    assert_eq!(
+        template["canonical_path"],
+        custom_template.to_string_lossy().as_ref()
+    );
+}
+
+#[test]
 fn in_repo_staged_invalid_workflow_reports_contract_and_exits_nonzero() {
     let (_fixture, root) = scaffold_root(true);
     let inventory = inventory(&root);

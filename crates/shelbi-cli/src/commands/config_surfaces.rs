@@ -402,12 +402,7 @@ fn collect_project_entries(
         let parsed = fs::read_to_string(&global_path)
             .ok()
             .and_then(|s| Project::from_yaml_str(&s).ok());
-        let root = parsed
-            .as_ref()
-            .and_then(|p| p.workspace_settings_template.as_ref())
-            .and_then(|_| global_path.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| home.join("projects").join(project));
-        (root, parsed, false)
+        (home.join("projects").join(project), parsed, false)
     } else {
         out.push(entry(
             &format!("project.{project}.registration.local"),
