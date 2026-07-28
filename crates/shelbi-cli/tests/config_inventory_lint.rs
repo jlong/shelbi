@@ -249,3 +249,87 @@ fn warnings_alone_exit_nonzero() {
         .iter()
         .any(|d| d["code"] == "KEYBINDINGS_RESERVED_CHORD_REBOUND"));
 }
+
+#[test]
+fn staged_all_uses_manifest_projects_and_validates_settings_templates() {
+    let (fixture, root) = scaffold_root(false);
+    let inventory = inventory(&root);
+    let staged = PathBuf::from(inventory["staged_dir"].as_str().unwrap());
+    let unrelated_root = fixture.path().join("unrelated-home");
+    let unrelated_repo = fixture.path().join("unrelated-repo");
+    fs::create_dir_all(&unrelated_repo).unwrap();
+    write(
+        unrelated_root.join("projects/other.yaml"),
+        &global_project(&unrelated_repo),
+    );
+
+    write(
+        staged.join("projects/demo/agents/developer/settings.json"),
+        r#"{"permissions":{"defaultMode":"{{workspace_permissions_mode}}"}}"#,
+    );
+    let valid = shelbi(
+        &unrelated_root,
+        &[
+            "config",
+            "lint",
+            "--all",
+            "--staged",
+            staged.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        valid.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&valid.stdout),
+        String::from_utf8_lossy(&valid.stderr)
+    );
+
+    write(
+        staged.join("projects/demo/agents/developer/settings.json"),
+        r#"{"custom":"{{unsupported}}"}"#,
+    );
+    let invalid = shelbi(
+        &unrelated_root,
+        &[
+            "config",
+            "lint",
+            "--all",
+            "--staged",
+            staged.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+    );
+    assert!(!invalid.status.success());
+    let report: Value = serde_json::from_slice(&invalid.stdout).unwrap();
+    assert!(report["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "TEMPLATE_UNKNOWN_PLACEHOLDER"));
+}
+
+#[test]
+fn staged_explicit_project_must_exist_in_manifest() {
+    let (_fixture, root) = scaffold_root(false);
+    let inventory = inventory(&root);
+    let staged = inventory["staged_dir"].as_str().unwrap();
+    let output = shelbi(
+        &root,
+        &[
+            "config",
+            "lint",
+            "--project",
+            "missing",
+            "--staged",
+            staged,
+            "--format",
+            "json",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("project `missing` is not present in staged inventory"));
+}

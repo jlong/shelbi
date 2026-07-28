@@ -126,7 +126,10 @@ fn lint(
     let projects = selected_projects(project, all)?;
     let report = match staged {
         Some(path) => {
-            let selected = (!projects.is_empty()).then_some(projects.as_slice());
+            // A staged inventory is self-contained. `--all` means every
+            // project represented by that inventory, regardless of what is
+            // registered on the machine doing the lint.
+            let selected = (!all && !projects.is_empty()).then_some(projects.as_slice());
             super::config_surfaces::lint_staged(&path, selected)?
         }
         None => super::config_surfaces::lint_live(&projects)?,

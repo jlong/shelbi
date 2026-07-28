@@ -174,6 +174,21 @@ pub fn lint_staged(staged: &Path, selected_projects: Option<&[String]>) -> Resul
             INVENTORY_SCHEMA_VERSION
         );
     }
+    if let Some(selected) = selected_projects {
+        let available: BTreeSet<&str> = inventory
+            .entries
+            .iter()
+            .filter_map(|entry| entry.scope.strip_prefix("project:"))
+            .collect();
+        for project in selected {
+            if !available.contains(project.as_str()) {
+                bail!(
+                    "project `{project}` is not present in staged inventory {}",
+                    staged.display()
+                );
+            }
+        }
+    }
     // The directory supplied by the caller is authoritative. This keeps a
     // copied/moved candidate snapshot portable instead of pinning it to the
     // temporary directory where inventory first created it.
@@ -1045,12 +1060,14 @@ fn lint_project(
         .filter(|e| e.scope == format!("project:{project}"))
     {
         let Some(text) = texts.get(&entry.logical_id) else {
-            if entry.logical_id.ends_with(".instructions") && entry.lifecycle_owned {
+            if entry.lifecycle_owned
+                && (entry.logical_id.contains(".agent.") || entry.logical_id.contains(".agents."))
+            {
                 out.push(diag(
                     entry,
                     Severity::Warning,
-                    "AGENT_INSTRUCTIONS_MISSING",
-                    "bundled agent instructions are missing".into(),
+                    "AGENT_ASSET_MISSING",
+                    "lifecycle-owned agent asset is missing".into(),
                     Some("Run `shelbi reload` to restore lifecycle-owned agent assets.".into()),
                     Location { line: 1, column: 1 },
                 ));
@@ -1285,7 +1302,9 @@ fn lint_keybindings(
 }
 
 fn lint_json_surface(entry: &InventoryEntry, text: &str, out: &mut Vec<Diagnostic>) {
-    let rendered = if entry.logical_id.ends_with("workspace-settings-template") {
+    let is_settings_template = entry.logical_id.ends_with("workspace-settings-template")
+        || entry.logical_id.ends_with(".settings");
+    let rendered = if is_settings_template {
         if text.contains("{{worker_") {
             out.push(diag(
                 entry,
@@ -1297,7 +1316,18 @@ fn lint_json_surface(entry: &InventoryEntry, text: &str, out: &mut Vec<Diagnosti
                 Location { line: 1, column: 1 },
             ));
         }
-        text.replace("{{workspace_permissions_mode}}", "default")
+        let rendered = text.replace("{{workspace_permissions_mode}}", "default");
+        if rendered.contains("{{") {
+            out.push(diag(
+                entry,
+                Severity::Error,
+                "TEMPLATE_UNKNOWN_PLACEHOLDER",
+                "settings template contains an unsupported or unclosed placeholder".into(),
+                Some("Use only the supported `{{workspace_permissions_mode}}` placeholder.".into()),
+                Location { line: 1, column: 1 },
+            ));
+        }
+        rendered
     } else {
         text.to_string()
     };
