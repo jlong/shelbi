@@ -107,6 +107,18 @@ echo "==> installing to $INSTALL_PATH"
 mkdir -p "$(dirname "$INSTALL_PATH")"
 cp target/release/shelbi "$INSTALL_PATH"
 
+ASSET_ROOT="$(dirname "$INSTALL_PATH")/../share/shelbi/plugins/update-shelbi-configuration"
+echo "==> installing system plugin to $ASSET_ROOT"
+mkdir -p "$ASSET_ROOT/.claude-plugin" \
+  "$ASSET_ROOT/.codex-plugin" \
+  "$ASSET_ROOT/skills/update-shelbi-configuration"
+cp plugins/update-shelbi-configuration/.claude-plugin/plugin.json \
+  "$ASSET_ROOT/.claude-plugin/plugin.json"
+cp plugins/update-shelbi-configuration/.codex-plugin/plugin.json \
+  "$ASSET_ROOT/.codex-plugin/plugin.json"
+cp plugins/update-shelbi-configuration/skills/update-shelbi-configuration/SKILL.md \
+  "$ASSET_ROOT/skills/update-shelbi-configuration/SKILL.md"
+
 if [[ "$(uname -s)" == "Darwin" ]]; then
   echo "==> re-signing (macOS)"
   codesign --remove-signature "$INSTALL_PATH" 2>/dev/null || true

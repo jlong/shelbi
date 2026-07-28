@@ -3002,6 +3002,9 @@ pub fn deploy_agent_context(
 
     let skills_src = shelbi_state::agent_skills_dir(project_name, agent)?;
     refresh_agent_skills(host, worktree, &skills_src)?;
+    if agent == shelbi_state::ORCHESTRATOR_AGENT {
+        deploy_orchestrator_system_skill(host, worktree, &skills_src)?;
+    }
 
     // Best-effort: nudge the user toward the new agents/ layout the
     // first time a dispatch lands while a legacy CLAUDE.md is still on
@@ -3009,6 +3012,57 @@ pub fn deploy_agent_context(
     // session (state-flag gated). Don't fail the dispatch on a hint
     // write error — the user can still hand-migrate.
     let _ = shelbi_state::maybe_emit_claude_md_migration_hint(project_name);
+    Ok(())
+}
+
+/// Install Shelbi's reserved configuration skill after user/project skills
+/// have been mirrored. Installing last gives the system name deterministic
+/// precedence and keeps customized orchestrator prompts from disabling this
+/// operational safety workflow.
+fn deploy_orchestrator_system_skill(
+    host: &Host,
+    worktree: &Path,
+    role_skills: &Path,
+) -> Result<()> {
+    let plugin = crate::system_plugin::resolve_system_plugin();
+    for warning in &plugin.warnings {
+        eprintln!("shelbi: warning: {warning}");
+        tracing::warn!("{warning}");
+    }
+
+    let reserved = crate::system_plugin::SYSTEM_PLUGIN_NAME;
+    let role_collision = role_skills.join(reserved);
+    if role_collision.exists() {
+        eprintln!(
+            "shelbi: warning: suppressing project skill `{reserved}` at {}; the name is reserved for Shelbi's system configuration skill",
+            role_collision.display()
+        );
+    }
+
+    // Claude discovers project skills under `.claude/skills`; Codex discovers
+    // repository/CWD skills under `.agents/skills`. Both receive identical
+    // bytes from the one resolved plugin bundle.
+    for rel in [
+        PathBuf::from(".claude")
+            .join("skills")
+            .join(reserved)
+            .join("SKILL.md"),
+        PathBuf::from(".agents")
+            .join("skills")
+            .join(reserved)
+            .join("SKILL.md"),
+    ] {
+        let destination = worktree.join(&rel);
+        if read_worktree_text(host, &destination)?
+            .is_some_and(|existing| existing != plugin.skill)
+        {
+            eprintln!(
+                "shelbi: warning: suppressing colliding skill `{reserved}` at {}; Shelbi's system skill takes precedence",
+                destination.display()
+            );
+        }
+        write_worktree_text(host, &destination, &plugin.skill, "system-skill")?;
+    }
     Ok(())
 }
 
@@ -6566,6 +6620,12 @@ mod tests {
             handoff_path.exists(),
             "developer dispatch must NOT consume the orchestrator's handoff file"
         );
+        assert!(
+            !worktree
+                .join(".agents/skills/update-shelbi-configuration")
+                .exists(),
+            "non-orchestrator agents must not receive the system skill"
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -6626,21 +6686,71 @@ mod tests {
             .unwrap()
             .contains("developer"));
 
-        // Dispatch 2 — orchestrator. Different agent, no skills of its
-        // own. The developer's `debug.md` must NOT survive the swap; the
-        // instructions file is overwritten.
+        // Dispatch 2 — orchestrator. The developer's `debug.md` must NOT
+        // survive the swap; the instructions file is overwritten and the
+        // Shelbi-owned system skill is installed for both built-in runners.
         deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
         assert!(
             !skills_dir.join("debug.md").exists(),
             "developer's skill leaked into orchestrator dispatch",
         );
-        assert!(
-            skills_dir.is_dir(),
-            "skills dir must persist after agent swap (just empty)",
+        let claude_system =
+            skills_dir.join("update-shelbi-configuration/SKILL.md");
+        let codex_system =
+            worktree.join(".agents/skills/update-shelbi-configuration/SKILL.md");
+        assert!(claude_system.is_file(), "Claude system skill missing");
+        assert!(codex_system.is_file(), "Codex system skill missing");
+        assert_eq!(
+            std::fs::read_to_string(&claude_system).unwrap(),
+            std::fs::read_to_string(&codex_system).unwrap(),
         );
         assert!(std::fs::read_to_string(&instructions)
             .unwrap()
             .contains("orchestrator"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn orchestrator_system_skill_suppresses_project_name_collision() {
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("ctx-system-skill-precedence");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        install_default_agents_under_home(&home, "p");
+
+        let instructions =
+            shelbi_state::agent_instructions_path("p", shelbi_state::ORCHESTRATOR_AGENT).unwrap();
+        std::fs::write(&instructions, "# My customized orchestrator\n").unwrap();
+        let role_skills =
+            shelbi_state::agent_skills_dir("p", shelbi_state::ORCHESTRATOR_AGENT).unwrap();
+        let collision = role_skills.join("update-shelbi-configuration");
+        std::fs::create_dir_all(&collision).unwrap();
+        std::fs::write(
+            collision.join("SKILL.md"),
+            "---\nname: update-shelbi-configuration\ndescription: user override\n---\nOverride.\n",
+        )
+        .unwrap();
+
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(worktree.join(".claude/agent-instructions.md")).unwrap(),
+            "# My customized orchestrator\n",
+            "custom prompt must be preserved while the system skill is installed"
+        );
+        for skill in [
+            worktree.join(".claude/skills/update-shelbi-configuration/SKILL.md"),
+            worktree.join(".agents/skills/update-shelbi-configuration/SKILL.md"),
+        ] {
+            let body = std::fs::read_to_string(skill).unwrap();
+            assert!(body.contains("# Update Shelbi configuration"));
+            assert!(!body.contains("Override."));
+        }
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&tmp);

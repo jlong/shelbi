@@ -84,6 +84,7 @@ formula = <<~RUBY
 
     def install
       bin.install "shelbi"
+      pkgshare.install "plugins"
     end
 
     test do

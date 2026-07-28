@@ -1,0 +1,13 @@
+{
+  "name": "update-shelbi-configuration",
+  "version": "1.0.0",
+  "description": "Safely preview, validate, and apply Shelbi configuration changes.",
+  "author": {
+    "name": "Shelbi"
+  },
+  "homepage": "https://shelbi.dev",
+  "repository": "https://github.com/jlong/shelbi",
+  "license": "MIT",
+  "keywords": ["shelbi", "configuration", "orchestration"],
+  "skills": "./skills/"
+}
