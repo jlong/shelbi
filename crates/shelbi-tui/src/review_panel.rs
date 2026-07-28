@@ -11,8 +11,10 @@
 //! - a **header** showing review status + the review worktree's folder name
 //!   (left-truncated to fit; click to reveal it in the OS file manager),
 //! - a **view-switcher** action group — *Chat with Reviewer* (default) /
-//!   *Edit in <editor>* / *Open Browser* (the last only when the workflow
-//!   declares a review URL), the active content view highlighted, and
+//!   *View Diff* / *Edit in <editor>* / *Open Browser* (the last only when the
+//!   workflow declares a review URL), the active content view highlighted,
+//!   *View Diff* opening the OS-configured diff tool over the review branch's
+//!   changes in the right-column content pane, and
 //! - an **Approve** / **Reject** action group, Reject opening a
 //!   type-the-reason popover (a centered `tmux display-popup` with a bordered
 //!   textbox and [ Reject ] / [ Cancel ] buttons — see
@@ -41,19 +43,21 @@ use ratatui::{
 };
 
 /// Which middle-pane view is currently shown. `Browser` isn't a persistent
-/// view — it opens the system browser — so only `Chat` / `Vim` are ever the
-/// *active* highlighted entry.
+/// view — it opens the system browser — so only `Chat` / `Diff` / `Vim` are
+/// ever the *active* highlighted entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveView {
     Chat,
+    Diff,
     Vim,
 }
 
-/// The three view-switcher entries. `Browser` renders only when a review URL
-/// is configured.
+/// The view-switcher entries. `Diff` sits directly below `Chat`; `Browser`
+/// renders only when a review URL is configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwitchItem {
     Chat,
+    Diff,
     Vim,
     Browser,
 }
@@ -96,6 +100,9 @@ pub enum PanelEffect {
     FocusDashboard,
     /// Swap the reviewer-chat pane into the middle slot.
     ShowChat,
+    /// Open the OS-configured diff tool over the review branch's changes in
+    /// the middle slot.
+    ShowDiff,
     /// Swap the editor pane into the middle slot.
     ShowVim,
     /// Open the configured review URL in the system browser.
@@ -180,6 +187,7 @@ impl ReviewPanel {
             PanelRow::Folder,
             PanelRow::Blank,
             PanelRow::Switch(SwitchItem::Chat),
+            PanelRow::Switch(SwitchItem::Diff),
             PanelRow::Switch(SwitchItem::Vim),
         ];
         if self.has_review_url {
@@ -289,6 +297,10 @@ impl ReviewPanel {
             PanelRow::Switch(SwitchItem::Chat) => {
                 self.active_view = ActiveView::Chat;
                 PanelEffect::ShowChat
+            }
+            PanelRow::Switch(SwitchItem::Diff) => {
+                self.active_view = ActiveView::Diff;
+                PanelEffect::ShowDiff
             }
             PanelRow::Switch(SwitchItem::Vim) => {
                 self.active_view = ActiveView::Vim;
@@ -566,6 +578,11 @@ fn switch_nav_line(
             "Chat with Reviewer".to_string(),
             app.active_view == ActiveView::Chat,
         ),
+        SwitchItem::Diff => (
+            "🔀",
+            "View Diff".to_string(),
+            app.active_view == ActiveView::Diff,
+        ),
         SwitchItem::Vim => (
             "✍️",
             format!("Edit in {}", app.editor_name),
@@ -811,6 +828,15 @@ fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect
                 app.status_line = format!("show chat failed: {e}");
             }
         }
+        PanelEffect::ShowDiff => {
+            if let Err(e) = shelbi_orchestrator::review_ui::show_review_view(
+                project_name,
+                &app.task_id,
+                shelbi_orchestrator::review_ui::ReviewMidView::Diff,
+            ) {
+                app.status_line = format!("view diff failed: {e}");
+            }
+        }
         PanelEffect::ShowVim => {
             if let Err(e) = shelbi_orchestrator::review_ui::show_review_view(
                 project_name,
@@ -1006,6 +1032,7 @@ mod tests {
         assert!(out.contains("Ready for review"), "header status: {out}");
         assert!(out.contains("wt/review"), "worktree folder shown: {out}");
         assert!(out.contains("Chat with Reviewer"), "chat switch: {out}");
+        assert!(out.contains("View Diff"), "diff switch: {out}");
         assert!(out.contains("Edit in Vim"), "editor switch reflects name: {out}");
         assert!(out.contains("Open Browser"), "browser switch when url set: {out}");
         assert!(out.contains("Approve"), "approve button: {out}");
@@ -1127,8 +1154,9 @@ mod tests {
     fn selected_switch_renders_full_width_half_block_bleed() {
         let width = 30u16;
         let mut app = panel(true);
-        // Move focus to the Edit switch (the middle of the three) so both a
-        // separator-above and separator-below are asserted.
+        // Move focus to the Edit switch (Chat / View Diff / Edit / Browser) so
+        // both a separator-above and separator-below are asserted.
+        app.nav_down();
         app.nav_down();
         let rows = render_lines(&mut app, width, 20);
         let edit_y = row_y(&rows, "Edit in Vim");
@@ -1160,22 +1188,27 @@ mod tests {
         let mut chat = panel(true); // Chat focused by default
         let chat_rows = render_lines(&mut chat, 30, 20);
 
-        let mut edit = panel(true);
-        edit.nav_down(); // focus Edit
-        let edit_rows = render_lines(&mut edit, 30, 20);
+        let mut moved = panel(true);
+        moved.nav_down(); // focus View Diff
+        let moved_rows = render_lines(&mut moved, 30, 20);
 
-        for label in ["Chat with Reviewer", "Edit in Vim", "Open Browser"] {
+        for label in ["Chat with Reviewer", "View Diff", "Edit in Vim", "Open Browser"] {
             assert_eq!(
                 row_y(&chat_rows, label),
-                row_y(&edit_rows, label),
+                row_y(&moved_rows, label),
                 "'{label}' must not move when the selection changes"
             );
         }
         // Adjacent switches are one separator line apart.
         assert_eq!(
-            row_y(&chat_rows, "Edit in Vim") - row_y(&chat_rows, "Chat with Reviewer"),
+            row_y(&chat_rows, "View Diff") - row_y(&chat_rows, "Chat with Reviewer"),
             2,
-            "one separator line always sits between adjacent switches"
+            "one separator line always sits between Chat and View Diff"
+        );
+        assert_eq!(
+            row_y(&chat_rows, "Edit in Vim") - row_y(&chat_rows, "View Diff"),
+            2,
+            "one separator line always sits between View Diff and Edit"
         );
     }
 
@@ -1231,19 +1264,102 @@ mod tests {
         assert!(out.contains("Edit in Helix"), "label uses resolved editor: {out}");
     }
 
+    /// Move the selection to the switch backing `item` (used by the
+    /// activation tests so they don't hard-code a step count that shifts as
+    /// switches are added or removed).
+    fn select_switch(app: &mut ReviewPanel, item: SwitchItem) {
+        let idx = app
+            .rows()
+            .iter()
+            .position(|r| matches!(r, PanelRow::Switch(i) if *i == item))
+            .unwrap();
+        app.selected = idx;
+    }
+
     #[test]
     fn activating_chat_and_vim_returns_switch_effects_and_marks_active() {
         let mut app = panel(true);
         // Default selection is Chat; active view starts Chat.
         assert_eq!(app.active_view, ActiveView::Chat);
-        // Move down to the Vim switch and activate.
-        app.nav_down();
+        // Move to the Vim switch and activate.
+        select_switch(&mut app, SwitchItem::Vim);
         assert_eq!(app.activate(), PanelEffect::ShowVim);
         assert_eq!(app.active_view, ActiveView::Vim);
-        // Back up to Chat.
-        app.nav_up();
+        // Back to Chat.
+        select_switch(&mut app, SwitchItem::Chat);
         assert_eq!(app.activate(), PanelEffect::ShowChat);
         assert_eq!(app.active_view, ActiveView::Chat);
+    }
+
+    /// View Diff sits directly below Chat with Reviewer in the switch group —
+    /// the ordering the wireframe pins — with no other selectable row between
+    /// them.
+    #[test]
+    fn view_diff_renders_directly_below_chat() {
+        let mut app = panel(true);
+        let rows = render_lines(&mut app, 44, 16);
+        let chat_y = row_y(&rows, "Chat with Reviewer");
+        let diff_y = row_y(&rows, "View Diff");
+        assert!(diff_y > chat_y, "View Diff must render below Chat");
+        // Exactly one separator line between them — nothing else is interleaved.
+        assert_eq!(
+            diff_y - chat_y,
+            2,
+            "View Diff sits immediately below Chat with Reviewer"
+        );
+        // And it precedes the editor switch, preserving the rest of the order.
+        assert!(
+            diff_y < row_y(&rows, "Edit in Vim"),
+            "View Diff comes before Edit in the switch group"
+        );
+    }
+
+    /// The row order in the pure model puts the Diff switch between Chat and
+    /// Vim — the same invariant the render test asserts, checked structurally so
+    /// a renderer change can't mask a model regression.
+    #[test]
+    fn diff_switch_is_second_in_the_switch_group() {
+        let app = panel(true);
+        let switches: Vec<SwitchItem> = app
+            .rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                PanelRow::Switch(i) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            switches,
+            vec![
+                SwitchItem::Chat,
+                SwitchItem::Diff,
+                SwitchItem::Vim,
+                SwitchItem::Browser
+            ]
+        );
+    }
+
+    #[test]
+    fn activating_view_diff_returns_show_diff_and_marks_active() {
+        let mut app = panel(true);
+        select_switch(&mut app, SwitchItem::Diff);
+        assert_eq!(app.activate(), PanelEffect::ShowDiff);
+        assert_eq!(app.active_view, ActiveView::Diff);
+    }
+
+    /// The mouse path reaches View Diff through the same nav-block click map the
+    /// other switches use: a click on the rendered "View Diff" line dispatches
+    /// ShowDiff and marks it the active view.
+    #[test]
+    fn clicking_view_diff_dispatches_show_diff() {
+        let mut app = panel(true);
+        // Render so `list_area` and the switch-block geometry are populated.
+        let rows = render_lines(&mut app, 44, 16);
+        let diff_line = row_y(&rows, "View Diff") as u16;
+        // The test backend renders the list at the pane origin (0, 0).
+        let effect = app.click(2, diff_line);
+        assert_eq!(effect, PanelEffect::ShowDiff);
+        assert_eq!(app.active_view, ActiveView::Diff);
     }
 
     #[test]

@@ -60,6 +60,8 @@ const MID_KEY: &str = "SHELBI_REVIEW_MID";
 pub(crate) const PANEL_KEY: &str = "SHELBI_REVIEW_PANEL";
 /// Session env var holding the lazily-created editor pane id.
 const EDITOR_KEY: &str = "SHELBI_REVIEW_EDITOR";
+/// Session env var holding the lazily-created diff-tool pane id.
+const DIFF_KEY: &str = "SHELBI_REVIEW_DIFF";
 /// Session env var holding the review agent's chat pane id.
 const CHAT_KEY: &str = "SHELBI_REVIEW_CHAT";
 /// Session env var holding the task id the interface is currently open on.
@@ -72,6 +74,9 @@ pub enum ReviewMidView {
     Chat,
     /// An editor opened in the review worktree.
     Editor,
+    /// The OS-configured diff tool (`git difftool`) run over the review
+    /// branch's changes in the review worktree.
+    Diff,
 }
 
 /// Outcome of [`open_review_interface`].
@@ -351,6 +356,7 @@ pub fn show_review_view(project_name: &str, task_id: &str, view: ReviewMidView) 
             .map(Ok)
             .unwrap_or_else(|| local_workspace_pane_id(&session, &ws.name))?,
         ReviewMidView::Editor => ensure_editor_pane(&project, ws, &session)?,
+        ReviewMidView::Diff => ensure_diff_pane(&project, ws, &session)?,
     };
 
     if target == current_mid {
@@ -426,6 +432,139 @@ fn ensure_editor_pane(
     Ok(editor_id)
 }
 
+/// Create the diff pane in the review worktree if it doesn't exist yet,
+/// returning its pane id. Like [`ensure_editor_pane`] it parks the pane in its
+/// own `__review-diff` window inside the hidden stash session `_{session}` so
+/// no window shows in the user's window list; [`show_review_view`] swaps it
+/// into the middle column on demand.
+///
+/// The pane runs `git difftool` — Shelbi's reuse of the OS/git-configured diff
+/// tool — over the review branch's changes: `-d` (dir-diff, so the whole
+/// changeset opens at once) `-y` (no per-file prompt) against the merge base of
+/// the project's base branch and `HEAD`, exactly the range `shelbi diff`
+/// reports. The GUI variant (`-g`) is used when a `diff.guitool` is configured.
+///
+/// The diff tool is resolved *before* the pane is spawned so an unconfigured or
+/// unusable tool surfaces as an `Err` on the panel's status line rather than a
+/// dead pane in the middle column (see [`resolve_difftool_gui`]).
+fn ensure_diff_pane(
+    project: &shelbi_core::Project,
+    ws: &shelbi_core::WorkspaceSpec,
+    session: &str,
+) -> Result<String> {
+    if let Some(existing) = read_session_var(session, DIFF_KEY) {
+        return Ok(existing);
+    }
+    let machine = project
+        .machine(&ws.machine)
+        .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
+    let worktree = crate::workspace::workspace_worktree(machine, ws);
+    // Resolve the configured diff tool up front: a missing/unusable one is a
+    // clear error here, not a pane that flashes a git message and dies.
+    let use_gui = resolve_difftool_gui(&worktree)?;
+    // Diff the branch against where it forked from the base branch — the same
+    // `merge-base(base, HEAD)..HEAD` range `shelbi diff` shows.
+    let base = git_capture(&worktree, &["merge-base", project.base_branch(), "HEAD"])?;
+    let gui = if use_gui { "-g " } else { "" };
+    // `cd <worktree> && exec git difftool …` — exec so the pane dies with the
+    // diff tool (as the editor pane dies with the editor) rather than dropping
+    // to a shell. `-d` opens the whole changeset at once; `-y` skips the
+    // per-file prompt.
+    let cmd = format!(
+        "cd {wt} && exec git difftool -d -y {gui}{base} HEAD",
+        wt = shelbi_core::shell_escape(&worktree.to_string_lossy()),
+        base = shelbi_core::shell_escape(&base),
+    );
+    ensure_stash_session(project, session)?;
+    let stash = format!("_{session}");
+    // Its own window in the stash (like the editor's) so closing it on teardown
+    // leaves the `views` panes untouched.
+    let win = format!("{stash}:__review-diff");
+    let diff_id = tmux_capture(&[
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-t",
+        &format!("{stash}:"),
+        "-n",
+        "__review-diff",
+        "sh",
+        "-c",
+        &cmd,
+    ])
+    .map_err(|e| Error::Other(format!("could not open diff window {win}: {e}")))?;
+    set_session_var(session, DIFF_KEY, &diff_id)?;
+    Ok(diff_id)
+}
+
+/// Decide how to invoke `git difftool` for `worktree`, returning `true` when a
+/// GUI tool (`-g`) should be used and `false` for the terminal tool. Errors
+/// with a clear, actionable message when no diff tool is configured at all —
+/// exactly the state `git difftool` itself would reject — so the caller can put
+/// it on the status line instead of spawning a pane that immediately dies.
+///
+/// Precedence mirrors what `git difftool` consults: a `diff.guitool` /
+/// `merge.guitool` (preferred for a desktop review) selects the GUI path; a
+/// `diff.tool` / `merge.tool` selects the terminal path; nothing configured is
+/// the error.
+fn resolve_difftool_gui(worktree: &std::path::Path) -> Result<bool> {
+    if git_config_value(worktree, "diff.guitool")
+        .or_else(|| git_config_value(worktree, "merge.guitool"))
+        .is_some()
+    {
+        return Ok(true);
+    }
+    if git_config_value(worktree, "diff.tool")
+        .or_else(|| git_config_value(worktree, "merge.tool"))
+        .is_some()
+    {
+        return Ok(false);
+    }
+    Err(Error::Other(
+        "no diff tool configured — set git `diff.tool` (or `diff.guitool`) to your preferred diff tool"
+            .into(),
+    ))
+}
+
+/// Run `git -C <worktree> <args>` and return trimmed stdout, mapping a non-zero
+/// exit to an `Err` carrying git's stderr. Used for the merge-base lookup where
+/// a failure should surface, not be swallowed.
+fn git_capture(worktree: &std::path::Path, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .output()
+        .map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Other(format!(
+            "git {} failed: {}",
+            args.first().copied().unwrap_or(""),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Read a single git config value from `worktree`, returning `None` when the
+/// key is unset (a non-zero `git config --get` exit) or blank. Used to probe
+/// for a configured diff tool without treating "unset" as a hard error.
+fn git_config_value(worktree: &std::path::Path, key: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
 /// Make sure the hidden stash session `_{session}` exists before we park the
 /// editor window in it. Bootstrap's [`crate::ensure_hidden_views`] builds it,
 /// but the editor view can be opened before/without a full dashboard rebuild,
@@ -471,10 +610,16 @@ pub fn close_review_interface(project_name: &str) -> Result<()> {
     if let Some(editor) = read_session_var(&session, EDITOR_KEY) {
         let _ = tmux_run(&["kill-pane", "-t", &editor]);
     }
+    // The diff pane, like the editor, is the sole pane of its own
+    // `__review-diff` window in the hidden stash session — killing it closes
+    // that window only.
+    if let Some(diff) = read_session_var(&session, DIFF_KEY) {
+        let _ = tmux_run(&["kill-pane", "-t", &diff]);
+    }
     if let Some(panel) = read_session_var(&session, PANEL_KEY) {
         let _ = tmux_run(&["kill-pane", "-t", &panel]);
     }
-    for key in [MID_KEY, PANEL_KEY, EDITOR_KEY, CHAT_KEY, TASK_KEY] {
+    for key in [MID_KEY, PANEL_KEY, EDITOR_KEY, DIFF_KEY, CHAT_KEY, TASK_KEY] {
         unset_session_var(&session, key);
     }
     let _ = tmux_run(&["select-window", "-t", &dashboard]);
@@ -573,7 +718,7 @@ mod tests {
 
     #[test]
     fn session_env_keys_are_distinct() {
-        let keys = [MID_KEY, PANEL_KEY, EDITOR_KEY, CHAT_KEY, TASK_KEY];
+        let keys = [MID_KEY, PANEL_KEY, EDITOR_KEY, DIFF_KEY, CHAT_KEY, TASK_KEY];
         let mut sorted = keys.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
