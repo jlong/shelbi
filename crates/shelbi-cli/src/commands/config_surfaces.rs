@@ -17,7 +17,7 @@ use shelbi_state::keymap::{
     WarningKind as KeymapWarningKind,
 };
 use shelbi_state::{
-    hub_config_path, projects_dir, shelbi_home, user_config_path, HubConfig, UserConfig,
+    hub_config_path, project_dir, projects_dir, shelbi_home, user_config_path, HubConfig, UserConfig,
     DEFAULT_AGENTS,
 };
 
@@ -375,20 +375,21 @@ fn collect_entries(projects: &[String]) -> Result<Vec<InventoryEntry>> {
     for project in projects {
         validate_project_name(project)
             .with_context(|| format!("invalid project id `{project}` in inventory selection"))?;
-        collect_project_entries(project, &home, &mut out)?;
+        collect_project_entries(project, &mut out)?;
     }
     Ok(out)
 }
 
-fn collect_project_entries(
-    project: &str,
-    home: &Path,
-    out: &mut Vec<InventoryEntry>,
-) -> Result<()> {
+fn collect_project_entries(project: &str, out: &mut Vec<InventoryEntry>) -> Result<()> {
     let scope = format!("project:{project}");
     let candidate_root = PathBuf::from("projects").join(project);
-    let global_path = home.join("projects").join(format!("{project}.yaml"));
-    let local_path = home.join("projects").join(project).join("local.yaml");
+    // Route the per-project home layout through the crate-owned path helpers
+    // rather than hand-building `~/.shelbi/projects/<name>` (the split/in-repo
+    // config root is resolved separately below from the registration's `repo`).
+    let projects_root = absolute(projects_dir()?)?;
+    let project_home = absolute(project_dir(project)?)?;
+    let global_path = projects_root.join(format!("{project}.yaml"));
+    let local_path = project_home.join("local.yaml");
 
     let (config_root, parsed, split) = if global_path.is_file() {
         out.push(entry(
@@ -402,7 +403,7 @@ fn collect_project_entries(
         let parsed = fs::read_to_string(&global_path)
             .ok()
             .and_then(|s| Project::from_yaml_str(&s).ok());
-        (home.join("projects").join(project), parsed, false)
+        (project_home.clone(), parsed, false)
     } else {
         out.push(entry(
             &format!("project.{project}.registration.local"),
@@ -420,7 +421,7 @@ fn collect_project_entries(
         let shared_path = repo
             .as_ref()
             .map(|r| r.join(".shelbi/project.yaml"))
-            .unwrap_or_else(|| home.join("projects").join(project).join("project.yaml"));
+            .unwrap_or_else(|| project_home.join("project.yaml"));
         out.push(entry(
             &format!("project.{project}.registration.shared"),
             &scope,
@@ -436,7 +437,7 @@ fn collect_project_entries(
         };
         (
             repo.map(|r| r.join(".shelbi"))
-                .unwrap_or_else(|| home.join("projects").join(project)),
+                .unwrap_or_else(|| project_home.clone()),
             parsed,
             true,
         )

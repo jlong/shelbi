@@ -1,18 +1,25 @@
 ---
 title: shelbi config
 order: 34
-summary: Inspect and validate your keybinding configuration — list every action's chords, dump a starter keys.yaml, or check ~/.shelbi/keys.yaml for errors.
+summary: "Inspect and validate Shelbi configuration: take a versioned inventory of every owned surface, lint live or staged candidates, and manage keybindings."
 ---
 
 ```text
 shelbi config <COMMAND> [OPTIONS]
 ```
 
-`shelbi config` inspects and validates the TUI's keybinding configuration. It's
-how you see which chords are bound to which actions, generate a starter
-`keys.yaml` to customize, and confirm your overrides parse before you rely on
-them. The bindings themselves live in `~/.shelbi/keys.yaml`, documented
-field-by-field in [Global config](/docs/configuration/global#keysyaml).
+`shelbi config` inspects and validates the configuration Shelbi owns. Two
+commands cover every configuration surface: `inventory` discovers the canonical
+files and materializes an isolated candidate snapshot you can edit safely, and
+`lint` validates those surfaces through the same parsers Shelbi uses at runtime.
+Three older commands (`list-actions`, `dump-keybindings`, `check`) stay focused
+on the TUI keybindings in `~/.shelbi/keys.yaml`.
+
+These commands are what the built-in configuration workflow runs. When you ask a
+built-in orchestrator to change Shelbi configuration, it drives `inventory` and
+`lint` behind the reserved [`update-shelbi-configuration`](/docs/maintainers/system-configuration)
+skill so edits are staged, validated, previewed, and confirmed before any live
+file is touched.
 
 Every subcommand accepts the global `--root <PATH>` (override the Shelbi root
 directory, else `$SHELBI_ROOT`, else the install-time default) and
@@ -23,9 +30,79 @@ project whose `work_dir` contains the current directory) flags.
 
 | Command | Description |
 | --- | --- |
+| `inventory` | Discover every Shelbi-owned configuration file and materialize an isolated candidate snapshot for safe editing. |
+| `lint` | Validate the selected configuration surfaces (live or staged) through Shelbi's production parsers. |
 | `list-actions` | Print every action with its mode, name, description, and the chord(s) bound to it after the `keys.yaml` merge. |
-| `dump-keybindings` | Dump the full default keymap as YAML — a starting point for `~/.shelbi/keys.yaml`. |
+| `dump-keybindings` | Dump the full default keymap as YAML (a starting point for `~/.shelbi/keys.yaml`). |
 | `check` | Validate `~/.shelbi/keys.yaml` and print any errors or warnings. |
+
+## inventory
+
+```text
+shelbi config inventory [--project <PROJECT> | --all] [--format json]
+```
+
+Discover the canonical global and per-project configuration files, copy the ones
+that exist into a fresh candidate directory, and print a JSON manifest. Scope it
+with `--project <PROJECT>` for one project or `--all` for every locally
+registered project (the two are mutually exclusive); with neither, it covers the
+global surfaces plus the project resolved from your working directory.
+
+The candidate snapshot lives in a temporary `staged_dir`. Edit files there, not
+the canonical originals, so nothing goes live until you apply it deliberately.
+
+The manifest is a stable contract:
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | Inventory format version. A newer staged snapshot is rejected by an older `shelbi` (see [Compatibility](#compatibility)). |
+| `shelbi_version` | The `shelbi` build that produced the snapshot. |
+| `staged_dir` | Absolute path to the candidate directory. |
+| `entries[]` | One record per configuration surface. |
+
+Each entry carries a `logical_id` (a stable name like `global.keybindings` or
+`project.demo.workflow.task`), its `scope` (`global` or `project:<name>`), the
+`canonical_path` it was read from, the relative `candidate_path` inside
+`staged_dir`, its `format` (`yaml`, `json`, or `markdown`), whether it `exists`,
+and whether it is `lifecycle_owned`. A `lifecycle_owned` surface is one Shelbi
+regenerates through its own lifecycle commands (for example `shelbi reload`), so
+changing it usually means running that command, not only writing the file.
+
+## lint
+
+```text
+shelbi config lint [--project <PROJECT> | --all] [--staged <DIR>] [--format human|json]
+```
+
+Validate configuration surfaces without mutating them. By default `lint` reads
+live files; pass `--staged <DIR>` to validate a candidate directory produced by
+`inventory` instead. A staged snapshot is self-contained, so with `--staged` the
+`--all` flag means every project the snapshot represents, regardless of what is
+registered on the machine running the lint.
+
+### Lint scope
+
+`lint` covers every configuration family Shelbi owns, each through the parser
+that Shelbi itself uses, so a clean lint means the file will load at runtime:
+
+- global preferences (`config.yaml`), the hub config (`shelbi.yaml`), and
+  keybindings (`keys.yaml`);
+- per-project registration (flat `demo.yaml`, or the split `project.yaml` +
+  `local.yaml` for [in-repo config](/docs/concepts/config-modes)), statuses,
+  workflows, and the workspace-settings template;
+- per-project Markdown (Zen Mode policy, agent instructions, the shared
+  preamble) and per-agent `settings.json` and skills.
+
+Diagnostics come back with a stable `code` (for example `CONFIG_UNKNOWN_FIELD`,
+`KEYBINDINGS_COLLISION`, `WORKFLOW_STATUS_REFERENCE_INVALID`,
+`TEMPLATE_UNKNOWN_PLACEHOLDER`, `ZENMODE_SUMMARY_MISSING`), a `severity`
+(`warning` or `error`), a source `location`, and often a `remediation` hint.
+
+### Exit code
+
+`lint` **exits 1 when the report is not clean**: warnings and errors both count.
+Configuration is either valid or it is not, so a warning is not something to
+apply and move past; it slots the command cleanly into a pre-flight check.
 
 ## list-actions
 
@@ -55,8 +132,38 @@ shelbi config check
 
 Validate `~/.shelbi/keys.yaml` and print any errors or warnings. It **exits 1**
 on errors, so it slots cleanly into a pre-flight script; warnings still exit 0.
+(`config lint` validates `keys.yaml` alongside every other surface; `check` is
+the keybindings-only view.)
+
+## Compatibility
+
+The inventory manifest is versioned by `schema_version`. A staged snapshot is
+only valid for the `shelbi` build that produced it: linting a snapshot whose
+version a newer or older binary does not recognize is refused rather than
+misread. Take a fresh `inventory` with the `shelbi` you are running instead of
+reusing an old `staged_dir`. Unknown fields are reported (`CONFIG_UNKNOWN_FIELD`)
+rather than silently ignored, so a config written for a different Shelbi version
+surfaces as a diagnostic you can act on.
 
 ## Examples
+
+Take an inventory of one project and read the candidate directory it staged:
+
+```bash
+shelbi config inventory --project demo --format json
+```
+
+Lint every registered project's live configuration before a release:
+
+```bash
+shelbi config lint --all
+```
+
+Validate a staged candidate directory you have been editing:
+
+```bash
+shelbi config lint --project demo --staged /tmp/shelbi-config-1234 --format json
+```
 
 See what every action is bound to after your overrides are applied:
 
@@ -64,21 +171,12 @@ See what every action is bound to after your overrides are applied:
 shelbi config list-actions
 ```
 
-Generate a starter keybindings file to customize:
-
-```bash
-shelbi config dump-keybindings > ~/.shelbi/keys.yaml
-```
-
-Validate your edits before relying on them:
-
-```bash
-shelbi config check
-```
-
 ## See also
 
-- [Global config](/docs/configuration/global#keysyaml) — the `keys.yaml` schema:
+- [System configuration](/docs/maintainers/system-configuration): how the
+  reserved configuration skill and system plugin drive these commands, plus
+  ownership, fallback, and compatibility behavior.
+- [Global config](/docs/configuration/global#keysyaml): the `keys.yaml` schema,
   modes, actions, chord syntax, and the built-in defaults.
-- [Enable Zen Mode](/docs/guides/getting-started/enable-zen-mode) — a worked
-  example of customizing a chord (the Zen Mode toggle).
+- [Config modes](/docs/concepts/config-modes): flat versus in-repo project
+  layouts, which shape the registration surfaces `inventory` reports.
