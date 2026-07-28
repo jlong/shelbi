@@ -1,0 +1,136 @@
+---
+title: System Configuration
+order: 90
+summary: "How Shelbi's reserved configuration skill, system plugin, and config inventory/lint interfaces fit together: ownership, fallback, lint scope, and compatibility."
+---
+
+This is the maintainer's map of the system-owned configuration-update path: the
+reserved skill that safely edits Shelbi configuration, the plugin that carries
+it into a built-in orchestrator, and the `shelbi config` interfaces both rely
+on. It complements the user-facing [`shelbi config`](/docs/cli/config)
+reference; read that first for the command surface.
+
+## The pieces
+
+- **The skill** `update-shelbi-configuration` (`plugins/update-shelbi-configuration/skills/`)
+  is prose the orchestrator agent follows to change Shelbi configuration safely:
+  inventory, stage, lint, one combined preview, explicit confirmation, race
+  detection, atomic apply, and a live lint. It never hardcodes paths or schemas
+  (those move between versions). It drives the installed `shelbi config` CLI,
+  which is authoritative for the running version's layout and validation.
+- **The system plugin** `plugins/update-shelbi-configuration` ships one bundle
+  with two runner manifests (`.claude-plugin/plugin.json`,
+  `.codex-plugin/plugin.json`) that both reserve the name
+  `update-shelbi-configuration` and point at the shared `./skills/` directory.
+- **The CLI** `shelbi config inventory` and `shelbi config lint`
+  (`crates/shelbi-cli/src/commands/config_surfaces.rs`) are the machinery the
+  skill orchestrates: versioned discovery and read-only validation of every
+  owned surface.
+
+## Ownership
+
+The name `update-shelbi-configuration` is reserved. It is installed **last**,
+after user and project skills are mirrored into the worktree, so a customized
+orchestrator prompt cannot shadow or disable the operational safety workflow. A
+project skill that tries to claim the same name is suppressed with a warning
+rather than silently winning.
+
+The plugin is staged into a **Shelbi-owned, session-scoped** path
+(`.claude/shelbi-system-plugins/update-shelbi-configuration`), never a runner's
+global registry. Each built-in runner then picks its own transport for that one
+bundle:
+
+- **Claude** loads the isolated bundle with a session-scoped `--plugin-dir`,
+  leaving the user's global plugin registry untouched.
+- **Codex** discovers the bundle's `skills/` directory through the app-server's
+  process-scoped `skills/extraRoots/set` request. Older app-servers that lack it
+  fall back to receiving the same `SKILL.md` bytes as developer instructions on
+  the new or resumed owned thread.
+
+Generic and custom runners are intentionally outside the system plugin, and
+non-orchestrator agents never receive it. Injecting the bundle changes no global
+runner registry and no runner-owned Claude or Codex configuration.
+
+## Fallback
+
+Release packages carry an editable copy of the plugin next to the binary; the
+binary also embeds the exact same bundle. Resolution
+(`crates/shelbi-orchestrator/src/system_plugin.rs`) prefers a parseable
+installed copy so packaging defects stay visible, and falls back to the embedded
+copy so orchestrator startup keeps working when the packaged asset is absent or
+broken:
+
+- **Missing or unreadable** installed asset → embedded copy, with a warning.
+- **Malformed** installed asset (bad manifest JSON, mismatched skill directories,
+  missing frontmatter) → embedded copy, with a warning.
+- **Valid but modified** installed asset → the installed copy is loaded (a
+  maintainer may legitimately patch the prose), with a warning that it differs
+  from the compiled checksum.
+- **Valid and matching** installed asset → loaded with no warning.
+
+The checksum is an FNV-1a integrity fingerprint, not a security primitive: a
+valid local patch must remain usable, so a mismatch warns but never blocks. The
+installed-path lookup handles the standalone archive layout (plugin beside the
+binary), prefix installs (`share/shelbi/plugins` preferred over a stale adjacent
+`bin/plugins`), Homebrew's versioned pkgshare, and the cargo development layout.
+Release, Homebrew, and APT packaging checks assert all three packaged files ship,
+so dot-directories cannot be silently dropped from an archive.
+
+## Lint scope
+
+`shelbi config lint` validates every configuration family Shelbi owns through
+the same parser Shelbi uses at runtime, so a clean lint means the file loads. The
+families:
+
+- **Global:** preferences (`config.yaml`), hub config (`shelbi.yaml`),
+  keybindings (`keys.yaml`).
+- **Per-project:** registration (flat `demo.yaml`, or split `project.yaml` +
+  `local.yaml`), statuses, workflows, and the workspace-settings template.
+- **Per-agent:** instructions and the shared preamble (Markdown), `settings.json`
+  (JSON), and skills (Markdown).
+
+Both live and staged linting run the identical checks; `--staged` points them at
+an inventory candidate directory instead of live files. Diagnostics carry a
+stable `code`, a `severity`, a source `location`, and often a `remediation`
+hint. **Both warnings and errors make the report unclean and exit non-zero**:
+configuration is valid or it is not, so the workflow never applies a config that
+lints with warnings.
+
+Lint is deliberately read-only. The write half of the workflow (atomic apply to
+canonical paths, running lifecycle commands for `lifecycle_owned` surfaces) is
+the skill's responsibility, gated behind explicit confirmation and re-checked for
+concurrent source changes immediately before the first live write.
+
+## Compatibility
+
+The inventory manifest is versioned (`schema_version`). A staged snapshot is
+only valid for the `shelbi` build that produced it: a snapshot whose version the
+running binary does not recognize is refused, not misread. The skill always
+takes a fresh inventory from the installed CLI rather than reusing an old
+`staged_dir`, and reads paths, candidate layout, and `lifecycle_owned` facts from
+that inventory rather than from any version-specific prose. Unknown configuration
+fields are reported (`CONFIG_UNKNOWN_FIELD`) rather than ignored, so a file
+written for a different Shelbi version surfaces as an actionable diagnostic
+instead of loading with silent surprises.
+
+## Verifying the workflow
+
+The end-to-end behavior is covered by
+`crates/shelbi-cli/tests/system_config_workflow_e2e.rs`, which drives the shipped
+binary through the full inventory → stage → lint → preview → confirm →
+race-check → apply → live-lint sequence and asserts the guardrails: no live write
+before confirmation, a raced source blocking the confirmed apply, a recovery that
+changes the confirmed diff or command list re-entering confirmation, and a
+valid/invalid scenario for every configuration family across both the flat and
+in-repo layouts and both orchestrator runners. Surface-level discovery and
+validation are covered by `crates/shelbi-cli/tests/config_inventory_lint.rs`, and
+plugin resolution and fallback by the unit tests in `system_plugin.rs`.
+
+## See also
+
+- [`shelbi config`](/docs/cli/config): the command reference for `inventory`,
+  `lint`, and the keybinding subcommands.
+- [Config modes](/docs/concepts/config-modes): flat versus in-repo layouts,
+  which shape the registration surfaces inventory reports.
+- [Agents](/docs/concepts/agents): how orchestrator and role agents are
+  materialized into a worktree, where the system skill is installed last.
