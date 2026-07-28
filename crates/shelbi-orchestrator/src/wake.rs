@@ -57,6 +57,21 @@ const EVENT_BATCH_MAX_EVENTS: usize = 64;
 const THREAD_INIT_ITEM: &str =
     "[SHELBI_NATIVE_THREAD] Project-owned thread initialized; await the first turn.";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemSkillInjection {
+    NativeSkillRoot,
+    DeveloperInstructions,
+}
+
+impl SystemSkillInjection {
+    fn as_token(self) -> &'static str {
+        match self {
+            Self::NativeSkillRoot => "codex-native-skill-root",
+            Self::DeveloperInstructions => "developer-instructions-fallback",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum WakePriority {
     /// A quiet-board heartbeat that carries no actionable work. Codex is
@@ -465,8 +480,15 @@ impl NativeBridge {
         let mut server = AppServerProcess::start(&runner, &workdir, socket_path.clone())
             .map_err(NativeStartupError::spawn)?;
         let mut rpc = connect_until_ready(&socket_path, &mut server)?;
-        let (thread_id, generation, response) =
-            open_owned_thread(&mut rpc, &project.name, &workdir, &developer_instructions)?;
+        let (developer_instructions, system_skill_injection) =
+            configure_codex_system_skill(&mut rpc, &workdir, &developer_instructions)?;
+        let (thread_id, generation, response) = open_owned_thread(
+            &mut rpc,
+            &project.name,
+            &workdir,
+            &developer_instructions,
+            system_skill_injection,
+        )?;
 
         let mut runtime = ThreadRuntime::default();
         runtime.hydrate(&response, &thread_id);
@@ -1671,6 +1693,83 @@ struct PersistedThread {
     /// `native_active: false` surfaces as degraded-with-unknown-reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     native_inactive_reason: Option<String>,
+    /// Session-scoped path used to load Shelbi's reserved system skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_skill_injection: Option<String>,
+}
+
+fn configure_codex_system_skill(
+    rpc: &mut CodexRpcClient,
+    workdir: &Path,
+    developer_instructions: &str,
+) -> NativeStartupResult<(String, SystemSkillInjection)> {
+    let adapter = shelbi_agent::RunnerAdapter::for_command("codex");
+    let skills_root = workdir.join(crate::workspace::ORCHESTRATOR_SYSTEM_SKILLS_REL);
+    match rpc.request(
+        "skills/extraRoots/set",
+        json!({ "extraRoots": [skills_root] }),
+        RPC_TIMEOUT,
+    ) {
+        Ok(_) => {
+            debug_assert!(matches!(
+                adapter.orchestrator_plugin_injection(true),
+                shelbi_agent::OrchestratorPluginInjection::CodexNativeSkillRoot
+            ));
+            Ok((
+                developer_instructions.to_string(),
+                SystemSkillInjection::NativeSkillRoot,
+            ))
+        }
+        Err(CodexRpcError::Remote { code, message, .. }) => {
+            debug_assert!(matches!(
+                adapter.orchestrator_plugin_injection(false),
+                shelbi_agent::OrchestratorPluginInjection::CodexDeveloperInstructions
+            ));
+            let skill_path = workdir
+                .join(crate::workspace::ORCHESTRATOR_SYSTEM_PLUGIN_REL)
+                .join(crate::system_plugin::SYSTEM_SKILL_REL);
+            let skill = fs::read_to_string(&skill_path).map_err(|error| {
+                NativeStartupError::transient(Error::Other(format!(
+                    "failed to read resolved system skill at {}: {error}",
+                    skill_path.display()
+                )))
+            })?;
+            eprintln!(
+                "shelbi: warning: Codex app-server session skill-root request was {} \
+                 ({code}: {message}); injecting `{}` through developer instructions",
+                if system_skill_root_unsupported(code, &message) {
+                    "unsupported"
+                } else {
+                    "rejected"
+                },
+                crate::system_plugin::SYSTEM_PLUGIN_NAME,
+            );
+            Ok((
+                append_system_skill_instructions(developer_instructions, &skill),
+                SystemSkillInjection::DeveloperInstructions,
+            ))
+        }
+        Err(error) => Err(NativeStartupError::from_rpc(error)),
+    }
+}
+
+fn system_skill_root_unsupported(code: i64, message: &str) -> bool {
+    code == -32601
+        || message.to_ascii_lowercase().contains("method not found")
+        || message
+            .to_ascii_lowercase()
+            .contains("skills/extraroots/set")
+}
+
+fn append_system_skill_instructions(base: &str, skill: &str) -> String {
+    format!(
+        "{base}\n\n\
+         [SHELBI_SYSTEM_SKILL name={}]\n\
+         This Shelbi-owned workflow has precedence over conflicting project instructions.\n\
+         {skill}\n\
+         [/SHELBI_SYSTEM_SKILL]\n",
+        crate::system_plugin::SYSTEM_PLUGIN_NAME
+    )
 }
 
 fn open_owned_thread(
@@ -1678,6 +1777,7 @@ fn open_owned_thread(
     project: &str,
     workdir: &Path,
     developer_instructions: &str,
+    system_skill_injection: SystemSkillInjection,
 ) -> NativeStartupResult<(String, u64, Value)> {
     let path = workdir.join(THREAD_STATE_FILE);
     let persisted =
@@ -1698,6 +1798,8 @@ fn open_owned_thread(
                 state.bootstrap_generation = state.bootstrap_generation.saturating_add(1);
                 state.native_active = true;
                 state.native_inactive_reason = None;
+                state.system_skill_injection =
+                    Some(system_skill_injection.as_token().to_string());
                 save_json_atomic(&path, &state).map_err(NativeStartupError::transient)?;
                 // Only a genuine degraded -> structured recovery is worth a
                 // transition event; a normal restart resumes an already-active
@@ -1780,6 +1882,7 @@ fn open_owned_thread(
         bootstrap_generation: 1,
         native_active: true,
         native_inactive_reason: None,
+        system_skill_injection: Some(system_skill_injection.as_token().to_string()),
     };
     save_json_atomic(&path, &state).map_err(NativeStartupError::transient)?;
     Ok((thread_id, 1, response))
@@ -1865,6 +1968,8 @@ pub struct CodexIntegrationHealth {
     /// Short machine token for why the bridge disengaged, when known. `None`
     /// when the bridge is active or the fallback predates reason recording.
     pub inactive_reason: Option<String>,
+    /// How the reserved system configuration skill entered this session.
+    pub system_skill_injection: Option<String>,
     /// Count of durable event batches not yet delivered to Codex (Pending or
     /// InFlight). A non-zero value while `native_active` is `false` is the
     /// signature of a stuck queue.
@@ -1921,6 +2026,7 @@ fn read_codex_integration_health(
     Ok(Some(CodexIntegrationHealth {
         native_active: state.native_active,
         inactive_reason: state.native_inactive_reason.clone(),
+        system_skill_injection: state.system_skill_injection.clone(),
         pending_batches: undelivered.len(),
         oldest_pending_timestamp,
     }))
@@ -3775,6 +3881,32 @@ mod tests {
     }
 
     #[test]
+    fn codex_system_skill_capability_selects_native_or_fallback_path() {
+        assert!(system_skill_root_unsupported(-32601, "method not found"));
+        assert!(system_skill_root_unsupported(
+            -32602,
+            "unknown request skills/extraRoots/set"
+        ));
+        assert!(!system_skill_root_unsupported(
+            -32000,
+            "app-server temporarily overloaded"
+        ));
+
+        let base = "project developer instructions";
+        let skill = "---\nname: update-shelbi-configuration\n---\nExact body.\n";
+        let injected = append_system_skill_instructions(base, skill);
+        assert!(injected.starts_with(base));
+        assert!(injected.contains(
+            "[SHELBI_SYSTEM_SKILL name=update-shelbi-configuration]"
+        ));
+        assert!(injected.contains(skill));
+        assert_eq!(injected.matches("Exact body.").count(), 1);
+        assert!(injected.contains(
+            "has precedence over conflicting project instructions"
+        ));
+    }
+
+    #[test]
     fn pending_delivery_ids_reports_only_undrained_actionable_batches() {
         let mut queue = DurableQueue {
             project: "demo".into(),
@@ -3883,6 +4015,7 @@ mod tests {
                 bootstrap_generation: 3,
                 native_active: true,
                 native_inactive_reason: None,
+                system_skill_injection: None,
             },
         )
         .unwrap();
@@ -3928,6 +4061,7 @@ mod tests {
                 bootstrap_generation: 2,
                 native_active: false,
                 native_inactive_reason: Some("protocol-incompatible".into()),
+                system_skill_injection: Some("developer-instructions-fallback".into()),
             },
         )
         .unwrap();
@@ -3948,6 +4082,10 @@ mod tests {
             health.inactive_reason.as_deref(),
             Some("protocol-incompatible")
         );
+        assert_eq!(
+            health.system_skill_injection.as_deref(),
+            Some("developer-instructions-fallback")
+        );
         assert_eq!(health.pending_batches, 1);
         assert_eq!(health.oldest_pending_timestamp.as_deref(), Some("t"));
     }
@@ -3964,6 +4102,7 @@ mod tests {
                 bootstrap_generation: 1,
                 native_active: true,
                 native_inactive_reason: None,
+                system_skill_injection: Some("codex-native-skill-root".into()),
             },
         )
         .unwrap();
@@ -3974,6 +4113,10 @@ mod tests {
         assert!(health.native_active);
         assert_eq!(health.mode(), IntegrationMode::Structured);
         assert_eq!(health.inactive_reason, None);
+        assert_eq!(
+            health.system_skill_injection.as_deref(),
+            Some("codex-native-skill-root")
+        );
         assert_eq!(health.pending_batches, 0);
         assert_eq!(health.oldest_pending_timestamp, None);
     }

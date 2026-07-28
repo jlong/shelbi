@@ -40,6 +40,24 @@ pub enum ResumeStrategy {
     ColdBanner,
 }
 
+/// Session-scoped path used to expose Shelbi's reserved orchestrator plugin.
+///
+/// The adapter owns the runner distinction while the orchestrator crate owns
+/// filesystem materialization and Codex app-server RPCs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestratorPluginInjection {
+    /// Claude Code loads the isolated bundle with `--plugin-dir`.
+    ClaudePluginDir,
+    /// Codex app-server discovers the bundle's skill directory through its
+    /// non-persistent `skills/extraRoots/set` request.
+    CodexNativeSkillRoot,
+    /// Older Codex app-servers receive the same SKILL.md bytes as developer
+    /// instructions for the new/resumed owned thread.
+    CodexDeveloperInstructions,
+    /// Generic/custom runners are intentionally outside the system plugin.
+    None,
+}
+
 /// The single per-runner integration adapter.
 ///
 /// Constructed once by detection — an explicit `integration:` field on the
@@ -123,6 +141,43 @@ impl RunnerAdapter {
     /// other runner is delivered to without the probe.
     pub fn needs_claude_readiness_probe(self) -> bool {
         self.is_claude()
+    }
+
+    /// Select the system-plugin transport for a built-in orchestrator.
+    ///
+    /// `codex_native_supported` is the result of the app-server capability
+    /// probe. It is ignored for non-Codex runners.
+    pub fn orchestrator_plugin_injection(
+        self,
+        codex_native_supported: bool,
+    ) -> OrchestratorPluginInjection {
+        match self.kind {
+            RunnerKind::Claude => OrchestratorPluginInjection::ClaudePluginDir,
+            RunnerKind::Codex if codex_native_supported => {
+                OrchestratorPluginInjection::CodexNativeSkillRoot
+            }
+            RunnerKind::Codex => OrchestratorPluginInjection::CodexDeveloperInstructions,
+            RunnerKind::Generic => OrchestratorPluginInjection::None,
+        }
+    }
+
+    /// Add Claude's session-scoped plugin directory without changing the
+    /// runner-owned global registry. Other runners are returned unchanged.
+    pub fn with_orchestrator_plugin_dir(
+        self,
+        spec: &AgentRunnerSpec,
+        plugin_dir: &str,
+    ) -> AgentRunnerSpec {
+        if !matches!(
+            self.orchestrator_plugin_injection(false),
+            OrchestratorPluginInjection::ClaudePluginDir
+        ) {
+            return spec.clone();
+        }
+        let mut out = spec.clone();
+        out.flags.push("--plugin-dir".into());
+        out.flags.push(plugin_dir.into());
+        out
     }
 
     /// Return a copy of `spec` with `--permission-mode <mode>` appended when
@@ -359,6 +414,53 @@ mod tests {
             integration: None,
         };
         assert_eq!(launch_command(&spec), "codex --print thinking");
+    }
+
+    #[test]
+    fn orchestrator_plugin_transport_is_runner_scoped() {
+        let claude = RunnerAdapter::for_command("claude");
+        let codex = RunnerAdapter::for_command("codex");
+        let custom = RunnerAdapter::for_command("aider");
+
+        assert_eq!(
+            claude.orchestrator_plugin_injection(false),
+            OrchestratorPluginInjection::ClaudePluginDir
+        );
+        assert_eq!(
+            codex.orchestrator_plugin_injection(true),
+            OrchestratorPluginInjection::CodexNativeSkillRoot
+        );
+        assert_eq!(
+            codex.orchestrator_plugin_injection(false),
+            OrchestratorPluginInjection::CodexDeveloperInstructions
+        );
+        assert_eq!(
+            custom.orchestrator_plugin_injection(true),
+            OrchestratorPluginInjection::None
+        );
+    }
+
+    #[test]
+    fn claude_orchestrator_plugin_dir_is_session_scoped_and_preserves_registry() {
+        let spec = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec!["--permission-mode".into(), "auto".into()],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        };
+        let out = RunnerAdapter::for_spec(&spec)
+            .with_orchestrator_plugin_dir(&spec, ".claude/shelbi-system-plugin");
+        assert_eq!(
+            out.flags,
+            vec![
+                "--permission-mode",
+                "auto",
+                "--plugin-dir",
+                ".claude/shelbi-system-plugin"
+            ]
+        );
+        assert_eq!(spec.flags, vec!["--permission-mode", "auto"]);
     }
 
     #[test]
