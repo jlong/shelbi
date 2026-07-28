@@ -194,10 +194,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::project::ProjectCmd,
     },
-    /// Inspect and validate the user's keybinding configuration.
-    /// `list-actions` shows every action's current chord(s); `dump-keybindings`
-    /// writes a starter `keys.yaml`; `check` validates `~/.shelbi/keys.yaml`
-    /// and reports any errors/warnings.
+    /// Discover and validate Shelbi-owned configuration. The existing
+    /// keybinding commands remain available alongside `inventory` and `lint`.
     Config {
         #[command(subcommand)]
         cmd: commands::config::ConfigCmd,

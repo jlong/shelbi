@@ -4,6 +4,7 @@ pub mod agent;
 pub mod archive;
 pub mod attach;
 pub mod config;
+mod config_surfaces;
 pub mod daemon;
 pub mod diff;
 pub mod events;

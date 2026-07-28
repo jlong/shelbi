@@ -288,19 +288,41 @@ fn value_type_name(v: &Value) -> &'static str {
 /// and `config.yaml` on disk, so subsequent calls observe the migrated
 /// state and stay silent.
 pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnostic>) {
+    load_keymaps_source(project_name, None, true)
+}
+
+/// Parse and validate a buffered `keys.yaml` candidate through the same merge,
+/// chord, collision, reserved-chord, and shadow checks as [`load_keymaps`],
+/// without reading or migrating live configuration.
+///
+/// This is the read-only entry point used by `shelbi config lint --staged`.
+pub fn validate_keymaps_yaml(
+    text: &str,
+    project_name: Option<&str>,
+) -> (Keymaps, Vec<KeymapDiagnostic>) {
+    load_keymaps_source(project_name, Some(text), false)
+}
+
+fn load_keymaps_source(
+    project_name: Option<&str>,
+    source: Option<&str>,
+    run_migrations: bool,
+) -> (Keymaps, Vec<KeymapDiagnostic>) {
     let mut diags = Vec::new();
 
     // One-shot: rename a legacy `~/.shelbi/keys.yml` to the canonical
     // `keys.yaml` before any read below, so the rest of this load — and
     // the zen-toggle migration that also rewrites the file — observes and
     // writes only `.yaml`.
-    migrate_keys_extension();
+    if run_migrations {
+        migrate_keys_extension();
+    }
 
     // One-shot: migrate the legacy config.yaml field into keys.yaml before
     // the merge so the merge picks up the migrated chord on this very
     // call. Emits the migration warning on success — the next startup
     // sees the legacy field at its default and stays silent.
-    if let Some(chord) = migrate_legacy_zen_toggle() {
+    if let Some(chord) = run_migrations.then(migrate_legacy_zen_toggle).flatten() {
         let msg = format!(
             "migrated config.yaml::keymap.zen_toggle (`{chord}`) into \
              keys.yaml::defaults.global.zen_toggle; the legacy field is no \
@@ -327,7 +349,20 @@ pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnosti
     }
 
     // Layer 2/3: load keys.yaml if present. Missing file is fine.
-    let file = read_keys_file(&mut diags);
+    let file = match source {
+        Some(text) => match serde_yaml::from_str::<KeysFile>(text) {
+            Ok(file) => Some(file),
+            Err(e) => {
+                diags.push(KeymapDiagnostic::err(
+                    ErrorKind::ParseError,
+                    format!("parsing {KEYS_FILENAME}: {e}"),
+                    Some(KEYS_FILENAME.into()),
+                ));
+                None
+            }
+        },
+        None => read_keys_file(&mut diags),
+    };
 
     if let Some(ref f) = file {
         if let Some(defaults) = &f.defaults {
@@ -362,7 +397,7 @@ pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnosti
     //   - keys.yaml doesn't override: forward the chord for this load.
     //     (In the common path the migration above already rewrote
     //     keys.yaml so this branch becomes inert on subsequent loads.)
-    if let Some(legacy) = legacy_zen_toggle_chord() {
+    if let Some(legacy) = run_migrations.then(legacy_zen_toggle_chord).flatten() {
         if zen_overridden_in_defaults {
             let warn_msg = "config.yaml::keymap.zen_toggle is deprecated; \
                  keys.yaml::defaults.global.zen_toggle is already set — \

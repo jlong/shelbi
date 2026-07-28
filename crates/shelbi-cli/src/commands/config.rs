@@ -1,6 +1,12 @@
-//! `shelbi config` — discover, dump, and validate keybindings.
+//! `shelbi config` — discover and validate Shelbi configuration.
 //!
-//! Three sub-subcommands:
+//! The all-surface interface consists of:
+//!
+//! - `inventory` discovers canonical global/project paths and materializes a
+//!   versioned candidate snapshot.
+//! - `lint` validates live or staged candidates through production parsers.
+//!
+//! Existing keybinding-specific commands remain compatible:
 //!
 //! - `list-actions` prints every action with its mode, name, description,
 //!   and current (post-merge) chord list.
@@ -9,14 +15,14 @@
 //! - `check` validates `~/.shelbi/keys.yaml` and reports any diagnostics
 //!   the loader surfaces. Non-zero exit on errors; warnings stay quiet.
 //!
-//! All three inspect the merged [`Keymaps`] from `shelbi-state` so the
+//! The keybinding commands inspect the merged [`Keymaps`] from `shelbi-state` so the
 //! same logic feeds the TUI dispatcher (when a later task wires it up) and
 //! these commands.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use shelbi_state::keymap::{
     load_keymaps, Action, KeyChord, KeymapDiagnostic, Keymaps, KEYS_FILENAME, MODE_NAMES,
 };
@@ -24,6 +30,28 @@ use shelbi_state::{shelbi_home, user_config_path};
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCmd {
+    /// Discover every Shelbi-owned configuration file and materialize an
+    /// isolated candidate snapshot for safe editing.
+    Inventory {
+        /// Include every locally registered project.
+        #[arg(long)]
+        all: bool,
+        /// Machine-readable output format.
+        #[arg(long, value_enum, default_value_t = InventoryFormat::Json)]
+        format: InventoryFormat,
+    },
+    /// Validate all selected configuration surfaces without mutating them.
+    Lint {
+        /// Include every locally registered project.
+        #[arg(long)]
+        all: bool,
+        /// Validate an inventory candidate directory instead of live files.
+        #[arg(long, value_name = "DIR")]
+        staged: Option<PathBuf>,
+        /// Diagnostic output format.
+        #[arg(long, value_enum, default_value_t = LintFormat::Human)]
+        format: LintFormat,
+    },
     /// Print every action with its mode, name, description, and the
     /// chord(s) bound to it after the keys.yaml merge.
     ListActions,
@@ -45,12 +73,75 @@ pub enum ConfigCmd {
     Check,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum InventoryFormat {
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum LintFormat {
+    Human,
+    Json,
+}
+
 pub fn run(project: Option<String>, cmd: ConfigCmd) -> Result<()> {
     match cmd {
+        ConfigCmd::Inventory { all, format } => inventory(project, all, format),
+        ConfigCmd::Lint {
+            all,
+            staged,
+            format,
+        } => lint(project, all, staged, format),
         ConfigCmd::ListActions => list_actions(project),
         ConfigCmd::DumpKeybindings { out, force } => dump_keybindings(out, force),
         ConfigCmd::Check => check(project),
     }
+}
+
+fn selected_projects(project: Option<String>, all: bool) -> Result<Vec<String>> {
+    if all && project.is_some() {
+        bail!("--project and --all are mutually exclusive");
+    }
+    if all {
+        return super::config_surfaces::discover_project_names();
+    }
+    Ok(resolve_project(project).into_iter().collect())
+}
+
+fn inventory(project: Option<String>, all: bool, format: InventoryFormat) -> Result<()> {
+    let projects = selected_projects(project, all)?;
+    let inventory = super::config_surfaces::inventory(&projects)?;
+    match format {
+        InventoryFormat::Json => println!("{}", serde_json::to_string_pretty(&inventory)?),
+    }
+    Ok(())
+}
+
+fn lint(
+    project: Option<String>,
+    all: bool,
+    staged: Option<PathBuf>,
+    format: LintFormat,
+) -> Result<()> {
+    let projects = selected_projects(project, all)?;
+    let report = match staged {
+        Some(path) => {
+            // A staged inventory is self-contained. `--all` means every
+            // project represented by that inventory, regardless of what is
+            // registered on the machine doing the lint.
+            let selected = (!all && !projects.is_empty()).then_some(projects.as_slice());
+            super::config_surfaces::lint_staged(&path, selected)?
+        }
+        None => super::config_surfaces::lint_live(&projects)?,
+    };
+    match format {
+        LintFormat::Human => print!("{}", super::config_surfaces::render_human(&report)),
+        LintFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+    }
+    if !report.is_clean() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// Resolve the project name without erroring when none is configured —
