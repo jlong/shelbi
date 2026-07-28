@@ -30,12 +30,18 @@ omits a block, resolves to defaults.
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `keymap.zen_toggle` | [chord](#zen_toggle-chords) | no | `alt-z` | Chord that toggles Zen Mode on and off. The canonical place to set it is `keys.yaml` (`defaults.global.zen_toggle`). |
+| `editor` | string | no | `$EDITOR`, else `vim` | Editor the [review interface](/docs/concepts/review-workspaces#the-review-editor)'s "Edit in `<editor>`" view launches in the review worktree. Hub-wide, so it follows you across projects. May be a bare command (`hx`) or one with flags (`code --wait`). Resolution order: this key, then `$EDITOR`, then `vim`. |
 
 ```yaml
 # ~/.shelbi/config.yaml
 keymap:
   zen_toggle: ctrl-g
+editor: code --wait
 ```
+
+The `editor` display label in the switcher is the program's basename with its
+first letter upper-cased — `hx` shows as **Edit in Hx**, `code --wait` as
+**Edit in Code**.
 
 ### `zen_toggle` chords
 

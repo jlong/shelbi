@@ -72,11 +72,70 @@ when spread across machines, clamped to `[1, 16]`). Add or remove workspaces
 later by editing the YAML and running `shelbi reload`.
 
 A slot can also carry `tags` — capability labels a workflow status can
-require, so a task routes to a matching workspace. A
-[review workspace](/docs/concepts/review-workspaces) is just a slot tagged
-`review` that a review status routes to: it loads a finished branch and boots
-its dev server for a human to click through. Everything on this page applies to
-it too; the tag just changes what gets routed there.
+require, so a task routes to a matching workspace. That routing is generic:
+[review workspaces](/docs/concepts/review-workspaces) are just the canonical
+use of it (a slot tagged `review` that a review status routes to), but the same
+mechanism pins any capability to any pool.
+
+## Tags: capability labels
+
+Every machine and every workspace can carry a free-form `tags` list. A
+workspace's **effective tags** are its own tags **unioned** with its
+machine's tags — a tag declared once on a machine applies to all of its
+slots without repeating it per workspace.
+
+```yaml
+machines:
+  - name: hub
+    kind: local
+    work_dir: ~/Workspaces/myapp
+    tags: [review]              # every slot on hub inherits `review`
+
+workspaces:
+  - { name: alpha, machine: hub, runner: claude }                 # effective: {review}
+  - { name: bravo, machine: hub, runner: claude, tags: [gpu] }    # effective: {review, gpu}
+```
+
+Both fields accept a scalar `tag:` alias and a bare string as shorthand for a
+one-element list (`tags: review` ≡ `tags: [review]`). Both are elided from the
+on-disk form when empty, so existing project YAMLs round-trip unchanged.
+
+### Status-tag routing
+
+A workflow [status](/docs/configuration/workflow#statuses) declares the tags a
+task needs while it sits there:
+
+```yaml
+statuses:
+  - { id: review, owner: user, agent: review, tags: [review] }
+```
+
+When a task enters that status, the orchestrator routes it to a **free
+workspace whose effective tags are a superset of the status's required set**
+(set-AND). Empty required tags — the default — match any free workspace, so
+any idle slot qualifies. `tags: [review]` on the status plus `tags: [review]`
+on a machine is all it takes to pin that work to matching slots. Nothing in the
+routing branches on a literal tag name — it's the same superset query every tag
+uses.
+
+If no declared workspace matches the required tags, the load fails loudly
+rather than silently running the work on a general slot.
+
+### Slots and `$SLOT`
+
+Each workspace has a numeric **slot**. Set it explicitly with `slot:`, or let
+it default to the workspace's zero-based index among its machine's slots. The
+slot is exported to transition commands as **`$SLOT`**, which is how two
+workspaces on one machine avoid colliding on a port:
+
+```yaml
+workspaces:
+  - { name: review-0, machine: hub, runner: claude, tags: [review], slot: 0 }
+  - { name: review-1, machine: hub, runner: claude, tags: [review], slot: 1 }
+```
+
+Alongside `$SLOT`, every transition command also gets `$SHELBI_TASK`,
+`$SHELBI_BRANCH`, `$SHELBI_WORKTREE`, and `$SHELBI_MACHINE`.
 
 ## The sidebar: grouped by machine
 
@@ -101,6 +160,17 @@ Idle slots (`·`) carry no agent or task. They're capacity waiting to be
 filled. A busy slot shows which [agent](/docs/concepts/agents) role it's
 running, which is how you tell at a glance that `delta` is doing a QA pass,
 not writing code.
+
+Each machine group can be collapsed (Space / Enter on its header). The set of
+collapsed machine names persists to `~/.shelbi/state.json` under
+`sidebar.collapsed_machines` (the `SidebarPrefs` struct), so the choice
+survives a sidebar respawn and follows you across projects that share a machine
+name. A collapsed machine keeps its `(total, active)` count on the header so
+capacity stays visible at a glance.
+
+[Review](/docs/concepts/review-workspaces)-tagged slots are the exception:
+they never render here. Their capacity surfaces under the sidebar's
+*Ready for Review* and *Queued for Review* sections instead.
 
 ## Machine-aware routing
 
@@ -193,7 +263,7 @@ A workspace reports task completion by writing its task id into a marker file
 in the worktree:
 
 ```text
-<worktree>/.claude/shelbi-review-ready
+<worktree>/.claude/shelbi-ready
 ```
 
 The hub poller `cat`s this file on each tick (locally or over SSH), and when
