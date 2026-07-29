@@ -18,7 +18,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Clear, Paragraph, Wrap},
     Frame,
 };
 
@@ -104,36 +104,40 @@ pub fn step_intro(state: &mut IntroState, key: KeyEvent) -> IntroOutcome {
     }
 }
 
-/// Paint the popover overlay. Sized to comfortably fit the body copy at
-/// terminal widths from ~64 columns up; clipping kicks in on narrower
-/// panes (see [`centered_rect`]). Buttons render at the bottom of the
-/// inner block in the same Cancel-left / primary-right order the
-/// existing Quit popovers use.
+/// Paint the intro dialog. It fills the whole pane it's given — in
+/// production that pane is the palette's `tmux display-popup`, which
+/// already draws its own border, so the widget deliberately draws *no*
+/// border of its own (a second one would double up; see the task
+/// "zen-intro-double-border"). The " Enable Zen Mode? " title is a plain
+/// in-content heading instead of a border title. Buttons render at the
+/// bottom in the same Cancel-left / primary-right order the existing
+/// Quit popovers use.
 pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
-    let overlay = centered_rect(64, 18, area);
-    f.render_widget(Clear, overlay);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Line::from(Span::styled(
-            " Enable Zen Mode? ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-    let inner = block.inner(overlay);
-    f.render_widget(block, overlay);
-
+    // Clear the whole pane so the palette list behind us doesn't bleed
+    // through around the copy, then inset the content (2 cols / 1 row) so
+    // the text isn't jammed against the tmux popup border.
+    f.render_widget(Clear, area);
     let layout = Layout::default()
         .direction(Direction::Vertical)
+        .horizontal_margin(2)
+        .vertical_margin(1)
         .constraints([
+            Constraint::Length(1), // heading (in-content title)
             Constraint::Length(1), // blank
             Constraint::Min(8),    // body copy
             Constraint::Length(1), // checkbox
             Constraint::Length(1), // blank
             Constraint::Length(1), // buttons
         ])
-        .split(inner);
+        .split(area);
+
+    let heading = Paragraph::new(Line::from(Span::styled(
+        "Enable Zen Mode?",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(heading, layout[0]);
 
     let body = Paragraph::new(
         "Zen Mode lets the orchestrator act autonomously:\n\
@@ -147,7 +151,7 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
     )
     .style(Style::default().fg(Color::Gray))
     .wrap(Wrap { trim: true });
-    f.render_widget(body, layout[1]);
+    f.render_widget(body, layout[2]);
 
     let checkbox_glyph = if state.dont_show_again { "[x]" } else { "[ ]" };
     let checkbox_style = if state.focus == IntroFocus::Checkbox {
@@ -162,7 +166,7 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
             format!("{checkbox_glyph} Don't show this again"),
             checkbox_style,
         ))),
-        layout[2],
+        layout[3],
     );
 
     let cancel_style = if state.focus == IntroFocus::Cancel {
@@ -186,23 +190,7 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
         Span::raw("  "),
         Span::styled("  [ Enable Zen ]  ", enable_style),
     ]));
-    f.render_widget(buttons, layout[4]);
-}
-
-/// Center a `w × h` rect inside `area`, clipping to the available size.
-/// Mirrors the helper in `zen_probe` so the two overlays render at the
-/// same anchor in the same pane.
-fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
-    let w = w.min(area.width);
-    let h = h.min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    }
+    f.render_widget(buttons, layout[5]);
 }
 
 #[cfg(test)]
@@ -412,6 +400,16 @@ mod tests {
             dumped.contains("[ ] Don't show this again"),
             "default state must render unchecked checkbox:\n{dumped}",
         );
+        // Regression guard for "zen-intro-double-border": the widget must
+        // NOT draw its own border box — the surrounding tmux `display-popup`
+        // frame is the only border. Assert no box-drawing glyphs leaked in.
+        for glyph in ['┌', '┐', '└', '┘', '│', '─'] {
+            assert!(
+                !dumped.contains(glyph),
+                "widget drew its own border glyph {glyph:?}; only the tmux \
+                 popup border should frame the dialog:\n{dumped}",
+            );
+        }
     }
 
     #[test]
