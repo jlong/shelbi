@@ -446,7 +446,14 @@ fn main() -> Result<()> {
         Some(Cmd::Agent { cmd }) => commands::agent::run(cli.project, cmd),
         Some(Cmd::Workflow { cmd }) => commands::workflow::run(cli.project, cmd),
         Some(Cmd::Project { cmd }) => commands::project::run(cli.project, cmd),
-        Some(Cmd::Config { cmd }) => commands::config::run(cli.project, cmd),
+        Some(Cmd::Config { cmd }) => {
+            // `--project` carries `[env: SHELBI_PROJECT]`, so `cli.project` is
+            // `Some` in every Shelbi session even without a CLI flag. `config`
+            // needs to distinguish an env-derived project from an explicit one
+            // so `--all` doesn't spuriously collide with the ambient value.
+            let explicit_project = project_flag_was_explicit(std::env::args_os());
+            commands::config::run(cli.project, explicit_project, cmd)
+        }
         Some(Cmd::Events { cmd }) => commands::events::run(cmd),
         Some(Cmd::Daemon { cmd }) => commands::daemon::run(cmd),
         Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),
@@ -497,6 +504,28 @@ fn main() -> Result<()> {
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),
         Some(Cmd::ZenOrchExit { project }) => commands::zen_lifecycle::orch_exit(&project),
     }
+}
+
+/// Did `--project` / `-p` appear on the command line (as opposed to being
+/// resolved from `$SHELBI_PROJECT`)? The top-level flag declares
+/// `[env: SHELBI_PROJECT]`, so `cli.project` is `Some` in every Shelbi
+/// session; commands that must treat an env-derived project differently from
+/// an explicit one (currently `config`, for its `--all` mutual-exclusion
+/// check) use this to tell them apart.
+fn project_flag_was_explicit<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    args.into_iter().skip(1).any(|arg| {
+        let arg = arg.as_ref().to_string_lossy();
+        arg == "--project"
+            || arg.starts_with("--project=")
+            || arg == "-p"
+            // Short flag with an attached value, e.g. `-pshelbi`. Guard against
+            // long flags (`--…`) which never start a short group.
+            || (arg.starts_with("-p") && !arg.starts_with("--"))
+    })
 }
 
 fn init_project_root_was_explicit<I, S>(args: I) -> bool
@@ -742,6 +771,29 @@ mod cli_tests {
             "init",
             "-y",
             "--root=/tmp/project"
+        ]));
+    }
+
+    #[test]
+    fn project_flag_explicit_only_for_cli_forms() {
+        // Explicit on the command line, in every spelling.
+        assert!(project_flag_was_explicit([
+            "shelbi", "config", "lint", "--project", "demo"
+        ]));
+        assert!(project_flag_was_explicit([
+            "shelbi",
+            "config",
+            "lint",
+            "--project=demo"
+        ]));
+        assert!(project_flag_was_explicit(["shelbi", "config", "lint", "-p", "demo"]));
+        assert!(project_flag_was_explicit(["shelbi", "config", "lint", "-pdemo"]));
+        // No `--project` on the line → env-derived, treated as not explicit.
+        assert!(!project_flag_was_explicit(["shelbi", "config", "lint", "--all"]));
+        assert!(!project_flag_was_explicit(["shelbi", "config", "inventory"]));
+        // A long flag that merely shares the `--p…` prefix must not match.
+        assert!(!project_flag_was_explicit([
+            "shelbi", "config", "lint", "--pretty"
         ]));
     }
 

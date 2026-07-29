@@ -6,7 +6,24 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 fn shelbi(root: &Path, args: &[&str]) -> Output {
+    // Hermetic: strip the ambient `SHELBI_PROJECT` so these tests behave the
+    // same whether or not they run inside a Shelbi session (where the hub and
+    // workspaces both export it). Tests that need an env-derived project set it
+    // explicitly via `shelbi_with_project`.
     Command::new(env!("CARGO_BIN_EXE_shelbi"))
+        .env_remove("SHELBI_PROJECT")
+        .arg("--root")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("run shelbi")
+}
+
+/// Like [`shelbi`], but with `SHELBI_PROJECT` set in the child environment —
+/// exercises the env-derived-project code path deterministically.
+fn shelbi_with_project(root: &Path, project: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_shelbi"))
+        .env("SHELBI_PROJECT", project)
         .arg("--root")
         .arg(root)
         .args(args)
@@ -345,6 +362,56 @@ fn staged_all_uses_manifest_projects_and_validates_settings_templates() {
         .unwrap()
         .iter()
         .any(|d| d["code"] == "TEMPLATE_UNKNOWN_PLACEHOLDER"));
+}
+
+#[test]
+fn all_ignores_ambient_shelbi_project_env() {
+    // Regression: an env-derived `SHELBI_PROJECT` (set in every Shelbi
+    // session) must not collide with an explicit `--all`. The flag carries
+    // `[env: SHELBI_PROJECT]`, so before the fix `--all` bailed with
+    // "--project and --all are mutually exclusive" whenever the env var was
+    // set. Only a `--project` passed on the CLI should conflict with `--all`.
+    let (_fixture, root) = scaffold_root(false);
+    let inventory = inventory(&root);
+    let staged = inventory["staged_dir"].as_str().unwrap();
+    for cmd in [
+        vec!["config", "inventory", "--all", "--format", "json"],
+        vec![
+            "config", "lint", "--all", "--staged", staged, "--format", "json",
+        ],
+    ] {
+        let out = shelbi_with_project(&root, "demo", &cmd);
+        assert!(
+            out.status.success(),
+            "`{}` should succeed with SHELBI_PROJECT set\nstdout:\n{}\nstderr:\n{}",
+            cmd.join(" "),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+}
+
+#[test]
+fn explicit_project_with_all_still_conflicts() {
+    // The mutual-exclusion guard must still fire for a genuinely explicit
+    // `--project X --all`, even with the ambient env var also present.
+    let (_fixture, root) = scaffold_root(false);
+    let inventory = inventory(&root);
+    let staged = inventory["staged_dir"].as_str().unwrap();
+    let out = shelbi_with_project(
+        &root,
+        "demo",
+        &[
+            "config", "lint", "--project", "demo", "--all", "--staged", staged, "--format",
+            "json",
+        ],
+    );
+    assert!(!out.status.success(), "explicit --project --all should error");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("mutually exclusive"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
 }
 
 #[test]

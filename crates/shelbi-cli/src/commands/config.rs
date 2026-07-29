@@ -84,22 +84,32 @@ pub enum LintFormat {
     Json,
 }
 
-pub fn run(project: Option<String>, cmd: ConfigCmd) -> Result<()> {
+/// `explicit_project` is `true` only when `--project` / `-p` was passed on
+/// the command line. The flag carries `[env: SHELBI_PROJECT]`, so `project`
+/// is `Some` in every Shelbi session; `--all` must collide only with an
+/// *explicit* project, never with the ambient `$SHELBI_PROJECT`.
+pub fn run(project: Option<String>, explicit_project: bool, cmd: ConfigCmd) -> Result<()> {
     match cmd {
-        ConfigCmd::Inventory { all, format } => inventory(project, all, format),
+        ConfigCmd::Inventory { all, format } => {
+            inventory(project, explicit_project, all, format)
+        }
         ConfigCmd::Lint {
             all,
             staged,
             format,
-        } => lint(project, all, staged, format),
+        } => lint(project, explicit_project, all, staged, format),
         ConfigCmd::ListActions => list_actions(project),
         ConfigCmd::DumpKeybindings { out, force } => dump_keybindings(out, force),
         ConfigCmd::Check => check(project),
     }
 }
 
-fn selected_projects(project: Option<String>, all: bool) -> Result<Vec<String>> {
-    if all && project.is_some() {
+fn selected_projects(
+    project: Option<String>,
+    explicit_project: bool,
+    all: bool,
+) -> Result<Vec<String>> {
+    if all && explicit_project {
         bail!("--project and --all are mutually exclusive");
     }
     if all {
@@ -108,8 +118,13 @@ fn selected_projects(project: Option<String>, all: bool) -> Result<Vec<String>> 
     Ok(resolve_project(project).into_iter().collect())
 }
 
-fn inventory(project: Option<String>, all: bool, format: InventoryFormat) -> Result<()> {
-    let projects = selected_projects(project, all)?;
+fn inventory(
+    project: Option<String>,
+    explicit_project: bool,
+    all: bool,
+    format: InventoryFormat,
+) -> Result<()> {
+    let projects = selected_projects(project, explicit_project, all)?;
     let inventory = super::config_surfaces::inventory(&projects)?;
     match format {
         InventoryFormat::Json => println!("{}", serde_json::to_string_pretty(&inventory)?),
@@ -119,11 +134,12 @@ fn inventory(project: Option<String>, all: bool, format: InventoryFormat) -> Res
 
 fn lint(
     project: Option<String>,
+    explicit_project: bool,
     all: bool,
     staged: Option<PathBuf>,
     format: LintFormat,
 ) -> Result<()> {
-    let projects = selected_projects(project, all)?;
+    let projects = selected_projects(project, explicit_project, all)?;
     let report = match staged {
         Some(path) => {
             // A staged inventory is self-contained. `--all` means every
