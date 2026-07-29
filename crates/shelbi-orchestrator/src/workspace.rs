@@ -3942,8 +3942,12 @@ fn resolve_fresh_cut_base(host: &Host, repo: &str, default_branch: &str) -> Resu
     if !has_origin {
         return Ok(default_branch.to_string());
     }
-    let fetch = shelbi_ssh::run(host, ["git", "-C", repo, "fetch", "origin", default_branch])
-        .map_err(Error::Io)?;
+    // Resilient: a `fetch` that hits a flaky managed ControlMaster drops+reopens
+    // the master and, if that doesn't take, retries on a fresh non-multiplexed
+    // connection rather than failing the whole dispatch on a transient mux loss.
+    let fetch =
+        shelbi_ssh::run_resilient(host, ["git", "-C", repo, "fetch", "origin", default_branch])
+            .map_err(Error::Io)?;
     if !fetch.status.success() {
         return Err(Error::Other(format!(
             "refusing to cut a task branch from a possibly-stale `{default_branch}`: \
@@ -3956,6 +3960,32 @@ fn resolve_fresh_cut_base(host: &Host, repo: &str, default_branch: &str) -> Resu
         )));
     }
     Ok(format!("origin/{default_branch}"))
+}
+
+/// Run a `git worktree add` (`argv`) with transport-loss recovery for the
+/// managed ssh ControlMaster. A `worktree add` that checks out a large repo can
+/// run for many seconds; if the master drops mid-checkout the add fails with
+/// `exit 255`, and a bare retry would then hit `fatal: '<wt>' already exists`
+/// because the partial checkout is still on disk. So on a mux/transport failure
+/// (see [`shelbi_ssh::classify_mux_failure`]) the partial worktree is removed —
+/// over a fresh non-multiplexed connection, since the managed transport is
+/// exactly what just failed — before the add is retried. `repo`/`wt_str` locate
+/// the partial checkout to clean. Local hosts pass straight through.
+pub fn worktree_add_with_recovery(
+    host: &Host,
+    repo: &str,
+    wt_str: &str,
+    argv: &[String],
+) -> std::io::Result<std::process::Output> {
+    shelbi_ssh::run_resilient_with_cleanup(host, argv, || {
+        // Best-effort: deregister then delete the partial checkout so the
+        // retry's `worktree add` starts from a clean path.
+        let _ = shelbi_ssh::run_no_multiplex(
+            host,
+            ["git", "-C", repo, "worktree", "remove", "--force", wt_str],
+        );
+        let _ = shelbi_ssh::run_no_multiplex(host, ["rm", "-rf", wt_str]);
+    })
 }
 
 /// Ensure the worktree exists and is checked out on `branch`. Creates the
@@ -4051,7 +4081,7 @@ fn sync_worktree(
             argv.push(wt_str.clone());
             argv.push(branch.into());
         }
-        let out = shelbi_ssh::run(host, &argv).map_err(Error::Io)?;
+        let out = worktree_add_with_recovery(host, &repo, &wt_str, &argv).map_err(Error::Io)?;
         if !out.status.success() {
             return Err(Error::Command {
                 cmd: argv.join(" "),
@@ -4248,7 +4278,7 @@ fn sync_worktree_for_resume(
         argv.push(wt_str.clone());
         argv.push(base);
     }
-    let out = shelbi_ssh::run(host, &argv).map_err(Error::Io)?;
+    let out = worktree_add_with_recovery(host, &repo, &wt_str, &argv).map_err(Error::Io)?;
     if !out.status.success() {
         return Err(Error::Command {
             cmd: argv.join(" "),
@@ -4346,10 +4376,13 @@ pub fn materialize_idle_worktree(
     }
 
     let base = resolve_fresh_cut_base(&host, &repo, default_branch)?;
-    let argv = [
+    let argv: Vec<String> = [
         "git", "-C", &repo, "worktree", "add", "--detach", &wt_str, &base,
-    ];
-    let out = shelbi_ssh::run(&host, argv).map_err(Error::Io)?;
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let out = worktree_add_with_recovery(&host, &repo, &wt_str, &argv).map_err(Error::Io)?;
     if !out.status.success() {
         return Err(Error::Command {
             cmd: argv.join(" "),

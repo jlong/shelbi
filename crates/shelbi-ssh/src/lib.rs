@@ -137,6 +137,32 @@ const SSH_CONTROL_OPTS_STATIC: &[&str] = &[
     "ExitOnForwardFailure=no",
 ];
 
+/// Keepalive options applied to every shelbi-managed ssh connection — both the
+/// persistent ControlMaster and the one-shot no-forward maintenance / fallback
+/// connections.
+///
+/// `ControlPersist=600` (in [`SSH_CONTROL_OPTS_STATIC`]) only governs how long
+/// an *idle* master lingers; it says nothing about liveness *during* a transfer.
+/// Without keepalive a single long remote operation (the observed 91k-file
+/// `git worktree add` that lost its transport at 43%) or an idle NAT / Tailscale
+/// blip silently drops the master, and the next multiplexed command fails with
+/// `read from master failed: Broken pipe` / `Control socket connect(...): No
+/// such file`.
+///
+/// `ServerAliveInterval=15` + `ServerAliveCountMax=4` makes ssh send a keepalive
+/// every 15s and give up after 4 unanswered (~60s) — so a genuinely dead peer is
+/// detected in a bounded window instead of hanging on the multi-minute OS TCP
+/// timeout, while a live-but-quiet long transfer is held open. `TCPKeepAlive=yes`
+/// keeps NAT/firewall middleboxes from reaping an idle-but-alive connection.
+const SSH_KEEPALIVE_OPTS: &[&str] = &[
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
+    "-o",
+    "TCPKeepAlive=yes",
+];
+
 /// The ssh `LogLevel` to run shelbi-routed commands at. Defaults to `ERROR`
 /// (quiet — only genuine failures print), but `SHELBI_SSH_LOG_LEVEL` overrides
 /// it so an operator diagnosing a ControlMaster / reverse-forward problem can
@@ -158,6 +184,7 @@ fn ssh_log_level() -> String {
 fn base_control_opts() -> Vec<String> {
     let mut opts: Vec<String> = SSH_CONTROL_OPTS_STATIC
         .iter()
+        .chain(SSH_KEEPALIVE_OPTS.iter())
         .map(|s| (*s).to_string())
         .collect();
     // LogLevel rides in front of the ControlPath so a `SHELBI_SSH_LOG_LEVEL`
@@ -239,6 +266,12 @@ fn apply_ssh_no_forward_opts(cmd: &mut Command) {
         ("-o", format!("LogLevel={}", ssh_log_level())),
     ] {
         cmd.arg(flag).arg(value);
+    }
+    // Keepalive too: the non-multiplexed fallback is what carries a *long* op
+    // (a fresh-connection `git worktree add` retry) when the master is
+    // unrecoverable, so it needs the same dead-peer detection as the master.
+    for opt in SSH_KEEPALIVE_OPTS {
+        cmd.arg(opt);
     }
 }
 
@@ -337,6 +370,169 @@ where
     let mut cmd = build_command(host, argv);
     tracing::debug!(?cmd, host = ?host, "ssh::run");
     cmd.output()
+}
+
+/// Whether a failed command's [`Output`] is a recoverable *transport* failure
+/// (the multiplexed ControlMaster died) rather than a genuine remote-command
+/// error. See [`classify_mux_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuxFailure {
+    /// Not a mux/transport failure: the command succeeded, or it failed for a
+    /// reason reopening the master won't fix (a non-255 remote exit, or a 255
+    /// with a real ssh diagnostic like `Permission denied` / `Connection
+    /// refused`). Surface it as-is; do NOT drop the master.
+    None,
+    /// A multiplexing/transport failure: exit 255 whose stderr carries a
+    /// broken-pipe / no-such-file / connection-closed signature — or is blank,
+    /// the classic broken/absent-ControlMaster fingerprint. Drop+reopen the
+    /// master and retry; fall back to a fresh non-multiplexed connection if the
+    /// reopen doesn't take.
+    Transport,
+}
+
+/// Substrings ssh/mux emit when the *transport* — not the remote command — is
+/// what failed. Matched case-insensitively (stderr is lowercased first) and
+/// only ever consulted on an exit-255 failure, so a remote command that merely
+/// printed one of these strings (and exited with its own non-255 code) is never
+/// misread as a transport loss.
+const MUX_FAILURE_MARKERS: &[&str] = &[
+    // `mux_client_request_session: read from master failed: Broken pipe`
+    "read from master failed",
+    "broken pipe",
+    // `mux_client_*` chatter in general (request_session, hello_exchange, …).
+    "mux_client",
+    // `Control socket connect(/…/%C): No such file or directory` /
+    // `…: Connection refused` — the master socket is gone or unlistened.
+    "control socket connect",
+    "no such file",
+    // The peer went away mid-transfer — a fresh connection may well succeed.
+    "connection closed by remote host",
+    "connection reset by peer",
+];
+
+/// Classify a command's [`Output`] for ControlMaster/mux recovery. A pure
+/// function of the exit status + stderr so the drop/reopen/fallback decision is
+/// unit-testable without shelling out.
+///
+/// Only an ssh-level exit 255 can be a transport failure: a remote command that
+/// merely failed exits with its *own* code, which ssh passes through unchanged.
+/// A 255 with a mux signature (or a blank 255 — the broken-master fingerprint
+/// [`annotated_stderr`] already annotates) is [`MuxFailure::Transport`];
+/// everything else — including a 255 carrying a real ssh auth/host diagnostic a
+/// reopen can't fix — is [`MuxFailure::None`].
+pub fn classify_mux_failure(output: &Output) -> MuxFailure {
+    if output.status.success() {
+        return MuxFailure::None;
+    }
+    if output.status.code() != Some(255) {
+        return MuxFailure::None;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lowered = stderr.to_ascii_lowercase();
+    if lowered.trim().is_empty() {
+        // Blank 255 — the classic broken/absent-ControlMaster fingerprint.
+        return MuxFailure::Transport;
+    }
+    if MUX_FAILURE_MARKERS.iter().any(|m| lowered.contains(m)) {
+        return MuxFailure::Transport;
+    }
+    MuxFailure::None
+}
+
+/// Run `argv` on `host` over a fresh, **non-multiplexed** connection: no
+/// ControlMaster (`ControlMaster=no`, a new TCP+auth handshake) and no `-R`
+/// reverse forward. This is the transport the bug report confirms stays
+/// rock-solid, used as the last-resort fallback in [`run_resilient`] when the
+/// managed master is unrecoverable. Because it drops the reverse forward, it is
+/// for hub-side git/maintenance ops (fetch, worktree add) that don't need the
+/// worker→hub channel — not worker-facing commands.
+pub fn run_no_multiplex<I, S>(host: &Host, argv: I) -> std::io::Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    match host {
+        Host::Local => run(host, argv),
+        Host::Ssh { host } => {
+            let mut cmd = build_no_forward_command(host, argv);
+            tracing::debug!(?cmd, host = %host, "ssh::run_no_multiplex");
+            cmd.output()
+        }
+    }
+}
+
+/// Run `argv` on `host`, recovering from a transient ControlMaster/mux failure.
+///
+/// On a [`MuxFailure::Transport`] result the (half-open) master is dropped and
+/// reopened — serialized per host via [`shelbi_state::lock_ssh_master`] so a
+/// concurrent daemon/TUI/CLI can't tear it out mid-retry — and the command is
+/// retried once over the freshly reopened master. If that *still* fails on the
+/// transport, it falls back to a fresh non-multiplexed connection
+/// ([`run_no_multiplex`]) for this one op, so a critical task-start operation
+/// succeeds instead of erroring on a flaky mux. Non-transport failures (and
+/// successes) are returned from the first attempt untouched.
+///
+/// [`Host::Local`] has no multiplexed transport, so this is a plain [`run`].
+pub fn run_resilient<I, S>(host: &Host, argv: I) -> std::io::Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_resilient_with_cleanup(host, argv, || {})
+}
+
+/// [`run_resilient`], but run `cleanup` before each recovery attempt (the
+/// reopen retry and the non-multiplexed fallback). For a `git worktree add` that
+/// lost its transport mid-checkout the partial worktree must be removed before
+/// the add can be retried — `cleanup` is where the caller does that. `cleanup`
+/// is not run on the happy path (first attempt succeeded or failed
+/// non-transiently).
+pub fn run_resilient_with_cleanup<I, S>(
+    host: &Host,
+    argv: I,
+    mut cleanup: impl FnMut(),
+) -> std::io::Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    // Materialize argv once so it can be replayed across attempts.
+    let argv: Vec<std::ffi::OsString> = argv
+        .into_iter()
+        .map(|s| s.as_ref().to_os_string())
+        .collect();
+
+    let hostname = match host {
+        Host::Local => return run(host, &argv),
+        Host::Ssh { host } => host.clone(),
+    };
+
+    let first = run(host, &argv)?;
+    if classify_mux_failure(&first) != MuxFailure::Transport {
+        return Ok(first);
+    }
+    tracing::warn!(
+        host = %hostname,
+        "ssh mux transport failure; dropping+reopening the ControlMaster and retrying"
+    );
+    cleanup();
+    // Drop the half-open master under the per-host lock so `ControlMaster=auto`
+    // opens a fresh one on the retry and a concurrent process can't race the
+    // drop against its own reopen.
+    {
+        let _lock = shelbi_state::lock_ssh_master(&hostname);
+        drop_master(&hostname);
+    }
+    let second = run(host, &argv)?;
+    if classify_mux_failure(&second) != MuxFailure::Transport {
+        return Ok(second);
+    }
+    tracing::warn!(
+        host = %hostname,
+        "ssh mux still failing after master reopen; falling back to a fresh non-multiplexed connection"
+    );
+    cleanup();
+    run_no_multiplex(host, &argv)
 }
 
 /// How often [`run_with_deadline`] polls the child for exit. Small enough
@@ -1109,6 +1305,14 @@ pub fn ensure_reverse_forward(
         Host::Local => return Ok(()),
         Host::Ssh { host } => host.clone(),
     };
+    // Serialize this host's master (re)creation against every other process —
+    // the daemon poller, the TUI, a `task start` CLI — so a concurrent
+    // drop_master + reopen here can't tear the master out from under another
+    // party's in-flight command. Best-effort: if the lock can't be taken we
+    // proceed rather than wedge the forward path (the pre-existing behavior).
+    // Held for the whole ensure so the drop/reopen/probe sequence below is
+    // atomic per host; distinct hosts still run concurrently.
+    let _master_lock = shelbi_state::lock_ssh_master(&hostname);
     let remote_sock = shelbi_state::remote_hub_socket_path()
         .to_string_lossy()
         .into_owned();
@@ -1868,5 +2072,130 @@ mod tests {
             "override must reach the ssh argv: {opts:?}"
         );
         std::env::remove_var("SHELBI_SSH_LOG_LEVEL");
+    }
+
+    #[test]
+    fn master_control_opts_carry_keepalive() {
+        // Acceptance: the master carries keepalive opts so a long remote op /
+        // idle NAT blip doesn't silently drop it. They ride on every
+        // control-master-carrying invocation via `base_control_opts`.
+        let opts = build_ssh_control_opts("devbox");
+        assert!(
+            opts.iter().any(|o| o == "ServerAliveInterval=15"),
+            "missing ServerAliveInterval: {opts:?}"
+        );
+        assert!(
+            opts.iter().any(|o| o == "ServerAliveCountMax=4"),
+            "missing ServerAliveCountMax: {opts:?}"
+        );
+        assert!(
+            opts.iter().any(|o| o == "TCPKeepAlive=yes"),
+            "missing TCPKeepAlive: {opts:?}"
+        );
+        // The TCP master open and the stream-local-unlink master open both build
+        // on `base_control_opts`, so they inherit keepalive too.
+        let tcp = build_tcp_master_args("devbox", "127.0.0.1:47100:/h/hub.sock");
+        assert!(tcp.iter().any(|o| o == "ServerAliveInterval=15"));
+        let unlink = build_stream_local_unlink_master_args("devbox");
+        assert!(unlink.iter().any(|o| o == "ServerAliveInterval=15"));
+    }
+
+    #[test]
+    fn no_forward_fallback_command_carries_keepalive() {
+        // The non-multiplexed fallback carries a *long* op (a fresh-connection
+        // `git worktree add` retry), so it needs the same dead-peer detection.
+        let cmd = build_no_forward_command("devbox", ["git", "worktree", "add", "wt", "main"]);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter().any(|a| a == "ServerAliveInterval=15"),
+            "no-forward fallback must carry keepalive: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "TCPKeepAlive=yes"), "{args:?}");
+    }
+
+    /// Build an [`Output`] from a local `sh -c` so the mux-failure classifier
+    /// can be exercised without a real ssh transport.
+    fn output_from(script: &str) -> Output {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("sh -c failed to run")
+    }
+
+    #[test]
+    fn classify_mux_failure_flags_transport_losses() {
+        // A blank 255 — the classic broken/absent-ControlMaster fingerprint.
+        assert_eq!(
+            classify_mux_failure(&output_from("exit 255")),
+            MuxFailure::Transport
+        );
+        // The mux read-from-master broken-pipe signature.
+        assert_eq!(
+            classify_mux_failure(&output_from(
+                "echo 'mux_client_request_session: read from master failed: Broken pipe' >&2; exit 255"
+            )),
+            MuxFailure::Transport
+        );
+        // The dead-control-socket signature.
+        assert_eq!(
+            classify_mux_failure(&output_from(
+                "echo 'Control socket connect(/x/%C): No such file or directory' >&2; exit 255"
+            )),
+            MuxFailure::Transport
+        );
+        // Peer went away mid-transfer (the 43%-checkout shape).
+        assert_eq!(
+            classify_mux_failure(&output_from(
+                "echo 'Connection closed by remote host' >&2; exit 255"
+            )),
+            MuxFailure::Transport
+        );
+    }
+
+    #[test]
+    fn classify_mux_failure_leaves_genuine_errors_alone() {
+        // Success is never a transport failure.
+        assert_eq!(classify_mux_failure(&output_from("true")), MuxFailure::None);
+        // A remote command that merely failed exits with its OWN (non-255)
+        // code — reopening the master wouldn't help, so don't.
+        assert_eq!(
+            classify_mux_failure(&output_from("echo 'fatal: bad ref' >&2; exit 128")),
+            MuxFailure::None
+        );
+        // A 255 carrying a real ssh auth/host diagnostic a reopen can't fix.
+        assert_eq!(
+            classify_mux_failure(&output_from(
+                "echo 'Permission denied (publickey).' >&2; exit 255"
+            )),
+            MuxFailure::None
+        );
+        assert_eq!(
+            classify_mux_failure(&output_from("echo 'Connection refused' >&2; exit 255")),
+            MuxFailure::None
+        );
+    }
+
+    #[test]
+    fn run_resilient_local_passes_through_without_recovery() {
+        // Local has no multiplexed transport — resilient is a plain run, and a
+        // success comes straight back.
+        let out = run_resilient(&Host::Local, ["echo", "shelbi"]).expect("echo failed");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "shelbi");
+    }
+
+    #[test]
+    fn run_resilient_with_cleanup_skips_cleanup_on_success() {
+        // A first-attempt success must NOT run the cleanup closure (there is no
+        // partial state to unwind on the happy path).
+        let mut cleaned = 0;
+        let out = run_resilient_with_cleanup(&Host::Local, ["true"], || cleaned += 1)
+            .expect("true failed");
+        assert!(out.status.success());
+        assert_eq!(cleaned, 0, "cleanup must not fire on a clean first attempt");
     }
 }
