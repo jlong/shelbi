@@ -175,6 +175,10 @@ right.
 From the review panel you can:
 
 - **🤓 Chat with Reviewer** — talk to the Review agent (the default view).
+- **🔀 View Diff** — open your system diff tool over the review branch's
+  changes in the main pane. This uses git's configured diff tool
+  (`diff.tool`, or `diff.guitool` for a GUI tool); if none is configured the
+  panel shows a short error instead of launching.
 - **✍️ Edit in `<editor>`** — open the review worktree in your
   [configured editor](/docs/configuration/global#configyaml).
 - **🌐 Open Browser** — open the served `url` in your system browser. This
