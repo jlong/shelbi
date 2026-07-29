@@ -1,13 +1,18 @@
-//! The right-hand **review panel** of the review interface — a dedicated
-//! ratatui view hosted in a third tmux pane alongside the project sidebar
-//! (left) and the swappable content slot (middle). It renders, for the
-//! Ready-for-review task it was launched on:
+//! The **review panel** of the review interface — a dedicated ratatui view
+//! hosted in the **left** column of the review window, with the review content
+//! (agent / server / editor) filling the column on its right. It renders, for
+//! the Ready-for-review task it was launched on:
 //!
+//! - a **square back button** at the very top (a back-arrow glyph, no label)
+//!   that switches focus back to the dashboard window without tearing the
+//!   still-loaded review down — see [`PanelEffect::FocusDashboard`]. It reads
+//!   as a square via the same half-block bleed trick the sidebar nav uses for
+//!   its selection (a lower-half-block row above, an upper-half-block below),
 //! - a **header** showing review status + the review worktree's folder name
 //!   (left-truncated to fit; click to reveal it in the OS file manager),
 //! - a **view-switcher** action group — *Chat with Reviewer* (default) /
 //!   *Edit in <editor>* / *Open Browser* (the last only when the workflow
-//!   declares a review URL), the active middle-pane view highlighted, and
+//!   declares a review URL), the active content view highlighted, and
 //! - an **Approve** / **Reject** action group, Reject opening a
 //!   type-the-reason popover (a centered `tmux display-popup` with a bordered
 //!   textbox and [ Reject ] / [ Cancel ] buttons — see
@@ -57,6 +62,10 @@ pub enum SwitchItem {
 /// headers and blanks are inert; everything else activates on Enter/click.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PanelRow {
+    /// The square back button at the top of the panel — switches focus back
+    /// to the dashboard window. Rendered as its own three-line block (bleed /
+    /// button / bleed), not through the per-row list renderer.
+    Back,
     /// Review status line (e.g. `Ready for review`). Inert.
     Status,
     /// The worktree folder name — click to reveal in the file manager.
@@ -80,6 +89,11 @@ impl PanelRow {
 pub enum PanelEffect {
     /// Nothing to do (e.g. moved the selection).
     None,
+    /// Switch the active tmux window back to the dashboard, leaving the review
+    /// interface loaded. The back button navigates focus only — it does not
+    /// tear the interface down — so the reviewer can return to the still-loaded
+    /// review by re-opening it from the sidebar.
+    FocusDashboard,
     /// Swap the reviewer-chat pane into the middle slot.
     ShowChat,
     /// Swap the editor pane into the middle slot.
@@ -157,7 +171,11 @@ impl ReviewPanel {
         // The Chat / Edit / Browser switches render as a full-width nav block
         // (separator lines + half-block selection bleed) that stands on its
         // own the way the main sidebar nav does — no leading section header.
+        // The back button leads the panel (its own block above everything),
+        // a blank giving it breathing room before the header.
         let mut rows = vec![
+            PanelRow::Back,
+            PanelRow::Blank,
             PanelRow::Status,
             PanelRow::Folder,
             PanelRow::Blank,
@@ -193,23 +211,33 @@ impl ReviewPanel {
     }
 
     /// Map a rendered-line offset (from the top of the list area) back to a
-    /// row index. Rows before and after the switch group are one line each;
-    /// the switch group renders as a nav block whose item `j` sits on line
-    /// `sstart + 2j + 1` with inert separators on the even lines between.
+    /// row index. The back button block leads the panel (its middle line is the
+    /// only clickable one); rows before and after the switch group are one line
+    /// each; the switch group renders as a nav block whose item `j` sits on line
+    /// `navStart + 2j + 1` with inert separators on the even lines between.
     /// Mirrors [`crate::app::App::row_at`] so drawing and clicks agree.
     fn row_at_line(&self, target: usize) -> Option<usize> {
+        // The back button block (rows[0]) occupies the first BACK_BLOCK_H
+        // lines; only its middle line maps to the Back row.
+        if target < BACK_BLOCK_H {
+            return (target == BACK_BUTTON_LINE).then_some(0);
+        }
         let rows = self.rows();
         let (sstart, scount) = self.switch_span();
-        if target < sstart {
-            return Some(target);
+        // Lines below the back block, 0-based. The plain rows above the switch
+        // group are rows[1..sstart], one line each.
+        let t = target - BACK_BLOCK_H;
+        let above = sstart.saturating_sub(1);
+        if t < above {
+            return Some(1 + t);
         }
         let nav_lines = crate::sidebar::nav_lines(scount);
-        if target < sstart + nav_lines {
-            let offset = target - sstart;
+        if t < above + nav_lines {
+            let offset = t - above;
             // Odd offsets are item rows; even offsets are inert separators.
             return (offset % 2 == 1).then_some(sstart + offset / 2);
         }
-        let idx = sstart + scount + (target - sstart - nav_lines);
+        let idx = sstart + scount + (t - above - nav_lines);
         (idx < rows.len()).then_some(idx)
     }
 
@@ -256,6 +284,7 @@ impl ReviewPanel {
 
     fn activate_row(&mut self, row: PanelRow) -> PanelEffect {
         match row {
+            PanelRow::Back => PanelEffect::FocusDashboard,
             PanelRow::Folder => PanelEffect::RevealFolder,
             PanelRow::Switch(SwitchItem::Chat) => {
                 self.active_view = ActiveView::Chat;
@@ -328,6 +357,19 @@ const LIST_INDENT: Margin = Margin {
     vertical: 0,
 };
 
+/// The square back button occupies three rendered lines: a lower-half-block
+/// bleed row, the button (arrow) row, and an upper-half-block bleed row. The
+/// two bleed rows extend the button's fill half a cell up and down so a single
+/// text row reads as a square block — the same trick the sidebar nav uses for
+/// its selection (see [`crate::sidebar::BLEED_ABOVE`] / `BLEED_BELOW`).
+const BACK_BLOCK_H: usize = 3;
+/// The button (arrow) sits on the middle line of the three-line block.
+const BACK_BUTTON_LINE: usize = 1;
+/// Column width of the back button. A terminal cell is ~twice as tall as it is
+/// wide and the half-block bleed makes the button ~2 cells tall, so a handful
+/// of columns reads as roughly square; the arrow is centered within it.
+const BACK_BTN_WIDTH: usize = 5;
+
 pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
     // The list spans the full pane width so the switch nav block's selection
     // fill and half-block bleed can paint edge to edge; the plain rows above
@@ -335,41 +377,107 @@ pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
     app.list_area = area;
     let rows = app.rows();
     let (sstart, scount) = app.switch_span();
-    let nav_h = crate::sidebar::nav_lines(scount) as u16;
 
-    // Region above the switches (status / folder / blank), one line each.
-    let a_h = (sstart as u16).min(area.height);
+    // 1. The square back button block leads the panel, occupying the top
+    //    BACK_BLOCK_H lines.
+    let back_h = (BACK_BLOCK_H as u16).min(area.height);
+    render_back_button(
+        f,
+        app,
+        Rect {
+            height: back_h,
+            ..area
+        },
+    );
+    if area.height <= back_h {
+        return;
+    }
+    // Everything else renders below the back block. `sstart` counts the Back
+    // row (rows[0]); the plain rows above the switch group are rows[1..sstart].
+    let below_y = area.y + back_h;
+    let below_h = area.height - back_h;
+
+    // Region above the switches (blank / status / folder / blank), one line each.
+    let above_n = (sstart.saturating_sub(1)) as u16;
+    let a_h = above_n.min(below_h);
     let a_area = Rect {
+        y: below_y,
         height: a_h,
         ..area
     };
-    render_row_list(f, app, &rows[..sstart], 0, a_area.inner(LIST_INDENT));
+    render_row_list(f, app, &rows[1..sstart], 1, a_area.inner(LIST_INDENT));
+    if below_h <= a_h {
+        return;
+    }
 
     // The switch group itself — a full-width nav block: a separator line
     // between (and bracketing) each item, the selected item filling edge to
     // edge with its adjacent separators carrying the half-block bleed. Same
     // treatment as the main sidebar nav.
-    if area.height > a_h {
-        let nav_area = Rect {
-            y: area.y + a_h,
-            height: nav_h.min(area.height - a_h),
-            ..area
-        };
-        render_switch_nav(f, app, nav_area, sstart, scount);
+    let nav_h = (crate::sidebar::nav_lines(scount) as u16).min(below_h - a_h);
+    let nav_area = Rect {
+        y: below_y + a_h,
+        height: nav_h,
+        ..area
+    };
+    render_switch_nav(f, app, nav_area, sstart, scount);
 
-        // Region below the switches (blank, Actions header, Approve / Reject).
-        let used = a_h + nav_h;
-        if area.height > used {
-            let rest = Rect {
-                y: area.y + used,
-                height: area.height - used,
-                ..area
-            }
-            .inner(LIST_INDENT);
-            let offset = sstart + scount;
-            render_row_list(f, app, &rows[offset..], offset, rest);
+    // Region below the switches (blank, Actions header, Approve / Reject).
+    let used = a_h + nav_h;
+    if below_h > used {
+        let rest = Rect {
+            y: below_y + used,
+            height: below_h - used,
+            ..area
         }
+        .inner(LIST_INDENT);
+        let offset = sstart + scount;
+        render_row_list(f, app, &rows[offset..], offset, rest);
     }
+}
+
+/// Render the square back button block: a lower-half-block bleed row, the
+/// arrow row, and an upper-half-block bleed row. The bleed rows carry the
+/// button's fill colour in their *foreground* so the eye reads the fill as
+/// continuing half a cell past the arrow row — the same half-block trick the
+/// sidebar nav uses — making the single arrow row read as a square. The arrow
+/// glyph (`←`, U+2190) is the only content; there is no text label. Selecting
+/// the button brightens the arrow; the fill is constant so it always reads as
+/// a raised square.
+fn render_back_button(f: &mut Frame, app: &ReviewPanel, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let selected = app.selected == 0; // Back is always rows[0].
+    let bg = crate::theme::SELECTION_BG;
+    let width = area.width as usize;
+    // Keep a 1-col indent (matching LIST_INDENT) so the button sits in from the
+    // pane edge like the labels below it.
+    let btn_w = BACK_BTN_WIDTH.min(width.saturating_sub(1)).max(1);
+    let left = (btn_w - 1) / 2;
+    let right = btn_w - 1 - left;
+    let btn_text = format!("{}\u{2190}{}", " ".repeat(left), " ".repeat(right));
+    let arrow_style = if selected {
+        Style::default()
+            .fg(Color::White)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray).bg(bg)
+    };
+    let bleed_style = Style::default().fg(bg);
+    let lines = vec![
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled(crate::sidebar::BLEED_ABOVE.repeat(btn_w), bleed_style),
+        ]),
+        Line::from(vec![Span::raw(" "), Span::styled(btn_text, arrow_style)]),
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled(crate::sidebar::BLEED_BELOW.repeat(btn_w), bleed_style),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Render a slice of one-line rows as an indented `List`, highlighting the row
@@ -492,6 +600,9 @@ fn switch_nav_line(
 
 fn render_row(app: &ReviewPanel, row: &PanelRow, selected: bool, width: usize) -> ListItem<'static> {
     match row {
+        // The back button is drawn by `render_back_button` as its own block,
+        // never through this per-row list renderer.
+        PanelRow::Back => unreachable!("the back button renders via render_back_button"),
         PanelRow::Status => ListItem::new(Line::from(Span::styled(
             "Ready for review",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -683,6 +794,14 @@ fn handle_mouse(app: &mut ReviewPanel, mouse: MouseEvent) -> PanelEffect {
 fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect) {
     match effect {
         PanelEffect::None => {}
+        // Back button: navigate focus to the dashboard without tearing the
+        // interface down (no `should_quit`), so the still-loaded review stays
+        // put and can be re-opened from the sidebar.
+        PanelEffect::FocusDashboard => {
+            if let Err(e) = shelbi_orchestrator::review_ui::focus_dashboard(project_name) {
+                app.status_line = format!("back to dashboard failed: {e}");
+            }
+        }
         PanelEffect::ShowChat => {
             if let Err(e) = shelbi_orchestrator::review_ui::show_review_view(
                 project_name,
@@ -881,8 +1000,9 @@ mod tests {
     #[test]
     fn renders_header_switcher_and_action_buttons() {
         let mut app = panel(true);
-        // Wide enough that the (short) worktree path isn't truncated.
-        let out = render(&mut app, 44, 16);
+        // Wide enough that the (short) worktree path isn't truncated; tall
+        // enough that the back button + header + switches + actions all fit.
+        let out = render(&mut app, 44, 20);
         assert!(out.contains("Ready for review"), "header status: {out}");
         assert!(out.contains("wt/review"), "worktree folder shown: {out}");
         assert!(out.contains("Chat with Reviewer"), "chat switch: {out}");
@@ -892,13 +1012,97 @@ mod tests {
         assert!(out.contains("Reject"), "reject button: {out}");
     }
 
+    /// The back button leads the panel: a square block (bleed row above, arrow
+    /// row, bleed row below) sitting above the "Ready for review" header, with
+    /// only the back-arrow glyph and no text label.
+    #[test]
+    fn back_button_renders_a_square_arrow_at_the_top() {
+        let mut app = panel(true);
+        let rows = render_lines(&mut app, 30, 20);
+        // Arrow on the button's middle line; bleed rows bracket it.
+        assert!(
+            rows[BACK_BUTTON_LINE].contains('\u{2190}'),
+            "back-arrow glyph on the button line: {:?}",
+            rows[BACK_BUTTON_LINE]
+        );
+        assert!(
+            rows[BACK_BUTTON_LINE - 1].contains(crate::sidebar::BLEED_ABOVE),
+            "lower-half-block bleed above the button: {:?}",
+            rows[BACK_BUTTON_LINE - 1]
+        );
+        assert!(
+            rows[BACK_BUTTON_LINE + 1].contains(crate::sidebar::BLEED_BELOW),
+            "upper-half-block bleed below the button: {:?}",
+            rows[BACK_BUTTON_LINE + 1]
+        );
+        // Glyph only — no text label on the button row.
+        assert!(
+            !rows[BACK_BUTTON_LINE].chars().any(|c| c.is_alphabetic()),
+            "back button carries no text label: {:?}",
+            rows[BACK_BUTTON_LINE]
+        );
+        // It sits above the header, which is the whole point of a top button.
+        assert!(
+            row_y(&rows, "Ready for review") > BACK_BUTTON_LINE,
+            "back button must sit above the status header, rows:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// The back button's fill reads as a square: the arrow line carries the
+    /// selection background across the button's cells, and the bleed rows carry
+    /// that same colour in their foreground so it continues half a cell up/down.
+    #[test]
+    fn back_button_fill_reads_as_a_square() {
+        let mut term = Terminal::new(TestBackend::new(30, 20)).unwrap();
+        let mut app = panel(true);
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        // The button starts at the 1-col indent (column 1). Its fill covers the
+        // arrow row (BACK_BUTTON_LINE); the bleed rows above/below paint the
+        // same colour in the foreground.
+        assert_eq!(
+            buf[(1, BACK_BUTTON_LINE as u16)].bg,
+            crate::theme::SELECTION_BG,
+            "arrow row carries the button fill"
+        );
+        assert_eq!(
+            buf[(1, (BACK_BUTTON_LINE - 1) as u16)].fg,
+            crate::theme::SELECTION_BG,
+            "bleed above carries the fill colour so it reads square"
+        );
+        assert_eq!(
+            buf[(1, (BACK_BUTTON_LINE + 1) as u16)].fg,
+            crate::theme::SELECTION_BG,
+            "bleed below carries the fill colour so it reads square"
+        );
+    }
+
+    /// Activating the back button (Enter or click) asks the host loop to switch
+    /// focus back to the dashboard — it does not tear the interface down.
+    #[test]
+    fn activating_back_button_focuses_the_dashboard() {
+        let mut app = panel(true);
+        let idx = app
+            .rows()
+            .iter()
+            .position(|r| matches!(r, PanelRow::Back))
+            .unwrap();
+        assert_eq!(idx, 0, "back button leads the panel");
+        app.selected = idx;
+        assert_eq!(app.activate(), PanelEffect::FocusDashboard);
+        // A click on the button's middle line maps to the same effect.
+        let _ = render(&mut app, 30, 20); // populate list_area
+        assert_eq!(app.click(1, BACK_BUTTON_LINE as u16), PanelEffect::FocusDashboard);
+    }
+
     /// The leading "Actions" header above the switches is gone — the three
     /// action items stand on their own the way the main nav does. The switch
     /// group renders before any remaining section header.
     #[test]
     fn leading_actions_header_no_longer_renders_above_the_switches() {
         let mut app = panel(true);
-        let rows = render_lines(&mut app, 44, 16);
+        let rows = render_lines(&mut app, 44, 20);
         // The Chat switch is the first action, sitting directly under the
         // folder row with no "Actions" divider above it.
         let chat_y = row_y(&rows, "Chat with Reviewer");
@@ -926,7 +1130,7 @@ mod tests {
         // Move focus to the Edit switch (the middle of the three) so both a
         // separator-above and separator-below are asserted.
         app.nav_down();
-        let rows = render_lines(&mut app, width, 16);
+        let rows = render_lines(&mut app, width, 20);
         let edit_y = row_y(&rows, "Edit in Vim");
         assert_eq!(
             rows[edit_y - 1],
@@ -954,11 +1158,11 @@ mod tests {
     #[test]
     fn switch_separators_keep_labels_from_shifting_across_selection() {
         let mut chat = panel(true); // Chat focused by default
-        let chat_rows = render_lines(&mut chat, 30, 16);
+        let chat_rows = render_lines(&mut chat, 30, 20);
 
         let mut edit = panel(true);
         edit.nav_down(); // focus Edit
-        let edit_rows = render_lines(&mut edit, 30, 16);
+        let edit_rows = render_lines(&mut edit, 30, 20);
 
         for label in ["Chat with Reviewer", "Edit in Vim", "Open Browser"] {
             assert_eq!(
@@ -980,7 +1184,7 @@ mod tests {
     #[test]
     fn selected_switch_fill_spans_full_width() {
         let width = 30u16;
-        let mut term = Terminal::new(TestBackend::new(width, 16)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
         let mut app = panel(true); // Chat focused by default
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
@@ -1014,7 +1218,7 @@ mod tests {
     #[test]
     fn browser_entry_hidden_without_review_url() {
         let mut app = panel(false);
-        let out = render(&mut app, 30, 16);
+        let out = render(&mut app, 30, 20);
         assert!(!out.contains("Open Browser"), "no browser action when no url: {out}");
         // The rest of the panel still renders.
         assert!(out.contains("Chat with Reviewer") && out.contains("Approve"));
@@ -1023,7 +1227,7 @@ mod tests {
     #[test]
     fn editor_label_tracks_resolved_editor_name() {
         let mut app = ReviewPanel::new("t", "/wt", "Helix".to_string(), false);
-        let out = render(&mut app, 30, 16);
+        let out = render(&mut app, 30, 20);
         assert!(out.contains("Edit in Helix"), "label uses resolved editor: {out}");
     }
 

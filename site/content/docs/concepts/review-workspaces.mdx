@@ -231,15 +231,18 @@ state.
 
 ## The review interface
 
-Opening a Ready task launches the **review interface** — a three-pane tmux
-layout: the project sidebar on the left, a swappable content pane in the
-middle, and a **review panel** on the right. The panel is where you drive the
-review:
+Opening a Ready task launches the **review interface** — a two-column tmux
+layout: the **review panel** on the left and the swappable review content on
+the right. The panel is the review window's own navigation, so the global nav
+sidebar stays docked in the dashboard. The panel is where you drive the review:
 
+- A square **back button** at the top (a back-arrow glyph) that switches focus
+  back to the dashboard window. It leaves the review interface loaded, so you
+  can return to it from the sidebar.
 - A **header** with the review status (`Ready for review`) and the review
   worktree's folder (`📂`) — click it to reveal the worktree in your OS file
   manager.
-- A **view switcher** that swaps the middle pane:
+- A **view switcher** that swaps the right-hand content pane:
   - **🤓 Chat with Reviewer** (default) — talk to the Review agent.
   - **✍️ Edit in `<editor>`** — open the worktree in your configured editor
     (see below).
