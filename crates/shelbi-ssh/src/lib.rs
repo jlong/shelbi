@@ -125,17 +125,32 @@ const SSH_CONTROL_OPTS_STATIC: &[&str] = &[
     // The ControlMaster opened on the first call inherits the `-R`
     // reverse forward; subsequent slave connections inherit the
     // multiplexed channel without re-requesting it. ExitOnForwardFailure=no
-    // (the default) and LogLevel=ERROR keep duplicate-forward warnings
-    // on slave reconnects from blocking the connection or polluting
-    // the user's terminal. NB: these options silence the forward-failed
-    // warning on the *master open* too. That gap is closed out of band by
-    // [`ensure_reverse_forward`], which cleans and verifies the forward
-    // instead of relying on ssh's suppressed stderr.
+    // (the default) keeps duplicate-forward warnings on slave reconnects
+    // from blocking the connection. The `LogLevel` (appended by
+    // [`base_control_opts`], default `ERROR`, overridable via
+    // `SHELBI_SSH_LOG_LEVEL`) keeps those warnings from polluting the
+    // user's terminal. NB: at the default level these options silence the
+    // forward-failed warning on the *master open* too. That gap is closed
+    // out of band by [`ensure_reverse_forward`], which cleans and verifies
+    // the forward instead of relying on ssh's suppressed stderr.
     "-o",
     "ExitOnForwardFailure=no",
-    "-o",
-    "LogLevel=ERROR",
 ];
+
+/// The ssh `LogLevel` to run shelbi-routed commands at. Defaults to `ERROR`
+/// (quiet — only genuine failures print), but `SHELBI_SSH_LOG_LEVEL` overrides
+/// it so an operator diagnosing a ControlMaster / reverse-forward problem can
+/// escalate to `DEBUG1` and see ssh's mux chatter (the
+/// `mux_client_request_session: read from master failed…` line and friends)
+/// instead of a blank `--- stderr ---`. Trimmed; an empty value falls back to
+/// the `ERROR` default.
+fn ssh_log_level() -> String {
+    std::env::var("SHELBI_SSH_LOG_LEVEL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "ERROR".to_string())
+}
 
 /// The static control options plus the per-invocation `ControlPath`, but
 /// *without* the `-R` reverse forward — the forward spec is mode-dependent
@@ -145,6 +160,11 @@ fn base_control_opts() -> Vec<String> {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
+    // LogLevel rides in front of the ControlPath so a `SHELBI_SSH_LOG_LEVEL`
+    // override (e.g. DEBUG1) surfaces ssh's mux/ControlMaster diagnostics that
+    // the default ERROR level keeps quiet.
+    opts.push("-o".into());
+    opts.push(format!("LogLevel={}", ssh_log_level()));
     // OpenSSH refuses to create the ControlPath's parent for us — a
     // missing `~/.shelbi/ssh/` surfaces as `unix_listener: cannot bind
     // to path …: No such file or directory` and the connection dies
@@ -213,10 +233,10 @@ fn apply_ssh_control_opts(cmd: &mut Command, hostname: &str) {
 /// so they must not create the socket as a side effect.
 fn apply_ssh_no_forward_opts(cmd: &mut Command) {
     for (flag, value) in [
-        ("-o", "ControlMaster=no"),
-        ("-o", "ConnectTimeout=5"),
-        ("-o", "BatchMode=yes"),
-        ("-o", "LogLevel=ERROR"),
+        ("-o", "ControlMaster=no".to_string()),
+        ("-o", "ConnectTimeout=5".to_string()),
+        ("-o", "BatchMode=yes".to_string()),
+        ("-o", format!("LogLevel={}", ssh_log_level())),
     ] {
         cmd.arg(flag).arg(value);
     }
@@ -406,11 +426,20 @@ where
             let _ = child.wait();
             // The kill closed the pipes, so the readers see EOF and finish.
             let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("command did not finish within {deadline:?}"),
-            ));
+            // Surface whatever the child wrote to stderr *before* the kill —
+            // a Tailscale-SSH web-auth wedge, for instance, prints its
+            // "To authenticate, visit …" line and then parks, and that line is
+            // the actionable diagnostic. Without folding it in, the timeout
+            // error would be as blank as the `exit 255` case this task fixes.
+            let partial = stderr_reader.join().unwrap_or_default();
+            let partial = String::from_utf8_lossy(&partial);
+            let partial = partial.trim();
+            let msg = if partial.is_empty() {
+                format!("command did not finish within {deadline:?}")
+            } else {
+                format!("command did not finish within {deadline:?}; stderr before kill: {partial}")
+            };
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, msg));
         }
         std::thread::sleep(DEADLINE_POLL);
     };
@@ -442,7 +471,10 @@ where
         return Err(shelbi_core::Error::Command {
             cmd: cmd_str,
             status: output.status.to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            // Never a blank tail: a broken/absent ControlMaster (`exit 255`
+            // with empty stderr) gets a Shelbi-side annotation of the master
+            // state instead. See [`annotated_stderr`].
+            stderr: annotated_stderr(host, &output),
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -508,7 +540,9 @@ where
         return Err(shelbi_core::Error::Command {
             cmd: cmd_str,
             status: output.status.to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            // Annotated so a broken-master `exit 255` doesn't reach the
+            // operator as a blank `--- stderr ---`. See [`annotated_stderr`].
+            stderr: annotated_stderr(host, &output),
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -540,6 +574,96 @@ fn drop_master(hostname: &str) {
     }
     cmd.arg("-O").arg("exit").arg(hostname);
     let _ = cmd.output();
+}
+
+/// Read-only `ssh -O check` against the shelbi ControlPath for `hostname`,
+/// returning ssh's own one-line verdict about the master. Unlike
+/// [`drop_master`] this never opens or tears anything down — it only asks
+/// whether a master is alive — so it is safe to run on a *failure* path to
+/// explain a blank `--- stderr ---`. ssh writes the verdict to stderr
+/// (`Master running (pid=…)` on success, `Control socket connect(…): No such
+/// file or directory` when the socket is gone); we fall back to stdout and
+/// then to the exit status so the caller always gets a non-empty string.
+fn master_check(hostname: &str) -> String {
+    let mut cmd = Command::new("ssh");
+    for o in control_path_opt() {
+        cmd.arg(o);
+    }
+    cmd.arg("-O").arg("check").arg(hostname);
+    match cmd.output() {
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stderr = stderr.trim();
+            if !stderr.is_empty() {
+                return stderr.to_string();
+            }
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let stdout = stdout.trim();
+            if !stdout.is_empty() {
+                return stdout.to_string();
+            }
+            format!("no output ({})", o.status)
+        }
+        Err(e) => format!("could not spawn `ssh -O check`: {e}"),
+    }
+}
+
+/// Format the Shelbi-side annotation used when a failed command left an empty
+/// stderr. Pure so the message shape is unit-testable without shelling out:
+/// callers pass the exit `code` and, for an ssh command, the `master_state`
+/// that [`master_check`] probed (`None` for a local command, where there is no
+/// ControlMaster to inspect).
+fn format_blank_stderr_annotation(code: Option<i32>, master_state: Option<&str>) -> String {
+    let exit = match code {
+        Some(c) => format!("exit {c}"),
+        None => "terminated by signal".to_string(),
+    };
+    match master_state {
+        Some(state) => format!(
+            "<shelbi: ssh produced no stderr ({exit}); \
+             ControlMaster probe `ssh -O check`: {state}>"
+        ),
+        None => format!("<shelbi: command produced no stderr ({exit})>"),
+    }
+}
+
+/// The stderr text to attach to a failed command's error, **guaranteed
+/// non-empty** so a managed-SSH failure never surfaces as a blank
+/// `--- stderr ---`. When the child left a diagnostic on stderr it is returned
+/// verbatim (this is the common, informative case — `Permission denied`,
+/// `Connection refused`, `fatal: …`). When stderr is blank on a *failing*
+/// command — the classic `exit status: 255` from a broken/absent ControlMaster
+/// — it is annotated: for an ssh host with a cheap read-only `ssh -O check`
+/// probe of the same ControlPath (so the operator sees whether the transport
+/// was alive), for a local host with the exit code alone.
+///
+/// A *successful* command with empty stderr returns the empty string unchanged
+/// — there is nothing to explain — so this is only meaningful on the error path.
+pub fn annotated_stderr(host: &Host, output: &Output) -> String {
+    let raw = String::from_utf8_lossy(&output.stderr);
+    if !raw.trim().is_empty() || output.status.success() {
+        return raw.into_owned();
+    }
+    let code = output.status.code();
+    match host {
+        Host::Ssh { host } => {
+            let state = master_check(host);
+            format_blank_stderr_annotation(code, Some(&state))
+        }
+        Host::Local => format_blank_stderr_annotation(code, None),
+    }
+}
+
+/// A one-line `exit <status> — <stderr-or-annotation>` summary of a failed
+/// command's [`Output`], for callers (e.g. the git branch-cut path) that fold a
+/// remote failure into an [`shelbi_core::Error::Other`] message rather than the
+/// structured [`shelbi_core::Error::Command`]. Wraps [`annotated_stderr`] so
+/// those hand-rolled messages carry the exit code and the ssh diagnostic (or
+/// ControlMaster annotation) instead of a bare, blank tail.
+pub fn describe_failure(host: &Host, output: &Output) -> String {
+    let stderr = annotated_stderr(host, output);
+    let stderr = stderr.trim();
+    format!("{}: {stderr}", output.status)
 }
 
 /// Assemble the argv (after the `ssh` program) for a Unix-socket master open
@@ -1622,5 +1746,127 @@ mod tests {
             forward_health_changed(&host, "fail:tcp:loopback_port_exhausted"),
             "a different failure detail must emit"
         );
+    }
+
+    #[test]
+    fn format_blank_stderr_annotation_is_never_blank() {
+        // The ssh variant folds in the exit code and the ControlMaster probe
+        // result — this is what replaces a blank `--- stderr ---` on a
+        // broken-master `exit 255`.
+        let ssh = format_blank_stderr_annotation(
+            Some(255),
+            Some("Control socket connect(/x): No such file or directory"),
+        );
+        assert!(!ssh.trim().is_empty());
+        assert!(ssh.contains("255"), "must name the exit code: {ssh}");
+        assert!(ssh.contains("ssh -O check"), "must name the probe: {ssh}");
+        assert!(ssh.contains("No such file"), "must carry the probe result: {ssh}");
+
+        // The local variant still annotates (no master to probe, but never blank).
+        let local = format_blank_stderr_annotation(Some(255), None);
+        assert!(!local.trim().is_empty());
+        assert!(local.contains("255"), "must name the exit code: {local}");
+
+        // A signal-terminated child (no exit code) is still described.
+        let sig = format_blank_stderr_annotation(None, None);
+        assert!(sig.contains("signal"), "signal death must be described: {sig}");
+    }
+
+    #[test]
+    fn annotated_stderr_passes_through_a_real_diagnostic() {
+        // When the child actually wrote to stderr, we return it verbatim —
+        // the annotation only kicks in on the blank case.
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("echo 'Permission denied (publickey).' >&2; exit 255")
+            .output()
+            .expect("sh failed");
+        let got = annotated_stderr(&Host::Local, &output);
+        assert!(got.contains("Permission denied"), "verbatim stderr: {got}");
+        assert!(!got.contains("<shelbi:"), "no annotation when stderr present: {got}");
+    }
+
+    #[test]
+    fn annotated_stderr_annotates_a_255_with_empty_stderr() {
+        // Acceptance: given an Output with status 255 and empty stderr, the
+        // formatter produces an annotated (non-blank) message. Local host so
+        // the test is hermetic (no ssh spawn), but the code path is identical.
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 255")
+            .output()
+            .expect("sh failed");
+        assert_eq!(output.status.code(), Some(255));
+        assert!(output.stderr.is_empty(), "precondition: blank stderr");
+
+        let got = annotated_stderr(&Host::Local, &output);
+        assert!(!got.trim().is_empty(), "annotation must never be blank");
+        assert!(got.contains("255"), "annotation must name the exit code: {got}");
+    }
+
+    #[test]
+    fn annotated_stderr_leaves_a_successful_command_empty() {
+        // A success with no stderr has nothing to explain — don't manufacture
+        // a spurious annotation (or spawn an `ssh -O check`) on the happy path.
+        let output = std::process::Command::new("true").output().expect("true failed");
+        assert!(annotated_stderr(&Host::Local, &output).is_empty());
+    }
+
+    #[test]
+    fn describe_failure_carries_exit_code_and_annotation() {
+        // The hand-rolled-message path (git branch cut) gets both the status
+        // and a non-blank tail from one call.
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 255")
+            .output()
+            .expect("sh failed");
+        let desc = describe_failure(&Host::Local, &output);
+        assert!(desc.contains("255"), "must carry the exit code: {desc}");
+        assert!(!desc.trim_end_matches(':').trim().is_empty());
+        // The annotation, not a bare trailing colon with nothing after it.
+        assert!(desc.contains("<shelbi:"), "must carry the annotation: {desc}");
+    }
+
+    #[test]
+    fn run_with_deadline_timeout_surfaces_partial_stderr() {
+        // A child that writes a diagnostic and then hangs (the Tailscale-SSH
+        // web-auth wedge shape) must have that line folded into the TimedOut
+        // error, not discarded.
+        let err = run_with_deadline(
+            &Host::Local,
+            ["sh", "-c", "echo 'To authenticate, visit https://…' >&2; sleep 30"],
+            Duration::from_millis(300),
+        )
+        .expect_err("hung child must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "err: {err}");
+        assert!(
+            err.to_string().contains("To authenticate"),
+            "timeout error must surface pre-kill stderr: {err}"
+        );
+    }
+
+    #[test]
+    fn ssh_log_level_defaults_to_error_and_honors_override() {
+        std::env::remove_var("SHELBI_SSH_LOG_LEVEL");
+        assert_eq!(ssh_log_level(), "ERROR");
+
+        std::env::set_var("SHELBI_SSH_LOG_LEVEL", "DEBUG1");
+        assert_eq!(ssh_log_level(), "DEBUG1");
+
+        // Whitespace-only / empty falls back to the quiet default.
+        std::env::set_var("SHELBI_SSH_LOG_LEVEL", "   ");
+        assert_eq!(ssh_log_level(), "ERROR");
+
+        std::env::remove_var("SHELBI_SSH_LOG_LEVEL");
+
+        // The chosen level rides in the control opts every ssh command carries.
+        std::env::set_var("SHELBI_SSH_LOG_LEVEL", "DEBUG1");
+        let opts = build_ssh_control_opts("devbox");
+        assert!(
+            opts.iter().any(|o| o == "LogLevel=DEBUG1"),
+            "override must reach the ssh argv: {opts:?}"
+        );
+        std::env::remove_var("SHELBI_SSH_LOG_LEVEL");
     }
 }

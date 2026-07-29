@@ -3948,7 +3948,11 @@ fn resolve_fresh_cut_base(host: &Host, repo: &str, default_branch: &str) -> Resu
         return Err(Error::Other(format!(
             "refusing to cut a task branch from a possibly-stale `{default_branch}`: \
              `git fetch origin {default_branch}` failed in {repo}: {}",
-            String::from_utf8_lossy(&fetch.stderr).trim(),
+            // `describe_failure` folds in the exit code AND a non-blank stderr:
+            // a broken/absent ssh ControlMaster fails this fetch with `exit 255`
+            // and empty stderr, which used to surface as a bare, actionless
+            // message. See `shelbi_ssh::annotated_stderr`.
+            shelbi_ssh::describe_failure(host, &fetch),
         )));
     }
     Ok(format!("origin/{default_branch}"))
