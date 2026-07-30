@@ -715,6 +715,36 @@ pub fn lock_project_scaffold() -> Result<ProjectScaffoldLock> {
     Ok(ProjectScaffoldLock(acquire_file_lock(&path)?))
 }
 
+/// Public RAII handle for the per-host SSH ControlMaster creation lock.
+/// Released when dropped.
+#[must_use = "the ssh-master lock is released as soon as the guard is dropped"]
+pub struct SshMasterLock(#[allow(dead_code)] FileLockGuard);
+
+/// Block until the exclusive per-host SSH ControlMaster lock is held.
+///
+/// The hub daemon, TUI, and CLI all open `ControlMaster=auto` against the same
+/// `%C` `ControlPath` for a given remote host. Left uncoordinated, one process
+/// can drop-and-reopen (or the startup prune can sweep) the master while another
+/// has an in-flight command multiplexed over it — surfacing as the
+/// `read from master failed: Broken pipe` / `Control socket connect(...): No
+/// such file` failures this lock prevents. Holding this guard across a
+/// master (re)creation serializes it against every other process — and thread —
+/// that touches the same host's master.
+///
+/// The lock file lives under `$SHELBI_HOME/ssh/` (a sibling of the sockets
+/// themselves) so it travels with them; it is a regular file, so the socket-only
+/// startup prune never touches it. `host` is sanitized to a flat filename token
+/// — two distinct hosts that sanitize alike merely serialize with each other,
+/// which is harmless.
+pub fn lock_ssh_master(host: &str) -> Result<SshMasterLock> {
+    let token: String = host
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let path = shelbi_home()?.join("ssh").join(format!("master-{token}.lock"));
+    Ok(SshMasterLock(acquire_file_lock(&path)?))
+}
+
 /// Sibling lock-file path for `path` (`state.json` → `state.json.lock`).
 /// The suffix is appended to the full file name — never `with_extension`,
 /// which would collide `a.json` and `a.yaml` onto the same lock.

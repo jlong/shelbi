@@ -365,7 +365,13 @@ fn create_worktree(
         args.push(parent_branch.clone());
     }
 
-    let output = shelbi_ssh::run(host, &args).map_err(|e| anyhow!(e))?;
+    // Route through the shared transport-loss recovery: a `worktree add` that
+    // loses the managed ControlMaster mid-checkout (large repos take seconds)
+    // cleans the partial worktree and retries once on a fresh non-multiplexed
+    // connection rather than failing the spawn on a transient mux drop.
+    let output =
+        shelbi_orchestrator::workspace::worktree_add_with_recovery(host, &repo_dir, &wt_str, &args)
+            .map_err(|e| anyhow!(e))?;
     if !output.status.success() {
         bail!(
             "git worktree add failed: {}\n{}",

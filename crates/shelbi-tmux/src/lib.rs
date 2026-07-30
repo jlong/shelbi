@@ -476,6 +476,9 @@ mod tests {
                     || v.starts_with("BatchMode=")
                     || v.starts_with("ExitOnForwardFailure=")
                     || v.starts_with("LogLevel=")
+                    || v.starts_with("ServerAliveInterval=")
+                    || v.starts_with("ServerAliveCountMax=")
+                    || v.starts_with("TCPKeepAlive=")
                 {
                     i += 2;
                     continue;
