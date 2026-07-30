@@ -560,6 +560,36 @@ pub fn save_host_forward(host: &str, decision: Option<HostForward>) -> Result<()
     crate::atomic_write(&path, &body)
 }
 
+/// Reconcile the persisted forward decisions against reality and release any
+/// that no longer hold. `still_bound(host, &HostForward)` reports whether that
+/// host's forward still corresponds to a *live* transport (a ControlMaster
+/// whose `-R` listener is actually up) — the caller supplies the real-world
+/// probe. Entries that fail are dropped so a stale or leaked port assignment
+/// left behind by a dead master is not carried forward as though it were
+/// durable, and — critically — is never mistaken for an occupied port on the
+/// next TCP allocation sweep (the false-exhaustion bug this guards against).
+///
+/// Best-effort and single-pass: reads the map once, releases the stale hosts,
+/// and returns their names (in no particular order) so the caller can log a
+/// one-liner. A per-host write failure is swallowed rather than aborting the
+/// reconciliation of the remaining hosts.
+pub fn reconcile_forward_state(
+    still_bound: impl Fn(&str, &HostForward) -> bool,
+) -> Vec<String> {
+    let stale: Vec<String> = load_forward_state()
+        .iter()
+        .filter(|(host, hf)| !still_bound(host, hf))
+        .map(|(host, _)| host.clone())
+        .collect();
+    for host in &stale {
+        // A leftover entry for a dead master is worse than none: it points
+        // workers (via `remote_hub_endpoint`) at a port nothing is listening
+        // on. Releasing it forces a clean re-detection on the next ensure.
+        let _ = save_host_forward(host, None);
+    }
+    stale
+}
+
 /// Where a *worker* on a remote host reaches the hub daemon — the endpoint the
 /// hub's `-R` forward lands on. Resolved from the persisted per-host decision:
 /// a host in TCP mode (with a bound port) yields [`HubEndpoint::Tcp`], everyone
@@ -1144,6 +1174,62 @@ mod tests {
             remote_hub_endpoint("halfway"),
             HubEndpoint::Unix(_)
         ));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn reconcile_forward_state_releases_stale_entries_and_keeps_live_ones() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Two hosts: one whose forward is still live, one whose master died
+        // (its persisted TCP port is now stale/leaked — nothing is listening).
+        save_host_forward(
+            "live",
+            Some(HostForward {
+                mode: shelbi_core::ForwardMode::Tcp,
+                port: Some(47101),
+            }),
+        )
+        .unwrap();
+        save_host_forward(
+            "dead",
+            Some(HostForward {
+                mode: shelbi_core::ForwardMode::Tcp,
+                port: Some(47102),
+            }),
+        )
+        .unwrap();
+
+        // Reality probe: only "live" still has a bound listener.
+        let released = reconcile_forward_state(|host, _hf| host == "live");
+
+        assert_eq!(released, vec!["dead".to_string()], "only the dead host is released");
+        // The live entry survives verbatim; the stale one is gone so it can't
+        // be counted as an occupied port on the next allocation sweep.
+        assert_eq!(
+            load_host_forward("live"),
+            Some(HostForward {
+                mode: shelbi_core::ForwardMode::Tcp,
+                port: Some(47101),
+            })
+        );
+        assert_eq!(load_host_forward("dead"), None);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn reconcile_forward_state_on_empty_map_is_a_noop() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // No persisted decisions → nothing to release, predicate never consulted.
+        let released = reconcile_forward_state(|_, _| panic!("predicate must not run on an empty map"));
+        assert!(released.is_empty());
 
         std::env::remove_var("SHELBI_HOME");
     }

@@ -218,6 +218,7 @@ pub(super) fn run_foreground() -> Result<()> {
     let _bind_lock = acquire_bind_lock(&sock)?;
     prepare_socket(&sock)?;
     prune_stale_control_masters();
+    reconcile_forward_modes();
 
     // Tighten the umask around bind() so the socket inode is created
     // 0600 from the very start. Without this there is a window between
@@ -427,6 +428,25 @@ fn prune_stale_control_masters() {
         Err(e) => {
             eprintln!("shelbi daemon: ControlMaster cleanup failed: {e}");
         }
+    }
+}
+
+/// Reconcile `forward-modes.json` against reality right after the stale
+/// ControlMaster sweep, releasing any persisted forward decision whose master is
+/// no longer alive. A dead master has no `-R` listener behind it, so a leftover
+/// TCP entry both points workers at a dead port and — worse — could be miscounted
+/// as an occupied port on the next allocation sweep (the false-exhaustion bug).
+/// Runs once at startup, before any poller re-establishes forwards, so there is
+/// no race with an in-flight ensure. Best-effort: never fails the daemon start.
+fn reconcile_forward_modes() {
+    let released = shelbi_state::reconcile_forward_state(|host, _hf| shelbi_ssh::master_alive(host));
+    if !released.is_empty() {
+        eprintln!(
+            "shelbi daemon: forward-mode reconciliation — released {} stale entr{} ({})",
+            released.len(),
+            if released.len() == 1 { "y" } else { "ies" },
+            released.join(", "),
+        );
     }
 }
 
