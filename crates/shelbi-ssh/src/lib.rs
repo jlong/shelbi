@@ -804,6 +804,25 @@ fn master_check(hostname: &str) -> String {
     }
 }
 
+/// Is a live ControlMaster answering for `hostname`? A read-only `ssh -O check`
+/// against the shelbi ControlPath: exit 0 means a master is up (and, since its
+/// `-R` reverse forward rides on that master, the forward listener is up too);
+/// any other result means no live master. Never opens or tears anything down,
+/// so it is safe to call from startup reconciliation without side effects.
+///
+/// This is the reality probe [`shelbi_state::reconcile_forward_state`] uses to
+/// release stale/leaked `forward-modes.json` entries: a persisted TCP port whose
+/// master is dead has no listener behind it, so keeping the entry would both
+/// point workers at a dead port and let the next sweep miscount it as occupied.
+pub fn master_alive(hostname: &str) -> bool {
+    let mut cmd = Command::new("ssh");
+    for o in control_path_opt() {
+        cmd.arg(o);
+    }
+    cmd.arg("-O").arg("check").arg(hostname);
+    matches!(cmd.output(), Ok(o) if o.status.success())
+}
+
 /// Format the Shelbi-side annotation used when a failed command left an empty
 /// stderr. Pure so the message shape is unit-testable without shelling out:
 /// callers pass the exit `code` and, for an ssh command, the `master_state`
@@ -1137,6 +1156,129 @@ fn ensure_unix_forward(host: &Host, hostname: &str, remote_sock: &str) -> UnixFo
     }
 }
 
+/// Substrings the ssh client emits (with `ExitOnForwardFailure=yes`) when a `-R`
+/// bind is refused because the remote loopback port is already taken — the
+/// genuine "this port is occupied" fingerprint. Matched case-insensitively.
+///
+/// Crucially distinct from a *transport* failure (a churning/broken
+/// ControlMaster, a reset connection, an unreachable host): those exit nonzero
+/// too, but say nothing about whether the port is free — misreading them as
+/// occupancy is exactly the false-exhaustion bug (a mux hiccup on all 64 ports
+/// reported "all 64 in use" when `ss` showed them free).
+const TCP_FORWARD_COLLISION_MARKERS: &[&str] = &[
+    // OpenSSH client, ExitOnForwardFailure=yes, remote refused the bind:
+    //   "Warning: remote port forwarding failed for listen port 47100"
+    "remote port forwarding failed",
+    // Defensive synonyms seen across ssh/sshd versions and setups.
+    "forwarding request failed",
+    "address already in use",
+    "cannot listen to port",
+];
+
+/// Outcome of a single TCP-loopback `-R` master open against one candidate port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpForwardOpen {
+    /// The master opened and (via `ExitOnForwardFailure=yes`) the `-R` bound:
+    /// the port is ours.
+    Bound,
+    /// The remote refused to bind the port — it is genuinely occupied. The sweep
+    /// should advance to the next candidate.
+    PortCollision,
+    /// The master could not be established at all: a churning/broken
+    /// ControlMaster, a reset connection, an unreachable host, a refused auth.
+    /// This is NOT evidence the port is in use, so it must never be counted as an
+    /// occupied port. The sweep aborts and reports a transient, recoverable
+    /// failure the next ~120s recheck re-probes — rather than latching a bogus
+    /// "band exhausted."
+    Transport,
+}
+
+/// Classify a TCP-loopback master-open [`Output`]. Pure so the
+/// free/collision/transient decision is unit-testable without a real ssh
+/// transport. Success is [`TcpForwardOpen::Bound`]; a failure whose stderr
+/// carries a port-bind-collision signature is [`TcpForwardOpen::PortCollision`];
+/// every *other* failure (blank 255, mux churn, connection reset, unreachable,
+/// refused auth) is [`TcpForwardOpen::Transport`] — a transport loss that says
+/// nothing about port occupancy. Defaulting the unknown case to `Transport`
+/// (not `PortCollision`) is deliberate: at worst we re-probe next cycle, which
+/// recovers; the opposite mistake latches false exhaustion.
+fn classify_tcp_forward_open(output: &Output) -> TcpForwardOpen {
+    if output.status.success() {
+        return TcpForwardOpen::Bound;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if TCP_FORWARD_COLLISION_MARKERS.iter().any(|m| stderr.contains(m)) {
+        return TcpForwardOpen::PortCollision;
+    }
+    TcpForwardOpen::Transport
+}
+
+/// The terminal decision of a candidate-port sweep. Pure result type so
+/// [`decide_tcp_sweep`] can be tested independently of the side-effecting opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpSweepResult {
+    /// A candidate bound — worker→hub delivery works on this port.
+    Bound(u16),
+    /// The transport flaked partway through the sweep (at this port). NOT
+    /// exhaustion: the remaining ports would fail identically and say nothing
+    /// about occupancy, so we bail with a recoverable error and re-probe.
+    TransportUnstable(u16),
+    /// Every candidate reported a *genuine* bind collision — real exhaustion.
+    Exhausted,
+}
+
+/// Fold a lazily-evaluated sequence of `(port, outcome)` bind attempts into the
+/// terminal [`TcpSweepResult`]. Stops at the first `Bound` (success) or
+/// `Transport` (transient — do not keep sweeping a flaky transport as though the
+/// ports were occupied); a `PortCollision` advances to the next candidate. Only
+/// a run in which *every* candidate collided yields [`TcpSweepResult::Exhausted`]
+/// — that is the sole path to a legitimate "band exhausted" report. Consuming an
+/// iterator (rather than a materialized `Vec`) preserves the caller's laziness:
+/// the expensive per-port open only runs until the decision is reached.
+fn decide_tcp_sweep<I>(outcomes: I) -> TcpSweepResult
+where
+    I: IntoIterator<Item = (u16, TcpForwardOpen)>,
+{
+    for (port, outcome) in outcomes {
+        match outcome {
+            TcpForwardOpen::Bound => return TcpSweepResult::Bound(port),
+            TcpForwardOpen::PortCollision => continue,
+            TcpForwardOpen::Transport => return TcpSweepResult::TransportUnstable(port),
+        }
+    }
+    TcpSweepResult::Exhausted
+}
+
+/// Attempt to bind the TCP-loopback forward on one `port`, absorbing a transient
+/// ControlMaster blip. Drops any existing master first (so `ControlMaster=auto`
+/// opens a fresh one that binds *this* port's `-R`), opens, and classifies. A
+/// [`TcpForwardOpen::Transport`] result is retried with the shared backoff
+/// schedule — a master churning mid-sweep must not be read as "port occupied" —
+/// while a [`TcpForwardOpen::PortCollision`] (genuinely occupied) and a
+/// [`TcpForwardOpen::Bound`] (success) both return immediately. A failure to
+/// even spawn `ssh` is transport-shaped.
+fn try_bind_tcp_forward_port(hostname: &str, port: u16) -> TcpForwardOpen {
+    let attempts = forward_retry_attempts();
+    let delays = backoff_delays(attempts, forward_retry_backoff_base());
+    let mut outcome = TcpForwardOpen::Transport;
+    for i in 0..attempts {
+        drop_master(hostname);
+        outcome = match open_master_tcp(hostname, port) {
+            Ok(o) => classify_tcp_forward_open(&o),
+            Err(_) => TcpForwardOpen::Transport,
+        };
+        match outcome {
+            TcpForwardOpen::Bound | TcpForwardOpen::PortCollision => return outcome,
+            TcpForwardOpen::Transport => {
+                if let Some(delay) = delays.get(i as usize) {
+                    std::thread::sleep(*delay);
+                }
+            }
+        }
+    }
+    outcome
+}
+
 /// Candidate loopback ports to try, starting from `start` (the port a previous
 /// forward bound, if any) and sweeping the configured band on a collision.
 fn tcp_candidate_ports(start: u16) -> Vec<u16> {
@@ -1226,17 +1368,24 @@ fn ensure_tcp_forward(hostname: &str) -> shelbi_core::Result<u16> {
 
     let candidates = tcp_candidate_ports(start);
     let band_len = candidates.len();
-    for port in candidates {
-        // Drop any master first so ControlMaster=auto opens a fresh one that
-        // binds this candidate port's `-R`.
-        drop_master(hostname);
-        let opened = open_master_tcp(hostname, port);
-        if matches!(&opened, Ok(o) if o.status.success()) {
-            // ExitOnForwardFailure=yes guarantees the `-R` bound when the
-            // master opened. Remember the mode + port so subsequent outbound
-            // ssh (and the worker env) reuse this exact port. Success is silent
-            // — like the Unix path, we only log failures, so the 120s rechecks
-            // don't flood events.log.
+    // Sweep the band, binding the first free port. Each candidate is opened
+    // lazily via the mapped iterator, so `decide_tcp_sweep` stops the moment it
+    // reaches a decision — the expensive per-port master open only runs until a
+    // port binds, the transport flakes, or the band is exhausted. Only a
+    // *genuine* bind collision (`TcpForwardOpen::PortCollision`) advances to the
+    // next port; a transport blip is retried per-port and, if it persists, aborts
+    // the sweep as transient rather than being miscounted as an occupied port.
+    let outcomes = candidates
+        .into_iter()
+        .map(|port| (port, try_bind_tcp_forward_port(hostname, port)));
+    match decide_tcp_sweep(outcomes) {
+        TcpSweepResult::Bound(port) => {
+            // ExitOnForwardFailure=yes guarantees the `-R` bound when the master
+            // opened. Remember the mode + port so subsequent outbound ssh (and
+            // the worker env) reuse this exact port; this also *releases* any
+            // stale port previously persisted for the host (overwrite). Success
+            // is silent — like the Unix path, we only log failures, so the 120s
+            // rechecks don't flood events.log.
             let _ = shelbi_state::save_host_forward(
                 hostname,
                 Some(shelbi_state::HostForward {
@@ -1247,33 +1396,55 @@ fn ensure_tcp_forward(hostname: &str) -> shelbi_core::Result<u16> {
             // Healthy: record it so a later failure is seen as a state change
             // and re-emits (without this, fail→ok→fail would emit only once).
             mark_forward_ok(hostname);
-            return Ok(port);
+            Ok(port)
         }
-        // Network was already proven reachable, so a failure here is a bind
-        // collision — try the next candidate port.
+        TcpSweepResult::TransportUnstable(port) => {
+            // A churning/broken transport, not a full band. Surface it
+            // *distinctly* from genuine exhaustion so a re-probe can recover: the
+            // per-workspace ~120s recheck re-enters this path and binds once the
+            // master is healthy again. Never latches "all ports in use" — the bug
+            // this fixes (a mux hiccup across every port read as 64 occupied
+            // listeners when `ss` showed them free). State-change gated so a
+            // recurring flap logs once, not once per cycle.
+            report_forward_failure(
+                hostname,
+                "fail:tcp:forward_transport_unstable",
+                &format!(
+                    "ssh reverse-forward host={hostname} mode=tcp status=failed \
+                     detail=forward_transport_unstable port={port}"
+                ),
+            );
+            Err(shelbi_core::Error::Other(format!(
+                "ssh reverse forward to {hostname} could not bind a TCP loopback port \
+                 (transport unstable at port {port}); Shelbi will re-probe — \
+                 worker→hub messages are delayed, not disabled"
+            )))
+        }
+        TcpSweepResult::Exhausted => {
+            // Genuine exhaustion: every port in the band reported a real bind
+            // collision even though the host is reachable. Surface it distinctly
+            // (`detail=loopback_port_exhausted`, with the band that was swept) so
+            // an operator can tell "widen the band / find the port hog" apart
+            // from "the transport flickered." Widening the band
+            // (SHELBI_TCP_FORWARD_PORT_SPAN) or moving it
+            // (SHELBI_TCP_FORWARD_PORT_BASE) is the remedy this points at.
+            let base = shelbi_state::tcp_forward_port_base();
+            let band_hi = base as u32 + band_len.saturating_sub(1) as u32;
+            report_forward_failure(
+                hostname,
+                "fail:tcp:loopback_port_exhausted",
+                &format!(
+                    "ssh reverse-forward host={hostname} mode=tcp status=failed \
+                     detail=loopback_port_exhausted band={base}-{band_hi} tried={band_len}"
+                ),
+            );
+            Err(shelbi_core::Error::Other(format!(
+                "ssh reverse forward to {hostname} could not bind a TCP loopback port \
+                 (all {band_len} ports in band {base}-{band_hi} in use); \
+                 worker→hub messages will not be delivered"
+            )))
+        }
     }
-
-    // Genuine exhaustion: every port in the band collided even though the host
-    // is reachable. Surface it *distinctly* from a transient master-open blip
-    // (`detail=loopback_port_exhausted`, with the band that was swept) so an
-    // operator can tell "widen the band / find the port hog" apart from "the
-    // network flickered." Widening the band (SHELBI_TCP_FORWARD_PORT_SPAN) or
-    // moving it (SHELBI_TCP_FORWARD_PORT_BASE) is the remedy this points at.
-    let base = shelbi_state::tcp_forward_port_base();
-    let band_hi = base as u32 + band_len.saturating_sub(1) as u32;
-    report_forward_failure(
-        hostname,
-        "fail:tcp:loopback_port_exhausted",
-        &format!(
-            "ssh reverse-forward host={hostname} mode=tcp status=failed \
-             detail=loopback_port_exhausted band={base}-{band_hi} tried={band_len}"
-        ),
-    );
-    Err(shelbi_core::Error::Other(format!(
-        "ssh reverse forward to {hostname} could not bind a TCP loopback port \
-         (all {band_len} ports in band {base}-{band_hi} in use); \
-         worker→hub messages will not be delivered"
-    )))
 }
 
 /// Ensure the hub's reverse forward to `host` is bound and healthy, repairing
@@ -2177,6 +2348,108 @@ mod tests {
             classify_mux_failure(&output_from("echo 'Connection refused' >&2; exit 255")),
             MuxFailure::None
         );
+    }
+
+    #[test]
+    fn classify_tcp_forward_open_distinguishes_bind_from_transport() {
+        // Success → the port bound; it's ours.
+        assert_eq!(
+            classify_tcp_forward_open(&output_from("true")),
+            TcpForwardOpen::Bound
+        );
+
+        // The genuine bind-collision fingerprint (ExitOnForwardFailure=yes):
+        // the remote refused to listen on the port because it is occupied.
+        assert_eq!(
+            classify_tcp_forward_open(&output_from(
+                "echo 'Warning: remote port forwarding failed for listen port 47100' >&2; exit 255"
+            )),
+            TcpForwardOpen::PortCollision
+        );
+
+        // The false-exhaustion shapes: a churning ControlMaster and friends. A
+        // blank 255, a mux read-from-master loss, a reset connection, and a
+        // refused auth all exit nonzero but say NOTHING about port occupancy, so
+        // they must be Transport (re-probe, recover) — never PortCollision (which
+        // would let a mux hiccup across the whole band latch "all ports in use").
+        for script in [
+            "exit 255",
+            "echo 'mux_client_request_session: read from master failed: Broken pipe' >&2; exit 255",
+            "echo 'Connection reset by peer' >&2; exit 255",
+            "echo 'Connection refused' >&2; exit 255",
+            "echo 'Permission denied (publickey).' >&2; exit 255",
+        ] {
+            assert_eq!(
+                classify_tcp_forward_open(&output_from(script)),
+                TcpForwardOpen::Transport,
+                "script should classify as Transport: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_tcp_sweep_binds_first_free_port() {
+        use TcpForwardOpen::*;
+        // A free band (first candidate binds) → Bound on that port.
+        assert_eq!(
+            decide_tcp_sweep([(47100, Bound)]),
+            TcpSweepResult::Bound(47100)
+        );
+        // Genuine collisions are skipped until a free port is found.
+        assert_eq!(
+            decide_tcp_sweep([(47100, PortCollision), (47101, PortCollision), (47102, Bound)]),
+            TcpSweepResult::Bound(47102)
+        );
+    }
+
+    #[test]
+    fn decide_tcp_sweep_transport_blip_does_not_latch_exhaustion() {
+        use TcpForwardOpen::*;
+        // A transport failure partway through is surfaced as transient (at the
+        // port it happened on), NOT swept past as though the port were occupied
+        // and NOT allowed to reach the exhaustion verdict.
+        assert_eq!(
+            decide_tcp_sweep([(47100, PortCollision), (47101, Transport), (47102, Bound)]),
+            TcpSweepResult::TransportUnstable(47101),
+        );
+        // Even a transport blip on the very first candidate bails transient
+        // rather than declaring the band exhausted.
+        assert_eq!(
+            decide_tcp_sweep([(47100, Transport)]),
+            TcpSweepResult::TransportUnstable(47100),
+        );
+    }
+
+    #[test]
+    fn decide_tcp_sweep_reports_exhaustion_only_when_every_port_collides() {
+        use TcpForwardOpen::*;
+        // The ONLY path to "band exhausted": every candidate reported a genuine
+        // bind collision. This is what makes a false-exhaustion report
+        // impossible unless the ports really are all occupied.
+        assert_eq!(
+            decide_tcp_sweep([(47100, PortCollision), (47101, PortCollision)]),
+            TcpSweepResult::Exhausted,
+        );
+        // An empty band is trivially exhausted (no candidate bound).
+        assert_eq!(decide_tcp_sweep([]), TcpSweepResult::Exhausted);
+    }
+
+    #[test]
+    fn decide_tcp_sweep_is_lazy_and_stops_at_the_decision() {
+        use std::cell::Cell;
+        use TcpForwardOpen::*;
+        // The per-port open is expensive, so the fold must stop evaluating
+        // candidates the moment it reaches a verdict. Prove it by counting how
+        // many outcomes the lazily-mapped iterator actually produces.
+        let evaluated = Cell::new(0);
+        let ports = [47100u16, 47101, 47102, 47103];
+        let result = decide_tcp_sweep(ports.iter().map(|&p| {
+            evaluated.set(evaluated.get() + 1);
+            // First candidate binds → nothing after it should be evaluated.
+            (p, Bound)
+        }));
+        assert_eq!(result, TcpSweepResult::Bound(47100));
+        assert_eq!(evaluated.get(), 1, "must not open ports past the first bind");
     }
 
     #[test]
