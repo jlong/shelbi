@@ -991,6 +991,13 @@ fn run_project_picker<B: ratatui::backend::Backend>(
         return Ok(None);
     }
 
+    // Projects with a live `shelbi-<name>` tmux session are "loaded"; every
+    // other declared project is unloaded. Session state can't change while
+    // this blocking picker owns the screen, so enumerate once up front rather
+    // than per-frame.
+    let loaded: std::collections::HashSet<String> =
+        super::quit_shelbi::project_names().into_iter().collect();
+
     let opener_close = keymaps
         .global
         .first_chord_for(GlobalAction::OpenPalette)
@@ -1000,7 +1007,7 @@ fn run_project_picker<B: ratatui::backend::Backend>(
 
     loop {
         let results = filter_projects(&projects, &query);
-        term.draw(|f| render_project_picker(f, current, &query, &results, selected))?;
+        term.draw(|f| render_project_picker(f, current, &query, &results, selected, &loaded))?;
 
         if event::poll(Duration::from_millis(150))? {
             if let Event::Key(k) = event::read()? {
@@ -1071,12 +1078,27 @@ fn filter_projects(projects: &[ProjectSummary], query: &str) -> Vec<ProjectSumma
     hits.into_iter().map(|(p, _)| p).collect()
 }
 
+/// Leading status glyph + color for a project row in the switch-project
+/// picker: a green filled circle for a loaded project (live `shelbi-<name>`
+/// session), a dim hollow circle for an unloaded one. Reuses the same glyph
+/// pair the task board uses for Running/Queued so the surfaces read
+/// consistently, and both glyphs share the fixed ` X ` render width so loaded
+/// and unloaded rows stay aligned.
+fn project_status_glyph(loaded: bool) -> (&'static str, Color) {
+    if loaded {
+        ("●", Color::Green)
+    } else {
+        ("○", Color::DarkGray)
+    }
+}
+
 fn render_project_picker(
     f: &mut Frame,
     current: &str,
     query: &str,
     results: &[ProjectSummary],
     selected: usize,
+    loaded: &std::collections::HashSet<String>,
 ) {
     let area = f.area();
     let layout = Layout::default()
@@ -1123,11 +1145,12 @@ fn render_project_picker(
             } else {
                 "workspaces"
             };
+            let (glyph, glyph_color) = project_status_glyph(loaded.contains(&p.name));
             // Show the human-readable label. When it differs from the slug,
             // trail a dimmed `(slug)` so the id stays discoverable.
             let label = p.display_label();
             let mut spans = vec![
-                Span::styled(" ◉ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!(" {glyph} "), Style::default().fg(glyph_color)),
                 Span::raw(format!("{label:<22}")),
             ];
             if p.display_name.is_some() {
@@ -1551,6 +1574,25 @@ mod tests {
         );
         // Defensive: a target without a `:` is passed through untouched.
         assert_eq!(exact_window_target("no-colon"), "no-colon");
+    }
+
+    #[test]
+    fn project_status_glyph_distinguishes_loaded_from_unloaded() {
+        // Loaded: green filled circle. Unloaded: dim hollow circle. Both are
+        // single display cells, so the leading ` X ` slot stays the same width
+        // and rows stay aligned regardless of load state.
+        let (loaded_glyph, loaded_color) = project_status_glyph(true);
+        assert_eq!(loaded_glyph, "●");
+        assert_eq!(loaded_color, Color::Green);
+
+        let (unloaded_glyph, unloaded_color) = project_status_glyph(false);
+        assert_eq!(unloaded_glyph, "○");
+        assert_eq!(unloaded_color, Color::DarkGray);
+
+        assert_eq!(
+            loaded_glyph.chars().count(),
+            unloaded_glyph.chars().count()
+        );
     }
 
     #[test]
