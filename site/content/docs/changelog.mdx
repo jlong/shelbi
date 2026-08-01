@@ -9,6 +9,51 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### August 1, 2026
+
+**v0.7.0. Shelbi Zen ships, and a reviewer to match.**
+
+**Shelbi Zen is a real autopilot now.** Zen can take a handoff branch all the
+way to `main` on its own: it runs the project's local pre-merge checks, gates on
+merge conflicts, diff size, and danger-path edits, then drives the PR create →
+CI-watch → squash-merge flow to completion. `shelbi zen probe` self-recovers
+when the hub's primary checkout is holding the task branch, and it flags the
+cases that used to slip through — a stale base, an already-merged branch, or a
+squash-merge that would silently revert a sibling PR. Orchestrator self-review is
+now codified in the shipped defaults, so the old fresh-context evaluator subagent
+is retired.
+
+**A two-column review interface.** Reviewing a task is now a dedicated
+experience: a left panel with the diff and reviewer actions,
+a View Diff action alongside Chat with Reviewer, and a reject-reason prompt that
+opens as a tmux popover with a real textbox and buttons. Queued-for-Review tasks
+auto-load onto an idle review slot, the Review agent is dispatched there instead
+of the status's Zen agent, and a review slot stranded by a quit or restart is
+resumed on the next launch.
+
+**The command palette learned about projects.** Switch Project is pinned to the
+top with inline "Switch to X" entries, each project carries a loaded or unloaded
+status glyph, and a second column lists your other projects — `Right` to focus
+it, `Up`/`Down` to move, `Enter` to switch.
+
+**A traveling sidebar for window-per-workspace navigation.** The dashboard
+sidebar now travels with you across per-workspace windows, clamped to its
+canonical width, and self-heals so a render fault or a process exit can't leave it
+gone. Activity is a plain-language timeline with multi-line wrapping rows, and
+project config validation errors surface directly in the sidebar.
+
+**System configuration ships as a skill.** Shelbi bundles a system configuration
+skill with an inventory and an all-surface lint, and injects the system plugin
+into the built-in runners so a fresh install carries it.
+
+**CLI and reliability.** `shelbi quit` tears down a running project cleanly, and
+`shelbi task edit` gains non-interactive flags for title, body, and field
+substitutions. SSH grew a stabilized managed `ControlMaster` — keepalive,
+per-host locking, and mux recovery — and now surfaces the ssh diagnostic behind a
+blank `exit status: 255` instead of swallowing it. The launchd daemon registers
+idempotently, and the heartbeat and poller are hardened so a busy board or an
+unreachable machine can't starve them.
+
 ### July 18, 2026
 
 **v0.6.0. Workspaces, project names, and safer worktree integration.**
