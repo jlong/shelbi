@@ -108,6 +108,11 @@ pub fn score(matcher: &mut Matcher, pattern: &str, label: &str) -> Option<u16> {
 /// query is empty or whitespace-only, then scored normally the instant the
 /// user types a non-blank character — a "hidden until searched" tier for
 /// power-user shortcuts that shouldn't pad the default list.
+///
+/// The query is tokenized on whitespace (via nucleo's multi-atom
+/// [`Pattern::parse`]): every token must match the label, so a multi-word
+/// query like `chat rev` matches a multi-word label like `Chat with Reviewer`
+/// across the space. A whitespace-only query still counts as blank.
 pub fn search(entries: &[Entry], query: &str) -> Vec<(Entry, u16)> {
     let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
     let pattern = parse_pattern(query);
@@ -202,6 +207,52 @@ mod tests {
         // A whitespace-only query counts as blank too.
         let ws = search(&entries, "   ");
         assert!(ws.iter().all(|(e, _)| e.id != "edit:project"));
+    }
+
+    /// An entry with a multi-word label, for the space/multi-token tests.
+    fn multiword_entry() -> Entry {
+        Entry {
+            id: "action:chat-with-reviewer".into(),
+            label: "Chat with Reviewer".into(),
+            kind: EntryKind::Action,
+            subtitle: None,
+            shortcut: None,
+            decoration: None,
+            hidden_until_query: false,
+        }
+    }
+
+    #[test]
+    fn multi_token_query_matches_across_a_space() {
+        // `chat rev` is two tokens; both must match the label. "chat" hits
+        // "Chat" and "rev" hits "Reviewer", so the multi-word label matches
+        // even though the tokens straddle a space.
+        let entries = vec![multiword_entry()];
+        let hits = search(&entries, "chat rev");
+        assert!(
+            hits.iter().any(|(e, _)| e.id == "action:chat-with-reviewer"),
+            "multi-word query should match a multi-word label across the space"
+        );
+    }
+
+    #[test]
+    fn multi_token_query_requires_every_token_to_match() {
+        // Both tokens must match; a token with no home in the label drops it.
+        let entries = vec![multiword_entry()];
+        let hits = search(&entries, "chat zzz");
+        assert!(
+            hits.iter().all(|(e, _)| e.id != "action:chat-with-reviewer"),
+            "a token that matches nothing must exclude the entry"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_query_still_counts_as_blank() {
+        // A query that is only spaces has no content tokens, so it behaves
+        // like the empty query: everything visible, nothing filtered out.
+        let entries = sample();
+        let hits = search(&entries, "   ");
+        assert_eq!(hits.len(), entries.len());
     }
 
     #[test]

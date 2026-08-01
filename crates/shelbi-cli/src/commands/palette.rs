@@ -19,7 +19,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use shelbi_palette::{Entry, EntryKind};
@@ -157,11 +157,34 @@ pub fn run(project: String) -> Result<()> {
     Ok(())
 }
 
+/// Which column the empty-query palette has focus in. The projects
+/// column only exists when the query is empty and there's at least one
+/// other project; `Commands` is the default and the only meaningful
+/// focus once the user starts typing (the projects column drops).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Commands,
+    Projects,
+}
+
 struct State {
     query: String,
     selected: usize,
     all_entries: Vec<Entry>,
     project: String,
+    /// The other registered projects (current excluded), rendered in the
+    /// empty-query palette's second column. Loaded once in `new` — the
+    /// project set can't change while this blocking picker owns the screen.
+    projects: Vec<ProjectSummary>,
+    /// Names of projects with a live `shelbi-<name>` tmux session, so the
+    /// second column can paint the same loaded/unloaded glyphs the
+    /// switch-project sub-picker uses.
+    loaded_projects: std::collections::HashSet<String>,
+    /// Selection index into `projects` for the second column.
+    project_selected: usize,
+    /// Which column Up/Down/Enter act on. Only meaningful while the
+    /// projects column is visible; typing forces it back to `Commands`.
+    focus: Focus,
 }
 
 impl State {
@@ -183,16 +206,43 @@ impl State {
             .unwrap_or(ZenToggleChord::AltZ);
         let chord = keymaps.zen_toggle_chord(legacy);
         let all_entries = build_entries(&app, app.zen_mode, chord);
+        // Other registered projects for the second column — same source and
+        // current-project filter the `Switch to project…` sub-picker uses. A
+        // failed enumeration degrades to no column rather than failing the
+        // whole palette open.
+        let projects: Vec<ProjectSummary> = shelbi_state::list_projects()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.name != project)
+            .collect();
+        // Projects with a live `shelbi-<name>` session are "loaded"; enumerate
+        // once (session state can't change while this blocking picker owns the
+        // screen) so the column can paint the same glyphs the sub-picker does.
+        let loaded_projects: std::collections::HashSet<String> =
+            super::quit_shelbi::project_names().into_iter().collect();
         Ok(Self {
             query: String::new(),
             selected: 0,
             all_entries,
             project: project.to_string(),
+            projects,
+            loaded_projects,
+            project_selected: 0,
+            focus: Focus::Commands,
         })
     }
 
     fn results(&self) -> Vec<(Entry, u16)> {
         shelbi_palette::search(&self.all_entries, &self.query)
+    }
+
+    /// True when the empty-query second column of other projects should be
+    /// shown. Both `render` and `picker_loop` gate on this so the input
+    /// handling (Right focuses the column; Enter switches) can never target a
+    /// column the user can't see — an empty query with at least one other
+    /// project.
+    fn projects_column_visible(&self) -> bool {
+        self.query.is_empty() && !self.projects.is_empty()
     }
 }
 
@@ -274,20 +324,62 @@ fn picker_loop<B: ratatui::backend::Backend>(
                         return Ok(None);
                     }
                 }
+                // Column focus (Left/Right) and the space key are handled as
+                // raw KeyCodes ahead of the customizable palette dispatch so
+                // they behave the same regardless of user bindings:
+                //   - Right focuses the projects column (no-op when it isn't
+                //     shown), Left returns focus to commands.
+                //   - Space types into the query even if some keymap binds it
+                //     to a palette action — a bound space would otherwise be
+                //     un-typeable, and a multi-word query is the whole point of
+                //     the completion path.
+                match k.code {
+                    KeyCode::Right if state.projects_column_visible() => {
+                        state.focus = Focus::Projects;
+                        continue;
+                    }
+                    KeyCode::Left => {
+                        state.focus = Focus::Commands;
+                        continue;
+                    }
+                    KeyCode::Char(' ')
+                        if k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT =>
+                    {
+                        state.query.push(' ');
+                        state.selected = 0;
+                        state.focus = Focus::Commands;
+                        continue;
+                    }
+                    _ => {}
+                }
                 match keymaps.palette.dispatch(k) {
                     Some(PaletteAction::Close) => return Ok(None),
                     Some(PaletteAction::Activate) => {
-                        if let Some((entry, _)) = results.get(state.selected) {
+                        if state.focus == Focus::Projects && state.projects_column_visible() {
+                            // Route the project selection through the same
+                            // post-loop `switch_target` path the inline
+                            // "Switch to <project>" entries use, so switch
+                            // semantics stay identical to the sub-picker.
+                            if let Some(p) = state.projects.get(state.project_selected) {
+                                return Ok(Some(switch_project_entry(p)));
+                            }
+                        } else if let Some((entry, _)) = results.get(state.selected) {
                             return Ok(Some(entry.clone()));
                         }
                     }
                     Some(PaletteAction::NavUp) => {
-                        if state.selected > 0 {
+                        if state.focus == Focus::Projects {
+                            state.project_selected = state.project_selected.saturating_sub(1);
+                        } else if state.selected > 0 {
                             state.selected -= 1;
                         }
                     }
                     Some(PaletteAction::NavDown) => {
-                        if state.selected + 1 < results.len() {
+                        if state.focus == Focus::Projects {
+                            if state.project_selected + 1 < state.projects.len() {
+                                state.project_selected += 1;
+                            }
+                        } else if state.selected + 1 < results.len() {
                             state.selected += 1;
                         }
                     }
@@ -296,14 +388,16 @@ fn picker_loop<B: ratatui::backend::Backend>(
                         state.selected = 0;
                     }
                     None => {
-                        // Unbound printable Char appends to the query.
-                        // Binding a printable character (e.g. `space`) to
-                        // a palette action makes it un-typeable in the
-                        // query — that's the documented trade-off.
+                        // Unbound printable Char appends to the query and drops
+                        // focus back to commands (the projects column vanishes
+                        // the instant the query is non-empty). Space is handled
+                        // above; other bound printable chars stay un-typeable —
+                        // the documented trade-off.
                         if let KeyCode::Char(c) = k.code {
                             if k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT {
                                 state.query.push(c);
                                 state.selected = 0;
+                                state.focus = Focus::Commands;
                             }
                         }
                     }
@@ -342,11 +436,29 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
     ]);
     f.render_widget(Paragraph::new(vec![prompt, Line::raw("")]), layout[1]);
 
+    // Results area. With an empty query and at least one other project, the
+    // area splits into a Commands column (left, the full list) and a Projects
+    // column (right). The moment the query is non-empty the projects column
+    // drops and the commands list reclaims the whole width — a single-column
+    // completion list exactly as before. Percent-of-width, clamped, keeps the
+    // split responsive inside the 70%×60% popup and degrades to a thin (but
+    // never negative) projects column on a narrow terminal without panicking.
+    let (commands_area, projects_area) = if state.projects_column_visible() {
+        let proj_w = (layout[2].width / 3).clamp(18, 28);
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(proj_w)])
+            .split(layout[2]);
+        (cols[0], Some(cols[1]))
+    } else {
+        (layout[2], None)
+    };
+
     // Result list. List row width matches the list pane so we can pad
     // out to the right edge and tuck the shortcut hint flush against
     // it; falls back to no padding when the area is narrower than the
     // content (the shortcut still appears, just not right-aligned).
-    let row_width = layout[2].width as usize;
+    let row_width = commands_area.width as usize;
     let items: Vec<ListItem> = results
         .iter()
         .map(|(e, _)| {
@@ -387,24 +499,101 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
         })
         .collect();
 
-    let list = List::new(items).highlight_style(
-        Style::default()
-            .bg(shelbi_tui::theme::SELECTION_BG)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    );
+    // The commands column loses its bright selection highlight when focus is
+    // in the projects column, so only one column ever reads as "active".
+    let commands_focused = projects_area.is_none() || state.focus == Focus::Commands;
+    let list = List::new(items).highlight_style(selection_style(commands_focused));
     let mut s = ListState::default();
     if !results.is_empty() {
         s.select(Some(state.selected.min(results.len().saturating_sub(1))));
     }
-    f.render_stateful_widget(list, layout[2], &mut s);
+    f.render_stateful_widget(list, commands_area, &mut s);
 
-    // Footer.
+    // Second column: the other registered projects. Rendered only on an empty
+    // query (see `projects_column_visible`).
+    if let Some(area) = projects_area {
+        render_projects_column(f, area, state);
+    }
+
+    // Footer. The projects-column hint only shows while that column is up so
+    // the empty-query palette advertises the switch shortcut without cluttering
+    // the completion view.
+    let footer_text = if state.projects_column_visible() {
+        "↑↓ navigate · → projects · Enter activate · Esc / Ctrl+P close"
+    } else {
+        "↑↓ navigate · Enter activate · Esc / Ctrl+P close"
+    };
     let footer = Paragraph::new(Line::from(vec![Span::styled(
-        "↑↓ navigate · Enter activate · Esc / Ctrl+P close",
+        footer_text,
         Style::default().fg(Color::DarkGray),
     )]));
     f.render_widget(footer, layout[3]);
+}
+
+/// Highlight style for a list's selected row. The focused column gets the
+/// bright selection bar; an unfocused column keeps a visible but dim marker so
+/// the user can still see where its selection sits without it competing with
+/// the active column.
+fn selection_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .bg(shelbi_tui::theme::SELECTION_BG)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::DIM)
+    }
+}
+
+/// Render the empty-query second column of other projects into `area`. A left
+/// border acts as the divider from the commands column, a dim "Projects"
+/// header labels it, and each row carries the same loaded/unloaded glyph the
+/// switch-project sub-picker paints. The projects column is narrow, so rows are
+/// glyph + label only; ratatui clips a label too wide for the column rather
+/// than overflowing the popup.
+fn render_projects_column(f: &mut Frame, area: Rect, state: &State) {
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    let header = Paragraph::new(Line::from(Span::styled(
+        " Projects",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(header, rows[0]);
+
+    let items: Vec<ListItem> = state
+        .projects
+        .iter()
+        .map(|p| {
+            let (glyph, glyph_color) = project_status_glyph(state.loaded_projects.contains(&p.name));
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {glyph} "), Style::default().fg(glyph_color)),
+                Span::raw(p.display_label()),
+            ]))
+        })
+        .collect();
+
+    let focused = state.focus == Focus::Projects;
+    let list = List::new(items).highlight_style(selection_style(focused));
+    let mut s = ListState::default();
+    if !state.projects.is_empty() {
+        s.select(Some(
+            state
+                .project_selected
+                .min(state.projects.len().saturating_sub(1)),
+        ));
+    }
+    f.render_stateful_widget(list, rows[1], &mut s);
 }
 
 // ---------------------------------------------------------------------------
@@ -1536,6 +1725,24 @@ fn switch_target_from_id(id: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
+/// Synthesize the inline "Switch to <project>" [`Entry`] for a selection made
+/// in the second column. Its id carries the target slug in the exact shape
+/// [`switch_target_from_id`] recognizes, so the post-loop `run` flow routes it
+/// through the same `switch_target` path as the sub-picker and the typed
+/// inline entries — one switch code path, no divergence.
+fn switch_project_entry(p: &ProjectSummary) -> Entry {
+    let display = p.display_label();
+    Entry {
+        id: format!("action:switch-project:{}", p.name),
+        label: format!("Switch to {display} project"),
+        kind: EntryKind::Action,
+        subtitle: None,
+        shortcut: None,
+        decoration: None,
+        hidden_until_query: true,
+    }
+}
+
 /// Launch (or focus) `target`'s dashboard and move the attached client to it.
 /// The `attach`/`switch-client` call must inherit the terminal's stdio (it's
 /// interactive), so it deliberately does NOT go through the capturing
@@ -1733,6 +1940,26 @@ mod tests {
         );
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn switch_project_entry_routes_through_the_inline_switch_target_path() {
+        // A second-column selection must produce an entry whose id the
+        // post-loop `run` flow recognizes as a direct switch target — same
+        // shape the typed inline "Switch to X" entries use — so the switch
+        // path never diverges from the sub-picker's.
+        let p = ProjectSummary {
+            name: "web".into(),
+            display_name: Some("Website".into()),
+            repo_path: "/tmp/web".into(),
+            machine_count: 1,
+            workspace_count: 0,
+            last_launched: None,
+        };
+        let entry = switch_project_entry(&p);
+        assert_eq!(entry.id, "action:switch-project:web");
+        assert_eq!(switch_target_from_id(&entry.id), Some("web"));
+        assert_eq!(entry.label, "Switch to Website project");
     }
 
     #[test]
