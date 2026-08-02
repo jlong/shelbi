@@ -1494,6 +1494,12 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // before Shelbi can deliver its startup prompt.
     require_runner_available(&host, &runner)?;
 
+    // A dispatch onto a `review`-tagged slot is a review dispatch: the slot
+    // serves the branch for inspection and must never receive the developer's
+    // rebase + ready-marker handoff (see `compose_prompt` — that handoff on an
+    // already-handed-off task is the review-resume churn loop).
+    let is_review = spec.project.effective_tags(spec.workspace).contains("review");
+
     // 2–7. Deploy the agent context, reset the pane, launch the runner, wait
     //       for readiness, and send the loop-closing dev prompt. Dev
     //       workspaces inject no `PORT` (that's a review-workspace concern).
@@ -1505,6 +1511,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         &spec.project.default_branch,
         &spec.project.name,
         shelbi_agent::polls_for_messages(&runner),
+        !is_review,
     );
     // Review dispatch: pin the review slot's port into the pane env (finally
     // wiring the long-stubbed `SpawnArgs.port`) and append the workflow's
@@ -1627,6 +1634,7 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         shelbi_agent::RunnerAdapter::for_spec(&runner).resume_strategy(),
         shelbi_agent::ResumeStrategy::Transcript
     );
+    let is_review = spec.project.effective_tags(spec.workspace).contains("review");
     let prompt = compose_resume_prompt(
         spec.task_id,
         spec.branch,
@@ -1636,6 +1644,7 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         &spec.project.name,
         shelbi_agent::polls_for_messages(&runner),
         resume,
+        !is_review,
     );
     deploy_and_spawn(SpawnArgs {
         project: spec.project,
@@ -3669,6 +3678,7 @@ fn scp_text_to_remote(
 /// the workspace re-runs its checks against the rebased base before signalling
 /// review — a hub-side rebase happens after handoff, when there's no agent
 /// around to fix conflicts or re-run tests.
+#[allow(clippy::too_many_arguments)]
 fn compose_prompt(
     task_id: &str,
     branch: &str,
@@ -3677,6 +3687,7 @@ fn compose_prompt(
     default_branch: &str,
     project: &str,
     polls_messages: bool,
+    include_handoff: bool,
 ) -> String {
     let trimmed = body.trim();
     let body_section = if trimmed.is_empty() {
@@ -3685,6 +3696,23 @@ fn compose_prompt(
         trimmed.to_string()
     };
     let id_esc = shelbi_agent::shell_escape(task_id);
+    let polling_section = if polls_messages {
+        message_polling_section(task_id, project, &id_esc)
+    } else {
+        String::new()
+    };
+    // Review dispatches (a `review`-tagged slot) exist to *serve* the branch
+    // for human inspection — the Review agent installs/builds/boots it and
+    // explicitly does NOT rebase or open a PR. Handing it the developer's
+    // rebase-then-write-the-ready-marker handoff is the churn bug this guards:
+    // on an already-handed-off task the agent dutifully re-writes the marker,
+    // which bounces the card `review -> in_progress -> review` and re-triggers
+    // the stranded-review-slot resume, looping. So a review dispatch gets the
+    // task body (what it's reviewing) plus its message-polling contract, and
+    // nothing else — the serve recipe is appended by the caller.
+    if !include_handoff {
+        return format!("{body_section}{polling_section}");
+    }
     let marker_esc = shelbi_agent::shell_escape(&marker.to_string_lossy());
     // Write to a sibling temp file and `mv` it into place so the poller
     // never `cat`s a half-written marker (a torn body would fail
@@ -3696,11 +3724,6 @@ fn compose_prompt(
         PathBuf::from(s)
     };
     let marker_tmp_esc = shelbi_agent::shell_escape(&marker_tmp.to_string_lossy());
-    let polling_section = if polls_messages {
-        message_polling_section(task_id, project, &id_esc)
-    } else {
-        String::new()
-    };
     format!(
         "{body_section}\n\n\
          ---\n\
@@ -3842,6 +3865,7 @@ fn compose_resume_prompt(
     project: &str,
     polls_messages: bool,
     conversation_resumed: bool,
+    include_handoff: bool,
 ) -> String {
     let banner = if conversation_resumed {
         format!(
@@ -3869,6 +3893,7 @@ fn compose_resume_prompt(
         default_branch,
         project,
         polls_messages,
+        include_handoff,
     );
     format!("{banner}{base}")
 }
@@ -4755,6 +4780,7 @@ mod tests {
             "main",
             "myapp",
             false,
+            true,
         );
         assert!(prompt.contains("Fix the Safari SSO bug."));
         assert!(prompt.contains("fix-login"));
@@ -4780,6 +4806,7 @@ mod tests {
             "main",
             "myapp",
             false,
+            true,
         );
         assert!(prompt.contains("# Task fix-login"));
         assert!(prompt.contains(".claude/shelbi-ready"));
@@ -4795,6 +4822,7 @@ mod tests {
             &marker,
             "main",
             "myapp",
+            true,
             true,
         );
         // Still hands off the same way, and still rebases first.
@@ -4833,6 +4861,7 @@ mod tests {
             "main",
             "myapp",
             false,
+            true,
         );
         assert!(
             prompt.contains("git fetch origin main && git rebase origin/main"),
@@ -4851,6 +4880,49 @@ mod tests {
     }
 
     #[test]
+    fn review_prompt_omits_the_developer_rebase_and_ready_marker_handoff() {
+        // A review dispatch (`include_handoff = false`) serves the branch for
+        // inspection; it must NOT carry the developer's rebase + ready-marker
+        // handoff. Handing a review slot the marker instructions on an
+        // already-handed-off task is the churn loop: the agent re-writes the
+        // marker, bouncing the card back to review and re-triggering the
+        // stranded-review-slot resume. The task body still rides along (it's
+        // what's being reviewed).
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/review-1/.claude/shelbi-ready");
+        let prompt = compose_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "Fix the Safari SSO bug.",
+            &marker,
+            "main",
+            "myapp",
+            true, // polls: keep the message-delivery contract for the reviewer
+            false, // include_handoff: review slots never produce a handoff marker
+        );
+        assert!(
+            prompt.contains("Fix the Safari SSO bug."),
+            "review prompt must keep the task body: {prompt}"
+        );
+        assert!(
+            !prompt.contains("shelbi-ready"),
+            "review prompt must not mention the ready marker: {prompt}"
+        );
+        assert!(
+            !prompt.contains("git rebase"),
+            "review prompt must not instruct a rebase: {prompt}"
+        );
+        assert!(
+            !prompt.contains("printf '%s\\n'"),
+            "review prompt must not instruct a marker write: {prompt}"
+        );
+        // The reviewer still pulls orchestrator messages.
+        assert!(
+            prompt.contains(".shelbi/messages/fix-login.log"),
+            "review prompt should keep the message-polling contract: {prompt}"
+        );
+    }
+
+    #[test]
     fn prompt_uses_projects_default_branch_for_rebase_target() {
         // Not every project's main branch is named `main` — verify the
         // command picks up `default_branch` rather than hard-coding it.
@@ -4863,6 +4935,7 @@ mod tests {
             "trunk",
             "myapp",
             false,
+            true,
         );
         assert!(
             prompt.contains("git fetch origin trunk && git rebase origin/trunk"),
@@ -4889,6 +4962,7 @@ mod tests {
             "main",
             "myapp",
             false,
+            true,
             true,
         );
         assert!(
@@ -4922,7 +4996,7 @@ mod tests {
         // conversation_resumed = true (claude --continue): point at the
         // conversation above.
         let resumed = compose_resume_prompt(
-            "t", "shelbi/t", "body", &marker, "main", "myapp", false, true,
+            "t", "shelbi/t", "body", &marker, "main", "myapp", false, true, true,
         );
         assert!(
             resumed.contains("conversation above"),
@@ -4930,7 +5004,7 @@ mod tests {
         );
         // conversation_resumed = false (cold relaunch): point at the worktree.
         let cold = compose_resume_prompt(
-            "t", "shelbi/t", "body", &marker, "main", "myapp", false, false,
+            "t", "shelbi/t", "body", &marker, "main", "myapp", false, false, true,
         );
         assert!(
             cold.contains("git log") && cold.contains("git status"),
@@ -5336,6 +5410,7 @@ mod tests {
             "main",
             "myapp",
             false,
+            true,
         );
         assert!(
             prompt.contains(

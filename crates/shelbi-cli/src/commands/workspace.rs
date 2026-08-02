@@ -351,12 +351,43 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
         shelbi_state::list_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
     let assigned: Vec<&Task> = in_progress.iter().map(|tf| &tf.task).collect();
 
-    let occupied = occupied_idle_workspaces(&p, &assigned)?;
+    // A `review`-tagged slot holds a review-column (handoff) task while it
+    // serves the branch for inspection — that task never sits in `in_progress`,
+    // so without this it looks like a live pane no active task points at and
+    // gets mislabeled `orphaned session`. Map each review slot to the task it's
+    // serving so `list` renders it as `review: <id>` (and the probe skips it).
+    let review = shelbi_state::list_column(project, Column::review()).map_err(|e| anyhow!(e))?;
+    let review_by_ws = review_assignments(&p, &review);
+
+    let occupied = occupied_idle_workspaces(&p, &assigned, &review_by_ws)?;
     let modes = workspace_integration_modes(&p);
-    for line in render_list_with_occupied(&p.workspaces, &assigned, &occupied, &modes)? {
+    for line in render_list_with_occupied(&p.workspaces, &assigned, &review_by_ws, &occupied, &modes)?
+    {
         println!("{line}");
     }
     Ok(())
+}
+
+/// Map each `review`-tagged workspace to the review-column task currently
+/// assigned to it (`workspace name -> task id`). A review slot serving a
+/// handoff task is legitimately occupied — not an orphaned session — so both
+/// the probe ([`occupied_idle_workspaces`]) and the renderer
+/// ([`render_list_with_occupied`]) consult this to treat it as busy.
+fn review_assignments(
+    project: &shelbi_core::Project,
+    review: &[shelbi_state::TaskFile],
+) -> BTreeMap<String, String> {
+    review
+        .iter()
+        .filter_map(|tf| {
+            let ws = tf.task.assigned_to.as_deref()?;
+            let spec = project.workspace(ws)?;
+            project
+                .effective_tags(spec)
+                .contains("review")
+                .then(|| (ws.to_string(), tf.task.id.clone()))
+        })
+        .collect()
 }
 
 /// The integration transport tier for each declared workspace, keyed by
@@ -421,10 +452,16 @@ impl OccupiedKind {
 fn occupied_idle_workspaces(
     project: &shelbi_core::Project,
     in_progress: &[&Task],
+    review_by_ws: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, OccupiedKind>> {
+    // A slot assigned an in-progress task OR serving a review-column task is
+    // already accounted for by the renderer (`in_progress: <id>` / `review:
+    // <id>`) — skip it here so a live review pane is never probed into an
+    // `orphaned session` verdict, and so we don't burn a probe deadline on it.
     let assigned: BTreeSet<&str> = in_progress
         .iter()
         .filter_map(|t| t.assigned_to.as_deref())
+        .chain(review_by_ws.keys().map(|s| s.as_str()))
         .collect();
     let deadline = orch_workspace::probe_deadline();
     // One unreachable verdict per *machine*, not per workspace: once a
@@ -488,12 +525,19 @@ fn render_list(
     workspaces: &[WorkspaceSpec],
     in_progress: &[&Task],
 ) -> Result<Vec<String>> {
-    render_list_with_occupied(workspaces, in_progress, &BTreeMap::new(), &BTreeMap::new())
+    render_list_with_occupied(
+        workspaces,
+        in_progress,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
 }
 
 fn render_list_with_occupied(
     workspaces: &[WorkspaceSpec],
     in_progress: &[&Task],
+    review_by_ws: &BTreeMap<String, String>,
     occupied_idle: &BTreeMap<String, OccupiedKind>,
     integration: &BTreeMap<String, IntegrationMode>,
 ) -> Result<Vec<String>> {
@@ -509,11 +553,23 @@ fn render_list_with_occupied(
             .filter(|t| t.assigned_to.as_deref() == Some(workspace.name.as_str()))
             .collect();
         let (agent, state) = if mine.is_empty() {
-            let state = match occupied_idle.get(&workspace.name) {
-                Some(kind) => kind.state_cell(),
-                None => "idle".to_string(),
-            };
-            (IDLE_AGENT_CELL.to_string(), state)
+            // A review slot serving a handoff task reads as `review: <id>`
+            // (agent `review`), never `orphaned session` — its loaded task
+            // just lives in the review column, not `in_progress`. Checked
+            // before the occupied-idle probe so a live review pane is never
+            // misclassified.
+            if let Some(task_id) = review_by_ws.get(&workspace.name) {
+                (
+                    shelbi_state::REVIEW_AGENT.to_string(),
+                    format!("review: {task_id}"),
+                )
+            } else {
+                let state = match occupied_idle.get(&workspace.name) {
+                    Some(kind) => kind.state_cell(),
+                    None => "idle".to_string(),
+                };
+                (IDLE_AGENT_CELL.to_string(), state)
+            }
         } else {
             // `agent:` from the task frontmatter wins when present —
             // matches the same lookup the task-start path uses to load
@@ -902,8 +958,14 @@ mod tests {
             ("bravo".to_string(), IntegrationMode::Degraded),
         ]);
 
-        let rows =
-            render_list_with_occupied(&workspaces, &in_progress, &BTreeMap::new(), &modes).unwrap();
+        let rows = render_list_with_occupied(
+            &workspaces,
+            &in_progress,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &modes,
+        )
+        .unwrap();
         assert!(rows[1].contains("conventional"), "row: {}", rows[1]);
         assert!(rows[2].contains("degraded"), "row: {}", rows[2]);
         // STATE stays last: an idle workspace still ends with `idle`.
@@ -993,11 +1055,53 @@ mod tests {
         let in_progress: Vec<&Task> = Vec::new();
         let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::Orphaned)]);
 
-        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied, &BTreeMap::new()).unwrap();
+        let rows = render_list_with_occupied(
+            &workspaces,
+            &in_progress,
+            &BTreeMap::new(),
+            &occupied,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let row = &rows[1];
         assert!(row.contains("delta"), "row: {row}");
         assert!(row.contains(&format!(" {IDLE_AGENT_CELL} ")), "row: {row}");
         assert!(row.trim_end().ends_with("orphaned session"), "row: {row}");
+    }
+
+    /// A `review`-tagged slot serving a handoff (review-column) task renders
+    /// as `review: <id>`, never `orphaned session` — even though its loaded
+    /// task is NOT in `in_progress`. This is the regression from the
+    /// stranded-review-slot bug: a live review agent pane was mislabeled
+    /// orphaned because only in-progress assignments counted as "occupied".
+    #[test]
+    fn render_list_review_slot_serving_handoff_is_not_orphaned() {
+        let mut ws = make_workspace("review-1", "hub", "opus-4-7");
+        ws.tags = vec!["review".to_string()];
+        let workspaces = vec![ws];
+        let in_progress: Vec<&Task> = Vec::new();
+        let review_by_ws =
+            BTreeMap::from([("review-1".to_string(), "palette-second-column".to_string())]);
+        // Even if a probe had (wrongly) flagged it orphaned, the review
+        // assignment wins and the probe should have skipped it anyway.
+        let occupied = BTreeMap::from([("review-1".to_string(), OccupiedKind::Orphaned)]);
+
+        let rows = render_list_with_occupied(
+            &workspaces,
+            &in_progress,
+            &review_by_ws,
+            &occupied,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let row = &rows[1];
+        assert!(!row.contains("orphaned session"), "row: {row}");
+        assert!(
+            row.contains("review: palette-second-column"),
+            "row should show the served task: {row}"
+        );
+        // AGENT cell reads `review`, not the idle placeholder.
+        assert!(row.contains(" review "), "row: {row}");
     }
 
     /// A live slot carrying the user-shell mark (sidebar click on an idle
@@ -1010,7 +1114,14 @@ mod tests {
         let in_progress: Vec<&Task> = Vec::new();
         let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::UserShell)]);
 
-        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied, &BTreeMap::new()).unwrap();
+        let rows = render_list_with_occupied(
+            &workspaces,
+            &in_progress,
+            &BTreeMap::new(),
+            &occupied,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let row = &rows[1];
         assert!(row.contains("delta"), "row: {row}");
         assert!(row.contains(&format!(" {IDLE_AGENT_CELL} ")), "row: {row}");
@@ -1035,7 +1146,14 @@ mod tests {
             ),
         )]);
 
-        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied, &BTreeMap::new()).unwrap();
+        let rows = render_list_with_occupied(
+            &workspaces,
+            &in_progress,
+            &BTreeMap::new(),
+            &occupied,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let row = &rows[1];
         assert!(row.contains("delta"), "row: {row}");
         assert!(row.contains(&format!(" {IDLE_AGENT_CELL} ")), "row: {row}");
@@ -1054,7 +1172,14 @@ mod tests {
         let in_progress: Vec<&Task> = vec![&task];
         let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::Orphaned)]);
 
-        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied, &BTreeMap::new()).unwrap();
+        let rows = render_list_with_occupied(
+            &workspaces,
+            &in_progress,
+            &BTreeMap::new(),
+            &occupied,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let row = &rows[1];
         assert!(row.contains("in_progress: bug-fix"), "row: {row}");
         assert!(!row.contains("orphaned session"), "row: {row}");
