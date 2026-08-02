@@ -6953,24 +6953,17 @@ mod user_shell_tmux_tests {
             eprintln!("skipping: tmux not on PATH");
             return;
         }
+        // Serialize with every other env-mutating test in the crate: the
+        // private-server pin below is a `TMUX_TMPDIR` set_var, and the default
+        // multithreaded runner would otherwise race it against concurrent
+        // SHELBI_HOME writers.
+        let _lock = crate::test_lock::acquire();
+        // Own tmux server, so a concurrent teardown on the machine-wide default
+        // one can't drop this client mid-command (`server exited unexpectedly`).
+        crate::tmux_test_support::use_private_tmux_server();
+
         let session = format!("shelbi-test-usershell-{}", std::process::id());
-        kill_session(&session);
-        let ok = std::process::Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session,
-                "-n",
-                "alpha",
-                "sh",
-                "-c",
-                "sleep 30",
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "failed to create test session `{session}`");
+        crate::tmux_test_support::start_session(&session, "alpha");
 
         let host = Host::Local;
         let addr = TmuxAddr {
@@ -7015,29 +7008,24 @@ mod user_shell_tmux_tests {
         // this test rewrites the env var, and the default multithreaded runner
         // would otherwise race concurrent readers (flaking hub probes).
         let _lock = crate::test_lock::acquire();
-        // Isolate on a private tmux server so the mark file the kill writes
-        // (SHELBI_HOME-scoped) and the session can't collide with a real hub.
+        // Own tmux server (private `TMUX_TMPDIR`), so a concurrent teardown on
+        // the machine-wide default one can't drop this client mid-command with
+        // `server exited unexpectedly`; also keeps the mark file the kill
+        // writes (SHELBI_HOME-scoped) and the session off any real hub.
+        crate::tmux_test_support::use_private_tmux_server();
         let home = std::env::temp_dir().join(format!("shelbi-reap-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         let prev_home = std::env::var("SHELBI_HOME").ok();
         std::env::set_var("SHELBI_HOME", &home);
 
         let session = format!("shelbi-test-reap-{}", std::process::id());
-        kill_session(&session);
         // Two windows both named `alice`: the stale orphan and the fresh
         // resumed pane. tmux happily allows the duplicate name.
-        let ok = std::process::Command::new("tmux")
-            .args([
-                "new-session", "-d", "-s", &session, "-n", "alice", "sh", "-c", "sleep 30",
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "failed to create test session `{session}`");
+        crate::tmux_test_support::start_session(&session, "alice");
         let ok = std::process::Command::new("tmux")
             .args([
                 "new-window", "-d", "-t", &format!("={session}:"), "-n", "alice", "sh", "-c",
-                "sleep 30",
+                "sleep 600",
             ])
             .status()
             .map(|s| s.success())
@@ -7182,6 +7170,14 @@ mod slot_probe_tests {
             eprintln!("skipping: tmux not on PATH");
             return;
         }
+        // Serialize the `TMUX_TMPDIR` pin with every other env-mutating test.
+        let _lock = crate::test_lock::acquire();
+        // Own tmux server, so a concurrent teardown on the machine-wide default
+        // one can't drop this client mid-command (`server exited unexpectedly`).
+        // Set before the opening Dead probe so it, too, targets the private
+        // server (where the session genuinely does not exist yet).
+        crate::tmux_test_support::use_private_tmux_server();
+
         let session = format!("shelbi-test-slotprobe-{}", std::process::id());
         let kill = || {
             let _ = std::process::Command::new("tmux")
@@ -7203,22 +7199,7 @@ mod slot_probe_tests {
             "no session yet"
         );
 
-        let ok = std::process::Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session,
-                "-n",
-                "alpha",
-                "sh",
-                "-c",
-                "sleep 30",
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "failed to create test session `{session}`");
+        crate::tmux_test_support::start_session(&session, "alpha");
 
         assert_eq!(
             probe_workspace_slot(&host, &addr, deadline),

@@ -895,6 +895,14 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     fn runner(command: &str) -> AgentRunnerSpec {
         AgentRunnerSpec {
             command: command.into(),
@@ -1185,16 +1193,39 @@ mod tests {
         // draw the box, block reading one line, then replace it with a busy
         // footer once Enter is received. This exercises the real tmux text +
         // separate Enter calls, not merely the state-machine closures above.
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        // Serialize the private-server env pin against the rest of the suite,
+        // then run every session on our own tmux server so a concurrent
+        // teardown elsewhere can't drop a client mid-command.
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
+        // A long-lived holder keeps the private server alive across all twenty
+        // trials, so the gap between a trial's `kill-session` and the next
+        // `new-session` never empties (and thus exits) the server. Skip if the
+        // sandbox denies socket access, matching the repo's optional-tmux
+        // convention.
+        let holder = format!("shelbi-submit-holder-{}", std::process::id());
+        if !crate::tmux_test_support::try_start_session(&holder, "holder") {
+            eprintln!("skipping: tmux cannot create a server here");
+            return;
+        }
+
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("fake-claude.sh");
         std::fs::write(
             &script,
+            // `sleep 600`, never `sleep 2`: the busy footer must persist long
+            // enough for `send_verified` to observe it under CI load, and the
+            // pane must not exit and risk emptying the private server.
             "#!/bin/sh\n\
              stty -echo\n\
              printf '\\033[2J\\033[H────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  ? for shortcuts\\n'\n\
              IFS= read -r line\n\
              printf '\\033[2J\\033[H✳ Working on message\\n────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  esc to interrupt\\n'\n\
-             sleep 2\n",
+             sleep 600\n",
         )
         .unwrap();
 
@@ -1212,17 +1243,10 @@ mod tests {
                     script.to_str().unwrap(),
                 ])
                 .status();
-            let Ok(started) = started else {
-                // tmux is optional in development/test containers.
-                return;
-            };
-            if !started.success() {
-                // The workspace sandbox denies tmux socket access. The full
-                // CI/local run (where tmux can create a server) executes all
-                // twenty trials; match the repo's existing optional-tmux
-                // convention when no server can be created.
-                return;
-            }
+            assert!(
+                matches!(started, Ok(status) if status.success()),
+                "trial {trial}: failed to start fixture session on the private server"
+            );
 
             let addr = TmuxAddr {
                 session: session.clone(),
@@ -1246,9 +1270,7 @@ mod tests {
                 &format!("idle message trial {trial}"),
                 &baseline,
             );
-            let _ = std::process::Command::new("tmux")
-                .args(["kill-session", "-t", &session])
-                .status();
+            crate::tmux_test_support::kill_session(&session);
             assert_eq!(
                 result.unwrap(),
                 SubmitStatus::Submitted {
@@ -1257,6 +1279,8 @@ mod tests {
                 "trial {trial} did not submit"
             );
         }
+
+        crate::tmux_test_support::kill_session(&holder);
     }
 
     #[test]
@@ -1269,15 +1293,29 @@ mod tests {
         //   * a genuinely busy pane (the seed submitted): must confirm.
         // The pure-logic core is covered above; this exercises the real
         // `capture_history` / `pane_title` path the seed verifier walks.
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
+        // Holder keeps the private server alive across both fixture runs so a
+        // fixture's exit can't empty and take down the server mid-test.
+        let holder = format!("shelbi-seed-holder-{}", std::process::id());
+        if !crate::tmux_test_support::try_start_session(&holder, "holder") {
+            eprintln!("skipping: tmux cannot create a server here");
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
 
-        // Idle box that never goes busy — the bug's symptom.
+        // Idle box that never goes busy — the bug's symptom. `sleep 600` so the
+        // pane can't exit before the verifier finishes sampling it.
         let idle_script = tmp.path().join("idle-seed.sh");
         std::fs::write(
             &idle_script,
             "#!/bin/sh\n\
              printf '\\033[2J\\033[H────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  ? for shortcuts\\n'\n\
-             sleep 5\n",
+             sleep 600\n",
         )
         .unwrap();
 
@@ -1287,7 +1325,7 @@ mod tests {
             &busy_script,
             "#!/bin/sh\n\
              printf '\\033[2J\\033[H✳ Working on the seeded prompt\\n────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  esc to interrupt\\n'\n\
-             sleep 5\n",
+             sleep 600\n",
         )
         .unwrap();
 
@@ -1309,12 +1347,11 @@ mod tests {
                     script.to_str().unwrap(),
                 ])
                 .status();
-            // tmux is optional in development/test containers; match the repo's
-            // skip convention when no server can be created.
-            let Ok(started) = started else { return None };
-            if !started.success() {
-                return None;
-            }
+            // The holder guarantees a live server, so a failure here is real.
+            assert!(
+                matches!(started, Ok(status) if status.success()),
+                "failed to start fixture session `{session}` on the private server"
+            );
             let addr = TmuxAddr {
                 session: session.clone(),
                 window: "agent".into(),
@@ -1336,27 +1373,23 @@ mod tests {
                 &baseline,
                 std::time::Duration::from_millis(600),
             );
-            let _ = std::process::Command::new("tmux")
-                .args(["kill-session", "-t", &session])
-                .status();
+            crate::tmux_test_support::kill_session(&session);
             Some(confirmed)
         };
 
-        let Some(idle_confirmed) = run(&idle_script, "? for shortcuts") else {
-            return; // no tmux server available
-        };
+        let idle_confirmed = run(&idle_script, "? for shortcuts").expect("idle fixture ran");
         assert!(
             !idle_confirmed,
             "an idle empty box (dropped seed) must not read as a submitted dispatch"
         );
 
-        let Some(busy_confirmed) = run(&busy_script, "esc to interrupt") else {
-            return;
-        };
+        let busy_confirmed = run(&busy_script, "esc to interrupt").expect("busy fixture ran");
         assert!(
             busy_confirmed,
             "a busy pane (submitted seed) must confirm the dispatch"
         );
+
+        crate::tmux_test_support::kill_session(&holder);
     }
 
     /// Opt-in acceptance path against the actual Claude Code TUI. Unlike the

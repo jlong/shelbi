@@ -453,6 +453,14 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     fn project_with_runner(name: &str, command: &str) -> shelbi_core::Project {
         shelbi_core::Project {
             name: "demo".into(),
@@ -513,16 +521,31 @@ mod tests {
         // `request_orchestrator_handoff` now uses and asserts the pane went
         // busy (proof Enter landed), exercising the real tmux paste-buffer +
         // separate-Enter + confirm-busy path rather than the pure closures.
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
+        // Holder keeps the private server alive so the fixture's exit can't
+        // empty and take down the server; skip if the sandbox denies sockets.
+        let holder = format!("shelbi-handoff-holder-{}", std::process::id());
+        if !crate::tmux_test_support::try_start_session(&holder, "holder") {
+            eprintln!("skipping: tmux cannot create a server here");
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("fake-claude.sh");
         fs::write(
             &script,
+            // `sleep 600`, never `sleep 2`: the busy footer must outlive the
+            // verifier's poll under CI load, and the pane must not exit early.
             "#!/bin/sh\n\
              stty -echo\n\
              printf '\\033[2J\\033[H────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  ? for shortcuts\\n'\n\
              IFS= read -r line\n\
              printf '\\033[2J\\033[H✳ Working on message\\n────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  esc to interrupt\\n'\n\
-             sleep 2\n",
+             sleep 600\n",
         )
         .unwrap();
 
@@ -539,14 +562,11 @@ mod tests {
                 script.to_str().unwrap(),
             ])
             .status();
-        // tmux is optional in dev/test containers and the workspace sandbox may
-        // deny socket access — match the repo's existing optional-tmux skip.
-        let Ok(started) = started else {
-            return;
-        };
-        if !started.success() {
-            return;
-        }
+        // The holder guarantees a live server, so a failure here is real.
+        assert!(
+            matches!(started, Ok(status) if status.success()),
+            "failed to start fixture session on the private server"
+        );
 
         let addr = TmuxAddr {
             session: session.clone(),
@@ -570,9 +590,8 @@ mod tests {
             &handoff_request_message(),
             &baseline,
         );
-        let _ = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", &session])
-            .status();
+        crate::tmux_test_support::kill_session(&session);
+        crate::tmux_test_support::kill_session(&holder);
 
         assert!(
             matches!(result, Ok(SubmitStatus::Submitted { .. })),
