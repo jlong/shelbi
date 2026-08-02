@@ -40,6 +40,9 @@ pub mod zen;
 mod golden;
 
 #[cfg(test)]
+pub(crate) mod tmux_test_support;
+
+#[cfg(test)]
 pub(crate) mod test_lock {
     //! Shared mutex for any orchestrator-crate test that mutates the
     //! process-wide `SHELBI_HOME` env var. `actions.rs` and `lifecycle.rs`
@@ -3148,7 +3151,7 @@ mod create_stash_pane_tmux_tests {
                 "dashboard",
                 "sh",
                 "-c",
-                "sleep 30",
+                "sleep 600",
             ])
             .status()
             .map(|s| s.success())
@@ -3165,7 +3168,7 @@ mod create_stash_pane_tmux_tests {
                 "views",
                 "sh",
                 "-c",
-                "sleep 30",
+                "sleep 600",
             ])
             .status()
             .map(|s| s.success())
@@ -3181,9 +3184,11 @@ mod create_stash_pane_tmux_tests {
             eprintln!("skipping: tmux not on PATH");
             return;
         }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
         let (vis, _stash) = provision_sessions("alloc");
 
-        let status = create_stash_pane(&vis, "activity", "sleep 30");
+        let status = create_stash_pane(&vis, "activity", "sleep 600");
         let pane_id = match &status {
             PaneReloadStatus::Created { target } => target.clone(),
             other => panic!("expected Created, got {other:?}"),
@@ -3216,9 +3221,11 @@ mod create_stash_pane_tmux_tests {
             eprintln!("skipping: tmux not on PATH");
             return;
         }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
         let (vis, _stash) = provision_sessions("idem");
 
-        let first = reload_stash_pane(&vis, "activity", "sleep 30");
+        let first = reload_stash_pane(&vis, "activity", "sleep 600");
         let pane_id = match &first {
             PaneReloadStatus::Created { target } => target.clone(),
             other => panic!("expected Created on first call, got {other:?}"),
@@ -3226,7 +3233,7 @@ mod create_stash_pane_tmux_tests {
 
         // Second call should find the env entry and respawn in-place,
         // preserving the pane id.
-        let second = reload_stash_pane(&vis, "activity", "sleep 30");
+        let second = reload_stash_pane(&vis, "activity", "sleep 600");
         match &second {
             PaneReloadStatus::Respawned { target } => {
                 assert_eq!(target, &pane_id, "pane id should be reused on respawn");
@@ -3276,7 +3283,7 @@ mod ensure_hidden_views_tmux_tests {
         for _ in 0..50 {
             let _ = std::process::Command::new("tmux")
                 .args([
-                    "new-session", "-d", "-s", name, "-n", win, "sh", "-c", "sleep 30",
+                    "new-session", "-d", "-s", name, "-n", win, "sh", "-c", "sleep 600",
                 ])
                 .status();
             let live = std::process::Command::new("tmux")
@@ -3318,6 +3325,8 @@ mod ensure_hidden_views_tmux_tests {
             eprintln!("skipping: tmux not on PATH");
             return;
         }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
         let vis = format!("shelbi-test-ehv-fresh-{}", std::process::id());
         let stash = format!("_{vis}");
         kill_session(&vis);
@@ -3357,6 +3366,8 @@ mod ensure_hidden_views_tmux_tests {
             eprintln!("skipping: tmux not on PATH");
             return;
         }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
         let vis = format!("shelbi-test-ehv-heal-{}", std::process::id());
         let stash = format!("_{vis}");
         kill_session(&vis);
@@ -3406,6 +3417,8 @@ mod ensure_hidden_views_tmux_tests {
             eprintln!("skipping: tmux not on PATH");
             return;
         }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
         let vis = format!("shelbi-test-ehv-dead-{}", std::process::id());
         let stash = format!("_{vis}");
         kill_session(&vis);
@@ -3607,7 +3620,7 @@ mod reload_target_tmux_tests {
         for _ in 0..50 {
             let _ = std::process::Command::new("tmux")
                 .args([
-                    "new-session", "-d", "-s", name, "-n", win, "sh", "-c", "sleep 30",
+                    "new-session", "-d", "-s", name, "-n", win, "sh", "-c", "sleep 600",
                 ])
                 .status();
             let live = std::process::Command::new("tmux")
@@ -3690,6 +3703,8 @@ mod reload_target_tmux_tests {
             eprintln!("skipping: tmux not on PATH");
             return;
         }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
         let project = format!("tgt-tasks-{}", std::process::id());
         let vis = format!("shelbi-{project}");
         let stash = format!("_{vis}");
@@ -3699,7 +3714,7 @@ mod reload_target_tmux_tests {
         start_session(&stash, "views");
 
         // Pin a tasks stash pane so the reload respawns (rather than creates) it.
-        let created = reload_stash_pane(&vis, "tasks", "sleep 30");
+        let created = reload_stash_pane(&vis, "tasks", "sleep 600");
         assert!(
             matches!(created, PaneReloadStatus::Created { .. }),
             "setup: expected Created, got {created:?}"
@@ -3730,6 +3745,8 @@ mod reload_target_tmux_tests {
             eprintln!("skipping: tmux not on PATH");
             return;
         }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
         let project = format!("tgt-sidebar-{}", std::process::id());
         let vis = format!("shelbi-{project}");
         kill_session(&vis);
@@ -3762,6 +3779,8 @@ mod reload_target_tmux_tests {
             eprintln!("skipping: tmux not on PATH");
             return;
         }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
         let project = format!("tgt-nosession-{}", std::process::id());
         kill_session(&format!("shelbi-{project}"));
         let err = reload_target(&project, &ReloadTarget::Tasks).unwrap_err();
@@ -3781,6 +3800,7 @@ mod reload_target_tmux_tests {
         let temp = tempfile::tempdir().unwrap();
         let _home = HomeGuard::install(temp.path());
 
+        crate::tmux_test_support::use_private_tmux_server();
         let project_name = format!("native-switch-{}", std::process::id());
         let hub_work_dir = temp.path().join("repo");
         std::fs::create_dir_all(&hub_work_dir).unwrap();
@@ -3840,6 +3860,7 @@ mod reload_target_tmux_tests {
         let temp = tempfile::tempdir().unwrap();
         let _home = HomeGuard::install(temp.path());
 
+        crate::tmux_test_support::use_private_tmux_server();
         let project_name = format!("native-start-switch-{}", std::process::id());
         let hub_work_dir = temp.path().join("repo");
         std::fs::create_dir_all(&hub_work_dir).unwrap();
@@ -3897,6 +3918,7 @@ mod reload_target_tmux_tests {
         let temp = tempfile::tempdir().unwrap();
         let _home = HomeGuard::install(temp.path());
 
+        crate::tmux_test_support::use_private_tmux_server();
         let project_name = format!("native-cold-switch-{}", std::process::id());
         let hub_work_dir = temp.path().join("repo");
         std::fs::create_dir_all(&hub_work_dir).unwrap();
@@ -3987,6 +4009,7 @@ mod reload_target_tmux_tests {
         let temp = tempfile::tempdir().unwrap();
         let _home = HomeGuard::install(temp.path());
 
+        crate::tmux_test_support::use_private_tmux_server();
         let project_name = format!("native-attach-switch-{}", std::process::id());
         let hub_work_dir = temp.path().join("repo");
         std::fs::create_dir_all(&hub_work_dir).unwrap();
@@ -4009,7 +4032,7 @@ mod reload_target_tmux_tests {
                 &format!("{session}:dashboard"),
                 "sh",
                 "-c",
-                "sleep 30",
+                "sleep 600",
             ])
             .status()
             .unwrap();
@@ -4057,6 +4080,7 @@ mod reload_target_tmux_tests {
         let temp = tempfile::tempdir().unwrap();
         let _home = HomeGuard::install(temp.path());
 
+        crate::tmux_test_support::use_private_tmux_server();
         let project_name = format!("incomplete-chat-{}", std::process::id());
         let hub_work_dir = temp.path().join("repo");
         std::fs::create_dir_all(&hub_work_dir).unwrap();
@@ -4197,6 +4221,7 @@ mod reload_workspace_tmux_tests {
             return;
         }
         let _g = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
         let home = std::env::temp_dir().join(format!(
             "shelbi-reload-ws-{}-{}",
             std::process::id(),
@@ -4208,12 +4233,10 @@ mod reload_workspace_tmux_tests {
         let project = "reload-ws-proj";
         save_min_project(project);
         let vis = format!("shelbi-{project}");
-        kill_session(&vis);
-        // The session must exist so the reload gets past the liveness gate
-        // to the workspace lookup.
-        let _ = std::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", &vis, "-n", "dashboard", "sh", "-c", "sleep 30"])
-            .status();
+        // The session must exist so the reload gets past the liveness gate to
+        // the workspace lookup. `start_session` cold-start-retries so the first
+        // session on the freshly-forked private server can't race the follow-up.
+        crate::tmux_test_support::start_session(&vis, "dashboard");
 
         let err = reload_target(project, &ReloadTarget::Workspace("ghost".into())).unwrap_err();
         let msg = err.to_string();

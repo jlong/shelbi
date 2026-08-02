@@ -6921,94 +6921,6 @@ mod tests {
     }
 }
 
-/// Shared harness for the crate's real-tmux round-trip tests.
-///
-/// They used to drive the machine-wide *default* tmux server. Under CI load
-/// several of them (plus `shelbi zen probe`) hit that one server at once, and a
-/// concurrent teardown there could drop a test's client mid-command with
-/// `server exited unexpectedly` — failing PRs whose code was unrelated. The fix
-/// is to give this test *process* its own tmux server: we pin `TMUX_TMPDIR` at
-/// a private directory, so every `tmux` these tests spawn — directly and
-/// through the production workspace helpers, which inherit our env — lands on a
-/// server socket no other process (or crate's test binary) can see. Tests still
-/// use unique per-pid session names and only ever `kill-session` (never
-/// `kill-server`), so the ones sharing this process coexist on the private
-/// server without tearing it out from under each other.
-#[cfg(test)]
-pub(super) mod tmux_test_support {
-    use std::sync::Once;
-    use std::time::Duration;
-
-    static INIT: Once = Once::new();
-
-    /// Point this test process's tmux at a private server socket. Idempotent
-    /// and thread-safe: the first caller creates the dir and sets the env, all
-    /// later callers are a no-op. Never restored — the process is a throwaway
-    /// test runner and every real-tmux test wants the same private server.
-    /// Call it before the FIRST tmux interaction of a test (some assert Dead on
-    /// a not-yet-created session, so even the opening probe must hit the
-    /// private server, not the default one).
-    pub(crate) fn use_private_tmux_server() {
-        INIT.call_once(|| {
-            let dir =
-                std::env::temp_dir().join(format!("shelbi-tmux-test-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&dir);
-            std::env::set_var("TMUX_TMPDIR", &dir);
-        });
-    }
-
-    /// Create a detached `sleep`-holding session on the private server, then
-    /// block until the server actually reports it live. tmux forks its server
-    /// lazily on the first client; under load that fork can lose the race with
-    /// the follow-up command, surfacing as `server exited unexpectedly`, so we
-    /// retry a transient cold-start failure and confirm liveness before handing
-    /// the session back. The pane sleeps far longer than any test body needs so
-    /// its shell can't exit mid-test and tear the slot down early.
-    pub(crate) fn start_session(session: &str, window: &str) {
-        use_private_tmux_server();
-        // Clear a same-named session left by a prior aborted run in this
-        // process (unique per-pid names mean this only ever hits our own).
-        let _ = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", &format!("={session}")])
-            .output();
-        let mut last = String::new();
-        for _ in 0..20 {
-            match std::process::Command::new("tmux")
-                .args([
-                    "new-session", "-d", "-s", session, "-n", window, "sh", "-c", "sleep 600",
-                ])
-                .output()
-            {
-                Ok(out) if out.status.success() && wait_for_session(session) => return,
-                Ok(out) => {
-                    last = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                }
-                Err(err) => last = err.to_string(),
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        panic!("failed to start isolated tmux session `{session}`: {last}");
-    }
-
-    /// Poll `has-session` until the private server confirms `session` is live,
-    /// giving the freshly-forked server time to answer. Returns whether it
-    /// came up within the budget.
-    fn wait_for_session(session: &str) -> bool {
-        for _ in 0..100 {
-            let up = std::process::Command::new("tmux")
-                .args(["has-session", "-t", &format!("={session}")])
-                .output()
-                .map(|out| out.status.success())
-                .unwrap_or(false);
-            if up {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        false
-    }
-}
-
 #[cfg(test)]
 mod user_shell_tmux_tests {
     //! Real-tmux round-trip for the user-shell slot mark. Skipped silently
@@ -7048,10 +6960,10 @@ mod user_shell_tmux_tests {
         let _lock = crate::test_lock::acquire();
         // Own tmux server, so a concurrent teardown on the machine-wide default
         // one can't drop this client mid-command (`server exited unexpectedly`).
-        super::tmux_test_support::use_private_tmux_server();
+        crate::tmux_test_support::use_private_tmux_server();
 
         let session = format!("shelbi-test-usershell-{}", std::process::id());
-        super::tmux_test_support::start_session(&session, "alpha");
+        crate::tmux_test_support::start_session(&session, "alpha");
 
         let host = Host::Local;
         let addr = TmuxAddr {
@@ -7100,7 +7012,7 @@ mod user_shell_tmux_tests {
         // the machine-wide default one can't drop this client mid-command with
         // `server exited unexpectedly`; also keeps the mark file the kill
         // writes (SHELBI_HOME-scoped) and the session off any real hub.
-        super::tmux_test_support::use_private_tmux_server();
+        crate::tmux_test_support::use_private_tmux_server();
         let home = std::env::temp_dir().join(format!("shelbi-reap-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         let prev_home = std::env::var("SHELBI_HOME").ok();
@@ -7109,7 +7021,7 @@ mod user_shell_tmux_tests {
         let session = format!("shelbi-test-reap-{}", std::process::id());
         // Two windows both named `alice`: the stale orphan and the fresh
         // resumed pane. tmux happily allows the duplicate name.
-        super::tmux_test_support::start_session(&session, "alice");
+        crate::tmux_test_support::start_session(&session, "alice");
         let ok = std::process::Command::new("tmux")
             .args([
                 "new-window", "-d", "-t", &format!("={session}:"), "-n", "alice", "sh", "-c",
@@ -7264,7 +7176,7 @@ mod slot_probe_tests {
         // one can't drop this client mid-command (`server exited unexpectedly`).
         // Set before the opening Dead probe so it, too, targets the private
         // server (where the session genuinely does not exist yet).
-        super::tmux_test_support::use_private_tmux_server();
+        crate::tmux_test_support::use_private_tmux_server();
 
         let session = format!("shelbi-test-slotprobe-{}", std::process::id());
         let kill = || {
@@ -7287,7 +7199,7 @@ mod slot_probe_tests {
             "no session yet"
         );
 
-        super::tmux_test_support::start_session(&session, "alpha");
+        crate::tmux_test_support::start_session(&session, "alpha");
 
         assert_eq!(
             probe_workspace_slot(&host, &addr, deadline),
