@@ -962,6 +962,15 @@ fn merge_hub_side(
         )));
     }
 
+    // Ancestry guard: refuse to squash-merge a branch cut from the wrong
+    // base. A branch whose history diverges from `origin/<target>` (a
+    // subtask branched off `main` instead of its feature branch) can revert
+    // sibling subtasks already integrated on the target when squashed in —
+    // corruption a green zen probe does not catch. Auto-rebase it onto the
+    // target when that lands cleanly, otherwise reject rather than merge a
+    // wrong-base branch. `merge()` stays in handoff on the error.
+    ensure_branch_descends_from_target(host, wt, branch, target, task_id)?;
+
     let tmp_path = unique_temp_worktree_path("merge", task_id);
     // git worktree add refuses to overwrite an existing path. Clean up
     // any stale dir from a previous crashed merge before we re-add.
@@ -1050,6 +1059,165 @@ fn merge_and_push_in_worktree(
         )));
     }
     Ok(sha)
+}
+
+/// Ancestry guard for [`merge_hub_side`]: refuse to squash-merge a branch
+/// that was cut from the wrong base.
+///
+/// A subtask branched off `main` (rather than its feature branch) diverges
+/// from `origin/<target>`: `origin/<target>` is *not* an ancestor of
+/// `origin/<branch>`. Squash-merging it as-is folds the branch's stale view
+/// of the target back in, which can **revert sibling subtasks** already
+/// integrated on the target — corruption a green zen probe does not catch
+/// (the "probe green can hide sibling revert" failure class).
+///
+/// Remedy, in order:
+/// 1. If `origin/<branch>` already descends from `origin/<target>`, return
+///    immediately — no spurious rebase, no force-push.
+/// 2. Otherwise auto-rebase the branch onto `origin/<target>` in a
+///    throwaway worktree (the same isolation the merge itself uses) and,
+///    when it lands cleanly, force-push the corrected history back so the
+///    follow-on squash merges only the branch's own commits. Re-verify the
+///    descendant relationship before returning `Ok`.
+/// 3. If the rebase conflicts, refuse with a loud [`Error`] naming the
+///    branch and target. The caller propagates it, so `merge()` leaves the
+///    task in handoff rather than merging a wrong-base branch.
+fn ensure_branch_descends_from_target(
+    host: &Host,
+    wt: &str,
+    branch: &str,
+    target: &str,
+    task_id: &str,
+) -> Result<()> {
+    if branch_descends_from_target(host, wt, branch, target)? {
+        return Ok(());
+    }
+
+    // Wrong-base branch. Rebase it onto origin/<target> in a throwaway
+    // worktree checked out at the branch tip, then push the corrected
+    // history. The worktree is torn down on every exit path so a conflicted
+    // rebase can't leak a half-rebased tree into $TMPDIR — same discipline
+    // as [`merge_hub_side`] and [`restack`].
+    let origin_branch = format!("origin/{branch}");
+    let tmp_path = unique_temp_worktree_path("merge-rebase", task_id);
+    let _ = std::fs::remove_dir_all(&tmp_path);
+    let tmp = tmp_path.to_string_lossy().into_owned();
+    run_or_command_err(
+        host,
+        wt,
+        &["git", "worktree", "add", "--detach", &tmp, &origin_branch],
+        || format!("git -C {wt} worktree add --detach {tmp} {origin_branch}"),
+    )?;
+
+    let rebased = rebase_branch_onto_target(host, wt, &tmp, branch, target);
+
+    let _ = run_in_dir(host, wt, &["git", "worktree", "remove", "--force", &tmp]);
+    let _ = std::fs::remove_dir_all(&tmp_path);
+
+    rebased
+}
+
+/// The mutating half of [`ensure_branch_descends_from_target`], run inside
+/// the throwaway worktree `tmp` (checked out at `origin/<branch>`). Split
+/// out so the caller can tear the worktree down on every exit path.
+///
+/// Aborts a conflicted rebase before returning so `git worktree remove`
+/// sees a clean tree, and converts the conflict into a loud error that
+/// names both branch and target.
+fn rebase_branch_onto_target(
+    host: &Host,
+    wt: &str,
+    tmp: &str,
+    branch: &str,
+    target: &str,
+) -> Result<()> {
+    let origin_target = format!("origin/{target}");
+    let rebase = run_in_dir(host, tmp, &["git", "rebase", &origin_target])?;
+    if !rebase.status.success() {
+        // Abort so the worktree is clean for the remove that follows.
+        let _ = run_in_dir(host, tmp, &["git", "rebase", "--abort"]);
+        return Err(Error::Other(format!(
+            "branch `{branch}` does not descend from `{target}` and could not be \
+             auto-rebased onto it (rebase conflict) — refusing to squash-merge a \
+             wrong-base branch, which could revert sibling work already on \
+             `{target}`. Rebase `{branch}` onto `{target}` by hand, resolve the \
+             conflicts, and retry the merge."
+        )));
+    }
+
+    // Push the corrected history. --force-with-lease without an expected
+    // SHA leases against our local origin/<branch> ref (just read to build
+    // the worktree above), so a race between that read and this push is the
+    // only way the lease fails — exactly the case we want to refuse.
+    let push = run_in_dir(
+        host,
+        tmp,
+        &[
+            "git",
+            "push",
+            &format!("--force-with-lease={branch}"),
+            "origin",
+            "--",
+            &format!("HEAD:{branch}"),
+        ],
+    )?;
+    if !push.status.success() {
+        return Err(Error::Command {
+            cmd: format!("git -C {tmp} push --force-with-lease={branch} origin HEAD:{branch}"),
+            status: push.status.to_string(),
+            stderr: String::from_utf8_lossy(&push.stderr).into_owned(),
+        });
+    }
+
+    // Re-fetch the branch (the push already advanced the shared
+    // remote-tracking ref, but fetch keeps the invariant explicit) and
+    // re-verify. If the rebase somehow didn't produce a descendant — e.g.
+    // `origin/<target>` moved under a concurrent merge — refuse rather than
+    // merge on a stale assumption; the operator can retry against the new
+    // tip.
+    run_or_command_err(host, wt, &["git", "fetch", "origin", "--", branch], || {
+        format!("git -C {wt} fetch origin -- {branch}")
+    })?;
+    if !branch_descends_from_target(host, wt, branch, target)? {
+        return Err(Error::Other(format!(
+            "branch `{branch}` still does not descend from `{target}` after an \
+             auto-rebase (did `{target}` move under a concurrent merge?) — \
+             refusing to squash-merge; retry the merge"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `origin/<target>` is an ancestor of `origin/<branch>` — i.e. the
+/// branch descends from the merge target. `git merge-base --is-ancestor A
+/// B` exits 0 when A is an ancestor of B, 1 when it is not, and >1 on a
+/// real error (bad object, broken repo). Surface the last as an error
+/// rather than silently reading it as "not a descendant."
+fn branch_descends_from_target(host: &Host, wt: &str, branch: &str, target: &str) -> Result<bool> {
+    let origin_target = format!("origin/{target}");
+    let origin_branch = format!("origin/{branch}");
+    let out = run_in_dir(
+        host,
+        wt,
+        &[
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            &origin_target,
+            &origin_branch,
+        ],
+    )?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(Error::Command {
+            cmd: format!(
+                "git -C {wt} merge-base --is-ancestor origin/{target} origin/{branch}"
+            ),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }),
+    }
 }
 
 /// v1 of the `merge` action supports `squash` and `merge`. `rebase` is
@@ -2267,6 +2435,219 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no commits beyond"), "{msg}");
+    }
+
+    /// On top of `fixture_repo_with_origin`, model a stacked workflow whose
+    /// integration target is `feature`: land a sibling subtask's commit on
+    /// `feature` (writing `sibling_file`), then cut a wrong-base subtask
+    /// branch `subB` off `main` (not `feature`) that writes `b_file`. `subB`
+    /// therefore does **not** descend from `origin/feature`. Returns the
+    /// worktree path.
+    ///
+    /// Point `b_file` at the same path as `sibling_file` to force the
+    /// rebase-onto-target to conflict; use distinct paths for a clean
+    /// rebase.
+    fn wrong_base_subtask_fixture(
+        local: &std::path::Path,
+        sibling_file: &str,
+        b_file: &str,
+    ) -> String {
+        // Sibling subtask, already integrated on the target branch.
+        run_git(local, &["checkout", "feature"]);
+        std::fs::write(local.join(sibling_file), "sibling work\n").unwrap();
+        run_git(local, &["add", sibling_file]);
+        run_git(local, &["commit", "-q", "-m", "sibling work on feature"]);
+        run_git(local, &["push", "origin", "feature"]);
+
+        // Wrong-base subtask: branched off main instead of feature.
+        run_git(local, &["checkout", "main"]);
+        run_git(local, &["checkout", "-b", "subB"]);
+        std::fs::write(local.join(b_file), "b work\n").unwrap();
+        run_git(local, &["add", b_file]);
+        run_git(local, &["commit", "-q", "-m", "subtask B work"]);
+        run_git(local, &["push", "-u", "origin", "subB"]);
+        run_git(local, &["checkout", "main"]);
+
+        local.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn wrong_base_branch_is_rebased_onto_target_before_merge() {
+        // A subtask cut off `main` instead of its feature branch does not
+        // descend from `origin/feature`. The guard must rebase it onto the
+        // target (here it lands cleanly — B touches a different file than
+        // the sibling) and only then squash-merge, so the sibling's commit
+        // is preserved and the branch is never squash-merged as-is.
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        let wt = wrong_base_subtask_fixture(&local, "sibling.txt", "b.txt");
+
+        // Capture the pre-merge tips. The `feature` tip is what the guard
+        // rebases subB onto; the merge then advances `feature` past it.
+        let feature_tip = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "rev-parse", "origin/feature"],
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let sub_before =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/subB"])
+                .unwrap()
+                .trim()
+                .to_string();
+
+        // Pre-check: subB really does NOT descend from origin/feature.
+        let pre = run_in_dir(
+            &Host::Local,
+            &wt,
+            &[
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                "origin/feature",
+                "origin/subB",
+            ],
+        )
+        .unwrap();
+        assert!(!pre.status.success(), "subB should not descend pre-merge");
+
+        let sha = merge_hub_side(
+            &Host::Local,
+            &wt,
+            "subB",
+            "feature",
+            MergeStrategy::Squash,
+            "t",
+        )
+        .unwrap();
+        assert!(!sha.is_empty());
+
+        // Refresh remote-tracking refs the push/merge advanced.
+        run_or_command_err(&Host::Local, &wt, &["git", "fetch", "origin"], || {
+            "git fetch origin".into()
+        })
+        .unwrap();
+
+        // subB was rewritten (force-pushed after the rebase), and the
+        // rewritten branch descends from the feature tip it was rebased
+        // onto — proof the guard corrected the base rather than merging as
+        // is. (origin/feature itself has since advanced with the squash
+        // commit, so we verify against the captured pre-merge tip.)
+        let sub_after =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/subB"])
+                .unwrap()
+                .trim()
+                .to_string();
+        assert_ne!(sub_before, sub_after, "subB should have been rebased");
+        let post = run_in_dir(
+            &Host::Local,
+            &wt,
+            &["git", "merge-base", "--is-ancestor", &feature_tip, "origin/subB"],
+        )
+        .unwrap();
+        assert!(
+            post.status.success(),
+            "rebased subB should descend from the pre-merge feature tip"
+        );
+
+        // The merge landed on origin/feature with BOTH the sibling's file
+        // and B's file present — the sibling subtask was not reverted.
+        let tree = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "ls-tree", "-r", "--name-only", "origin/feature"],
+        )
+        .unwrap();
+        assert!(tree.contains("sibling.txt"), "sibling reverted: {tree}");
+        assert!(tree.contains("b.txt"), "B work missing: {tree}");
+    }
+
+    #[test]
+    fn wrong_base_branch_that_cannot_rebase_is_rejected_leaving_target_intact() {
+        // The sibling-revert scenario: the wrong-base subtask edits the
+        // SAME file a sibling already changed on the target, so rebasing it
+        // onto the target conflicts. The guard must refuse the merge with
+        // an error naming the branch and target, and must NOT record a
+        // squash commit — leaving origin/feature (the sibling's work)
+        // untouched so `merge()` keeps the task in handoff.
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        let wt = wrong_base_subtask_fixture(&local, "shared.txt", "shared.txt");
+
+        let feature_before =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/feature"])
+                .unwrap()
+                .trim()
+                .to_string();
+
+        let err = merge_hub_side(
+            &Host::Local,
+            &wt,
+            "subB",
+            "feature",
+            MergeStrategy::Squash,
+            "t",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("subB"), "error must name the branch: {msg}");
+        assert!(msg.contains("feature"), "error must name the target: {msg}");
+
+        // origin/feature never moved — no squash commit, sibling intact.
+        run_or_command_err(&Host::Local, &wt, &["git", "fetch", "origin"], || {
+            "git fetch origin".into()
+        })
+        .unwrap();
+        let feature_after =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/feature"])
+                .unwrap()
+                .trim()
+                .to_string();
+        assert_eq!(
+            feature_before, feature_after,
+            "target must be untouched on reject"
+        );
+    }
+
+    #[test]
+    fn descendant_branch_merges_without_a_spurious_rebase() {
+        // A branch that already descends from origin/<target> must merge
+        // unchanged: the guard returns early, so the branch tip on origin
+        // is never rewritten (no force-push).
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        advance_feature_with_origin(&local);
+        let wt = local.to_string_lossy().into_owned();
+
+        let branch_before =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/feature"])
+                .unwrap()
+                .trim()
+                .to_string();
+
+        let sha = merge_hub_side(
+            &Host::Local,
+            &wt,
+            "feature",
+            "main",
+            MergeStrategy::Squash,
+            "t",
+        )
+        .unwrap();
+        assert!(!sha.is_empty());
+
+        run_or_command_err(&Host::Local, &wt, &["git", "fetch", "origin"], || {
+            "git fetch origin".into()
+        })
+        .unwrap();
+        let branch_after =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/feature"])
+                .unwrap()
+                .trim()
+                .to_string();
+        assert_eq!(
+            branch_before, branch_after,
+            "descendant branch must not be rebased/force-pushed"
+        );
     }
 
     #[test]
