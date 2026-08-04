@@ -74,9 +74,75 @@ pub fn execute_transition(
     from: &str,
     to: &str,
 ) -> Result<Vec<ActionOutcome>> {
+    execute_transition_except(project, project_name, task, task_body, workflow, from, to, &[])
+}
+
+/// Fire ONLY the `merge` action of the `from -> to` edge — with the same
+/// target resolution [`execute_transition`] uses (edge `target:` override,
+/// else the workflow's resolved `git.base_branch`) — and return its outcome.
+/// `Ok(None)` when the edge declares no `merge`.
+///
+/// The poller's handoff-less auto-advance uses this to land, and gate the
+/// task's done-move on, the merge *before* marking the task done — so a failed
+/// or no-op merge leaves the task un-done rather than showing done with nothing
+/// integrated. The edge's remaining cleanup (`delete_branch`, `run:`/`ready:`)
+/// runs afterward via [`execute_transition_except`] with `merge` skipped, so
+/// the now-no-op merge (which would fail with "no commits beyond target")
+/// doesn't wedge the cleanup.
+pub fn execute_merge_action(
+    project: &Project,
+    project_name: &str,
+    task: &Task,
+    task_body: &str,
+    workflow: &Workflow,
+    from: &str,
+    to: &str,
+) -> Result<Option<ActionOutcome>> {
+    if !workflow
+        .actions_for_transition(from, to)
+        .contains(&TransitionAction::Merge)
+    {
+        return Ok(None);
+    }
+    let target = resolve_effective_target(workflow, task, from, to)?;
+    let line = run_action(
+        project,
+        project_name,
+        task,
+        task_body,
+        TransitionAction::Merge,
+        target.as_deref(),
+    )?;
+    Ok(Some(ActionOutcome {
+        action: TransitionAction::Merge,
+        line,
+    }))
+}
+
+/// Like [`execute_transition`] but skips any [`TransitionAction`] listed in
+/// `skip`. The poller's handoff-less auto-advance passes
+/// `&[TransitionAction::Merge]` here after it has already run (and gated on)
+/// the merge via [`execute_merge_action`]: skipping the merge avoids
+/// re-running it (a second merge would fail "no commits beyond target" and
+/// short-circuit the edge's cleanup before `delete_branch` fires). The `run:`
+/// / `ready:` commands always run — they never re-run the merge.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_transition_except(
+    project: &Project,
+    project_name: &str,
+    task: &Task,
+    task_body: &str,
+    workflow: &Workflow,
+    from: &str,
+    to: &str,
+    skip: &[TransitionAction],
+) -> Result<Vec<ActionOutcome>> {
     let target = resolve_effective_target(workflow, task, from, to)?;
     let mut outcomes = Vec::new();
     for &action in workflow.actions_for_transition(from, to) {
+        if skip.contains(&action) {
+            continue;
+        }
         let line = run_action(
             project,
             project_name,

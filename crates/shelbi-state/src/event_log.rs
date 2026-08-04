@@ -1370,13 +1370,18 @@ pub fn append_workspace_pane_event(
     emit_event_body(&body)
 }
 
-/// Append `<rfc3339> rebase task=<id> workspace=<name> branch=<branch> status=<status> detail=<detail>`
-/// to `~/.shelbi/events.log`. Emitted by the poller's review-marker handler
-/// when it auto-rebases a workspace's branch onto the project's default branch
-/// — so the user (and `shelbi events tail`) can see whether the rebase
+/// Append `<rfc3339> rebase task=<id> workspace=<name> branch=<branch> base=<base> status=<status> detail=<detail>`
+/// to `~/.shelbi/events.log`. Emitted by the poller's ready-marker handoff
+/// when it auto-rebases a workspace's branch onto the branch the work merges
+/// into — so the user (and `shelbi events tail`) can see whether the rebase
 /// succeeded, was a no-op (`up-to-date`), conflicted (`conflict`, worktree
 /// returned to a clean pre-rebase state), or was skipped (`skipped`, e.g.
-/// missing default branch ref or dirty worktree).
+/// missing base branch ref or dirty worktree).
+///
+/// `base` names the *actual* base branch the rebase/ancestry check compared
+/// against — the workflow's resolved `git.base_branch`, not always the repo
+/// default — so a subtask flow's `feature/x` base is legible in the log
+/// rather than being silently attributed to the default branch.
 ///
 /// Detail is a single short token (short shas, conflict excerpt, or reason
 /// snippet); whitespace folds to underscores so the line stays parseable.
@@ -1384,6 +1389,7 @@ pub fn append_rebase_event(
     task_id: &str,
     workspace: &str,
     branch: &str,
+    base: &str,
     status: &str,
     detail: &str,
 ) -> Result<()> {
@@ -1391,10 +1397,11 @@ pub fn append_rebase_event(
     let task_id = sanitize_field(task_id);
     let workspace = sanitize_field(workspace);
     let branch = sanitize_reason(branch);
+    let base = sanitize_reason(base);
     let status = sanitize_reason(status);
     let detail = sanitize_reason(detail);
     append_event_line(&format!(
-        "{ts} rebase task={task_id} workspace={workspace} branch={branch} status={status} detail={detail}"
+        "{ts} rebase task={task_id} workspace={workspace} branch={branch} base={base} status={status} detail={detail}"
     ))
 }
 
@@ -1424,6 +1431,36 @@ pub fn append_push_event(
     let detail = sanitize_reason(detail);
     append_event_line(&format!(
         "{ts} push task={task_id} workspace={workspace} branch={branch} status={status} detail={detail}"
+    ))
+}
+
+/// Append `<rfc3339> merge task=<id> workspace=<name> base=<base> status=<status> detail=<detail>`
+/// to `~/.shelbi/events.log`. Emitted by the poller's ready-marker handoff for
+/// a **handoff-less** workflow that auto-advances straight to a terminal status
+/// along a `merge`-firing edge: the merge runs *before* the task is marked
+/// done, and this line records whether it landed (`status=ok`) or failed
+/// (`status=failed`, task left un-done for a retry / human).
+///
+/// `base` names the branch the merge integrated into (the workflow's resolved
+/// `git.base_branch`), so a `status=failed` line points at exactly which
+/// integration didn't happen instead of the merge silently no-oping while the
+/// task shows done. Same task-scoped shape as [`append_push_event`] /
+/// [`append_rebase_event`]; whitespace folds to underscores.
+pub fn append_merge_event(
+    task_id: &str,
+    workspace: &str,
+    base: &str,
+    status: &str,
+    detail: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let task_id = sanitize_field(task_id);
+    let workspace = sanitize_field(workspace);
+    let base = sanitize_reason(base);
+    let status = sanitize_reason(status);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} merge task={task_id} workspace={workspace} base={base} status={status} detail={detail}"
     ))
 }
 

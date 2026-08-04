@@ -446,7 +446,7 @@ impl RebaseOutcome {
         }
         match self {
             RebaseOutcome::AlreadyUpToDate { default_sha } => {
-                format!("default={}", short(default_sha))
+                format!("base_sha={}", short(default_sha))
             }
             RebaseOutcome::Rebased {
                 before_sha,
@@ -465,13 +465,60 @@ impl RebaseOutcome {
             } => {
                 let excerpt = stderr_excerpt.trim();
                 if excerpt.is_empty() {
-                    format!("default={}", short(default_sha))
+                    format!("base_sha={}", short(default_sha))
                 } else {
-                    format!("default={} {}", short(default_sha), excerpt)
+                    format!("base_sha={} {}", short(default_sha), excerpt)
                 }
             }
             RebaseOutcome::Skipped { reason } => reason.clone(),
         }
+    }
+}
+
+/// Fetch `base_branch` from origin into `worktree` and return the ref the
+/// finish-flow rebase should compare/rebase against: `origin/<base_branch>`
+/// when the fetch lands a remote-tracking tip, else the plain `base_branch`
+/// name (a repo with no origin — a local-only project — has only the local
+/// ref to offer).
+///
+/// Why fetch first: the hub's local base ref can lag origin — a sibling task
+/// may have merged onto `origin/<base_branch>` after this workspace's worktree
+/// was cut. Comparing or rebasing against the stale local ref would wrongly
+/// report the branch already up-to-date (the incident's `06fe574` case) and
+/// skip the rebase. Freshening `origin/<base_branch>` first makes the ancestry
+/// check and the rebase reflect what the work will actually merge into.
+///
+/// Best-effort by design (the finish-flow rebase is advisory): a missing
+/// origin, an offline host, or an unknown base all leave the remote-tracking
+/// ref absent, and we fall back to the local `base_branch` — exactly the
+/// pre-fetch behavior, so a local-only project is never made worse.
+pub fn fetch_origin_base_ref(host: &Host, worktree: &Path, base_branch: &str) -> String {
+    let wt = worktree.to_string_lossy().into_owned();
+    // Best-effort: ignore the fetch's exit status; the rev-parse below is the
+    // authority on whether a usable `origin/<base>` tip now exists.
+    let _ = shelbi_ssh::run(
+        host,
+        [
+            "git", "-C", &wt, "fetch", "--quiet", "origin", "--", base_branch,
+        ],
+    );
+    let origin_ref = format!("origin/{base_branch}");
+    let resolved = shelbi_ssh::run(
+        host,
+        [
+            "git",
+            "-C",
+            &wt,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{origin_ref}^{{commit}}"),
+        ],
+    );
+    if matches!(resolved, Ok(ref o) if o.status.success()) {
+        origin_ref
+    } else {
+        base_branch.to_string()
     }
 }
 
@@ -7623,7 +7670,8 @@ mod rebase_git_tests {
     fn detail_format_uses_short_shas() {
         // The detail helper feeds straight into events.log; downstream
         // parsers expect a stable, compact shape — short 7-char SHAs and
-        // a recognizable `default=` prefix.
+        // a recognizable `base_sha=` prefix (the base branch itself is named
+        // in the event's own `base=` field).
         let outcome = RebaseOutcome::Rebased {
             before_sha: "abcdef0123456789".into(),
             after_sha: "1234567890abcdef".into(),
@@ -7634,7 +7682,7 @@ mod rebase_git_tests {
         let outcome = RebaseOutcome::AlreadyUpToDate {
             default_sha: "abcdef0123456789".into(),
         };
-        assert_eq!(outcome.detail(), "default=abcdef0");
+        assert_eq!(outcome.detail(), "base_sha=abcdef0");
     }
 
     /// The dispatch-path tmux invocation MUST inject `TASK_ID`,
@@ -7882,6 +7930,78 @@ mod push_git_tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn fetch_origin_base_ref_freshens_stale_local_and_returns_origin_ref() {
+        // The finish-flow rebase must compare against origin's tip of the base,
+        // not the hub's local remote-tracking ref, which can lag origin when a
+        // sibling task merged after this worktree was cut (the incident's
+        // stale `06fe574`). `fetch_origin_base_ref` fetches first and returns
+        // `origin/<base>` pointing at the freshened tip.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, bare) = init_repo_with_origin("fetch-base");
+        // A non-default base branch on origin.
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature/x"]);
+        commit_file(&repo, "base.txt", "base\n", "feature base");
+        assert!(run_git_in(&repo, &["push", "-q", "-u", "origin", "feature/x"])
+            .status
+            .success());
+        let stale_local = branch_sha(&repo, "feature/x");
+        run_git_in(&repo, &["checkout", "-q", "main"]);
+
+        // A second clone advances origin/feature/x out from under `repo`, so
+        // `repo`'s `origin/feature/x` tracking ref is now stale. Derive the
+        // path from the (unique) repo name so repeated runs don't collide on a
+        // leftover dir.
+        let other = repo.with_file_name(format!(
+            "{}-other",
+            repo.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(std::process::Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&bare)
+            .arg(&other)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        run_git_in(&other, &["checkout", "-q", "feature/x"]);
+        commit_file(&other, "more.txt", "more\n", "advance base");
+        assert!(run_git_in(&other, &["push", "-q", "origin", "feature/x"])
+            .status
+            .success());
+        let advanced = origin_tip(&bare, "feature/x");
+        assert_ne!(advanced, stale_local, "origin must be ahead of the local ref");
+
+        let base_ref = fetch_origin_base_ref(&Host::Local, &repo, "feature/x");
+        assert_eq!(
+            base_ref, "origin/feature/x",
+            "an origin-backed base must resolve to its remote-tracking ref"
+        );
+        // The fetch freshened the tracking ref to origin's advanced tip.
+        let tracked = branch_sha(&repo, "origin/feature/x");
+        assert_eq!(
+            tracked, advanced,
+            "fetch_origin_base_ref must freshen origin/feature/x to origin's tip",
+        );
+    }
+
+    #[test]
+    fn fetch_origin_base_ref_falls_back_to_local_name_without_origin() {
+        // A local-only project (no origin) has only the local base ref to
+        // offer; the helper returns the plain branch name so the rebase still
+        // compares against it rather than a nonexistent `origin/<base>`.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("fetch-base-no-origin");
+        let base_ref = fetch_origin_base_ref(&Host::Local, &repo, "main");
+        assert_eq!(base_ref, "main");
     }
 
     #[test]

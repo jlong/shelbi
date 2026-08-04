@@ -1769,15 +1769,21 @@ fn maybe_apply_ready_handoff(
             let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
                 .unwrap_or_else(|_| default_workflow());
             let from_status = resolve_current_status_id(&workflow, Column::in_progress());
-            let to_status = if let Some(handoff) = workflow
+            // `is_merge_edge_advance` is true only when there is NO handoff
+            // status and we're auto-advancing straight to a terminal status
+            // along a `merge`-firing edge. In that case the merge is
+            // load-bearing and must land BEFORE the task is marked done (see
+            // below); a handoff to a review status instead runs its edge
+            // (serving) AFTER the move, best-effort.
+            let (to_status, is_merge_edge_advance) = if let Some(handoff) = workflow
                 .statuses
                 .iter()
                 .find(|s| s.category == StatusCategory::Handoff)
             {
-                handoff.id.clone()
+                (handoff.id.clone(), false)
             } else if let Some(edge) = workflow.outgoing_merge_transitions(&from_status).first() {
                 tracing::info!(workspace = %workspace.name, task = %task_id, from = %from_status, to = %edge.to, "workflow declares no handoff status; auto-advancing along merge transition");
-                edge.to.clone()
+                (edge.to.clone(), true)
             } else {
                 tracing::warn!(workspace = %workspace.name, task = %task_id, "workflow declares no handoff status and no merge transition out of the active status; clearing ready marker");
                 let _ = shelbi_orchestrator::workspace::clear_ready_marker(host, &marker);
@@ -1813,6 +1819,76 @@ fn maybe_apply_ready_handoff(
                 return;
             }
 
+            // Handoff-less workflow advancing straight to a terminal status
+            // along a `merge` edge: the integration is load-bearing and must
+            // succeed BEFORE the task is marked done. A failed or no-op merge
+            // that only got logged after the move would strand the task as
+            // "done" with nothing merged (the silent-no-op incident). Detach
+            // the worktree first so the same edge's `delete_branch` isn't
+            // blocked by the still-held branch, run and gate on the merge, then
+            // let the move proceed. The edge's remaining cleanup runs after the
+            // move via `execute_transition_except` (merge skipped) below.
+            if is_merge_edge_advance {
+                let merge_base = workflow
+                    .resolve_git(&tf.task.string_params())
+                    .ok()
+                    .flatten()
+                    .and_then(|g| g.base_branch)
+                    .unwrap_or_else(|| project.base_branch().to_string());
+                detach_workspace_worktree_after_handoff(workspace, machine, host, &task_id);
+                match shelbi_orchestrator::transition::execute_merge_action(
+                    project,
+                    &project.name,
+                    &tf.task,
+                    &tf.body,
+                    &workflow,
+                    &from_status,
+                    &to_status,
+                ) {
+                    Ok(outcome) => {
+                        let detail = outcome
+                            .as_ref()
+                            .map(|o| o.line.replace('\n', "; "))
+                            .unwrap_or_else(|| "no-merge-action".into());
+                        if let Err(e) = shelbi_state::append_merge_event(
+                            &task_id,
+                            &workspace.name,
+                            &merge_base,
+                            "ok",
+                            &detail,
+                        ) {
+                            tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_merge_event failed");
+                        }
+                        tracing::info!(workspace = %workspace.name, task = %task_id, base = %merge_base, detail = %detail, "ready-handoff merge landed");
+                    }
+                    Err(e) => {
+                        // Merge failed: leave the task in-progress and the
+                        // marker in place so a transient failure (e.g. a
+                        // concurrent non-fast-forward push race) retries next
+                        // tick; a persistent conflict keeps emitting until a
+                        // human intervenes. Do NOT advance to done.
+                        let detail = e.to_string();
+                        if let Err(ev) = shelbi_state::append_merge_event(
+                            &task_id,
+                            &workspace.name,
+                            &merge_base,
+                            "failed",
+                            &detail,
+                        ) {
+                            tracing::warn!(workspace = %workspace.name, task = %task_id, error = %ev, "append_merge_event failed");
+                        }
+                        tracing::warn!(
+                            workspace = %workspace.name,
+                            task = %task_id,
+                            base = %merge_base,
+                            error = %detail,
+                            "handoff-less merge edge failed; leaving task in-progress and marker in place (NOT advancing to done)",
+                        );
+                        return;
+                    }
+                }
+            }
+
             match shelbi_state::move_task(&project.name, &task_id, to_column) {
                 Ok(Some((from, to, workflow))) => {
                     if let Err(e) = shelbi_state::append_task_event(
@@ -1834,43 +1910,65 @@ fn maybe_apply_ready_handoff(
                 }
             }
 
-            // Release the worker's worktree from the task branch now that the
-            // handoff has landed (rebase + column move both succeeded). Detach
-            // the worktree's HEAD in place so `<task.branch>` is no longer held
-            // by any worktree — the review checkout and the later merge /
-            // `delete_branch` would otherwise die on `already checked out at
-            // <worktree>`. Done BEFORE `execute_transition` on purpose: a
-            // handoff-less workflow's edge fires `merge` + `delete_branch` right
-            // here, and `delete_branch` skips a branch still held by a worktree
-            // (see `actions::workspace_holding_branch`), so freeing it first is
-            // what lets the immediate delete succeed. Ordering stays
-            // load-bearing — this runs only AFTER the move, and its failure
-            // never rolls the handoff back (the promoted task is the source of
-            // truth). This is also the missed-marker recovery path (this whole
-            // function runs on later ticks even after the pane has died), so
-            // both routes leave the branch free.
-            detach_workspace_worktree_after_handoff(workspace, machine, host, &task_id);
-
-            // Fire the edge's transition actions + `run:` / `ready:` commands
-            // (serving). Best-effort — the move already happened, so a command
-            // failure logs but doesn't roll it back. A workflow with no edge
-            // declared for this move is a clean no-op.
-            match shelbi_orchestrator::transition::execute_transition(
-                project,
-                &project.name,
-                &tf.task,
-                &tf.body,
-                &workflow,
-                &from_status,
-                &to_status,
-            ) {
-                Ok(outcomes) => {
-                    for o in outcomes {
-                        tracing::info!(workspace = %workspace.name, task = %task_id, action = %o.action, line = %o.line, "ready-handoff action fired");
+            if is_merge_edge_advance {
+                // Merge already landed and the worktree was detached above; now
+                // that the task is done, fire the edge's REMAINING actions
+                // (`delete_branch`, etc.) and `run:`/`ready:` commands, skipping
+                // the merge so it isn't re-run (a second merge would fail "no
+                // commits beyond target" and short-circuit before cleanup).
+                // Best-effort — the move already happened.
+                match shelbi_orchestrator::transition::execute_transition_except(
+                    project,
+                    &project.name,
+                    &tf.task,
+                    &tf.body,
+                    &workflow,
+                    &from_status,
+                    &to_status,
+                    &[shelbi_core::TransitionAction::Merge],
+                ) {
+                    Ok(outcomes) => {
+                        for o in outcomes {
+                            tracing::info!(workspace = %workspace.name, task = %task_id, action = %o.action, line = %o.line, "ready-handoff cleanup action fired");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "ready-handoff cleanup/command failed after merge");
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "ready-handoff transition command failed");
+            } else {
+                // Handoff to a review status. Release the worker's worktree from
+                // the task branch now that the move landed — detach the HEAD in
+                // place so `<task.branch>` is no longer held by any worktree, or
+                // the review checkout and the later merge / `delete_branch` die
+                // on `already checked out at <worktree>`. Its failure never
+                // rolls the handoff back (the promoted task is the source of
+                // truth). This is also the missed-marker recovery path (this
+                // whole function runs on later ticks even after the pane has
+                // died), so both routes leave the branch free.
+                detach_workspace_worktree_after_handoff(workspace, machine, host, &task_id);
+
+                // Fire the edge's transition actions + `run:` / `ready:`
+                // commands (serving). Best-effort — the move already happened,
+                // so a command failure logs but doesn't roll it back. A
+                // workflow with no edge declared for this move is a clean no-op.
+                match shelbi_orchestrator::transition::execute_transition(
+                    project,
+                    &project.name,
+                    &tf.task,
+                    &tf.body,
+                    &workflow,
+                    &from_status,
+                    &to_status,
+                ) {
+                    Ok(outcomes) => {
+                        for o in outcomes {
+                            tracing::info!(workspace = %workspace.name, task = %task_id, action = %o.action, line = %o.line, "ready-handoff action fired");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "ready-handoff transition command failed");
+                    }
                 }
             }
 
@@ -2198,10 +2296,13 @@ fn maybe_apply_transition(
 /// Resolve the workspace's branch for the in-progress task and rebase it onto
 /// the workflow's resolved `git.base_branch` (the branch the work merges
 /// into — e.g. `feature/{{feature}}` for a subtask flow), falling back to the
-/// project's default branch when the workflow declares none. Records one
-/// `rebase` line in `events.log` describing the outcome (ok / up-to-date /
-/// conflict / skipped). Never blocks the calling handoff — failures here are
-/// advisory.
+/// project's default branch when the workflow declares none. The base is
+/// freshened from origin first (see
+/// [`shelbi_orchestrator::workspace::fetch_origin_base_ref`]) so the ancestry
+/// check compares against `origin/<base>` rather than a stale local ref that
+/// would wrongly skip the rebase. Records one `rebase` line in `events.log`
+/// naming the base branch and the outcome (ok / up-to-date / conflict /
+/// skipped). Never blocks the calling handoff — failures here are advisory.
 ///
 /// `branch` uses the same explicit/workflow/project/GitHub fallback resolver
 /// as task dispatch when the task frontmatter doesn't pin one explicitly.
@@ -2254,15 +2355,21 @@ fn rebase_workspace_branch_before_handoff(
     };
 
     let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
+    // Compare/rebase against origin's tip of the base, not the hub's local ref
+    // (which can lag origin and wrongly report "already up-to-date"). Falls
+    // back to the local base name for a repo with no origin.
+    let rebase_ref =
+        shelbi_orchestrator::workspace::fetch_origin_base_ref(host, &worktree, &base_branch);
     let outcome = shelbi_orchestrator::workspace::rebase_workspace_branch_onto_default(
         host,
         &worktree,
-        &base_branch,
+        &rebase_ref,
     );
 
     let status = outcome.status_token();
     let detail = outcome.detail();
-    if let Err(e) = append_rebase_event(task_id, &workspace.name, &branch, status, &detail) {
+    if let Err(e) = append_rebase_event(task_id, &workspace.name, &branch, &base_branch, status, &detail)
+    {
         tracing::warn!(
             workspace = %workspace.name,
             task = %task_id,
@@ -4728,12 +4835,61 @@ while :; do sleep 60; done
         std::fs::write(&path, yaml).unwrap();
     }
 
+    /// Install a stub `gh` on the login-shell PATH that reports "no open PR"
+    /// for `pr list` (so `merge` takes the hub-side fetch+merge path) and
+    /// succeeds for anything else. Returns the previous `HOME`/`SHELL` so the
+    /// caller can restore them. `run_in_dir` runs git/gh through a login shell
+    /// that sources `~/.profile`, so pointing `HOME` at a tempdir whose
+    /// `.profile` prepends the stub dir makes `gh` resolve to the stub while
+    /// real `git` still resolves from the system PATH.
+    fn install_gh_stub_no_pr(home: &std::path::Path) -> (Option<std::ffi::OsString>, Option<std::ffi::OsString>) {
+        let bin = home.join("stub-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join("gh"),
+            "#!/bin/sh\ncase \"$*\" in\n  *\"pr list\"*) : ;;\n  *) : ;;\nesac\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            home.join(".profile"),
+            format!("export PATH=\"{}:$PATH\"\n", bin.display()),
+        )
+        .unwrap();
+        let prev_home = std::env::var_os("HOME");
+        let prev_shell = std::env::var_os("SHELL");
+        std::env::set_var("HOME", home);
+        std::env::set_var("SHELL", "/bin/sh");
+        (prev_home, prev_shell)
+    }
+
+    fn restore_home_shell(prev: (Option<std::ffi::OsString>, Option<std::ffi::OsString>)) {
+        match prev.0 {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev.1 {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+    }
+
     #[test]
-    fn handoffless_workflow_auto_advances_along_merge_edge() {
-        // A workflow with NO handoff-category status but an
-        // `in-progress -> done: [merge, delete_branch]` edge — the
-        // `app-feature-subtask` shape. The ready marker must advance the
-        // task straight to done instead of stranding it in-progress.
+    fn handoffless_workflow_merges_into_workflow_base_branch_not_default() {
+        // Regression for the merge-base-resolution incident: a handoff-less
+        // subtask workflow whose `git.base_branch` is NOT the repo default
+        // (`feature/x`, not `main`) must auto-advance to done by merging into
+        // `feature/x` — advancing `origin/feature/x`, never `origin/main`.
+        // Exercises the merge-transition path end-to-end (rebase names the
+        // base, push, hub-side merge onto the workflow base, delete_branch).
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
         let _g = crate::test_support::ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-automerge-{}-{}",
@@ -4746,13 +4902,65 @@ while :; do sleep 60; done
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("SHELBI_HOME", &home);
 
+        // Main clone + bare origin. Set a repo-local identity so the hub-side
+        // merge's throwaway worktree (which shares this repo's config) can
+        // commit the squash.
         let work_dir = home.join("repo");
         std::fs::create_dir_all(&work_dir).unwrap();
+        assert!(git_in(&work_dir, &["init", "-q", "-b", "main"]).status.success());
+        assert!(git_in(&work_dir, &["config", "user.email", "test@shelbi.local"]).status.success());
+        assert!(git_in(&work_dir, &["config", "user.name", "Shelbi Test"]).status.success());
+        std::fs::write(work_dir.join("README.md"), "# repo\n").unwrap();
+        assert!(git_in(&work_dir, &["add", "README.md"]).status.success());
+        assert!(git_in(&work_dir, &["commit", "-q", "-m", "init"]).status.success());
+        let bare = home.join("origin.git");
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let bare_str = bare.to_string_lossy().into_owned();
+        assert!(git_in(&work_dir, &["remote", "add", "origin", &bare_str]).status.success());
+        assert!(git_in(&work_dir, &["push", "-q", "-u", "origin", "main"]).status.success());
+
+        // The workflow base branch `feature/x`, distinct from main, pushed to
+        // origin. A commit of its own so main and feature/x truly diverge.
+        assert!(git_in(&work_dir, &["checkout", "-q", "-b", "feature/x", "main"]).status.success());
+        std::fs::write(work_dir.join("feature.txt"), "base\n").unwrap();
+        assert!(git_in(&work_dir, &["add", "feature.txt"]).status.success());
+        assert!(git_in(&work_dir, &["commit", "-q", "-m", "feature base"]).status.success());
+        assert!(git_in(&work_dir, &["push", "-q", "-u", "origin", "feature/x"]).status.success());
+        let main_tip_before =
+            String::from_utf8_lossy(&git_in(&bare, &["rev-parse", "main"]).stdout).trim().to_string();
+        assert!(git_in(&work_dir, &["checkout", "-q", "main"]).status.success());
+
+        // Workspace worktree cut from feature/x, on the task branch, with a
+        // commit of its own. push_branch (in the handoff) puts it on origin.
         let project = local_project(&work_dir);
+        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        assert!(git_in(
+            &work_dir,
+            &["worktree", "add", "-q", "-b", "subtask/subtask-a", wt.to_str().unwrap(), "feature/x"],
+        )
+        .status
+        .success());
+        std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
+        assert!(git_in(&wt, &["add", "work.txt"]).status.success());
+        assert!(git_in(&wt, &["commit", "-q", "-m", "task work"]).status.success());
+
         write_project_workflow(
             "subtask",
             r#"
 name: subtask
+git:
+  base_branch: feature/x
+  merge_strategy: squash
 statuses:
   - { id: todo,        owner: agent, agent: orchestrator }
   - { id: in-progress, owner: agent, agent: developer    }
@@ -4764,8 +4972,10 @@ transitions:
         );
         let mut task = in_progress_task("subtask-a", "alpha");
         task.workflow = Some("subtask".into());
+        task.branch = Some("subtask/subtask-a".into());
         shelbi_state::save_task("demo", &task, "body").unwrap();
 
+        let prev = install_gh_stub_no_pr(&home);
         let marker = write_marker(&project, "subtask-a\n");
         maybe_apply_ready_handoff(
             &project,
@@ -4777,6 +4987,7 @@ transitions:
                 window: "w".into(),
             },
         );
+        restore_home_shell(prev);
 
         assert_eq!(
             shelbi_state::load_task("demo", "subtask-a")
@@ -4784,27 +4995,179 @@ transitions:
                 .task
                 .column,
             Column::done(),
-            "task should auto-advance along the merge edge"
+            "task should auto-advance along the merge edge once the merge lands"
         );
         assert!(!marker.exists(), "marker should be consumed (cleared)");
 
-        // The move lands in the canonical event stream like any other
-        // marker-driven advance.
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        let task_lines: Vec<&str> = log
-            .lines()
-            .filter(|l| l.contains(" project=demo task=subtask-a "))
-            .collect();
-        assert_eq!(task_lines.len(), 1, "log: {log:?}");
+        // origin/feature/x advanced (carries the squash), origin/main did not.
+        let feature_log =
+            String::from_utf8_lossy(&git_in(&bare, &["log", "feature/x", "--format=%s"]).stdout)
+                .to_string();
         assert!(
-            task_lines[0].contains(" in_progress -> done "),
-            "line: {}",
-            task_lines[0]
+            feature_log.contains("shelbi: merge subtask-a from subtask/subtask-a"),
+            "origin/feature/x must carry the squash merge; log: {feature_log:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&git_in(&bare, &["rev-parse", "main"]).stdout).trim(),
+            main_tip_before,
+            "origin/main must NOT have advanced — the merge belongs on feature/x",
+        );
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        // The rebase event names the actual base branch it compared against.
+        assert!(
+            log.lines().any(|l| l.contains(" rebase ")
+                && l.contains(" task=subtask-a ")
+                && l.contains(" base=feature/x ")),
+            "rebase event must name base=feature/x; log: {log:?}"
+        );
+        // A merge event records the landed integration (no silent no-op).
+        assert!(
+            log.lines().any(|l| l.contains(" merge ")
+                && l.contains(" task=subtask-a ")
+                && l.contains(" base=feature/x ")
+                && l.contains(" status=ok ")),
+            "a merge=ok event naming base=feature/x must be emitted; log: {log:?}"
+        );
+        // And the canonical column transition still lands.
+        assert!(
+            log.lines().any(|l| l.contains(" project=demo task=subtask-a ")
+                && l.contains(" in_progress -> done ")
+                && l.contains(" reason=workspace:ready-marker ")),
+            "log: {log:?}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn handoffless_merge_failure_leaves_task_in_progress_and_emits_failed_event() {
+        // Criterion: a merge that cannot run must fail the auto-advance
+        // visibly — the task stays in-progress (NOT done) and a
+        // `merge ... status=failed` event is emitted — rather than silently
+        // marking the task done with nothing merged. Here the task branch is
+        // never pushed to origin, so the hub-side merge refuses ("not on
+        // origin"); with no origin at all it fails just as loudly.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-mergefail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        assert!(git_in(&work_dir, &["init", "-q", "-b", "main"]).status.success());
+        assert!(git_in(&work_dir, &["config", "user.email", "test@shelbi.local"]).status.success());
+        assert!(git_in(&work_dir, &["config", "user.name", "Shelbi Test"]).status.success());
+        std::fs::write(work_dir.join("README.md"), "# repo\n").unwrap();
+        assert!(git_in(&work_dir, &["add", "README.md"]).status.success());
+        assert!(git_in(&work_dir, &["commit", "-q", "-m", "init"]).status.success());
+        let bare = home.join("origin.git");
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let bare_str = bare.to_string_lossy().into_owned();
+        assert!(git_in(&work_dir, &["remote", "add", "origin", &bare_str]).status.success());
+        assert!(git_in(&work_dir, &["push", "-q", "-u", "origin", "main"]).status.success());
+        assert!(git_in(&work_dir, &["checkout", "-q", "-b", "feature/x", "main"]).status.success());
+        assert!(git_in(&work_dir, &["push", "-q", "-u", "origin", "feature/x"]).status.success());
+        assert!(git_in(&work_dir, &["checkout", "-q", "main"]).status.success());
+
+        let project = local_project(&work_dir);
+        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        assert!(git_in(
+            &work_dir,
+            &["worktree", "add", "-q", "-b", "subtask/subtask-a", wt.to_str().unwrap(), "feature/x"],
+        )
+        .status
+        .success());
+        std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
+        assert!(git_in(&wt, &["add", "work.txt"]).status.success());
+        assert!(git_in(&wt, &["commit", "-q", "-m", "task work"]).status.success());
+        // Remove origin so BOTH the push gate and the merge fail: with no
+        // remote to strand it on, the push is a clean `no-remote` (handoff
+        // proceeds) and the merge then refuses because the branch is not on
+        // origin — isolating the merge gate as the thing that blocks done.
+        assert!(git_in(&work_dir, &["remote", "remove", "origin"]).status.success());
+
+        write_project_workflow(
+            "subtask",
+            r#"
+name: subtask
+git:
+  base_branch: feature/x
+  merge_strategy: squash
+statuses:
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer    }
+  - { id: done,        owner: user }
+transitions:
+  - { from: todo, to: in-progress }
+  - { from: in-progress, to: done, actions: [merge, delete_branch] }
+"#,
+        );
+        let mut task = in_progress_task("subtask-a", "alpha");
+        task.workflow = Some("subtask".into());
+        task.branch = Some("subtask/subtask-a".into());
+        shelbi_state::save_task("demo", &task, "body").unwrap();
+
+        let prev = install_gh_stub_no_pr(&home);
+        let marker = write_marker(&project, "subtask-a\n");
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
+        );
+        restore_home_shell(prev);
+
+        assert_eq!(
+            shelbi_state::load_task("demo", "subtask-a")
+                .unwrap()
+                .task
+                .column,
+            Column::in_progress(),
+            "a failed merge must leave the task in-progress, not silently mark it done",
         );
         assert!(
-            task_lines[0].contains(" reason=workspace:ready-marker "),
-            "line: {}",
-            task_lines[0]
+            marker.exists(),
+            "the ready marker must be retained so the merge retries next tick",
+        );
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.lines().any(|l| l.contains(" merge ")
+                && l.contains(" task=subtask-a ")
+                && l.contains(" status=failed ")),
+            "a merge=failed event must be emitted; log: {log:?}"
+        );
+        assert!(
+            !log.lines().any(|l| l.contains(" project=demo task=subtask-a ")
+                && l.contains(" in_progress -> done ")),
+            "no done transition must be logged when the merge failed; log: {log:?}"
         );
 
         std::env::remove_var("SHELBI_HOME");
