@@ -322,7 +322,24 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
 }
 
 fn add(project: &str, args: AddArgs) -> Result<()> {
-    add_with_stdin(project, args, read_piped_stdin()?)
+    // Only consult stdin when NO explicit body source was passed. `-d` /
+    // `--description` already carries the body, so touching `stdin()` would
+    // pointlessly block a non-interactive caller whose stdin never reaches EOF.
+    // Reading stdin is reserved for the `shelbi task add "Title" <<EOF` spelling.
+    let stdin_body = if add_should_read_stdin(&args) {
+        read_piped_stdin()?
+    } else {
+        None
+    };
+    add_with_stdin(project, args, stdin_body)
+}
+
+/// Whether `add` should consult stdin for the body. False when an explicit
+/// body source (`-d`/`--description`) was given — the caller already supplied
+/// the body, so reading stdin would only risk blocking a non-interactive
+/// invocation whose stdin never closes.
+fn add_should_read_stdin(args: &AddArgs) -> bool {
+    args.description.is_none()
 }
 
 /// Read piped stdin, if any. `None` when stdin is a terminal (interactive
@@ -330,6 +347,13 @@ fn add(project: &str, args: AddArgs) -> Result<()> {
 /// A non-TTY stdin (pipe, heredoc, `/dev/null`) is drained to EOF; an
 /// empty result is normalized to `None` so `< /dev/null` behaves like no
 /// pipe at all.
+///
+/// Callers must only invoke this when the body is meant to come from stdin —
+/// i.e. no explicit `--body`/`--body-file` (edit) or `-d` (add) was passed.
+/// A non-TTY stdin that never reaches EOF (backgrounded process, inherited
+/// pipe) blocks `read_to_string` forever, so gate the call on the absence of
+/// an explicit body source (see `edit_should_read_stdin` /
+/// `add_should_read_stdin`) rather than reading unconditionally.
 fn read_piped_stdin() -> Result<Option<String>> {
     use std::io::{IsTerminal, Read};
     let mut stdin = std::io::stdin();
@@ -1371,6 +1395,15 @@ fn edit_has_field_flags(args: &EditArgs, stdin_body: &Option<String>) -> bool {
         || stdin_body.is_some()
 }
 
+/// Whether `edit` should consult stdin for the body. False when an explicit
+/// body source (`--body`/`--body-file`) was given — the caller already supplied
+/// the body, so reading stdin would only risk blocking a non-interactive
+/// invocation whose stdin never closes. Reading stdin is reserved for the
+/// `shelbi task edit x <<EOF` spelling, where the body comes from stdin.
+fn edit_should_read_stdin(args: &EditArgs) -> bool {
+    args.body.is_none() && args.body_file.is_none()
+}
+
 /// Reconstruct the command-line order of `--sub` / `--sub-regex` occurrences.
 ///
 /// clap's derive can't preserve the *relative* order of two distinct
@@ -1440,7 +1473,17 @@ where
 }
 
 fn edit(project: &str, args: EditArgs) -> Result<()> {
-    let stdin_body = read_piped_stdin()?;
+    // Only consult stdin when NO explicit body source was passed. `--body` /
+    // `--body-file` already carry the body, so touching `stdin()` would
+    // pointlessly block a non-interactive caller whose stdin never reaches EOF
+    // (backgrounded process, inherited pipe) — the hang this gate exists to
+    // prevent. Reading stdin here is reserved for the `shelbi task edit x <<EOF`
+    // spelling, where the body is *meant* to come from stdin.
+    let stdin_body = if edit_should_read_stdin(&args) {
+        read_piped_stdin()?
+    } else {
+        None
+    };
     // Zero-flag invocation preserves the historical behavior: open the file in
     // `$EDITOR`. Any field flag (or a piped body) switches to non-interactive
     // mode.
@@ -1833,6 +1876,20 @@ mod tests {
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn add_stdin_gate_skips_stdin_when_description_given() {
+        // Companion to the `edit` gate: `-d`/`--description` already carries the
+        // body, so `add` must not block reading a stdin that never closes.
+        let mut a = add_args("t");
+        a.description = Some("inline".into());
+        assert!(!add_should_read_stdin(&a), "--description must skip stdin");
+
+        assert!(
+            add_should_read_stdin(&add_args("t")),
+            "no description must still consult stdin (heredoc spelling)"
+        );
     }
 
     #[test]
@@ -2687,6 +2744,34 @@ statuses:
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn edit_stdin_gate_skips_stdin_when_explicit_body_source() {
+        // Regression guard for the hang where `edit` blocked on a stdin that
+        // never reached EOF even though `--body`/`--body-file` already carried
+        // the body. `edit_should_read_stdin` is the pure gate `edit()` keys off
+        // of BEFORE ever touching `stdin()`, so pinning it here keeps the fix
+        // from regressing without needing a real blocking stdin in the test.
+        let mut a = edit_args("x");
+        a.body = Some("inline".into());
+        assert!(!edit_should_read_stdin(&a), "--body must skip stdin");
+
+        let mut a = edit_args("x");
+        a.body_file = Some(PathBuf::from("/tmp/whatever.md"));
+        assert!(!edit_should_read_stdin(&a), "--body-file must skip stdin");
+
+        // No explicit source: stdin is still the body channel (heredoc spelling).
+        assert!(
+            edit_should_read_stdin(&edit_args("x")),
+            "no body source must still consult stdin"
+        );
+        let mut a = edit_args("x");
+        a.append = true;
+        assert!(
+            edit_should_read_stdin(&a),
+            "--append with no --body/--body-file still reads stdin as its source"
+        );
     }
 
     #[test]
