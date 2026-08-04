@@ -11997,6 +11997,7 @@ mod dry_run_tests {
                 .collect(),
             initial_status: None,
             transitions: None,
+            required_params: Vec::new(),
             git: None,
             zen: None,
             review: None,

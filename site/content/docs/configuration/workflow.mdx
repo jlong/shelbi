@@ -52,6 +52,7 @@ transitions:
 | `description` | string | no | — | Free-form description surfaced in `shelbi workflow list` and the picker. |
 | `initial_status` | string | no | first status | Stable `id` a new task lands in. Must reference a status declared here. |
 | `transitions` | list of [Transition](#transitions) | no | — | Side-effect declarations for specific edges. Omitting it means all moves are pure status changes. |
+| `required_params` | list of string | no | — | Task frontmatter fields every task on this workflow must carry. Every `{{var}}` in [`git.base_branch`](#git) must appear here, or the workflow is rejected at load. See [Required params](#required-params). |
 | `git` | [Git](#git) | no | inherit project | Per-workflow override of the project's `git:` block. |
 | `zen` | [Zen](#zen) | no | inherit project | Per-workflow override of the project's Zen Mode config. |
 
@@ -224,6 +225,27 @@ health-check, summarize failures, and apply a human's tweak. Keep transition
 `run:` for hub-side side-effects that aren't the review server itself.
 
 </Callout>
+
+## required_params
+
+The task frontmatter fields every task on this workflow must carry. This is
+the contract that makes a templated [`git.base_branch`](#git) safe: because
+`base_branch` resolves only against a task's own frontmatter params (unlike
+`branch`, it gets no `{{id}}` or `{{github_user}}` context), a task that omits
+the field produces an unresolved base branch at dispatch.
+
+Shelbi validates the invariant when the workflow loads: every `{{var}}` in
+`git.base_branch` must appear in `required_params`, or the load fails naming
+the variable and the workflow. The shipped `subtask` workflow declares it:
+
+```yaml
+name: subtask
+required_params: [task]        # every subtask must set `task:`
+git:
+  base_branch: task/{{task}}   # the parent task's branch
+```
+
+Leave it out for workflows whose `base_branch` is a literal like `main`.
 
 ## git
 

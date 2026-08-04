@@ -89,6 +89,21 @@ pub struct Workflow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transitions: Option<Vec<Transition>>,
 
+    /// Task frontmatter fields every task on this workflow must carry.
+    ///
+    /// This is the contract that makes a templated `git.base_branch` safe:
+    /// a workflow whose `base_branch` is `task/{{task}}` declares
+    /// `required_params: [task]` so [`Workflow::validate`] can reject the
+    /// configuration up front if the two ever drift, instead of leaving an
+    /// unresolved `{{task}}` to surface only at dispatch. Every `{{var}}`
+    /// in `git.base_branch` must appear here (see the validation in
+    /// [`Workflow::validate`]).
+    ///
+    /// Empty (the common case) for workflows whose `base_branch` is a
+    /// literal like `main`. Elided from the wire form when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_params: Vec<String>,
+
     /// Per-workflow override of the project-level `git:` defaults. When
     /// `None`, callers inherit `Project::base_branch` and
     /// `Project::merge_strategy` unchanged. Field values may contain
@@ -448,6 +463,26 @@ impl Workflow {
                     })?;
                 }
             }
+
+            // Every `{{var}}` in `base_branch` resolves against the task's
+            // frontmatter params at dispatch (see [`Workflow::resolve_git`]):
+            // unlike `git.branch`, no `{{id}}` / `{{github_user}}` context is
+            // injected. So each placeholder MUST be a declared required task
+            // field, or a task that omits it silently produces an unresolved
+            // base branch at dispatch. Reject the mismatch here — the static
+            // counterpart to the runtime dispatch-refuse.
+            if let Some(base_branch) = &git.base_branch {
+                for var in crate::extract_placeholders(base_branch) {
+                    if !self.required_params.iter().any(|p| p == &var) {
+                        return Err(workflow_err(format!(
+                            "workflow `{}`: git.base_branch references `{{{{{var}}}}}` but `{var}` \
+                             is not a required task field — add `{var}` to the workflow's \
+                             `required_params:` so tasks must carry it",
+                            self.name,
+                        )));
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -689,6 +724,7 @@ pub fn default_workflow() -> Workflow {
         // no transitions declared as the legacy 5-status flow — see
         // [`Workflow::fires_merge_bar`].
         transitions: None,
+        required_params: Vec::new(),
         git: None,
         zen: None,
         review: None,
@@ -791,6 +827,9 @@ pub fn task_workflow() -> Workflow {
                 &[TransitionAction::ClosePr, TransitionAction::DeleteBranch],
             ),
         ]),
+        // `base_branch: main` is a literal — no `{{var}}`, so no required
+        // task fields.
+        required_params: Vec::new(),
         git: Some(GitConfig {
             base_branch: Some("main".into()),
             // Full-name template: `<github_user>/<id>`, e.g. `jlong/fix-login`.
@@ -876,6 +915,11 @@ pub fn subtask_workflow() -> Workflow {
             ),
             transition("in-progress", "canceled", &[TransitionAction::DeleteBranch]),
         ]),
+        // `base_branch: task/{{task}}` interpolates the parent task's id from
+        // the subtask's `task:` frontmatter — declare it required so a subtask
+        // that omits it is caught up front, and so [`Workflow::validate`]
+        // accepts the templated base branch.
+        required_params: vec!["task".into()],
         git: Some(GitConfig {
             // Interpolated from the subtask's `task:` frontmatter (the parent
             // task's id) at dispatch — see [`Workflow::resolve_git`].
@@ -1448,6 +1492,8 @@ struct RawWorkflow {
     #[serde(default)]
     transitions: Option<Vec<Transition>>,
     #[serde(default)]
+    required_params: Vec<String>,
+    #[serde(default)]
     git: Option<GitConfig>,
     #[serde(default)]
     zen: Option<WorkflowZenConfig>,
@@ -1551,6 +1597,7 @@ fn convert_raw_workflow(raw: RawWorkflow) -> crate::Result<(Workflow, Vec<Status
             statuses,
             initial_status: raw.initial_status,
             transitions: raw.transitions,
+            required_params: raw.required_params,
             git: raw.git,
             zen: raw.zen,
             review: raw.review,
@@ -2640,6 +2687,7 @@ statuses:
             }],
             initial_status: None,
             transitions: None,
+            required_params: Vec::new(),
             git: None,
             zen: None,
             review: None,
@@ -2670,6 +2718,7 @@ statuses:
 name: feature-task
 statuses:
   - { name: Todo, category: ready, owner: agent, agent: orchestrator }
+required_params: [feature]
 git:
   base_branch: feature/{{feature}}
   branch_prefix: app/{{team}}
@@ -2678,6 +2727,127 @@ git:
         let git = wf.git.expect("git block parsed");
         assert_eq!(git.base_branch.as_deref(), Some("feature/{{feature}}"));
         assert_eq!(git.branch_prefix.as_deref(), Some("app/{{team}}"));
+    }
+
+    // ---------------------------------------------------------------------
+    // base_branch placeholder ↔ required_params invariant
+
+    #[test]
+    fn validate_rejects_base_branch_placeholder_without_required_field() {
+        // A `{{feature}}` in base_branch that isn't a declared required task
+        // field is a misconfiguration: any task omitting `feature:` produces
+        // an unresolved base branch at dispatch. Reject up front, naming the
+        // var and the workflow.
+        let yaml = r#"
+name: feature-track
+statuses:
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
+git:
+  base_branch: feature/{{feature}}
+"#;
+        let err = Workflow::from_yaml_str(yaml).unwrap_err();
+        match &err {
+            Error::InvalidWorkflow(msg) => {
+                assert!(msg.contains("feature-track"), "msg: {msg}");
+                assert!(msg.contains("feature"), "msg: {msg}");
+                assert!(msg.contains("required_params"), "msg: {msg}");
+            }
+            other => panic!("expected InvalidWorkflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_names_the_first_unmatched_placeholder() {
+        // Only one of the two placeholders is declared; the undeclared one
+        // (`region`) must be the one surfaced.
+        let yaml = r#"
+name: stacked
+statuses:
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
+required_params: [feature]
+git:
+  base_branch: feature/{{feature}}-{{region}}
+"#;
+        let err = Workflow::from_yaml_str(yaml).unwrap_err();
+        match &err {
+            Error::InvalidWorkflow(msg) => {
+                assert!(msg.contains("region"), "msg: {msg}");
+            }
+            other => panic!("expected InvalidWorkflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_base_branch_when_every_placeholder_is_required() {
+        // Every `{{var}}` in base_branch maps to a required field → clean.
+        let yaml = r#"
+name: feature-track
+statuses:
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
+required_params: [feature, region]
+git:
+  base_branch: feature/{{feature}}-{{region}}
+"#;
+        let wf = Workflow::from_yaml_str(yaml).expect("valid workflow");
+        assert_eq!(wf.required_params, vec!["feature", "region"]);
+    }
+
+    #[test]
+    fn validate_ignores_placeholders_outside_base_branch() {
+        // The invariant is scoped to base_branch. `branch_prefix` resolves
+        // against the same params but isn't gated here, so `{{team}}` needs
+        // no required-field declaration.
+        let yaml = r#"
+name: feature-track
+statuses:
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
+required_params: [feature]
+git:
+  base_branch: feature/{{feature}}
+  branch_prefix: team/{{team}}
+"#;
+        Workflow::from_yaml_str(yaml).expect("branch_prefix placeholder is not gated");
+    }
+
+    #[test]
+    fn validate_literal_base_branch_needs_no_required_params() {
+        // The shipped `task` workflow: `base_branch: main`, no placeholders,
+        // no required fields.
+        let yaml = r#"
+name: plain
+statuses:
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
+git:
+  base_branch: main
+"#;
+        Workflow::from_yaml_str(yaml).expect("literal base_branch validates");
+    }
+
+    #[test]
+    fn shipped_workflows_satisfy_the_base_branch_invariant() {
+        // The three shipped/documented subtask shapes all declare the field
+        // their templated base_branch references, so each validates cleanly:
+        // subtask/{{task}}, and the app-feature ({{feature}}) / site-update
+        // ({{update}}) variants built the same way.
+        default_workflow().validate().expect("default validates");
+        task_workflow().validate().expect("task validates");
+        subtask_workflow().validate().expect("subtask validates");
+
+        for (wf_name, field) in [("app-feature-subtask", "feature"), ("site-update-subtask", "update")]
+        {
+            let yaml = format!(
+                r#"
+name: {wf_name}
+statuses:
+  - {{ name: Todo, category: ready, owner: agent, agent: orchestrator }}
+required_params: [{field}]
+git:
+  base_branch: {field}/{{{{{field}}}}}
+"#
+            );
+            Workflow::from_yaml_str(&yaml)
+                .unwrap_or_else(|e| panic!("{wf_name} should validate: {e}"));
+        }
     }
 
     #[test]
@@ -2706,6 +2876,7 @@ git:
 name: feature-task
 statuses:
   - { name: Todo, category: ready, owner: agent, agent: orchestrator }
+required_params: [feature]
 git:
   base_branch: feature/{{feature}}
   branch_prefix: app/{{team}}
@@ -2733,6 +2904,7 @@ git:
 name: feature-task
 statuses:
   - { name: Todo, category: ready, owner: agent, agent: orchestrator }
+required_params: [feature]
 git:
   base_branch: feature/{{feature}}
 "#;
@@ -2761,6 +2933,7 @@ git:
 name: stack
 statuses:
   - { name: Todo, category: ready, owner: agent, agent: orchestrator }
+required_params: [feature, region]
 git:
   base_branch: feature/{{feature}}-{{region}}
   branch_prefix: app/{{team}}
@@ -2937,6 +3110,7 @@ transitions:
 name: feature-task
 statuses:
   - { id: todo, name: Todo, category: ready, owner: agent, agent: orchestrator }
+required_params: [feature]
 git:
   base_branch: feature/{{feature}}
   branch_prefix: app

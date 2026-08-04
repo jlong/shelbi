@@ -341,6 +341,9 @@ mod tests {
     /// `{{var}}` placeholders for the templating tests).
     fn wf_with_base(base: &str) -> Workflow {
         let mut w = shelbi_core::default_workflow();
+        // Declare whatever `{{var}}`s the base references so the workflow
+        // satisfies `Workflow::validate`'s base_branch invariant.
+        w.required_params = shelbi_core::extract_placeholders(base);
         w.git = Some(shelbi_core::GitConfig {
             base_branch: Some(base.to_string()),
             branch: None,

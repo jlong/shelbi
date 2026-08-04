@@ -368,6 +368,7 @@ task's frontmatter at load time. This is what makes one
 ```yaml
 # workflows/feature-task.yaml
 name: feature-task
+required_params: [feature]             # every task must set feature:
 git:
   base_branch: feature/{{feature}}     # resolved per task
   merge_strategy: squash
@@ -418,6 +419,11 @@ Substitution rules:
   unresolved placeholder, so a single edit to the task's frontmatter
   fixes them all: *"workflow `feature-task` requires task params:
   `feature`"*.
+- Every `{{var}}` in `base_branch` must be declared in the workflow's
+  [`required_params`](/docs/configuration/workflow#required-params).
+  Shelbi rejects the workflow at load time otherwise, so a base branch
+  that references a field no task carries is caught before dispatch, not
+  after.
 
 ## Dependent tasks with `depends_on`
 
@@ -577,6 +583,7 @@ to `Done`, firing the merge into the parent branch.
 name: subtask
 description: A piece of a parent task, squash-merged into the parent's branch with no PR or review.
 
+required_params: [task]           # every subtask must name its parent task
 git:
   base_branch: task/{{task}}      # resolves to the parent task's branch
   branch: 'subtask/{{id}}'
@@ -686,6 +693,7 @@ feature.
 name: feature-task
 description: Stack tasks on a long-lived feature branch.
 
+required_params: [feature]            # every task must set feature:
 git:
   base_branch: feature/{{feature}}     # supplied per task
 
