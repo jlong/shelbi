@@ -279,17 +279,21 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
     //    the global sidebar docked in the dashboard instead of migrating it in.
     let shelbi_bin = crate::current_exe_string()?;
     let panel_cmd = review_panel_cmd(&shelbi_bin, project_name, task_id);
-    // Open the panel at the nav sidebar's canonical width (SIDEBAR_TARGET_PCT of
-    // the window, clamped to [MIN, MAX]) instead of tmux's default 50/50 split
-    // of the agent pane. The generalized clamp hook resizes the panel
-    // (SHELBI_REVIEW_PANEL) alongside the traveling sidebar to keep the two
-    // locked to the same width, but the initial split width still matters so it
-    // opens correct before the first clamp fires. A failed `#{window_width}`
-    // query falls back to the max sidebar width, never the 50% default.
+    // Open the panel at the *shared* nav width — the user's stored width
+    // override (SHELBI_SIDEBAR_W) if they've dragged a divider, else the
+    // SIDEBAR_TARGET_PCT-of-window default clamped to [MIN, MAX] — instead of
+    // tmux's default 50/50 split of the agent pane. This makes the panel open
+    // at the very width the sidebar already has, so the two never flash to
+    // different sizes before the clamp hook (which also keeps them locked as
+    // either is dragged) first fires. A failed `#{window_width}` query with no
+    // override falls back to the max sidebar width, never the 50% default.
+    let width_override = read_session_var(&session, crate::SIDEBAR_WIDTH_KEY)
+        .and_then(|v| v.trim().parse::<u32>().ok());
     let panel_cols = tmux_capture(&["display-message", "-p", "-t", &chat, "#{window_width}"])
         .ok()
         .and_then(|w| w.trim().parse::<u32>().ok())
-        .map(crate::sidebar_cols_for)
+        .map(|w| crate::shared_sidebar_cols(w, width_override))
+        .or_else(|| width_override.map(|o| o.clamp(crate::SIDEBAR_MIN_COLS, crate::SIDEBAR_MAX_COLS)))
         .unwrap_or(crate::SIDEBAR_MAX_COLS);
     let panel_cols = panel_cols.to_string();
     let panel_id = tmux_capture(&[

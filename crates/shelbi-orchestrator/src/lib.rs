@@ -77,7 +77,7 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = shelbi_state::DEFAULT_ORCHESTRATOR_INSTR
 // `SIDEBAR_TARGET_PCT` of the window width — chosen so the
 // orchestrator gets noticeably more room on both narrow and wide
 // terminals than the previous fixed 30% split.
-const SIDEBAR_MIN_COLS: u32 = 24;
+pub(crate) const SIDEBAR_MIN_COLS: u32 = 24;
 pub(crate) const SIDEBAR_MAX_COLS: u32 = 40;
 const SIDEBAR_TARGET_PCT: u32 = 25;
 
@@ -90,6 +90,19 @@ pub(crate) fn sidebar_cols_for(window_width: u32) -> u32 {
     (window_width * SIDEBAR_TARGET_PCT / 100).clamp(SIDEBAR_MIN_COLS, SIDEBAR_MAX_COLS)
 }
 
+/// The shared nav-pane width the two panes should open at: the user's stored
+/// width override (clamped to `[MIN, MAX]`) when one has been set by dragging a
+/// divider, else the 25% [`sidebar_cols_for`] default for `window_width`. Keeps
+/// the "override wins, else formula" policy in one place so the review panel's
+/// initial split (`review_ui`) and the clamp hook agree on the opening width and
+/// never flash to different sizes.
+pub(crate) fn shared_sidebar_cols(window_width: u32, override_cols: Option<u32>) -> u32 {
+    match override_cols {
+        Some(c) => c.clamp(SIDEBAR_MIN_COLS, SIDEBAR_MAX_COLS),
+        None => sidebar_cols_for(window_width),
+    }
+}
+
 /// Session env var pinning the stable tmux pane id (`%N`) of the single
 /// *traveling* sidebar pane. Unlike `SHELBI_PANE_orch` (a stashed view the
 /// dashboard swaps in), this pane physically MOVES between windows: every
@@ -99,6 +112,22 @@ pub(crate) fn sidebar_cols_for(window_width: u32) -> u32 {
 /// travel + clamp scripts read it to find the pane wherever it currently
 /// lives (it is no longer reliably `dashboard.{left}`).
 const SIDEBAR_ENV_KEY: &str = "SHELBI_SIDEBAR";
+
+/// Session env var holding the user's chosen *shared* nav-pane width, in
+/// columns. Unset until the user drags either nav divider; once set, both the
+/// traveling sidebar (`SHELBI_SIDEBAR`) and the review panel
+/// (`SHELBI_REVIEW_PANEL`) are pinned to it instead of the 25% formula, and it
+/// survives client resizes, window switches, and review open/close (it lives as
+/// long as the tmux session does). Written by the clamp script's `adopt` pass
+/// and read by both the clamp script and the review panel's initial split.
+pub(crate) const SIDEBAR_WIDTH_KEY: &str = "SHELBI_SIDEBAR_W";
+
+/// Session env var caching the last-seen window width (columns) so the clamp
+/// script can tell a *divider drag* (window width steady, a nav pane's width
+/// changed — adopt it as the new shared width) apart from a *terminal resize*
+/// (window width changed, panes reflowed — never adopt the reflow). Purely an
+/// internal discriminator for the `adopt` pass.
+const SIDEBAR_WW_KEY: &str = "SHELBI_SIDEBAR_WW";
 
 /// Outcome of `ensure_dashboard`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1112,44 +1141,113 @@ fn set_session_env(host: &shelbi_core::Host, session: &str, key: &str, value: &s
     Ok(())
 }
 
-/// Shell snippet that clamps a nav pane's width to `SIDEBAR_TARGET_PCT%` of
-/// its current window, bounded to `[MIN, MAX]`.
+/// Shell snippet that keeps both nav panes — the traveling sidebar
+/// (`SHELBI_SIDEBAR`) and, when the review interface is open, the review panel
+/// (`SHELBI_REVIEW_PANEL`) — locked to one *shared, user-adjustable* width.
 ///
-/// It clamps **both** nav panes to that one canonical width: the traveling
-/// sidebar (`SHELBI_SIDEBAR`) and, whenever the review interface is open, its
-/// review panel (`SHELBI_REVIEW_PANEL`). Because both are computed from the
-/// same formula against the same client width, the review panel and the
-/// dashboard sidebar stay locked to an identical width — a resize of either
-/// (wired via `window-layout-changed`, see [`install_sidebar_clamp_hooks`])
-/// snaps both back to it. The `!= c` guard makes each clamp idempotent, so
-/// running it on every layout change can't loop. Panes are resolved from the
-/// session env so the sidebar is clamped wherever it currently lives (it
-/// travels between windows), not a fixed `dashboard.{left}` position. Written
-/// to disk so the hook can invoke it by path without inlining shell into a
-/// tmux command-list string.
+/// The width is the stored override (`SHELBI_SIDEBAR_W`, in cols) when the user
+/// has dragged either divider, else `SIDEBAR_TARGET_PCT%` of the window clamped
+/// to `[MIN, MAX]`. The script runs in two modes:
+///
+/// - **apply** (default; wired to `client-attached` / `client-resized` and
+///   re-run after a sidebar travel): pin both panes to that target. A terminal
+///   resize therefore keeps the chosen absolute width instead of reflowing it.
+/// - **adopt** (`sh <script> adopt`; wired to `window-layout-changed`): a
+///   divider drag fires this. If the window width is steady (a real drag, not a
+///   terminal resize — told apart via `SHELBI_SIDEBAR_WW`) and a nav pane's
+///   width drifted off the target, that pane's width (clamped to `[MIN, MAX]`)
+///   becomes the new shared width: it is persisted to `SHELBI_SIDEBAR_W` and
+///   mirrored to the OTHER pane. Persisting the override *before* mirroring
+///   makes the mirror's re-fired hook see both panes already on the new target,
+///   so the `!= c` idempotency guard fires and the hook can't loop.
+///
+/// Panes are resolved from the session env so the sidebar is handled wherever
+/// it currently lives (it travels between windows), not a fixed
+/// `dashboard.{left}`. Written to disk so the hook can invoke it by path.
 fn sidebar_clamp_script(session: &str) -> String {
     format!(
         "#!/bin/sh\n\
          # Auto-generated by shelbi; rewritten on every `ensure_dashboard`.\n\
-         clamp_one() {{\n\
-         \tp=\"$1\"\n\
-         \t[ -z \"$p\" ] && return 0\n\
-         \tw=$(tmux display-message -p -t \"$p\" '#{{window_width}}' 2>/dev/null)\n\
-         \t[ -z \"$w\" ] && return 0\n\
-         \tc=$((w * {pct} / 100))\n\
+         mode=\"${{1:-apply}}\"\n\
+         sess='{sess}'\n\
+         getenv() {{\n\
+         \ttmux show-environment -t \"$sess\" \"$1\" 2>/dev/null | sed -n \"s/^$1=//p\"\n\
+         }}\n\
+         # Stored shared-width override (cols), or empty when unset/non-numeric.\n\
+         override=$(getenv {wkey})\n\
+         case \"$override\" in ''|*[!0-9]*) override='' ;; esac\n\
+         # Target width for pane $1: the override if set, else {pct}% of the\n\
+         # pane's window width; always clamped to [{min},{max}]. Empty if unknown.\n\
+         target_for() {{\n\
+         \tif [ -n \"$override\" ]; then\n\
+         \t\tc=$override\n\
+         \telse\n\
+         \t\tw=$(tmux display-message -p -t \"$1\" '#{{window_width}}' 2>/dev/null)\n\
+         \t\t[ -z \"$w\" ] && {{ echo ''; return 0; }}\n\
+         \t\tc=$((w * {pct} / 100))\n\
+         \tfi\n\
          \t[ \"$c\" -lt {min} ] && c={min}\n\
          \t[ \"$c\" -gt {max} ] && c={max}\n\
-         \tcur=$(tmux display-message -p -t \"$p\" '#{{pane_width}}' 2>/dev/null)\n\
-         \t[ \"$cur\" = \"$c\" ] && return 0\n\
-         \ttmux resize-pane -t \"$p\" -x \"$c\" 2>/dev/null || true\n\
+         \techo \"$c\"\n\
          }}\n\
-         sb=$(tmux show-environment -t '{sess}' {env} 2>/dev/null | sed -n 's/^{env}=//p')\n\
-         panel=$(tmux show-environment -t '{sess}' {panel} 2>/dev/null | sed -n 's/^{panel}=//p')\n\
-         clamp_one \"$sb\"\n\
-         clamp_one \"$panel\"\n",
+         # Resize pane $1 to width $2 unless already there (idempotent, loop-safe).\n\
+         apply_one() {{\n\
+         \t[ -z \"$1\" ] && return 0\n\
+         \t[ -z \"$2\" ] && return 0\n\
+         \tcur=$(tmux display-message -p -t \"$1\" '#{{pane_width}}' 2>/dev/null)\n\
+         \t[ \"$cur\" = \"$2\" ] && return 0\n\
+         \ttmux resize-pane -t \"$1\" -x \"$2\" 2>/dev/null || true\n\
+         }}\n\
+         sb=$(getenv {env})\n\
+         panel=$(getenv {panel})\n\
+         cw=$(tmux display-message -p -t \"$sess\" '#{{window_width}}' 2>/dev/null)\n\
+         cwin=$(tmux display-message -p -t \"$sess\" '#{{window_id}}' 2>/dev/null)\n\
+         if [ \"$mode\" = adopt ] && [ -n \"$cw\" ] && [ \"$cw\" = \"$(getenv {wwkey})\" ]; then\n\
+         \t# Window width steady vs. the last-seen width => a divider DRAG, not a\n\
+         \t# terminal resize. Adopt the drifted width of the nav pane in the\n\
+         \t# CURRENT window (the only pane the user can be dragging) as the new\n\
+         \t# shared width: clamp it to [{min},{max}], persist it to {wkey}, and\n\
+         \t# mirror it to both panes. The current-window guard means the\n\
+         \t# programmatic mirror only ever moves the pane in the OTHER window, so\n\
+         \t# a re-fired hook can't re-adopt a transient width => no loop. (Keyed\n\
+         \t# off the session's current window id, which is well-defined with or\n\
+         \t# without an attached client, unlike client-relative window_active.)\n\
+         \tnew=''\n\
+         \tfor p in \"$sb\" \"$panel\"; do\n\
+         \t\t[ -z \"$p\" ] && continue\n\
+         \t\t[ -n \"$cwin\" ] || continue\n\
+         \t\t[ \"$(tmux display-message -p -t \"$p\" '#{{window_id}}' 2>/dev/null)\" = \"$cwin\" ] || continue\n\
+         \t\tt=$(target_for \"$p\")\n\
+         \t\t[ -z \"$t\" ] && continue\n\
+         \t\tcur=$(tmux display-message -p -t \"$p\" '#{{pane_width}}' 2>/dev/null)\n\
+         \t\t[ -z \"$cur\" ] && continue\n\
+         \t\tif [ \"$cur\" != \"$t\" ]; then\n\
+         \t\t\tnew=$cur\n\
+         \t\t\t[ \"$new\" -lt {min} ] && new={min}\n\
+         \t\t\t[ \"$new\" -gt {max} ] && new={max}\n\
+         \t\t\tbreak\n\
+         \t\tfi\n\
+         \tdone\n\
+         \tif [ -n \"$new\" ]; then\n\
+         \t\ttmux set-environment -t \"$sess\" {wkey} \"$new\" 2>/dev/null || true\n\
+         \t\toverride=$new\n\
+         \t\tapply_one \"$sb\" \"$new\"\n\
+         \t\tapply_one \"$panel\" \"$new\"\n\
+         \t\texit 0\n\
+         \tfi\n\
+         fi\n\
+         # apply / terminal-resize / no-drift: re-pin both panes to the target,\n\
+         # and record the current window width so the NEXT layout change can tell\n\
+         # a steady-width drag from a resize (this also seeds it on first run so\n\
+         # the very first drag is recognized).\n\
+         apply_one \"$sb\" \"$(target_for \"$sb\")\"\n\
+         apply_one \"$panel\" \"$(target_for \"$panel\")\"\n\
+         [ -n \"$cw\" ] && tmux set-environment -t \"$sess\" {wwkey} \"$cw\" 2>/dev/null || true\n",
         sess = session,
         env = SIDEBAR_ENV_KEY,
         panel = review_ui::PANEL_KEY,
+        wkey = SIDEBAR_WIDTH_KEY,
+        wwkey = SIDEBAR_WW_KEY,
         pct = SIDEBAR_TARGET_PCT,
         min = SIDEBAR_MIN_COLS,
         max = SIDEBAR_MAX_COLS,
@@ -1247,23 +1345,28 @@ fn sidebar_travel_script(session: &str, clamp_script_path: &std::path::Path) -> 
 ///   changed; without this the panes would scale proportionally with the
 ///   window, which is exactly what we're avoiding.
 /// - `window-layout-changed` — a pane was resized (a manual divider drag, a
-///   split appearing). This is what keeps the review panel and the dashboard
-///   sidebar locked to the same width: dragging either nav pane fires this
-///   hook, which snaps both back to the shared canonical width. The clamp's
-///   `!= c` guard makes it idempotent so the hook can't loop. (Trade-off: a
-///   manual drag of a nav pane no longer sticks — it snaps back to the
-///   canonical width — which is consistent with the sidebar already being a
-///   fixed-width clamped nav.)
+///   split appearing). This runs the script in **adopt** mode: dragging either
+///   nav pane makes its new width the shared width for BOTH — it's persisted to
+///   `SHELBI_SIDEBAR_W` and mirrored to the other pane, so the drag sticks
+///   instead of snapping back. The `!= c` idempotency guard (the mirror leaves
+///   both panes on the new target) keeps the hook from looping.
 fn install_sidebar_clamp_hooks(
     host: &shelbi_core::Host,
     session: &str,
     script_path: &std::path::Path,
 ) -> Result<()> {
     let path_esc = shelbi_agent::shell_escape(&script_path.to_string_lossy());
-    let hook_cmd = format!("run-shell -b 'sh {path_esc}'");
-    for event in ["client-attached", "client-resized", "window-layout-changed"] {
-        let _ = shelbi_ssh::run(host, ["tmux", "set-hook", "-t", session, event, &hook_cmd]);
+    let apply_cmd = format!("run-shell -b 'sh {path_esc}'");
+    // A divider drag adopts + mirrors + persists the new shared width; a
+    // client attach/resize re-applies the stored (or default) shared width.
+    let adopt_cmd = format!("run-shell -b 'sh {path_esc} adopt'");
+    for event in ["client-attached", "client-resized"] {
+        let _ = shelbi_ssh::run(host, ["tmux", "set-hook", "-t", session, event, &apply_cmd]);
     }
+    let _ = shelbi_ssh::run(
+        host,
+        ["tmux", "set-hook", "-t", session, "window-layout-changed", &adopt_cmd],
+    );
     Ok(())
 }
 
@@ -2381,6 +2484,19 @@ mod pane_cmd_tests {
     }
 
     #[test]
+    fn shared_sidebar_cols_prefers_override_else_formula() {
+        // No override: identical to the 25% formula default.
+        assert_eq!(shared_sidebar_cols(120, None), sidebar_cols_for(120));
+        assert_eq!(shared_sidebar_cols(120, None), 30);
+        // Override in band: honored verbatim, independent of window width.
+        assert_eq!(shared_sidebar_cols(120, Some(36)), 36);
+        assert_eq!(shared_sidebar_cols(400, Some(36)), 36);
+        // Override out of band: clamped to the nearest bound, never reverted.
+        assert_eq!(shared_sidebar_cols(120, Some(80)), SIDEBAR_MAX_COLS);
+        assert_eq!(shared_sidebar_cols(120, Some(1)), SIDEBAR_MIN_COLS);
+    }
+
+    #[test]
     fn sidebar_clamp_script_targets_the_traveling_pane_not_a_fixed_position() {
         let out = sidebar_clamp_script("shelbi-myapp");
         // Resolves the pane from the session env (it travels), never the
@@ -2395,16 +2511,32 @@ mod pane_cmd_tests {
         // The clamp band is threaded through from the consts.
         assert!(out.contains(&SIDEBAR_MIN_COLS.to_string()));
         assert!(out.contains(&SIDEBAR_MAX_COLS.to_string()));
-        // It also clamps the review panel to the same width so the two nav
+        // It also handles the review panel with the same width so the two nav
         // panes stay locked together, and guards each resize so wiring it to
         // `window-layout-changed` can't loop.
         assert!(
             out.contains(review_ui::PANEL_KEY),
-            "clamps the review panel alongside the sidebar: {out}"
+            "handles the review panel alongside the sidebar: {out}"
         );
         assert!(
-            out.contains("[ \"$cur\" = \"$c\" ] && return 0"),
+            out.contains("[ \"$cur\" = \"$2\" ] && return 0"),
             "idempotent `!= c` guard so the layout-changed hook can't loop: {out}"
+        );
+        // A user drag adopts + persists a shared width override, mirrored to
+        // both panes, instead of reverting to the 25% formula.
+        assert!(
+            out.contains(SIDEBAR_WIDTH_KEY),
+            "reads/writes the shared-width override: {out}"
+        );
+        assert!(
+            out.contains("set-environment") && out.contains("adopt"),
+            "adopt mode persists the dragged width: {out}"
+        );
+        // The drag/resize discriminator env var is threaded through so a
+        // terminal resize is never mistaken for a divider drag.
+        assert!(
+            out.contains(SIDEBAR_WW_KEY),
+            "tracks last window width to tell a drag from a resize: {out}"
         );
     }
 
