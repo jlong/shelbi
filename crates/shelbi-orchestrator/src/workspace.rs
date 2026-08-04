@@ -2895,12 +2895,29 @@ echo "<system-reminder>New orchestrator messages:"
 cat "$PROC"
 echo "</system-reminder>"
 HUB_ADDR="${SHELBI_HUB_ADDR:-${SHELBI_HUB_SOCK:+unix:$SHELBI_HUB_SOCK}}"
+# The ack peer must half-close its write side after sending so the hub reader
+# sees EOF instead of a lingering (or leaked) connection. This differs by nc
+# flavour: openbsd netcat (the default nc on Debian/Ubuntu CI and most Linux)
+# only half-closes when given -N, whereas macOS/BSD nc closes on stdin EOF by
+# DEFAULT and repurposes -N for an unrelated numeric arg (num_probes), so
+# passing -N there breaks the send. Detect the flavour from `nc -h`; anything
+# that is neither (e.g. nmap ncat, busybox) falls through to python3, whose
+# shutdown(SHUT_WR) is correct everywhere.
+NC_HALF=
+NC_OK=
+if command -v nc >/dev/null 2>&1; then
+  NC_HELP=$(nc -h 2>&1)
+  case "$NC_HELP" in
+    *"after EOF"*) NC_HALF=-N; NC_OK=1 ;;
+    *num_probes*|*--apple-*) NC_OK=1 ;;
+  esac
+fi
 shelbi_ack_send() {
   # $1 = one newline-terminated JSON line to deliver to $HUB_ADDR.
-  if command -v nc >/dev/null 2>&1; then
+  if [ -n "$NC_OK" ]; then
     case "$HUB_ADDR" in
-      tcp:*) HP=${HUB_ADDR#tcp:}; printf '%s' "$1" | nc "${HP%:*}" "${HP##*:}" 2>/dev/null || true ;;
-      unix:*) printf '%s' "$1" | nc -U "${HUB_ADDR#unix:}" 2>/dev/null || true ;;
+      tcp:*) HP=${HUB_ADDR#tcp:}; printf '%s' "$1" | nc $NC_HALF "${HP%:*}" "${HP##*:}" 2>/dev/null || true ;;
+      unix:*) printf '%s' "$1" | nc $NC_HALF -U "${HUB_ADDR#unix:}" 2>/dev/null || true ;;
     esac
   elif command -v python3 >/dev/null 2>&1; then
     printf '%s' "$1" | python3 -c 'import socket,sys
@@ -6179,14 +6196,34 @@ mod tests {
                 .as_nanos()
         ));
         let listener = UnixListener::bind(&sock).unwrap();
+        // The acceptor is bounded on every blocking point so a regression
+        // (ack never sent, or a peer that doesn't half-close its write side)
+        // fails this test fast instead of hanging the CI runner indefinitely.
+        listener.set_nonblocking(true).unwrap();
         let acceptor = std::thread::spawn(move || {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(15);
             let mut received = Vec::new();
-            // Accept exactly the two acks the hook sends (one connection each).
-            for _ in 0..2 {
-                let (mut conn, _) = listener.accept().unwrap();
-                let mut buf = String::new();
-                conn.read_to_string(&mut buf).unwrap();
-                received.push(buf);
+            // Accept exactly the two acks the hook sends (one connection each),
+            // giving up at the deadline rather than blocking on accept() forever.
+            while received.len() < 2 && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut conn, _)) => {
+                        // Bound the read too: with a proper half-close (nc -N /
+                        // python shutdown) EOF arrives promptly; the timeout only
+                        // backstops a peer that never closes its write side.
+                        conn.set_nonblocking(false).ok();
+                        conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                            .ok();
+                        let mut buf = String::new();
+                        let _ = conn.read_to_string(&mut buf);
+                        received.push(buf);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
             }
             received
         });
@@ -6212,7 +6249,15 @@ mod tests {
         assert!(stdout.contains("\"msg_id\":\"m-1\"") && stdout.contains("\"msg_id\":\"m-2\""));
 
         // (b) An ack landed on the socket for each msg_id.
-        let received = acceptor.join().unwrap().join("");
+        let acks = acceptor.join().unwrap();
+        assert_eq!(
+            acks.len(),
+            2,
+            "expected 2 acks before the deadline, got {} (ack never sent or \
+             connection never closed?)",
+            acks.len()
+        );
+        let received = acks.join("");
         assert!(
             received.contains("\"verb\":\"message-ack\"")
                 && received.contains("\"project\":\"demoproj\"")

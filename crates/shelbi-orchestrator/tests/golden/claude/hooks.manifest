@@ -33,12 +33,29 @@ echo "<system-reminder>New orchestrator messages:"
 cat "$PROC"
 echo "</system-reminder>"
 HUB_ADDR="${SHELBI_HUB_ADDR:-${SHELBI_HUB_SOCK:+unix:$SHELBI_HUB_SOCK}}"
+# The ack peer must half-close its write side after sending so the hub reader
+# sees EOF instead of a lingering (or leaked) connection. This differs by nc
+# flavour: openbsd netcat (the default nc on Debian/Ubuntu CI and most Linux)
+# only half-closes when given -N, whereas macOS/BSD nc closes on stdin EOF by
+# DEFAULT and repurposes -N for an unrelated numeric arg (num_probes), so
+# passing -N there breaks the send. Detect the flavour from `nc -h`; anything
+# that is neither (e.g. nmap ncat, busybox) falls through to python3, whose
+# shutdown(SHUT_WR) is correct everywhere.
+NC_HALF=
+NC_OK=
+if command -v nc >/dev/null 2>&1; then
+  NC_HELP=$(nc -h 2>&1)
+  case "$NC_HELP" in
+    *"after EOF"*) NC_HALF=-N; NC_OK=1 ;;
+    *num_probes*|*--apple-*) NC_OK=1 ;;
+  esac
+fi
 shelbi_ack_send() {
   # $1 = one newline-terminated JSON line to deliver to $HUB_ADDR.
-  if command -v nc >/dev/null 2>&1; then
+  if [ -n "$NC_OK" ]; then
     case "$HUB_ADDR" in
-      tcp:*) HP=${HUB_ADDR#tcp:}; printf '%s' "$1" | nc "${HP%:*}" "${HP##*:}" 2>/dev/null || true ;;
-      unix:*) printf '%s' "$1" | nc -U "${HUB_ADDR#unix:}" 2>/dev/null || true ;;
+      tcp:*) HP=${HUB_ADDR#tcp:}; printf '%s' "$1" | nc $NC_HALF "${HP%:*}" "${HP##*:}" 2>/dev/null || true ;;
+      unix:*) printf '%s' "$1" | nc $NC_HALF -U "${HUB_ADDR#unix:}" 2>/dev/null || true ;;
     esac
   elif command -v python3 >/dev/null 2>&1; then
     printf '%s' "$1" | python3 -c 'import socket,sys
