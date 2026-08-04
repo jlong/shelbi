@@ -78,7 +78,7 @@ pub struct WorkspaceOverview {
 pub enum WorkspaceBadge {
     /// ⏵ — claude is actively running a turn.
     Working,
-    /// 💬 — claude finished a turn and is sitting at the prompt.
+    /// ? — claude finished a turn and is sitting at the prompt.
     AwaitingInput,
     /// ⚠ — claude is showing a permission dialog.
     AwaitingPermission,
@@ -101,7 +101,7 @@ impl WorkspaceBadge {
     pub fn glyph(self) -> &'static str {
         match self {
             WorkspaceBadge::Working => "⏵",
-            WorkspaceBadge::AwaitingInput => "💬",
+            WorkspaceBadge::AwaitingInput => "?",
             WorkspaceBadge::AwaitingPermission => "⚠",
             WorkspaceBadge::Paused => "⏸",
             WorkspaceBadge::Idle => "·",
