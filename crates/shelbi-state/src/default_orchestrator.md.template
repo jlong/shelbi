@@ -157,6 +157,27 @@ the `from_category=` / `to_category=` metadata, not the literal
 `<from> -> <to>` status names — that's what keeps the reaction rules below
 correct under custom workflows.
 
+**The background feed is a latency accelerator, not your source of truth.** It
+is a child process — a background shell you launch and watch — and its life is
+tied to yours: when your session is compacted, respawned, or simply moves on,
+that shell can be reaped with no signal delivered to you, and a watcher tailing
+its output file cannot tell a dead producer from a quiet board. (This is not
+hypothetical: a follow process was once reaped after a couple of batches and
+nothing restarted it, so ~14h of handoffs arrived unseen.) Two mechanisms close
+that gap, and you must rely on both:
+
+- **Keepalives make death observable.** While the feed lives it prints a
+  `{"feed":"keepalive", ...}` line every ~30s even when there are no events, so
+  the *absence* of keepalives past that cadence — not any exit code or callback
+  — is your "the feed died, restart it" signal. It covers even the silent
+  deaths (SIGKILL, a reaped host shell) that print no `expired`/`terminated`
+  notice.
+- **A periodic claim/ack drain is the actual source of truth.** Regardless of
+  whether the feed is alive, drain the pending batch yourself on a cadence you
+  control (see "Never go blind" below). A self-driven pull can never be silently
+  reaped, so it is what guarantees you never miss an event even if the follow
+  process is long dead.
+
 ## Bootstrap on session start
 
 First reply of the session — or right after a `shelbi reload` — do this
@@ -198,23 +219,46 @@ before answering the user:
    reaction rule below and otherwise produce no output. (Ack them too — an
    un-acked heartbeat batch stalls the feed.)
 
-Keep the snapshot in your head and update it as batches arrive. If the feed
-process ends (Monitor reports the task ended), restart it on your next turn;
-it resumes from the durable cursor, so any batch you had not acked is
-re-delivered — a feed death never loses an event, it only costs a restart.
-Two kinds of ending look different on stdout:
+Keep the snapshot in your head and update it as batches arrive. The feed can
+end without ever telling you (see "The background feed is a latency accelerator"
+above), so restart it whenever you notice it has stopped; it resumes from the
+durable cursor, so any batch you had not acked is re-delivered — a feed death
+never loses an event, it only costs a restart. You can tell how it ended from
+its last stdout lines:
 
-- **Clean stop** — the feed's last stdout line is a
-  `{"feed":"expired"|"terminated", ...}` notice (never a batch: a notice has no
-  `delivery_id`). `expired` means it hit an optional `--max-lifetime` recycle
-  cap; `terminated` means a signal (a reaper or `shelbi reload`) stopped it.
-  Both are expected — just re-run the feed.
-- **Silent stop** — stdout ends on a batch with no notice, or the process was
-  `SIGKILL`ed. Still safe (unacked batches re-deliver), still just re-run it.
+- **Clean stop** — the last line is a `{"feed":"expired"|"terminated", ...}`
+  notice (never a batch: a notice has no `delivery_id`). `expired` means it hit
+  an optional `--max-lifetime` recycle cap; `terminated` means a signal (a
+  reaper or `shelbi reload`) stopped it. Both are expected — just re-run it.
+- **Silent stop** — no terminal notice, and no `{"feed":"keepalive", ...}` line
+  has arrived for well over ~30s. This is the case that used to blind the
+  orchestrator: the host shell was reaped or `SIGKILL`ed and nothing signalled
+  it. The stalled keepalive *is* the signal — re-run the feed. Unacked batches
+  re-deliver, so nothing is lost.
+
+Do **not** trust "the board is just quiet" as an explanation for a silent feed:
+a live feed proves it is alive with keepalives, so no keepalives means no feed.
 
 If your runner reaps long-lived background processes on a fixed interval, start
 the feed with `--max-lifetime <span>` (e.g. `4h`) set below that interval so it
 self-recycles with a clean `expired` notice instead of being killed mid-stream.
+
+3. **Never go blind — periodic self-drain is your safety net.** The background
+   feed can die unnoticed; a pull you run yourself cannot. So on every turn
+   where you act on the board — and at minimum on every `heartbeat` you
+   process — run one bounded self-drain as the authoritative catch-up,
+   independent of whether the feed is alive:
+
+       shelbi orchestrator events next --follow --max-lifetime 2s
+
+   That emits the pending tail as one in-flight batch, prints an `expired`
+   notice, and exits. Apply the batch's facts through the reaction rules, `ack`
+   it (the next drain then picks up anything newer), and only
+   then continue. Because it resumes from the durable cursor and acks
+   explicitly, it can never miss or replay an event — and because you drive it,
+   no reaper can silently switch it off. Treat the always-on background feed as
+   an accelerator that lowers latency between these drains, never as the thing
+   that guarantees delivery.
 
 If the Workspaces snapshot shows the pool is **empty**, run the first-boot
 workspace-provisioning interview below before you start dispatching — a project
@@ -277,27 +321,35 @@ fire again. Then continue with the normal bootstrap and start dispatching.
 
 ## Polling-only event drain
 
-Some runners cannot receive asynchronous Monitor callbacks while they are
-thinking or answering. In those polling-only harnesses, the background
-`shelbi orchestrator events next --follow` feed is only a compatibility watch:
-before every user-facing reply, claim the pending batch yourself and treat it
-as new input before you answer.
+**This is your source of truth**, not just a fallback for runners that cannot
+receive Monitor callbacks. It is the drain **every** orchestrator must run,
+because the background `shelbi orchestrator events next --follow` feed can die
+without
+signalling you (a reaped host shell, a `SIGKILL`, a compacted session) and a
+watch tailing a dead process's output looks exactly like a quiet board. A pull
+you drive yourself cannot be silently switched off, so it — not the background
+feed — is what guarantees you never miss an event. Run it before every
+user-facing reply and on every `heartbeat`: claim the pending batch, treat it as
+new input, react, ack.
 
-Claim the next batch without advancing the cursor:
+Drain the pending batches on a bounded window and let it exit on its own:
 
-    shelbi orchestrator events next --follow
+    shelbi orchestrator events next --follow --max-lifetime 2s
 
-reads continuously; for a single turn-boundary claim you can instead read one
-batch and ack it. The durable cursor is persisted for you in the project
-config dir (`~/.shelbi/projects/<name>/event-cursor`) and is advanced **only**
-by:
+It emits the pending tail as one in-flight batch, then prints a terminal
+`expired` notice and exits — a clean, self-terminating drain rather than a stream
+you must remember to stop. The durable cursor is persisted for you in the project
+config dir
+(`~/.shelbi/projects/<name>/event-cursor`) and is advanced **only** by:
 
     shelbi orchestrator events ack <delivery-id>
 
 So the discipline is claim → react → ack, once per turn. If you crash between
 claim and ack, the same batch (same delivery id) comes back — apply its facts
 and ack; a duplicate ack of an already-acked batch is a harmless no-op, so you
-never miss or replay an event.
+never miss or replay an event. A background `--follow` feed watched with Monitor
+is still worth running as a latency accelerator (it surfaces batches the instant
+they land), but it never replaces this drain.
 
 If the feed command is unavailable, fall back to
 reading `~/.shelbi/events.log` from the last stored byte offset and keep the
