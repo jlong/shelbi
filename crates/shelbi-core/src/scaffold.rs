@@ -281,7 +281,7 @@ const WORKFLOW_SECTIONS: &[Section] = &[
         yaml: "\
 transitions:
   - { from: in-progress, to: review, actions: [push_branch, open_pr] }
-  - { from: review, to: done, actions: [merge, delete_branch] }
+  - { from: review, to: done, actions: [push_branch, merge] }
 ",
     },
     Section {
@@ -586,11 +586,21 @@ agent_runners:
         let wf = Workflow::from_yaml_str(&yaml).expect("decorated subtask workflow parses");
         assert_eq!(wf.name, "subtask");
         let transitions = wf.transitions.as_ref().expect("transitions are active");
-        // A subtask never opens a PR — no open_pr / push_branch anywhere.
-        assert!(transitions.iter().all(|t| {
-            !t.actions.contains(&TransitionAction::OpenPr)
-                && !t.actions.contains(&TransitionAction::PushBranch)
-        }));
+        // A subtask never opens a PR — no open_pr anywhere (push_branch alone
+        // only pushes the branch to origin, it opens no PR).
+        assert!(transitions
+            .iter()
+            .all(|t| !t.actions.contains(&TransitionAction::OpenPr)));
+        // in-progress -> done pushes first, then squash-merges — no eager
+        // delete_branch on the done edge.
+        let done = transitions
+            .iter()
+            .find(|t| t.from == "in-progress" && t.to == "done")
+            .expect("in-progress -> done edge");
+        assert_eq!(
+            done.actions,
+            vec![TransitionAction::PushBranch, TransitionAction::Merge]
+        );
         let git = wf.git.as_ref().expect("git block is active");
         assert_eq!(git.base_branch.as_deref(), Some("task/{{task}}"));
         // Names branches from a full template (`subtask/<id>`, no github_user),
