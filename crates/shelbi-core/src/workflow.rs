@@ -811,10 +811,14 @@ pub fn task_workflow() -> Workflow {
                 "review",
                 &[TransitionAction::PushBranch, TransitionAction::OpenPr],
             ),
+            // Push the branch to origin first (recoverable if the merge is
+            // wrong-base, and satisfies `merge`'s origin requirement), then
+            // squash-merge to main. No eager `delete_branch` — the merged
+            // branch is swept separately, so a bad merge stays recoverable.
             transition(
                 "review",
                 "done",
-                &[TransitionAction::Merge, TransitionAction::DeleteBranch],
+                &[TransitionAction::PushBranch, TransitionAction::Merge],
             ),
             transition(
                 "in-progress",
@@ -906,12 +910,16 @@ pub fn subtask_workflow() -> Workflow {
         ],
         initial_status: None,
         transitions: Some(vec![
-            // A direct local squash-merge into the parent task's branch — no
-            // push_branch / open_pr, so a subtask never opens its own PR.
+            // Push the branch to origin first (recoverable if the merge is
+            // wrong-base, and satisfies `merge`'s origin requirement), then
+            // squash-merge into the parent task's branch. `push_branch` only
+            // pushes — it opens no PR — so a subtask still never opens its own
+            // PR. No eager `delete_branch`: the merged subtask branch is swept
+            // when the umbrella task merges, keeping a bad merge recoverable.
             transition(
                 "in-progress",
                 "done",
-                &[TransitionAction::Merge, TransitionAction::DeleteBranch],
+                &[TransitionAction::PushBranch, TransitionAction::Merge],
             ),
             transition("in-progress", "canceled", &[TransitionAction::DeleteBranch]),
         ]),
@@ -2000,8 +2008,26 @@ statuses:
         assert_eq!(open_pr_edges.len(), 1);
         assert_eq!(open_pr_edges[0].from, "in-progress");
         assert_eq!(open_pr_edges[0].to, "review");
-        // review -> done squash-merges to main.
+        // review -> done pushes the branch first (recoverable + satisfies
+        // merge's origin requirement), then squash-merges to main — no eager
+        // delete_branch on the done edge.
         assert!(wf.is_merge_transition("review", "done"));
+        let done = transitions
+            .iter()
+            .find(|t| t.from == "review" && t.to == "done")
+            .expect("review -> done edge");
+        assert_eq!(
+            done.actions,
+            vec![TransitionAction::PushBranch, TransitionAction::Merge]
+        );
+        // The canceled edges still delete the abandoned branch.
+        for from in ["in-progress", "review"] {
+            let canceled = transitions
+                .iter()
+                .find(|t| t.from == from && t.to == "canceled")
+                .expect("canceled edge");
+            assert!(canceled.actions.contains(&TransitionAction::DeleteBranch));
+        }
         // The review handoff has the outgoing merge edge, so it trips the
         // confidence bar; in-progress (no merge edge) does not.
         assert!(wf.fires_merge_bar("review"));
@@ -2032,14 +2058,30 @@ statuses:
         assert_eq!(git.branch_prefix, None);
         assert_eq!(git.merge_strategy, MergeStrategy::Squash);
 
-        // Never opens a PR: no open_pr / push_branch on any edge.
+        // Never opens a PR: no open_pr on any edge (push_branch alone only
+        // pushes the branch to origin, it opens no PR).
         let transitions = wf.transitions.as_ref().expect("transitions");
-        assert!(transitions.iter().all(|t| {
-            !t.actions.contains(&TransitionAction::OpenPr)
-                && !t.actions.contains(&TransitionAction::PushBranch)
-        }));
-        // in-progress -> done is the direct local squash-merge.
+        assert!(transitions
+            .iter()
+            .all(|t| !t.actions.contains(&TransitionAction::OpenPr)));
+        // in-progress -> done pushes the branch first (recoverable + satisfies
+        // merge's origin requirement), then squash-merges — no eager
+        // delete_branch on the done edge.
         assert!(wf.is_merge_transition("in-progress", "done"));
+        let done = transitions
+            .iter()
+            .find(|t| t.from == "in-progress" && t.to == "done")
+            .expect("in-progress -> done edge");
+        assert_eq!(
+            done.actions,
+            vec![TransitionAction::PushBranch, TransitionAction::Merge]
+        );
+        // The canceled edge still deletes the abandoned branch.
+        let canceled = transitions
+            .iter()
+            .find(|t| t.from == "in-progress" && t.to == "canceled")
+            .expect("in-progress -> canceled edge");
+        assert!(canceled.actions.contains(&TransitionAction::DeleteBranch));
     }
 
     #[test]
