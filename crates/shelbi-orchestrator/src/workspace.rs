@@ -2872,29 +2872,76 @@ tail -f -n 0 .shelbi/messages/$TASK_ID.log > .shelbi/messages/$TASK_ID.unread.lo
 echo $! > "$LOCKDIR/pid"
 "#;
 
+// Stop hook: drain any messages the SessionStart `tail -f` streamed into
+// `<task>.unread.log`, inject them into the agent's context, and ack each one
+// back to the hub so `shelbi message` can report real delivery.
+//
+// Ack robustness (the "0 acks for 12" bug): the ack extraction must NOT depend
+// on `jq`. `jq` is absent on stock macOS and minimal Linux images, and the old
+// `command -v jq && command -v nc` gate silently skipped the entire ack block
+// when either was missing — so every message ended up `ack=timeout` even though
+// it was drained fine. We now pull `msg_id` out of each JSON line with `sed`
+// (in every POSIX toolbox) and send the ack over `nc` if present, else
+// `python3` (a far more portable fallback than nc on many hosts). Only the hub
+// address is a hard precondition now.
 const MESSAGE_DRAIN_STOP_SH: &str = r#"#!/bin/sh
 [ -n "${TASK_ID:-}" ] || exit 0
 UNREAD=.shelbi/messages/$TASK_ID.unread.log
 PROC=$UNREAD.processing
-if [ -s "$UNREAD" ]; then
-  mv "$UNREAD" "$PROC"
-  touch "$UNREAD"
-  echo "<system-reminder>New orchestrator messages:"
-  cat "$PROC"
-  echo "</system-reminder>"
-  HUB_ADDR="${SHELBI_HUB_ADDR:-${SHELBI_HUB_SOCK:+unix:$SHELBI_HUB_SOCK}}"
-  if [ -n "$HUB_ADDR" ] && command -v jq >/dev/null 2>&1 && command -v nc >/dev/null 2>&1; then
-    jq -r '.msg_id // empty' "$PROC" 2>/dev/null | while read MSG_ID; do
-      [ -n "$MSG_ID" ] || continue
-      ACK=$(printf '{"verb":"message-ack","project":"%s","task_id":"%s","msg_id":"%s"}\n' "$PROJECT" "$TASK_ID" "$MSG_ID")
-      case "$HUB_ADDR" in
-        tcp:*) HP=${HUB_ADDR#tcp:}; printf '%s' "$ACK" | nc "${HP%:*}" "${HP##*:}" 2>/dev/null || true ;;
-        unix:*) printf '%s' "$ACK" | nc -U "${HUB_ADDR#unix:}" 2>/dev/null || true ;;
-      esac
-    done
-  fi
-  rm "$PROC"
+[ -s "$UNREAD" ] || exit 0
+mv "$UNREAD" "$PROC"
+touch "$UNREAD"
+echo "<system-reminder>New orchestrator messages:"
+cat "$PROC"
+echo "</system-reminder>"
+HUB_ADDR="${SHELBI_HUB_ADDR:-${SHELBI_HUB_SOCK:+unix:$SHELBI_HUB_SOCK}}"
+# The ack peer must half-close its write side after sending so the hub reader
+# sees EOF instead of a lingering (or leaked) connection. This differs by nc
+# flavour: openbsd netcat (the default nc on Debian/Ubuntu CI and most Linux)
+# only half-closes when given -N, whereas macOS/BSD nc closes on stdin EOF by
+# DEFAULT and repurposes -N for an unrelated numeric arg (num_probes), so
+# passing -N there breaks the send. Detect the flavour from `nc -h`; anything
+# that is neither (e.g. nmap ncat, busybox) falls through to python3, whose
+# shutdown(SHUT_WR) is correct everywhere.
+NC_HALF=
+NC_OK=
+if command -v nc >/dev/null 2>&1; then
+  NC_HELP=$(nc -h 2>&1)
+  case "$NC_HELP" in
+    *"after EOF"*) NC_HALF=-N; NC_OK=1 ;;
+    *num_probes*|*--apple-*) NC_OK=1 ;;
+  esac
 fi
+shelbi_ack_send() {
+  # $1 = one newline-terminated JSON line to deliver to $HUB_ADDR.
+  if [ -n "$NC_OK" ]; then
+    case "$HUB_ADDR" in
+      tcp:*) HP=${HUB_ADDR#tcp:}; printf '%s' "$1" | nc $NC_HALF "${HP%:*}" "${HP##*:}" 2>/dev/null || true ;;
+      unix:*) printf '%s' "$1" | nc $NC_HALF -U "${HUB_ADDR#unix:}" 2>/dev/null || true ;;
+    esac
+  elif command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | python3 -c 'import socket,sys
+addr=sys.argv[1]; data=sys.stdin.buffer.read()
+try:
+    if addr.startswith("unix:"):
+        s=socket.socket(socket.AF_UNIX); s.connect(addr[5:])
+    elif addr.startswith("tcp:"):
+        host,_,port=addr[4:].rpartition(":"); s=socket.socket(socket.AF_INET); s.connect((host,int(port)))
+    else:
+        sys.exit(0)
+    s.sendall(data); s.shutdown(socket.SHUT_WR)
+except Exception:
+    pass' "$HUB_ADDR" 2>/dev/null || true
+  fi
+}
+if [ -n "$HUB_ADDR" ]; then
+  sed -n 's/.*"msg_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PROC" | while IFS= read -r MSG_ID; do
+    [ -n "$MSG_ID" ] || continue
+    ACK=$(printf '{"verb":"message-ack","project":"%s","task_id":"%s","msg_id":"%s"}\n' "$PROJECT" "$TASK_ID" "$MSG_ID")
+    shelbi_ack_send "$ACK"
+  done
+fi
+rm "$PROC"
 "#;
 
 const PANE_IDLE_SH: &str = "#!/bin/sh\nprintf '\\033]2;shelbi:idle\\007'\n";
@@ -6100,6 +6147,136 @@ mod tests {
             .arg(pid.trim())
             .output();
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// End-to-end proof that the `Stop` hook actually delivers an ack — the
+    /// heart of the "0 acks for 12" bug. We seed `<task>.unread.log` with two
+    /// message lines (as `shelbi message` writes them), point the hook at a
+    /// real Unix hub socket, run the deployed `stop.sh`, and assert that (a) it
+    /// injects the drained bodies as a `<system-reminder>` on stdout and (b) a
+    /// `message-ack` lands on the socket for *each* msg_id. The ack path must
+    /// not depend on `jq` — the regression that silently dropped every ack on
+    /// hosts without it — so this test also guards that extraction path.
+    #[test]
+    fn deployed_stop_hook_drains_and_acks_over_hub_socket() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "shelbi-stop-ack-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        deploy_runner_hooks(&Host::Local, &worktree).unwrap();
+
+        // Seed the tail's output file with two pushed messages.
+        let msgs = worktree.join(".shelbi/messages");
+        std::fs::create_dir_all(&msgs).unwrap();
+        std::fs::write(
+            msgs.join("feat-x.unread.log"),
+            "{\"msg_id\":\"m-1\",\"ts\":\"2026-08-04T00:00:00Z\",\"kind\":\"directive\",\"body\":\"one\"}\n\
+             {\"msg_id\":\"m-2\",\"ts\":\"2026-08-04T00:00:01Z\",\"kind\":\"context\",\"body\":\"two\"}\n",
+        )
+        .unwrap();
+
+        // A real Unix hub socket in a short tmp path (Unix socket paths are
+        // length-capped, so keep it out of the deep worktree path).
+        let sock = std::env::temp_dir().join(format!(
+            "shelbi-stop-ack-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = UnixListener::bind(&sock).unwrap();
+        // The acceptor is bounded on every blocking point so a regression
+        // (ack never sent, or a peer that doesn't half-close its write side)
+        // fails this test fast instead of hanging the CI runner indefinitely.
+        listener.set_nonblocking(true).unwrap();
+        let acceptor = std::thread::spawn(move || {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut received = Vec::new();
+            // Accept exactly the two acks the hook sends (one connection each),
+            // giving up at the deadline rather than blocking on accept() forever.
+            while received.len() < 2 && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut conn, _)) => {
+                        // Bound the read too: with a proper half-close (nc -N /
+                        // python shutdown) EOF arrives promptly; the timeout only
+                        // backstops a peer that never closes its write side.
+                        conn.set_nonblocking(false).ok();
+                        conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                            .ok();
+                        let mut buf = String::new();
+                        let _ = conn.read_to_string(&mut buf);
+                        received.push(buf);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            }
+            received
+        });
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(".shelbi/hooks/stop.sh")
+            .env("TASK_ID", "feat-x")
+            .env("PROJECT", "demoproj")
+            .env("SHELBI_HUB_ADDR", format!("unix:{}", sock.display()))
+            .env_remove("SHELBI_HUB_SOCK")
+            .current_dir(&worktree)
+            .output()
+            .expect("run stop hook");
+        assert!(out.status.success(), "stop hook failed: {:?}", out.status);
+
+        // (a) The drained bodies are injected as a system-reminder.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("<system-reminder>New orchestrator messages:"),
+            "drain reminder missing: {stdout}"
+        );
+        assert!(stdout.contains("\"msg_id\":\"m-1\"") && stdout.contains("\"msg_id\":\"m-2\""));
+
+        // (b) An ack landed on the socket for each msg_id.
+        let acks = acceptor.join().unwrap();
+        assert_eq!(
+            acks.len(),
+            2,
+            "expected 2 acks before the deadline, got {} (ack never sent or \
+             connection never closed?)",
+            acks.len()
+        );
+        let received = acks.join("");
+        assert!(
+            received.contains("\"verb\":\"message-ack\"")
+                && received.contains("\"project\":\"demoproj\"")
+                && received.contains("\"task_id\":\"feat-x\""),
+            "ack payload malformed: {received}"
+        );
+        assert!(
+            received.contains("\"msg_id\":\"m-1\"") && received.contains("\"msg_id\":\"m-2\""),
+            "both msg_ids must be acked: {received}"
+        );
+
+        // The drained file is consumed and the unread log reset to empty.
+        assert_eq!(
+            std::fs::read_to_string(msgs.join("feat-x.unread.log")).unwrap(),
+            ""
+        );
+        assert!(!msgs.join("feat-x.unread.log.processing").exists());
+
+        let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

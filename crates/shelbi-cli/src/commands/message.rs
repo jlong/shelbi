@@ -20,13 +20,37 @@
 //! the same body through pane injection would duplicate delivery and weaken the
 //! restart-safe contract of this channel.
 
+use std::time::{Duration, Instant};
+
 use anyhow::{anyhow, bail, Result};
 use chrono::{SecondsFormat, Utc};
-use clap::ValueEnum;
+use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
 use shelbi_core::{Column, Host};
+use shelbi_state::MessageDelivery;
 
 use super::require_project;
+
+/// Subcommands of `shelbi message` that are *not* a push. Today just
+/// `status`, which reads a pushed message's delivery outcome back off the
+/// events stream so a non-interactive caller can tell "the worker read it"
+/// from "the file was written and nobody has looked".
+#[derive(Debug, Subcommand)]
+pub enum MessageStatusCmd {
+    /// Report a pushed message's delivery status (`queued` / `delivered` /
+    /// `unconfirmed`) by scanning `events.log` for its `ack=` line. Exits 0
+    /// only when the worker has confirmed delivery.
+    Status {
+        /// The `msg-id` printed by `shelbi message` (e.g.
+        /// `m-1785764991921-86377`).
+        msg_id: String,
+    },
+}
+
+/// How long the `--wait` poll loop sleeps between `events.log` reads. Short
+/// enough that a `--wait` returns within ~1 poll of the ack landing; long
+/// enough not to spin on the log file.
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Recognized message kinds. Extensible — add a variant here and it's
 /// accepted on the wire and validated by clap automatically. clap rejects
@@ -66,12 +90,78 @@ struct Message<'a> {
     body: &'a str,
 }
 
+/// Entry point for `shelbi message`. Dispatches the `status` query subcommand
+/// or the positional push form. The push form's `id`/`kind`/`body` are optional
+/// at the clap layer only so `shelbi message status <msg-id>` parses without
+/// tripping the positional requirements; a bare push missing any of them is a
+/// hard error here with a usage hint.
 pub fn run(
+    project_opt: Option<String>,
+    status: Option<MessageStatusCmd>,
+    id: Option<String>,
+    kind: Option<MessageKind>,
+    body: Option<String>,
+    in_response_to: Option<String>,
+    wait: Option<u64>,
+) -> Result<()> {
+    if let Some(MessageStatusCmd::Status { msg_id }) = status {
+        return run_status(&msg_id);
+    }
+    let id = id.ok_or_else(|| {
+        anyhow!(
+            "missing <ID>: usage `shelbi message <task-id> <kind> <body>` \
+             (or `shelbi message status <msg-id>` to query delivery)"
+        )
+    })?;
+    let kind = kind.ok_or_else(|| {
+        anyhow!("missing <KIND> for `shelbi message {id} <kind> <body>` (one of: reply, directive, context)")
+    })?;
+    let body = body.ok_or_else(|| {
+        anyhow!(
+            "missing <BODY> for `shelbi message {id} {} <body>`",
+            kind.as_str()
+        )
+    })?;
+    run_send(project_opt, id, kind, body, in_response_to, wait)
+}
+
+/// Query and report a pushed message's delivery outcome from the events
+/// stream. Exit 0 only when the worker has confirmed delivery (`ack=worker`);
+/// every other state is a non-zero exit so a caller can gate on
+/// `shelbi message status <id>` in a script.
+fn run_status(msg_id: &str) -> Result<()> {
+    match shelbi_state::message_delivery_status(msg_id).map_err(|e| anyhow!(e))? {
+        MessageDelivery::Delivered => {
+            println!("delivered {msg_id} — worker acked (read into its context)");
+            Ok(())
+        }
+        MessageDelivery::TimedOut => bail!(
+            "unconfirmed {msg_id} — the ack window elapsed with no worker confirmation. \
+             The message is durable and may still be read when the worker's turn ends; \
+             re-check with `shelbi message status {msg_id}`."
+        ),
+        MessageDelivery::Queued => bail!(
+            "queued {msg_id} — durable on disk, no worker ack yet. \
+             Re-check with `shelbi message status {msg_id}`."
+        ),
+        MessageDelivery::Unknown => bail!(
+            "unknown message id `{msg_id}` — no `push=ok` for it in the events log \
+             (never pushed, or the log has rotated the record out)"
+        ),
+    }
+}
+
+/// Push a message onto a task's file-based message log, then report an honest
+/// delivery state: `queued` (durable, awaiting the worker's ack),
+/// `undeliverable` (no live reader will ever pick it up), or — with `--wait` —
+/// `delivered`/timed-out once the events stream resolves it.
+fn run_send(
     project_opt: Option<String>,
     id: String,
     kind: MessageKind,
     body: String,
     in_response_to: Option<String>,
+    wait: Option<u64>,
 ) -> Result<()> {
     let project_name = require_project(project_opt)?;
     // Version gate: the push writes the message log and arms the daemon's
@@ -101,11 +191,12 @@ pub fn run(
     let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
 
     // A `done` task still has a worktree (the workspace keeps it across tasks),
-    // so a push is harmless and useful for archival/replay — just warn so the
-    // operator knows the workspace has likely moved on.
-    if tf.task.column == Column::done() {
-        eprintln!("warning: task `{id}` is in `done` — pushing message anyway");
-    }
+    // so the append below is harmless and useful for archival/replay. But the
+    // workspace's next session is a *different* task, so nothing will ever
+    // drain this task's log — the push is undeliverable. We record it anyway
+    // (archival) and report that truth after the write (see below), rather than
+    // claiming a future SessionStart will pick it up.
+    let is_done = tf.task.column == Column::done();
 
     // Worktree must actually exist. A missing worktree is a hard error, never
     // a silent no-op — otherwise the message would vanish and the operator
@@ -153,26 +244,86 @@ pub fn run(
     // the missing ack themselves.
     notify_daemon_message_pushed(&project_name, &id, &msg_id);
 
-    // Verify a worker tail is actually running for this task: the
-    // SessionStart hook writes its pid to `<msgs>/<id>.tail.d/pid` and
-    // clears the dir on exit. If it's missing after our write, the
-    // message is durable but nobody is reading it — surface that loudly
-    // with a non-zero exit so callers (orchestrator scripts, humans)
-    // don't silently trust an undelivered push. The file itself has
-    // already been written, so a follow-up SessionStart will still find
-    // and drain it on the next worker restart.
-    if !tail_pid_alive(&host, &messages_dir, &id)? {
+    // Undeliverable #1 — the task is `done`. The record above is durable
+    // (archival/replay), but the assigned workspace has moved on to a
+    // different task and will never tail *this* task's log again. Report that
+    // honestly with a non-zero exit instead of implying a future pickup.
+    if is_done {
         bail!(
-            "message written to {} but worker tail is not running for task `{id}` \
-             (no live pid at .shelbi/messages/{id}.tail.d/pid) — \
-             the record is durable and will be picked up when the worker's \
-             SessionStart hook next fires, but nothing is reading right now",
+            "message {msg_id} written to {} but task `{id}` is in `done` — UNDELIVERABLE: \
+             the workspace has moved on to a different task and will not read this task's \
+             log. The record is kept for archival/replay only.",
             log_path.display(),
         );
     }
 
-    println!("✓ {msg_id} → {id} ({})", kind.as_str());
+    // Undeliverable #2 — no live reader right now. The SessionStart hook
+    // writes its `tail -f` pid to `<msgs>/<id>.tail.d/pid` and clears the dir
+    // on exit; its absence means nothing is draining the log. The record is
+    // durable and *this* task's next session (a resume) would drain it, but as
+    // of now it is not delivered — surface that with a non-zero exit so no
+    // caller trusts an undelivered push.
+    if !tail_pid_alive(&host, &messages_dir, &id)? {
+        bail!(
+            "message {msg_id} queued to {} but no worker is reading task `{id}` right now \
+             (no live tail pid at .shelbi/messages/{id}.tail.d/pid). It is durable and would \
+             be drained if this task's worker session restarts, but it is NOT delivered.",
+            log_path.display(),
+        );
+    }
+
+    // A live tail is consuming the log, so the message is genuinely queued.
+    // That is still not "delivered": the worker only drains + acks at its next
+    // turn boundary (its `Stop` hook), which for a busy worker can be well
+    // past the daemon's fixed ack window. Confirmation is therefore async.
+    if let Some(secs) = wait {
+        return wait_for_delivery(&msg_id, &id, kind, secs);
+    }
+
+    // No `✓`: the push succeeded but delivery is unconfirmed. Say exactly that
+    // so the success signal can't be misread as "the worker read it".
+    println!(
+        "queued {msg_id} → {id} ({}) — durable and being tailed by the worker, but NOT yet \
+         confirmed delivered. Delivery lands when the worker next ends a turn; confirm with \
+         `shelbi message status {msg_id}` or re-send with `--wait`.",
+        kind.as_str(),
+    );
     Ok(())
+}
+
+/// Block until the worker confirms delivery (`ack=worker` on the events
+/// stream) or `secs` elapses. Polls the durable events log rather than the
+/// in-memory daemon map so it works across a daemon restart and needs no live
+/// socket. A `TimedOut` seen mid-wait (the daemon's shorter 60s reaper fired
+/// first) is not terminal — a late worker ack still upgrades it, so we keep
+/// polling until *our* deadline. Exits non-zero if the window elapses without
+/// an `ack=worker`, so a non-interactive caller can distinguish
+/// delivered from queued-but-never-read.
+fn wait_for_delivery(msg_id: &str, id: &str, kind: MessageKind, secs: u64) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match shelbi_state::message_delivery_status(msg_id).map_err(|e| anyhow!(e))? {
+            MessageDelivery::Delivered => {
+                println!(
+                    "delivered {msg_id} → {id} ({}) — worker acked (read into its context)",
+                    kind.as_str()
+                );
+                return Ok(());
+            }
+            MessageDelivery::TimedOut | MessageDelivery::Queued | MessageDelivery::Unknown => {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "message {msg_id} → {id} ({}) was queued but NOT confirmed delivered \
+                         within {secs}s (no `ack=worker`). The worker may simply not have ended \
+                         a turn yet; the record stays durable — re-check with \
+                         `shelbi message status {msg_id}`.",
+                        kind.as_str(),
+                    );
+                }
+                std::thread::sleep(WAIT_POLL_INTERVAL);
+            }
+        }
+    }
 }
 
 /// Check whether the SessionStart hook's `tail -f` pid file exists and
@@ -355,6 +506,57 @@ mod tests {
         // The raw newline is escaped, so the on-disk record is a single line.
         assert!(!s.contains('\n'));
         assert!(s.contains(r#"line one\nline \"two\""#));
+    }
+
+    /// The push form requires id/kind/body; they are `Option` only so the
+    /// clap layer can accept `message status <id>`. A bare push missing an id
+    /// is a usage error here, not a panic or a silent no-op.
+    #[test]
+    fn run_without_id_or_status_is_a_usage_error() {
+        let err = run(None, None, None, None, None, None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing <ID>"), "got: {msg}");
+        assert!(msg.contains("status"), "usage hint should mention status: {msg}");
+    }
+
+    /// `message status` reports the real, durable delivery outcome and exits
+    /// non-zero unless the worker actually acked — the whole point of the
+    /// feature. This guards the success signal from regressing to "the file was
+    /// written": a queued-but-unacked message must NOT read as success.
+    #[test]
+    fn run_status_reflects_delivery_and_gates_exit_code() {
+        let _g = crate::commands::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-msg-status-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Unknown id → error (never pushed).
+        assert!(run_status("m-nope").is_err());
+
+        // Queued (push, no ack) → non-zero exit, and the wording is honest.
+        shelbi_state::append_message_event("m-q", "task-a").unwrap();
+        let queued = run_status("m-q").unwrap_err().to_string();
+        assert!(queued.contains("queued"), "got: {queued}");
+
+        // Timed out (daemon reaper) → still non-zero, distinct wording.
+        shelbi_state::append_message_event("m-t", "task-a").unwrap();
+        shelbi_state::append_message_ack_event("m-t", "task-a", "timeout").unwrap();
+        let timed = run_status("m-t").unwrap_err().to_string();
+        assert!(timed.contains("unconfirmed"), "got: {timed}");
+
+        // Worker acked → success (exit 0). This is the ONLY delivered state.
+        shelbi_state::append_message_event("m-ok", "task-a").unwrap();
+        shelbi_state::append_message_ack_event("m-ok", "task-a", "worker").unwrap();
+        assert!(run_status("m-ok").is_ok());
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

@@ -833,6 +833,96 @@ pub fn append_message_ack_event(msg_id: &str, task_id: &str, kind: &str) -> Resu
     append_event_line(&format!("{ts} message={msg_id} task={task_id} ack={kind}"))
 }
 
+/// Delivery state of a pushed message, reconstructed from the `message=`
+/// lines in `events.log`. This is the durable, after-the-fact view the CLI
+/// exposes to a caller (`shelbi message status`, `shelbi message --wait`) so
+/// "the file was written" is never conflated with "the worker read it".
+///
+/// The states are derived, not stored: the events stream is the single source
+/// of truth. `push=ok` (from [`append_message_event`]) means queued; the daemon
+/// or the worker later append an `ack=<kind>` line (see
+/// [`append_message_ack_event`]). Because the worker's ack is written
+/// unconditionally when it finally arrives — even after the daemon already
+/// synthesized an `ack=timeout` — a real `ack=worker` always wins over a
+/// prior timeout, which is why [`MessageDelivery::Delivered`] takes precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageDelivery {
+    /// An `ack=worker` line exists: the worker drained the message into its
+    /// context and confirmed it. The only state that means "actually read".
+    Delivered,
+    /// An `ack=timeout` line exists with no `ack=worker`: the daemon's ack
+    /// window elapsed without a worker confirmation. Delivery is *unconfirmed*,
+    /// not definitively failed — a late ack can still upgrade this to
+    /// `Delivered` when the worker's turn ends.
+    TimedOut,
+    /// A `push=ok` line exists with no `ack=` line yet: durable on disk, no
+    /// confirmation one way or the other.
+    Queued,
+    /// No `message=<msg_id>` line at all — the id was never pushed (or the
+    /// events.log has since rotated the record out of the live file).
+    Unknown,
+}
+
+/// Reconstruct a message's [`MessageDelivery`] by scanning the live
+/// `events.log` for its `message=<msg_id>` lines. Reads only the current
+/// (post-rotation) file: message delivery is checked seconds-to-minutes after
+/// the push, so the record is always in the live file within any realistic
+/// wait window. A missing log is [`MessageDelivery::Unknown`], never an error,
+/// so a status query on a fresh install doesn't blow up.
+pub fn message_delivery_status(msg_id: &str) -> Result<MessageDelivery> {
+    let path = events_log_path()?;
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(MessageDelivery::Unknown),
+        Err(e) => {
+            return Err(shelbi_core::Error::Other(format!(
+                "reading {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let mut queued = false;
+    let mut worker = false;
+    let mut timed_out = false;
+    for line in content.lines() {
+        // Every message line is a flat space-separated `key=value` record; find
+        // the one whose `message=` token matches this exact id, then read its
+        // `push=`/`ack=` verdict off the same line.
+        let mut is_this = false;
+        let mut has_push = false;
+        let mut ack: Option<&str> = None;
+        for tok in line.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("message=") {
+                is_this = v == msg_id;
+            } else if tok == "push=ok" {
+                has_push = true;
+            } else if let Some(v) = tok.strip_prefix("ack=") {
+                ack = Some(v);
+            }
+        }
+        if !is_this {
+            continue;
+        }
+        if has_push {
+            queued = true;
+        }
+        match ack {
+            Some("worker") => worker = true,
+            Some("timeout") => timed_out = true,
+            _ => {}
+        }
+    }
+    Ok(if worker {
+        MessageDelivery::Delivered
+    } else if timed_out {
+        MessageDelivery::TimedOut
+    } else if queued {
+        MessageDelivery::Queued
+    } else {
+        MessageDelivery::Unknown
+    })
+}
+
 /// Append `<rfc3339> question=<question-id> task=<task-id> kind=clarification text=<truncated>`
 /// to `~/.shelbi/events.log`. Emitted by the hub daemon when a worker sends
 /// `{"verb":"request-clarification", ...}` over the hub socket — surfaces
@@ -3995,6 +4085,98 @@ mod tests {
         assert_eq!(task_lines, N);
         assert_eq!(workspace_lines, N);
 
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn message_delivery_status_unknown_when_never_pushed() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // No events at all — a status query must be Unknown, not an error.
+        assert_eq!(
+            message_delivery_status("m-never").unwrap(),
+            MessageDelivery::Unknown
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn message_delivery_status_queued_after_push_without_ack() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        append_message_event("m-queued", "task-a").unwrap();
+        assert_eq!(
+            message_delivery_status("m-queued").unwrap(),
+            MessageDelivery::Queued
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn message_delivery_status_delivered_after_worker_ack() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        append_message_event("m-ok", "task-a").unwrap();
+        append_message_ack_event("m-ok", "task-a", "worker").unwrap();
+        assert_eq!(
+            message_delivery_status("m-ok").unwrap(),
+            MessageDelivery::Delivered
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn message_delivery_status_timed_out_after_daemon_timeout() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        append_message_event("m-late", "task-a").unwrap();
+        append_message_ack_event("m-late", "task-a", "timeout").unwrap();
+        assert_eq!(
+            message_delivery_status("m-late").unwrap(),
+            MessageDelivery::TimedOut
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// The worker's ack is written unconditionally even after the daemon's
+    /// reaper already synthesized `ack=timeout`, so a real delivery must win
+    /// over a prior timeout regardless of line order. This is the correctness
+    /// property `--wait` relies on when it keeps polling past a mid-wait
+    /// timeout.
+    #[test]
+    fn message_delivery_status_delivered_wins_over_prior_timeout() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        append_message_event("m-race", "task-a").unwrap();
+        append_message_ack_event("m-race", "task-a", "timeout").unwrap();
+        append_message_ack_event("m-race", "task-a", "worker").unwrap();
+        assert_eq!(
+            message_delivery_status("m-race").unwrap(),
+            MessageDelivery::Delivered
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A `message=` token that is a prefix of the queried id (or vice-versa)
+    /// must not match — the status query keys on the exact msg_id, so unrelated
+    /// messages on the same stream never leak into another's verdict.
+    #[test]
+    fn message_delivery_status_matches_exact_id_only() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        append_message_event("m-100", "task-a").unwrap();
+        append_message_ack_event("m-100", "task-a", "worker").unwrap();
+        // A different id that shares a prefix must be Unknown, not Delivered.
+        assert_eq!(
+            message_delivery_status("m-1").unwrap(),
+            MessageDelivery::Unknown
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 }

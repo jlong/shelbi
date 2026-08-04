@@ -92,19 +92,35 @@ enum Cmd {
     /// Push a message to a task's workspace via the file-based message log
     /// (`<worktree>/.shelbi/messages/<task-id>.log`). Distinct from `send`:
     /// `send` injects keystrokes into a tmux pane; `message` appends a
-    /// durable JSON record the workspace tails and acks.
+    /// durable JSON record the workspace tails and (best-effort) acks.
+    ///
+    /// The push being durable is NOT the same as the worker having read it:
+    /// use `--wait` (blocks, exits non-zero if the ack window elapses) or
+    /// `shelbi message status <msg-id>` to learn the real delivery outcome.
+    #[command(args_conflicts_with_subcommands = true)]
     Message {
+        /// Query a previously pushed message's delivery status instead of
+        /// sending. `shelbi message status <msg-id>`.
+        #[command(subcommand)]
+        status: Option<commands::message::MessageStatusCmd>,
         /// Task id whose assigned workspace receives the message.
-        id: String,
+        id: Option<String>,
         /// Message kind.
         #[arg(value_enum)]
-        kind: commands::message::MessageKind,
+        kind: Option<commands::message::MessageKind>,
         /// Message body.
-        body: String,
+        body: Option<String>,
         /// Question id this message replies to (sets `in_response_to`).
         /// Typically paired with `kind = reply`.
         #[arg(long = "in-response-to", value_name = "QUESTION-ID")]
         in_response_to: Option<String>,
+        /// Block until the worker confirms delivery (an `ack=worker` event),
+        /// polling the events stream. Optional value overrides the wait
+        /// window in seconds (default 120). Exits non-zero if the window
+        /// elapses without a confirmation — so a non-interactive caller can
+        /// tell "delivered" from "queued but never read".
+        #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "120")]
+        wait: Option<u64>,
     },
     /// [legacy spawn flow] Tail a spawn-agent's recent output. Workspaces
     /// don't write to the legacy log — use `tmux capture-pane` against
@@ -423,11 +439,13 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Send { id, message }) => commands::send::run(cli.project, id, message),
         Some(Cmd::Message {
+            status,
             id,
             kind,
             body,
             in_response_to,
-        }) => commands::message::run(cli.project, id, kind, body, in_response_to),
+            wait,
+        }) => commands::message::run(cli.project, status, id, kind, body, in_response_to, wait),
         Some(Cmd::Tail { id, lines }) => commands::tail::run(cli.project, id, lines),
         Some(Cmd::Diff { id }) => commands::diff::run(cli.project, id),
         Some(Cmd::Merge { id, pr }) => commands::merge::run(cli.project, id, pr),

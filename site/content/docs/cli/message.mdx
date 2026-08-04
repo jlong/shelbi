@@ -1,24 +1,41 @@
 ---
 title: shelbi message
 order: 33
-summary: Append a durable, acked JSON record to a task's file-based message log that its workspace tails.
+summary: Append a durable JSON record to a task's file-based message log that its workspace tails, then query or wait for the worker's delivery ack.
 ---
 
 ```text
 shelbi message [OPTIONS] <ID> <KIND> <BODY>
+shelbi message status <MSG-ID>
 ```
 
 `shelbi message` pushes a message to a task's assigned
 [workspace](/docs/concepts/workspaces) through a **file-based message log** at
 `<worktree>/.shelbi/messages/<task-id>.log`. Each call appends one durable JSON
-record. The workspace tails that log, folds the message into what it's doing,
-and acks it, so unlike a keystroke injection, the message is persisted and its
-delivery is confirmed.
+record. The workspace tails that log and folds the message into what it's doing.
 
 `shelbi message` does not type text or Enter into the tmux pane, so the pane's
 verified-submit mechanism intentionally does not apply. Runner hooks consume
-the file record and acknowledge its `msg_id`. Keeping this path file-based
-avoids duplicate delivery and lets the message survive a pane restart.
+the file record. Keeping this path file-based avoids duplicate delivery and lets
+the message survive a pane restart.
+
+### Queued is not delivered
+
+The push being durable is not the same as the worker having read it. A worker
+only drains and acknowledges its messages at the end of a turn, which for a busy
+worker can be well after you send. So a plain `shelbi message` reports the
+message as **queued**, not delivered, and does not print a success check.
+
+To learn the real outcome, either block on it or query it:
+
+- `--wait[=SECS]` blocks until the worker confirms delivery (default 120s), and
+  **exits non-zero** if the window elapses with no confirmation.
+- `shelbi message status <msg-id>` reports the current state (`delivered`,
+  `queued`, or `unconfirmed`) from the durable events stream, exiting 0 only
+  when the worker has acked.
+
+A message to a task that is already `done`, or to a workspace with no live
+reader, is reported as undeliverable rather than silently queued.
 
 `<KIND>` classifies the message so the workspace knows how to treat it:
 
@@ -37,7 +54,7 @@ workspace, but through different channels:
 | --- | --- | --- |
 | Channel | Keystrokes into the tmux pane | JSON record in the message log file |
 | Durability | Message text is ephemeral; delivery verdict is recorded in `events.log` | Durable record in `<worktree>/.shelbi/messages/<task-id>.log` |
-| Delivery proof | Pane submission is verified; no worker semantic ack | Workspace tails and acknowledges the `msg_id` |
+| Delivery proof | Pane submission is verified; no worker semantic ack | Worker acks the `msg_id` at its next turn; query with `status` or block with `--wait` |
 | Typed / classified | Free text | `reply` / `directive` / `context` |
 | Reach for it when | A quick, live nudge to a pane | A message that must survive, be logged, and be confirmed |
 
@@ -58,7 +75,17 @@ act on the message.
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--in-response-to <QUESTION-ID>` | string | — | Question id this message replies to (sets `in_response_to`). Typically paired with `kind = reply`. |
+| `--wait [<SECS>]` | int | 120 when bare | Block until the worker confirms delivery, polling the events stream. Exits non-zero if the window elapses without an `ack=worker`. |
 | `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. Defaults to `$SHELBI_PROJECT`, or the registered project whose `work_dir` contains the current directory. |
+
+## Subcommands
+
+### `shelbi message status <MSG-ID>`
+
+Report a pushed message's delivery state from `events.log`, keyed on the
+`msg-id` that `shelbi message` printed. Prints `delivered`, `queued`, or
+`unconfirmed` and exits 0 only when the worker has acked, so a script can gate
+on it.
 
 ## Examples
 
@@ -78,6 +105,19 @@ Fold in extra background without redirecting the work:
 
 ```bash
 shelbi message add-auth context "the staging DB is seeded with the fixtures you'll need"
+```
+
+Send a directive and block until the worker confirms it read it (fail the
+script if it does not within 90 seconds):
+
+```bash
+shelbi message add-auth directive "the auth spec changed, wait for the update" --wait 90
+```
+
+Check delivery of an earlier push without blocking:
+
+```bash
+shelbi message status m-1785764991921-86377
 ```
 
 ## See also
