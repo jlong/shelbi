@@ -9,6 +9,33 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### August 4, 2026
+
+**v0.7.1. Feature-branch fan-out you can trust.**
+
+**Subtasks land on their parent branch again.** A workflow whose `git.base_branch`
+is templated — `feature/{{feature}}`, `update/{{update}}`, `task/{{task}}` — now
+resolves that base from the task's frontmatter at every step instead of silently
+falling back to `main`. A subtask filed without its parent link is refused at
+dispatch rather than cut from a degraded base, `{{var}}` placeholders are validated
+against a workflow's `required_params` at load, and the finish-flow rebase freshens
+and restacks against the real `origin/<base>` — no more branches quietly rebased
+onto `main` and polluted with unrelated history. Most important, the handoff-less
+`merge` is now gated *before* a task is marked done: a merge that fails or
+integrates nothing leaves the task in-progress and emits a `merge status=failed`
+event instead of stranding a false `done` with the work landing nowhere. A
+pre-merge ancestry guard also stops a wrong-base squash from reverting an
+already-merged sibling.
+
+**Reliability.** `shelbi daemon restart` now recovers a launchd job wedged in the
+loaded-but-never-spawned state with `kickstart -k`, the orchestrator's event feed
+self-drains and emits keepalives so a dead follower can't silently blind it, and a
+review slot stranded by a quit or restart no longer re-runs the developer on resume.
+
+**Interface.** The dashboard sidebar and review panel now share one user-adjustable
+width, Add project moved into the projects sidebar, and an awaiting-input workspace
+shows a yellow `?` badge instead of a speech balloon.
+
 ### August 1, 2026
 
 **v0.7.0. Shelbi Zen ships, and a reviewer to match.**
