@@ -55,7 +55,11 @@ pub enum ActionCmd {
         task_id: String,
         /// Override the merge target for this call. Mirrors the
         /// per-transition `target:` field on the workflow YAML; absent,
-        /// the merge lands on the project's effective `base_branch`.
+        /// the merge lands on the task's workflow `git.base_branch`
+        /// (placeholders substituted from the task frontmatter), falling
+        /// back to the project's effective `base_branch` only when the
+        /// workflow declares none — never on the repo default branch when
+        /// the workflow names a different base.
         #[arg(long)]
         target: Option<String>,
     },

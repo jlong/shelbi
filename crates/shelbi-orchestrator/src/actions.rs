@@ -397,9 +397,10 @@ pub fn merge(
 ) -> Result<MergeResult> {
     let branch = require_branch(task)?;
     let strategy = require_supported_strategy(project.merge_strategy())?;
-    let target = target_override
-        .map(str::to_string)
-        .unwrap_or_else(|| project.base_branch().to_string());
+    let target = match target_override {
+        Some(t) => t.to_string(),
+        None => resolve_task_base_branch(project, project_name, task)?,
+    };
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
 
@@ -429,6 +430,35 @@ pub fn merge(
         merge: outcome,
         restacks,
     })
+}
+
+/// Resolve the branch a `merge` for `task` integrates into when the caller
+/// supplies no explicit `--target`: the task's workflow `git.base_branch`
+/// (with `{{var}}` placeholders substituted from the task's frontmatter)
+/// when the workflow declares one, else the project's effective
+/// [`Project::base_branch`].
+///
+/// This is the manual-CLI counterpart to the transition executor's
+/// `resolve_effective_target`: a bare `shelbi action merge <task>` must land
+/// on the *workflow's* base, never the repo default branch, so a subtask
+/// whose `base_branch` is `feature/x` is never squashed onto `main`. A
+/// workflow whose `git.base_branch` names a param the task can't satisfy is
+/// a hard error (propagated from [`Workflow::resolve_git`]) rather than a
+/// silent fall-through to the default branch — merging onto the wrong base is
+/// the exact bug this guards against.
+///
+/// A task whose workflow can't be loaded at all genuinely has no workflow
+/// base, so the project base is its effective base — matching the tolerant
+/// `load_task_workflow` fallback the poller and transition executor use.
+fn resolve_task_base_branch(project: &Project, project_name: &str, task: &Task) -> Result<String> {
+    let params = task.string_params();
+    match shelbi_state::load_task_workflow(project_name, project, task) {
+        Ok(workflow) => Ok(workflow
+            .resolve_git(&params)?
+            .and_then(|g| g.base_branch)
+            .unwrap_or_else(|| project.base_branch().to_string())),
+        Err(_) => Ok(project.base_branch().to_string()),
+    }
 }
 
 /// Walk every not-`Done` task in the project, restacking the ones that
@@ -3601,6 +3631,130 @@ exit 0
             ],
         );
         assert!(is_ancestor.is_ok(), "{is_ancestor:?}");
+    }
+
+    #[test]
+    fn merge_without_target_uses_workflow_base_branch_not_default() {
+        // `shelbi action merge <task>` (no --target) must integrate into the
+        // task's workflow `git.base_branch`, never the repo default branch.
+        // A subtask whose base is `feature` is squashed onto origin/feature;
+        // origin/main is never touched. This is the manual-CLI counterpart to
+        // the transition executor's target resolution, and the direct
+        // regression for the incident where `shelbi action merge` dumped a
+        // subtask's whole delta onto `main`.
+        let _g = auto_fire_lock();
+
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        // A `topic` branch cut from `feature` with a commit of its own,
+        // pushed to origin — the subtask branch to merge.
+        run_git(&local, &["checkout", "-b", "topic", "feature"]);
+        std::fs::write(local.join("topic.txt"), "topic work\n").unwrap();
+        run_git(&local, &["add", "topic.txt"]);
+        run_git(&local, &["commit", "-q", "-m", "topic work"]);
+        run_git(&local, &["push", "-u", "origin", "topic"]);
+        run_git(&local, &["checkout", "main"]);
+        let wt = local.to_string_lossy().into_owned();
+        let main_before = run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/main"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Stub `gh` so `merge`'s `pr list` probe reports no open PR (hub-side
+        // path). See the `merge_via_pr` test for the login-shell mechanics.
+        let stub = tempfile::tempdir().unwrap();
+        let bin = stub.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("gh"), "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            stub.path().join(".profile"),
+            format!("export PATH=\"{}:$PATH\"\n", bin.display()),
+        )
+        .unwrap();
+
+        let prev_shell = std::env::var_os("SHELL");
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("SHELL", "/bin/sh");
+        std::env::set_var("HOME", stub.path());
+        let home = fresh_shelbi_home("merge-workflow-base");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Materialize a workflow whose base is `feature`, and a task that
+        // references it. `load_task_workflow` reads these off SHELBI_HOME.
+        shelbi_state::materialize_default_agents("fixture").unwrap();
+        shelbi_state::save_project_statuses("fixture", &shelbi_core::default_project_statuses())
+            .unwrap();
+        let wf_path = shelbi_state::workflow_path("fixture", "sub").unwrap();
+        std::fs::create_dir_all(wf_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &wf_path,
+            r#"
+name: sub
+git:
+  base_branch: feature
+  merge_strategy: squash
+statuses:
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: done,        owner: user }
+transitions:
+  - { from: in-progress, to: done, actions: [merge] }
+"#,
+        )
+        .unwrap();
+        let mut task = bare_task("t");
+        task.branch = Some("topic".into());
+        task.workflow = Some("sub".into());
+        write_task_file("fixture", &task);
+
+        let project = project_with_no_workspaces(&local);
+        // No --target: the effective base must come from the workflow.
+        let result = merge(&project, "fixture", &task, None);
+
+        match prev_shell {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var("SHELBI_HOME");
+
+        let result = result.expect("merge should resolve the workflow base and land on it");
+        match &result.merge {
+            MergeOutcome::HubSide { target, .. } => {
+                assert_eq!(target, "feature", "merge must target the workflow base");
+            }
+            other => panic!("expected HubSide merge onto feature, got {other:?}"),
+        }
+
+        // origin/feature carries the squash; origin/main is untouched.
+        run_or_command_err(&Host::Local, &wt, &["git", "fetch", "origin"], || {
+            "git fetch origin".into()
+        })
+        .unwrap();
+        let feature_log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "origin/feature", "--format=%s"],
+        )
+        .unwrap();
+        assert!(
+            feature_log.contains("shelbi: merge t from topic"),
+            "origin/feature must carry the squash merge; log: {feature_log}"
+        );
+        let main_after = run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(
+            main_after, main_before,
+            "origin/main must NOT have advanced — the merge belongs on feature"
+        );
     }
 
     #[test]
