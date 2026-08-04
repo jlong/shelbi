@@ -242,7 +242,18 @@ impl State {
     /// column the user can't see — an empty query with at least one other
     /// project.
     fn projects_column_visible(&self) -> bool {
-        self.query.is_empty() && !self.projects.is_empty()
+        // Visible on any empty query: the sidebar always carries at least the
+        // trailing "Add project" row, so it's meaningful even with no other
+        // registered projects (a single-project install still gets the Add
+        // affordance here instead of only in the typed main-column results).
+        self.query.is_empty()
+    }
+
+    /// Number of navigable rows in the projects sidebar: one per other project
+    /// plus the trailing "Add project" row. The last index (`projects.len()`)
+    /// is the Add row.
+    fn sidebar_len(&self) -> usize {
+        self.projects.len() + 1
     }
 }
 
@@ -356,6 +367,13 @@ fn picker_loop<B: ratatui::backend::Backend>(
                     Some(PaletteAction::Close) => return Ok(None),
                     Some(PaletteAction::Activate) => {
                         if state.focus == Focus::Projects && state.projects_column_visible() {
+                            // The trailing row (index == projects.len()) is the
+                            // "Add project" affordance: hand back the same
+                            // `action:add-project` entry the main column carries
+                            // so the post-loop flow opens the Add project dialog.
+                            if state.project_selected >= state.projects.len() {
+                                return Ok(Some(add_project_entry()));
+                            }
                             // Route the project selection through the same
                             // post-loop `switch_target` path the inline
                             // "Switch to <project>" entries use, so switch
@@ -376,7 +394,7 @@ fn picker_loop<B: ratatui::backend::Backend>(
                     }
                     Some(PaletteAction::NavDown) => {
                         if state.focus == Focus::Projects {
-                            if state.project_selected + 1 < state.projects.len() {
+                            if state.project_selected + 1 < state.sidebar_len() {
                                 state.project_selected += 1;
                             }
                         } else if state.selected + 1 < results.len() {
@@ -571,7 +589,7 @@ fn render_projects_column(f: &mut Frame, area: Rect, state: &State) {
     )));
     f.render_widget(header, rows[0]);
 
-    let items: Vec<ListItem> = state
+    let mut items: Vec<ListItem> = state
         .projects
         .iter()
         .map(|p| {
@@ -582,15 +600,33 @@ fn render_projects_column(f: &mut Frame, area: Rect, state: &State) {
             ]))
         })
         .collect();
+    // Trailing "Add project" affordance — the last row of the sidebar. Its `+`
+    // glyph occupies the same fixed ` X ` slot as the project glyphs so rows
+    // stay aligned, and Enter here opens the Add project dialog (see the
+    // `Activate` branch in `picker_loop`, which mints the `action:add-project`
+    // entry for this row).
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled(" + ", Style::default().fg(Color::DarkGray)),
+        Span::raw("Add project"),
+    ])));
 
     let focused = state.focus == Focus::Projects;
-    let list = List::new(items).highlight_style(selection_style(focused));
+    // Selection highlight patches background + weight only, never a foreground
+    // color, so a loaded project's green `●` keeps its status color under the
+    // bar instead of being repainted white/gray. We also only paint the
+    // selection while the column is focused: an unfocused column shows no
+    // selected row, so the first project never renders in the dim/gray
+    // unfocused-selection style on initial load (focus starts on Commands).
+    let highlight = Style::default()
+        .bg(shelbi_tui::theme::SELECTION_BG)
+        .add_modifier(Modifier::BOLD);
+    let list = List::new(items).highlight_style(highlight);
     let mut s = ListState::default();
-    if !state.projects.is_empty() {
+    if focused {
         s.select(Some(
             state
                 .project_selected
-                .min(state.projects.len().saturating_sub(1)),
+                .min(state.sidebar_len().saturating_sub(1)),
         ));
     }
     f.render_stateful_widget(list, rows[1], &mut s);
@@ -663,17 +699,11 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
     // `E` / `Edit` / `settings` surfaces them. Placed ahead of the global
     // action trail so "Quit Shelbi" stays the structurally-last entry.
     out.extend(edit_entries(&app.project_name));
-    // Sits with the other project actions. Switch Project now leads the whole
-    // list (pushed first, above the nav rows), so this trails Add → Quit.
-    out.push(Entry {
-        id: "action:add-project".into(),
-        label: "Add project".into(),
-        kind: EntryKind::Action,
-        subtitle: Some("create + register a new project (same as `shelbi init`)".into()),
-        shortcut: None,
-        decoration: None,
-        hidden_until_query: false,
-    });
+    // "Add project" now lives in the projects sidebar as its trailing row on an
+    // empty-query load, so the main-column copy is hidden until the user types
+    // (searching `add` still surfaces it). Kept in `all_entries` either way so
+    // the sidebar's Add row and the typed result dispatch through one entry.
+    out.push(add_project_entry());
     out.push(Entry {
         id: "action:quit-project".into(),
         label: "Quit Project".into(),
@@ -1743,6 +1773,23 @@ fn switch_project_entry(p: &ProjectSummary) -> Entry {
     }
 }
 
+/// The "Add project" [`Entry`]. Shared by [`build_entries`] (the searchable,
+/// hidden-until-query main-column copy) and the projects sidebar's trailing
+/// Add row, so both dispatch through the one `action:add-project` id the
+/// post-loop flow recognizes to open the Add project dialog. Hidden until the
+/// user types because the empty-query affordance now lives in the sidebar.
+fn add_project_entry() -> Entry {
+    Entry {
+        id: "action:add-project".into(),
+        label: "Add project".into(),
+        kind: EntryKind::Action,
+        subtitle: Some("create + register a new project (same as `shelbi init`)".into()),
+        shortcut: None,
+        decoration: None,
+        hidden_until_query: true,
+    }
+}
+
 /// Launch (or focus) `target`'s dashboard and move the attached client to it.
 /// The `attach`/`switch-client` call must inherit the terminal's stdio (it's
 /// interactive), so it deliberately does NOT go through the capturing
@@ -1960,6 +2007,130 @@ mod tests {
         assert_eq!(entry.id, "action:switch-project:web");
         assert_eq!(switch_target_from_id(&entry.id), Some("web"));
         assert_eq!(entry.label, "Switch to Website project");
+    }
+
+    /// Build a projects-sidebar [`State`] with a single loaded project and the
+    /// given focus/selection, for the `render_projects_column` render tests.
+    fn projects_column_state(focus: Focus, project_selected: usize) -> State {
+        let mut loaded = std::collections::HashSet::new();
+        loaded.insert("web".to_string());
+        State {
+            query: String::new(),
+            selected: 0,
+            all_entries: Vec::new(),
+            project: "portal".into(),
+            projects: vec![ProjectSummary {
+                name: "web".into(),
+                display_name: Some("Website".into()),
+                repo_path: "/tmp/web".into(),
+                machine_count: 1,
+                workspace_count: 0,
+                last_launched: None,
+            }],
+            loaded_projects: loaded,
+            project_selected,
+            focus,
+        }
+    }
+
+    fn draw_projects_column(state: &State) -> ratatui::buffer::Buffer {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| render_projects_column(f, f.area(), state))
+            .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn dump_buffer(buf: &ratatui::buffer::Buffer) -> String {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn projects_column_keeps_the_loaded_glyph_green_when_its_row_is_selected() {
+        // Focused + selected on the loaded project: the selection bar must not
+        // repaint the green `●` white/gray — the highlight patches bg + weight
+        // only, so the glyph keeps its status color.
+        let state = projects_column_state(Focus::Projects, 0);
+        let buf = draw_projects_column(&state);
+        let mut found = false;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                if cell.symbol() == "●" {
+                    assert_eq!(
+                        cell.fg,
+                        Color::Green,
+                        "the selected loaded glyph must stay green"
+                    );
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "the loaded project's green glyph should render");
+    }
+
+    #[test]
+    fn projects_column_renders_the_add_row_and_never_dims_the_first_row_unfocused() {
+        // Initial-load shape: focus on Commands (column unfocused), selection at
+        // row 0. The first project must render in normal text (no dim/gray
+        // unfocused-selection styling), and the trailing "+ Add project" row
+        // must be present.
+        let state = projects_column_state(Focus::Commands, 0);
+        let buf = draw_projects_column(&state);
+
+        let dumped = dump_buffer(&buf);
+        assert!(dumped.contains("Website"), "project row should render");
+        assert!(dumped.contains("Add project"), "Add project row should render");
+        assert!(dumped.contains('+'), "Add row should carry a `+` glyph");
+
+        // No cell on the first project's label may be dimmed or gray — the
+        // unfocused column shows no selection at all.
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                if "Website".contains(cell.symbol()) && cell.symbol() != " " {
+                    assert!(
+                        !cell.modifier.contains(Modifier::DIM),
+                        "first project label must not be dimmed on initial load"
+                    );
+                    assert_ne!(
+                        cell.fg,
+                        Color::Gray,
+                        "first project label must not render gray on initial load"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn add_project_entry_carries_the_dialog_dispatch_id_and_stays_hidden() {
+        // The sidebar's trailing "Add project" row and the searchable
+        // main-column copy both come from this one helper, so its id must be
+        // exactly the `action:add-project` string the post-loop flow matches to
+        // open the Add project dialog. It's hidden-until-query so the
+        // empty-query main column defers to the sidebar row.
+        let entry = add_project_entry();
+        assert_eq!(entry.id, "action:add-project");
+        assert_eq!(entry.label, "Add project");
+        assert!(
+            entry.hidden_until_query,
+            "the empty-query affordance is the sidebar row, so the main-column copy hides"
+        );
+        // Typing still surfaces it (it stays in `all_entries`).
+        let hits = shelbi_palette::search(std::slice::from_ref(&entry), "add");
+        assert!(
+            hits.iter().any(|(e, _)| e.id == "action:add-project"),
+            "typing `add` must still surface the Add project entry"
+        );
     }
 
     #[test]
