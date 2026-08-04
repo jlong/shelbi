@@ -319,6 +319,19 @@ mod tests {
         wf
     }
 
+    /// A workflow whose `git.base_branch` carries a template (the branch a
+    /// subtask is cut from — e.g. `feature/{{feature}}`), with no branch-naming
+    /// key so naming falls through to the project prefix.
+    fn workflow_with_base(template: &str) -> Workflow {
+        let mut wf = workflow(None);
+        wf.git = Some(GitConfig {
+            base_branch: Some(template.to_string()),
+            merge_strategy: MergeStrategy::Squash,
+            ..Default::default()
+        });
+        wf
+    }
+
     #[test]
     fn branch_template_renders_github_user_and_id() {
         let p = project(None);
@@ -419,6 +432,40 @@ mod tests {
         assert!(
             matches!(&err, Error::MissingTaskParams { params, .. } if params == &["feature"]),
             "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_templated_base_branch_errors_even_when_naming_needs_no_params() {
+        // Branch NAMING here needs no params (falls through to the project
+        // prefix), but the workflow's `base_branch: feature/{{feature}}` can't
+        // resolve without `feature:`. `branch_name_for_task` resolves the whole
+        // `git:` block up front, so a subtask that would otherwise be cut from a
+        // degraded base is refused at the naming step — the load/dispatch path
+        // leans on exactly this to fail loudly instead of launching.
+        let p = project(Some("shelbi"));
+        let wf = workflow_with_base("feature/{{feature}}");
+        let t = task("orphan", None, Some("app"));
+        let err = branch_name_for_task_with_login(&p, Some(&wf), &t, || Some("jlong".into()))
+            .expect_err("unresolved base_branch `{{feature}}` should error");
+        assert!(
+            matches!(&err, Error::MissingTaskParams { params, .. } if params == &["feature"]),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolved_templated_base_branch_names_from_project_prefix() {
+        // Same workflow, but the `feature:` frontmatter is present: the base
+        // resolves, so naming proceeds and yields the project-prefix branch.
+        let p = project(Some("shelbi"));
+        let wf = workflow_with_base("feature/{{feature}}");
+        let mut t = task("add-export", None, Some("app"));
+        t.params
+            .insert("feature".into(), serde_yaml::Value::from("dashboard"));
+        assert_eq!(
+            branch_name_for_task_with_login(&p, Some(&wf), &t, || Some("jlong".into())).unwrap(),
+            "shelbi/add-export"
         );
     }
 

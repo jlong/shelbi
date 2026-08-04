@@ -411,6 +411,23 @@ fn dispatch_task_onto(
     ws: &WorkspaceSpec,
     agent: Option<String>,
 ) -> Result<String> {
+    // Refuse to launch when the workflow's templated `base_branch` can't be
+    // fully resolved from this task's frontmatter — a first-class guard at the
+    // dispatch chokepoint, not an incidental side effect of branch naming. A
+    // subtask filed without its `feature:`/`task:`/`update:` link leaves a
+    // `{{var}}` in the base template unresolved; degrading the base (historically
+    // to `main`) and launching anyway cuts the worker's branch from the wrong
+    // base, and a later squash-merge into the parent can revert already-merged
+    // sibling subtasks. Fail loudly, naming the missing field(s), before
+    // persisting any assignment or touching a pane, so the task stays put in its
+    // ready status. Scoped to a fresh cut (`branch` not yet pinned): a re-serve
+    // / resume of an existing branch needs no base to cut from. `resolve_git`
+    // returns `Ok(None)` for a workflow with no `git:` block and `Ok(Some(_))`
+    // when the base resolves, so a fully-resolved task dispatches unchanged.
+    if tf.task.branch.is_none() {
+        workflow.resolve_git(&tf.task.string_params())?;
+    }
+
     let branch = branch::branch_name_for_task(project, Some(workflow), &tf.task)?;
 
     let agent = dispatch_agent_for(project, ws, agent);
@@ -452,9 +469,48 @@ fn dispatch_task_onto(
 mod tests {
     use super::*;
     use shelbi_core::{
-        AgentRunnerSpec, Machine, MachineKind, OrchestratorSpec, Project, Task, WorkspaceSpec,
+        AgentRunnerSpec, GitConfig, Machine, MachineKind, MergeStrategy, OrchestratorSpec, Project,
+        Task, WorkspaceSpec,
     };
     use std::collections::BTreeMap;
+
+    /// A fresh `todo` task with no branch cut yet — the shape a subtask is in
+    /// before dispatch. `params` seeds the frontmatter the workflow templates
+    /// resolve against.
+    fn todo_task(id: &str, params: &[(&str, &str)]) -> Task {
+        let now = chrono::Utc::now();
+        Task {
+            id: id.into(),
+            title: id.into(),
+            column: Column::todo(),
+            priority: 0,
+            assigned_to: None,
+            workflow: None,
+            branch: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            params: params
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), serde_yaml::Value::from(*v)))
+                .collect(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The default workflow with a `git.base_branch` template (may carry
+    /// `{{var}}` placeholders) so dispatch has a templated base to resolve.
+    fn wf_with_templated_base(base: &str) -> Workflow {
+        let mut wf = shelbi_core::default_workflow();
+        wf.git = Some(GitConfig {
+            base_branch: Some(base.to_string()),
+            branch: None,
+            branch_prefix: None,
+            merge_strategy: MergeStrategy::Squash,
+        });
+        wf
+    }
 
     /// A review-column task assigned to `assigned_to` — the shape a
     /// Queued-for-Review card is in (still pinned to the slot that built it).
@@ -618,6 +674,42 @@ mod tests {
         // written by the aborted load.
         let after = shelbi_state::load_task("demo", "t-queued").unwrap();
         assert_eq!(after.task.assigned_to.as_deref(), Some("alpha"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn dispatch_refuses_when_templated_base_branch_is_unresolved() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let project = tagged_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        // A fresh subtask (no branch cut yet) filed without the `feature:` link
+        // its workflow's `base_branch: feature/{{feature}}` needs to resolve.
+        let task = todo_task("orphan-subtask", &[]);
+        shelbi_state::save_task("demo", &task, "body").unwrap();
+        let tf = shelbi_state::load_task("demo", "orphan-subtask").unwrap();
+
+        let wf = wf_with_templated_base("feature/{{feature}}");
+        let ws = project.workspace("alpha").unwrap().clone();
+
+        // Dispatch refuses loudly, naming the missing frontmatter field, before
+        // launching the worker or touching the board.
+        let err = dispatch_task_onto("demo", &project, &wf, tf, &ws, None).unwrap_err();
+        assert!(
+            err.to_string().contains("feature"),
+            "error should name the missing `feature` field, got: {err}"
+        );
+
+        // The task never left its ready status and was neither assigned nor
+        // branch-stamped by the aborted dispatch.
+        let after = shelbi_state::load_task("demo", "orphan-subtask").unwrap();
+        assert_eq!(after.task.column, Column::todo());
+        assert_eq!(after.task.assigned_to, None);
+        assert_eq!(after.task.branch, None);
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
