@@ -233,6 +233,7 @@ mod tests {
             }],
             initial_status: None,
             transitions: None,
+            required_params: Vec::new(),
             git,
             zen: None,
             review: None,

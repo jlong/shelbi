@@ -513,6 +513,7 @@ transitions:
         let yaml = format!(
             r#"
 name: subtask
+required_params: [feature]
 git:
   base_branch: feature/{{{{feature}}}}
 statuses:

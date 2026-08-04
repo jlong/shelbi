@@ -79,6 +79,44 @@ pub fn substitute_placeholders(
     }
 }
 
+/// Collect the distinct `{{key}}` placeholder names in `template`, in
+/// first-occurrence order with no duplicates. Uses the exact same
+/// tokenization rules as [`substitute_placeholders`]: whitespace inside
+/// the braces is trimmed (`{{ feature }}` → `feature`), a body that
+/// trims to empty (`{{}}`) or carries internal whitespace (`{{a b}}`) is
+/// not a token, and a `{{` with no matching `}}` is literal text.
+///
+/// This is the static counterpart to substitution: the validator uses it
+/// to check a template's variables against a declared field set *before*
+/// any task is loaded, rather than waiting for an unresolved placeholder
+/// to surface at dispatch.
+pub fn extract_placeholders(template: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut remaining = template;
+
+    loop {
+        let Some(open) = remaining.find("{{") else {
+            return out;
+        };
+        let after_open = &remaining[open + 2..];
+
+        let Some(close) = after_open.find("}}") else {
+            // Unclosed `{{` — literal, nothing more to scan.
+            return out;
+        };
+
+        let key = after_open[..close].trim();
+        if !key.is_empty() && !key.chars().any(char::is_whitespace) {
+            let key_owned = key.to_string();
+            if !out.contains(&key_owned) {
+                out.push(key_owned);
+            }
+        }
+
+        remaining = &after_open[close + 2..];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +246,47 @@ mod tests {
         let out = substitute_placeholders("{{a}}", &params(&[("a", "{{a}}")]), &mut missing);
         assert_eq!(out, "{{a}}");
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn extract_finds_distinct_keys_in_order() {
+        assert_eq!(
+            extract_placeholders("{{team}}/{{feature}}"),
+            vec!["team".to_string(), "feature".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_dedupes_repeated_keys() {
+        assert_eq!(
+            extract_placeholders("feature/{{feature}}/{{feature}}"),
+            vec!["feature".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_trims_inner_whitespace() {
+        assert_eq!(extract_placeholders("{{ task }}"), vec!["task".to_string()]);
+    }
+
+    #[test]
+    fn extract_ignores_non_tokens() {
+        // Empty body, internal whitespace, and an unclosed brace are all
+        // literal — none is a variable.
+        assert!(extract_placeholders("main").is_empty());
+        assert!(extract_placeholders("{{}}").is_empty());
+        assert!(extract_placeholders("{{a b}}").is_empty());
+        assert!(extract_placeholders("prefix {{ no close").is_empty());
+    }
+
+    #[test]
+    fn extract_matches_substitution_missing_set() {
+        // The keys `extract_placeholders` reports must be exactly the keys
+        // `substitute_placeholders` would flag as missing when no params
+        // are supplied — the static/runtime pair the validator relies on.
+        let template = "{{a}}-{{b}}/{{ a }}";
+        let mut missing = Vec::new();
+        substitute_placeholders(template, &params(&[]), &mut missing);
+        assert_eq!(extract_placeholders(template), missing);
     }
 }

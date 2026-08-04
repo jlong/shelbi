@@ -3961,6 +3961,7 @@ mod tests {
                 .collect(),
             initial_status: None,
             transitions: None,
+            required_params: Vec::new(),
             git: None,
             zen: None,
             review: None,
@@ -4028,6 +4029,7 @@ mod tests {
                 .collect(),
             initial_status: None,
             transitions: None,
+            required_params: Vec::new(),
             git: None,
             zen: None,
             review: None,
@@ -4931,6 +4933,11 @@ mod tests {
             }],
             initial_status: None,
             transitions: None,
+            // Keep the helper valid for templated bases: declare whatever
+            // `{{var}}`s the base branch references as required fields.
+            required_params: base_branch
+                .map(shelbi_core::extract_placeholders)
+                .unwrap_or_default(),
             git: base_branch.map(|b| shelbi_core::GitConfig {
                 base_branch: Some(b.into()),
                 merge_strategy: shelbi_core::MergeStrategy::Squash,
