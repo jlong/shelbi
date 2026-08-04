@@ -161,6 +161,11 @@ fn install_launchd() -> Result<()> {
     // bootstrap the freshly-written plist — retrying through launchd's
     // transient EIO. See [`bootstrap_launchd`].
     bootstrap_launchd(uid, &plist_path)?;
+    // bootstrap + RunAtLoad usually spawns the daemon, but launchd can
+    // leave the job "loaded but never spawned" (runs = 0, pended nondemand
+    // spawn = speculative). Force the spawn so the "should now be running"
+    // line below is a guarantee, not a hope. See [`kickstart_launchd`].
+    kickstart_launchd(uid)?;
 
     println!("✓ installed launchd agent at {}", plist_path.display());
     println!("  label: {SERVICE_LABEL}");
@@ -242,6 +247,13 @@ fn restart_launchd() -> Result<()> {
     // kickstart alone keeps the already-loaded (possibly stale) unit. The
     // retry in [`bootstrap_launchd`] rides out launchd's transient EIO.
     bootstrap_launchd(uid, &plist_path)?;
+    // Now guarantee the daemon is actually running. A bare bootstrap relies
+    // on RunAtLoad to spawn, but launchd can wedge the job "loaded but never
+    // spawned" (runs = 0, pended nondemand spawn = speculative) — the exact
+    // state where `restart` used to no-op and leave the hub socket down.
+    // `kickstart -k` spawns a stopped job and restarts a running one, so it
+    // covers both the wedge and the already-running case.
+    kickstart_launchd(uid)?;
     println!("✓ restarted {target} on the current shelbi binary");
     Ok(())
 }
@@ -273,6 +285,13 @@ fn bootstrap_launchd(uid: u32, plist_path: &std::path::Path) -> Result<()> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
+
+        // `bootout` is asynchronous for a live daemon: the process runs its
+        // SIGTERM drain (up to `serve::SHUTDOWN_DRAIN_TIMEOUT`) and stays
+        // registered until it exits. Bootstrapping into that window lets the
+        // in-flight teardown tear the fresh registration back down, leaving
+        // the job fully unloaded. Wait for the unload to settle first.
+        wait_until_unloaded(uid);
 
         let out = Command::new("launchctl")
             .args(["bootstrap", &gui_domain(uid)])
@@ -308,6 +327,24 @@ fn bootstrap_launchd(uid: u32, plist_path: &std::path::Path) -> Result<()> {
     );
 }
 
+/// Block until launchd reports the shelbi agent fully unloaded, or a bounded
+/// timeout elapses. `bootout` returns before a live daemon finishes its
+/// SIGTERM drain, so [`bootstrap_launchd`] calls this between bootout and
+/// bootstrap to avoid racing the async teardown. The cap is comfortably
+/// larger than the daemon's `serve::SHUTDOWN_DRAIN_TIMEOUT` (3s) so a normal
+/// drain always completes first; it exists only so a wedged teardown can't
+/// hang the command forever (the bootstrap retry recovers from that).
+#[cfg(target_os = "macos")]
+fn wait_until_unloaded(uid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    while service_loaded(uid) {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+}
+
 /// True when launchd has the shelbi agent loaded in the user's GUI domain.
 /// Used as the fallback success signal for [`bootstrap_launchd`] when
 /// `bootstrap` returns a spurious non-zero over an already-registered unit.
@@ -320,6 +357,59 @@ fn service_loaded(uid: u32) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// The `launchctl kickstart` argv that forces a (re)spawn of the agent.
+/// Factored out so the argument shape is unit-testable without shelling out
+/// to launchd. `-k` kills any running instance before restarting, which is
+/// why one call covers both the already-running relaunch and the "loaded but
+/// never spawned" wedge.
+#[cfg(target_os = "macos")]
+fn kickstart_args(uid: u32) -> [String; 3] {
+    ["kickstart".into(), "-k".into(), gui_target(uid)]
+}
+
+/// Force launchd to (re)spawn the agent, curing the "loaded but never
+/// spawned" wedge where the job sits with `runs = 0` / `pended nondemand
+/// spawn = speculative` and neither `bootstrap` nor `RunAtLoad` ever fires
+/// it. This is the in-process equivalent of the manual
+/// `launchctl kickstart -k gui/<uid>/dev.shelbi.daemon` recovery.
+///
+/// `-k` first kills any running instance, so this is also a valid relaunch
+/// for an already-running daemon — one code path handles restart from every
+/// starting state. Retries through the same transient EIO that
+/// [`bootstrap_launchd`] rides out; only a persistent failure is surfaced.
+#[cfg(target_os = "macos")]
+fn kickstart_launchd(uid: u32) -> Result<()> {
+    const ATTEMPTS: u32 = 4;
+    let target = gui_target(uid);
+    let mut last: Option<(Option<i32>, String)> = None;
+    for attempt in 1..=ATTEMPTS {
+        let out = Command::new("launchctl")
+            .args(kickstart_args(uid))
+            .output()
+            .context("invoking launchctl kickstart")?;
+        if out.status.success() {
+            return Ok(());
+        }
+        last = Some((
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+        if attempt < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+    let (code, stderr) = last.unwrap_or((None, String::new()));
+    let detail = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!("{stderr}; ")
+    };
+    bail!(
+        "launchctl kickstart -k failed (exit {code:?}) after {ATTEMPTS} attempts — \
+         {detail}see `launchctl print {target}` for details"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -565,6 +655,10 @@ fn restart_systemd() -> Result<()> {
     fs::write(&unit_path, unit)
         .with_context(|| format!("writing systemd user unit {}", unit_path.display()))?;
     run_systemctl(&["daemon-reload"])?;
+    // `restart` = stop-if-running then start, so it also spawns a unit that
+    // is loaded but inactive/dead — the systemd analogue of launchd's
+    // "loaded but never spawned" wedge that the macOS path cures with
+    // `kickstart -k`. No extra kick is needed here.
     run_systemctl(&["restart", SYSTEMD_SERVICE_NAME])?;
     println!("✓ restarted {SYSTEMD_SERVICE_NAME} on the current shelbi binary");
     Ok(())
@@ -808,6 +902,19 @@ mod tests {
             legacy.display()
         );
         assert_ne!(legacy, systemd_unit_path().unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kickstart_args_force_respawn_of_current_target() {
+        // `restart` must force a spawn via `kickstart -k` at the live
+        // target, not the legacy one — this is what cures the "loaded but
+        // never spawned" wedge and doubles as the running-daemon relaunch.
+        let args = kickstart_args(501);
+        assert_eq!(args[0], "kickstart");
+        assert_eq!(args[1], "-k", "the -k flag makes it kill-and-restart");
+        assert_eq!(args[2], gui_target(501));
+        assert_ne!(args[2], legacy_gui_target(501));
     }
 
     #[cfg(target_os = "macos")]
