@@ -26,25 +26,43 @@ exec
 [ -n "${TASK_ID:-}" ] || exit 0
 UNREAD=.shelbi/messages/$TASK_ID.unread.log
 PROC=$UNREAD.processing
-if [ -s "$UNREAD" ]; then
-  mv "$UNREAD" "$PROC"
-  touch "$UNREAD"
-  echo "<system-reminder>New orchestrator messages:"
-  cat "$PROC"
-  echo "</system-reminder>"
-  HUB_ADDR="${SHELBI_HUB_ADDR:-${SHELBI_HUB_SOCK:+unix:$SHELBI_HUB_SOCK}}"
-  if [ -n "$HUB_ADDR" ] && command -v jq >/dev/null 2>&1 && command -v nc >/dev/null 2>&1; then
-    jq -r '.msg_id // empty' "$PROC" 2>/dev/null | while read MSG_ID; do
-      [ -n "$MSG_ID" ] || continue
-      ACK=$(printf '{"verb":"message-ack","project":"%s","task_id":"%s","msg_id":"%s"}\n' "$PROJECT" "$TASK_ID" "$MSG_ID")
-      case "$HUB_ADDR" in
-        tcp:*) HP=${HUB_ADDR#tcp:}; printf '%s' "$ACK" | nc "${HP%:*}" "${HP##*:}" 2>/dev/null || true ;;
-        unix:*) printf '%s' "$ACK" | nc -U "${HUB_ADDR#unix:}" 2>/dev/null || true ;;
-      esac
-    done
+[ -s "$UNREAD" ] || exit 0
+mv "$UNREAD" "$PROC"
+touch "$UNREAD"
+echo "<system-reminder>New orchestrator messages:"
+cat "$PROC"
+echo "</system-reminder>"
+HUB_ADDR="${SHELBI_HUB_ADDR:-${SHELBI_HUB_SOCK:+unix:$SHELBI_HUB_SOCK}}"
+shelbi_ack_send() {
+  # $1 = one newline-terminated JSON line to deliver to $HUB_ADDR.
+  if command -v nc >/dev/null 2>&1; then
+    case "$HUB_ADDR" in
+      tcp:*) HP=${HUB_ADDR#tcp:}; printf '%s' "$1" | nc "${HP%:*}" "${HP##*:}" 2>/dev/null || true ;;
+      unix:*) printf '%s' "$1" | nc -U "${HUB_ADDR#unix:}" 2>/dev/null || true ;;
+    esac
+  elif command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | python3 -c 'import socket,sys
+addr=sys.argv[1]; data=sys.stdin.buffer.read()
+try:
+    if addr.startswith("unix:"):
+        s=socket.socket(socket.AF_UNIX); s.connect(addr[5:])
+    elif addr.startswith("tcp:"):
+        host,_,port=addr[4:].rpartition(":"); s=socket.socket(socket.AF_INET); s.connect((host,int(port)))
+    else:
+        sys.exit(0)
+    s.sendall(data); s.shutdown(socket.SHUT_WR)
+except Exception:
+    pass' "$HUB_ADDR" 2>/dev/null || true
   fi
-  rm "$PROC"
+}
+if [ -n "$HUB_ADDR" ]; then
+  sed -n 's/.*"msg_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PROC" | while IFS= read -r MSG_ID; do
+    [ -n "$MSG_ID" ] || continue
+    ACK=$(printf '{"verb":"message-ack","project":"%s","task_id":"%s","msg_id":"%s"}\n' "$PROJECT" "$TASK_ID" "$MSG_ID")
+    shelbi_ack_send "$ACK"
+  done
 fi
+rm "$PROC"
 
 ========
 .shelbi/hooks/pane-idle.sh
