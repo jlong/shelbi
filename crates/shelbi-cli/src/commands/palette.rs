@@ -644,9 +644,13 @@ fn render_projects_column(f: &mut Frame, area: Rect, state: &State) {
 
 fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
-    // Switch Project leads the list: it's the most common cross-project
-    // action, so it sits ahead of the sidebar/nav destinations. Selecting
-    // it still opens the fuzzy sub-picker (see `run_project_picker`).
+    // Switch Project leads the list structurally (it stays first in
+    // `build_entries` output), but it's `hidden_until_query` so the
+    // empty-query palette doesn't advertise it — the empty-query surface
+    // already offers the projects sidebar column and the per-project
+    // "Switch to X" shortcuts. Typing (e.g. `sw`) surfaces it, and
+    // selecting it still opens the fuzzy sub-picker (see
+    // `run_project_picker`).
     out.push(Entry {
         id: "action:switch-project".into(),
         label: "Switch Project".into(),
@@ -654,7 +658,7 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
         subtitle: Some("fuzzy-pick another project and swap the dashboard".into()),
         shortcut: None,
         decoration: None,
-        hidden_until_query: false,
+        hidden_until_query: true,
     });
     // Inline per-project shortcuts. Hidden until the user types, they let
     // `web` surface "Switch to Website project" and switch directly without
@@ -1900,10 +1904,13 @@ mod tests {
         let app = App::new_sidebar("demo");
         let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
-        // Switch Project leads, then the view block (Chat/Tasks/Activity), then
-        // the mode toggle, then the global actions trail (Add → Quit).
-        // Workspaces/reviews/agents are empty in this fixture so they don't
-        // appear, and no other projects exist so no inline "Switch to X" rows.
+        // Switch Project leads structurally, then the view block
+        // (Chat/Tasks/Activity), then the mode toggle, then the global actions
+        // trail (Add → Quit). Workspaces/reviews/agents are empty in this
+        // fixture so they don't appear, and no other projects exist so no
+        // inline "Switch to X" rows. (Switch Project is `hidden_until_query`,
+        // so it's present here in the raw list but dropped from the empty-query
+        // *search* — see `switch_project_hidden_from_empty_query_but_searchable`.)
         assert_eq!(
             ids,
             vec![
@@ -1917,6 +1924,33 @@ mod tests {
                 "action:quit-shelbi",
             ]
         );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn switch_project_hidden_from_empty_query_but_searchable() {
+        // Isolate `SHELBI_HOME` so `list_projects()` finds no other projects
+        // and can't inject inline "Switch to X" rows that would also match `sw`.
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let app = App::new_sidebar("demo");
+        let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
+
+        // Empty query: Switch Project is dropped from the initial menu.
+        let blank = shelbi_palette::search(&entries, "");
+        assert!(
+            !blank.iter().any(|(e, _)| e.id == "action:switch-project"),
+            "Switch Project must not appear in the empty-query menu"
+        );
+
+        // Typing surfaces it again, ready for the sub-picker on select.
+        let typed = shelbi_palette::search(&entries, "sw");
+        assert!(
+            typed.iter().any(|(e, _)| e.id == "action:switch-project"),
+            "typing `sw` should surface Switch Project"
+        );
+
         std::env::remove_var("SHELBI_HOME");
     }
 
