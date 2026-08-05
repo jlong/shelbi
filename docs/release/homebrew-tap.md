@@ -55,6 +55,11 @@ the MIT license, depends on `tmux`, points at the GitHub release tarballs,
 verifies SHA256, selects arm64 vs x86_64 only when both artifacts exist, and
 tests `shelbi --version`.
 
+It deliberately omits a `version` stanza. Homebrew scans the version out of the
+`.../releases/download/vX.Y.Z/...` URL, and `brew audit --strict` (which tap CI
+runs on every formula PR) fails the formula when an explicit `version` merely
+repeats it.
+
 ## Unresolved Naming Decision
 
 The source plan leaves final ownership open: `jlong/*` vs `shelbi/*`. This

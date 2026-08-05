@@ -69,11 +69,13 @@ else
   RUBY
 end
 
+# No `version` stanza: `brew audit --strict` rejects one that matches the
+# version Homebrew already scans out of the release URL, which is exactly what
+# `.../releases/download/v#{version}/...` yields.
 formula = <<~RUBY
   class Shelbi < Formula
     desc "Open-source agent orchestrator built on tmux"
     homepage "https://github.com/#{github_repo}"
-    version "#{version}"
     license "MIT"
 
     depends_on "tmux"
