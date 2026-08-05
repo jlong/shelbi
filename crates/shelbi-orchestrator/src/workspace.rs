@@ -1550,12 +1550,13 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // 2–7. Deploy the agent context, reset the pane, launch the runner, wait
     //       for readiness, and send the loop-closing dev prompt. Dev
     //       workspaces inject no `PORT` (that's a review-workspace concern).
+    let handoff_base = resolve_handoff_base_branch(spec.project, spec.task_id);
     let mut prompt = compose_prompt(
         spec.task_id,
         spec.branch,
         spec.task_body,
         &marker,
-        &spec.project.default_branch,
+        &handoff_base,
         &spec.project.name,
         shelbi_agent::polls_for_messages(&runner),
         !is_review,
@@ -1682,12 +1683,13 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         shelbi_agent::ResumeStrategy::Transcript
     );
     let is_review = spec.project.effective_tags(spec.workspace).contains("review");
+    let handoff_base = resolve_handoff_base_branch(spec.project, spec.task_id);
     let prompt = compose_resume_prompt(
         spec.task_id,
         spec.branch,
         spec.task_body,
         &marker,
-        &spec.project.default_branch,
+        &handoff_base,
         &spec.project.name,
         shelbi_agent::polls_for_messages(&runner),
         resume,
@@ -3757,8 +3759,9 @@ fn scp_text_to_remote(
 }
 
 /// Build the initial prompt: the task body + the loop-closing instructions
-/// that tell the workspace how to rebase onto current `default_branch` and then
-/// mark itself done.
+/// that tell the workspace how to rebase onto current `base_branch` (the task
+/// workflow's resolved `git.base_branch`, see [`resolve_handoff_base_branch`])
+/// and then mark itself done.
 ///
 /// The handoff is a file marker, not a pane title or a `shelbi` CLI call.
 /// The workspace writes its task id into `<worktree>/.claude/shelbi-ready`
@@ -3772,13 +3775,46 @@ fn scp_text_to_remote(
 /// the workspace re-runs its checks against the rebased base before signalling
 /// review — a hub-side rebase happens after handoff, when there's no agent
 /// around to fix conflicts or re-run tests.
+/// Resolve the base branch the dispatch/resume handoff should tell the worker
+/// to rebase onto: the task workflow's resolved `git.base_branch` (with
+/// `{{var}}` placeholders substituted from the task's frontmatter) when the
+/// workflow declares one, else the project's effective [`Project::base_branch`].
+///
+/// This mirrors the merge-side `resolve_task_base_branch` in [`crate::actions`]:
+/// a `subtask` workflow whose `base_branch` is `rewrite/rust-core` must hand the
+/// worker `git rebase origin/rewrite/rust-core`, never `origin/main`, so the
+/// branch it produces merges cleanly into the line it was cut from (and passes
+/// the hub's wrong-base merge guard). Hardcoding `main` in the prompt was the
+/// bug: agents that followed it literally produced wrong-base branches.
+///
+/// Deliberately tolerant: the handoff text is advisory, so a failure to load
+/// the task or resolve the workflow git block (missing file, bad YAML, an
+/// unresolved `{{var}}`) falls back to the project base rather than aborting the
+/// dispatch. The authoritative wrong-base guard lives on the merge path.
+fn resolve_handoff_base_branch(project: &Project, task_id: &str) -> String {
+    resolve_workflow_base_branch(project, task_id)
+        .unwrap_or_else(|| project.base_branch().to_string())
+}
+
+/// The workflow-declared base branch for `task_id`, or `None` when the task /
+/// workflow can't be loaded, the workflow has no `git.base_branch`, or a
+/// placeholder in it can't be resolved from the task's params.
+fn resolve_workflow_base_branch(project: &Project, task_id: &str) -> Option<String> {
+    let task_file = shelbi_state::load_task(&project.name, task_id).ok()?;
+    let workflow = shelbi_state::load_task_workflow(&project.name, project, &task_file.task).ok()?;
+    workflow
+        .resolve_git(&task_file.task.string_params())
+        .ok()?
+        .and_then(|git| git.base_branch)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compose_prompt(
     task_id: &str,
     branch: &str,
     body: &str,
     marker: &Path,
-    default_branch: &str,
+    base_branch: &str,
     project: &str,
     polls_messages: bool,
     include_handoff: bool,
@@ -3824,12 +3860,12 @@ fn compose_prompt(
          You are working on task `{task_id}` on branch `{branch}`. When \
          the work is complete and committed, do these two things in order:\n\
          \n\
-         1. Rebase your branch onto current `{default_branch}` so the review \
+         1. Rebase your branch onto current `{base_branch}` so the review \
          sees a clean diff against an up-to-date base — a stale base produces \
          test failures that have nothing to do with your change and inflates \
-         the diff with commits already on `{default_branch}`:\n\
+         the diff with commits already on `{base_branch}`:\n\
          \n\
-         git fetch origin {default_branch} && git rebase origin/{default_branch}\n\
+         git fetch origin {base_branch} && git rebase origin/{base_branch}\n\
          \n\
          If the rebase produces conflicts, resolve them, run `git rebase \
          --continue`, and re-run any affected tests before moving on. Do NOT \
@@ -3955,7 +3991,7 @@ fn compose_resume_prompt(
     branch: &str,
     body: &str,
     marker: &Path,
-    default_branch: &str,
+    base_branch: &str,
     project: &str,
     polls_messages: bool,
     conversation_resumed: bool,
@@ -3984,7 +4020,7 @@ fn compose_resume_prompt(
         branch,
         body,
         marker,
-        default_branch,
+        base_branch,
         project,
         polls_messages,
         include_handoff,
@@ -5039,6 +5075,118 @@ mod tests {
             !prompt.contains("origin/main"),
             "stale `main` reference leaked into prompt: {prompt}"
         );
+    }
+
+    #[test]
+    fn handoff_base_follows_the_workflow_git_base_branch() {
+        // The rebase step the dispatch hands the worker must name the task
+        // workflow's resolved `git.base_branch`, not the repo default branch.
+        // For a subtask whose base is `rewrite/rust-core` (main predates the
+        // integration line), the worker must rebase onto origin/rewrite/rust-core
+        // or it produces a wrong-base branch the merge guard rightly refuses.
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("handoff-workflow-base");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // `load_task_workflow` reads these off SHELBI_HOME; once a workflow file
+        // exists the loader also requires statuses.yaml.
+        shelbi_state::materialize_default_agents("myapp").unwrap();
+        shelbi_state::save_project_statuses("myapp", &shelbi_core::default_project_statuses())
+            .unwrap();
+        let wf_path = shelbi_state::workflow_path("myapp", "sub").unwrap();
+        std::fs::create_dir_all(wf_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &wf_path,
+            "name: sub\n\
+             git:\n  \
+               base_branch: rewrite/rust-core\n  \
+               merge_strategy: squash\n\
+             statuses:\n  \
+               - { id: in-progress, owner: agent, agent: developer }\n  \
+               - { id: done,        owner: user }\n\
+             transitions:\n  \
+               - { from: in-progress, to: done, actions: [merge] }\n",
+        )
+        .unwrap();
+
+        let task = shelbi_core::Task {
+            id: "rust-ui-app-name".into(),
+            title: "rust-ui-app-name".into(),
+            column: shelbi_core::Column::in_progress(),
+            priority: 0,
+            assigned_to: None,
+            workflow: Some("sub".into()),
+            branch: Some("shelbi/rust-ui-app-name".into()),
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            params: BTreeMap::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        shelbi_state::save_task("myapp", &task, "").unwrap();
+
+        let project = fixture_project();
+        let base = resolve_handoff_base_branch(&project, "rust-ui-app-name");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            base, "rewrite/rust-core",
+            "handoff base must follow the workflow git.base_branch, not the repo default"
+        );
+
+        // And the composed prompt threads it into the actual rebase command.
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-ready");
+        let prompt = compose_prompt(
+            "rust-ui-app-name",
+            "shelbi/rust-ui-app-name",
+            "Rename the app.",
+            &marker,
+            &base,
+            "myapp",
+            false,
+            true,
+        );
+        assert!(
+            prompt.contains(
+                "git fetch origin rewrite/rust-core && git rebase origin/rewrite/rust-core"
+            ),
+            "rebase step must target the workflow base: {prompt}"
+        );
+        assert!(
+            !prompt.contains("origin/main"),
+            "stale `main` reference leaked into prompt: {prompt}"
+        );
+    }
+
+    #[test]
+    fn handoff_base_falls_back_to_project_base_when_task_unresolvable() {
+        // The handoff text is advisory: a task the resolver can't load (missing
+        // file / no SHELBI_HOME state) must degrade to the project's effective
+        // base branch rather than abort the dispatch. This is also the
+        // default-workflow path — a `main`-based project keeps rebasing onto main.
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("handoff-fallback");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project(); // default_branch: main, no git.base_branch
+        let base = resolve_handoff_base_branch(&project, "no-such-task");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(
+            base,
+            project.base_branch(),
+            "an unresolvable task must fall back to the project base branch"
+        );
+        assert_eq!(base, "main", "fixture project base is `main`");
     }
 
     #[test]
