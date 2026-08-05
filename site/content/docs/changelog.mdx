@@ -9,6 +9,35 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### August 5, 2026
+
+**v0.7.2. Honest mid-flight comms and workflow-aware handoffs.**
+
+**`shelbi message` tells the truth about delivery.** The command used to print a
+checkmark and exit 0 the instant it wrote the durable record, conflating "queued"
+with "the worker read it" — and on some hosts the ack never once landed (12 sent,
+12 timeouts). Root cause: the worker's ack was gated behind `jq`, absent on stock
+macOS and minimal Linux, so the ack block was silently skipped. Now the ack
+extraction is `jq`-free and sends over `nc` (flavour-detected, `-N` on Linux) or a
+`python3` fallback. The CLI stops over-promising too: a bare push prints
+`queued … not yet confirmed delivered`, `--wait` blocks and exits non-zero on the
+ack window elapsing, `shelbi message status <id>` reports the real outcome, and a
+`done` task or dead pane is reported undeliverable rather than implying a future
+pickup.
+
+**Handoffs follow the workflow's base branch.** The workspace startup prompt
+hardcoded `git rebase origin/main`, ignoring a task workflow's `git.base_branch`.
+For fan-out workflows whose base isn't `main` (e.g. `feature/{{feature}}`), agents
+that followed it produced wrong-base branches the merge guard rightly refuses. The
+prompt now rebases onto the workflow's resolved base, mirroring the merge side so
+the handoff and the merge target agree.
+
+**Smaller fixes.** `task add`/`task edit` no longer hang reading stdin when the
+body was already supplied by `--body`/`--body-file`/`-d`; the command palette hides
+the redundant 'Switch Project' entry from its empty-query menu (it still surfaces
+on typing); and the generated Homebrew formula drops the redundant `version`
+stanza that `brew audit --strict` rejects.
+
 ### August 4, 2026
 
 **v0.7.1. Feature-branch fan-out you can trust.**
