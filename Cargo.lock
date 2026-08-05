@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1200,14 +1200,14 @@ dependencies = [
 
 [[package]]
 name = "shelbi-agent"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "shelbi-core",
 ]
 
 [[package]]
 name = "shelbi-core"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "chrono",
  "serde",
@@ -1217,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-orchestrator"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-palette"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "nucleo-matcher",
  "shelbi-core",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-ssh"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "libc",
  "shelbi-core",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-state"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "chrono",
  "crossterm 0.28.1",
@@ -1275,7 +1275,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-tmux"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "shelbi-core",
  "shelbi-ssh",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-tui"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "chrono",
