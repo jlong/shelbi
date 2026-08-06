@@ -14,12 +14,12 @@
 //!    window's own left nav), and
 //! 2. `select-window`s the review window, giving `panel | agent`.
 //!
-//! The global traveling sidebar does **not** follow into the review window —
-//! the review panel is that window's navigation, so the sidebar stays docked
-//! in the dashboard (the `after-select-window` hook recognizes a window holding
-//! the `SHELBI_REVIEW_PANEL` pane and skips it). That keeps the persistent
-//! sidebar in its home and avoids two navs stacking up in the review window.
-//! The panel is the review window's own left nav; its top **back button**
+//! The dashboard sidebar lives permanently in the dashboard window and never
+//! travels, so opening a review window never touches it: the review panel is
+//! that window's own left nav and the dashboard keeps its sidebar. Each review
+//! window carries its own panel (created here on open, torn down on close), so
+//! loading or closing one review window leaves any other review window's panel
+//! and the dashboard sidebar untouched. The panel's top **back button**
 //! ([`focus_dashboard`]) switches focus back to the dashboard without tearing
 //! the interface down.
 //!
@@ -51,12 +51,10 @@ use crate::load;
 /// Session env var holding the pane id currently shown in the middle content
 /// slot. Updated on every [`show_review_view`] swap.
 const MID_KEY: &str = "SHELBI_REVIEW_MID";
-/// Session env var holding the review-panel (right sidebar) pane id.
+/// Session env var holding the review window's own panel (left nav) pane id.
 ///
-/// Read by the sidebar-travel hook (see [`crate::sidebar_travel_script`]) to
-/// recognize a window that hosts the review interface and skip relocating the
-/// global sidebar into it — the review panel is that window's navigation, so
-/// the sidebar stays docked in the dashboard.
+/// Read by the sidebar-clamp script (see [`crate::sidebar_clamp_script`]) so the
+/// panel is sized within its own window, independently of the dashboard sidebar.
 pub(crate) const PANEL_KEY: &str = "SHELBI_REVIEW_PANEL";
 /// Session env var holding the lazily-created editor pane id.
 const EDITOR_KEY: &str = "SHELBI_REVIEW_EDITOR";
@@ -188,11 +186,10 @@ fn local_workspace_pane_id(session: &str, window: &str) -> Result<String> {
 /// [`ReviewOpenOutcome::NeedsLaunch`] so the caller launches the workspace
 /// before re-opening — there is no window to embed into. Otherwise builds the
 /// two-column layout **inside the review workspace's own window** —
-/// splitting the review panel onto the right of the agent/server pane and
-/// switching to that window — and returns that window's target. The global
-/// traveling sidebar stays docked in the dashboard (the travel hook skips a
-/// window holding the review panel), and the dashboard window is never
-/// reshaped, so a review load adds no pane there.
+/// splitting the review panel onto the left of the agent/server pane and
+/// switching to that window — and returns that window's target. The dashboard
+/// sidebar never travels, so it stays docked in the dashboard and the dashboard
+/// window is never reshaped — a review load adds a panel only to its own window.
 pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<ReviewOpenOutcome> {
     let project = shelbi_state::load_project(project_name)?;
     let tf = shelbi_state::load_task(project_name, task_id)?;
@@ -250,8 +247,8 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
     }
 
     // Reuse: the interface is already up on this same task — just re-focus its
-    // window (the traveling sidebar follows the select-window). Avoids
-    // splitting a second panel on a repeat click.
+    // window (switching windows relocates nothing). Avoids splitting a second
+    // panel on a repeat click.
     if read_session_var(&session, PANEL_KEY).is_some()
         && read_session_var(&session, TASK_KEY).as_deref() == Some(task_id)
     {
@@ -274,9 +271,8 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
 
     // 1. Split the review panel onto the LEFT of the agent pane (`-b`, and
     //    detached so focus stays on the agent pane), yielding `panel | agent`.
-    //    The panel pin (PANEL_KEY) is set below *before* the select-window, so
-    //    the travel hook already sees this window as review-hosting and leaves
-    //    the global sidebar docked in the dashboard instead of migrating it in.
+    //    This panel is the review window's own left nav; the dashboard sidebar
+    //    is a separate pane in the dashboard window and is never involved.
     let shelbi_bin = crate::current_exe_string()?;
     let panel_cmd = review_panel_cmd(&shelbi_bin, project_name, task_id);
     // Open the panel at the *shared* nav width — the user's stored width
@@ -314,10 +310,9 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
     ])?;
     set_session_var(&session, PANEL_KEY, &panel_id)?;
 
-    // 2. Switch to the review window. The `after-select-window` hook fires but
-    //    recognizes this window by its `SHELBI_REVIEW_PANEL` pin and skips the
-    //    sidebar relocation, so the sidebar stays in the dashboard and the
-    //    window shows just `panel | agent`.
+    // 2. Switch to the review window. Switching windows relocates no panes, so
+    //    the dashboard keeps its sidebar and this window shows just
+    //    `panel | agent`.
     let _ = tmux_run(&["select-window", "-t", &review_win]);
     let _ = tmux_run(&["select-pane", "-t", &chat]);
     Ok(ReviewOpenOutcome::Opened(review_win))
@@ -590,9 +585,10 @@ fn ensure_stash_session(project: &shelbi_core::Project, session: &str) -> Result
 /// review window's content slot (if the editor is showing), kill the
 /// review-panel and editor panes, clear the `SHELBI_REVIEW_*` session vars, and
 /// return focus to the dashboard. The review window is left with just its agent
-/// pane, so a later visit to the (now interface-free) review slot travels like
-/// any other workspace window. Idempotent and best-effort — a missing var means
-/// nothing to undo.
+/// pane, so a later visit to the (now interface-free) review slot shows just
+/// that pane. Closing one review window touches only its own panes — other
+/// review windows' panels and the dashboard sidebar are untouched. Idempotent
+/// and best-effort — a missing var means nothing to undo.
 pub fn close_review_interface(project_name: &str) -> Result<()> {
     let session = format!("shelbi-{project_name}");
     let dashboard = format!("{session}:dashboard");
