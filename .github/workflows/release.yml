@@ -223,6 +223,10 @@ jobs:
     environment: release-downstream
     permissions:
       contents: read
+      # The tap operations authenticate with the tap-scoped TAP_GITHUB_TOKEN, so
+      # this grant governs only GITHUB_TOKEN. It is declared to document that the
+      # job opens and merges a pull request on the downstream tap repository.
+      pull-requests: write
     steps:
       - name: Checkout Shelbi
         uses: actions/checkout@v4
@@ -256,6 +260,7 @@ jobs:
             --github-repo "$GITHUB_REPOSITORY"
 
       - name: Open tap update PR
+        id: tap_pr
         working-directory: homebrew-tap
         env:
           GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
@@ -269,12 +274,58 @@ jobs:
           git add Formula/shelbi.rb
           git commit -m "shelbi ${version}"
           git push --force-with-lease origin "$branch"
-          gh pr create \
+          # Create the PR, or reuse the open one if this tag is being re-run.
+          if pr_url="$(gh pr create \
             --repo "$TAP_REPOSITORY" \
             --base main \
             --head "$branch" \
             --title "shelbi ${version}" \
-            --body "Updates the Shelbi formula to ${version} after GitHub Release artifacts were published."
+            --body "Updates the Shelbi formula to ${version} after GitHub Release artifacts were published.")"; then
+            echo "Opened tap PR: $pr_url"
+          else
+            pr_url="$(gh pr list \
+              --repo "$TAP_REPOSITORY" \
+              --head "$branch" \
+              --state open \
+              --json url \
+              --jq '.[0].url')"
+            if [ -z "$pr_url" ]; then
+              echo "::error::Could not create or find an open tap PR for branch $branch"
+              exit 1
+            fi
+            echo "Reusing existing tap PR: $pr_url"
+          fi
+          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+
+      - name: Merge tap PR once green
+        working-directory: homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          PR_URL: ${{ steps.tap_pr.outputs.pr_url }}
+        run: |
+          # Wait for the tap's `test` check to finish, then squash-merge so the
+          # formula lands on the tap's main with no manual step. Fail the job
+          # loudly (rather than leaving the PR open) if the check goes red, the
+          # merge is blocked, or CI never registers a check.
+          status=0
+          for attempt in $(seq 1 12); do
+            status=0
+            gh pr checks "$PR_URL" --watch --fail-fast || status=$?
+            if [ "$status" -eq 0 ]; then
+              break
+            fi
+            # Exit code 8 means no checks have been reported yet; give the tap CI
+            # a moment to register the run before retrying. Any other non-zero is
+            # a real failure and should stop the job.
+            if [ "$status" -eq 8 ] && [ "$attempt" -lt 12 ]; then
+              echo "No checks reported on the tap PR yet (attempt ${attempt}); waiting for CI to start..."
+              sleep 15
+              continue
+            fi
+            echo "::error::Tap PR checks did not pass (exit ${status}): $PR_URL"
+            exit 1
+          done
+          gh pr merge "$PR_URL" --squash --delete-branch
 
   apt-publish:
     name: Publish APT repository

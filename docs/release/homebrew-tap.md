@@ -27,8 +27,22 @@ automation after GitHub Release tarballs and `checksums.txt` exist.
 Set these values in `jlong/shelbi`:
 
 - Repository variable: `HOMEBREW_TAP_REPOSITORY=jlong/homebrew-shelbi`
-- Repository secret: `TAP_GITHUB_TOKEN`, scoped to open branches and pull
-  requests in `jlong/homebrew-shelbi`
+- Repository secret: `TAP_GITHUB_TOKEN`, scoped to `jlong/homebrew-shelbi` with
+  `contents: write` and `pull-requests: write` so release automation can push
+  the branch, open the formula PR, and squash-merge it once CI is green
+
+## Automatic Merge
+
+The `homebrew-pr` job does not stop at opening the PR. It waits for the tap's
+`test` check with `gh pr checks --watch`, then squash-merges the PR (deleting the
+branch) so the new formula lands on the tap's `main` without a human merge. The
+job fails loudly if the check goes red, the merge is blocked, or CI never
+reports a check, so a broken formula never lands and never sits silently open.
+
+This requires the tap to run a PR check named `test` (the tap CI that runs
+`brew audit --strict` and installs the formula). If tap `main` is branch
+protected, make `test` a required status check so the merge only succeeds on
+green.
 
 ## Formula Shape
 

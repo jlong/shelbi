@@ -75,6 +75,21 @@ Publish a formula in a dedicated tap such as `jlong/homebrew-shelbi` or
 `shelbi/homebrew-shelbi` that points to the GitHub Release tarballs and their
 SHA256 checksums.
 
+The job opens the formula-bump PR, waits for the tap's `test` check with
+`gh pr checks --watch`, and then squash-merges it (deleting the branch) so the
+new version lands on the tap's `main` with no manual step. If the tap check goes
+red, the PR conflicts, or the merge is otherwise blocked, the job fails loudly
+instead of leaving the PR open. For this to work the tap must run a check named
+`test` on pull requests, and `TAP_GITHUB_TOKEN` must be allowed to merge (a
+fine-scoped token with `contents: write` and `pull-requests: write` on the tap).
+If the tap enforces branch protection on `main`, make `test` a required status
+check so the squash-merge only succeeds on green.
+
+The APT publish job pushes directly to the hosting repository, so it needs no
+merge step today. If a future downstream publisher opens a PR instead (for
+example an APT metadata PR), give it the same watch-and-merge treatment so
+publication stays fully automatic.
+
 For APT, the `apt-publish` job runs when the `APT_REPO` variable names the
 hosting repository (for example `jlong/shelbi-apt`). It publishes the `.deb`
 into a signed static repository (see docs/release-apt.md) with this shape:
