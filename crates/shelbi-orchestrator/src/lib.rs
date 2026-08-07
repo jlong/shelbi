@@ -103,23 +103,23 @@ pub(crate) fn shared_sidebar_cols(window_width: u32, override_cols: Option<u32>)
     }
 }
 
-/// Session env var pinning the stable tmux pane id (`%N`) of the single
-/// *traveling* sidebar pane. Unlike `SHELBI_PANE_orch` (a stashed view the
-/// dashboard swaps in), this pane physically MOVES between windows: every
-/// window switch relocates it into the newly-active window's left edge via
-/// the `after-select-window` hook, so the sidebar is always beside whatever
-/// workspace/dashboard window is on screen. Pinned once at bootstrap; the
-/// travel + clamp scripts read it to find the pane wherever it currently
-/// lives (it is no longer reliably `dashboard.{left}`).
+/// Session env var pinning the stable tmux pane id (`%N`) of the dashboard's
+/// sidebar pane. The sidebar lives permanently in the dashboard window's left
+/// pane and never moves between windows — switching windows relocates nothing.
+/// Pinned once at bootstrap (and re-pinned on the heal path) so the clamp
+/// script and the pane reload path can resolve it by id; it always resolves to
+/// `dashboard.{left}`.
 const SIDEBAR_ENV_KEY: &str = "SHELBI_SIDEBAR";
 
-/// Session env var holding the user's chosen *shared* nav-pane width, in
-/// columns. Unset until the user drags either nav divider; once set, both the
-/// traveling sidebar (`SHELBI_SIDEBAR`) and the review panel
-/// (`SHELBI_REVIEW_PANEL`) are pinned to it instead of the 25% formula, and it
-/// survives client resizes, window switches, and review open/close (it lives as
-/// long as the tmux session does). Written by the clamp script's `adopt` pass
-/// and read by both the clamp script and the review panel's initial split.
+/// Session env var holding the user's chosen nav-pane width, in columns. Unset
+/// until the user drags a nav divider; once set, the dashboard sidebar
+/// (`SHELBI_SIDEBAR`) and a review window's panel (`SHELBI_REVIEW_PANEL`) each
+/// open at it (within their own window) instead of the 25% formula, and it
+/// survives client resizes and review open/close (it lives as long as the tmux
+/// session does). A drag adopts the dragged pane's new width as this shared
+/// default, but never reaches across windows to resize the other pane. Written
+/// by the clamp script's `adopt` pass and read by both the clamp script and the
+/// review panel's initial split.
 pub(crate) const SIDEBAR_WIDTH_KEY: &str = "SHELBI_SIDEBAR_W";
 
 /// Session env var caching the last-seen window width (columns) so the clamp
@@ -649,10 +649,12 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     let pane_count = panes.lines().filter(|l| !l.trim().is_empty()).count();
     if pane_count >= 2 {
         ensure_hidden_views(&host, session, project_name, &shelbi_bin)?;
-        // Heal the traveling-sidebar wiring on an already-running session so a
-        // session that pre-dates this feature (or lost its hook to a tmux
-        // server restart) gains window-follow navigation without a restart.
-        let _ = ensure_sidebar_travel(&host, session, &workdir);
+        // Heal the dashboard sidebar on an already-running session: re-pin it
+        // and, crucially, retire any `after-select-window` travel hook left by
+        // an older shelbi so an upgraded session stops relocating panes on
+        // every window switch (the travel script it pointed at is no longer
+        // generated).
+        ensure_dashboard_sidebar(&host, session, &workdir);
         return Ok(BootstrapStatus::AlreadyRunning);
     }
 
@@ -746,12 +748,11 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     // `switch-client` path, where no attach event fires.
     install_sidebar_clamp_hooks(&host, session, &clamp_script_path)?;
 
-    // Pin the sidebar's pane id and install the `after-select-window` hook
-    // that travels it into whatever window becomes active. Must run before
-    // the clamp one-shot: the generalized clamp script now resolves the
-    // pane from `SHELBI_SIDEBAR` rather than the fixed `dashboard.{left}`
-    // position (the pane no longer stays put).
-    let _ = ensure_sidebar_travel(&host, session, &workdir);
+    // Pin the sidebar's pane id (the dashboard's left pane, where it lives for
+    // the life of the session) and clear any stale `after-select-window` travel
+    // hook. Must run before the clamp one-shot: the clamp script resolves the
+    // pane from `SHELBI_SIDEBAR`.
+    ensure_dashboard_sidebar(&host, session, &workdir);
     let _ = clamp_sidebar(&host, &clamp_script_path);
 
     // 4. Materialize the hidden `__views` window with tasks/review/machines
@@ -1141,29 +1142,29 @@ fn set_session_env(host: &shelbi_core::Host, session: &str, key: &str, value: &s
     Ok(())
 }
 
-/// Shell snippet that keeps both nav panes — the traveling sidebar
-/// (`SHELBI_SIDEBAR`) and, when the review interface is open, the review panel
-/// (`SHELBI_REVIEW_PANEL`) — locked to one *shared, user-adjustable* width.
+/// Shell snippet that sizes each nav pane — the dashboard sidebar
+/// (`SHELBI_SIDEBAR`) and, when a review interface is open, that review window's
+/// panel (`SHELBI_REVIEW_PANEL`) — within its own window, to a shared,
+/// user-adjustable width. It never resizes a pane in one window to match a pane
+/// in another (no cross-window mirroring); each pane is clamped independently.
 ///
 /// The width is the stored override (`SHELBI_SIDEBAR_W`, in cols) when the user
-/// has dragged either divider, else `SIDEBAR_TARGET_PCT%` of the window clamped
-/// to `[MIN, MAX]`. The script runs in two modes:
+/// has dragged a divider, else `SIDEBAR_TARGET_PCT%` of the window clamped to
+/// `[MIN, MAX]`. The script runs in two modes:
 ///
-/// - **apply** (default; wired to `client-attached` / `client-resized` and
-///   re-run after a sidebar travel): pin both panes to that target. A terminal
-///   resize therefore keeps the chosen absolute width instead of reflowing it.
+/// - **apply** (default; wired to `client-attached` / `client-resized`): pin
+///   each nav pane to that target. A terminal resize therefore keeps the chosen
+///   absolute width instead of reflowing it.
 /// - **adopt** (`sh <script> adopt`; wired to `window-layout-changed`): a
 ///   divider drag fires this. If the window width is steady (a real drag, not a
-///   terminal resize — told apart via `SHELBI_SIDEBAR_WW`) and a nav pane's
-///   width drifted off the target, that pane's width (clamped to `[MIN, MAX]`)
-///   becomes the new shared width: it is persisted to `SHELBI_SIDEBAR_W` and
-///   mirrored to the OTHER pane. Persisting the override *before* mirroring
-///   makes the mirror's re-fired hook see both panes already on the new target,
-///   so the `!= c` idempotency guard fires and the hook can't loop.
+///   terminal resize — told apart via `SHELBI_SIDEBAR_WW`) and the nav pane in
+///   the current window drifted off the target, that pane's width (clamped to
+///   `[MIN, MAX]`) is adopted as the new shared default and persisted to
+///   `SHELBI_SIDEBAR_W`. The drag simply sticks; no other pane is touched, so
+///   the hook fires no resize and can't loop.
 ///
-/// Panes are resolved from the session env so the sidebar is handled wherever
-/// it currently lives (it travels between windows), not a fixed
-/// `dashboard.{left}`. Written to disk so the hook can invoke it by path.
+/// Panes are resolved from the session env. Written to disk so the hook can
+/// invoke it by path.
 fn sidebar_clamp_script(session: &str) -> String {
     format!(
         "#!/bin/sh\n\
@@ -1206,12 +1207,12 @@ fn sidebar_clamp_script(session: &str) -> String {
          \t# Window width steady vs. the last-seen width => a divider DRAG, not a\n\
          \t# terminal resize. Adopt the drifted width of the nav pane in the\n\
          \t# CURRENT window (the only pane the user can be dragging) as the new\n\
-         \t# shared width: clamp it to [{min},{max}], persist it to {wkey}, and\n\
-         \t# mirror it to both panes. The current-window guard means the\n\
-         \t# programmatic mirror only ever moves the pane in the OTHER window, so\n\
-         \t# a re-fired hook can't re-adopt a transient width => no loop. (Keyed\n\
-         \t# off the session's current window id, which is well-defined with or\n\
-         \t# without an attached client, unlike client-relative window_active.)\n\
+         \t# shared default: clamp it to [{min},{max}] and persist it to {wkey}.\n\
+         \t# The dragged pane already sits at that width, so we resize nothing —\n\
+         \t# no other window's pane is touched (no cross-window mirroring) and the\n\
+         \t# hook fires no layout change, so it can't loop. (Keyed off the\n\
+         \t# session's current window id, well-defined with or without an attached\n\
+         \t# client, unlike client-relative window_active.)\n\
          \tnew=''\n\
          \tfor p in \"$sb\" \"$panel\"; do\n\
          \t\t[ -z \"$p\" ] && continue\n\
@@ -1230,13 +1231,11 @@ fn sidebar_clamp_script(session: &str) -> String {
          \tdone\n\
          \tif [ -n \"$new\" ]; then\n\
          \t\ttmux set-environment -t \"$sess\" {wkey} \"$new\" 2>/dev/null || true\n\
-         \t\toverride=$new\n\
-         \t\tapply_one \"$sb\" \"$new\"\n\
-         \t\tapply_one \"$panel\" \"$new\"\n\
          \t\texit 0\n\
          \tfi\n\
          fi\n\
-         # apply / terminal-resize / no-drift: re-pin both panes to the target,\n\
+         # apply / terminal-resize / no-drift: re-pin each nav pane to the target\n\
+         # within its own window (never one to match the other),\n\
          # and record the current window width so the NEXT layout change can tell\n\
          # a steady-width drag from a resize (this also seeds it on first run so\n\
          # the very first drag is recognized).\n\
@@ -1254,102 +1253,18 @@ fn sidebar_clamp_script(session: &str) -> String {
     )
 }
 
-/// Shell snippet that relocates the single traveling sidebar pane into the
-/// session's currently-active window, preserving its exact column width.
-///
-/// Installed as the session's `after-select-window` hook (and re-run as a
-/// one-shot on shelbi-driven switches), so EVERY window change — a sidebar
-/// click, a `shelbi open`, native `prefix+n`, the window list — keeps the
-/// sidebar beside whatever window is now on screen. Because a tmux pane
-/// belongs to exactly one window, there is a single sidebar instance that
-/// moves rather than N copies.
-///
-/// One exception: a window hosting the review interface (its `SHELBI_REVIEW_PANEL`
-/// pane) is skipped. That window already has its own review panel serving as
-/// its navigation, so the sidebar stays docked in the dashboard rather than
-/// migrating in — which would both strip the dashboard of its sidebar and
-/// squish the review panel to a 1-col orphan. The skip is keyed off the live
-/// panel pin, so it clears itself the moment the interface closes.
-///
-/// Width preservation across the *move itself*: the pane's live
-/// `#{pane_width}` is captured before the join and reapplied with
-/// `join-pane -l`, so the relocation never flashes through a default 50/50
-/// split. Immediately after the move, the canonical clamp is re-run
-/// synchronously (see below), so the sidebar lands at the same default width
-/// as the dashboard regardless of the destination window's geometry.
-///
-/// Re-clamp on arrival: window switches are the *only* layout events that
-/// re-run the clamp, so entering a differently-shaped window (e.g. a workspace
-/// window whose dev-server split reflowed the sidebar to a non-canonical width)
-/// snaps the sidebar back to `[MIN, MAX]`. Intra-view layout events (a dev-server
-/// pane appearing, an interface/editor swap) don't fire this hook, so a
-/// deliberate manual drag survives *within* a view — it's only reset when the
-/// user leaves and returns. The clamp is invoked by path, after the join, in
-/// the same (background) job as the travel, so there's no race between the
-/// two.
-fn sidebar_travel_script(session: &str, clamp_script_path: &std::path::Path) -> String {
-    let clamp_esc = shelbi_agent::shell_escape(&clamp_script_path.to_string_lossy());
-    format!(
-        "#!/bin/sh\n\
-         # Auto-generated by shelbi; rewritten on every `ensure_dashboard`.\n\
-         sess='{sess}'\n\
-         sb=$(tmux show-environment -t \"$sess\" {env} 2>/dev/null | sed -n 's/^{env}=//p')\n\
-         [ -z \"$sb\" ] && exit 0\n\
-         # Sidebar pane still alive? (a crash/reload may have retired it)\n\
-         tmux display-message -p -t \"$sb\" '#{{pane_id}}' >/dev/null 2>&1 || exit 0\n\
-         aw=$(tmux display-message -p -t \"$sess\" '#{{window_id}}' 2>/dev/null)\n\
-         sw=$(tmux display-message -p -t \"$sb\" '#{{window_id}}' 2>/dev/null)\n\
-         [ -z \"$aw\" ] || [ -z \"$sw\" ] && exit 0\n\
-         # Already beside the active window — nothing to move.\n\
-         [ \"$sw\" = \"$aw\" ] && exit 0\n\
-         # Don't relocate into a window hosting the review interface: its own\n\
-         # review panel is that window's navigation, so the global sidebar\n\
-         # stays docked in the dashboard rather than migrating in (which would\n\
-         # also squish the panel to a 1-col orphan). Self-clearing — the pin is\n\
-         # unset and the panel pane killed when the interface closes, after\n\
-         # which the window travels like any other.\n\
-         panel=$(tmux show-environment -t \"$sess\" {panel_env} 2>/dev/null | sed -n 's/^{panel_env}=//p')\n\
-         if [ -n \"$panel\" ]; then\n\
-         \tpw=$(tmux display-message -p -t \"$panel\" '#{{window_id}}' 2>/dev/null)\n\
-         \t[ -n \"$pw\" ] && [ \"$pw\" = \"$aw\" ] && exit 0\n\
-         fi\n\
-         # Preserve the sidebar's exact current width across the move, and\n\
-         # remember the active window's focused pane so focus stays on the\n\
-         # agent/orchestrator rather than snapping to the sidebar.\n\
-         w=$(tmux display-message -p -t \"$sb\" '#{{pane_width}}' 2>/dev/null)\n\
-         prev=$(tmux display-message -p -t \"$aw\" '#{{pane_id}}' 2>/dev/null)\n\
-         if [ -n \"$w\" ]; then\n\
-         \ttmux join-pane -h -b -l \"$w\" -s \"$sb\" -t \"$aw\" 2>/dev/null \\\n\
-         \t\t|| tmux join-pane -h -b -s \"$sb\" -t \"$aw\" 2>/dev/null || exit 0\n\
-         else\n\
-         \ttmux join-pane -h -b -s \"$sb\" -t \"$aw\" 2>/dev/null || exit 0\n\
-         fi\n\
-         [ -n \"$prev\" ] && tmux select-pane -t \"$prev\" 2>/dev/null || true\n\
-         # Re-clamp to the canonical width now the sidebar has landed, so a\n\
-         # window switch defaults it to the dashboard's width instead of\n\
-         # whatever the destination window's layout reflowed it to. Runs\n\
-         # after the join so there's no race with the move above.\n\
-         sh {clamp} 2>/dev/null || true\n",
-        sess = session,
-        env = SIDEBAR_ENV_KEY,
-        panel_env = review_ui::PANEL_KEY,
-        clamp = clamp_esc,
-    )
-}
-
-/// Install the clamp hooks on the session so both nav panes (the traveling
-/// sidebar and, when open, the review panel) are re-clamped to `[MIN, MAX]`
-/// cols on:
+/// Install the clamp hooks on the session so each nav pane (the dashboard
+/// sidebar and, when open, a review window's own panel) is re-clamped to
+/// `[MIN, MAX]` cols on:
 ///
 /// - `client-attached` / `client-resized` — the client's terminal size
 ///   changed; without this the panes would scale proportionally with the
 ///   window, which is exactly what we're avoiding.
 /// - `window-layout-changed` — a pane was resized (a manual divider drag, a
-///   split appearing). This runs the script in **adopt** mode: dragging either
-///   nav pane makes its new width the shared width for BOTH — it's persisted to
-///   `SHELBI_SIDEBAR_W` and mirrored to the other pane, so the drag sticks
-///   instead of snapping back. The `!= c` idempotency guard (the mirror leaves
-///   both panes on the new target) keeps the hook from looping.
+///   split appearing). This runs the script in **adopt** mode: dragging a nav
+///   pane makes its new width the shared default (persisted to
+///   `SHELBI_SIDEBAR_W`) so the drag sticks instead of snapping back. No other
+///   pane is resized, so the hook fires no further layout change and can't loop.
 fn install_sidebar_clamp_hooks(
     host: &shelbi_core::Host,
     session: &str,
@@ -1357,8 +1272,9 @@ fn install_sidebar_clamp_hooks(
 ) -> Result<()> {
     let path_esc = shelbi_agent::shell_escape(&script_path.to_string_lossy());
     let apply_cmd = format!("run-shell -b 'sh {path_esc}'");
-    // A divider drag adopts + mirrors + persists the new shared width; a
-    // client attach/resize re-applies the stored (or default) shared width.
+    // A divider drag adopts + persists the dragged pane's new width as the
+    // shared default; a client attach/resize re-applies the stored (or default)
+    // width to each nav pane within its own window.
     let adopt_cmd = format!("run-shell -b 'sh {path_esc} adopt'");
     for event in ["client-attached", "client-resized"] {
         let _ = shelbi_ssh::run(host, ["tmux", "set-hook", "-t", session, event, &apply_cmd]);
@@ -1378,39 +1294,14 @@ fn clamp_sidebar(host: &shelbi_core::Host, script_path: &std::path::Path) -> std
     shelbi_ssh::run(host, ["sh", path.as_ref()]).map(|_| ())
 }
 
-/// Install the session's `after-select-window` hook so the traveling
-/// sidebar relocates to the newly-active window on EVERY switch — including
-/// native tmux ones (`prefix+n`, the window list) that shelbi never sees.
-/// The click paths (`shelbi open`, `show_view`, review focus) all run
-/// `select-window`, so they trip this hook too; no per-click wiring needed.
-fn install_sidebar_travel_hook(
-    host: &shelbi_core::Host,
-    session: &str,
-    script_path: &std::path::Path,
-) -> Result<()> {
-    let path_esc = shelbi_agent::shell_escape(&script_path.to_string_lossy());
-    let hook_cmd = format!("run-shell -b 'sh {path_esc}'");
-    let _ = shelbi_ssh::run(
-        host,
-        ["tmux", "set-hook", "-t", session, "after-select-window", &hook_cmd],
-    );
-    Ok(())
-}
-
-/// Resolve the traveling sidebar's stable pane id and pin it into the
+/// Resolve the dashboard sidebar's stable pane id and pin it into the
 /// `SHELBI_SIDEBAR` session env, best-effort.
 ///
-/// Preference order: a pin that's already set and still alive is kept (the
-/// pane may have traveled away from `dashboard`, so we must not re-derive it
-/// from a fixed position once it's moved). Otherwise — a fresh session, or a
-/// pre-`SHELBI_SIDEBAR` session healing on upgrade — we read the dashboard's
-/// left pane, which is the sidebar's home before any switch has moved it.
+/// The sidebar lives permanently in the dashboard window's left pane, so the
+/// pin always resolves to `dashboard.{left}`. Re-derived (not preserved) on
+/// every call: it never travels, so the left pane of the dashboard is
+/// authoritative even after a reload swapped the pane id.
 fn ensure_sidebar_pin(host: &shelbi_core::Host, session: &str) {
-    if let Ok(Some(existing)) = read_session_env_var(host, session, SIDEBAR_ENV_KEY) {
-        if pane_id_alive(host, &existing).unwrap_or(false) {
-            return;
-        }
-    }
     let target = format!("{session}:dashboard.{{left}}");
     if let Ok(pane_id) = shelbi_ssh::run_capture(
         host,
@@ -1423,78 +1314,24 @@ fn ensure_sidebar_pin(host: &shelbi_core::Host, session: &str) {
     }
 }
 
-/// Wire the traveling sidebar for `session`: pin its pane id, (re)write the
-/// travel script, and install the `after-select-window` hook. Idempotent and
-/// best-effort — called on both the fresh-bootstrap and already-running heal
-/// paths so an upgraded session gains the behavior without a restart.
-fn ensure_sidebar_travel(
-    host: &shelbi_core::Host,
-    session: &str,
-    workdir: &std::path::Path,
-) -> Result<()> {
+/// Wire the dashboard-only sidebar for `session`: pin its pane id (the
+/// dashboard's left pane) and retire any legacy `after-select-window` travel
+/// hook + its generated `sidebar-travel.sh` so an upgraded session stops
+/// relocating panes on every window switch. Idempotent and best-effort —
+/// called on both the fresh-bootstrap and already-running heal paths.
+fn ensure_dashboard_sidebar(host: &shelbi_core::Host, session: &str, workdir: &std::path::Path) {
     ensure_sidebar_pin(host, session);
-    // The travel script re-runs the clamp after it moves the sidebar, so it
-    // needs the clamp script's path. `ensure_dashboard` writes the clamp to
-    // this same location on every call (both the fresh and heal paths), so it
-    // is always present by the time this runs.
-    let clamp_script_path = workdir.join("sidebar-clamp.sh");
-    let travel_script_path = workdir.join("sidebar-travel.sh");
-    std::fs::write(
-        &travel_script_path,
-        sidebar_travel_script(session, &clamp_script_path),
-    )
-    .map_err(Error::Io)?;
-    install_sidebar_travel_hook(host, session, &travel_script_path)?;
-    Ok(())
-}
-
-/// Before killing a workspace's window(s), rescue the traveling sidebar if it
-/// currently lives in one of them — `kill-window` takes every pane in the
-/// window down with it, and the sidebar is a single shared pane we can't lose.
-///
-/// When the sidebar is in a doomed window (i.e. the user was viewing that
-/// workspace when it was torn down), relocate it back into the dashboard
-/// window at its preserved width and focus the dashboard, satisfying the
-/// "focus falls back to the dashboard" teardown guarantee. A no-op — and no
-/// focus change — when the sidebar is elsewhere (the common headless-reap
-/// case, where the hub isn't viewing the workspace at all). Best-effort:
-/// every tmux call is allowed to fail without blocking the teardown.
-pub(crate) fn evict_sidebar_from_windows(host: &Host, session: &str, doomed_window_ids: &[String]) {
-    let Ok(Some(sidebar)) = read_session_env_var(host, session, SIDEBAR_ENV_KEY) else {
-        return;
-    };
-    let Ok(win) = shelbi_ssh::run_capture(
+    // Clear the old travel hook. A session created by an older shelbi still
+    // fires `after-select-window` on every switch; the script it invoked is no
+    // longer generated, so leaving the hook installed would run a now-missing
+    // file. `set-hook -u` removes the shelbi-owned hook entirely.
+    let _ = shelbi_ssh::run(
         host,
-        ["tmux", "display-message", "-p", "-t", &sidebar, "#{window_id}"],
-    ) else {
-        return;
-    };
-    let win = win.trim();
-    if win.is_empty() || !doomed_window_ids.iter().any(|w| w == win) {
-        return;
-    }
-    let width = shelbi_ssh::run_capture(
-        host,
-        ["tmux", "display-message", "-p", "-t", &sidebar, "#{pane_width}"],
-    )
-    .ok();
-    let dashboard = format!("{session}:dashboard");
-    let mut join: Vec<String> = vec![
-        "tmux".into(),
-        "join-pane".into(),
-        "-h".into(),
-        "-b".into(),
-    ];
-    if let Some(w) = width.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
-        join.push("-l".into());
-        join.push(w.to_string());
-    }
-    join.push("-s".into());
-    join.push(sidebar);
-    join.push("-t".into());
-    join.push(dashboard.clone());
-    let _ = shelbi_ssh::run(host, &join);
-    let _ = shelbi_ssh::run(host, ["tmux", "select-window", "-t", &dashboard]);
+        ["tmux", "set-hook", "-u", "-t", session, "after-select-window"],
+    );
+    // Remove the stale generator output so nothing on disk claims the old
+    // behavior; the next `ensure_dashboard` no longer rewrites it.
+    let _ = std::fs::remove_file(workdir.join("sidebar-travel.sh"));
 }
 
 /// Install a global `session-closed` hook on the tmux server so that when
@@ -2072,14 +1909,10 @@ fn reload_all(session: &str, project_name: &str, shelbi_bin: &str, report: &mut 
     report.orchestrator = reload_orchestrator_pane(session, project_name, shelbi_bin);
 }
 
-/// Respawn the sidebar pane. Prefer the stable pane id pinned in
-/// `SHELBI_SIDEBAR` at bootstrap: the sidebar TRAVELS between windows, so
-/// the positional `dashboard.{left}` no longer reliably resolves to it (when
-/// the user is in a workspace window the leftmost dashboard pane is the
-/// orchestrator). Fall back to the positional target for a session that
-/// pre-dates the pin (upgrade heal sets it, but a reload may race ahead of
-/// the next bootstrap) — before any switch the sidebar is still its home
-/// `dashboard.{left}`, so the fallback is correct for the un-traveled case.
+/// Respawn the sidebar pane. The sidebar lives permanently in the dashboard's
+/// left pane, so `dashboard.{left}` always resolves to it; prefer the pinned
+/// `SHELBI_SIDEBAR` pane id when it's still alive (identical target, one fewer
+/// positional lookup) and fall back to the position otherwise.
 fn reload_sidebar(session: &str, project_name: &str, shelbi_bin: &str) -> PaneReloadStatus {
     let sidebar_target = read_session_env_var(&Host::Local, session, SIDEBAR_ENV_KEY)
         .ok()
@@ -2501,33 +2334,26 @@ mod pane_cmd_tests {
     }
 
     #[test]
-    fn sidebar_clamp_script_targets_the_traveling_pane_not_a_fixed_position() {
+    fn sidebar_clamp_script_sizes_each_nav_pane_without_cross_window_mirroring() {
         let out = sidebar_clamp_script("shelbi-myapp");
-        // Resolves the pane from the session env (it travels), never the
-        // old fixed `dashboard.{left}` — a clamp keyed to that position
-        // would resize whatever pane happens to sit there after a switch.
+        // Sizes the dashboard sidebar (resolved from the session env pin).
         assert!(out.contains(SIDEBAR_ENV_KEY), "reads $SHELBI_SIDEBAR: {out}");
-        assert!(
-            !out.contains("dashboard.{left}"),
-            "must not clamp a fixed position: {out}"
-        );
         assert!(out.contains("resize-pane"), "clamps a width: {out}");
         // The clamp band is threaded through from the consts.
         assert!(out.contains(&SIDEBAR_MIN_COLS.to_string()));
         assert!(out.contains(&SIDEBAR_MAX_COLS.to_string()));
-        // It also handles the review panel with the same width so the two nav
-        // panes stay locked together, and guards each resize so wiring it to
-        // `window-layout-changed` can't loop.
+        // It also sizes a review window's own panel — within that window, not
+        // mirrored to the sidebar.
         assert!(
             out.contains(review_ui::PANEL_KEY),
-            "handles the review panel alongside the sidebar: {out}"
+            "sizes the review panel alongside the sidebar: {out}"
         );
         assert!(
             out.contains("[ \"$cur\" = \"$2\" ] && return 0"),
             "idempotent `!= c` guard so the layout-changed hook can't loop: {out}"
         );
-        // A user drag adopts + persists a shared width override, mirrored to
-        // both panes, instead of reverting to the 25% formula.
+        // A drag adopts + persists the dragged pane's width as the shared
+        // default so it sticks across resizes.
         assert!(
             out.contains(SIDEBAR_WIDTH_KEY),
             "reads/writes the shared-width override: {out}"
@@ -2542,79 +2368,52 @@ mod pane_cmd_tests {
             out.contains(SIDEBAR_WW_KEY),
             "tracks last window width to tell a drag from a resize: {out}"
         );
+        // No cross-window mirroring: the old adopt branch resized BOTH nav panes
+        // to the dragged width (`apply_one "$panel" "$new"`). That mirror is
+        // gone — a drag persists the shared default and exits, resizing nothing.
+        assert!(
+            !out.contains("apply_one \"$sb\" \"$new\"")
+                && !out.contains("apply_one \"$panel\" \"$new\""),
+            "adopt must not mirror the dragged width onto the other pane: {out}"
+        );
+        // The dragged width is persisted then the branch exits immediately.
+        let persist = out
+            .find("set-environment -t \"$sess\" SHELBI_SIDEBAR_W \"$new\"")
+            .expect("adopt persists the dragged width");
+        let after_persist = &out[persist..];
+        let exit = after_persist.find("exit 0").expect("adopt exits after persisting");
+        // Nothing resizes a pane between persisting and exiting the adopt branch.
+        assert!(
+            !after_persist[..exit].contains("apply_one"),
+            "adopt persists-and-exits without resizing any pane: {out}"
+        );
+        // Both nav panes are still sized (independently) by the per-window apply
+        // at the tail.
+        assert!(
+            out.contains("apply_one \"$sb\" \"$(target_for \"$sb\")\"")
+                && out.contains("apply_one \"$panel\" \"$(target_for \"$panel\")\""),
+            "each nav pane is sized within its own window: {out}"
+        );
     }
 
     #[test]
-    fn sidebar_travel_script_joins_preserving_width_and_avoids_focus_steal() {
-        let clamp = std::path::Path::new("/tmp/sidebar-clamp.sh");
-        let out = sidebar_travel_script("shelbi-myapp", clamp);
-        // Reads the pinned pane id, moves it with join-pane into the active
-        // window's LEFT edge (`-b -h`) at its captured width (`-l`), and is a
-        // no-op when it's already beside the active window.
-        assert!(out.contains(SIDEBAR_ENV_KEY), "reads $SHELBI_SIDEBAR: {out}");
-        assert!(out.contains("#{pane_width}"), "captures width: {out}");
-        assert!(out.contains("join-pane -h -b -l"), "join preserves width: {out}");
-        assert!(
-            out.contains("[ \"$sw\" = \"$aw\" ] && exit 0"),
-            "no-op when already beside the active window: {out}"
-        );
-        // Skips a window hosting the review interface so the sidebar stays
-        // docked in the dashboard instead of migrating into (and squishing) the
-        // review panel. Keyed off the live panel pin so it self-clears on close.
-        assert!(
-            out.contains(review_ui::PANEL_KEY),
-            "reads the review-panel pin to detect a review window: {out}"
-        );
-        assert!(
-            out.contains("[ \"$pw\" = \"$aw\" ] && exit 0"),
-            "skips travel when the active window hosts the review panel: {out}"
-        );
-        // Refocuses the prior pane so the switch never snaps focus onto the
-        // sidebar.
-        assert!(out.contains("select-pane -t \"$prev\""), "restores focus: {out}");
-        // The session name is baked in so the hook needs no arguments.
-        assert!(out.contains("sess='shelbi-myapp'"), "session pinned: {out}");
-        // After the move it re-runs the clamp so a window switch lands the
-        // sidebar at the canonical width, and does so *after* the join so
-        // there's no race — the clamp line follows the focus-restore line.
-        assert!(
-            out.contains("sh /tmp/sidebar-clamp.sh"),
-            "re-clamps after travel: {out}"
-        );
-        let refocus = out.find("select-pane -t \"$prev\"").unwrap();
-        let reclamp = out.find("sh /tmp/sidebar-clamp.sh").unwrap();
-        assert!(reclamp > refocus, "clamp runs after the move, not before: {out}");
-    }
-
-    #[test]
-    fn sidebar_scripts_are_syntactically_valid_shell() {
-        // The travel/clamp bodies are shell embedded in Rust string literals
-        // (tabs, `\`-continuations, nested tmux format braces) — exactly the
-        // kind of thing an edit silently breaks. Pipe each through `sh -n` so
-        // a malformed script fails here rather than as a dead hook at runtime.
-        for (label, script) in [
-            ("clamp", sidebar_clamp_script("shelbi-myapp")),
-            (
-                "travel",
-                sidebar_travel_script(
-                    "shelbi-myapp",
-                    std::path::Path::new("/tmp/sidebar-clamp.sh"),
-                ),
-            ),
-        ] {
-            let out = std::process::Command::new("sh")
-                .args(["-n", "-c", &script])
-                .output();
-            match out {
-                Ok(out) => assert!(
-                    out.status.success(),
-                    "{label} script is not valid shell: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                ),
-                // No `sh` on PATH (unlikely on a dev/CI box) — skip rather
-                // than fail the suite for an environment gap.
-                Err(_) => return,
-            }
+    fn sidebar_clamp_script_is_syntactically_valid_shell() {
+        // The clamp body is shell embedded in a Rust string literal (tabs,
+        // `\`-continuations, nested tmux format braces) — exactly the kind of
+        // thing an edit silently breaks. Pipe it through `sh -n` so a malformed
+        // script fails here rather than as a dead hook at runtime.
+        let script = sidebar_clamp_script("shelbi-myapp");
+        let out = std::process::Command::new("sh")
+            .args(["-n", "-c", &script])
+            .output();
+        // No `sh` on PATH (unlikely on a dev/CI box) — skip rather than fail
+        // the suite for an environment gap.
+        if let Ok(out) = out {
+            assert!(
+                out.status.success(),
+                "clamp script is not valid shell: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     }
 
@@ -4266,6 +4065,270 @@ mod reload_target_tmux_tests {
                 .filter(|line| !line.trim().is_empty())
                 .count(),
             2
+        );
+    }
+
+    /// A short-lived orchestrator runner so a fresh `ensure_dashboard` splits a
+    /// real (but quickly-reaped) pane instead of launching `claude`.
+    fn sleepy_orchestrator_project(
+        project_name: &str,
+        hub_work_dir: &std::path::Path,
+    ) -> shelbi_core::Project {
+        let mut project = non_codex_project(project_name, hub_work_dir);
+        let runner = project.agent_runners.get_mut("claude").unwrap();
+        runner.command = "sleep".into();
+        runner.flags = vec!["30".into()];
+        project
+    }
+
+    fn session_hooks(session: &str) -> String {
+        String::from_utf8_lossy(
+            &std::process::Command::new("tmux")
+                .args(["show-hooks", "-t", session])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .into_owned()
+    }
+
+    fn window_id_of(target: &str) -> String {
+        String::from_utf8_lossy(
+            &std::process::Command::new("tmux")
+                .args(["display-message", "-p", "-t", target, "#{window_id}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string()
+    }
+
+    /// The dashboard-only sidebar: a fresh bootstrap must NOT install an
+    /// `after-select-window` hook (nothing travels), must pin `SHELBI_SIDEBAR`
+    /// to the dashboard's left pane, and must not emit `sidebar-travel.sh`.
+    #[test]
+    fn bootstrap_installs_no_after_select_window_hook_and_homes_the_sidebar() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::install(temp.path());
+
+        crate::tmux_test_support::use_private_tmux_server();
+        let project_name = format!("dash-only-sidebar-{}", std::process::id());
+        let hub_work_dir = temp.path().join("repo");
+        std::fs::create_dir_all(&hub_work_dir).unwrap();
+        shelbi_state::save_project(&sleepy_orchestrator_project(&project_name, &hub_work_dir))
+            .unwrap();
+
+        let session = format!("shelbi-{project_name}");
+        let stash = format!("_{session}");
+        kill_session(&session);
+        kill_session(&stash);
+        let _sessions = SessionGuard::new(&[&session, &stash]);
+        let _tmux_globals = TmuxGlobalsGuard::capture();
+
+        assert_eq!(
+            ensure_dashboard(&project_name).unwrap(),
+            BootstrapStatus::Started
+        );
+
+        // No traveling: the session carries no `after-select-window` hook.
+        assert!(
+            !session_hooks(&session).contains("after-select-window"),
+            "a dashboard-only sidebar installs no travel hook: {}",
+            session_hooks(&session)
+        );
+
+        // The sidebar is pinned to the dashboard's left pane and lives there.
+        let sidebar = read_session_env_var(&Host::Local, &session, SIDEBAR_ENV_KEY)
+            .unwrap()
+            .expect("SHELBI_SIDEBAR pinned");
+        let left = format!("{session}:dashboard.{{left}}");
+        assert_eq!(
+            window_id_of(&sidebar),
+            window_id_of(&format!("{session}:dashboard")),
+            "sidebar lives in the dashboard window"
+        );
+        let left_id = String::from_utf8_lossy(
+            &std::process::Command::new("tmux")
+                .args(["display-message", "-p", "-t", &left, "#{pane_id}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(sidebar, left_id, "sidebar pin IS the dashboard's left pane");
+
+        // The clamp script is emitted; the travel script is not.
+        let project_dir = shelbi_state::project_dir(&project_name).unwrap();
+        assert!(project_dir.join("sidebar-clamp.sh").exists());
+        assert!(
+            !project_dir.join("sidebar-travel.sh").exists(),
+            "sidebar-travel.sh must not be generated"
+        );
+    }
+
+    /// The heal/upgrade path must retire a legacy `after-select-window` travel
+    /// hook (and its stale generated script) left by an older shelbi, so an
+    /// already-running session stops relocating panes on every window switch.
+    #[test]
+    fn heal_clears_a_legacy_after_select_window_travel_hook() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::install(temp.path());
+
+        crate::tmux_test_support::use_private_tmux_server();
+        let project_name = format!("heal-travel-hook-{}", std::process::id());
+        let hub_work_dir = temp.path().join("repo");
+        std::fs::create_dir_all(&hub_work_dir).unwrap();
+        shelbi_state::save_project(&non_codex_project(&project_name, &hub_work_dir)).unwrap();
+
+        let session = format!("shelbi-{project_name}");
+        let stash = format!("_{session}");
+        kill_session(&session);
+        kill_session(&stash);
+        let _sessions = SessionGuard::new(&[&session, &stash]);
+        let _tmux_globals = TmuxGlobalsGuard::capture();
+
+        // A live two-pane dashboard (so ensure_dashboard heals rather than
+        // rebuilds), plus a legacy travel hook and a stale generated script.
+        start_session(&session, "dashboard");
+        let split = std::process::Command::new("tmux")
+            .args([
+                "split-window",
+                "-d",
+                "-h",
+                "-t",
+                &format!("{session}:dashboard"),
+                "sh",
+                "-c",
+                "sleep 600",
+            ])
+            .status()
+            .unwrap();
+        assert!(split.success(), "fixture dashboard split failed");
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "set-hook",
+                "-t",
+                &session,
+                "after-select-window",
+                "run-shell -b 'sh /nonexistent-sidebar-travel.sh'",
+            ])
+            .status();
+        assert!(session_hooks(&session).contains("after-select-window"));
+        let project_dir = shelbi_state::project_dir(&project_name).unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("sidebar-travel.sh"), "# stale\n").unwrap();
+
+        assert_eq!(
+            ensure_dashboard(&project_name).unwrap(),
+            BootstrapStatus::AlreadyRunning
+        );
+
+        assert!(
+            !session_hooks(&session).contains("after-select-window"),
+            "heal must remove the legacy travel hook: {}",
+            session_hooks(&session)
+        );
+        assert!(
+            !project_dir.join("sidebar-travel.sh").exists(),
+            "heal must remove the stale travel script"
+        );
+    }
+
+    /// A non-dashboard workspace window has no sidebar pane, and killing it
+    /// can't strand or lose the dashboard sidebar (nothing ever traveled).
+    #[test]
+    fn killing_a_workspace_window_leaves_the_dashboard_sidebar_in_place() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::install(temp.path());
+
+        crate::tmux_test_support::use_private_tmux_server();
+        let project_name = format!("kill-ws-keeps-sidebar-{}", std::process::id());
+        let hub_work_dir = temp.path().join("repo");
+        std::fs::create_dir_all(&hub_work_dir).unwrap();
+        shelbi_state::save_project(&sleepy_orchestrator_project(&project_name, &hub_work_dir))
+            .unwrap();
+
+        let session = format!("shelbi-{project_name}");
+        let stash = format!("_{session}");
+        kill_session(&session);
+        kill_session(&stash);
+        let _sessions = SessionGuard::new(&[&session, &stash]);
+        let _tmux_globals = TmuxGlobalsGuard::capture();
+
+        assert_eq!(
+            ensure_dashboard(&project_name).unwrap(),
+            BootstrapStatus::Started
+        );
+        let sidebar = read_session_env_var(&Host::Local, &session, SIDEBAR_ENV_KEY)
+            .unwrap()
+            .expect("SHELBI_SIDEBAR pinned");
+        let dashboard_win = window_id_of(&format!("{session}:dashboard"));
+
+        // A workspace window: it holds only its own pane, no sidebar.
+        let ws_win = String::from_utf8_lossy(
+            &std::process::Command::new("tmux")
+                .args([
+                    "new-window",
+                    "-P",
+                    "-F",
+                    "#{window_id}",
+                    "-t",
+                    &format!("{session}:"),
+                    "-n",
+                    "worker",
+                    "sh",
+                    "-c",
+                    "sleep 600",
+                ])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let ws_panes = String::from_utf8_lossy(
+            &std::process::Command::new("tmux")
+                .args(["list-panes", "-t", &ws_win, "-F", "#{pane_id}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(ws_panes.len(), 1, "a workspace window has no sidebar pane");
+        assert!(!ws_panes.contains(&sidebar));
+
+        // Killing the workspace window can't touch the dashboard sidebar.
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-window", "-t", &ws_win])
+            .status();
+        assert!(
+            pane_id_alive(&Host::Local, &sidebar).unwrap_or(false),
+            "sidebar survives the workspace-window kill"
+        );
+        assert_eq!(
+            window_id_of(&sidebar),
+            dashboard_win,
+            "sidebar never left the dashboard window"
         );
     }
 }

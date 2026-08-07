@@ -901,7 +901,7 @@ impl App {
             // no tmux) mean the interface couldn't be embedded here. Don't kick
             // off another load — that risks a launch loop — just focus the
             // freshly loaded window so the review is at least on screen (the
-            // traveling sidebar follows via the `after-select-window` hook).
+            // dashboard sidebar stays put; switching windows relocates nothing).
             _ => {
                 let _ = run_tmux(["select-window", "-t", target]);
                 self.status_line = format!("▶ reviewing {task_id}");
