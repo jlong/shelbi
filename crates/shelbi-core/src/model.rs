@@ -110,8 +110,10 @@ pub struct Project {
     pub zen: ZenConfig,
     /// Periodic heartbeat the hub-side poller writes into
     /// `~/.shelbi/events.log` so the orchestrator's `events tail --follow`
-    /// watch has a guaranteed recurring trigger when the board is quiet.
-    /// Default `3m`; set to `off` to disable. See [`HeartbeatConfig`].
+    /// watch has a guaranteed recurring trigger when the board is quiet. It is
+    /// the single idle tick that also carries liveness — the standalone
+    /// keepalive is retired. Default `60s` base backing off to a `5m` cap; set
+    /// to `off` to disable. See [`HeartbeatConfig`].
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
     /// Project-level git config: where workspace branches are based and how
@@ -282,9 +284,9 @@ pub fn default_prompt_injection(command: &str) -> PromptInjectionSpec {
 /// [`max`](HeartbeatConfig::max). This type just carries the two bounds; the
 /// back-off state machine lives in the poller.
 ///
-/// On disk the value is either a bare duration scalar (`heartbeat: 3m`,
+/// On disk the value is either a bare duration scalar (`heartbeat: 60s`,
 /// interval-only with the default cap), the literal `off`, or a map that
-/// sets both bounds (`heartbeat: { interval: 3m, max: 60m }`). Durations are
+/// sets both bounds (`heartbeat: { interval: 60s, max: 5m }`). Durations are
 /// `45s` / `3m` / `1h`; bare integers are rejected — there's no implicit
 /// unit. See `HEARTBEAT_DEFAULT` / `HEARTBEAT_MAX_DEFAULT` for the defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,16 +300,20 @@ pub enum HeartbeatConfig {
     On { interval: Duration, max: Duration },
 }
 
-/// Default standard heartbeat cadence: 3 minutes. Tuned to be frequent enough
-/// that a stuck orchestrator wakes up within a couple of intervals, but rare
-/// enough that an idle hub doesn't bloat `events.log` with thousands of lines
-/// a day.
-pub const HEARTBEAT_DEFAULT: Duration = Duration::from_secs(180);
+/// Default standard heartbeat cadence: 60 seconds. This single tick is both the
+/// idle liveness signal and the reconcile/sweep trigger — with the standalone
+/// keepalive retired, the absence of any stream line (a real event *or* a
+/// heartbeat) past this interval plus a grace margin is what tells a consumer
+/// the producing follower has died. 60s is frequent enough that a dead follower
+/// is caught quickly, yet a busy board suppresses it entirely (a real event in
+/// the interval stands in for it), so an active hub never pays the chatter.
+pub const HEARTBEAT_DEFAULT: Duration = Duration::from_secs(60);
 
-/// Default back-off cap: 60 minutes. On a fully quiescent board the interval
-/// doubles each idle tick (3m → 6m → 12m → …) but never exceeds this, so even
-/// a long-idle hub still sweeps for a silently-stuck task about once an hour.
-pub const HEARTBEAT_MAX_DEFAULT: Duration = Duration::from_secs(3_600);
+/// Default back-off cap: 5 minutes. On a fully quiescent board the interval
+/// doubles each idle tick (60s → 2m → 4m → 5m) but never exceeds this, so a
+/// quiet hub emits one line at most every 5 minutes while still sweeping for a
+/// silently-stuck task — and worst-case dead-follower detection is ≈ the cap.
+pub const HEARTBEAT_MAX_DEFAULT: Duration = Duration::from_secs(300);
 
 impl Default for HeartbeatConfig {
     fn default() -> Self {
@@ -462,7 +468,7 @@ impl Serialize for HeartbeatConfig {
 impl<'de> Deserialize<'de> for HeartbeatConfig {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         // Accept both the bare scalar (`3m` / `off`) and the map form
-        // (`{ interval: 3m, max: 60m }`). Every field of the map is optional
+        // (`{ interval: 60s, max: 5m }`). Every field of the map is optional
         // so a partial map fills the rest from defaults.
         #[derive(Deserialize)]
         #[serde(untagged)]
@@ -4040,21 +4046,21 @@ updated_at: 2026-06-19T00:00:00Z
     // ---- HeartbeatConfig --------------------------------------------------
 
     #[test]
-    fn heartbeat_config_default_is_three_minutes_with_hour_cap() {
+    fn heartbeat_config_default_is_one_minute_with_five_minute_cap() {
         assert_eq!(
             HeartbeatConfig::default(),
             HeartbeatConfig::On {
-                interval: Duration::from_secs(180),
-                max: Duration::from_secs(3_600),
+                interval: Duration::from_secs(60),
+                max: Duration::from_secs(300),
             }
         );
         assert_eq!(
             HeartbeatConfig::default().interval(),
-            Some(Duration::from_secs(180))
+            Some(Duration::from_secs(60))
         );
         assert_eq!(
             HeartbeatConfig::default().max(),
-            Some(Duration::from_secs(3_600))
+            Some(Duration::from_secs(300))
         );
     }
 

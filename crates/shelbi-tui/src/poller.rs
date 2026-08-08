@@ -150,6 +150,16 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     // pre-existing dead-but-assigned slot on purpose.
     let mut review_resume: HashMap<String, ReviewResumeState> = HashMap::new();
 
+    // Scoped CI poll state. Project-wide (needs the whole in-review set), so it
+    // lives on the supervisor tick. Its own cadence (`CI_POLL_CADENCE`) keeps
+    // the GitHub round-trips gentle, independent of the 5s supervisor tick, and
+    // the sweep itself is conditional: no gh call when nothing is in review. A
+    // poller restart re-seeds it to empty on purpose — the first sweep then
+    // re-emits each in-review PR's terminal verdict, reconciling any `ci` event
+    // missed while the hub was down.
+    let mut ci_poll = shelbi_orchestrator::zen::ScopedCiState::new();
+    let mut last_ci_poll: Option<Instant> = None;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -232,6 +242,17 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
                 // clobbered, and crash-loop-capped so a slot that can't stay up
                 // surfaces a gave-up line instead of relaunching forever.
                 maybe_resume_stranded_review_slots(&project, &mut review_resume);
+
+                // Scoped CI poll: for every in-review PR, sample its checks and
+                // emit a `ci` state-change on a pass/fail transition so CI flows
+                // through the same follower/reaction path as any other event.
+                // Conditional (no gh call when nothing is in review) and gated
+                // on connectivity + its own cadence. This is also the CI
+                // reconcile the heartbeat sweep relies on: because it re-derives
+                // from disk + GitHub each run and re-emits on a fresh restart,
+                // an in-review terminal verdict whose `ci` event was missed is
+                // recovered here rather than sitting invisible.
+                maybe_poll_ci(&project, &mut ci_poll, &mut last_ci_poll, online_probe);
             }
             Err(e) => tracing::debug!(
                 project = %project.name,
@@ -409,6 +430,45 @@ struct HeartbeatSchedule {
     /// `None` whenever Zen is observed off so re-enabling Zen doesn't fire a
     /// re-read off a stale, hour-old timestamp.
     zen_last_reread: Option<Instant>,
+}
+
+/// Cadence for the scoped CI poll. Independent of the 5s supervisor tick so a
+/// board with an in-review PR awaiting CI polls GitHub gently — CI checks take
+/// minutes, so a per-tick round-trip would be wasteful and rate-limit-hostile.
+/// The sweep is *also* conditional inside
+/// [`shelbi_orchestrator::zen::scoped_ci_poll`]: it makes no gh call at all when
+/// nothing is in review, so a quiet board pays nothing.
+const CI_POLL_CADENCE: Duration = Duration::from_secs(30);
+
+/// Run one scoped CI sweep for `project` when the cadence is due and the box is
+/// online. On any in-review PR's pass/fail transition this emits a `ci` event
+/// into the unified stream (see [`shelbi_orchestrator::zen::scoped_ci_poll`]),
+/// which the orchestrator reacts to like a review marker (merge on success,
+/// bounce on failure). Best-effort: a sweep error is logged, never fatal.
+///
+/// Connectivity gated: a CI poll is a GitHub round-trip, so while the box is
+/// offline we skip without consuming the cadence, retrying on the next tick
+/// once connectivity returns.
+fn maybe_poll_ci(
+    project: &Project,
+    state: &mut shelbi_orchestrator::zen::ScopedCiState,
+    last_poll: &mut Option<Instant>,
+    is_online: impl Fn() -> bool,
+) {
+    let now = Instant::now();
+    if let Some(prev) = last_poll {
+        if now.duration_since(*prev) < CI_POLL_CADENCE {
+            return;
+        }
+    }
+    if !is_online() {
+        // Don't burn the cadence while offline — retry as soon as we're back.
+        return;
+    }
+    *last_poll = Some(now);
+    if let Err(e) = shelbi_orchestrator::zen::scoped_ci_poll(project, state) {
+        tracing::warn!(project = %project.name, error = %e, "scoped CI poll failed");
+    }
 }
 
 /// Consider emitting one heartbeat for `project`. Called once per poller

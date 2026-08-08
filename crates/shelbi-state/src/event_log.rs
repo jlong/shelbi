@@ -98,6 +98,7 @@ pub enum EventKind {
     Dispatch,
     Send,
     Rebase,
+    Ci,
     Zen,
     ZenDryrun,
     Supervision,
@@ -115,6 +116,11 @@ impl EventKind {
             EventKind::Send
         } else if body.contains(" heartbeat") || body.ends_with(" heartbeat") {
             EventKind::Heartbeat
+        } else if body.contains(" ci ") {
+            // A `ci` state-change line carries `task=` metadata, so match its
+            // ` ci ` discriminator before the broad `task=` branch below or a
+            // CI verdict would be mislabeled as an ordinary task transition.
+            EventKind::Ci
         } else if body.contains(" task=") || body.starts_with("task=") {
             EventKind::Task
         } else if body.contains(" workspace=") || body.starts_with("workspace=") {
@@ -996,6 +1002,53 @@ pub fn append_task_event(
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
     let body = task_event_body(project, task_id, workflow, from, to, reason);
+    let line = format!("{ts} {body}");
+    match append_event_line(&line) {
+        Ok(()) => Ok(()),
+        Err(e) if is_permission_denied(&e) => emit_event_body(&body),
+        Err(e) => Err(e),
+    }
+}
+
+/// Append a CI state-change line to `~/.shelbi/events.log`:
+///
+/// ```text
+/// <rfc3339> project=<p> task=<id> ci pr=<pr> check=<check> conclusion=<conclusion> head_sha=<sha>
+/// ```
+///
+/// Emitted by the hub poller's scoped CI poll when an in-review PR's checks
+/// reach a terminal pass/fail — the transition that used to be invisible to
+/// the orchestrator outside a blocking `shelbi zen ci-watch` window. Routing
+/// CI into the same stream as every other state change lets the orchestrator
+/// react through its normal follower/reaction path: `conclusion=success` on an
+/// in-review PR runs the merge, `conclusion=failure` bounces the task back to
+/// the workspace with the failing check.
+///
+/// The leading `project=<name>` scope is load-bearing for the same reason
+/// every other event carries it — `events.log` is hub-global, so each
+/// orchestrator filters to `project=<its-own-name>`. The ` ci ` keyword sits
+/// between the `task=` scope and the CI detail so [`EventKind::from_body`]
+/// classifies the line as [`EventKind::Ci`] rather than a plain task
+/// transition. `check` and `conclusion` fold whitespace to underscores so the
+/// line stays a single parseable record; `head_sha` is the commit CI graded
+/// (the PR's reviewed head).
+pub fn append_ci_event(
+    project: &str,
+    task_id: &str,
+    pr: u64,
+    check: &str,
+    conclusion: &str,
+    head_sha: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let task_id = sanitize_field(task_id);
+    let check = sanitize_reason(check);
+    let conclusion = sanitize_reason(conclusion);
+    let head_sha = sanitize_field(head_sha);
+    let body = format!(
+        "project={project} task={task_id} ci pr={pr} check={check} conclusion={conclusion} head_sha={head_sha}"
+    );
     let line = format!("{ts} {body}");
     match append_event_line(&line) {
         Ok(()) => Ok(()),
@@ -2126,6 +2179,27 @@ mod tests {
             serde_json::to_value(&send).unwrap()["kind"],
             serde_json::json!("send")
         );
+    }
+
+    #[test]
+    fn event_envelope_classifies_ci_state_change_not_as_a_task_transition() {
+        // A `ci` line carries `task=` metadata; its ` ci ` discriminator must
+        // win over the broad `task=` branch or CI verdicts would be mislabeled
+        // as ordinary task transitions and skip the CI reaction rule.
+        let green = EventEnvelope::from_log_line(
+            "2026-07-06T12:03:00+00:00 project=demo task=fix-login ci pr=42 check=all conclusion=success head_sha=deadbeef",
+        );
+        assert_eq!(green.kind, EventKind::Ci);
+        assert_eq!(green.project.as_deref(), Some("demo"));
+        assert_eq!(
+            serde_json::to_value(&green).unwrap()["kind"],
+            serde_json::json!("ci")
+        );
+
+        let red = EventEnvelope::from_log_line(
+            "2026-07-06T12:04:00+00:00 project=demo task=fix-login ci pr=42 check=build conclusion=failure head_sha=deadbeef",
+        );
+        assert_eq!(red.kind, EventKind::Ci);
     }
 
     #[test]

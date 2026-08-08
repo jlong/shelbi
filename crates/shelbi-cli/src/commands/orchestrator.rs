@@ -58,17 +58,18 @@ pub enum OrchestratorEventsCmd {
         /// (at-least-once). This is the Claude orchestrator's durable
         /// replacement for a raw `shelbi events tail --follow` watch.
         ///
-        /// The feed runs indefinitely, emitting a `{"feed":"keepalive", ...}`
-        /// line whenever it has been quiet (no batch) for ~30s so a watcher can
-        /// tell a live feed from a dead one — keepalives that stop arriving mean
-        /// the producer is gone, the observable signal for deaths that print no
-        /// terminal notice (SIGKILL, a reaped host shell). When the feed stops
-        /// on its own terms — a catchable termination signal (SIGTERM/SIGHUP/
-        /// SIGINT) or the optional `--max-lifetime` cap below — it prints a
-        /// terminal `{"feed":"expired"|"terminated", ...}` notice on stdout and
-        /// exits 0. Any batch left unacked at exit re-delivers to the next
-        /// follower. This feed is a latency accelerator; the source of truth for
-        /// never missing an event is a consumer's own periodic claim/ack drain.
+        /// The feed runs indefinitely. Liveness rides the unified event stream
+        /// itself: the hub always writes at least a heartbeat on its idle
+        /// cadence (and real events when busy), so a consumer that has seen no
+        /// line — batch or heartbeat — within the heartbeat interval plus a
+        /// grace margin can conclude the follower died and restart it. There is
+        /// no separate keepalive ping. When the feed stops on its own terms — a
+        /// catchable termination signal (SIGTERM/SIGHUP/SIGINT) or the optional
+        /// `--max-lifetime` cap below — it prints a terminal
+        /// `{"feed":"expired"|"terminated", ...}` notice on stdout and exits 0.
+        /// Any batch left unacked at exit re-delivers to the next follower. This
+        /// feed is a latency accelerator; the source of truth for never missing
+        /// an event is a consumer's own periodic claim/ack drain.
         #[arg(long)]
         follow: bool,
         /// Optional self-imposed wall-clock lifetime for `--follow`, e.g.
@@ -149,27 +150,6 @@ fn wait_next(project: &str, mut cursor: u64, timeout: Duration) -> Result<DrainR
 /// live-latency characteristics of the two watches are identical.
 const FEED_POLL: Duration = Duration::from_millis(250);
 
-/// How often the `--follow` feed emits a keepalive line while no batch is
-/// pending.
-///
-/// This is the load-bearing answer to "the stream died and looked identical to
-/// a quiet one". A terminal [`FeedNotice`] only covers the deaths the process
-/// lives to announce — a catchable signal or the `--max-lifetime` cap. The
-/// deaths that actually blinded the orchestrator in the field print nothing:
-/// an uncatchable `SIGKILL`, or the far more common case of the background
-/// shell that hosts the feed being reaped when the agent session is compacted,
-/// respawned, or simply moves on. A watcher tailing the feed's *output file*
-/// cannot tell that silence from a genuinely quiet board.
-///
-/// A periodic keepalive removes the ambiguity: while the feed lives it writes a
-/// `{"feed":"keepalive", ...}` line on this cadence even with nothing to
-/// deliver, so the *absence* of keepalives past this interval is itself the
-/// "producer is gone" signal — no terminal notice, exit code, or Monitor
-/// callback required. Set well under an orchestrator turn's timescale so a
-/// death is detectable within one turn, yet coarse enough not to flood the
-/// watch.
-const FEED_KEEPALIVE: Duration = Duration::from_secs(30);
-
 /// Durable claim/ack event feed — the Claude orchestrator's replacement for a
 /// raw `shelbi events tail --follow` watch.
 ///
@@ -195,11 +175,10 @@ const FEED_KEEPALIVE: Duration = Duration::from_secs(30);
 ///
 /// The loop is a pure filesystem poll of the persisted cursor and
 /// `events.log` — it holds no long-lived hub connection, so nothing on the hub
-/// side can recycle it out from under the consumer. Left alone it runs
-/// forever, emitting a [`FeedKeepalive`] line every [`FEED_KEEPALIVE`] whenever
-/// there is no batch to deliver. It stops on its own terms only two ways, both
-/// of which emit a terminal [`FeedNotice`] on stdout (and a line on stderr) and
-/// exit 0:
+/// side can recycle it out from under the consumer. Left alone it runs forever,
+/// emitting a batch only when one is pending. It stops on its own terms only
+/// two ways, both of which emit a terminal [`FeedNotice`] on stdout (and a line
+/// on stderr) and exit 0:
 ///
 /// * a catchable termination signal — SIGTERM/SIGHUP/SIGINT, e.g. an
 ///   environment reaper or a supervisor recycling the process; and
@@ -212,10 +191,13 @@ const FEED_KEEPALIVE: Duration = Duration::from_secs(30);
 /// An uncatchable `SIGKILL` — or the background shell hosting the feed being
 /// reaped when the agent session is recycled — still ends the process without a
 /// notice, but the same redelivery guarantee holds: no event is lost, only a
-/// restart is spent. That silent-death case is exactly what the keepalive
-/// covers — its absence, not any terminal notice, is what tells a watcher the
-/// producer is gone and the feed must be restarted. The keepalive is the
-/// stream's liveness signal; the source of truth for never missing an event
+/// restart is spent.
+///
+/// There is no separate keepalive ping. Liveness is subsumed by the unified
+/// event stream: the hub always writes at least a heartbeat on its idle cadence
+/// (and real events when busy), so a consumer that has seen no line — batch or
+/// heartbeat — for the heartbeat interval plus a grace margin can conclude the
+/// follower died and restart it. The source of truth for never missing an event
 /// remains the consumer's own periodic claim/ack drain (see the orchestrator
 /// instructions), for which this feed is only a latency accelerator.
 fn run_feed(project: &str, max_lifetime: Option<Duration>) -> Result<()> {
@@ -229,7 +211,7 @@ fn run_feed(project: &str, max_lifetime: Option<Duration>) -> Result<()> {
             anyhow!("failed to install signal handler {sig} for the event feed: {e}")
         })?;
     }
-    let outcome = feed_loop(project, max_lifetime, Some(FEED_KEEPALIVE), &signal)?;
+    let outcome = feed_loop(project, max_lifetime, &signal)?;
     emit_feed_notice(project, &outcome)
 }
 
@@ -242,16 +224,14 @@ fn run_feed(project: &str, max_lifetime: Option<Duration>) -> Result<()> {
 /// elapsed `max_lifetime`. With `max_lifetime = None` and no signal it loops
 /// forever, which is the default indefinite feed.
 ///
-/// `keepalive` is the liveness cadence: while it is `Some(interval)` and no
-/// batch is pending, the loop writes a [`FeedKeepalive`] line every `interval`
-/// so a watcher can tell a live-but-quiet feed from a dead one. A delivered
-/// batch resets the cadence, so keepalives only fill the quiet gaps. Pass
-/// `None` to suppress them (used by the exit-path tests, which never reach a
-/// quiet iteration).
+/// There is no keepalive line: liveness is carried by the unified stream (the
+/// hub's heartbeat and real events), so a quiet feed simply emits nothing until
+/// the next batch. A consumer detects a dead follower from the *absence* of any
+/// stream line past the heartbeat interval plus grace, not from a ping this
+/// loop writes.
 fn feed_loop(
     project: &str,
     max_lifetime: Option<Duration>,
-    keepalive: Option<Duration>,
     signal: &AtomicUsize,
 ) -> Result<FeedOutcome> {
     let start = Instant::now();
@@ -260,10 +240,6 @@ fn feed_loop(
     // so new events wait for the ack rather than growing the batch under a
     // churning delivery id.
     let mut emitted_at: Option<u64> = None;
-    // When we last wrote any line to stdout (a batch or a keepalive). A batch
-    // resets it so keepalives never crowd a busy feed — they only mark that the
-    // producer is still alive across a stretch of quiet.
-    let mut last_output = Instant::now();
     loop {
         let sig = signal.load(Ordering::Relaxed);
         if sig != 0 {
@@ -279,13 +255,6 @@ fn feed_loop(
             if let Some(batch) = scan_feed_batch(project, cursor)? {
                 emit_feed_batch(&batch)?;
                 emitted_at = Some(cursor);
-                last_output = Instant::now();
-            }
-        }
-        if let Some(interval) = keepalive {
-            if last_output.elapsed() >= interval {
-                emit_feed_keepalive(project)?;
-                last_output = Instant::now();
             }
         }
         thread::sleep(FEED_POLL);
@@ -343,44 +312,6 @@ fn emit_feed_notice(project: &str, outcome: &FeedOutcome) -> Result<()> {
     );
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer_pretty(&mut stdout, &notice)?;
-    stdout.write_all(b"\n")?;
-    stdout.flush()?;
-    Ok(())
-}
-
-/// The recovery instruction spelled out on the keepalive line so a watcher that
-/// notices the keepalives have stopped knows what to do without inferring it.
-const FEED_KEEPALIVE_NOTE: &str = "feed alive; if keepalives stop arriving the \
-     follower has died — re-run `shelbi orchestrator events next --follow`. The \
-     source of truth is your own periodic claim/ack drain, not this feed";
-
-/// Liveness line emitted on a quiet `--follow` feed every [`FEED_KEEPALIVE`].
-///
-/// Like [`FeedNotice`] it carries a `feed` discriminant (`"keepalive"`) that a
-/// [`FeedBatch`] never has, so a watcher never mistakes it for a batch. Unlike a
-/// notice it is *not* terminal — the feed keeps running. Its only job is to
-/// prove the producer is still alive between batches, so that the absence of
-/// keepalives is an observable "stream died" signal even for the deaths that
-/// print no terminal notice (SIGKILL, a reaped host shell).
-#[derive(Debug, Serialize)]
-struct FeedKeepalive {
-    feed: &'static str,
-    project: String,
-    note: &'static str,
-}
-
-fn emit_feed_keepalive(project: &str) -> Result<()> {
-    let keepalive = FeedKeepalive {
-        feed: "keepalive",
-        project: project.to_string(),
-        note: FEED_KEEPALIVE_NOTE,
-    };
-    // Compact single line: a keepalive is a heartbeat, one per interval, so a
-    // one-liner keeps the watch readable. Explicit flush because stdout is a
-    // pipe under `run_in_background` and block buffering would defeat the whole
-    // point of a liveness signal.
-    let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer(&mut stdout, &keepalive)?;
     stdout.write_all(b"\n")?;
     stdout.flush()?;
     Ok(())
@@ -1558,7 +1489,7 @@ mod tests {
         // elapsed on the first iteration, so the loop returns immediately
         // without sleeping or blocking forever.
         let signal = AtomicUsize::new(0);
-        let outcome = feed_loop("demo", Some(Duration::ZERO), None, &signal).unwrap();
+        let outcome = feed_loop("demo", Some(Duration::ZERO), &signal).unwrap();
         assert_eq!(outcome, FeedOutcome::Expired { after: Duration::ZERO });
     }
 
@@ -1569,7 +1500,7 @@ mod tests {
         // report the signal number and stop rather than stream on.
         let signal = AtomicUsize::new(SIGTERM as usize);
         // No lifetime cap: only the signal can end this loop.
-        let outcome = feed_loop("demo", None, None, &signal).unwrap();
+        let outcome = feed_loop("demo", None, &signal).unwrap();
         assert_eq!(outcome, FeedOutcome::Terminated { signal: SIGTERM });
     }
 
@@ -1592,7 +1523,7 @@ mod tests {
         // follower reaped mid-flight. The short cap trips on the second poll.
         let before = read_cursor("demo");
         let signal = AtomicUsize::new(0);
-        let outcome = feed_loop("demo", Some(Duration::from_millis(1)), None, &signal).unwrap();
+        let outcome = feed_loop("demo", Some(Duration::from_millis(1)), &signal).unwrap();
         assert!(matches!(outcome, FeedOutcome::Expired { .. }));
 
         // Death left the cursor untouched, so the next follower re-derives the
@@ -1633,44 +1564,23 @@ mod tests {
     }
 
     #[test]
-    fn feed_keepalive_is_distinguishable_from_a_batch_and_a_notice() {
-        // The keepalive carries a `feed` discriminant a batch never has, but a
-        // *different* value than the terminal notices — so a watcher tells all
-        // three apart: batch (has delivery_id), keepalive (feed=keepalive, feed
-        // still running), expired/terminated (feed stopped).
-        let keepalive = serde_json::to_value(FeedKeepalive {
-            feed: "keepalive",
-            project: "demo".to_string(),
-            note: FEED_KEEPALIVE_NOTE,
-        })
-        .unwrap();
-        assert_eq!(keepalive["feed"], "keepalive");
-        assert_ne!(keepalive["feed"], "expired");
-        assert_ne!(keepalive["feed"], "terminated");
-        assert!(keepalive.get("delivery_id").is_none());
-        assert!(keepalive["note"].as_str().unwrap().contains("re-run"));
-    }
-
-    #[test]
-    fn quiet_feed_emits_keepalives_and_still_honors_lifetime() {
+    fn quiet_feed_emits_nothing_and_still_honors_lifetime() {
         let (_guard, _tmp) = setup_home();
-        // No events at all — the feed is quiet. A zero keepalive interval fires
-        // on the first iteration; the short lifetime trips on the second poll.
-        // The loop must run the quiet-feed keepalive path (writing to real
-        // stdout, as the batch tests do) and then exit cleanly rather than
-        // panicking or blocking forever on a silent stream.
+        // No events at all — the feed is quiet. With the standalone keepalive
+        // retired, a quiet feed writes no line at all; it must still exit
+        // cleanly on its lifetime cap rather than panicking or blocking forever
+        // on a silent stream. Liveness now rides the unified stream's heartbeat,
+        // not a ping this loop emits.
         let before = read_cursor("demo");
         let signal = AtomicUsize::new(0);
-        let outcome = feed_loop(
-            "demo",
-            Some(Duration::from_millis(1)),
-            Some(Duration::ZERO),
-            &signal,
-        )
-        .unwrap();
+        let outcome = feed_loop("demo", Some(Duration::from_millis(1)), &signal).unwrap();
         assert!(matches!(outcome, FeedOutcome::Expired { .. }));
-        // A keepalive must never move the durable cursor — it is pure liveness.
-        assert_eq!(read_cursor("demo"), before, "a keepalive must not advance the cursor");
+        // A quiet feed never advances the durable cursor.
+        assert_eq!(
+            read_cursor("demo"),
+            before,
+            "a quiet feed must not advance the cursor"
+        );
     }
 
     #[test]
