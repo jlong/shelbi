@@ -178,6 +178,9 @@ pub enum SystemKind {
     Send,
     /// `message=… task=… push=…|ack=…` — a worker message push / ack.
     Message,
+    /// `[project=…] task=… ci pr=… conclusion=success|failure` — a CI
+    /// pass/fail verdict for an in-review PR from the hub's scoped CI poll.
+    Ci,
     /// `project=… mode=zen <prev> -> <new>` — a Zen Mode toggle.
     Mode,
     /// `project=… supervision=…` — a pane restart / crash-loop give-up.
@@ -688,6 +691,30 @@ pub fn parse_event_line(line: &str) -> Event {
     // Peel the `project=<name>` scope so both prefixed and legacy-bare
     // task/workspace lines route through the same classifier below.
     let (project, rest) = strip_project_prefix(after_ts);
+
+    // CI verdict shape (project- and task-scoped):
+    // `task=<id> ci pr=<pr> check=<check> conclusion=<success|failure> head_sha=<sha>`.
+    // The bare ` ci ` keyword between the `task=` scope and the CI detail
+    // distinguishes it from an ordinary `task=<id> <from> -> <to>` transition,
+    // so it must be matched before the `task=` branch below or it would fall
+    // through to a raw `Unknown` row.
+    if rest.starts_with("task=") && rest.contains(" ci ") {
+        let kv = parse_kv(rest);
+        let detail = match (kv.get("pr"), kv.get("check")) {
+            (Some(pr), Some(check)) => Some(format!("PR #{pr} {}", humanize_token(check))),
+            (Some(pr), None) => Some(format!("PR #{pr}")),
+            _ => None,
+        };
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Ci,
+            project,
+            target: kv.get("task").cloned(),
+            status: kv.get("conclusion").cloned(),
+            detail,
+            raw,
+        });
+    }
 
     if let Some(rest) = rest.strip_prefix("task=") {
         // Two on-the-wire shapes coexist (`Plans/workflows.md` §10):
@@ -1776,6 +1803,20 @@ fn render_system_event(
                 },
             )
         }
+        SystemKind::Ci => {
+            let ok = status == Some("success");
+            (
+                system_chip("ci"),
+                "CI",
+                if ok { Color::Green } else { Color::LightRed },
+                sys.detail
+                    .clone()
+                    .map(|d| {
+                        format!("{d} {}", if ok { "passed" } else { "failed" })
+                    })
+                    .unwrap_or_else(|| format!("CI {}", status.unwrap_or("reported"))),
+            )
+        }
         SystemKind::Other => (
             system_chip(sys.target.as_deref().unwrap_or("")),
             "event",
@@ -2772,6 +2813,18 @@ mod tests {
                 SystemKind::Handoff,
                 Some("shelbi"),
                 Some("written"),
+            ),
+            (
+                "2026-07-22T14:00:00+00:00 project=shelbi task=t ci pr=42 check=all conclusion=success head_sha=deadbeef",
+                SystemKind::Ci,
+                Some("t"),
+                Some("success"),
+            ),
+            (
+                "2026-07-22T14:00:00+00:00 project=shelbi task=t ci pr=42 check=build conclusion=failure head_sha=deadbeef",
+                SystemKind::Ci,
+                Some("t"),
+                Some("failure"),
             ),
         ];
         for (line, kind, target, status) in cases {

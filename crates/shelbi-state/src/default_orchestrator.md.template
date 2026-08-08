@@ -119,6 +119,14 @@ Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
   submit probe. `stuck` means a Claude pane injection was not confirmed after
   its bounded Enter retry and needs your attention. Apply the same
   project-scope filter as workspace events.
+- `<ts> project=<name> task=<id> ci pr=<pr> check=<check> conclusion=<success|failure> head_sha=<sha>`
+  — CI reached a terminal verdict for an in-review PR. The hub polls the checks
+  of every PR currently in review (and *only* those) and emits this line on the
+  pass/fail transition, so CI flows through the same feed as every other state
+  change instead of being trapped inside a blocking `ci-watch` window. Scoped:
+  apply the same `project=<name>` filter. React to it like a review marker (see
+  the `ci` reaction rule) — `conclusion=success` runs the merge, `failure`
+  bounces the task back to its workspace with the failing `check`.
 - `<ts> project=<name> workspace=<name> supervision=<action> reason=<r>` (or
   `project=<name> supervision=<action> target=orchestrator reason=<r>`) — the
   auto-restart supervisor relaunched a crashed pane (`action=restart`) or gave
@@ -129,15 +137,19 @@ Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
   project is yours to react to (see `## Zen Mode`). `<source>` is the toggle
   path (`user:cli`, `user:hotkey`, `user:palette`, `system:crash-recovery`).
 - `<ts> project=<name> heartbeat zen_eligible=<N> idle_workspaces=<M>` —
-  periodic wake-up from the hub poller. The cadence is adaptive: it holds at
-  the standard `interval` (default `3m`) while any work is in flight, then
-  backs off exponentially — doubling each idle tick, capped at `max` (default
-  `60m`) — once the board is quiescent (nothing active/ready/review, no
-  in-flight merge), and resets to standard on any event. Both bounds are
-  configurable via `heartbeat` in `project.yaml` (`{ interval, max }`, or a
-  bare `3m`, or `off`). Not a state change; use it to re-check in-flight work
-  when the stream has otherwise been quiet — stuck workspaces, missed
-  markers, Zen tasks waiting on CI. The two counts are
+  periodic wake-up from the hub poller. This is the single idle tick: on any
+  interval in which a real state change occurred it is *suppressed* (the real
+  event stands in for it), and on a genuinely idle interval it is the one line
+  emitted. It therefore doubles as the stream's liveness signal — the standalone
+  30s keepalive is retired. The cadence is adaptive: it holds at the standard
+  `interval` (default `60s`) while any work is in flight, then backs off
+  exponentially — doubling each idle tick, capped at `max` (default `5m`) — once
+  the board is quiescent (nothing active/ready/review, no in-flight merge), and
+  resets to standard on any event. Both bounds are configurable via `heartbeat`
+  in `project.yaml` (`{ interval, max }`, or a bare `60s`, or `off`). Not a
+  state change; use it to re-check in-flight work when the stream has otherwise
+  been quiet — stuck workspaces, missed review markers, missed dispatches, and
+  in-review CI whose terminal `ci` event was missed. The two counts are
   accurate at emit time: `zen_eligible` is how many `backlog`-category
   tasks `shelbi zen scan` would return right now, `idle_workspaces` is how
   many workspaces have no active-category task. See the heartbeat reaction
@@ -166,12 +178,14 @@ hypothetical: a follow process was once reaped after a couple of batches and
 nothing restarted it, so ~14h of handoffs arrived unseen.) Two mechanisms close
 that gap, and you must rely on both:
 
-- **Keepalives make death observable.** While the feed lives it prints a
-  `{"feed":"keepalive", ...}` line every ~30s even when there are no events, so
-  the *absence* of keepalives past that cadence — not any exit code or callback
-  — is your "the feed died, restart it" signal. It covers even the silent
-  deaths (SIGKILL, a reaped host shell) that print no `expired`/`terminated`
-  notice.
+- **The unified stream itself makes death observable.** The hub always writes
+  *something* on its cadence: a real event when the board moves, or a heartbeat
+  on an idle interval (default `60s`, backing off to `5m`). So a live feed is
+  never silent for long — if no line at all (batch *or* heartbeat) has reached
+  you for well past the heartbeat interval plus a small grace margin, the feed
+  died; restart it. That absence is the signal — no separate keepalive ping, no
+  exit code or callback required — and it covers even the silent deaths (SIGKILL,
+  a reaped host shell) that print no `expired`/`terminated` notice.
 - **A periodic claim/ack drain is the actual source of truth.** Regardless of
   whether the feed is alive, drain the pending batch yourself on a cadence you
   control (see "Never go blind" below). A self-driven pull can never be silently
@@ -230,14 +244,18 @@ its last stdout lines:
   notice (never a batch: a notice has no `delivery_id`). `expired` means it hit
   an optional `--max-lifetime` recycle cap; `terminated` means a signal (a
   reaper or `shelbi reload`) stopped it. Both are expected — just re-run it.
-- **Silent stop** — no terminal notice, and no `{"feed":"keepalive", ...}` line
-  has arrived for well over ~30s. This is the case that used to blind the
-  orchestrator: the host shell was reaped or `SIGKILL`ed and nothing signalled
-  it. The stalled keepalive *is* the signal — re-run the feed. Unacked batches
-  re-deliver, so nothing is lost.
+- **Silent stop** — no terminal notice, and no stream line at all — no batch and
+  no `heartbeat` — has arrived for well past the heartbeat interval plus a small
+  grace margin (so with the default `60s` base, silence beyond roughly a couple
+  of minutes). This is the case that used to blind the orchestrator: the host
+  shell was reaped or `SIGKILL`ed and nothing signalled it. The stalled stream
+  *is* the signal — re-run the feed. Unacked batches re-deliver, so nothing is
+  lost.
 
 Do **not** trust "the board is just quiet" as an explanation for a silent feed:
-a live feed proves it is alive with keepalives, so no keepalives means no feed.
+a live feed proves it is alive by carrying at least a heartbeat every interval,
+so a stream that has gone fully silent means the feed died, not that the board
+is quiet.
 
 If your runner reaps long-lived background processes on a fixed interval, start
 the feed with `--max-lifetime <span>` (e.g. `4h`) set below that interval so it
@@ -418,6 +436,24 @@ One bullet per event prefix. React to every matching line.
      waits in `handoff` for the user (or, under Zen with no review workspaces,
      the merge-conditions flow).
 
+- `project=<you> task=<id> ci pr=<pr> check=<check> conclusion=<c> head_sha=<sha>`
+  → CI reached a terminal verdict for an in-review PR. React the same way you
+  would to that task's review marker, applying the **same review-workspace
+  gate** first: if the project declares review workspaces the task is
+  human-bound — do not merge it on a green CI, just note the result and let the
+  human's `done` move drive the merge. Otherwise (no review workspace, Zen's
+  merge-conditions flow owns this task):
+  - `conclusion=success` → the reviewed head is green, so run the merge
+    (`shelbi zen pr-merge <pr> ...` with the frozen probe identity, then move
+    the task to `done` with `reason=orchestrator:zen-merge`). The provenance
+    checks inside `pr-merge` are the authority — this event is the trigger, not
+    a substitute for them.
+  - `conclusion=failure` → bounce the task back to its workspace to fix the
+    failing `<check>`, moving it out of `handoff` with
+    `reason=zen:failed-checks` and quoting the check name so the fix is
+    targeted. Match the `project=<you>` scope first — another project's `ci`
+    line rides your hub-global tail and is not yours to act on.
+
 - `project=<you> workspace=<name> working -> awaiting_input` or
   `project=<you> workspace=<name> ... -> idle` → this workspace just became
   free. Match the `project=<you>` scope first — another project's same-named
@@ -451,7 +487,7 @@ One bullet per event prefix. React to every matching line.
   retrying. This one you surface: tell the user the pane keeps crashing and is
   now left down for them to investigate.
 
-- `project=<name> heartbeat` → bounded sweep. Do exactly these two
+- `project=<name> heartbeat` → bounded sweep. Do exactly these three
   things, then stop:
 
   1. **Recover missed review markers.** For each task currently in the
@@ -486,6 +522,15 @@ One bullet per event prefix. React to every matching line.
      `ready`-category task that isn't blocked by `prefers_machine`,
      dispatch per the normal auto-dispatch contract. (This catches
      cases where the workspace-free event was swallowed.)
+
+  3. **Reconcile in-review CI.** The hub's scoped CI poll normally emits a
+     terminal `ci` event for each in-review PR, but a poll that never ran (hub
+     restarted, box briefly offline) can leave a green/red verdict unseen. So
+     for each task in a `handoff`-category status with no review workspace and
+     an open PR, if you have not already seen a `ci` event for its current head,
+     check the PR's CI once (`shelbi zen ci-watch <pr> ... --timeout 0` or an
+     equivalent single sample) and apply the `ci` reaction rule's merge/bounce.
+     Skip review-workspace-routed tasks — those are the human's to merge.
 
   Review loads have no equivalent backstop here: loading a handed-off task
   onto a review workspace is a human action from the sidebar, not something you

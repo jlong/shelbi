@@ -906,6 +906,151 @@ fn ci_watch_with_poll_interval(
     }
 }
 
+/// Cross-tick memory for the scoped CI poll, one entry per in-review task whose
+/// terminal CI verdict has already been emitted as a `ci` event. Keyed
+/// `task_id -> (head_sha, conclusion)` so the sweep re-emits only on a genuine
+/// transition (a new head, or a conclusion that flipped) rather than every tick.
+///
+/// The map is in-memory and starts empty on a hub restart — deliberately: the
+/// first sweep after a restart re-emits each in-review PR's current terminal
+/// verdict, which is exactly the reconcile that recovers a `ci` event missed
+/// while the hub was down.
+#[derive(Debug, Default)]
+pub struct ScopedCiState {
+    seen: std::collections::BTreeMap<String, (String, String)>,
+}
+
+impl ScopedCiState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// One scoped, conditional CI sweep over the PRs currently in review.
+///
+/// For every task in a `handoff`-category status (the in-review set) with an
+/// open PR, this polls the PR's checks exactly once and, on a terminal
+/// pass/fail transition, emits a `ci` state-change line into `events.log` via
+/// [`shelbi_state::append_ci_event`] — so CI flows through the same
+/// follower/reaction path as any other event. When the in-review set is empty
+/// it makes no GitHub call at all and clears the transition memory: there is no
+/// unconditional CI clock, only a poll scoped to work actually awaiting CI.
+///
+/// Best-effort: a per-PR lookup or snapshot error is logged and skipped so one
+/// unreachable PR never stalls the sweep. Shares the single CI-poll
+/// implementation with [`ci_watch`] — both grade the same atomic
+/// [`ci_snapshot`] through [`classify_ci_snapshot`]; the difference is only
+/// that the blocking command loops to a deadline while this takes one sample
+/// per hub tick.
+pub fn scoped_ci_poll(project: &Project, state: &mut ScopedCiState) -> Result<()> {
+    let in_review = in_review_tasks_with_branch(project)?;
+    if in_review.is_empty() {
+        // Conditional: no PR is awaiting CI, so run no clock and forget prior
+        // transitions (a task can re-enter review later with a fresh head).
+        state.seen.clear();
+        return Ok(());
+    }
+    let (host, dir) = locate_hub_workdir(project)?;
+    let wt = dir.to_string_lossy().into_owned();
+    let repository = lookup_origin_repository(&host, &wt)?;
+
+    // Drop memory for tasks that have since left the in-review set so the map
+    // can't grow without bound across a long-lived hub.
+    let live: std::collections::BTreeSet<&str> =
+        in_review.iter().map(|(id, _)| id.as_str()).collect();
+    state.seen.retain(|id, _| live.contains(id.as_str()));
+
+    for (task_id, branch) in &in_review {
+        let pr = match lookup_open_pr_in_repository(&host, &wt, branch, &repository.selector) {
+            Ok(Some(pr)) => pr,
+            Ok(None) => continue, // no PR yet — nothing to grade
+            Err(e) => {
+                tracing::debug!(
+                    task = %task_id, branch = %branch, error = %e,
+                    "scoped CI poll: PR lookup failed"
+                );
+                continue;
+            }
+        };
+        let snapshot = match ci_snapshot(&host, &wt, &repository, pr) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(
+                    task = %task_id, pr, error = %e,
+                    "scoped CI poll: snapshot failed"
+                );
+                continue;
+            }
+        };
+        let (conclusion, check) = match classify_ci_snapshot(&snapshot) {
+            Some(CiVerdict::Green) => ("success", "all".to_string()),
+            Some(CiVerdict::Red { check, .. }) => ("failure", check),
+            // `None` = still pending / not yet mergeable; `Timeout` is only
+            // produced by the deadline loop, never a single snapshot. Either
+            // way there's no terminal transition to emit this tick.
+            Some(CiVerdict::Timeout) | None => continue,
+        };
+        let head_sha = snapshot.head_oid;
+        if ci_should_emit(state.seen.get(task_id), &head_sha, conclusion) {
+            shelbi_state::append_ci_event(
+                &project.name,
+                task_id,
+                pr,
+                &check,
+                conclusion,
+                &head_sha,
+            )?;
+            state
+                .seen
+                .insert(task_id.clone(), (head_sha, conclusion.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a freshly-observed terminal verdict is a new transition worth
+/// emitting, given the `(head_sha, conclusion)` we last emitted for this task.
+/// A first observation (`None`), a moved head, or a flipped conclusion each
+/// count; an unchanged verdict is suppressed so a settled PR emits one line,
+/// not one per tick.
+fn ci_should_emit(prev: Option<&(String, String)>, head_sha: &str, conclusion: &str) -> bool {
+    match prev {
+        Some((seen_head, seen_conclusion)) => seen_head != head_sha || seen_conclusion != conclusion,
+        None => true,
+    }
+}
+
+/// The in-review set for the scoped CI poll: every task in a `handoff`-category
+/// status, paired with its resolved task branch. Category is resolved through
+/// the task's workflow (mirroring [`dry_run_tick`]) rather than the literal
+/// `review` column, so a custom workflow whose handoff status is renamed still
+/// counts. A task whose branch can't be resolved is skipped rather than failing
+/// the whole sweep.
+fn in_review_tasks_with_branch(project: &Project) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for tf in shelbi_state::list_tasks(&project.name)? {
+        let workflow = load_task_workflow(&project.name, &tf.task);
+        let workflow_ref = workflow.as_ref();
+        let status = workflow_ref.and_then(|w| resolve_task_status(&tf.task, w));
+        let category = status
+            .map(|s| s.category)
+            .unwrap_or_else(|| tf.task.column.category());
+        if category != StatusCategory::Handoff {
+            continue;
+        }
+        match branch::branch_name_for_task(project, workflow_ref, &tf.task) {
+            Ok(branch) => out.push((tf.task.id.clone(), branch)),
+            Err(e) => {
+                tracing::debug!(
+                    task = %tf.task.id, error = %e,
+                    "scoped CI poll: branch resolve failed"
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CiSnapshot {
     repository_id: String,
@@ -2136,6 +2281,26 @@ mod tests {
         assert_eq!(line.matches(':').count(), 2);
         assert!(line.starts_with("red:lint_strict:"));
     }
+    #[test]
+    fn ci_should_emit_only_on_transition() {
+        // First observation of any task always emits — the scoped poll has no
+        // prior memory of it (also the fresh-restart reconcile path).
+        assert!(ci_should_emit(None, "sha1", "success"));
+
+        // An unchanged verdict for the same head is suppressed, so a settled PR
+        // emits one `ci` line, not one every tick.
+        let prev = ("sha1".to_string(), "success".to_string());
+        assert!(!ci_should_emit(Some(&prev), "sha1", "success"));
+
+        // A flipped conclusion on the same head is a transition (e.g. a rerun
+        // that turned a red check green).
+        assert!(ci_should_emit(Some(&prev), "sha1", "failure"));
+
+        // A moved head re-grades from scratch even at the same conclusion — the
+        // green (or red) now describes a different commit.
+        assert!(ci_should_emit(Some(&prev), "sha2", "success"));
+    }
+
     #[test]
     fn detects_no_required_checks_message_in_stdout() {
         // gh's "no required checks" wire text — exact match on the
@@ -4754,6 +4919,200 @@ esac
             calls.matches("api graphql --hostname github.com").count(),
             1,
             "the pending required row must outweigh the same-name optional pass: {calls}"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Scoped CI poll — the conditional per-tick sweep over in-review PRs.
+    // ----------------------------------------------------------------------
+
+    /// The `ci` lines currently in the test `events.log`. Must be called while
+    /// the `EnvGuard`'s `SHELBI_HOME` is in scope so the path resolves to the
+    /// hermetic home rather than the developer's real one.
+    fn scoped_ci_event_lines() -> Vec<String> {
+        let path = shelbi_state::events_log_path().unwrap();
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(" ci pr="))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A `gh` stub for the scoped CI poll. Unlike [`install_ci_watch_stub`] it
+    /// also answers `gh pr list` (the scoped poll looks the PR up itself),
+    /// returning one open PR (`pr`) whose atomic snapshot is a single green
+    /// required check bound to `head`.
+    fn install_scoped_ci_green_stub(stub_home: &Path, head: &str, pr: u64) -> PathBuf {
+        let bin = stub_home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log_file = stub_home.join("gh.log");
+        let snapshot_file = stub_home.join("snapshot.json");
+        let snapshot = serde_json::json!({
+            "data": { "repository": {
+                "id": ORIGIN_REPOSITORY_ID,
+                "pullRequest": {
+                    "state": "OPEN",
+                    "baseRefName": "main",
+                    "baseRefOid": CI_BASE_SHA,
+                    "headRefOid": head,
+                    "headRepository": { "id": ORIGIN_REPOSITORY_ID },
+                    "mergeStateStatus": "CLEAN",
+                    "commits": { "nodes": [{ "commit": {
+                        "oid": head,
+                        "statusCheckRollup": { "contexts": {
+                            "totalCount": 1,
+                            "pageInfo": { "hasNextPage": false },
+                            "nodes": [{
+                                "__typename": "CheckRun",
+                                "name": "build",
+                                "status": "COMPLETED",
+                                "conclusion": "SUCCESS",
+                                "detailsUrl": "https://example/build",
+                                "isRequired": true,
+                            }],
+                        }},
+                    }}]},
+                },
+            }},
+        });
+        std::fs::write(&snapshot_file, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let q = shelbi_agent::shell_escape;
+        let script = format!(
+            r#"#!/bin/sh
+case "$1 $2" in
+  "api graphql") printf 'api graphql --hostname %s\n' "$4" >> {log} ;;
+  *) printf '%s\n' "$*" >> {log} ;;
+esac
+case "$1 $2" in
+  "repo view")
+    printf '%s\n' {origin_repository_id} {origin_repository_name} {origin_repository_url}
+    ;;
+  "pr list")
+    printf '%s\n' {pr}
+    ;;
+  "api graphql")
+    cat {snapshot}
+    printf '\n'
+    ;;
+  *)
+    printf 'unexpected gh invocation: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+"#,
+            log = q(&log_file.to_string_lossy()),
+            snapshot = q(&snapshot_file.to_string_lossy()),
+            pr = q(&pr.to_string()),
+            origin_repository_id = q(ORIGIN_REPOSITORY_ID),
+            origin_repository_name = q(ORIGIN_REPOSITORY_NAME),
+            origin_repository_url = q("https://github.com/example/repo"),
+        );
+        let gh = bin.join("gh");
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            stub_home.join(".profile"),
+            format!("export PATH=\"{}:$PATH\"\n", bin.display()),
+        )
+        .unwrap();
+        log_file
+    }
+
+    #[test]
+    fn scoped_ci_poll_is_a_noop_when_nothing_is_in_review() {
+        let _lock = crate::test_lock::acquire();
+        let (base, _origin, worktree) = setup_repo(false);
+        let stub = tempfile::tempdir().unwrap();
+        // Install a fully-capable green stub: if the poll ever shells out, its
+        // log will be non-empty. The empty-log assertion below is what proves
+        // the empty-in-review early return runs *before* any gh work.
+        let log = install_scoped_ci_green_stub(stub.path(), &task_branch_head(&worktree), 379);
+        let project = ci_project(base.path(), &worktree);
+
+        let (result, seen_after, ci_lines, gh) = {
+            let _env = EnvGuard::install(stub.path());
+            // A task that is NOT in a handoff-category status, so the in-review
+            // set is empty and the sweep must short-circuit.
+            let mut not_in_review = task();
+            not_in_review.column = Column::in_progress();
+            shelbi_state::save_task(PROJECT_NAME, &not_in_review, "").unwrap();
+
+            let mut state = ScopedCiState::new();
+            // Seed stale transition memory to prove the empty-set branch clears
+            // it (a task can re-enter review later with a fresh head).
+            state
+                .seen
+                .insert("stale".into(), ("sha".into(), "success".into()));
+
+            let result = scoped_ci_poll(&project, &mut state);
+            let ci_lines = scoped_ci_event_lines();
+            (result, state.seen.clone(), ci_lines, gh_calls(&log))
+        };
+
+        assert!(result.is_ok(), "empty in-review set must not error: {result:?}");
+        assert!(
+            seen_after.is_empty(),
+            "the empty-in-review branch must clear transition memory, got {seen_after:?}"
+        );
+        assert!(
+            ci_lines.is_empty(),
+            "no ci line may be appended when nothing is in review: {ci_lines:?}"
+        );
+        assert!(
+            gh.is_empty(),
+            "the early return must precede locate_hub_workdir and any gh call: {gh}"
+        );
+    }
+
+    #[test]
+    fn scoped_ci_poll_emits_ci_event_on_green_transition_and_dedupes() {
+        let _lock = crate::test_lock::acquire();
+        let (base, _origin, worktree) = setup_repo(false);
+        let reviewed_head = task_branch_head(&worktree);
+        let stub = tempfile::tempdir().unwrap();
+        let _log = install_scoped_ci_green_stub(stub.path(), &reviewed_head, 379);
+        let project = ci_project(base.path(), &worktree);
+
+        let (first, second) = {
+            let _env = EnvGuard::install(stub.path());
+            // `task()` sits in the `review` column (Handoff category) with an
+            // explicit `branch:` of TASK_BRANCH, so it is the in-review PR.
+            shelbi_state::save_task(PROJECT_NAME, &task(), "").unwrap();
+
+            let mut state = ScopedCiState::new();
+            scoped_ci_poll(&project, &mut state).unwrap();
+            let first = scoped_ci_event_lines();
+            // Second sweep, same settled green head: the transition is
+            // remembered, so nothing new is emitted.
+            scoped_ci_poll(&project, &mut state).unwrap();
+            let second = scoped_ci_event_lines();
+            (first, second)
+        };
+
+        assert_eq!(
+            first.len(),
+            1,
+            "the green transition must emit exactly one ci line: {first:?}"
+        );
+        let line = &first[0];
+        assert!(line.contains(" ci pr=379 "), "wrong pr in ci line: {line}");
+        assert!(
+            line.contains(&format!("task={}", task().id)),
+            "wrong task in ci line: {line}"
+        );
+        assert!(
+            line.contains("conclusion=success"),
+            "green must record a success conclusion: {line}"
+        );
+        assert!(
+            line.contains(&format!("head_sha={reviewed_head}")),
+            "ci line must carry the reviewed head sha: {line}"
+        );
+        assert_eq!(
+            second.len(),
+            1,
+            "a settled green must not re-emit on the next sweep (transition dedup): {second:?}"
         );
     }
 }

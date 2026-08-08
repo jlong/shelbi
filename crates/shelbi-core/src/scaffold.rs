@@ -160,17 +160,19 @@ const PROJECT_SECTIONS: &[Section] = &[
     Section {
         prose: &[
             "Recurring hub heartbeat written to events.log so the orchestrator's",
-            "watch fires on a quiet board. The cadence is adaptive: it holds at",
-            "`interval` while any work is in flight, then backs off exponentially",
-            "(doubling each idle tick, capped at `max`) once the board is quiescent,",
-            "and snaps back to `interval` on any event. A bare `heartbeat: 3m`",
-            "(interval only, default cap) or `heartbeat: off` also work. Defaults:",
-            "interval 3m, max 60m.",
+            "watch fires on a quiet board. This single tick is both the idle",
+            "liveness signal and the reconcile trigger — the standalone keepalive",
+            "is retired. The cadence is adaptive: it holds at `interval` while any",
+            "work is in flight, then backs off exponentially (doubling each idle",
+            "tick, capped at `max`) once the board is quiescent, and snaps back to",
+            "`interval` on any event. A bare `heartbeat: 60s` (interval only,",
+            "default cap) or `heartbeat: off` also work. Defaults: interval 60s,",
+            "max 5m.",
         ],
         yaml: "\
 heartbeat:
-  interval: 3m               # standard cadence while work is in flight
-  max: 60m                   # back-off cap once the board is quiescent
+  interval: 60s              # standard cadence while work is in flight
+  max: 5m                    # back-off cap once the board is quiescent
 ",
     },
     Section {

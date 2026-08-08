@@ -1408,8 +1408,10 @@ const ORCH_BOOTSTRAP_PROMPT: &str = "Run the \"Bootstrap on session start\" sequ
     through the reaction rules, then run its `shelbi orchestrator events ack \
     <delivery-id>` command — ack only after reacting, so a crash re-delivers an \
     unacked batch. That background feed is only a latency accelerator and can die \
-    unnoticed (a reaped host shell prints no signal; watch its `{\"feed\":\"keepalive\"}` \
-    lines — their absence means it died, restart it). Your source of truth is the \
+    unnoticed (a reaped host shell prints no signal). Liveness rides the unified stream \
+    itself: the hub always writes at least a heartbeat on its idle cadence, so if no line \
+    — batch or heartbeat — arrives for well past the heartbeat interval, the follower \
+    died; restart it. Your source of truth is the \
     self-driven drain from the \"Polling-only event drain\" section: before every \
     user-facing reply and on every heartbeat, run \
     `shelbi orchestrator events next --follow --max-lifetime 2s`, apply every returned \
