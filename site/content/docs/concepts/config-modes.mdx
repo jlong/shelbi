@@ -32,19 +32,37 @@ runner settings without each of them having to redo the setup wizard.
 
 ## The two modes at a glance
 
-| Piece | Global mode | In-repo mode |
+| Piece | Global mode | In-repo mode (fresh `init` / `--pick-up`) |
 | --- | --- | --- |
-| Shared config (name, default_branch, orchestrator, agent_runners, zen, heartbeat, git, workflows/, agents/, workspace-settings.json.template) | `~/.shelbi/projects/<name>.yaml` and `~/.shelbi/projects/<name>/` | `<repo>/.shelbi/project.yaml` and `<repo>/.shelbi/` |
-| User-local config (repo path, machines, workspaces, editor) | Same YAML: `~/.shelbi/projects/<name>.yaml` | `~/.shelbi/projects/<name>/local.yaml` |
+| Scalar config (name, default_branch, orchestrator, agent_runners, zen, heartbeat, git) plus user-local config (repo path, machines, workspaces, editor) | `~/.shelbi/projects/<name>.yaml` (one flat file) | `~/.shelbi/projects/<name>.yaml` (same flat file, with `config_mode: in-repo` and a `repo:` pointer) |
+| Shared directories (workflows/, agents/, workspace-settings.json.template) | `~/.shelbi/projects/<name>/` | `<repo>/.shelbi/` |
+| Committed `<repo>/.shelbi/project.yaml` | — (nothing added to the repo) | Minimal: the canonical `name` (+ optional `display_name`) only |
 | State (state.json, tasks/, HANDOFF.md, .claude/, workspaces/, events.log) | `~/.shelbi/projects/<name>/` (+ `~/.shelbi/events.log`) | `~/.shelbi/projects/<name>/` (+ `~/.shelbi/events.log`) |
-| Discovery | Reverse-lookup: cwd matched against every registered project's local `work_dir` | Walk up from cwd for `<dir>/.shelbi/project.yaml`, then require a matching `local.yaml` |
-| Shared with clones? | No: every teammate reruns `shelbi init` | Yes: everything under `<repo>/.shelbi/` (minus the gitignored state pieces) travels with `git clone` |
+| Discovery | Reverse-lookup: cwd matched against every registered project's local `work_dir` | Walk up from cwd for `<dir>/.shelbi/project.yaml`, backed by the flat `~/.shelbi/projects/<name>.yaml` registry entry |
+| Shared with clones? | No: every teammate reruns `shelbi init` | The committed `<repo>/.shelbi/` directories (workflows, agents, settings template) travel with `git clone`; the scalar config still lives in each teammate's flat registry until you run `migrate-to-in-repo` |
+
+<Callout type="note" title="The full shared/local split is what migration produces">
+
+Today, fresh `shelbi init` and `shelbi init --pick-up` keep your project's
+scalar config in the flat `~/.shelbi/projects/<name>.yaml` registry file
+(the same file global mode uses) and commit only a **minimal**
+`<repo>/.shelbi/project.yaml` — the canonical `name` — alongside the shared
+`workflows/`, `agents/`, and settings-template directories under
+`<repo>/.shelbi/`. The fuller layout below, where the committed
+`project.yaml` carries the shared config and a per-user `local.yaml` carries
+your machines, is produced **only** by
+[`shelbi project migrate-to-in-repo`](#migrating-a-project-to-in-repo-mode).
+The loader reads the flat registry file first and falls back to the
+`project.yaml` + `local.yaml` split only once migration has retired the flat
+file.
+
+</Callout>
 
 The full field-by-field bucket lists are in
 [`shelbi_core::model`](https://github.com/jlong/shelbi/blob/main/crates/shelbi-core/src/model.rs)
-under `SHARED_PROJECT_FIELDS` and `LOCAL_PROJECT_FIELDS`; a shared YAML
-that carries a user-local field (or vice versa) errors on load rather
-than silently letting one side win.
+under `SHARED_PROJECT_FIELDS` and `LOCAL_PROJECT_FIELDS`; in the migrated
+split a shared YAML that carries a user-local field (or vice versa) errors
+on load rather than silently letting one side win.
 
 ## Global mode
 
@@ -71,20 +89,22 @@ with a single command.
 
 ## In-repo mode
 
-The project's shared config is committed at `<repo>/.shelbi/project.yaml`
-and everyone who clones the repo gets the same workflows, agent prompts,
-and runner settings. Each teammate still has their own machines and
-workspace pool. Those live in a per-user `local.yaml` that never gets
-committed.
+In-repo mode commits the shared `workflows/`, agent prompts, and settings
+template under `<repo>/.shelbi/` so everyone who clones the repo materializes
+against the same directories. Each teammate still has their own machines and
+workspace pool. As shipped today, your scalar config and those user-local
+fields live together in the flat `~/.shelbi/projects/<name>.yaml` registry
+file; only [migration](#migrating-a-project-to-in-repo-mode) moves the shared
+config into a committed `project.yaml` and splits your machines into a
+per-user `local.yaml`.
 
-### On-disk layout
+### On-disk layout (fresh `init` / `--pick-up`)
 
 ```
 <repo>/
   .shelbi/
-    project.yaml              # ← shared: name, default_branch, orchestrator,
-                              #   agent_runners, zen, heartbeat, git, github_url,
-                              #   workspace_permissions_mode, config_mode: in-repo
+    project.yaml              # ← committed, minimal: canonical name
+                              #   (+ optional display_name) only
     workflows/
       default.yaml
       statuses.yaml
@@ -99,9 +119,9 @@ committed.
 ```
 ~/.shelbi/
   projects/
+    <name>.yaml               # ← flat registry: scalar config + user-local
+                              #   fields, config_mode: in-repo, repo: pointer
     <name>/
-      local.yaml              # ← user-local: repo, machines, workspaces,
-                              #   editor
       state.json              # ← state — never committed
       tasks/
       HANDOFF.md
@@ -110,10 +130,12 @@ committed.
   events.log                  # ← state — cross-project
 ```
 
-The shared/local split is enforced at parse time: a `machines:` block
-inside `<repo>/.shelbi/project.yaml`, or a `zen:` block inside
-`local.yaml`, raises an error identifying the misplaced field and
-naming the file it belongs in.
+After `shelbi project migrate-to-in-repo`, the committed `project.yaml`
+carries the full shared config and the flat registry file is replaced by
+`~/.shelbi/projects/<name>/local.yaml` (the user-local half). At that point
+the shared/local split is enforced at parse time: a `machines:` block inside
+`<repo>/.shelbi/project.yaml`, or a `zen:` block inside `local.yaml`, raises
+an error identifying the misplaced field and naming the file it belongs in.
 
 ### Discovery walk-up
 
@@ -122,12 +144,14 @@ you happen to `cd`), Shelbi walks up looking for the first ancestor
 containing `.shelbi/project.yaml`. This mirrors how `git` finds its
 `.git` directory: no env var, no marker file to place by hand.
 
-Once the walk-up finds a shared config, Shelbi reads the `name:` field
-out of it and checks that a matching
-`~/.shelbi/projects/<name>/local.yaml` exists on your machine. If it
-doesn't, the resolver returns `ProjectNotPickedUp` and points at
+Once the walk-up finds a committed `project.yaml`, Shelbi reads the `name:`
+field out of it and checks that you've registered the project locally. If you
+haven't, the resolver returns `ProjectNotPickedUp` and points at
 `shelbi init --pick-up`, the flow for a fresh clone that hasn't been
 registered locally yet ([see below](#picking-up-a-teammates-project)).
+Pick-up writes that local registration as a flat
+`~/.shelbi/projects/<name>.yaml` (migration later replaces it with a
+`local.yaml` under `~/.shelbi/projects/<name>/`).
 
 Walk-up wins over reverse-lookup: if a repo happens to sit inside another
 registered project's `work_dir`, the walk-up match takes precedence.
@@ -172,8 +196,10 @@ alias:
   …). The committed name is unchanged; the alias is only how *you* refer
   to that clone locally.
 
-You reach the suffixed clone with `shelbi -p shelbi-2`. Rename the
-alias later with `shelbi project rename` if you want something friendlier.
+You reach the suffixed clone with `shelbi -p shelbi-2`. The local alias is
+fixed at pick-up time; there is no rename command, so if you want a
+different alias, re-pick-up the clone (or edit the registry filename and its
+entry by hand).
 
 ## Migrating a project to in-repo mode
 
@@ -190,8 +216,9 @@ existing global-mode project into the in-repo layout:
    removes.
 3. Prints the `.gitignore` snippet above and offers to auto-append it
    (interactively), or applies it non-interactively with `--yes`.
-4. Deletes the original `~/.shelbi/projects/<name>.yaml`, whose contents
-   now live in the two files above.
+4. Retires the original `~/.shelbi/projects/<name>.yaml` by renaming it to
+   `<name>.yaml.migrated` (it is not deleted — the copy stays as a rollback
+   source), whose contents now live in the two files above.
 
 State (`state.json`, `tasks/`, `HANDOFF.md`, `.claude/`, `workspaces/`,
 `events.log`) stays put under `~/.shelbi/`.
@@ -241,8 +268,10 @@ There is no `migrate-to-global` command. Reverting is:
 
 1. `git revert` the migration commit, which restores `<repo>/.shelbi/`
    to its pre-migration state.
-2. Move `~/.shelbi/projects/<name>/local.yaml` back to
-   `~/.shelbi/projects/<name>.yaml` (the global-mode YAML shape).
+2. Restore the global-mode YAML: rename the retained
+   `~/.shelbi/projects/<name>.yaml.migrated` copy back to
+   `~/.shelbi/projects/<name>.yaml` (or reconstruct it from
+   `~/.shelbi/projects/<name>/local.yaml` plus the committed shared half).
 
 A merged migration commit is expensive to undo. `--dry-run` first.
 
@@ -262,10 +291,10 @@ agents/  project.yaml  workflows/  workspace-settings.json.template
 $ shelbi init --pick-up
 ✓ scaffolded /Users/you/.shelbi
 ✓ registered project: /Users/you/.shelbi/projects/shelbi.yaml
-✓ wrote workspace settings template: /Users/you/.shelbi/projects/shelbi/workspace-settings.json.template
+✓ wrote workspace settings template: /Users/you/work/shelbi/.shelbi/workspace-settings.json.template
 ✓ created agent workspace: agents/orchestrator/
 ✓ created agent workspace: agents/developer/
-✓ wrote project statuses: /Users/you/.shelbi/projects/shelbi/workflows/statuses.yaml
+✓ wrote project statuses: /Users/you/work/shelbi/.shelbi/workflows/statuses.yaml
 
 ✓ picked up `shelbi` from /Users/you/work/shelbi/.shelbi/project.yaml.
 
@@ -289,7 +318,6 @@ note: local alias `shelbi` was already taken — using `shelbi-2` on this machin
 ✓ registered project: /Users/you/.shelbi/projects/shelbi-2.yaml
 …
 ✓ picked up `shelbi` from /Users/you/work/shelbi/.shelbi/project.yaml as local alias `shelbi-2`.
-  Tip: `shelbi project rename` can retitle the local alias to something friendlier.
 
 next:
   1. add machines/workspaces to ~/.shelbi/projects/shelbi-2.yaml if needed

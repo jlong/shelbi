@@ -19,8 +19,8 @@ running against this hub interleave in the same file. Filtering by
 project (or workspace, or task) is the orchestrator's job. At the
 filesystem layer, it's one stream.
 
-Defined in `crates/shelbi-state/src/worker_status.rs` (`events_log_path`,
-`append_worker_event`, `append_task_event`).
+Defined in `crates/shelbi-state/src/event_log.rs` (`events_log_path`,
+`append_workspace_event`, `append_task_event`).
 
 ## Line shape
 
@@ -30,17 +30,20 @@ carries:
 ### Workspace transitions
 
 ```
-<rfc3339-timestamp> workspace=<name> <prev-state> -> <new-state>
+<rfc3339-timestamp> project=<name> workspace=<name> <prev-state> -> <new-state>
 ```
 
 ```
-2026-06-22T14:22:11+00:00 workspace=alpha none -> working
-2026-06-22T14:23:47+00:00 workspace=alpha working -> awaiting_input
-2026-06-22T14:23:48+00:00 workspace=alpha awaiting_input -> working
+2026-06-22T14:22:11+00:00 project=myapp workspace=alpha none -> working
+2026-06-22T14:23:47+00:00 project=myapp workspace=alpha working -> awaiting_input
+2026-06-22T14:23:48+00:00 project=myapp workspace=alpha awaiting_input -> working
 ```
 
+- The leading `project=<name>` scope is load-bearing: `events.log` is
+  hub-global and workspace names are only unique *within* a project, so
+  each orchestrator filters to `project=<its-own-name>`.
 - `<prev-state>` is `none` on the first observation of that workspace.
-- States: `working`, `awaiting_input`, `blocked`. See
+- States: `working`, `awaiting_input`, `blocked`, `paused`. See
   [workspace states](/docs/concepts/workspaces#workspace-states).
 - The `workspace=` token names the [workspace](/docs/concepts/workspaces) whose state changed.
 - Written by the hub-side poller every time it observes a state change
@@ -49,41 +52,52 @@ carries:
 ### Task transitions
 
 ```
-<rfc3339-timestamp> task=<id> <from-column> -> <to-column> reason=<short>
+<rfc3339-timestamp> project=<name> task=<id> workflow=<name> <from-column> -> <to-column> reason=<short> from_category=<cat> to_category=<cat>
 ```
 
 ```
-2026-06-22T14:24:03+00:00 task=fix-login backlog -> todo reason=user:cli
-2026-06-22T14:24:11+00:00 task=fix-login todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha
-2026-06-22T14:31:52+00:00 task=fix-login in_progress -> review reason=workspace:ready-marker
+2026-06-22T14:24:03+00:00 project=myapp task=fix-login workflow=task backlog -> todo reason=user:cli from_category=backlog to_category=ready
+2026-06-22T14:24:11+00:00 project=myapp task=fix-login workflow=task todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha from_category=ready to_category=active
+2026-06-22T14:31:52+00:00 project=myapp task=fix-login workflow=task in_progress -> review reason=workspace:ready-marker from_category=active to_category=handoff
 ```
 
+- The leading `project=<name>` scope is load-bearing, exactly as for
+  workspace lines.
+- `workflow=<name>` is the workflow the task runs under (from its
+  frontmatter); an empty value is treated as the default workflow.
 - `<from-column>` and `<to-column>` are the snake_case status names
   from the task's workflow (default workflow: `backlog`, `todo`,
   `in_progress`, `review`, `done`). See
   [workflows](/docs/guides/getting-started/workflows).
+- `from_category=<cat>` and `to_category=<cat>` are the
+  [status categories](/docs/concepts/orchestrator) of those columns,
+  derived from the workflow so reaction rules can match semantically
+  without re-reading the workflow YAML.
 - `reason=<short>` is a single token (whitespace is folded to
   underscores) describing who triggered the move.
 
 ### Heartbeats
 
 ```
-<rfc3339-timestamp> project=<name> heartbeat
+<rfc3339-timestamp> project=<name> heartbeat zen_eligible=<N> idle_workspaces=<M>
 ```
 
 ```
-2026-06-22T14:25:11+00:00 project=myapp heartbeat
+2026-06-22T14:25:11+00:00 project=myapp heartbeat zen_eligible=5 idle_workspaces=4
 ```
 
+- The line always carries `zen_eligible=` (how many tasks Zen could act
+  on) and `idle_workspaces=`. When Zen Mode is On a `zen=on` marker is
+  inserted right after `heartbeat`, and a trailing reminder may follow.
 - Emitted by the hub-side poller on the cadence set by the
   [`heartbeat`](/docs/configuration/project#heartbeat) key in
   `project.yaml`. Set to `"off"` to disable.
 - Adaptive cadence: the poller holds at the standard `interval`
-  (default `3m`) while there's supervisable work in flight, then backs
+  (default `60s`) while there's supervisable work in flight, then backs
   off exponentially once the board is quiescent, doubling each idle tick
-  and capping at `max` (default `60m`). A fully idle hub relaxes
-  `3m → 6m → 12m → … → 60m`, so even a long-quiet board still sweeps for
-  a silently-stuck task about once an hour. Backing off on "no
+  and capping at `max` (default `5m` / `300s`). A fully idle hub relaxes
+  `60s → 2m → 4m → 5m` (capped), so even a long-quiet board still sweeps
+  for a silently-stuck task about every five minutes. Backing off on "no
   supervisable work" rather than "no log line" is deliberate: a stuck
   `in_progress` task also emits nothing, and the heartbeat sweep is
   exactly what catches it.
@@ -116,11 +130,14 @@ this log records, rendered for a human instead of grepped:
 
 <AppMockup terminalTitle="jlong@hub — shelbi" activeView="activity" />
 
-The orchestrator distinguishes the line kinds by the second token
-(`task=`, `workspace=`, `project=`, `dispatch`, `mode=zen`,
-`zen-dryrun`). New line shapes get added over time;
-consumers that only recognize `task=` and `workspace=` should fall through
-gracefully on the rest.
+The orchestrator distinguishes the line kinds by which marker tokens the
+body contains (`EventKind::from_body` matches on `contains`, not a fixed
+position). Because every state line now leads with the `project=` scope,
+`workspace=` and `task=` are the *third* token; other kinds are keyed off
+`dispatch`, `mode=zen`, `zen-dryrun`, `ci`, `message=`, `pane_alive=`,
+and more. New line shapes get added over time; consumers that only
+recognize `task=` and `workspace=` should fall through gracefully on the
+rest.
 
 ## Atomicity
 
@@ -133,8 +150,8 @@ interleave **whole lines** rather than tearing.
 This matters because both the CLI (when you run `shelbi task move`) and
 the poller (when it observes state changes) write to the same file
 concurrently. The test
-`concurrent_task_and_worker_appends_dont_tear` in
-`crates/shelbi-state/src/worker_status.rs` locks this property in.
+`concurrent_task_and_workspace_appends_dont_tear` in
+`crates/shelbi-state/src/event_log.rs` locks this property in.
 
 ## Tailing the log
 
@@ -159,11 +176,11 @@ restarts from the top rather than silently dropping the next writer's
 content.
 
 ```text
-2026-06-22T14:24:03+00:00 task=fix-login backlog -> todo reason=user:cli
-2026-06-22T14:24:11+00:00 task=fix-login todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha
-2026-06-22T14:24:11+00:00 workspace=alpha awaiting_input -> working
-2026-06-22T14:31:50+00:00 workspace=alpha working -> awaiting_input
-2026-06-22T14:31:52+00:00 task=fix-login in_progress -> review reason=workspace:ready-marker
+2026-06-22T14:24:03+00:00 project=myapp task=fix-login workflow=task backlog -> todo reason=user:cli from_category=backlog to_category=ready
+2026-06-22T14:24:11+00:00 project=myapp task=fix-login workflow=task todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha from_category=ready to_category=active
+2026-06-22T14:24:11+00:00 project=myapp workspace=alpha awaiting_input -> working
+2026-06-22T14:31:50+00:00 project=myapp workspace=alpha working -> awaiting_input
+2026-06-22T14:31:52+00:00 project=myapp task=fix-login workflow=task in_progress -> review reason=workspace:ready-marker from_category=active to_category=handoff
 ```
 
 That five-line burst is what one task moving through the system looks
@@ -212,14 +229,16 @@ contract is:
   via rename.
 - One line per event, RFC3339 timestamp first, ASCII fields separated
   by single spaces.
-- Two prefixes (`workspace=` or `task=`) keyed off the second
-  whitespace-separated token after the timestamp.
+- Every state line leads with a `project=<name>` scope; match on the
+  presence of the `workspace=` or `task=` marker token (they now sit
+  after `project=`), not on a fixed token position.
 - Reason strings are tokens (no whitespace). If you need to embed
   structured data, encode it inside the token (the convention
   `key=value` works fine).
 
-The full grammar lives in the two `append_*_event` functions in
-`crates/shelbi-state/src/worker_status.rs`.
+The full grammar lives in the `append_*_event` family in
+`crates/shelbi-state/src/event_log.rs` (`append_workspace_event`,
+`append_task_event`, `append_heartbeat_event`, and the rest).
 
 ## See also
 

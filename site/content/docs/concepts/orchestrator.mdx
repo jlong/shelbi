@@ -58,6 +58,7 @@ names:
 | `active`   | Owner is working on it now.                                          | `in_progress`           |
 | `handoff`  | One owner finished their part; another's input is required next.    | `review`                |
 | `done`     | Terminal; accepted by the user.                                      | `done`                  |
+| `archived` | Terminal; closed without acceptance.                                 | `canceled`              |
 
 The category set is fixed; status names are user-customizable per
 workflow. A workflow that renames `Review` to `QA`, or splits `handoff`
@@ -97,12 +98,16 @@ When you boot a project (`shelbi orchestrate` or via the TUI launcher),
 For Claude, Shelbi adds Claude-specific launch wiring:
 `--append-system-prompt "$(cat .claude/agent-instructions.md)"` and an
 initial positional prompt that tells Claude to run the bootstrap sequence.
-For Codex, Shelbi launches the configured `command` and `flags`, then adds
-an initial positional prompt containing the project identity, worktree path,
-rendered `.claude/agent-instructions.md` contents, reload handoff context,
-and bootstrap request. Other non-Claude runners launch exactly as
-configured, so they must support any prompt-loading flags you declare in
-`agent_runners.<name>.flags`.
+Codex, by default, routes through Shelbi's native app-server bridge
+(`shelbi __codex-orchestrator <project>`): the bridge owns the Codex thread
+and attaches the visible TUI to it, so board events are never pasted into
+the pane. A compatibility fallback (`codex_standalone_launch`, for Codex
+binaries without app-server mode) instead launches the configured `command`
+and `flags` with an initial positional prompt containing the project
+identity, worktree path, rendered `.claude/agent-instructions.md` contents,
+reload handoff context, and bootstrap request. Other non-Claude runners
+launch exactly as configured, so they must support any prompt-loading flags
+you declare in `agent_runners.<name>.flags`.
 
 The split is: the *source* you edit is `instructions.md`;
 `.claude/agent-instructions.md` is a rendered build artifact, not a file
@@ -141,18 +146,22 @@ the user:
 
 1. **Read the board.** `shelbi task list` for the column membership,
    priorities, `assigned_to`, and any `prefers_machine` hints on each
-   card. Each status belongs to one of the five categories above; the
+   card. Each status belongs to one of the six categories above; the
    orchestrator maps column → category from the active workflow.
 2. **Read the workspace pool.** `shelbi workspace list` to see which
    workspaces are free (no `active`-category task assigned), which machine
    each lives on, and which agent each is running.
-3. **Start tailing.** Launch `shelbi events tail --follow` in the
-   background and watch it. Every emitted line is a trigger the
-   orchestrator must consider.
+3. **Start its live watch.** Launch `shelbi orchestrator events next
+   --follow` in the background — the durable claim/ack feed is the
+   orchestrator's primary watch (`shelbi events tail` is the raw view for
+   humans). Every emitted line is a trigger the orchestrator must consider.
 
+In practice the shipped prompt folds the first two steps into a single
+`shelbi status --full --handoff` snapshot (plus `shelbi zen status` and a
+crash-recovery scan); the commands above read the same content piecewise.
 After that, the in-memory snapshot is kept up to date from the event
-stream. The orchestrator only re-runs `workspace list` / `task list` if
-the tail process dies and it has to rebuild.
+stream. The orchestrator only re-reads the board if its watch dies and it
+has to rebuild.
 
 The reaction rules pattern-match the **category** tokens on each task
 event line, not the literal `<from> -> <to>` status pair. That's what
@@ -168,10 +177,11 @@ statuses:
   finished branch onto a matching workspace — firing the status's enter
   transition to boot a server (or leave it queued when they're all busy) so a
   human can run the change.
-- `worker=<name> working -> awaiting_input` → same idea, the workspace
+- `workspace=<name> working -> awaiting_input` → same idea, the workspace
   just freed up.
-- `worker=<name> pane_alive=false` → surface to the user; don't
-  auto-restart.
+- `workspace=<name> pane_alive=false reason=<short>` → an ordinary crash
+  is auto-restarted by the supervisor; the orchestrator at most mentions
+  it. Only `supervision=gave-up` (crash-loop) is surfaced for direction.
 - `project=<name> heartbeat` → no state change to react to, but the
   watch is awake. A good time to re-check `active`-category tasks for
   stuck workspaces or missed markers. See
@@ -273,8 +283,10 @@ What you might *want* to change per project:
   accept signal.
 - **It does not auto-promote `backlog` → `ready`.** Triage belongs to
   the user.
-- **It does not restart a workspace whose pane died.** It surfaces the
-  death and waits for direction.
+- **It does not itself restart a workspace whose pane died.** The
+  supervisor auto-restarts an ordinary crash; the orchestrator only
+  surfaces the case the supervisor gives up on (a crash loop) and waits
+  for direction there.
 - **It does not stop workspaces without asking.**
 
 These are guardrails encoded in the prompt itself. They're worth

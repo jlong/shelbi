@@ -43,7 +43,9 @@ with three fallback chords:
 - `Ctrl+Shift+Z`
 
 …plus a "skip" option that leaves the toggle unbound (use the CLI
-instead). Your pick is persisted to `~/.shelbi/shelbi.yaml`.
+instead). Your pick is persisted to `~/.shelbi/config.yaml` (a later
+one-shot migration copies it into `~/.shelbi/keys.yaml`); this is a
+different file from `~/.shelbi/shelbi.yaml`, the hub project index.
 
 ## Turning it off
 
@@ -286,6 +288,21 @@ top.
 
 The default ships with these categories and conditions filled in. Edit
 the sections in place to reshape them.
+
+<Callout type="note" title="Review loading is also daemon-automated">
+
+Where the review-workspace gate above says to "leave it in the review status
+for the human to load from the sidebar," the substantive guarantees still
+hold: Zen never auto-merges a review-routed task, the human still resolves it
+(accept → `done`, or bounce → `ready`), and there is genuinely no `shelbi
+review` command. What has changed is *who triggers the load*: the daemon now
+auto-loads queued review-column tasks onto idle
+[review workspaces](/docs/concepts/review-workspaces) each poller tick
+(`autoload_review_queue`), so loading is no longer a human-only sidebar
+action. The sidebar confirm popup is the manual path for loading a queued
+task onto a chosen slot.
+
+</Callout>
 
 ### Pre-merge review is the orchestrator's own
 
@@ -729,13 +746,13 @@ per-workspace avatars use, and a subtle dark-tinted row background so
 machine-driven actions are visually separable from user actions in
 the same stream.
 
-The reason strings the feed recognizes (each renders with its own
-specific phrasing):
+The reason strings the feed recognizes (most render with their own
+specific phrasing; the exception is called out below):
 
 | Reason | Meaning |
 | --- | --- |
 | `orchestrator:zen-promote category=<n>` | Promoted a backlog task to todo under judgment category `<n>`. |
-| `orchestrator:zen-decline reason-text=<short>` | Considered a candidate, decided not to promote. |
+| `orchestrator:zen-decline reason-text=<short>` | Considered a candidate, decided not to promote. Still gets the ZEN badge and tinted row, but has no dedicated phrasing: it renders generically as a move and does not surface `reason-text`. |
 | `orchestrator:zen-merge sha=<short>` | Auto-merged a reviewed task to `main`. |
 | `zen:failed-checks cmd=<…> exit=<…>` | Local check failed; task stays in review. |
 | `zen:diff-too-large files=<…> lines=<…>` | Diff exceeded the size threshold. |
@@ -752,7 +769,8 @@ Mode that's the recurring nudge to check in-flight reviews and stuck
 auto-promotions when nothing else has fired. The merge bar can spend
 minutes waiting on CI, and heartbeats keep the orchestrator from
 sleeping through the settle. The cadence comes from the `heartbeat`
-key in `project.yaml` (default `3m`).
+key in `project.yaml` (default `60s`, backing off to a `5m` cap while the
+board is quiescent).
 
 ## See also
 

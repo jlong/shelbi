@@ -199,6 +199,7 @@ The hub polls each workspace's tmux pane title every few seconds (see
 | `⏵`   | `working`          | agent is mid-turn: actively typing, calling tools, running shells.       |
 | `💬`  | `awaiting_input`   | agent finished a turn and is sitting at the prompt.                      |
 | `⚠`   | `blocked`          | agent paused on a permission dialog or other interactive gate.           |
+| `⏸`   | `paused`           | the workspace stalled on a usage limit and is waiting to resume.         |
 | `·`   | (no in-flight task) | the slot is idle and ready to be assigned.                              |
 
 A workspace that *finishes* a task doesn't get its own "done" badge. The
@@ -216,8 +217,8 @@ work. The actual completion signal is the review-ready marker (see below).
 State changes are also appended to `~/.shelbi/events.log`:
 
 ```text
-2026-06-22T14:22:11+00:00 worker=bravo none -> working
-2026-06-22T14:24:03+00:00 worker=bravo working -> awaiting_input
+2026-06-22T14:22:11+00:00 project=myapp workspace=bravo none -> working
+2026-06-22T14:24:03+00:00 project=myapp workspace=bravo working -> awaiting_input
 ```
 
 That feed is what the orchestrator tails to know when to dispatch more work.
@@ -226,14 +227,20 @@ See [the events log](/docs/concepts/events-log).
 ## Switching tasks clears context
 
 When a workspace picks up a new task its pane is **killed and re-created**
-from scratch:
+from scratch. The branch switch happens first, while the old pane is still
+intact; the pane is torn down and rebuilt only after the worktree and
+settings are in place:
 
-1. The pane (window for hub workspaces, session for remote ones) is torn
-   down.
-2. The worktree is switched to the task's branch, creating the branch off
-   `default_branch` if it doesn't exist and refusing to switch if there are
+1. The worktree is switched to the task's branch, creating the branch off
+   the project's `base_branch()` (the `git.base_branch` setting when
+   present, otherwise `default_branch`, and a workflow can override it
+   further) if it doesn't exist, and refusing to switch if there are
    uncommitted changes.
-3. A fresh `.claude/settings.json` is deployed under the worktree.
+2. `.claude/settings.local.json` is re-wired under the worktree — an
+   additive, self-healing merge, not a clobber (Shelbi no longer
+   overwrites the committed `settings.json` on every dispatch).
+3. The pane (window for hub workspaces, session for remote ones) is torn
+   down.
 4. A new pane is created and the agent CLI is launched in it, loaded with
    the [agent](/docs/concepts/agents) the task's status calls for.
 5. Once the agent's input box is ready (`shift+tab to cycle` footer
@@ -245,7 +252,7 @@ clean context, with no leakage between tasks on the same workspace.
 
 <Callout type="warning" title="Uncommitted work blocks the switch">
 
-Step 2 refuses to switch branches if the worktree has uncommitted changes.
+Step 1 refuses to switch branches if the worktree has uncommitted changes.
 An agent that leaves work uncommitted will stall its own next dispatch. The
 completion protocol is a commit plus the review-ready marker, never a dirty
 tree.
@@ -273,8 +280,8 @@ it finds a non-empty value:
 2. Moves the task to the next `handoff` status (`review` in the default
    workflow).
 3. Clears the marker.
-4. Appends `task=<id> in_progress -> review reason=workspace:ready-marker` to
-   the events log.
+4. Appends the task transition to the events log, e.g.
+   `project=<name> task=<id> workflow=<name> in_progress -> review reason=workspace:ready-marker from_category=active to_category=handoff`.
 
 The workspace never runs `shelbi` itself. The marker file is the *entire*
 on-workspace protocol. This is what makes a remote workspace possible with
