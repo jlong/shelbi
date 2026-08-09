@@ -815,6 +815,26 @@ fn poll_one(
     // UI does can hide a file-based signal.
     maybe_apply_transition(project, workspace, machine, &host, &addr);
 
+    // Review-slot serving detection. A `review`-tagged slot runs the workflow's
+    // serve recipe (e.g. `npm run dev`), so its pane title is the dev server's,
+    // never a `shelbi:<state>` marker — the title path below would parse nothing
+    // and return, leaving the slot forever "hasn't been polled" and stuck under
+    // Queued for Review even while the server is up. Run the recipe's `ready:`
+    // probe ourselves: when it passes we write the review-loaded marker (so the
+    // sidebar promotes the task to Ready for Review, deterministically, without
+    // depending on the agent remembering to) and record the `serving` sub-state.
+    // When a review slot's task is resolved we reap the orphaned server. Handled
+    // here for both auto-loaded and human-loaded review tasks — they differ only
+    // in who set `assigned_to`, which this reads the same way. Returns `true`
+    // when it took authoritative action; a not-yet-serving slot falls through so
+    // its Review agent pane is still observed normally (loading / blocked /
+    // paused / dialogs).
+    if project.effective_tags(workspace).contains("review")
+        && handle_review_slot(project, workspace, machine, &host, &addr, last_known)
+    {
+        return;
+    }
+
     // No pane → no marker. The display-message call would fail anyway,
     // but checking up-front keeps stderr noise out of the log.
     let alive = shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(false);
@@ -3062,6 +3082,195 @@ fn assigned_review_task_for(project: &Project, workspace_name: &str) -> Option<S
         .map(|tf| tf.task.id)
 }
 
+/// Drive a `review`-tagged slot's serving lifecycle for one poll tick. Returns
+/// `true` when it took authoritative action (recorded serving, or reaped an
+/// orphan) and the caller should skip the rest of the tick; `false` when the
+/// slot isn't serving yet and isn't orphaned, so the caller should observe its
+/// Review agent pane normally (loading / blocked / paused / dialogs).
+///
+/// - **Task assigned + `ready:` probe passes** → the branch is serving: write
+///   the `.claude/shelbi-review-loaded` marker (so the sidebar promotes it to
+///   **Ready for Review**, deterministically) and record the `serving`
+///   sub-state (so `shelbi workspace status` no longer reads "hasn't been
+///   polled"). Authoritative.
+/// - **Task assigned + probe not yet passing** (booting, or a diff-only review
+///   with no probe) → not authoritative; fall through to observe the pane.
+/// - **No review task assigned** → the slot's task is resolved; reap any
+///   orphaned server it left listening (see [`maybe_reap_orphaned_review_slot`]).
+fn handle_review_slot(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    machine: &shelbi_core::Machine,
+    host: &shelbi_core::Host,
+    addr: &shelbi_core::TmuxAddr,
+    last_known: &mut Option<WorkspaceState>,
+) -> bool {
+    let marker =
+        shelbi_orchestrator::workspace::workspace_review_loaded_marker(machine, workspace);
+    match assigned_review_task_for(project, &workspace.name) {
+        Some(task_id) => {
+            match shelbi_orchestrator::workspace::probe_review_slot_serving(
+                project, workspace, &task_id,
+            ) {
+                Some(serving) => {
+                    ensure_review_marker_and_serving_state(
+                        project,
+                        workspace,
+                        host,
+                        &marker,
+                        &task_id,
+                        serving.url.as_deref(),
+                        last_known,
+                    );
+                    true
+                }
+                // Not confirmed serving yet (still booting, or a diff-only
+                // review with no probe). Leave the marker to the agent and let
+                // the caller observe the pane's own loading/blocked state.
+                None => false,
+            }
+        }
+        None => maybe_reap_orphaned_review_slot(project, workspace, host, addr, &marker),
+    }
+}
+
+/// Write the review-loaded marker (idempotently — only when it doesn't already
+/// name `task_id`, since a slot reused between tasks can still hold the previous
+/// task's marker) and persist the `serving` sub-state for a confirmed-serving
+/// review slot.
+fn ensure_review_marker_and_serving_state(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    host: &shelbi_core::Host,
+    marker: &std::path::Path,
+    task_id: &str,
+    url: Option<&str>,
+    last_known: &mut Option<WorkspaceState>,
+) {
+    let already_marked = matches!(
+        shelbi_orchestrator::workspace::read_review_loaded_marker(host, marker),
+        Ok(Some(m)) if m == task_id
+    );
+    if !already_marked {
+        match shelbi_orchestrator::workspace::write_review_loaded_marker(
+            host, marker, task_id, url,
+        ) {
+            Ok(()) => tracing::info!(
+                workspace = %workspace.name,
+                task = %task_id,
+                "review slot confirmed serving; wrote review-loaded marker",
+            ),
+            Err(e) => tracing::warn!(
+                workspace = %workspace.name,
+                error = %e,
+                "write_review_loaded_marker failed",
+            ),
+        }
+    }
+    record_review_serving(project, workspace, task_id, last_known);
+}
+
+/// Persist the `serving` sub-state for a review slot, emitting a
+/// `... -> serving` event on the edge into it. Rides the same [`decide`]
+/// dedupe machinery as the other states: while the slot stays serving only
+/// `last_seen` moves and no further event fires.
+fn record_review_serving(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    task_id: &str,
+    last_known: &mut Option<WorkspaceState>,
+) {
+    let prior = load_prior(&workspace.name, last_known);
+    let outcome = decide(
+        &workspace.name,
+        Some(task_id.to_string()),
+        prior,
+        WorkspaceState::Serving,
+        Utc::now(),
+    );
+    if let Err(e) = save_workspace_status(&outcome.status) {
+        tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status (serving) failed");
+    }
+    if outcome.transitioned {
+        if let Err(e) = append_workspace_event(
+            &project.name,
+            &workspace.name,
+            outcome.prev_state,
+            WorkspaceState::Serving,
+        ) {
+            tracing::warn!(workspace = %workspace.name, error = %e, "append_workspace_event (serving) failed");
+        }
+        tracing::info!(workspace = %workspace.name, task = %task_id, "review slot serving");
+    }
+    *last_known = Some(WorkspaceState::Serving);
+}
+
+/// Reap a review slot whose task is resolved (no review-column task points at
+/// it) but which still holds a `.claude/shelbi-review-loaded` marker — evidence
+/// it served a now-gone task and its server is orphaned. Clears the stale
+/// marker (so the sidebar drops the phantom **Ready for Review** row) and, on a
+/// live non-user-shell pane, kills it (stopping the server it parented). Returns
+/// `true` when it acted (marker cleared) so the caller skips the rest of the
+/// tick.
+///
+/// Marker presence is the gate: with no marker there's no evidence a server was
+/// started here, so an idle review agent or the sidebar's user shell is left
+/// untouched — the same conservative bias as the dev orphan path
+/// ([`maybe_reconcile_orphaned_pane`]), which this complements (that path
+/// deliberately skips `review` slots).
+fn maybe_reap_orphaned_review_slot(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    host: &shelbi_core::Host,
+    addr: &shelbi_core::TmuxAddr,
+    marker: &std::path::Path,
+) -> bool {
+    let has_marker = matches!(
+        shelbi_orchestrator::workspace::read_review_loaded_marker(host, marker),
+        Ok(Some(_))
+    );
+    if !has_marker {
+        return false;
+    }
+    // Clear the stale marker first so the Ready row drops even if the reap
+    // below can't run (a probe hiccup, or a pane already gone).
+    if let Err(e) = shelbi_orchestrator::workspace::clear_review_loaded_marker(host, marker) {
+        tracing::warn!(workspace = %workspace.name, error = %e, "clear_review_loaded_marker failed");
+    }
+    // Kill only a live, non-user-shell pane — the same guard the dev orphan
+    // path uses so a user shell opened on the idle slot is never reaped.
+    match shelbi_orchestrator::workspace::probe_workspace_slot(
+        host,
+        addr,
+        shelbi_orchestrator::workspace::probe_deadline(),
+    ) {
+        shelbi_orchestrator::workspace::SlotProbe::Alive { user_shell: false } => {}
+        shelbi_orchestrator::workspace::SlotProbe::Alive { user_shell: true }
+        | shelbi_orchestrator::workspace::SlotProbe::Dead
+        | shelbi_orchestrator::workspace::SlotProbe::Unreachable { .. } => return true,
+    }
+    match shelbi_orchestrator::workspace::kill_workspace_pane(host, addr, &workspace.name) {
+        Ok(()) => {
+            if let Err(e) = shelbi_state::append_workspace_pane_event(
+                &project.name,
+                &workspace.name,
+                false,
+                "orphaned-review-slot-reaped",
+            ) {
+                tracing::warn!(workspace = %workspace.name, error = %e, "append_workspace_pane_event failed");
+            }
+            tracing::info!(
+                workspace = %workspace.name,
+                "reaped orphaned review slot (task resolved); stopped its serving pane",
+            );
+        }
+        Err(e) => {
+            tracing::warn!(workspace = %workspace.name, error = %e, "reap of orphaned review slot failed");
+        }
+    }
+    true
+}
+
 /// Reap a dev workspace pane orphaned by a manual board move. Fires when a
 /// live, non-user-shell pane on a non-`review` workspace has no active
 /// (`active`-category) task assigned to it — the state a hand move out of
@@ -3285,6 +3494,110 @@ mod tests {
             s.decide_dead(t0 + STABLE_RECOVERY + Duration::from_secs(2)),
             ReviewResumeAction::Resume
         );
+    }
+
+    /// A unique temp SHELBI_HOME for a serving test, keyed by pid+nanos.
+    fn review_serving_home() -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-review-serving-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    #[test]
+    fn record_review_serving_persists_serving_state_and_dedupes() {
+        // Criterion 1: a serving review slot is polled to a `serving` sub-state
+        // (not "hasn't been polled"), and while it stays serving only last_seen
+        // moves — the ordinary decide() dedupe, so the feed isn't spammed.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = review_serving_home();
+        let prior_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.name = "demo".into();
+        project.workspaces[0].tags = vec!["review".into()];
+        project.workspaces[0].slot = Some(4310);
+        shelbi_state::save_project(&project).unwrap();
+
+        let ws = project.workspaces[0].clone();
+        let mut last_known = None;
+        record_review_serving(&project, &ws, "t-serve", &mut last_known);
+
+        let s = shelbi_state::load_workspace_status(&ws.name)
+            .unwrap()
+            .expect("status.yaml written");
+        assert_eq!(s.state, WorkspaceState::Serving);
+        assert_eq!(s.current_task.as_deref(), Some("t-serve"));
+        assert_eq!(last_known, Some(WorkspaceState::Serving));
+        let first_transition = s.last_transition;
+
+        // Same state again → not a transition; last_transition is preserved.
+        record_review_serving(&project, &ws, "t-serve", &mut last_known);
+        let s2 = shelbi_state::load_workspace_status(&ws.name).unwrap().unwrap();
+        assert_eq!(s2.state, WorkspaceState::Serving);
+        assert_eq!(s2.last_transition, first_transition);
+
+        match prior_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn maybe_reap_orphaned_review_slot_clears_a_stale_marker() {
+        // Criterion 5: a review slot whose task is resolved but whose
+        // review-loaded marker lingers is an orphan — the marker is cleared so
+        // the sidebar drops the phantom Ready row. (Pane teardown needs a live
+        // tmux; here the bogus addr probes Dead, so we assert the marker clear,
+        // which happens before any kill.)
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = review_serving_home();
+        let prior_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.name = "demo".into();
+        project.workspaces[0].tags = vec!["review".into()];
+        project.workspaces[0].slot = Some(4310);
+        shelbi_state::save_project(&project).unwrap();
+        let ws = project.workspaces[0].clone();
+
+        // Plant a stale review-loaded marker naming a (now-resolved) task.
+        let marker_dir = work_dir.join(".claude");
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        let marker = work_dir.join(".claude").join("shelbi-review-loaded");
+        std::fs::write(&marker, "gone-task http://localhost:4310\n").unwrap();
+
+        let host = Host::Local;
+        let addr = TmuxAddr {
+            session: "shelbi-nonexistent-review-reap".into(),
+            window: "review-1".into(),
+        };
+        let acted = maybe_reap_orphaned_review_slot(&project, &ws, &host, &addr, &marker);
+        assert!(acted, "a lingering marker with no assigned task must be reaped");
+        assert!(!marker.exists(), "the stale marker must be cleared");
+
+        // No marker → nothing to reap (an idle agent / user shell is left alone).
+        let again = maybe_reap_orphaned_review_slot(&project, &ws, &host, &addr, &marker);
+        assert!(!again, "with no marker the slot is left untouched");
+
+        match prior_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

@@ -46,6 +46,15 @@ pub enum WorkspaceState {
     /// it reverts on the first poll after the limit lifts. Surfaced as the ⏸
     /// pause badge so a paused slot is visible at a glance.
     Paused,
+    /// A `review`-tagged slot whose loaded branch is confirmed serving — the
+    /// workflow's `review:` recipe `ready:` probe passed. Like [`Paused`] this
+    /// is derived from the poller's own observation (running the probe), not the
+    /// pane title: a review pane running `npm run dev` shows the dev server's
+    /// title, never a `shelbi:<state>` marker, so without this the slot would
+    /// never be polled at all ("hasn't been polled"). It is the serving
+    /// sub-state the sidebar's **Ready for Review** section keys off (via the
+    /// poller-written `.claude/shelbi-review-loaded` marker).
+    Serving,
 }
 
 impl WorkspaceState {
@@ -55,6 +64,7 @@ impl WorkspaceState {
             WorkspaceState::AwaitingInput => "awaiting_input",
             WorkspaceState::Blocked => "blocked",
             WorkspaceState::Paused => "paused",
+            WorkspaceState::Serving => "serving",
         }
     }
 }
