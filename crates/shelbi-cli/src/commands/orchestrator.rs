@@ -63,7 +63,12 @@ pub enum OrchestratorEventsCmd {
         /// cadence (and real events when busy), so a consumer that has seen no
         /// line — batch or heartbeat — within the heartbeat interval plus a
         /// grace margin can conclude the follower died and restart it. There is
-        /// no separate keepalive ping. When the feed stops on its own terms — a
+        /// no separate keepalive ping. A delivered-but-unacked batch does not
+        /// wedge the feed: it is held in lock-step only up to a bounded
+        /// visibility timeout, after which the feed redelivers it (folding in
+        /// anything appended since) rather than parking forever — so a dropped
+        /// ack or a consumer that hangs mid-batch can never silence a follower
+        /// while the stream is still flowing. When the feed stops on its own terms — a
         /// catchable termination signal (SIGTERM/SIGHUP/SIGINT) or the optional
         /// `--max-lifetime` cap below — it prints a terminal
         /// `{"feed":"expired"|"terminated", ...}` notice on stdout and exits 0.
@@ -150,6 +155,22 @@ fn wait_next(project: &str, mut cursor: u64, timeout: Duration) -> Result<DrainR
 /// live-latency characteristics of the two watches are identical.
 const FEED_POLL: Duration = Duration::from_millis(250);
 
+/// Visibility timeout for an in-flight (emitted-but-unacked) batch. The feed
+/// holds a delivered batch in lock-step so new events wait behind it under a
+/// stable delivery id, but only for this long: once a batch has been
+/// outstanding past this window without an ack, the feed redelivers it (picking
+/// up anything appended since) rather than hold the claim forever.
+///
+/// This is the release valve for the failure the lock-step alone caused — a
+/// consumer that silently drops an ack (or hangs after receiving a batch) used
+/// to leave the follower parked forever, delivering nothing while the stream
+/// kept flowing (heartbeats, zen toggles, pane deaths all landing in
+/// `events.log` unseen). Chosen comfortably longer than a normal
+/// process-then-`events ack` round-trip (seconds) so a healthy consumer is
+/// never spammed with duplicates, yet well under the heartbeat cap (minutes) so
+/// a stuck follower recovers — and re-blinds no one — within a bounded time.
+const FEED_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Durable claim/ack event feed — the Claude orchestrator's replacement for a
 /// raw `shelbi events tail --follow` watch.
 ///
@@ -229,17 +250,46 @@ fn run_feed(project: &str, max_lifetime: Option<Duration>) -> Result<()> {
 /// the next batch. A consumer detects a dead follower from the *absence* of any
 /// stream line past the heartbeat interval plus grace, not from a ping this
 /// loop writes.
+///
+/// A batch is held in lock-step only until [`FEED_VISIBILITY_TIMEOUT`]: an
+/// in-flight batch left unacked past that window is redelivered rather than
+/// parked forever, so a consumer that silently dropped its ack (or hung after
+/// receiving the batch) can never leave the follower delivering nothing while
+/// the stream keeps flowing. See [`feed_should_scan`].
 fn feed_loop(
     project: &str,
     max_lifetime: Option<Duration>,
     signal: &AtomicUsize,
 ) -> Result<FeedOutcome> {
+    feed_loop_with(
+        project,
+        max_lifetime,
+        signal,
+        FEED_POLL,
+        FEED_VISIBILITY_TIMEOUT,
+        &mut |batch| emit_feed_batch(batch),
+    )
+}
+
+/// [`feed_loop`] with the poll cadence, visibility timeout, and batch emitter
+/// injected, so tests can drive the redelivery behaviour deterministically
+/// (short cadences, an in-memory sink) without touching global stdout or real
+/// wall-clock intervals.
+fn feed_loop_with(
+    project: &str,
+    max_lifetime: Option<Duration>,
+    signal: &AtomicUsize,
+    poll: Duration,
+    visibility_timeout: Duration,
+    emit: &mut dyn FnMut(&FeedBatch) -> Result<()>,
+) -> Result<FeedOutcome> {
     let start = Instant::now();
-    // The cursor value we have already emitted a batch for. While it matches
-    // the persisted cursor we hold the in-flight batch instead of re-scanning,
-    // so new events wait for the ack rather than growing the batch under a
-    // churning delivery id.
-    let mut emitted_at: Option<u64> = None;
+    // The batch currently in flight: the cursor it was scanned from and when it
+    // was last emitted. `None` means nothing is outstanding, so the next pending
+    // batch emits on the very next tick. While a batch is in flight we hold it
+    // in lock-step (new events wait behind it under a stable delivery id) until
+    // its visibility timeout elapses, at which point it is redelivered.
+    let mut inflight: Option<InflightBatch> = None;
     loop {
         let sig = signal.load(Ordering::Relaxed);
         if sig != 0 {
@@ -251,13 +301,67 @@ fn feed_loop(
             }
         }
         let cursor = read_persisted_cursor(project)?;
-        if emitted_at != Some(cursor) {
-            if let Some(batch) = scan_feed_batch(project, cursor)? {
-                emit_feed_batch(&batch)?;
-                emitted_at = Some(cursor);
+        if feed_should_scan(inflight.as_ref(), cursor, Instant::now(), visibility_timeout) {
+            match scan_feed_batch(project, cursor)? {
+                Some(batch) => {
+                    emit(&batch)?;
+                    inflight = Some(InflightBatch {
+                        cursor,
+                        emitted: Instant::now(),
+                    });
+                }
+                // Nothing pending: drop any stale in-flight marker so the next
+                // appended event emits immediately instead of waiting out a
+                // visibility window that started before the ack landed.
+                None => inflight = None,
             }
         }
-        thread::sleep(FEED_POLL);
+        thread::sleep(poll);
+    }
+}
+
+/// A batch handed to the consumer but not yet acked. The feed holds it in
+/// lock-step — new events wait behind it under a stable delivery id — but only
+/// until its visibility timeout elapses, after which it is redelivered so a
+/// dropped ack or a hung consumer never leaves the follower silently blind.
+struct InflightBatch {
+    /// The durable cursor the batch was scanned from. While the persisted
+    /// cursor still equals this, the ack has not landed.
+    cursor: u64,
+    /// When the batch was last emitted; the visibility timeout is measured from
+    /// here, and reset on each redelivery so redeliveries are spaced out.
+    emitted: Instant,
+}
+
+/// Decide whether the feed should scan and (re)emit on this tick. Split out as
+/// a pure function so the redelivery policy is unit-testable without a running
+/// loop.
+///
+/// Returns `true` in three cases:
+/// * nothing is in flight (`inflight` is `None`) — emit whatever is pending;
+/// * the durable cursor has moved past the in-flight batch — it was acked, so
+///   scan the next batch; or
+/// * the in-flight batch has been outstanding longer than `visibility_timeout`
+///   — redeliver it (at-least-once) instead of holding the claim indefinitely.
+///
+/// The remaining case — an in-flight batch still inside its visibility window —
+/// returns `false`, preserving the lock-step that keeps a batch's delivery id
+/// stable while the consumer is actively working it. Because a crash never
+/// advances the cursor (only `events ack` does), redelivery here and redelivery
+/// after a fresh restart share one guarantee: no acked batch is ever replayed,
+/// and no unacked batch is ever dropped.
+fn feed_should_scan(
+    inflight: Option<&InflightBatch>,
+    cursor: u64,
+    now: Instant,
+    visibility_timeout: Duration,
+) -> bool {
+    match inflight {
+        None => true,
+        Some(batch) => {
+            batch.cursor != cursor
+                || now.saturating_duration_since(batch.emitted) >= visibility_timeout
+        }
     }
 }
 
@@ -1533,6 +1637,113 @@ mod tests {
         assert_eq!(redelivered.cursor.from, before.to_string());
         assert_eq!(redelivered.events.len(), 1);
         assert_eq!(redelivered.events[0].task.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn feed_should_scan_holds_inflight_batch_until_ack_or_timeout() {
+        let now = Instant::now();
+        let lease = Duration::from_secs(90);
+
+        // Nothing in flight → emit whatever is pending.
+        assert!(feed_should_scan(None, 100, now, lease));
+
+        let inflight = InflightBatch {
+            cursor: 100,
+            emitted: now,
+        };
+
+        // Same cursor, still inside the visibility window → hold in lock-step
+        // (this is the property that keeps a batch's delivery id stable while
+        // the consumer works it).
+        assert!(!feed_should_scan(Some(&inflight), 100, now, lease));
+
+        // The ack advanced the durable cursor past the batch → scan the next.
+        assert!(feed_should_scan(Some(&inflight), 250, now, lease));
+
+        // Same cursor but the visibility timeout has elapsed → redeliver rather
+        // than park the claim forever. This is the branch that un-blinds a
+        // follower whose consumer dropped or hung on its ack.
+        assert!(feed_should_scan(Some(&inflight), 100, now + lease, lease));
+    }
+
+    #[test]
+    fn feed_loop_redelivers_an_unacked_batch_instead_of_going_silent() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task("demo", "first");
+        append_task_event(
+            "demo",
+            "first",
+            "default",
+            Column::todo(),
+            Column::done(),
+            "one",
+        )
+        .unwrap();
+
+        // A follower whose consumer never acks. With a zero visibility timeout
+        // every poll past the first redelivers, so a bounded lifetime captures
+        // several deliveries of the same still-unacked batch — the follower
+        // keeps the orchestrator fed rather than silently stalling.
+        let signal = AtomicUsize::new(0);
+        let mut deliveries: Vec<String> = Vec::new();
+        let outcome = feed_loop_with(
+            "demo",
+            Some(Duration::from_millis(80)),
+            &signal,
+            Duration::from_millis(5),
+            Duration::ZERO,
+            &mut |batch| {
+                deliveries.push(batch.delivery_id.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, FeedOutcome::Expired { .. }));
+        assert!(
+            deliveries.len() >= 2,
+            "an unacked batch must be redelivered, not held silently: {deliveries:?}"
+        );
+        // Never acked, so the cursor never moved and every redelivery carries
+        // the identical delivery id (at-least-once, idempotent).
+        assert!(deliveries.iter().all(|id| *id == deliveries[0]));
+        assert_eq!(
+            read_cursor("demo"),
+            0,
+            "redelivery must never advance the durable cursor"
+        );
+    }
+
+    #[test]
+    fn redelivery_folds_in_events_appended_after_an_unacked_batch() {
+        let (_guard, _tmp) = setup_home();
+        // A first event is delivered as a batch...
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+        let cursor = read_cursor("demo");
+        let first = scan_feed_batch("demo", cursor).unwrap().unwrap();
+        assert_eq!(first.events.len(), 1);
+
+        // ...but never acked. Meanwhile the stream keeps flowing: a heartbeat
+        // and a zen-mode toggle land — exactly the lines the live follower
+        // silently dropped while parked on an unacked batch.
+        append_heartbeat_event("demo", 0, 1, None).unwrap();
+        shelbi_state::append_zen_mode_event("demo", "off", "on", "user:palette").unwrap();
+
+        // Redelivery re-scans from the SAME unadvanced cursor, so the
+        // redelivered batch is a superset that finally surfaces the events the
+        // stall had hidden.
+        let redelivered = scan_feed_batch("demo", read_cursor("demo")).unwrap().unwrap();
+        assert_eq!(
+            read_cursor("demo"),
+            cursor,
+            "redelivery must not advance the cursor"
+        );
+        assert!(redelivered.events.len() >= 3);
+        assert!(redelivered.events.iter().any(|e| e.kind == "heartbeat"));
+        assert!(redelivered
+            .events
+            .iter()
+            .any(|e| e.kind == "zen_mode_transition"));
     }
 
     #[test]
