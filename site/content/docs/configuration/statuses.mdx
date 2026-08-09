@@ -30,6 +30,7 @@ statuses:
   - { id: in-progress, name: In Progress, category: active }
   - { id: review,      name: Review,      category: handoff }
   - { id: done,        name: Done,        category: done }
+  - { id: canceled,    name: Canceled,    category: archived }
 ```
 
 ## Top-level fields
@@ -66,10 +67,12 @@ semantics intact. See [status categories](/docs/guides/getting-started/workflows
 
 Loading fails if no status has category `done` or `archived`. A board
 with no terminal state is degenerate, since a task could never leave it.
-A category set is otherwise unconstrained: repeating a category is
-allowed (a long pipeline might have several `active` statuses), though a
-missing `handoff` or a duplicated single-instance category raises a
-non-fatal warning.
+Beyond that, the terminal categories `done` and `archived` may repeat
+cleanly (a pipeline can carry several done-like or archived-like lanes).
+The single-instance categories — `backlog`, `ready`, `active`, and
+`handoff` — raise a non-fatal warning if any of them appears more than
+once, as does a missing `handoff`. So two `active` statuses load, but
+with a warning.
 
 </Callout>
 
