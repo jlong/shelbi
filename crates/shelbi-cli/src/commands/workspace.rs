@@ -703,17 +703,57 @@ fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
     })?;
     let host = machine.host();
     let addr = orch_workspace::workspace_tmux_addr(&p, workspace).map_err(|e| anyhow!(e))?;
+
+    // Release/park the task BEFORE killing the pane. The stranded-slot resume
+    // only acts on a *dead* review pane whose task is still assigned on disk;
+    // parking (unassign + marker) while the pane is still alive means no tick
+    // can observe the (dead + assigned) state that would trigger a resume, so
+    // there's no window for the churn loop. `--keep-task` skips this entirely
+    // (a bare pane bounce that resume is meant to bring back).
+    if !keep_task {
+        // A review slot serves a handoff-category task that lives in the review
+        // column, not `in_progress`. Releasing it to `todo` (the dev-slot path
+        // below) would be wrong — it belongs in review — and leaving it
+        // assigned makes the stranded-slot resume relaunch the pane on the next
+        // tick (the churn loop). So *park* it: unassign it from the slot and
+        // mark it so neither the auto-loader nor the resume re-grabs it. It
+        // stays in the review column, and the slot returns to idle.
+        if p.effective_tags(workspace).contains("review") {
+            for id in park_review_workspace_tasks(project, name)? {
+                println!("✓ {id} unloaded from review (parked — won't auto-reload)");
+            }
+        }
+        // Also release any in-progress task assigned here. Normally a review
+        // slot holds none, but running this unconditionally reconciles a slot
+        // whose state diverged (an in-progress card still pinned to it) rather
+        // than leaving it dangling.
+        for id in release_workspace_tasks(project, name)? {
+            println!("✓ {id} released → todo (was assigned to {name})");
+        }
+    }
+
     orch_workspace::kill_workspace_pane(&host, &addr, &workspace.name).map_err(|e| anyhow!(e))?;
     println!("✓ {name} pane stopped");
-
-    if keep_task {
-        return Ok(());
-    }
-
-    for id in release_workspace_tasks(project, name)? {
-        println!("✓ {id} released → todo (was assigned to {name})");
-    }
     Ok(())
+}
+
+/// Park every review-column task assigned to `workspace_name`: unassign it and
+/// set its parked marker so the auto-loader and the stranded-slot resume leave
+/// it alone. Returns the parked task ids. There is normally at most one, but a
+/// diverged board is reconciled by parking them all. Used by [`stop`] on a
+/// `review`-tagged slot.
+fn park_review_workspace_tasks(project: &str, workspace_name: &str) -> Result<Vec<String>> {
+    let review = shelbi_state::list_column(project, Column::review()).map_err(|e| anyhow!(e))?;
+    let mut parked = Vec::new();
+    for tf in review {
+        if tf.task.assigned_to.as_deref() != Some(workspace_name) {
+            continue;
+        }
+        let id = tf.task.id.clone();
+        shelbi_state::park_review_task(project, &id).map_err(|e| anyhow!(e))?;
+        parked.push(id);
+    }
+    Ok(parked)
 }
 
 /// The task currently loaded on `workspace` — an in-progress or review-column

@@ -835,12 +835,25 @@ fn assign(project: &str, id: &str, workspace: &str) -> Result<()> {
     tf.task.assigned_to = Some(workspace.to_string());
     tf.task.updated_at = Utc::now();
     shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
+    // A fresh assignment un-parks the task, so a previously-parked card can be
+    // re-served. Best-effort — a stale marker only ever suppresses an auto-load.
+    let _ = shelbi_state::clear_task_parked(project, id);
     println!("✓ {id} assigned to {workspace}");
     Ok(())
 }
 
 fn unassign(project: &str, id: &str) -> Result<()> {
-    let mut tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
+    let tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
+    // Unassigning a review-column (handoff) task from its slot is a *park*: it
+    // must stay unloaded, not be re-grabbed by the review auto-loader on the
+    // next tick. `park_review_task` clears `assigned_to` and sets the parked
+    // marker in one locked write. A non-review task is a plain unassign.
+    if tf.task.column == Column::review() {
+        shelbi_state::park_review_task(project, id).map_err(|e| anyhow!(e))?;
+        println!("✓ {id} unassigned (parked — won't auto-reload for review)");
+        return Ok(());
+    }
+    let mut tf = tf;
     tf.task.assigned_to = None;
     tf.task.updated_at = Utc::now();
     shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
@@ -3065,5 +3078,49 @@ statuses:
                 },
             ]
         );
+    }
+
+    #[test]
+    fn unassign_parks_a_review_column_task() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A handoff card sitting under review, still pinned to the slot serving
+        // it. Unassigning it is a *park*: it stays in review, loses its owner,
+        // and gets marked so the auto-loader won't re-grab it on the next tick.
+        let mut t = task_in(Column::review(), "fix-docs");
+        t.assigned_to = Some("review".into());
+        shelbi_state::save_task("p", &t, "body").unwrap();
+
+        unassign("p", "fix-docs").unwrap();
+
+        let after = shelbi_state::load_task("p", "fix-docs").unwrap().task;
+        assert_eq!(after.assigned_to, None);
+        assert_eq!(after.column, Column::review());
+        assert!(shelbi_state::is_task_parked("p", "fix-docs").unwrap());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn unassign_does_not_park_a_non_review_task() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A plain in-progress card: unassign clears the owner but never parks —
+        // parking is a review-slot concept only.
+        let mut t = task_in(Column::in_progress(), "wip");
+        t.assigned_to = Some("alpha".into());
+        shelbi_state::save_task("p", &t, "body").unwrap();
+
+        unassign("p", "wip").unwrap();
+
+        let after = shelbi_state::load_task("p", "wip").unwrap().task;
+        assert_eq!(after.assigned_to, None);
+        assert!(!shelbi_state::is_task_parked("p", "wip").unwrap());
+
+        std::env::remove_var("SHELBI_HOME");
     }
 }

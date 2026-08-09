@@ -255,7 +255,11 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
     let review_tasks = shelbi_state::list_column(project_name, Column::review())?;
     // Idle review slots in declaration order (never lists a dev slot).
     let free = free_review_workspaces(project_name)?;
-    let plan = plan_review_autoload(&review_tasks, &project, &free);
+    // Tasks an operator deliberately unloaded (`shelbi workspace stop` /
+    // `task unassign`). Skipped so a parked task stays unloaded instead of
+    // being re-grabbed on the next tick.
+    let parked = shelbi_state::parked_review_tasks(project_name)?;
+    let plan = plan_review_autoload(&review_tasks, &project, &free, &parked);
     if plan.is_empty() {
         return Ok(Vec::new());
     }
@@ -308,15 +312,19 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
 /// `min(queued, free)`. "Queued" is a review-column task not already assigned to
 /// a review-tagged slot — a handoff card still pinned to the dev slot that built
 /// it, or one with no assignment; a task already serving on a review slot is
-/// dropped. Split out with no I/O so board order and capacity limiting are
-/// unit-testable on in-memory fixtures.
+/// dropped. A task in `parked` (deliberately unloaded by the operator) is also
+/// dropped, so a parked task stays unloaded instead of being re-grabbed on the
+/// next tick. Split out with no I/O so board order, capacity limiting, and the
+/// parked skip are unit-testable on in-memory fixtures.
 fn plan_review_autoload(
     review_tasks: &[TaskFile],
     project: &Project,
     free: &[WorkspaceSpec],
+    parked: &BTreeSet<String>,
 ) -> Vec<(String, String)> {
     review_tasks
         .iter()
+        .filter(|tf| !parked.contains(&tf.task.id))
         .filter(|tf| {
             let on_review_slot = tf
                 .task
@@ -439,6 +447,12 @@ fn dispatch_task_onto(
     tf.task.branch = Some(branch.clone());
     tf.task.updated_at = chrono::Utc::now();
     shelbi_state::save_task(project_name, &tf.task, &tf.body)?;
+
+    // Any fresh dispatch/assignment un-parks the task: an operator-parked task
+    // that is now being loaded again (manually, or re-dispatched for rework)
+    // must stop being skipped by the auto-loader. Best-effort — a stale marker
+    // only ever suppresses an auto-load, never blocks this explicit dispatch.
+    let _ = shelbi_state::clear_task_parked(project_name, &tf.task.id);
 
     let addr = match start_workspace_on_task(StartSpec {
         project,
@@ -819,7 +833,7 @@ mod tests {
             project.workspace("review-1").unwrap().clone(),
             project.workspace("review-2").unwrap().clone(),
         ];
-        let plan = plan_review_autoload(&review, &project, &free);
+        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new());
         assert_eq!(
             plan,
             vec![
@@ -839,7 +853,7 @@ mod tests {
             tf(review_task_pri("t-queued", Some("alpha"), 1)),
         ];
         let free = vec![project.workspace("review-2").unwrap().clone()];
-        let plan = plan_review_autoload(&review, &project, &free);
+        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new());
         assert_eq!(plan, vec![("t-queued".to_string(), "review-2".to_string())]);
     }
 
@@ -854,14 +868,38 @@ mod tests {
             tf(review_task_pri("t-3", None, 2)),
         ];
         let free = vec![project.workspace("review-1").unwrap().clone()];
-        let plan = plan_review_autoload(&review, &project, &free);
+        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new());
         assert_eq!(plan, vec![("t-1".to_string(), "review-1".to_string())]);
 
         // No free slots → nothing planned even with queued work.
-        assert!(plan_review_autoload(&review, &project, &[]).is_empty());
+        assert!(plan_review_autoload(&review, &project, &[], &BTreeSet::new()).is_empty());
         // No queued work → nothing planned even with free slots.
         let serving = [tf(review_task_pri("t-x", Some("review-1"), 0))];
-        assert!(plan_review_autoload(&serving, &project, &free).is_empty());
+        assert!(plan_review_autoload(&serving, &project, &free, &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn plan_skips_a_parked_task_and_still_serves_the_rest() {
+        let project = tagged_project();
+        // Two queued cards, two free slots. `t-parked` was deliberately
+        // unloaded by the operator, so it must NOT be re-grabbed even though a
+        // slot is free — the other queued card is still served.
+        let review = [
+            tf(review_task_pri("t-parked", None, 0)),
+            tf(review_task_pri("t-queued", Some("alpha"), 1)),
+        ];
+        let free = vec![
+            project.workspace("review-1").unwrap().clone(),
+            project.workspace("review-2").unwrap().clone(),
+        ];
+        let parked: BTreeSet<String> = std::iter::once("t-parked".to_string()).collect();
+        let plan = plan_review_autoload(&review, &project, &free, &parked);
+        // The parked card is dropped; the queued one lands on the first slot.
+        assert_eq!(plan, vec![("t-queued".to_string(), "review-1".to_string())]);
+
+        // With only the parked card queued, nothing loads at all.
+        let only_parked = [tf(review_task_pri("t-parked", None, 0))];
+        assert!(plan_review_autoload(&only_parked, &project, &free, &parked).is_empty());
     }
 
     // -- conflicting-slot guard (pure) --------------------------------------
@@ -1003,6 +1041,32 @@ mod tests {
     }
 
     #[test]
+    fn autoload_review_queue_leaves_a_parked_task_unloaded() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+
+        // A queued review card the operator deliberately unloaded (parked) —
+        // still in the review column, on the dev slot, with a free review slot
+        // available. The end-to-end auto-loader must skip it, so it stays
+        // unloaded rather than being re-grabbed on the next tick (the churn
+        // this fixes). No dispatch is attempted, so the assertion holds even
+        // without tmux.
+        shelbi_state::save_task("demo", &review_task("t-parked", "alpha"), "body").unwrap();
+        shelbi_state::set_task_parked("demo", "t-parked").unwrap();
+
+        let loaded = autoload_review_queue("demo").unwrap();
+        assert!(loaded.is_empty(), "parked task must not auto-load, got {loaded:?}");
+        let after = shelbi_state::load_task("demo", "t-parked").unwrap();
+        assert_eq!(after.task.assigned_to.as_deref(), Some("alpha"));
+        assert!(after.task.branch.is_none());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn autoload_review_queue_plans_from_disk_on_a_fresh_evaluation() {
         let _g = crate::test_lock::acquire();
         let home = fresh_home();
@@ -1020,7 +1084,7 @@ mod tests {
         let project = shelbi_state::load_project("demo").unwrap();
         let review = shelbi_state::list_column("demo", Column::review()).unwrap();
         let free = free_review_workspaces("demo").unwrap();
-        let plan = plan_review_autoload(&review, &project, &free);
+        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new());
         assert_eq!(plan, vec![("t-queued".to_string(), "review-1".to_string())]);
 
         std::env::remove_var("SHELBI_HOME");

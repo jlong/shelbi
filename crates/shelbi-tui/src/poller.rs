@@ -864,7 +864,8 @@ fn poll_one(
     // supervisor ignores it, and the orchestrator won't stop workspaces on its
     // own. Reap it here and return the slot to idle. Runs only on a live pane
     // (we just returned on a dead one) and short-circuits the rest of the tick
-    // when it reaps — there's nothing left to observe.
+    // when it reaps — there's nothing left to observe. (A review slot's teardown
+    // lives in `handle_review_slot` above, not here.)
     if maybe_reconcile_orphaned_pane(project, workspace, &host, &addr) {
         *last_dialog = None;
         *limit_resume = LimitResumeState::Idle;
@@ -3053,6 +3054,17 @@ fn maybe_resume_stranded_review_slots(
             continue;
         };
 
+        // A task the operator deliberately unloaded (`shelbi workspace stop` /
+        // `task unassign`) must STAY unloaded — resuming it is the churn loop.
+        // Parking clears the assignment, so `assigned_review_task_for` above
+        // normally already returns `None`; this is the belt-and-suspenders read
+        // that makes the parked marker authoritative even if a slot's task is
+        // parked without being unassigned. A parked slot is idle, not stranded.
+        if shelbi_state::is_task_parked(&project.name, &task_id).unwrap_or(false) {
+            state.remove(&ws.name);
+            continue;
+        }
+
         match entry.decide_dead(now) {
             ReviewResumeAction::None => {}
             ReviewResumeAction::Resume => {
@@ -3336,8 +3348,8 @@ fn maybe_reap_orphaned_review_slot(
 /// Called only on a live pane (the caller returned on a dead one). Guards, each
 /// erring toward leaving the pane alone:
 ///  - **`review` workspaces are skipped** — a review slot legitimately holds a
-///    loaded (handoff-category) task and keeps its pane; its own lifecycle owns
-///    teardown. (The review-load pane bug is tracked separately.)
+///    loaded (handoff-category) task and keeps its pane; its own serving
+///    lifecycle ([`handle_review_slot`]) owns teardown.
 ///  - **A read failure is not "no task."** [`current_task_for`] collapses a
 ///    `list_tasks` error into `None`; here we read explicitly and bail on `Err`
 ///    so a transient FS hiccup never reaps a healthy worker.
@@ -3411,8 +3423,9 @@ fn maybe_reconcile_orphaned_pane(
 
 /// Pure board-side half of [`maybe_reconcile_orphaned_pane`]: is `workspace` a
 /// dev slot with no active task pointing at it? A `review`-tagged workspace is
-/// never orphaned by this rule (it holds a loaded handoff-category task). Split
-/// out so the decision is unit-testable without touching tmux.
+/// never orphaned by this rule (it holds a loaded handoff-category task, and its
+/// own serving lifecycle in [`handle_review_slot`] owns teardown). Split out so
+/// the decision is unit-testable without touching tmux.
 fn workspace_orphaned_by_board(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
@@ -6310,7 +6323,8 @@ transitions:
         assert!(workspace_orphaned_by_board(&dev, dev_ws, &[]));
 
         // A `review`-tagged workspace holding a loaded review task is NEVER
-        // reaped by this rule — its own lifecycle owns teardown.
+        // reaped by this rule — its own serving lifecycle (`handle_review_slot`)
+        // owns teardown.
         let review = tagged_project(&work_dir, &["review"]);
         let review_ws = &review.workspaces[0];
         assert!(!workspace_orphaned_by_board(
