@@ -9,10 +9,13 @@ shelbi zen <SUBCOMMAND> [OPTIONS]
 ```
 
 `shelbi zen` is the CLI face of [Zen Mode](/docs/concepts/zen-mode).
-The toggle subcommands (`on`, `off`, `pause`, `status`) flip the
-project's mode in `state.json` and write a `mode=zen <prev> -> <new>
-reason=user:cli` line to `~/.shelbi/events.log`. The orchestrator
-reads those events to know when to switch behavior.
+The toggle subcommands (`on`, `off`, `pause`) flip the project's mode in
+`state.json` and write a `<ts> project=<project> mode=zen <prev> -> <new>
+reason=user:cli` line to `~/.shelbi/events.log` (the leading
+`project=<project>` scope keeps one project's toggle from being read by
+another project's orchestrator). `status` is read-only: it prints the current
+mode and writes no event. The orchestrator reads those events to know when to
+switch behavior.
 
 The remaining subcommands are single-purpose primitives. The
 orchestrator sequences them per the merge-conditions policy in the
@@ -100,7 +103,7 @@ for real to confirm the policy matches your intent.
 ## probe
 
 ```text
-shelbi zen probe <ID>
+shelbi zen probe <TASK_ID>
 ```
 
 Run every readiness probe for the task and print the full report as
@@ -120,12 +123,12 @@ every later PR command.
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
-| `<ID>` | string | — | Task id to probe (required). |
+| `<TASK_ID>` | string | — | Task id to probe (required). |
 
 ## pr-create
 
 ```text
-shelbi zen pr-create <ID> --match-repository <REPOSITORY> --match-repository-id <REPOSITORY_ID> --match-base-branch <BRANCH> --match-base-commit <BASE_SHA> --match-integration-commit <INTEGRATION_SHA> --match-head-commit <HEAD_SHA>
+shelbi zen pr-create <TASK_ID> --match-repository <REPOSITORY> --match-repository-id <REPOSITORY_ID> --match-base-branch <BRANCH> --match-base-commit <BASE_SHA> --match-integration-commit <INTEGRATION_SHA> --match-head-commit <HEAD_SHA> [--match-published-head-commit <SHA>]
 ```
 
 Push the task's named branch and open a PR. Idempotent. If an open PR for
@@ -137,21 +140,31 @@ Reuse also requires the exact task branch, resolved workflow base branch and
 commit, and `origin` repository identity. A same-named PR aimed at another
 base or coming from another repository is rejected.
 
-All six `--match-*` flags are required. Copy them from the immediately
+The six `--match-*` flags above are required. Copy them from the immediately
 preceding `probe` report without re-resolving configuration or `origin`.
 Shelbi rejects the operation if any part of that identity moved after the
 probe, so mutable workflow, remote, or branch state cannot silently replace
 what was reviewed.
 
+A seventh flag, `--match-published-head-commit <SHA>`, is optional and only
+`pr-create` reads it. Pass the probe report's `published_head_sha` when the
+probe rebased the task branch onto a moved base — so `head_sha` is a
+never-pushed local commit while the remote task branch still points at the
+pre-rebase tip. It lets `pr-create` recognize that pre-rebase remote tip as the
+flow's own prior state rather than a concurrent update. Omit it to preserve the
+default acceptance rules. (`ci-watch` and `pr-merge` also accept the flag
+because they share the same pinned-identity group, but neither acts on it.)
+
 | Argument or flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `<ID>` | string | — | Task id whose branch to push and PR (required). |
+| `<TASK_ID>` | string | — | Task id whose branch to push and PR (required). |
 | `--match-repository <REPOSITORY>` | string | required | Require the `origin` repository selector to equal probe `repository`. |
 | `--match-repository-id <REPOSITORY_ID>` | string | required | Require the immutable GitHub repository id to equal probe `repository_id`. |
 | `--match-base-branch <BRANCH>` | string | required | Require the PR target to equal probe `base_branch`. |
 | `--match-base-commit <SHA>` | string | required | Require the resolved target commit to equal probe `base_sha`. |
 | `--match-integration-commit <SHA>` | string | required | Require the published PR head to equal probe `integration_sha`. |
 | `--match-head-commit <SHA>` | string | required | Require the durable task branch to match probe `head_sha`. |
+| `--match-published-head-commit <SHA>` | string | — | Optional. Probe `published_head_sha` — the pre-rebase remote tip, recognized as the flow's own prior state when the probe rebased onto a moved base. |
 
 ## ci-watch
 

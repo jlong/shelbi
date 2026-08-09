@@ -5,9 +5,13 @@ summary: Append a durable JSON record to a task's file-based message log that it
 ---
 
 ```text
-shelbi message [OPTIONS] <ID> <KIND> <BODY>
-shelbi message status <MSG-ID>
+shelbi message [OPTIONS] [ID] [KIND] [BODY]
+shelbi message status <MSG_ID>
 ```
+
+`ID`, `KIND`, and `BODY` are optional at the parser (so the `status` subcommand
+parses) but required for the base `shelbi message` form — omitting any of them
+there is a runtime error.
 
 `shelbi message` pushes a message to a task's assigned
 [workspace](/docs/concepts/workspaces) through a **file-based message log** at
@@ -66,9 +70,9 @@ act on the message.
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
-| `<ID>` | string | — | Task id whose assigned workspace receives the message (required). |
-| `<KIND>` | `reply` \| `directive` \| `context` | — | Message kind (required). |
-| `<BODY>` | string | — | Message body (required). |
+| `[ID]` | string | — | Task id whose assigned workspace receives the message. Required for the base `message` form. |
+| `[KIND]` | `reply` \| `directive` \| `context` | — | Message kind. Required for the base `message` form. |
+| `[BODY]` | string | — | Message body. Required for the base `message` form. |
 
 ## Flags
 
@@ -80,10 +84,10 @@ act on the message.
 
 ## Subcommands
 
-### `shelbi message status <MSG-ID>`
+### `shelbi message status <MSG_ID>`
 
 Report a pushed message's delivery state from `events.log`, keyed on the
-`msg-id` that `shelbi message` printed. Prints `delivered`, `queued`, or
+`msg_id` that `shelbi message` printed. Prints `delivered`, `queued`, or
 `unconfirmed` and exits 0 only when the worker has acked, so a script can gate
 on it.
 

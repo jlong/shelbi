@@ -5,7 +5,7 @@ summary: Run the same detected, one-confirmation project setup used by first-run
 ---
 
 ```text
-shelbi wizard
+shelbi wizard [OPTIONS]
 ```
 
 `shelbi wizard` is the explicit interactive entry point for Shelbi's first
@@ -28,6 +28,9 @@ setup before the card and print an install-and-retry message.
 The command is idempotent at the project-registration level. If any project is
 already registered, it completes without creating another one. Use
 `shelbi project add` to run the shared setup flow for an additional project.
+
+`wizard` accepts the global `--root <PATH>`, `-p / --project <PROJECT>`, and
+`-y / --yes` flags.
 
 ## Examples
 

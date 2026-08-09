@@ -78,7 +78,9 @@ orchestrator starts.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
+| `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
 | `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
+| `-y, --yes` | flag | off | Skip confirmation prompts. |
 
 ## Examples
 

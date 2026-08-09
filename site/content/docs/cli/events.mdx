@@ -16,14 +16,19 @@ follows it as its trigger stream. To see what the orchestrator is seeing, run
 The most common line shapes are:
 
 ```text
-<ts> task=<id> <from> -> <to> reason=<short>
-<ts> worker=<name> <prev> -> <new>
+<ts> project=<p> task=<id> workflow=<name> <from> -> <to> reason=<r> from_category=<c> to_category=<c>
+<ts> project=<p> workspace=<name> <prev> -> <new>
 <ts> project=<name> heartbeat
 ```
 
-`heartbeat` is the periodic wake-up the hub poller writes when the
-board is otherwise quiet. Cadence comes from the `heartbeat` key in
-`project.yaml` (default `3m`). See
+The token is `workspace=`, not `worker=` (a retired pre-rename alias). On the
+first workspace transition `<prev>` is `none`.
+
+`heartbeat` is the periodic wake-up the hub poller writes. Its cadence is
+adaptive: the standard interval runs whenever there is supervisable work in
+flight, and the poller backs off (doubling toward the max) while the board is
+quiescent. Cadence comes from the `heartbeat` key in `project.yaml` (default
+interval `60s`, backing off toward a `5m` cap). See
 [the events log](/docs/concepts/events-log#heartbeats) for the full
 shape catalog.
 

@@ -118,11 +118,19 @@ action currently does.
 ## dump-keybindings
 
 ```text
-shelbi config dump-keybindings
+shelbi config dump-keybindings [OPTIONS]
 ```
 
-Dump the full default keymap as YAML. Drop the output into `~/.shelbi/keys.yaml`
-as a starting point for customization, then edit the chords you want to change.
+Dump the full default keymap as YAML. By default it prints to stdout — drop the
+output into `~/.shelbi/keys.yaml` as a starting point for customization, then
+edit the chords you want to change. Pass `-o, --out <OUT>` to write the dump
+straight to a file instead, and `--force` to overwrite an existing file at that
+path.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `-o, --out <OUT>` | path | stdout | Write the dumped keymap to this file instead of printing it. |
+| `--force` | flag | off | Overwrite the `--out` file if it already exists. |
 
 ## check
 
