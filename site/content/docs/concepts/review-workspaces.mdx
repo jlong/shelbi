@@ -212,10 +212,14 @@ A `review`-tagged slot **never appears under the `— Workspaces —` section**;
 its capacity surfaces exclusively through these two review sections. Dev
 workspaces list under `— Workspaces —` as usual.
 
-Selecting a **Queued** row raises a "Load onto a review workspace?" confirm
-popup and, on confirm, loads the branch onto a free `review`-tagged slot (never
-the dev pane that built it). Selecting a **Ready** row opens its review
-interface directly.
+The daemon auto-loads queued review-column tasks onto idle `review`-tagged
+slots each poller tick (`autoload_review_queue`), so a queued branch normally
+lands on a free slot without any human action. The confirm popup is the
+manual path: selecting a **Queued** row raises a "Load onto a review
+workspace?" prompt and, on confirm, loads the branch onto a free
+`review`-tagged slot (never the dev pane that built it) — useful for loading
+a queued task while the slots are otherwise busy. Selecting a **Ready** row
+opens its review interface directly.
 
 <Callout type="note" title="Sidebar collapse persists">
 
@@ -286,9 +290,12 @@ End to end, a finished task reaches a human like this:
    review status. The finishing workspace closes its own session and returns
    to idle (see [Workspaces](/docs/concepts/workspaces#how-a-task-completes)).
 2. **The orchestrator routes it.** The review status requires `tags: [review]`,
-   so the task loads onto a free `review`-tagged workspace (preferring the one
-   it ran on) and the Review agent boots the branch from the resolved `review:`
-   recipe. If every matching slot is busy, the task sits in **Queued for
+   so the task loads onto a free `review`-tagged workspace and the Review
+   agent boots the branch from the resolved `review:` recipe. Queued review
+   tasks are paired with idle review slots in **declaration order** — the dev
+   workspace that built the branch is *not* preferred (it is typically not
+   review-tagged); the only reuse is resuming a slot the task is already
+   serving on. If every matching slot is busy, the task sits in **Queued for
    Review** until one frees — nothing is preempted.
 3. **A human inspects.** You open the task's review interface from the sidebar,
    click through the running app at the served URL, and decide: **Approve**

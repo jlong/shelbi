@@ -29,7 +29,7 @@ are specialized reviewers:
 | Agent | Role |
 | --- | --- |
 | `orchestrator` | The agent you talk to. Turns requests into cards, dispatches tasks to free workspaces, tails the events log, reports back. Runs in window 1, never in a workspace. See [Orchestrator](/docs/concepts/orchestrator). |
-| `developer` | The default workspace agent. Implements a task on its branch, runs the project's checks, writes the review-ready marker. This is the agent an `agent`-owned status uses when no other is named. |
+| `developer` | The default workspace agent. Implements a task on its branch, runs the project's checks, writes the review-ready marker. This is the agent the runtime dispatcher runs for an `active`-category status when no other is named. |
 | `review` | The agent named by a review status, run on a [review workspace](/docs/concepts/review-workspaces). Its charter is to make the finished branch runnable for a human. The dev server itself is booted by the status's transition commands, and it hands over a working URL. It doesn't write code (bar an explicitly requested tweak). |
 | `qa` | Exercises a finished change against its acceptance criteria and reports pass or fail with concrete repro steps. It verifies, it doesn't rewrite. |
 | `security` | A defensive-only review of the diff: injection, broken authorization, leaked secrets, unsafe deserialization, path traversal, risky dependencies. Reports findings with severity and location. It does not write exploits. |
@@ -71,32 +71,45 @@ An agent is a directory under the project's Shelbi config:
 ├── _shared/
 │   └── preamble.md          # project-wide context, prepended to every agent
 ├── orchestrator/
-│   └── instructions.md      # the orchestrator's system prompt
+│   ├── instructions.md      # the orchestrator's system prompt
+│   ├── settings.json        # per-agent runner settings
+│   └── skills/              # agent-scoped skills (created for every default agent)
 ├── developer/
 │   ├── instructions.md      # the developer agent's system prompt
-│   └── skills/              # agent-scoped skills (optional)
+│   ├── settings.json
+│   └── skills/
 ├── review/
 │   ├── instructions.md      # the Review agent's system prompt
+│   ├── settings.json
 │   └── skills/              # ships a `load-run-detection` skill
 ├── qa/                      # shipped reviewer preset
-│   └── instructions.md
+│   ├── instructions.md
+│   ├── settings.json
+│   └── skills/
 ├── security/                # shipped reviewer preset
-│   └── instructions.md
+│   ├── instructions.md
+│   ├── settings.json
+│   └── skills/
 ├── adversarial/             # shipped reviewer preset
-│   └── instructions.md
+│   ├── instructions.md
+│   ├── settings.json
+│   └── skills/
 └── perf/                    # ← one you authored with `shelbi agent new`
     └── instructions.md
 ```
 
-Each agent has at minimum an `instructions.md`: its system prompt. It may
-also carry a `skills/` directory of agent-scoped skills the runner loads when
-that agent is active. The `_shared/preamble.md` file is special: its contents
+Each agent has at minimum an `instructions.md`: its system prompt. Every
+default agent also materializes a `settings.json` (from its shipped settings
+template) and a `skills/` directory of agent-scoped skills the runner loads
+when that agent is active — most ship empty, but `review/` seeds a
+`load-run-detection` skill. The `_shared/preamble.md` file is special: its contents
 are prepended to *every* agent's instructions, so project-wide context (the
 repo layout, the house style, the test command) lives in one place instead of
 being copy-pasted into four prompts.
 
-When a task is dispatched, the agent named for that status (or `developer` by
-default) has its rendered prompt (`_shared/preamble.md` followed by the
+When a task is dispatched, the agent named for that status (or `developer`
+for an `active`-category status with no `agent:` named) has its rendered
+prompt (`_shared/preamble.md` followed by the
 agent's own `instructions.md`) handed to the runner in the workspace. The
 [orchestrator's own prompt](/docs/concepts/orchestrator#how-the-prompt-is-wired)
 is rendered the same way; it's just the agent that happens to run in window 1.
@@ -109,11 +122,22 @@ From then on they're yours to edit: change `developer/instructions.md` to
 bake in your repo's conventions, drop a skill into a role's `skills/`, tighten
 the shipped `security` prompt to your threat model.
 
-The defaults are *seeded, not enforced*. On upgrade, Shelbi only writes an
-agent file that doesn't already exist. It never clobbers a file you've
-edited. New shipped agents (or new skills) show up; your customizations stay
-put. If you want to reset an agent to the current default, delete its
-`instructions.md` and reload.
+The defaults are *seeded*, and the self-heal on `shelbi reload` **never
+clobbers your edits** — but that is not the same as "only writes files that
+don't exist." Two cases rewrite an existing file:
+
+- **Untouched-but-stale files** are auto-upgraded in place: if you never
+  edited an agent file and the shipped default has moved on, reload brings
+  your copy up to date (`PristineStale`).
+- **A customized orchestrator prompt** has *missing required sections* merged
+  back from the shipped default (`RepairedRequiredSections`,
+  `MigratedZenCommands`), so runner-critical contracts survive an upgrade
+  without discarding your prose.
+
+A genuinely customized non-orchestrator file is left `Preserved`. New shipped
+agents (or new skills) show up; your customizations stay put. If you want to
+reset an agent to the current default, delete its `instructions.md` and
+reload.
 
 Edit an agent by hand, or through the CLI:
 
@@ -140,10 +164,16 @@ statuses:
   - { id: done,        owner: user }
 ```
 
-`owner: agent` makes a status the orchestrator's to act on; the optional
-`agent:` field names *which* agent does it. Omit `agent:` and the
-`developer` agent is used. The `review` status above is auto-reviewed by the
-shipped `qa` agent before a human ever sees it. That's the whole "a
+`owner: agent` makes a status the orchestrator's to act on; the `agent:`
+field names *which* agent does it. Name it explicitly: `validate()` rejects a
+bare `owner: agent` with no `agent:`. A category-based fallback still exists
+for YAML loaded from older configs — `ready` resolves to `orchestrator`,
+`active` to `developer`, and any other category is a hard error — but it is a
+**deprecated legacy form** that emits a one-per-workflow deprecation
+diagnostic, not a first-class default. (The runtime dispatcher does default
+the *active* status to `developer`, which is where the "omit it and you get
+developer" intuition comes from.) The `review` status above is auto-reviewed
+by the shipped `qa` agent before a human ever sees it. That's the whole "a
 reviewer is a role you can drop on a status" idea, expressed declaratively.
 
 Because `qa`, `security`, and `adversarial` already ship, opting one onto a
