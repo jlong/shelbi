@@ -1395,7 +1395,7 @@ fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
                 .map(str::to_string)
                 .unwrap_or_else(|| DEFAULT_TASK_AGENT.to_string())
         });
-        let badge = derive_workspace_badge(&workspace.name, current_task.is_some());
+        let badge = derive_workspace_badge(&workspace.name, current_task.as_deref());
         out.push(WorkspaceOverview {
             name: workspace.name.clone(),
             machine: workspace.machine.clone(),
@@ -1437,12 +1437,18 @@ const DEFAULT_TASK_AGENT: &str = "developer";
 /// so a finished slot simply reads Idle. Completion lives in the sidebar's
 /// review sections, keyed to the review workspace the task is loaded on —
 /// never on the dev workspace that produced it.
-fn derive_workspace_badge(workspace_name: &str, has_in_progress: bool) -> WorkspaceBadge {
-    if !has_in_progress {
+fn derive_workspace_badge(workspace_name: &str, current_task: Option<&str>) -> WorkspaceBadge {
+    let Some(task_id) = current_task else {
         return WorkspaceBadge::Idle;
-    }
+    };
     match load_workspace_status(workspace_name).ok().flatten() {
-        Some(s) => match s.state {
+        // Only trust the persisted state when it describes the task currently
+        // assigned to this slot. A `status.yaml` still naming a *prior* task
+        // is stale: a new task was just dispatched here and the poller hasn't
+        // re-observed the fresh pane yet, so its recorded `?`/state would latch
+        // on the row until the next marker lands. Fall through to the
+        // freshly-assigned default rather than render that stale badge.
+        Some(s) if s.current_task.as_deref() == Some(task_id) => match s.state {
             WorkspaceState::Working => WorkspaceBadge::Working,
             WorkspaceState::AwaitingInput => WorkspaceBadge::AwaitingInput,
             WorkspaceState::Blocked => WorkspaceBadge::AwaitingPermission,
@@ -1450,9 +1456,10 @@ fn derive_workspace_badge(workspace_name: &str, has_in_progress: bool) -> Worksp
             // A serving review slot reads as active work (the branch is up).
             WorkspaceState::Serving => WorkspaceBadge::Working,
         },
-        // Task assigned but the poller hasn't observed a marker yet. Show
-        // working as the best guess — it'll firm up within one poll tick.
-        None => WorkspaceBadge::Working,
+        // Task assigned but the poller hasn't recorded a matching marker yet
+        // (never observed, or the status still names a prior task). Show
+        // working as the best guess — it firms up within one poll tick.
+        _ => WorkspaceBadge::Working,
     }
 }
 
@@ -3037,6 +3044,62 @@ mod tests {
         assert_eq!(
             find_workspace_badge(&rows, "delta").unwrap(),
             WorkspaceBadge::AwaitingInput
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn workspace_badge_resets_when_new_task_dispatched() {
+        // A new task was dispatched onto `alpha`, but the poller hasn't
+        // re-observed the fresh pane yet: `status.yaml` still names the *prior*
+        // task and its latched AwaitingInput state. The stale `?` must not stick
+        // on the row — the freshly-assigned slot reads Working until the poller
+        // catches up (never the previous task's badge).
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        shelbi_state::save_task(
+            "demo",
+            &Task {
+                id: "t-new".into(),
+                title: "t-new".into(),
+                column: Column::in_progress(),
+                priority: 0,
+                assigned_to: Some("alpha".into()),
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                created_at: now,
+                updated_at: now,
+                params: std::collections::BTreeMap::new(),
+            },
+            "",
+        )
+        .unwrap();
+        // Stale status left by the previous task on this slot.
+        shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
+            workspace: "alpha".into(),
+            current_task: Some("t-old".into()),
+            state: WorkspaceState::AwaitingInput,
+            last_transition: now,
+            last_seen: now,
+        })
+        .unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        let rows = app.rows();
+        assert_eq!(
+            find_workspace_badge(&rows, "alpha").unwrap(),
+            WorkspaceBadge::Working
         );
 
         std::env::remove_var("SHELBI_HOME");

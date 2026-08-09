@@ -1012,14 +1012,34 @@ fn poll_one(
     // `last_dialog` so a still-open modal produces one event per incident.
     maybe_emit_dialog_event(project, workspace, screen.as_deref(), last_dialog);
 
-    let title = match shelbi_tmux::pane_title(&host, &addr) {
-        Ok(t) => t,
-        Err(_) => return,
+    // Resolve this tick's workspace state. For a Claude runner the live pane
+    // *content* is the primary signal, not the `shelbi:<state>` pane-title
+    // marker: Claude overwrites its own title with a live activity summary
+    // within tens of milliseconds of the `UserPromptSubmit` hook writing
+    // `shelbi:working` (see `submit.rs`), while the `shelbi:idle` a `Stop` hook
+    // leaves at the prompt is never clobbered. Reading the title alone
+    // therefore *latches* AwaitingInput — the resume edge's brief
+    // `shelbi:working` is gone by the next poll, so the `?` badge never clears
+    // when the worker resumes work. The busy footer / ready input box are drawn
+    // by Claude itself and track the true working<->awaiting edge, so we trust
+    // them first and fall back to the title marker only when the screen is
+    // inconclusive (startup, a modal, mid-repaint) or the runner isn't Claude.
+    let live_state = runner_is_claude
+        .then(|| screen.as_deref().and_then(live_workspace_state))
+        .flatten();
+    let new_state = match live_state {
+        Some(state) => state,
+        None => {
+            let title = match shelbi_tmux::pane_title(&host, &addr) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            let Some(marker) = parse_pane_title_marker(&title) else {
+                return;
+            };
+            marker.workspace_state()
+        }
     };
-    let Some(marker) = parse_pane_title_marker(&title) else {
-        return;
-    };
-    let new_state = marker.workspace_state();
 
     // Bootstrap previous state from disk on first sighting so a hub
     // restart doesn't emit a bogus `none -> X` event for state we've
@@ -2637,6 +2657,32 @@ struct PollOutcome {
     status: WorkspaceStatus,
 }
 
+/// Live working/awaiting state for a Claude pane, read from pane *content*
+/// rather than the `shelbi:<state>` title marker.
+///
+/// Claude overwrites its own `shelbi:working` title with a live activity
+/// summary within tens of milliseconds of the `UserPromptSubmit` hook writing
+/// it, whereas the `shelbi:idle` a `Stop` hook leaves at the prompt is never
+/// clobbered. Deriving state from the title alone therefore latches
+/// AwaitingInput: the resume edge's brief `shelbi:working` marker is usually
+/// gone by the next poll, so the `?` badge sticks until the next turn ends.
+/// The busy footer and ready input box are drawn by Claude itself and are not
+/// clobbered, so they track the true working<->awaiting edge every poll.
+///
+/// Returns `None` when neither signal is present (startup, a modal, a
+/// mid-repaint capture) so the caller falls back to the title marker. Busy is
+/// checked first: while a turn runs the footer shows `esc to interrupt` and the
+/// input box is not offered.
+fn live_workspace_state(screen: &str) -> Option<WorkspaceState> {
+    if shelbi_orchestrator::ready::is_claude_busy(screen) {
+        Some(WorkspaceState::Working)
+    } else if shelbi_orchestrator::ready::is_input_ready(screen) {
+        Some(WorkspaceState::AwaitingInput)
+    } else {
+        None
+    }
+}
+
 /// Pure transition decision: given the previous state (if any) and a
 /// fresh observation, build the [`WorkspaceStatus`] to persist and decide
 /// whether the change deserves an `events.log` line.
@@ -3632,6 +3678,43 @@ mod tests {
         let (out, next) = decide_dialog(Some("trust"), Some("permission"));
         assert_eq!(out, vec![ev("trust", false), ev("permission", true)]);
         assert_eq!(next.as_deref(), Some("permission"));
+    }
+
+    #[test]
+    fn live_workspace_state_reads_pane_content_not_title() {
+        // A busy footer means the turn is running, even if the pane title still
+        // carries the stale `shelbi:idle` a prior Stop hook left behind.
+        assert_eq!(
+            live_workspace_state("· Booping… (10s · ↑ 2k tokens)  esc to interrupt"),
+            Some(WorkspaceState::Working)
+        );
+        // The ready input-box footer means the worker is genuinely at the prompt.
+        assert_eq!(
+            live_workspace_state("> \n  shift+tab to cycle"),
+            Some(WorkspaceState::AwaitingInput)
+        );
+        // Neither signal (startup, a modal, a mid-repaint capture) → fall back
+        // to the title marker at the call site.
+        assert_eq!(live_workspace_state("Do you trust the files?"), None);
+    }
+
+    #[test]
+    fn live_busy_clears_latched_awaiting_input() {
+        // The regression: after a turn ends the pane latches `shelbi:idle`
+        // (AwaitingInput) because Claude clobbers the resume edge's brief
+        // `shelbi:working` title. On resume, the live busy footer — not the
+        // clobbered title — drives the `awaiting_input -> working` edge so the
+        // `?` badge clears.
+        let prior = Some(PriorState {
+            state: WorkspaceState::AwaitingInput,
+            last_transition: Some(ts(50)),
+        });
+        let resumed = live_workspace_state("· Working… esc to interrupt").unwrap();
+        let out = decide("alpha", Some("t".into()), prior, resumed, ts(200));
+        assert!(out.transitioned);
+        assert_eq!(out.prev_state, Some(WorkspaceState::AwaitingInput));
+        assert_eq!(out.status.state, WorkspaceState::Working);
+        assert_eq!(out.status.last_transition, ts(200));
     }
 
     #[test]
