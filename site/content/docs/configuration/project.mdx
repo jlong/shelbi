@@ -14,10 +14,10 @@ For the *why* behind each block, follow the concept links.
 The file's location depends on the project's
 [config mode](/docs/concepts/config-modes):
 
-| Mode | Shared fields | User-local fields |
-| --- | --- | --- |
-| Global (default) | `~/.shelbi/projects/<id>.yaml` | same file |
-| In-repo | `<repo>/.shelbi/project.yaml` (committed) | `~/.shelbi/projects/<id>/local.yaml` |
+| Mode | Where the config lives |
+| --- | --- |
+| Global (default) | One flat file: `~/.shelbi/projects/<id>.yaml` carries every field. |
+| In-repo | The same flat `~/.shelbi/projects/<id>.yaml` carries every field; the committed `<repo>/.shelbi/project.yaml` holds only `name` (and an optional `display_name`) so teammates share the label. |
 
 ## The project id comes from the filename
 
@@ -33,14 +33,28 @@ the fix is to rename the file, not to edit a field.
 The `name:` key *inside* the file is a free-form human **label** (see
 [top-level fields](#top-level-fields)); it never sets the id.
 
-In global mode every field lives in one flat file. In in-repo mode the
-**shared** fields (`name`, `default_branch`, `default_workflow`, `orchestrator`,
-`agent_runners`, `zen`, …) are committed and the **user-local** fields
-(`repo`, `machines`, `workspaces`, `editor`) live in
-a per-machine `local.yaml`. Putting a field on the wrong side errors at
-load time. The canonical bucket lists are `SHARED_PROJECT_FIELDS` and
-`LOCAL_PROJECT_FIELDS` in
-[`shelbi_core::model`](https://github.com/jlong/shelbi/blob/main/crates/shelbi-core/src/model.rs).
+In both modes every field lives in the one flat
+`~/.shelbi/projects/<id>.yaml` that `shelbi init` and `shelbi init --pick-up`
+write. In-repo mode adds a committed `<repo>/.shelbi/project.yaml`, but that
+file carries only `name` (plus an optional `display_name`) — the label
+teammates share; every other field stays in your per-machine flat file, which
+is where you edit `repo`, `machines`, `workspaces`, and the rest.
+
+<Callout type="note" title="The two-file local.yaml split is migration-only">
+
+Older projects (and any project touched by a `shelbi workspace` edit) may
+carry a two-file split: **shared** fields (`name`, `default_branch`,
+`default_workflow`, `orchestrator`, `agent_runners`, `zen`, …) in the
+committed `project.yaml` and **user-local** fields (`repo`, `machines`,
+`workspaces`, `editor`) in a per-machine
+`~/.shelbi/projects/<id>/local.yaml`. Shelbi still reads that layout, but no
+fresh `init` or `--pick-up` produces it, and a hand-created `local.yaml` is
+shadowed by the flat file the loader prefers. The bucket lists that drive the
+split — `SHARED_PROJECT_FIELDS` and `LOCAL_PROJECT_FIELDS` in
+[`shelbi_core::model`](https://github.com/jlong/shelbi/blob/main/crates/shelbi-core/src/model.rs)
+— govern only the migration and edit paths, not the flat file you get today.
+
+</Callout>
 
 ## Minimal example
 
@@ -89,7 +103,7 @@ workspaces:
 | `config_mode` | `global` \| `in-repo` | no | `global` | Which on-disk layout the project uses. Elided from the wire form when `global`. See [config modes](/docs/concepts/config-modes). |
 | `workspace_poll_interval_secs` | integer | no | `5` | How often the hub poller samples each workspace pane for state changes. |
 | `workspace_permissions_mode` | string | no | `auto` | Permissions posture rendered into the workspace settings template (`auto` → claude's `acceptEdits`). |
-| `heartbeat` | [Heartbeat](#heartbeat) | no | `3m` / `60m` | Adaptive hub heartbeat written to `events.log` so the orchestrator's watch fires on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. |
+| `heartbeat` | [Heartbeat](#heartbeat) | no | `60s` / `5m` | Adaptive hub heartbeat written to `events.log` so the orchestrator's watch fires on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. |
 | `git` | [Git](#git) | no | all defaults | Base branch, generated task branch prefix, and merge strategy for `shelbi merge` and Zen's auto-merge. |
 
 ## machines
@@ -104,6 +118,7 @@ workspace lives at `<work_dir>/.shelbi/wt/<workspace-name>`.
 | `work_dir` | path | yes | — | Base directory the repo checkout and worktrees live under. `~` is expanded. |
 | `host` | string | no | `name` | SSH hostname. Required when `kind: ssh`; falls back to `name` if omitted. Ignored for `local`. |
 | `tags` | list of string | no | `[]` | Capability tags every workspace on this machine inherits (e.g. `gpu`, `review`). A tag declared here applies to all of the machine's slots without repeating it per workspace. Accepts a scalar `tag:` alias and a bare string as shorthand. Elided when empty. |
+| `forward` | `unix` \| `tcp` | no | auto | How the hub reverse-forwards its daemon socket to an `ssh` machine. Unset (the default) auto-detects: start with a Unix-socket forward and fall back to TCP loopback if the Unix landing socket is unusable (the Tailscale-SSH root-owned-socket case). `tcp` skips detection and forwards over TCP loopback from the first attempt; `unix` pins the Unix forward and disables the fallback. Ignored for `local`. Elided when unset. |
 
 ```yaml
 machines:
@@ -275,31 +290,31 @@ even one emitting no events, which is exactly when the sweep earns its
 keep), and once the board is quiescent it backs off exponentially,
 doubling each idle tick up to `max`. Any real event snaps the cadence
 straight back to `interval`. So a fully idle hub relaxes
-`3m → 6m → 12m → … → 60m`, then resets to `3m` the moment something
+`60s → 2m → 4m → 5m`, then resets to `60s` the moment something
 happens.
 
 `heartbeat` accepts three shapes:
 
 | Form | Meaning |
 | --- | --- |
-| `heartbeat: 3m` | Bare duration — sets `interval` and keeps the default `max` (`60m`). |
+| `heartbeat: 60s` | Bare duration — sets `interval` and keeps the default `max` (`5m`). |
 | `heartbeat: off` | Disables heartbeats entirely. |
-| `heartbeat: { interval: 3m, max: 60m }` | Map — sets both bounds explicitly. |
+| `heartbeat: { interval: 60s, max: 5m }` | Map — sets both bounds explicitly. |
 
 The map form's fields:
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `interval` | duration | no | `3m` | Standard cadence, used whenever supervisable work is in flight. |
-| `max` | duration | no | `60m` | Back-off cap the interval doubles toward while the board is quiescent. A `max` ≤ `interval` pins the cadence at `interval` (no back-off). |
+| `interval` | duration | no | `60s` | Standard cadence, used whenever supervisable work is in flight. |
+| `max` | duration | no | `5m` | Back-off cap the interval doubles toward while the board is quiescent. A `max` ≤ `interval` pins the cadence at `interval` (no back-off). |
 
 Durations take an explicit unit: `45s`, `3m`, `1h`. A bare integer is
 rejected (there's no implicit unit).
 
 ```yaml
 heartbeat:
-  interval: 3m    # standard cadence while work is in flight
-  max: 60m        # back-off cap once the board is quiescent
+  interval: 60s   # standard cadence while work is in flight
+  max: 5m         # back-off cap once the board is quiescent
 ```
 
 ## git
@@ -310,7 +325,8 @@ and how they integrate back. See [the merge command](/docs/cli/merge).
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `base_branch` | string | no | `default_branch` | Branch new work is based on and merged into. Falls back to the project's `default_branch`. |
-| `branch` | string | no | none | Full branch-name template for generated task branches when a task omits `branch:`. Rendered with `{{var}}` substitution, including `{{github_user}}` (authenticated GitHub username) and `{{id}}` (task id), plus the task's frontmatter params. So `branch: '{{github_user}}/{{id}}'` yields e.g. `jlong/fix-login`. |
+| `branch` | string | no | none | Full branch-name template for generated task branches when a task omits `branch:`. Rendered with `{{var}}` substitution, including `{{github_user}}` (authenticated GitHub username) and `{{id}}` (task id), plus the task's frontmatter params. So `branch: '{{github_user}}/{{id}}'` yields e.g. `jlong/fix-login`. Mutually exclusive with `branch_prefix`. |
+| `branch_prefix` | string | no | none | Shorthand alternative to `branch`: when a task omits `branch:`, Shelbi cuts `<branch_prefix>/<task-id>`. Use it when a bare prefix is all you need and you don't want to spell out a full `{{var}}` template. Mutually exclusive with `branch` — declaring both in one `git:` block fails the load. |
 | `merge_strategy` | `squash` \| `merge` \| `rebase` | no | `squash` | How `shelbi merge` integrates a workspace branch. Zen exact-ref auto-integration currently supports `squash`; other strategies require human PR merge. |
 
 ```yaml

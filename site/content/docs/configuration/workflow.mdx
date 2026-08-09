@@ -25,10 +25,15 @@ lives in code until `shelbi workflow new` or `edit` writes a file. See
 
 ## Example
 
+The shipped `default` workflow is a pure status track: six statuses and
+**no** transitions, so every move is a plain status change. The scaffolded
+`default.yaml` writes `transitions:` only as a commented optional block you
+uncomment to add side-effects.
+
 ```yaml
 # ~/.shelbi/projects/myapp/workflows/default.yaml
 name: default
-description: standard one-track flow
+description: The standard one-track flow shipped with every project.
 
 # Reference-only statuses: name + category come from statuses.yaml.
 statuses:
@@ -37,10 +42,13 @@ statuses:
   - { id: in-progress, owner: agent, agent: developer }
   - { id: review,      owner: user,  agent: orchestrator }
   - { id: done,        owner: user }
+  - { id: canceled,    owner: user }
 
-transitions:
-  - { from: in-progress, to: review, actions: [push_branch, open_pr] }
-  - { from: review,      to: done,   actions: [merge, delete_branch] }
+# transitions: omitted by default — every move is a pure status change.
+# Uncomment to add hub-side side-effects on specific edges:
+# transitions:
+#   - { from: in-progress, to: review, actions: [push_branch, open_pr] }
+#   - { from: review,      to: done,   actions: [push_branch, merge] }
 ```
 
 ## Top-level fields
@@ -257,7 +265,8 @@ placeholders resolved against task params at load time.
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `base_branch` | string | no | project's `base_branch` | Branch this workflow's tasks are based on and merged into. |
-| `branch` | string | no | project's `branch` | Full branch-name template for generated task branches in this workflow, rendered with `{{var}}` substitution when a task omits `branch:`. The shipped `task` workflow uses `branch: '{{github_user}}/{{id}}'`. |
+| `branch` | string | no | project's `branch` | Full branch-name template for generated task branches in this workflow, rendered with `{{var}}` substitution when a task omits `branch:`. The shipped `task` workflow uses `branch: '{{github_user}}/{{id}}'`. Mutually exclusive with `branch_prefix`. |
+| `branch_prefix` | string | no | project's `branch_prefix` | Shorthand alternative to `branch`: generates `<branch_prefix>/<task-id>` when a task omits `branch:`. Mutually exclusive with `branch` — declaring both in one `git:` block fails the load. |
 | `merge_strategy` | `squash` \| `merge` \| `rebase` | no | project's `merge_strategy` | How this workflow's branches integrate back. |
 
 ```yaml
