@@ -139,6 +139,10 @@ pub struct ReviewPanel {
     /// Selected panel row.
     pub selected: usize,
     pub should_quit: bool,
+    /// Set when the reviewer Approved (accept). Distinguishes the accept exit
+    /// from a plain q / Esc / Reject dismissal so only acceptance closes the
+    /// review slot's window on the way out.
+    pub approved: bool,
     pub status_line: String,
     /// Screen rect of the rendered row list — written each frame, read by the
     /// mouse handler to map a click to a row.
@@ -160,6 +164,7 @@ impl ReviewPanel {
             active_view: ActiveView::Chat,
             selected: 0,
             should_quit: false,
+            approved: false,
             status_line: String::new(),
             list_area: Rect::default(),
         };
@@ -730,8 +735,19 @@ pub fn run_review_panel(project_name: &str, task_id: &str) -> Result<()> {
     // Every exit path (q / Esc / Approve / Reject) tears the three-column
     // interface back down: restore the agent pane to the review window's
     // middle, drop the panel/editor panes, and return focus to the dashboard.
-    // Best-effort — the pane is going away regardless.
+    // Best-effort — the pane is going away regardless. This also parks focus on
+    // the dashboard, so the window-close below reaps a *non-active* window and
+    // never yanks the client onto some adjacent window.
     let _ = shelbi_orchestrator::review_ui::close_review_interface(project_name);
+    // On accept (only), close the review slot's whole window now that the
+    // accept signal has been emitted — the slot returns to idle instead of
+    // lingering with just its agent pane. Ordering is load-bearing: the
+    // `approve_review_task` move event fired before we reach here, mirroring the
+    // dev-workspace teardown (promote, then close). q / Esc / Reject leave the
+    // window standing so the still-loaded review can be reopened.
+    if app.approved {
+        let _ = shelbi_orchestrator::review_ui::close_review_window(project_name, task_id);
+    }
     result
 }
 
@@ -869,7 +885,10 @@ fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect
         // runs close_review_interface to restore the dashboard layout.
         PanelEffect::Approve => {
             match shelbi_orchestrator::review_ui::approve_review_task(project_name, &app.task_id) {
-                Ok(()) => app.should_quit = true,
+                Ok(()) => {
+                    app.approved = true;
+                    app.should_quit = true;
+                }
                 Err(e) => app.status_line = format!("approve failed: {e}"),
             }
         }

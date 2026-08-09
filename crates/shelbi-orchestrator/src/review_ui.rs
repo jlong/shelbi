@@ -670,6 +670,45 @@ pub fn approve_review_task(project_name: &str, task_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Close the review slot's tmux window after acceptance so the slot returns to
+/// idle instead of lingering with just its agent pane.
+///
+/// The accept signal ([`approve_review_task`]) must have fired **first** — this
+/// is the teardown half, mirroring the dev-workspace ordering (branch promoted
+/// before the pane closes) so nothing is stranded by the close. Scoped to the
+/// **review-tagged** slot the accepted task is assigned to (`move_task` leaves
+/// `assigned_to` intact, so it still resolves here); a task on a non-review slot
+/// or with no assignment is a no-op, leaving dev-workspace teardown and the
+/// Reject flow untouched.
+///
+/// Routes through [`crate::workspace::kill_workspace_pane`] rather than a bare
+/// `kill-window` so the expected-teardown mark is set (the review agent pane's
+/// lifecycle wrapper won't emit a spurious `pane_alive=false reason=signal:SIGHUP`)
+/// and every window bound to the slot is reaped — the invariant that keeps a
+/// half-torn-down review window from resurfacing as an `orphaned session`.
+/// Best-effort: closing one review slot's window touches only that slot, so
+/// other review windows and the dashboard sidebar are left alone.
+pub fn close_review_window(project_name: &str, task_id: &str) -> Result<()> {
+    let project = shelbi_state::load_project(project_name)?;
+    let tf = shelbi_state::load_task(project_name, task_id)?;
+    let Some(ws) = tf
+        .task
+        .assigned_to
+        .as_deref()
+        .and_then(|name| project.workspace(name))
+        .filter(|w| project.effective_tags(w).contains("review"))
+        .cloned()
+    else {
+        // Not a review slot (or no assignment): nothing of ours to close.
+        return Ok(());
+    };
+    let machine = project
+        .machine(&ws.machine)
+        .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
+    let addr = crate::workspace::workspace_tmux_addr(&project, &ws)?;
+    crate::workspace::kill_workspace_pane(&machine.host(), &addr, &ws.name)
+}
+
 /// **Reject**: append the reviewer's `reason` to the task body as a marked
 /// fix section and bounce the task back to the workflow's ready status so
 /// normal auto-dispatch picks it back up with the feedback baked into the
@@ -723,5 +762,192 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), keys.len(), "review session keys must be unique");
+    }
+
+    // -- close_review_window (accept teardown) ------------------------------
+
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// A hub project named `name` with one dev slot (`alpha`, untagged) and one
+    /// `review`-tagged slot (`review-1`), so the accept-teardown scoping can be
+    /// exercised against both.
+    fn demo_project(name: &str) -> shelbi_core::Project {
+        use shelbi_core::*;
+        let mut runners = std::collections::BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+                integration: None,
+            },
+        );
+        Project {
+            name: name.into(),
+            label: None,
+            display_name: None,
+            repo: "git@example:demo.git".into(),
+            default_branch: "main".into(),
+            default_workflow: None,
+            config_mode: None,
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: "/tmp/demo".into(),
+                host: None,
+                tags: Vec::new(),
+                forward: None,
+            }],
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workspaces: vec![
+                WorkspaceSpec {
+                    name: "alpha".into(),
+                    machine: "hub".into(),
+                    runner: "claude".into(),
+                    tags: Vec::new(),
+                    slot: None,
+                },
+                WorkspaceSpec {
+                    name: "review-1".into(),
+                    machine: "hub".into(),
+                    runner: "claude".into(),
+                    tags: vec!["review".into()],
+                    slot: None,
+                },
+            ],
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
+            zen: shelbi_core::ZenConfig::default(),
+            heartbeat: shelbi_core::HeartbeatConfig::default(),
+            git: shelbi_core::GitConfig::default(),
+            detected_shapes: Vec::new(),
+        }
+    }
+
+    fn task_on(id: &str, slot: &str, column: Column) -> shelbi_core::Task {
+        let now = chrono::Utc::now();
+        shelbi_core::Task {
+            id: id.into(),
+            title: id.into(),
+            column,
+            priority: 0,
+            assigned_to: Some(slot.into()),
+            workflow: None,
+            branch: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            params: std::collections::BTreeMap::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn add_window(session: &str, name: &str) {
+        let ok = std::process::Command::new("tmux")
+            .args([
+                "new-window",
+                "-d",
+                "-t",
+                &format!("={session}:"),
+                "-n",
+                name,
+                "sh",
+                "-c",
+                "sleep 600",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "failed to create window `{name}` in `{session}`");
+    }
+
+    /// Accepting a review item closes *only* the review-tagged slot's window,
+    /// and only for the accepted task — the dev slot and any other window are
+    /// left standing. Locks the scoping half of the accept-teardown fix.
+    #[test]
+    fn close_review_window_reaps_only_the_review_slot() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
+
+        let proj = format!("review-ui-{}", std::process::id());
+        let home = std::env::temp_dir().join(format!("shelbi-review-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        shelbi_state::save_project(&demo_project(&proj)).unwrap();
+        shelbi_state::save_task(&proj, &task_on("t-dev", "alpha", Column::in_progress()), "body")
+            .unwrap();
+        shelbi_state::save_task(&proj, &task_on("t-rev", "review-1", Column::review()), "body")
+            .unwrap();
+
+        // Stand up the project session with a long-lived holder plus the dev and
+        // review windows the addrs resolve to (`shelbi-<proj>:<slot>`).
+        let session = format!("shelbi-{proj}");
+        crate::tmux_test_support::start_session(&session, "holder");
+        add_window(&session, "alpha");
+        add_window(&session, "review-1");
+
+        let host = Host::Local;
+        let alpha_addr = shelbi_core::TmuxAddr {
+            session: session.clone(),
+            window: "alpha".into(),
+        };
+        let review_addr = shelbi_core::TmuxAddr {
+            session: session.clone(),
+            window: "review-1".into(),
+        };
+        assert!(crate::workspace::workspace_pane_alive(&host, &alpha_addr).unwrap());
+        assert!(crate::workspace::workspace_pane_alive(&host, &review_addr).unwrap());
+
+        // Accepting a task on the DEV slot is a no-op — this path only tears down
+        // review-tagged slots, so the dev window (and the review one) survive.
+        close_review_window(&proj, "t-dev").unwrap();
+        assert!(
+            crate::workspace::workspace_pane_alive(&host, &alpha_addr).unwrap(),
+            "dev-slot accept must not close the dev window"
+        );
+        assert!(
+            crate::workspace::workspace_pane_alive(&host, &review_addr).unwrap(),
+            "dev-slot accept must not touch the review window"
+        );
+
+        // Accepting the review task closes its review slot's window — and only
+        // that window; the dev slot is left standing.
+        close_review_window(&proj, "t-rev").unwrap();
+        assert!(
+            !crate::workspace::workspace_pane_alive(&host, &review_addr).unwrap(),
+            "review accept must close the review slot's window"
+        );
+        assert!(
+            crate::workspace::workspace_pane_alive(&host, &alpha_addr).unwrap(),
+            "closing one review window must not disturb the dev slot"
+        );
+
+        crate::tmux_test_support::kill_session(&session);
+        match prev_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
