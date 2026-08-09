@@ -19,8 +19,8 @@ Status *names* are user-facing labels: what shows up on the Kanban
 card. Generic code (orchestrator auto-dispatch, Zen Mode's confidence
 bar, the events log, the activity feed) keeps working unchanged
 because every status maps to a small, closed set of **categories**:
-`backlog`, `ready`, `active`, `handoff`, `done`. Categories are the
-vocabulary the rest of the system reasons in.
+`backlog`, `ready`, `active`, `handoff`, `done`, `archived`. Categories
+are the vocabulary the rest of the system reasons in.
 
 The default workflow renders as the canonical five-column board, one column
 per category, each colored by its category:
@@ -109,7 +109,7 @@ statuses:
 #     actions: [push_branch, open_pr]
 #   - from: review
 #     to: done
-#     actions: [merge, delete_branch]
+#     actions: [push_branch, merge]
 ```
 
 Why two files? A status's identity is project-wide, but its automation
@@ -131,7 +131,7 @@ message names the workflow and the bad field.
 
 ## Status categories
 
-Every status, default or custom, declares one of five categories:
+Every status, default or custom, declares one of six categories:
 
 | Category   | Semantic                                                            | Example status names                                  |
 | ---------- | ------------------------------------------------------------------- | ----------------------------------------------------- |
@@ -140,9 +140,10 @@ Every status, default or custom, declares one of five categories:
 | `active`   | Owner is working on it now.                                         | `InProgress`, `Building`, `Designing`, `Drafting`     |
 | `handoff`  | One owner has finished their part; another's input is required.     | `Review`, `QA`, `Awaiting Sign-off`                   |
 | `done`     | Terminal — accepted, shipped.                                       | `Done`, `Shipped`, `Released`                         |
+| `archived` | Terminal — closed without shipping.                                 | `Canceled`, `Abandoned`, `Won't Do`                   |
 
-The category set is **closed at five**. A workflow can't introduce a
-sixth. Generic code (Zen Mode, activity feed, orchestrator routing)
+The category set is **closed at six**. A workflow can't introduce a
+seventh. Generic code (Zen Mode, activity feed, orchestrator routing)
 keys off the category, and an unknown one would have nowhere to fit. A
 workflow *can* repeat a category, though: a long pipeline might have
 three `active` statuses (Design, Build, QA) with different owners.
@@ -544,7 +545,7 @@ statuses:
 
 transitions:
   - { from: in-progress, to: review,   actions: [push_branch, open_pr] }
-  - { from: review,      to: done,     actions: [merge, delete_branch] }
+  - { from: review,      to: done,     actions: [push_branch, merge] }
   - { from: in-progress, to: canceled, actions: [close_pr, delete_branch] }
   - { from: review,      to: canceled, actions: [close_pr, delete_branch] }
 ```
@@ -597,7 +598,7 @@ statuses:
   - { id: canceled,    owner: user }
 
 transitions:
-  - { from: in-progress, to: done,     actions: [merge, delete_branch] }
+  - { from: in-progress, to: done,     actions: [push_branch, merge] }
   - { from: in-progress, to: canceled, actions: [delete_branch] }
 ```
 
@@ -669,8 +670,9 @@ workspace's pane. Instead:
 3. If the file is non-empty and names a task that's in an
    `active`-category status for this workspace, the poller moves the
    task into the next `handoff` status, clears the marker, and
-   appends `task=<id> <from> -> <to> reason=workspace:ready-marker` to
-   the events log.
+   appends `project=<p> task=<id> workflow=<name> <from> -> <to>
+   reason=workspace:ready-marker from_category=active to_category=handoff`
+   to the events log.
 
 The orchestrator hears about it through its `shelbi events tail
 --follow` feed and dispatches the next ready task to the now-free
@@ -751,7 +753,8 @@ whole feature into `main`.
 ## CLI reference
 
 - `shelbi workflow list` — list every workflow in the project.
-- `shelbi workflow show <name>` — print the resolved YAML.
+- `shelbi workflow show <name>` — print the workflow's per-status
+  `STATUS / OWNER / AGENT` table, in `statuses.yaml` order.
 - `shelbi workflow new <name>` — scaffold a starter file.
 - `shelbi workflow edit <name>` — open in `$EDITOR`.
 - `shelbi task add "Title" [--workflow <name>]` — create a card,

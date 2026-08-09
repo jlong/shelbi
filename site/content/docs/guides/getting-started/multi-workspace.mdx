@@ -133,8 +133,9 @@ the order you want them picked up:
   ```
 
 The orchestrator is already tailing `~/.shelbi/events.log`. Each
-promotion arrives as a `task=<id> backlog -> todo reason=user:*` line
-and triggers an immediate dispatch attempt.
+promotion arrives as a `project=<p> task=<id> workflow=<name> backlog ->
+todo reason=user:* from_category=backlog to_category=ready` line and
+triggers an immediate dispatch attempt.
 
 ## Watch the loop in action
 
@@ -207,11 +208,11 @@ You'll see the column moves and the workspace state changes interleaved,
 exactly what the orchestrator is reacting to:
 
 ```
-2026-06-22T14:11:02+00:00 task=add-csv-export-to-reports backlog -> todo reason=user:cli
-2026-06-22T14:11:02+00:00 task=add-csv-export-to-reports todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha
-2026-06-22T14:11:03+00:00 workspace=alpha none -> working
-2026-06-22T14:11:04+00:00 task=fix-cookie-domain-bug-on-safari-sso backlog -> todo reason=user:cli
-2026-06-22T14:11:04+00:00 task=fix-cookie-domain-bug-on-safari-sso todo -> in_progress reason=orchestrator:auto-dispatch_workspace=bravo
+2026-06-22T14:11:02+00:00 project=myapp task=add-csv-export-to-reports workflow=task backlog -> todo reason=user:cli from_category=backlog to_category=ready
+2026-06-22T14:11:02+00:00 project=myapp task=add-csv-export-to-reports workflow=task todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha from_category=ready to_category=active
+2026-06-22T14:11:03+00:00 project=myapp workspace=alpha none -> working
+2026-06-22T14:11:04+00:00 project=myapp task=fix-cookie-domain-bug-on-safari-sso workflow=task backlog -> todo reason=user:cli from_category=backlog to_category=ready
+2026-06-22T14:11:04+00:00 project=myapp task=fix-cookie-domain-bug-on-safari-sso workflow=task todo -> in_progress reason=orchestrator:auto-dispatch_workspace=bravo from_category=ready to_category=active
 …
 ```
 
@@ -226,8 +227,8 @@ review-ready marker, three things happen at once:
 
 1. The hub poller moves the task from `in_progress` to `review` and
    clears the marker.
-2. The workspace's badge flips from `⏵` to `✓` and the **Ready for
-   Review** list in the sidebar grows a row.
+2. The workspace's badge drops from `⏵` back to idle (`·`) and a `✓`
+   row appears in the sidebar's **Ready for Review** section.
 3. The orchestrator, watching the event stream, sees the workspace free
    up and immediately dispatches the next ready `todo` card to that
    slot (if any).
