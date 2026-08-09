@@ -5577,6 +5577,58 @@ transitions:
     }
 
     #[test]
+    fn maybe_emit_heartbeat_continues_across_a_zen_mode_toggle() {
+        // Regression (durable-follower-silently-stalls): a `mode=zen` toggle
+        // lands in events.log, which trips the reset-on-event debounce. That
+        // debounce is bounded — a toggle may defer one emission by at most a
+        // standard interval, but it must never silence the emitter. Live, the
+        // heartbeat was observed to go quiet right after a zen toggle; this
+        // pins the bound so a regression can't reintroduce a permanent stall.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-hb-zen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.heartbeat = shelbi_core::HeartbeatConfig::every(Duration::from_secs(1));
+
+        let mut hb = HeartbeatSchedule::default();
+        // Seed the schedule.
+        maybe_emit_heartbeat(&project, &mut hb, || true);
+
+        // A zen-mode toggle lands on the stream — the exact event that was
+        // observed to precede the heartbeat going silent.
+        shelbi_state::append_zen_mode_event("demo", "off", "on", "user:palette").unwrap();
+
+        // Advance past the bounded debounce window: the attempt is due and the
+        // reset-on-event deadline (window_start + standard) has already passed,
+        // so the safety net must win over the zen-toggle activity and emit.
+        hb.window_start = Some(Instant::now() - Duration::from_secs(10));
+        hb.next_attempt = Some(Instant::now() - Duration::from_secs(1));
+
+        maybe_emit_heartbeat(&project, &mut hb, || true);
+
+        let log = shelbi_state::events_log_path().unwrap();
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            body.lines().any(|l| l.contains("heartbeat")),
+            "a zen toggle must not silence the heartbeat emitter; log: {body:?}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn maybe_emit_heartbeat_off_never_emits_and_clears_schedule() {
         // Project sets `heartbeat: off`: the function must clear any
         // outstanding schedule (so flipping it back on later starts a
