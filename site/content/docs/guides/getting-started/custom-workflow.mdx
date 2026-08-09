@@ -152,8 +152,8 @@ true:
    names a file outside those globs, fall through.
 3. **The user has accepted ≥3 tasks of the same shape (same
    verb-prefix, same target directory) without changes in the
-   last week.** Track this against the `done` column via
-   `shelbi task list --column done`.
+   last week.** Track this against the `done` status via
+   `shelbi task list --status done`.
 
 If none of the above, leave the card in `backlog`, emit
 `reason=orchestrator:zen-decline reason-text=<short>`, and surface
@@ -239,7 +239,7 @@ The composed prompt (preamble + instructions) is written to
 `~/.shelbi/projects/<name>/CLAUDE.md` on every `shelbi reload`. Read
 that file to see exactly what the runner loads.
 
-`shelbi reload` respawns the sidebar, Tasks, and Review panes against the
+`shelbi reload` respawns the sidebar, Tasks, and Activity panes against the
 new config without restarting workspaces or losing chat history. It does
 recycle the orchestrator pane, so its conversation context resets: the
 cost of changing the system prompt mid-session. Heads up before the next

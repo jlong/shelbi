@@ -31,10 +31,10 @@ shelbi -p myapp
 ```
 
 The TUI is two panes. A borderless sidebar on the left lists the project
-name, the nav (Chat, Tasks), your declared workspaces, and any tasks
-waiting on review. The right pane is a real tmux pane: the orchestrator
-agent by default, or one of the built-in views (Chat / Tasks / Machines
-/ Review) when you switch.
+name, the nav (Chat, Tasks, Activity), your declared workspaces, and any
+tasks waiting on review. The right pane is a real tmux pane: the
+orchestrator agent by default, or one of the built-in views (Chat /
+Tasks / Activity) when you switch.
 
 `Ctrl+P` opens a fuzzy command palette as a tmux popup. Use it to
 switch projects, jump to a workspace pane, or swap the right pane to
@@ -185,16 +185,21 @@ into its pane to watch the run live.
 |---|---|
 | `·` | idle — no task assigned |
 | `⏵` | working — agent actively running a turn |
-| `💬` | awaiting input — finished a turn, sitting at the prompt |
+| `?` | awaiting input — finished a turn, sitting at the prompt |
 | `⚠` | awaiting permission — showing a permission dialog |
-| `✓` | review-ready — task moved to the review column |
+| `⏸` | paused — runner stalled on a usage/session limit |
+
+A finished dev workspace doesn't get its own completion glyph: on promotion
+the poller closes its session, so the row reads idle (`·`) immediately. The
+"done, awaiting human" state lives in the review section, not on the
+workspace row (that's where the `✓` you see below comes from).
 
 ## Review the workspace's branch
 
 When the workspace finishes, it writes a review-ready marker into its
 worktree. The hub poller picks it up on the next tick, moves the card
-into **Review**, and the workspace's badge flips to `✓`. The sidebar's
-*Ready for Review* list grows a row:
+into **Review**, and the workspace row drops back to idle (`·`). A `✓`
+row appears in the sidebar's *Ready for Review* section:
 
 ```
 — Ready for Review —

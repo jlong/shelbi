@@ -76,22 +76,34 @@ shelbi zen status
 ```
 
 ```
-mode: off
-checks.local:
+zen mode: off
+checks:
   - cargo test --workspace
   - cargo clippy --workspace --all-targets -- -D warnings
-ci_timeout: 15m
-danger_paths (resolved):
-  built-in:        .github/workflows/**, scripts/install.sh, *.yaml, *.yml, LICENSE, package-lock.json, Cargo.lock
-  cargo workspace: Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo/config.toml
-  github:          .github/CODEOWNERS, .github/dependabot.yml
-  extend:          crates/shelbi-state/src/migrations/**
+ci timeout: 15m
+danger paths (detected: cargo workspace, github):
+  - .github/workflows/**
+  - scripts/install.sh
+  - *.yaml
+  - *.yml
+  - LICENSE
+  - package-lock.json
+  - Cargo.lock
+  - Cargo.toml
+  - rust-toolchain.toml
+  - .cargo/config.toml
+  - .github/CODEOWNERS
+  - .github/dependabot.yml
+  - crates/shelbi-state/src/migrations/**
+last crash: never
 in-flight zen tasks: 0
 ```
 
-The resolved danger-path list labels every contribution so you can see
-which globs came from where. If something you expected to be guarded
-isn't on the list, add it under `extend`.
+The danger-path list is the fully resolved set of guarded globs: the
+built-in defaults, the globs contributed by your detected project shapes
+(`detected: …` names them), and anything you added under `extend`,
+deduped into one flat list. If something you expected to be guarded
+isn't on it, add it under `extend`.
 
 </Step>
 </Steps>
@@ -109,10 +121,11 @@ Three ways:
   `Ctrl+Shift+Z` as fallbacks. Pick one and it's persisted to
   `~/.shelbi/shelbi.yaml`.
 
-You'll know it's on by the **ZEN ON** pill anchored to the bottom of
-the workspaces column in the sidebar. That pill is the at-a-glance "the
-agent is in lead mode" signal. If it's not there, Zen is off or
-paused.
+You'll know it's on by the full-width **ZEN MODE ON** green band
+anchored to the bottom of the workspaces column in the sidebar. That
+band is the at-a-glance "the agent is in lead mode" signal. If it's not
+there, Zen is off or paused (off shows a dim `Alt+Z Zen mode` hint in
+the same spot instead).
 
 ```
  — hub —
@@ -123,7 +136,7 @@ paused.
  — Ready for Review —
  (empty)
 
-                          [ ZEN ON ]
+ ZEN MODE ON
 ```
 
 ## Watch one task land end to end
@@ -170,7 +183,7 @@ the remote Git ref, not GitHub PR metadata. Repositories that require protected
 PR or merge-queue mutations stay in review for a human merge.
 
 ```
-2026-06-22T14:31:08+00:00 task=tighten-rate-limit-error-copy review -> done reason=orchestrator:zen-merge sha=abc1234
+2026-06-22T14:31:08+00:00 project=myapp task=tighten-rate-limit-error-copy workflow=task review -> done reason=orchestrator:zen-merge from_category=handoff to_category=done
 ```
 
 The card lands in **Done** after GitHub reports the merge:
