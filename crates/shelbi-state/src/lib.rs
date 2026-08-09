@@ -2641,6 +2641,101 @@ fn resolved_task_workflow_name_for_project(project: &str, task: &Task) -> Result
         .unwrap_or_else(|_| task.workflow_or_default().to_string()))
 }
 
+// -- parked review tasks -------------------------------------------------------
+//
+// The "park" marker is how an operator (or the orchestrator) unloads a
+// review-column task from its slot and has it STAY unloaded. A review slot is
+// re-served on every poll tick by two independent paths — the auto-loader
+// ([`shelbi_orchestrator::load::autoload_review_queue`]) fills an idle slot
+// from the queued review column, and the stranded-slot resume relaunches a slot
+// whose task is still assigned on disk but whose pane died. Without a durable
+// "leave this one alone" signal those two paths re-grab a task the moment it is
+// cleared, which is the resume+autoload churn loop this whole subsystem fights.
+//
+// Parking is a per-task marker file under `<project_dir>/parked-review/`. It is
+// SET by the deliberate-unload paths (`shelbi workspace stop <review-slot>` and
+// `shelbi task unassign` on a review-column task, both via [`park_review_task`])
+// and CLEARED by any fresh dispatch/assignment of the task (so a re-served or
+// reworked-then-re-handed-off task is never wrongly skipped). A crash or a
+// `shelbi quit`+restart sets NO marker, so a genuinely stranded slot still
+// resumes — the park marker is exactly what tells an intentional unload apart
+// from an unexpected death.
+
+/// Directory of parked-review markers for `project`
+/// (`<project_dir>/parked-review/`). Each empty file named `<task-id>` marks a
+/// review-column task the operator deliberately unloaded from its slot.
+fn parked_review_dir(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("parked-review"))
+}
+
+/// Marker path for a single parked task. Validates the id so a hostile/synced
+/// id can't escape the project's `parked-review/` directory.
+fn parked_review_marker_path(project: &str, id: &str) -> Result<PathBuf> {
+    validate_task_id(id)?;
+    Ok(parked_review_dir(project)?.join(id))
+}
+
+/// Mark `id` as parked — the review auto-loader and the stranded-slot resume
+/// will leave it alone until it is loaded again. Idempotent.
+pub fn set_task_parked(project: &str, id: &str) -> Result<()> {
+    let path = parked_review_marker_path(project, id)?;
+    ensure_dir(&parked_review_dir(project)?)?;
+    atomic_write(&path, b"")
+}
+
+/// Clear `id`'s parked marker if present. Idempotent (no marker → `Ok`).
+/// Called on any fresh dispatch/assignment so a re-served or reworked task
+/// stops being skipped by the auto-loader.
+pub fn clear_task_parked(project: &str, id: &str) -> Result<()> {
+    let path = parked_review_marker_path(project, id)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
+/// Is `id` currently parked? A missing marker (or missing directory) → `false`.
+pub fn is_task_parked(project: &str, id: &str) -> Result<bool> {
+    Ok(parked_review_marker_path(project, id)?.exists())
+}
+
+/// The set of parked task ids for `project`. A missing directory → empty set.
+/// The auto-loader reads this once per batch to skip parked queued tasks.
+pub fn parked_review_tasks(project: &str) -> Result<BTreeSet<String>> {
+    let dir = parked_review_dir(project)?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    let mut out = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(shelbi_core::Error::Io)?;
+        if let Some(name) = entry.file_name().to_str() {
+            out.insert(name.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Unload a review-column task from its slot at the operator's request: clear
+/// its `assigned_to` and set its parked marker in one locked write, so the
+/// auto-loader and the stranded-slot resume both leave it alone until it is
+/// explicitly loaded again. Returns the workspace it was unassigned from (if
+/// any) for the caller's message. Safe (and still parks) on an already
+/// unassigned task.
+pub fn park_review_task(project: &str, id: &str) -> Result<Option<String>> {
+    hub_version::ensure_daemon_matches_for_mutation()?;
+    let _lock = lock_tasks(project)?;
+    let TaskFile { mut task, body } = load_task(project, id)?;
+    let was = task.assigned_to.take();
+    task.updated_at = Utc::now();
+    save_task_unlocked(project, &task, &body)?;
+    set_task_parked(project, id)?;
+    Ok(was)
+}
+
 /// Marked-up header the review interface's **Reject** action appends to a
 /// task body before bouncing it back for rework. Kept as a `##` section so
 /// the next worker reads the feedback as part of the task requirements, not
@@ -3556,6 +3651,66 @@ mod tests {
 
         // Fully clean (Todo + unowned) → genuine no-op.
         assert_eq!(release_task_to_todo("p", "t").unwrap(), None);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn park_marker_round_trips_and_clears() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // No marker yet, and no directory → not parked, empty set.
+        assert!(!is_task_parked("p", "t").unwrap());
+        assert!(parked_review_tasks("p").unwrap().is_empty());
+
+        // Set → present in both the per-task check and the batch listing.
+        set_task_parked("p", "t").unwrap();
+        assert!(is_task_parked("p", "t").unwrap());
+        assert_eq!(
+            parked_review_tasks("p").unwrap(),
+            std::iter::once("t".to_string()).collect()
+        );
+        // Idempotent set.
+        set_task_parked("p", "t").unwrap();
+        assert!(is_task_parked("p", "t").unwrap());
+
+        // Clear → gone; clearing again is a no-op.
+        clear_task_parked("p", "t").unwrap();
+        assert!(!is_task_parked("p", "t").unwrap());
+        clear_task_parked("p", "t").unwrap();
+        assert!(parked_review_tasks("p").unwrap().is_empty());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn park_review_task_unassigns_and_marks_in_one_step() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A review-column card still pinned to the slot that served it.
+        let mut task = make_task("fix-docs", Column::review(), 0);
+        task.assigned_to = Some("review".to_string());
+        save_task("p", &task, "body").unwrap();
+
+        // Park it: reports the slot it was on, clears the owner, sets the marker
+        // — all so neither the auto-loader nor the resume re-grabs it. The card
+        // stays in the review column.
+        let was = park_review_task("p", "fix-docs").unwrap();
+        assert_eq!(was.as_deref(), Some("review"));
+        let after = load_task("p", "fix-docs").unwrap().task;
+        assert_eq!(after.assigned_to, None);
+        assert_eq!(after.column, Column::review());
+        assert!(is_task_parked("p", "fix-docs").unwrap());
+
+        // Parking an already-unassigned task still sets the marker (idempotent
+        // recovery) and reports no prior slot.
+        clear_task_parked("p", "fix-docs").unwrap();
+        assert_eq!(park_review_task("p", "fix-docs").unwrap(), None);
+        assert!(is_task_parked("p", "fix-docs").unwrap());
 
         std::env::remove_var("SHELBI_HOME");
     }
