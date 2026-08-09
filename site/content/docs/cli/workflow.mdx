@@ -10,9 +10,9 @@ shelbi workflow <SUBCOMMAND> [OPTIONS]
 
 `shelbi workflow` manages the YAML files that declare the statuses a task moves
 through, who owns each one, and which git side-effects fire on each transition.
-Every project has a built-in `default` workflow: the canonical five-status
-flow (`Backlog → Todo → InProgress → Review → Done`). These subcommands
-surface it alongside any custom workflows the project authors.
+Every project has a built-in `default` workflow: the canonical six-status
+flow (`Backlog → Todo → In Progress → Review → Done → Canceled`). These
+subcommands surface it alongside any custom workflows the project authors.
 
 The default is virtual: it lives in code, not on disk, until `workflow new` or
 `workflow edit` writes a file. Workflow files live at
@@ -61,8 +61,8 @@ errors with the resolved file path.
 shelbi workflow new [OPTIONS] <NAME>
 ```
 
-Scaffold a new workflow YAML pre-populated with the canonical five-status
-default. The file's `name:` field is set to `<NAME>` so it matches the
+Scaffold a new workflow YAML pre-populated with the canonical six-status
+default (the five historical lanes plus `Canceled`). The file's `name:` field is set to `<NAME>` so it matches the
 basename. For non-`default` names the placeholder description is dropped.
 The default's "standard one-track flow…" copy would misrepresent a freshly
 scaffolded workflow whose author hasn't written a real description yet.

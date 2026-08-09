@@ -72,27 +72,31 @@ Print every declared workspace as a row. The columns:
 | `HOST`  | The machine it's pinned to — `hub` or a declared remote.                      |
 | `RUNNER` | The workspace runner name from `workspaces[].runner` (`claude`, `codex`, `opus`, …). |
 | `AGENT` | The [agent](/docs/concepts/agents) role the in-flight task loaded (`developer`, `qa`, …), or `-` when idle. |
-| `STATE` | `idle`, or `in_progress: <task-id>` when a task is running here. |
+| `INTEG` | The workspace's integration tier: `conventional` when the runner emits recognized markers (Claude Code, Codex), `degraded` when Shelbi can only poll it. |
+| `STATE` | The live pane state (see below). |
 
 ```text
-NAME         HOST     RUNNER         AGENT          STATE
-alpha        hub      opus           developer      in_progress: t-009
-bravo        hub      opus           -              idle
-charlie      hub      opus           -              idle
-delta        devbox   sonnet         qa             in_progress: t-017
-echo         devbox   sonnet         -              idle
+NAME         HOST     RUNNER         AGENT          INTEG          STATE
+alpha        hub      opus           developer      conventional   in_progress: t-009
+bravo        hub      opus           -              conventional   idle
+charlie      hub      opus           review         conventional   review: t-004
+delta        devbox   sonnet         qa             degraded       in_progress: t-017
+echo         devbox   sonnet         -              conventional   idle
 ```
 
 This is the first command the orchestrator runs at session start to snapshot
 the pool, and the same snapshot you want when answering "who's free, and what
 are they running?" An `AGENT` of `-` with `idle` state is a free slot. `STATE`
-here is board-derived. For the poller's live read (`working`,
+is live-probed, not board-derived — `list` runs a real tmux/SSH probe of each
+pane. It renders `idle`, `in_progress: <task-id>`, `review: <task-id>`,
+`occupied (user shell)`, `orphaned session`, or `unreachable (<reason>)`. For
+the poller's finer-grained read of an in-flight task (`working`,
 `awaiting_input`, `blocked`), use [`status`](#status).
 
 ## set-runner
 
 ```text
-shelbi workspace set-runner <RUNNER> [WORKSPACE ...]
+shelbi workspace set-runner <RUNNER> [NAMES]...
 shelbi workspace set-runner <RUNNER> --all
 ```
 
@@ -116,7 +120,7 @@ shelbi workspace set-runner codex alpha bravo
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<RUNNER>` | string | — | Runner name declared in `agent_runners`. |
-| `[WORKSPACE ...]` | string list | — | Workspace names to update. |
+| `[NAMES]...` | string list | — | Workspace names to update. |
 | `--all` | flag | off | Update every declared workspace. Cannot be combined with workspace names. |
 
 ## stop

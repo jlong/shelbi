@@ -10,7 +10,8 @@ shelbi merge [OPTIONS] <ID>
 
 `shelbi merge` bridges a task in `review` and a clean default branch. By
 default it squash-merges the task's branch into the project's default branch
-(typically `main`) using the workspace's commit message. Pass `--pr` to push
+(typically `main`) under a generated squash message, `shelbi: merge <id> from
+<branch>`. Pass `--pr` to push
 the branch and open a GitHub pull request instead, for teams that require a
 code-review roundtrip before anything lands.
 

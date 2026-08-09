@@ -13,9 +13,11 @@ about. Use it to onboard an additional project after your first, or to move an
 existing project from per-user global config into committed in-repo config.
 
 Every subcommand accepts the global `--root <PATH>` (override the Shelbi root
-directory, else `$SHELBI_ROOT`, else the install-time default) and
+directory, else `$SHELBI_ROOT`, else the install-time default),
 `-p, --project <PROJECT>` (defaults to `$SHELBI_PROJECT` or the registered
-project whose `work_dir` contains the current directory) flags.
+project whose `work_dir` contains the current directory), and `-y, --yes`
+(accept the detected plan without prompts — meaningful for `add`) flags. On
+`migrate-to-in-repo` the project flag's value name renders as `<NAME>`.
 
 ## Commands
 

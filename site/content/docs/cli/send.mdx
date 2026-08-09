@@ -25,7 +25,8 @@ the split text/Enter sequence, but Shelbi does not apply Claude's UI parser to
 them. Their result is explicit `status=unverified`, which preserves delivery
 without claiming runner-specific proof.
 
-`NAME` is resolved against the project YAML's `workspaces:` block.
+`ID` is resolved against the project YAML's `workspaces:` block first, then
+falls back to the legacy spawn agent registry.
 
 Because `send` writes keystrokes into a pane, the message content is
 **ephemeral**. Shelbi records and verifies the delivery result, but the worker
@@ -37,7 +38,7 @@ message that survives, is logged, and is acked by the workspace, reach for
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
-| `<ID>` | string | — | Workspace name, resolved against `workspaces:` (required). |
+| `<ID>` | string | — | Workspace name, resolved against `workspaces:` (then the legacy spawn agent registry) (required). |
 | `<MESSAGE>` | string | — | The message to type into the pane (required). |
 
 ## Flags

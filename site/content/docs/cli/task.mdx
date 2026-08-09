@@ -66,7 +66,7 @@ Pass `--status todo` to skip triage when you're already sure.
 | `<TITLE>` | string | — | Human-readable title (positional, required). |
 | `--id <ID>` | string | slug of title | Override the auto-generated id. |
 | `--status <STATUS>` | string | `backlog` | Initial status. |
-| `-d, --description <DESCRIPTION>` | string | empty | Task body. Use `shelbi task edit` later if omitted. |
+| `-d, --description <DESCRIPTION>` | string | the title | Task body. When omitted, the body defaults to the title; use `shelbi task edit` to fill it in later. |
 | `--depends-on <ID>` | string (repeatable) | — | Block this task on another. Repeat for multiple deps. |
 | `--prefers-machine <NAME>` | string | — | Hint for the orchestrator to route this task to a workspace on a specific machine. |
 | `--workflow <NAME>` | string | project default | Workflow this task runs under. Names a file in `workflows/<NAME>.yaml`. Omit to inherit the project's default workflow. |
