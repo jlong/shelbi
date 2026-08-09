@@ -1065,6 +1065,7 @@ fn parse_workspace_state(s: &str) -> Option<WorkspaceState> {
         "awaiting_input" => Some(WorkspaceState::AwaitingInput),
         "blocked" => Some(WorkspaceState::Blocked),
         "paused" => Some(WorkspaceState::Paused),
+        "serving" => Some(WorkspaceState::Serving),
         _ => None,
     }
 }
@@ -2175,6 +2176,7 @@ fn render_workspace_event(
             Color::DarkGray,
             Some("waiting for the limit to reset"),
         ),
+        WorkspaceState::Serving => ("serving", Color::Cyan, Some("branch is up for review")),
     };
 
     let mut row = Row::new(verb, String::new(), when);

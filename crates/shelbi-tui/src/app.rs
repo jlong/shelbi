@@ -1252,11 +1252,13 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 ///
 /// The serving signal is the review workspace's `.claude/shelbi-review-loaded`
 /// marker (see [`shelbi_orchestrator::workspace::read_review_loaded_marker`]):
-/// the Review agent writes it once the serve recipe's `ready:` health check
-/// passes, so it's the same "server is up" signal the review lifecycle uses to
-/// gate serving — just consulted here instead of ignored. It carries the task
-/// id, so a slot reused between tasks (its marker still naming the *previous*
-/// task) correctly reads as Loading for the new one.
+/// the hub poller writes it once the serve recipe's `ready:` health check passes
+/// (the deterministic, agent-independent path — see
+/// `shelbi_tui::poller::handle_review_slot`); the Review agent may also write it
+/// itself for a diff-only review or a recipe without a probe. Either way it's the
+/// "server is up" signal the review lifecycle gates serving on. It carries the
+/// task id, so a slot reused between tasks (its marker still naming the
+/// *previous* task) correctly reads as Loading for the new one.
 fn split_review_sections(
     project_name: &str,
     queue: Vec<TaskFile>,
@@ -1445,6 +1447,8 @@ fn derive_workspace_badge(workspace_name: &str, has_in_progress: bool) -> Worksp
             WorkspaceState::AwaitingInput => WorkspaceBadge::AwaitingInput,
             WorkspaceState::Blocked => WorkspaceBadge::AwaitingPermission,
             WorkspaceState::Paused => WorkspaceBadge::Paused,
+            // A serving review slot reads as active work (the branch is up).
+            WorkspaceState::Serving => WorkspaceBadge::Working,
         },
         // Task assigned but the poller hasn't observed a marker yet. Show
         // working as the best guess — it'll firm up within one poll tick.

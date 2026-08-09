@@ -179,9 +179,11 @@ pub fn read_ready_marker(host: &Host, marker: &Path) -> Result<Option<String>> {
 /// The review-serving file marker for a review workspace:
 /// `<worktree>/.claude/shelbi-review-loaded`.
 ///
-/// A Review agent writes this once its dev server is confirmed up (the
-/// serve recipe's `ready` probe has passed) — or once it has determined the
-/// review is diff-only. Where [`workspace_ready_marker`] is the dev worker's
+/// The hub poller writes this once the serve recipe's `ready:` probe passes
+/// (the deterministic path — see [`probe_review_slot_serving`] /
+/// [`write_review_loaded_marker`]); a Review agent may also write it itself
+/// (e.g. a diff-only review, or a recipe with no probe). Where
+/// [`workspace_ready_marker`] is the dev worker's
 /// "I'm done, hand me off" signal, this is the review slot's "the branch is
 /// actually serving now" signal: the durable, UI-proof handoff the sidebar
 /// gates **Ready for Review** on, so a task claims "ready" only once a human
@@ -244,6 +246,159 @@ pub fn read_review_loaded_marker(host: &Host, marker: &Path) -> Result<Option<St
 /// Called once the poller has consumed the signal, and again at task start to
 /// clear any stale marker before the worktree is reused.
 pub fn clear_ready_marker(host: &Host, marker: &Path) -> Result<()> {
+    let path = marker.to_string_lossy().into_owned();
+    shelbi_ssh::run(host, ["rm", "-f", path.as_str()]).map_err(Error::Io)?;
+    Ok(())
+}
+
+/// A review slot confirmed serving by the poller's own `ready:` probe.
+/// Carries the reviewable URL (if the recipe declared one) so the poller can
+/// write it into the `.claude/shelbi-review-loaded` marker body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewServing {
+    /// The resolved reviewable URL, or `None` when the recipe declared none.
+    pub url: Option<String>,
+}
+
+/// Run the `review:` recipe's `ready:` probe once for the task currently loaded
+/// on a review slot, returning `Some(ReviewServing)` when it exits 0 (the
+/// branch is actually serving) and `None` otherwise.
+///
+/// `None` covers every "can't confirm serving this way" case — the server
+/// isn't up yet, the recipe declares no `ready:` probe, the review slot has no
+/// assigned port (so `$SLOT`/`$PORT` are unresolved), the task/workflow can't
+/// be loaded, or the probe transport failed. In all of those the poller leaves
+/// the marker alone (a diff-only review, or one without a probe, is still the
+/// Review agent's to signal). This is called on the poll tick and must never be
+/// fatal, so every failure degrades to `None` rather than propagating.
+///
+/// The probe runs in the review worktree (and the recipe's `workdir`, if any)
+/// with the same `SLOT`/`PORT` env the Review agent's serve recipe was rendered
+/// against, so a probe that references them behaves identically to the agent's.
+pub fn probe_review_slot_serving(
+    project: &Project,
+    workspace: &WorkspaceSpec,
+    task_id: &str,
+) -> Option<ReviewServing> {
+    let machine = project.machine(&workspace.machine)?;
+    let host = machine.host();
+    let tf = shelbi_state::load_task(&project.name, task_id).ok()?;
+    let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task).ok()?;
+    let port = workspace.slot.and_then(|s| u16::try_from(s).ok());
+    let recipe = workflow.resolved_review_recipe(port)?;
+    // Unresolved port → the probe still carries `$SLOT`/`$PORT`; we must not
+    // guess a port, so we can't confirm serving here. Leave it to the agent
+    // (which the recipe tells to stop and report the misconfiguration).
+    recipe.port?;
+    let probe = recipe.ready.as_deref()?;
+    let worktree = workspace_worktree(machine, workspace);
+    if review_ready_probe_passes(
+        &host,
+        &worktree,
+        recipe.workdir.as_deref(),
+        recipe.port.unwrap_or(0),
+        task_id,
+        probe,
+    ) {
+        Some(ReviewServing { url: recipe.url })
+    } else {
+        None
+    }
+}
+
+/// Run a single review `ready:` probe on `host`, `cd`-ing into the review
+/// worktree (then the recipe `workdir`, if any) and exporting the same
+/// `SLOT`/`PORT`/`SHELBI_*` env the serve recipe was rendered against. Returns
+/// whether it exited 0. A transport error reads as "not serving" — the poll
+/// tick retries next cycle rather than treating a hiccup as fatal.
+fn review_ready_probe_passes(
+    host: &Host,
+    worktree: &Path,
+    workdir: Option<&str>,
+    port: u16,
+    task_id: &str,
+    probe: &str,
+) -> bool {
+    let esc = shelbi_core::shell_escape;
+    let mut cd = format!("cd {} || exit 1\n", esc(&worktree.to_string_lossy()));
+    if let Some(wd) = workdir {
+        cd.push_str(&format!("cd {} || exit 1\n", esc(wd)));
+    }
+    let script = format!(
+        "export SLOT={port}\n\
+         export PORT={port}\n\
+         export SHELBI_TASK={task}\n\
+         {cd}{probe}",
+        task = esc(task_id),
+    );
+    matches!(
+        shelbi_ssh::run(host, ["sh", "-c", &script]),
+        Ok(out) if out.status.success()
+    )
+}
+
+/// Write the review-serving marker (`<worktree>/.claude/shelbi-review-loaded`)
+/// naming `task_id`, optionally followed by the reviewable `url`. Atomic — a
+/// sibling `.tmp` is written and renamed into place so the sidebar never reads
+/// a half-written body (which would fail [`read_review_loaded_marker`]'s task-id
+/// validation). Mirrors the Review agent's own write so the poller-written and
+/// agent-written markers are byte-compatible.
+///
+/// The poller writes this when its own `ready:` probe confirms the slot is
+/// serving — making **Ready for Review** promotion deterministic instead of
+/// dependent on the agent remembering to write it.
+pub fn write_review_loaded_marker(
+    host: &Host,
+    marker: &Path,
+    task_id: &str,
+    url: Option<&str>,
+) -> Result<()> {
+    let body = match url {
+        Some(u) => format!("{task_id} {u}\n"),
+        None => format!("{task_id}\n"),
+    };
+    let dir = marker.parent();
+    let marker_path = marker.to_string_lossy().into_owned();
+    let tmp_path = {
+        let mut s = marker.as_os_str().to_owned();
+        s.push(".tmp");
+        PathBuf::from(s)
+    };
+    if host.is_local() {
+        if let Some(dir) = dir {
+            std::fs::create_dir_all(dir).map_err(Error::Io)?;
+        }
+        std::fs::write(&tmp_path, body.as_bytes()).map_err(Error::Io)?;
+        std::fs::rename(&tmp_path, marker).map_err(Error::Io)?;
+        return Ok(());
+    }
+    // Remote slot: mkdir -p the .claude dir, then atomically write via a temp
+    // file + mv, all through one `sh -c` so it's a single round-trip.
+    let esc = shelbi_core::shell_escape;
+    let dir_esc = dir
+        .map(|d| esc(&d.to_string_lossy()))
+        .unwrap_or_else(|| esc("."));
+    let script = format!(
+        "mkdir -p {dir} && printf %s {body} > {tmp} && mv {tmp} {marker}",
+        dir = dir_esc,
+        body = esc(&body),
+        tmp = esc(&tmp_path.to_string_lossy()),
+        marker = esc(&marker_path),
+    );
+    let out = shelbi_ssh::run(host, ["sh", "-c", &script]).map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Other(format!(
+            "writing review-loaded marker at {marker_path} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Remove the review-serving marker (idempotent — `rm -f` succeeds if absent).
+/// Called when the poller reaps an orphaned review slot so a stale marker
+/// naming a resolved task can't keep the sidebar showing **Ready for Review**.
+pub fn clear_review_loaded_marker(host: &Host, marker: &Path) -> Result<()> {
     let path = marker.to_string_lossy().into_owned();
     shelbi_ssh::run(host, ["rm", "-f", path.as_str()]).map_err(Error::Io)?;
     Ok(())
@@ -5510,6 +5665,102 @@ mod tests {
         assert!(read_review_loaded_marker(&Host::Local, &marker).is_err());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_and_clear_review_loaded_marker_round_trip_locally() {
+        // The poller-written marker must be byte-compatible with the agent's:
+        // `<task-id>\n` (diff-only) or `<task-id> <url>\n`, and read back through
+        // the same `read_review_loaded_marker` the sidebar uses.
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-write-review-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Marker lives under a `.claude` subdir that write_ must create.
+        let marker = dir.join(".claude").join("shelbi-review-loaded");
+
+        // With a URL.
+        write_review_loaded_marker(
+            &Host::Local,
+            &marker,
+            "fix-homepage-nav",
+            Some("http://localhost:4310"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_review_loaded_marker(&Host::Local, &marker)
+                .unwrap()
+                .as_deref(),
+            Some("fix-homepage-nav")
+        );
+        let body = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(body, "fix-homepage-nav http://localhost:4310\n");
+        // No leftover temp file from the atomic write.
+        assert!(!marker.with_extension("tmp").exists());
+
+        // Overwrite (slot reused) with a diff-only marker (no URL).
+        write_review_loaded_marker(&Host::Local, &marker, "other-task", None).unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "other-task\n");
+
+        // Clear is idempotent.
+        clear_review_loaded_marker(&Host::Local, &marker).unwrap();
+        assert!(read_review_loaded_marker(&Host::Local, &marker)
+            .unwrap()
+            .is_none());
+        clear_review_loaded_marker(&Host::Local, &marker).unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn review_ready_probe_runs_in_the_worktree_with_slot_env() {
+        // The probe runs `cd`-ed into the worktree with SLOT/PORT exported, so a
+        // recipe probe that references them behaves like the agent's serve.
+        let worktree = std::env::temp_dir().join(format!(
+            "shelbi-review-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        // A probe that exits 0 → serving.
+        assert!(review_ready_probe_passes(
+            &Host::Local,
+            &worktree,
+            None,
+            4310,
+            "t-1",
+            "true"
+        ));
+        // A probe that exits non-zero → not serving.
+        assert!(!review_ready_probe_passes(
+            &Host::Local,
+            &worktree,
+            None,
+            4310,
+            "t-1",
+            "false"
+        ));
+        // The probe sees SLOT/PORT and runs in the worktree: assert on a marker
+        // file it writes there keyed off $PORT.
+        assert!(review_ready_probe_passes(
+            &Host::Local,
+            &worktree,
+            None,
+            4310,
+            "t-1",
+            r#"test "$PORT" = 4310 && test "$SLOT" = 4310 && touch "port-$PORT.seen""#
+        ));
+        assert!(worktree.join("port-4310.seen").exists());
+
+        std::fs::remove_dir_all(&worktree).ok();
     }
 
     #[test]

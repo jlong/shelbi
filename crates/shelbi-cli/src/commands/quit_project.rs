@@ -133,6 +133,7 @@ fn workspace_state_label(has_task: bool, status: Option<WorkspaceState>) -> &'st
         Some(WorkspaceState::AwaitingInput) => "awaiting input",
         Some(WorkspaceState::Blocked) => "blocked",
         Some(WorkspaceState::Paused) => "paused",
+        Some(WorkspaceState::Serving) => "serving",
         None => "working",
     }
 }
