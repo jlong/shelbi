@@ -80,13 +80,13 @@ Notes on the fields:
   *multi-runner-first*: it declares a `runners` map keyed by runner kind, each
   block carrying that kind's `model` and `reasoning_effort`, and
   `preferred_runner` names which block is the default. Every value is a
-  recommendation the project can override (§4) — a project may pin the runner
-  kind (via `runner:` in its override, §5), override a block, or add a block for
-  a kind the author didn't ship. The `preferred_` prefix is deliberate and lives
-  **only on the agent side**: the agent *recommends* (`preferred_runner`), the
-  project *decides* (`runner`). This also reads honestly for the availability
-  case: a preferred runner kind may simply not be installed, in which case the
-  project's chosen kind (or another declared block) applies.
+  recommendation the project can override (§4): the project pins the kind per
+  agent with `runner:` and may set a house `model` / `reasoning_effort` per kind
+  in its **top-level** **`runners:`** map (§5) — there is no per-agent project block.
+  The `preferred_` prefix is deliberate and lives **only on the agent side**: the
+  agent *recommends* (`preferred_runner`), the project *decides* (`runner`). This
+  also reads honestly for the availability case: a preferred runner kind may
+  simply not be installed, in which case the project's chosen kind applies.
 
 - **`description`** feeds both docs and the sidebar/marketplace UI.
 
@@ -196,7 +196,7 @@ Two rules make this work:
   unset and let each manifest decide; to impose a house model on a kind, set it
   once at the top level.
 
-- **`runner`, not `preferred_runner`.** The `preferred_` prefix lives only in the
+- **`runner`, not** **`preferred_runner`.** The `preferred_` prefix lives only in the
   agent manifest (a recommendation); the project's `runner:` and top-level
   `runners:` values are authoritative (§1).
 
@@ -305,7 +305,7 @@ into the design above.
      `runner` (authoritative — no `preferred_` prefix). The agent recommends, the
      project decides. Reflected in §1, §5.
 3. **Runner-kind → concrete-runner mapping → direct (revised).** The project's
-   runner fleet is a **top-level `runners:` map keyed by kind** (not nested under
+   runner fleet is a **top-level** **`runners:`** **map keyed by kind** (not nested under
    each agent), one entry per kind, so kind → concrete runner is a direct lookup.
    This supersedes the earlier layered `runner_kinds:` answer; multiple runners of
    one kind is a future follow-up, not v1. Reflected in §2, §5.
