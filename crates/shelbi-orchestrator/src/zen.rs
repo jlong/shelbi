@@ -45,13 +45,13 @@ use std::time::{Duration, Instant};
 use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use shelbi_core::{
-    checks_for_task_in_workflow, danger_paths_for_workflow, Column, Error, Host, Machine, Project,
-    Result, StatusCategory, Task, Workflow, WorkflowStatus, WorkspaceSpec,
+    checks_for_task_in_workflow, danger_paths_for_workflow, Column, Error, Host, Machine,
+    MergeStrategy, Project, Result, StatusCategory, Task, Workflow, WorkflowStatus, WorkspaceSpec,
 };
 
 use crate::branch;
 use crate::git::{
-    commit_subject, compose_pr_body, locate_hub_workdir, locate_workspace_worktree,
+    commit_subject, compose_pr_body, gh_pr_merge, locate_hub_workdir, locate_workspace_worktree,
     login_shell_prefix, lookup_open_pr_in_repository, lookup_origin_repository,
     lookup_origin_repository_selector,
     lookup_origin_repository_with_push_target, lookup_pr_identity, parse_pr_number_from_url,
@@ -1678,21 +1678,16 @@ fn merge_via_pull_request(
     pr: u64,
     expected: &PinnedPrIdentity,
 ) -> Result<PrMergeOutcome> {
-    let pr_str = pr.to_string();
-    let merge = run_in_dir(
+    // Shares the exact `gh pr merge` primitive with the per-workflow `merge`
+    // action and `shelbi merge`; here we pin the repo and the reviewed head so
+    // GitHub can only act on the commit Zen verified.
+    let merge = gh_pr_merge(
         host,
         wt,
-        &[
-            "gh",
-            "pr",
-            "merge",
-            &pr_str,
-            "--repo",
-            &repository.selector,
-            "--squash",
-            "--match-head-commit",
-            &expected.integration_sha,
-        ],
+        pr,
+        MergeStrategy::Squash,
+        Some(&repository.selector),
+        Some(&expected.integration_sha),
     )?;
     if !merge.status.success() {
         return Err(unsupported_exact_ref_message(

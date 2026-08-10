@@ -228,10 +228,11 @@ just ask:
 you: merge it.
 ```
 
-Under the hood that's `shelbi merge fix-login-bug-on-safari`. The CLI
-squash-merges the branch into `default_branch` and prints the resulting
-commit hash. Add `--pr` to open a PR via the GitHub CLI instead of
-merging directly.
+Under the hood that's `shelbi merge fix-login-bug-on-safari`. If the review
+flow already opened a PR for the branch, the CLI squash-merges that PR through
+the GitHub CLI (so a PR-protected `default_branch` still accepts it); otherwise
+it squash-merges locally into `default_branch`. Either way it prints the
+resulting commit hash. Add `--pr` to open a fresh PR instead of merging.
 
 **Move the card to Done.** The orchestrator never auto-completes
 review. You confirm the merge landed and move the card yourself, with `L`

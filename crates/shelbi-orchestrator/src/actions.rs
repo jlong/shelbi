@@ -45,9 +45,9 @@
 use shelbi_core::{validate_branch, Column, Error, Host, MergeStrategy, Project, Result, Task};
 
 use crate::git::{
-    compose_pr_body, head_commit_subject, locate_hub_workdir, locate_workspace_worktree,
-    lookup_open_pr, lookup_pr_base, parse_pr_number_from_url, run_in_dir,
-    wait_for_merge_commit_sha,
+    compose_pr_body, gh_pr_merge, head_commit_subject, locate_hub_workdir,
+    locate_workspace_worktree, lookup_open_pr, lookup_pr_base, parse_pr_number_from_url,
+    run_in_dir, wait_for_merge_commit_sha,
 };
 use crate::workspace::workspace_worktree;
 
@@ -864,6 +864,38 @@ fn lookup_open_pr_tolerant(host: &Host, wt: &str, branch: &str) -> Result<Option
     }
 }
 
+/// Detect an *open* GitHub PR for `branch` in the repo at `wt` on `host`,
+/// returning its number if one exists. This is the public, CLI-reachable
+/// entry point for the PR-aware `shelbi merge` command: it reuses the same
+/// `gh pr list --head` probe every orchestrator action uses, degraded to
+/// "no PR" when `origin` isn't a GitHub remote (a purely-local project), so
+/// the caller can fall back to a local squash-merge.
+///
+/// A real gh failure (auth, network) still propagates — only the specific
+/// "no known GitHub host" case is treated as "no PR".
+pub fn detect_open_pr(host: &Host, wt: &str, branch: &str) -> Result<Option<u64>> {
+    lookup_open_pr_tolerant(host, wt, branch)
+}
+
+/// Merge open PR number `pr` for the repo at `wt` on `host` via GitHub's own
+/// PR merge, using `strategy`. Returns the squash-merge commit SHA once GitHub
+/// records it (`None` while it's still pending). A rejected or failed merge is
+/// a hard error — the caller must not mark the task done with the change
+/// unshipped.
+///
+/// This is the public wrapper the `shelbi merge` CLI calls; it shares the exact
+/// `gh pr merge` primitive ([`crate::git::gh_pr_merge`]) with the per-workflow
+/// `merge` action and Zen's required-PR landing path, so board-accept, Zen, and
+/// the CLI all land a PR the same way.
+pub fn merge_pr(
+    host: &Host,
+    wt: &str,
+    pr: u64,
+    strategy: MergeStrategy,
+) -> Result<Option<String>> {
+    merge_via_pr(host, wt, pr, strategy)
+}
+
 /// Unique-per-call `$TMPDIR` path for a throwaway git worktree. The
 /// process id + a process-wide counter keep concurrent calls (and
 /// parallel test runs) from colliding on the same path — `git worktree
@@ -905,12 +937,10 @@ fn sanitize_path_segment(s: &str) -> String {
 /// the merge commit yet after the polling window — see
 /// [`wait_for_merge_commit_sha`].
 fn merge_via_pr(host: &Host, wt: &str, pr: u64, strategy: MergeStrategy) -> Result<Option<String>> {
-    let pr_str = pr.to_string();
-    let strategy_flag = strategy.gh_flag();
-    let out = run_in_dir(host, wt, &["gh", "pr", "merge", &pr_str, strategy_flag])?;
+    let out = gh_pr_merge(host, wt, pr, strategy, None, None)?;
     if !out.status.success() {
         return Err(Error::Command {
-            cmd: format!("gh pr merge {pr_str} {strategy_flag}"),
+            cmd: format!("gh pr merge {pr} {}", strategy.gh_flag()),
             status: out.status.to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });

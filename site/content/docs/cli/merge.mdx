@@ -8,16 +8,22 @@ summary: Merge a workspace's branch into the project's default branch, locally o
 shelbi merge [OPTIONS] <ID>
 ```
 
-`shelbi merge` bridges a task in `review` and a clean default branch. By
-default it squash-merges the task's branch into the project's default branch
-(typically `main`) under a generated squash message, `shelbi: merge <id> from
-<branch>`. Pass `--pr` to push
-the branch and open a GitHub pull request instead, for teams that require a
-code-review roundtrip before anything lands.
+`shelbi merge` bridges a task in `review` and a clean default branch. It is
+PR-aware: if an open GitHub PR already exists for the task's branch (the review
+flow's `open_pr` step opens one), it lands the change through that PR with a
+GitHub CLI squash-merge, so a repo whose branch protection requires PRs still
+accepts it. Only when there is no GitHub remote or no open PR does it fall back
+to a local squash-merge into the project's default branch (typically `main`)
+under the generated message `shelbi: merge <id> from <branch>`. Pass `--pr` to
+push the branch and open a fresh GitHub pull request instead, without merging.
 
-The command does not move the card. After a successful local merge, the
+A blocked push or a failed PR merge is a hard error: the command stops and does
+not mark the task done, so an unshippable change is never silently left as an
+"accepted" card whose PR stayed open.
+
+The command does not move the card. After a successful merge, the
 orchestrator's "merged → done" sweep (or you, manually) moves the task to
-`done`. After a `--pr` merge, the card stays in `review` until the PR
+`done`. After a `--pr` open, the card stays in `review` until the PR
 itself lands.
 
 ## Arguments
@@ -30,7 +36,7 @@ itself lands.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--pr` | flag | off | Push the branch and open a GitHub PR instead of a local squash-merge. |
+| `--pr` | flag | off | Push the branch and open a fresh GitHub PR instead of merging. |
 | `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
 
 ## Examples
