@@ -126,19 +126,31 @@ kind supplies that block's `(model, reasoning_effort)` together.
 
 ### 4. Resolution / precedence
 
-The override chain, highest to lowest:
+Two related but distinct chains resolve, both highest-to-lowest. **Runner kind**
+(which kind an agent runs on):
 
 ```
-task/status override  →  project agents.<name> override  →  agent.yaml preferred_*  →  built-in default
+task/status override  →  project agents.<name>.runner  →  agent.yaml preferred_runner  →  built-in default
+```
+
+**Model / effort** (the values for the resolved kind):
+
+```
+task/status override  →  project runners.<kind>.{model,effort}  →  agent.yaml runners.<kind>.{model,effort}  →  built-in default
 ```
 
 - **task/status override** — a specific dispatch may pin a runner/model (rare;
   e.g. a one-off "run this on the big model"). Most specific, wins.
 
-- **project** **`agents.<name>`** **override** — the consuming project's say (§5). This
-  is what makes `preferred_` "preferred": the project overrides the package.
+- **project layer** — the consuming project's say (§5): `agents.<name>.runner`
+  picks the kind, and a top-level `runners.<kind>` block may set `model` /
+  `reasoning_effort`. This is what makes `preferred_` "preferred": the project
+  overrides the package. **Each field is independent** — a project `runners`
+  block that sets `model` but omits `reasoning_effort` overrides only the model;
+  effort still falls through to the agent's manifest.
 
-- **`agent.yaml`** **preferred\_\*** — the package author's recommendation.
+- **`agent.yaml`** — the package author's recommendation: `preferred_runner` for
+  the kind, and the per-kind `runners` block for model/effort.
 
 - **built-in default** — shelbi's fallback when nothing above resolves (and the
   graceful-degradation target when a preferred runner kind isn't installed on
