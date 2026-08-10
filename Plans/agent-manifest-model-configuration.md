@@ -1,6 +1,6 @@
 # Agent Manifest & Model Configuration
 
-Builds on **[[agents-workspaces]]**, which established the vocabulary: a
+Builds on **\[\[agents-workspaces]]**, which established the vocabulary: a
 *workspace* is capacity (a machine slot: one tmux pane + one worktree), an
 *agent* is a role (a system prompt + skill set), a *task* is work. A dispatch
 reads *"run task T using agent A in workspace W."* This plan gives the **agent**
@@ -12,11 +12,10 @@ up agents to eventually be distributable packages.
 Two gaps today, both stemming from the same root: an agent (role) has no
 runner-agnostic config of its own.
 
-1. **Model/runner config lives on the *workspace*, not the agent.** A
+1. **Model/runner config lives on the** ***workspace*****, not the agent.** A
    `Workspace` carries `runner: String` (`crates/shelbi-core/src/model.rs:916`),
    which names an entry in the project's `agent_runners` map
-   (`AgentRunnerSpec { command, flags, prompt_injection, dialog_signatures,
-   integration }`). There is **no `model` field** — the model is baked into
+   (`AgentRunnerSpec { command, flags, prompt_injection, dialog_signatures, integration }`). There is **no** **`model`** **field** — the model is baked into
    `flags` (e.g. `flags: ["--model", "opus"]`). At dispatch the workspace's
    runner is resolved (`crates/shelbi-orchestrator/src/workspace.rs:1452`)
    regardless of which agent-role runs there. So you **cannot** express "the
@@ -71,9 +70,11 @@ Notes on the fields:
   addresses the agent (in a status `agent:` field); `name` is how the
   *marketplace* addresses it. They may differ (installed as `review`, published
   as `acme/adversarial-reviewer`).
+
 - **`preferred_*`** naming is deliberate — every one is a recommendation the
   project can override (§4). It also reads honestly for the availability case:
   a preferred runner kind may simply not be installed on a given machine.
+
 - **`description`** feeds both docs and the sidebar/marketplace UI.
 
 ### 2. `preferred_runner` names a runner *kind*, not a project-local runner
@@ -116,9 +117,12 @@ task/status override  →  project agents.<name> override  →  agent.yaml prefe
 
 - **task/status override** — a specific dispatch may pin a runner/model (rare;
   e.g. a one-off "run this on the big model"). Most specific, wins.
-- **project `agents.<name>` override** — the consuming project's say (§5). This
+
+- **project** **`agents.<name>`** **override** — the consuming project's say (§5). This
   is what makes `preferred_` "preferred": the project overrides the package.
-- **`agent.yaml` preferred_\*** — the package author's recommendation.
+
+- **`agent.yaml`** **preferred\_\*** — the package author's recommendation.
+
 - **built-in default** — shelbi's fallback when nothing above resolves (and the
   graceful-degradation target when a preferred runner kind isn't installed on
   the chosen machine).
@@ -150,8 +154,10 @@ Unlike model (taste), permissions is a security boundary, so it resolves with
 **opposite** asymmetry from §4:
 
 - A project sets a **ceiling** (e.g. project cap = `auto-edit`).
+
 - An agent-role may request **equal or tighter** (`review` → `read-only`) and
   gets it.
+
 - An agent-role (or an installed third-party package) may **never escalate**
   past the project ceiling. A package requesting `full-access` against a
   `read-only` project cap is clamped to `read-only`, not granted.
@@ -164,12 +170,12 @@ statuses (that setting becomes the ceiling).
 
 `agent.yaml` is the runner-agnostic layer. The rest stays:
 
-| File | Role | Runner scope |
-| --- | --- | --- |
-| `agent.yaml` | identity, runner/model/effort, permissions, requires | agnostic |
-| `instructions.md` | system prompt | agnostic |
-| `skills/` | agent-scoped skills | agnostic |
-| `settings.json` | Claude Code hooks (pane-state detection) | **Claude only** |
+| File              | Role                                                 | Runner scope    |
+| ----------------- | ---------------------------------------------------- | --------------- |
+| `agent.yaml`      | identity, runner/model/effort, permissions, requires | agnostic        |
+| `instructions.md` | system prompt                                        | agnostic        |
+| `skills/`         | agent-scoped skills                                  | agnostic        |
+| `settings.json`   | Claude Code hooks (pane-state detection)             | **Claude only** |
 
 Future generalization (out of scope here, noted for direction): if non-Claude
 runners grow an equivalent hook contract, `settings.json` becomes
@@ -180,11 +186,13 @@ stable anchor that makes that possible.
 
 - **Additive, non-breaking.** `Workspace.runner` remains as the fallback (§4);
   existing projects keep working with no `agent.yaml` present.
+
 - **Dogfood before codify** (per project convention): add
   `agents/*/agent.yaml` to *this* project first and prove the resolution chain
   live, then a held task codifies the manifest schema, the runner-kind mapping,
   and the resolution order into the shipped scaffold
   (`crates/shelbi-core/src/scaffold.rs`) and domain model.
+
 - Back-compat for model-in-flags: an `agent_runners` entry that still bakes
   `--model` into `flags` keeps working; a resolved `agent.yaml` model, when
   present, takes precedence via the adapter (§3).
@@ -195,11 +203,14 @@ The manifest is the seam that makes agents installable:
 
 - **Versioning** (`version`, `requires.shelbi`) lets an install fail fast on an
   incompatible host.
+
 - **`requires.runner_kinds`** lets a project reject an agent it can't run (no
   matching runner installed) at install time rather than at dispatch.
+
 - An `shelbi agent add <package>` install flow would drop
   `instructions.md` + `skills/` + `agent.yaml` (+ optional `settings.json`) into
   `agents/<name>/`, then surface any `requires` gaps for the user to resolve.
+
 - Publishing is the inverse: an agent directory with a complete `agent.yaml` is
   a publishable unit.
 
@@ -216,10 +227,10 @@ The manifest is the seam that makes agents installable:
 3. **Where does the runner-kind → concrete-runner mapping live** when a project
    has several runners of one kind — a project-level default, or forced to be
    explicit in each `agents.<name>` override?
-4. **Naming vs. the workflow `agent:` field.** The status `agent:` names the
+4. **Naming vs. the workflow** **`agent:`** **field.** The status `agent:` names the
    install directory; the manifest `name:` is the package id. Confirm we want
    both, and that the sidebar/label shows the manifest `description`/name, not
    the raw directory.
-5. **Should `Workspace.runner` eventually be deprecated** once agents own runner
+5. **Should** **`Workspace.runner`** **eventually be deprecated** once agents own runner
    selection, or does it stay permanently as the machine-capacity fallback
    (e.g. a machine that only has Codex installed)?
