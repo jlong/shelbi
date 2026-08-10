@@ -92,18 +92,17 @@ Notes on the fields:
 
 ### 2. `preferred_runner` names a runner *kind*, not a project-local runner
 
-A distributable package **cannot** reference a project's `agent_runners` keys —
-the author has no idea you named your runner `my-claude`. So `preferred_runner`
-(and any project override of it) names a canonical **runner kind**: `claude` /
-`codex` / `generic` — the same `RunnerKind` classification that the launch-flag
-assembly, submit profile, readiness probe, resume strategy, and hook wiring
-already key off (`crates/shelbi-core/src/model.rs:1146` `RunnerKind`).
+A distributable package **cannot** reference a project's runner keys — the author
+has no idea how you configured your fleet. So `preferred_runner` (and the
+project's `runner:`) names a canonical **runner kind**: `claude` / `codex` /
+`generic` — the same `RunnerKind` classification that the launch-flag assembly,
+submit profile, readiness probe, resume strategy, and hook wiring already key off
+(`crates/shelbi-core/src/model.rs:1146` `RunnerKind`).
 
-The project maps a kind to a concrete `agent_runners` entry (which carries the
-`command`, `flags`, prompt-injection, etc.). If a project declares exactly one
-runner of a kind, the mapping is automatic; with several, the project picks
-(see §5). This keeps packages portable across projects that name their runners
-differently.
+The project's top-level `runners:` map (§5) is keyed by that same kind and
+carries the concrete launcher (`command`, `flags`, prompt-injection, etc.) — one
+entry per kind, so kind → concrete runner is a direct lookup. This keeps packages
+portable across projects that configure their fleets differently.
 
 ### 3. Model *and* effort application is per-runner-adapter
 
