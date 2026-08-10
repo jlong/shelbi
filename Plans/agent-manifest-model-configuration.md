@@ -76,9 +76,15 @@ Notes on the fields:
   *marketplace* addresses it. They may differ (installed as `review`, published
   as `acme/adversarial-reviewer`).
 
-- **`preferred_*`** naming is deliberate — every one is a recommendation the
-  project can override (§4). It also reads honestly for the availability case:
-  a preferred runner kind may simply not be installed on a given machine.
+- **`preferred_runner`** **+ per-kind** **`runners:`** **blocks.** The manifest is
+  *multi-runner-first*: it declares a `runners` map keyed by runner kind, each
+  block carrying that kind's `model` and `reasoning_effort`, and
+  `preferred_runner` names which block is the default. Every value is a
+  recommendation the project can override (§4) — a project may swap
+  `preferred_runner`, override a block, or add a block for a kind the author
+  didn't ship. This also reads honestly for the availability case: a preferred
+  runner kind may simply not be installed, in which case the project's chosen
+  kind (or another declared block) applies.
 
 - **`description`** feeds both docs and the sidebar/marketplace UI.
 
