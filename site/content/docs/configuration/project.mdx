@@ -17,7 +17,7 @@ The file's location depends on the project's
 | Mode | Where the config lives |
 | --- | --- |
 | Global (default) | One flat file: `~/.shelbi/projects/<id>.yaml` carries every field. |
-| In-repo | The same flat `~/.shelbi/projects/<id>.yaml` carries every field; the committed `<repo>/.shelbi/project.yaml` holds only `name` (and an optional `display_name`) so teammates share the label. |
+| In-repo | A two-file split: the committed `<repo>/.shelbi/project.yaml` carries the shared fields (`SHARED_PROJECT_FIELDS`); a per-machine `~/.shelbi/projects/<id>/local.yaml` carries the user-local fields (`LOCAL_PROJECT_FIELDS`). No flat `~/.shelbi/projects/<id>.yaml`. |
 
 ## The project id comes from the filename
 
@@ -30,29 +30,44 @@ and `_`, starting with a letter or digit. A file whose stem breaks that rule
 (`Shelbi.yaml`, `my project.yaml`) fails to load with an actionable error;
 the fix is to rename the file, not to edit a field.
 
-The `name:` key *inside* the file is a free-form human **label** (see
-[top-level fields](#top-level-fields)); it never sets the id.
+In the flat global file the `name:` key is a free-form human **label** (see
+[top-level fields](#top-level-fields)); it never sets the id. The committed
+in-repo `project.yaml` is the one exception, described below.
 
-In both modes every field lives in the one flat
-`~/.shelbi/projects/<id>.yaml` that `shelbi init` and `shelbi init --pick-up`
-write. In-repo mode adds a committed `<repo>/.shelbi/project.yaml`, but that
-file carries only `name` (plus an optional `display_name`) — the label
-teammates share; every other field stays in your per-machine flat file, which
-is where you edit `repo`, `machines`, `workspaces`, and the rest.
+In global mode every field lives in the one flat
+`~/.shelbi/projects/<id>.yaml` that `shelbi init --mode global` writes. In-repo
+mode uses a **two-file split** instead. `shelbi init --mode in-repo` writes
+both halves; `shelbi init --pick-up` writes just the user-local half and reads
+the already-committed shared half in place:
 
-<Callout type="note" title="The two-file local.yaml split is migration-only">
+- **Shared** fields (`SHARED_PROJECT_FIELDS`) — `name`, `display_name`,
+  `default_branch`, `default_workflow`, `orchestrator`, `agent_runners`, `zen`,
+  `heartbeat`, `git`, and the rest — live in the committed
+  `<repo>/.shelbi/project.yaml`, so every clone shares them.
+- **User-local** fields (`LOCAL_PROJECT_FIELDS`) — `repo`, `machines`,
+  `workspaces`, `editor` — live in a per-machine
+  `~/.shelbi/projects/<id>/local.yaml`.
 
-Older projects (and any project touched by a `shelbi workspace` edit) may
-carry a two-file split: **shared** fields (`name`, `default_branch`,
-`default_workflow`, `orchestrator`, `agent_runners`, `zen`, …) in the
-committed `project.yaml` and **user-local** fields (`repo`, `machines`,
-`workspaces`, `editor`) in a per-machine
-`~/.shelbi/projects/<id>/local.yaml`. Shelbi still reads that layout, but no
-fresh `init` or `--pick-up` produces it, and a hand-created `local.yaml` is
-shadowed by the flat file the loader prefers. The bucket lists that drive the
-split — `SHARED_PROJECT_FIELDS` and `LOCAL_PROJECT_FIELDS` in
-[`shelbi_core::model`](https://github.com/jlong/shelbi/blob/main/crates/shelbi-core/src/model.rs)
-— govern only the migration and edit paths, not the flat file you get today.
+There is no flat `~/.shelbi/projects/<id>.yaml` for an in-repo project. Putting
+a field on the wrong side errors at load time. The canonical bucket lists are
+`SHARED_PROJECT_FIELDS` and `LOCAL_PROJECT_FIELDS` in
+[`shelbi_core::model`](https://github.com/jlong/shelbi/blob/main/crates/shelbi-core/src/model.rs).
+
+In the committed `<repo>/.shelbi/project.yaml`, the `name:` key is the project
+**id** — a valid slug, which `shelbi init --pick-up` reads back to seed a
+teammate's local alias — and the human label rides under `display_name:` (only
+emitted when the entered name was slugified into a different id). This is the
+one file where `name:` carries the id rather than a label.
+
+<Callout type="note" title="A present local.yaml is authoritative">
+
+Once `~/.shelbi/projects/<id>/local.yaml` exists, that split *is* the project's
+config: the loader reads the committed shared half plus your local half, and a
+stale flat `~/.shelbi/projects/<id>.yaml` left over from a pre-migration global
+registration can never shadow it.
+[`shelbi project migrate-to-in-repo`](/docs/concepts/config-modes#migrating-a-project-to-in-repo-mode)
+is now just the path that converts an existing flat/global project into this
+same split — fresh `init --mode in-repo` and `--pick-up` produce it directly.
 
 </Callout>
 
