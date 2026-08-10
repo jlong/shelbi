@@ -37,14 +37,61 @@ pub fn run(project_opt: Option<String>, id: String, pr: bool) -> Result<()> {
         );
     }
 
-    // A rebase strategy implicitly checks `branch` out in the parent repo.
-    // Serialize that named checkout with workspace attaches and Zen ref
-    // advancement. This path holds no workspace lock, so it takes the Git
-    // worktree/ref lock directly.
+    // PR-aware landing. The review flow's `open_pr` opens a GitHub PR for the
+    // branch, and on a repo whose branch protection requires PRs a local
+    // `git merge --squash` + push to `target` is *refused* — leaving the PR
+    // open and `target` unchanged, yet the task marked done: the change
+    // silently never ships. So if an open PR exists, land it through GitHub
+    // itself (squash, matching the project's `merge_strategy`) — the same
+    // primitive Zen's `pr-merge` and a board-accept `shelbi action merge` use.
+    // Only a purely-local project (no GitHub remote / no PR) falls through to
+    // the local squash-merge.
+    let wt = file.agent.worktree.to_string_lossy().into_owned();
+
+    // Commit any last-minute edits onto the branch first, so whichever path we
+    // take lands the reviewer's final state (not a half-committed worktree).
+    capture_uncommitted(&host, &file.agent.worktree, &id)?;
+
+    if let Some(pr_number) =
+        shelbi_orchestrator::actions::detect_open_pr(&host, &wt, &branch).map_err(|e| anyhow!(e))?
+    {
+        // Push the (possibly amended) branch so the PR head is current, then
+        // merge the PR. A rejected push or a failed PR merge is a HARD error:
+        // we return *before* marking the task done, so a blocked landing never
+        // strands the change as an "accepted" card that never shipped.
+        shelbi_ssh::run_capture(&host, ["git", "-C", &wt, "push", "origin", &branch])
+            .map_err(|e| anyhow!(e))?;
+        let sha = shelbi_orchestrator::actions::merge_pr(&host, &wt, pr_number, strategy)
+            .map_err(|e| anyhow!(e))?;
+        // Landed: only now tear the workspace down and mark the task done.
+        cleanup(
+            &host,
+            &machine,
+            &file.agent.worktree,
+            &branch,
+            &file.agent.tmux,
+        );
+        let mut updated = file.agent.clone();
+        updated.status = Status::Done;
+        updated.updated = Utc::now();
+        shelbi_state::save_agent(&project_name, &updated, &file.body).map_err(|e| anyhow!(e))?;
+        shelbi_state::append_log(&project_name, &id, &format!("merged via PR #{pr_number}"))
+            .map_err(|e| anyhow!(e))?;
+        match sha {
+            Some(sha) => println!("✓ merged {id} via PR #{pr_number} ({strategy}) → {sha}"),
+            None => println!("✓ merged {id} via PR #{pr_number} ({strategy})"),
+        }
+        return Ok(());
+    }
+
+    // No GitHub PR (purely-local project, or `origin` isn't a GitHub remote):
+    // integrate with the local squash-merge into `target`. A rebase strategy
+    // implicitly checks `branch` out in the parent repo; serialize that named
+    // checkout with workspace attaches and Zen ref advancement. This path
+    // holds no workspace lock, so it takes the Git worktree/ref lock directly.
     let git_worktree_lock = shelbi_state::lock_git_worktrees(&project_name)
         .map_err(|e| anyhow!(e))?;
     preflight(&host, &machine, &target)?;
-    capture_uncommitted(&host, &file.agent.worktree, &id)?;
     integrate_branch(&host, &machine, &branch, &target, strategy, &id)?;
     drop(git_worktree_lock);
     cleanup(

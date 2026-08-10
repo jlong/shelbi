@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::process::Output;
 
-use shelbi_core::{Error, Host, MachineKind, Project, Result, Task};
+use shelbi_core::{Error, Host, MachineKind, MergeStrategy, Project, Result, Task};
 
 use crate::workspace::workspace_worktree;
 
@@ -213,6 +213,58 @@ fn lookup_open_pr_impl(
         });
     }
     parse_open_pr_list(&String::from_utf8_lossy(&out.stdout), branch)
+}
+
+/// Merge an open pull request through GitHub's own PR merge —
+/// `gh pr merge <pr> [--repo <sel>] --<strategy> [--match-head-commit <sha>]`
+/// — in `wt` on `host`.
+///
+/// This is the **single** place both the per-workflow `merge` action (via
+/// [`crate::actions::merge`] / `shelbi merge`) and Zen's required-PR landing
+/// path shell out to GitHub to merge a PR, so the two can never drift on the
+/// invocation. It deliberately omits `--delete-branch`: branch cleanup is the
+/// `delete_branch` action's job, sequenced *after* `merge` in the shipped
+/// workflows. Callers read the resulting merge SHA back themselves (they
+/// differ on how) and map a non-zero exit to their own error type.
+pub(crate) fn gh_pr_merge(
+    host: &Host,
+    wt: &str,
+    pr: u64,
+    strategy: MergeStrategy,
+    repo: Option<&str>,
+    match_head_commit: Option<&str>,
+) -> Result<Output> {
+    let argv = gh_pr_merge_argv(pr, strategy, repo, match_head_commit);
+    let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
+    run_in_dir(host, wt, &argv_ref)
+}
+
+/// Build the `gh pr merge` argv. Split out from [`gh_pr_merge`] so the exact
+/// invocation both merge paths share is lockable by a unit test without
+/// spawning `gh`. `--repo` (when set) precedes the strategy flag and
+/// `--match-head-commit` (when set) follows it, matching gh's own ordering.
+fn gh_pr_merge_argv(
+    pr: u64,
+    strategy: MergeStrategy,
+    repo: Option<&str>,
+    match_head_commit: Option<&str>,
+) -> Vec<String> {
+    let mut argv = vec![
+        "gh".to_string(),
+        "pr".to_string(),
+        "merge".to_string(),
+        pr.to_string(),
+    ];
+    if let Some(repo) = repo {
+        argv.push("--repo".to_string());
+        argv.push(repo.to_string());
+    }
+    argv.push(strategy.gh_flag().to_string());
+    if let Some(sha) = match_head_commit {
+        argv.push("--match-head-commit".to_string());
+        argv.push(sha.to_string());
+    }
+    argv
 }
 
 /// The immutable and routing-sensitive identity of an open pull request.
@@ -705,6 +757,40 @@ mod tests {
         let body = compose_pr_body("", "/tmp/t.md");
         assert!(body.starts_with("---\n"));
         assert!(body.contains("Auto-opened by Shelbi"));
+    }
+
+    #[test]
+    fn gh_pr_merge_argv_plain_matches_the_action_shape() {
+        // The per-workflow `merge` action / `shelbi merge`: no repo pin, no
+        // head match — just `gh pr merge <pr> --<strategy>`.
+        assert_eq!(
+            gh_pr_merge_argv(42, MergeStrategy::Squash, None, None),
+            vec!["gh", "pr", "merge", "42", "--squash"]
+        );
+        assert_eq!(
+            gh_pr_merge_argv(7, MergeStrategy::Merge, None, None),
+            vec!["gh", "pr", "merge", "7", "--merge"]
+        );
+    }
+
+    #[test]
+    fn gh_pr_merge_argv_zen_shape_pins_repo_and_head() {
+        // Zen's required-PR path: `--repo` precedes the strategy flag,
+        // `--match-head-commit` follows it — the exact ordering gh expects.
+        assert_eq!(
+            gh_pr_merge_argv(42, MergeStrategy::Squash, Some("jlong/shelbi"), Some("abc123")),
+            vec![
+                "gh",
+                "pr",
+                "merge",
+                "42",
+                "--repo",
+                "jlong/shelbi",
+                "--squash",
+                "--match-head-commit",
+                "abc123",
+            ]
+        );
     }
 
     #[test]
