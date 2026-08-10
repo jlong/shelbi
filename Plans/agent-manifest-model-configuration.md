@@ -258,23 +258,31 @@ The manifest is the seam that makes agents installable:
 - Publishing is the inverse: an agent directory with a complete `agent.yaml` is
   a publishable unit.
 
-## Open questions
+## Resolved decisions (2026-08-10)
 
-1. **Reasoning effort portability.** `preferred_reasoning_effort` is
-   Claude-thinking / Codex-effort shaped. Is a shared 3–4 level scale
-   (`low`/`medium`/`high`/`max`) mapped per-adapter enough, or does it need
-   per-runner values like model does?
-2. **Multi-runner manifests.** Should a package be able to declare *distinct*
-   preferred models per runner kind (`claude → opus`, `codex → gpt-5`) so it
-   degrades well across projects, or is single-preferred + project-override
-   sufficient for v1?
-3. **Where does the runner-kind → concrete-runner mapping live** when a project
-   has several runners of one kind — a project-level default, or forced to be
-   explicit in each `agents.<name>` override?
-4. **Naming vs. the workflow** **`agent:`** **field.** The status `agent:` names the
-   install directory; the manifest `name:` is the package id. Confirm we want
-   both, and that the sidebar/label shows the manifest `description`/name, not
-   the raw directory.
-5. **Should** **`Workspace.runner`** **eventually be deprecated** once agents own runner
-   selection, or does it stay permanently as the machine-capacity fallback
-   (e.g. a machine that only has Codex installed)?
+Worked through with the maintainer; each open question is now settled and folded
+into the design above.
+
+1. **Reasoning effort → per-runner values.** Effort lives *inside* each
+   `runners:` block alongside `model` and travels with its runner kind, rather
+   than a single shared ordinal scale. Reflected in §1 and §3.
+2. **Multi-runner manifests → per-kind blocks from v1.** The manifest is
+   multi-runner-first: a `runners:` map keyed by runner kind, each block carrying
+   `model` + `reasoning_effort`, with `preferred_runner` naming the default.
+   Reflected in §1–§3, §5.
+3. **Runner-kind → concrete-runner mapping → layered.** Automatic when a kind
+   has exactly one runner; a project-level `runner_kinds:` default when several;
+   a per-`agents.<name>` concrete-entry override to disambiguate further.
+   Reflected in §5.
+4. **Naming → keep both.** Directory name stays the project-local handle (status
+   `agent:` field) and canonical key; manifest `name:` is the global package id.
+   Display prefers the manifest `description`, and **must fall back to the
+   directory name** when no `agent.yaml` is present (manifest is optional under
+   the additive migration). Reflected in §1, §7.
+5. **`Workspace.runner` → removed outright after migration.** Retained only
+   through the migration window as the non-breaking fallback, then deleted; the
+   agent/project layers become the sole runner source. This milestone assumes a
+   **uniform fleet** (every machine has every runner kind), so availability needs
+   no per-workspace field. A machine/workspace **capability declaration** for
+   heterogeneous fleets is a filed follow-up, not this milestone. Reflected in
+   §4, §8.
