@@ -80,11 +80,13 @@ Notes on the fields:
   *multi-runner-first*: it declares a `runners` map keyed by runner kind, each
   block carrying that kind's `model` and `reasoning_effort`, and
   `preferred_runner` names which block is the default. Every value is a
-  recommendation the project can override (§4) — a project may swap
-  `preferred_runner`, override a block, or add a block for a kind the author
-  didn't ship. This also reads honestly for the availability case: a preferred
-  runner kind may simply not be installed, in which case the project's chosen
-  kind (or another declared block) applies.
+  recommendation the project can override (§4) — a project may pin the runner
+  kind (via `runner:` in its override, §5), override a block, or add a block for
+  a kind the author didn't ship. The `preferred_` prefix is deliberate and lives
+  **only on the agent side**: the agent *recommends* (`preferred_runner`), the
+  project *decides* (`runner`). This also reads honestly for the availability
+  case: a preferred runner kind may simply not be installed, in which case the
+  project's chosen kind (or another declared block) applies.
 
 - **`description`** feeds both docs and the sidebar/marketplace UI.
 
@@ -279,7 +281,7 @@ into the design above.
    Display prefers the manifest `description`, and **must fall back to the
    directory name** when no `agent.yaml` is present (manifest is optional under
    the additive migration). Reflected in §1, §7.
-5. **`Workspace.runner` → removed outright after migration.** Retained only
+5. **`Workspace.runner`** **→ removed outright after migration.** Retained only
    through the migration window as the non-breaking fallback, then deleted; the
    agent/project layers become the sole runner source. This milestone assumes a
    **uniform fleet** (every machine has every runner kind), so availability needs
