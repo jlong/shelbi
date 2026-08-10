@@ -159,7 +159,7 @@ runner_kinds:               # project-level kind -> concrete agent_runners entry
   claude: my-claude         # only needed when a kind maps to MORE THAN ONE entry
 agents:
   orchestrator:
-    preferred_runner: codex     # swap the default runner kind...
+    runner: codex               # pin the runner kind (project decides; no preferred_ prefix)...
     runners:
       codex:
         model: gpt-5            # ...and set that kind's model/effort
@@ -169,9 +169,12 @@ agents:
         model: claude-opus-4-8  # keep the kind, bump just the model
 ```
 
-Only the keys a project wants to change appear; everything else falls through to
-the manifest (block-level merge — a `review.runners.claude.model` override leaves
-the manifest's `reasoning_effort` intact).
+The project side uses **`runner`**, not `preferred_runner`: the `preferred_`
+prefix lives only in the agent manifest (a recommendation), while the project's
+`runner` is authoritative (§1). Only the keys a project wants to change appear;
+everything else falls through to the manifest (block-level merge — a
+`review.runners.claude.model` override leaves the manifest's `reasoning_effort`
+intact).
 
 **Runner-kind → concrete-runner mapping (resolved decision Q3).** A kind resolves
 to a concrete `agent_runners` entry by a layered rule, specific-overrides-general
