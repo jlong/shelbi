@@ -304,10 +304,18 @@ into the design above.
      `preferred_runner` (a recommendation); the project override uses plain
      `runner` (authoritative — no `preferred_` prefix). The agent recommends, the
      project decides. Reflected in §1, §5.
-3. **Runner-kind → concrete-runner mapping → layered.** Automatic when a kind
-   has exactly one runner; a project-level `runner_kinds:` default when several;
-   a per-`agents.<name>` concrete-entry override to disambiguate further.
-   Reflected in §5.
+3. **Runner-kind → concrete-runner mapping → direct (revised).** The project's
+   runner fleet is a **top-level `runners:` map keyed by kind** (not nested under
+   each agent), one entry per kind, so kind → concrete runner is a direct lookup.
+   This supersedes the earlier layered `runner_kinds:` answer; multiple runners of
+   one kind is a future follow-up, not v1. Reflected in §2, §5.
+
+   - **Project-level model/effort is optional and field-level.** A top-level
+     `runners.<kind>` block may set `model` / `reasoning_effort`; when set it's
+     authoritative for every agent of that kind, and any field it omits falls
+     through to the agent's manifest preference (then built-in default). There is
+     **no per-agent project override** — per-agent differentiation comes from the
+     manifests (leave the project field unset). Reflected in §4, §5.
 4. **Naming → keep both.** Directory name stays the project-local handle (status
    `agent:` field) and canonical key; manifest `name:` is the global package id.
    Display prefers the manifest `description`, and **must fall back to the
