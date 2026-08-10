@@ -21,11 +21,19 @@ use heuristic::{probe_team_signals, recommend_mode};
 /// read by `--pick-up` to register a teammate's already-committed
 /// project into the local registry.
 ///
-/// The current committed shape is intentionally minimal (`name: <name>`)
-/// — that's the one field pick-up needs and the one field that has to
-/// stay stable while the shared/local split evolves. Future phases can
-/// grow the committed keys without breaking pick-up because the loader
-/// is name-anchored.
+/// The committed file is the **shared half** of the two-file split
+/// ([`shelbi_core::SHARED_PROJECT_FIELDS`]): the canonical `name:`,
+/// `config_mode: in-repo`, `default_branch`, `orchestrator`,
+/// `agent_runners`, and the rest of the shared surface. `--pick-up`
+/// stays name-anchored — it reads `name:` back as the canonical id — so
+/// the `name:` key must always carry a valid id slug regardless of what
+/// else the shared half grows. The user-local half (`repo`, `machines`,
+/// `workspaces`) lives per-machine in `~/.shelbi/projects/<id>/local.yaml`
+/// and is never committed.
+///
+/// A legacy committed file that predates the split (just `name:`) is
+/// still honored: `--pick-up` detects the incomplete shared half and
+/// falls back to a flat local registration so the project still loads.
 pub const IN_REPO_CONFIG_REL: &str = ".shelbi/project.yaml";
 
 /// Where the project config should live. Chosen once at `shelbi init`
@@ -135,8 +143,8 @@ pub fn run(args: Args, assume_yes: bool) -> Result<()> {
         println!();
         println!("next:");
         println!(
-            "  1. add machines/workspaces to ~/.shelbi/projects/{}.yaml if needed",
-            outcome.local_alias
+            "  1. add machines/workspaces to {} if needed",
+            outcome.registration_path.display()
         );
         if outcome.suffixed_from.is_some() {
             println!(
@@ -226,12 +234,15 @@ fn noninteractive_project_root(requested: Option<&Path>) -> Result<PathBuf> {
 ///
 /// Resolves the project root (prompting interactively, or honoring
 /// `--root` when supplied), asks the mode question (or reads it from
-/// `--mode`), then writes the project YAML, workspace-settings template,
+/// `--mode`), then writes the project config, workspace-settings template,
 /// default agent workspaces, and the project-wide statuses catalogue.
-/// When mode is `InRepo`, also drops a committed `<repo>/.shelbi/project.yaml`
-/// carrying the canonical name. No `.shelbi/project` marker is written
-/// — resolution reverse-looks-up the directory against the registered
-/// project YAMLs (see [`shelbi_state::resolve_project_for_cwd`]).
+/// Global mode writes the flat `~/.shelbi/projects/<name>.yaml`; in-repo
+/// mode writes the two-file split — the committed shared half at
+/// `<repo>/.shelbi/project.yaml` plus the user-local half at
+/// `~/.shelbi/projects/<name>/local.yaml`, and no flat registry YAML. No
+/// `.shelbi/project` marker is written — resolution reverse-looks-up the
+/// directory against the registered projects (see
+/// [`shelbi_state::resolve_project_for_cwd`]).
 pub fn scaffold_with_prompt(args: Args) -> Result<ResolvedProjectRoot> {
     // Hard-fail with a clear, source-tagged error if the shelbi root is
     // unwritable; otherwise materialize the standard layout
@@ -502,16 +513,69 @@ fn render_project_yaml(
     Ok(shelbi_core::scaffold::decorate_project_yaml(&active))
 }
 
+/// Render the two halves of an in-repo project's config: the committed shared
+/// half (`<repo>/.shelbi/project.yaml`) and the user-local half
+/// (`~/.shelbi/projects/<id>/local.yaml`). Returns `(shared_body, local_body)`.
+///
+/// Both halves are produced from the same starter surface
+/// [`render_project_yaml`] emits — re-parsed into a [`shelbi_core::Project`]
+/// and re-serialized through the SHARED/LOCAL field partition the migration
+/// path uses ([`shelbi_core::Project::to_shared_yaml_string`] /
+/// [`to_local_yaml_string`](shelbi_core::Project::to_local_yaml_string)) — so
+/// `init` and `migrate-to-in-repo` emit byte-compatible splits from one writer.
+///
+/// The committed `name:` is deliberately the project **id** (a valid slug),
+/// not the free-form display label: `shelbi init --pick-up` reads it back as
+/// the canonical name to seed a teammate's local alias, so it must clear the
+/// same charset gate as any other id. The human label, when the entered name
+/// was slugified, rides along in the shared half under `display_name:` —
+/// exactly as the pre-split committed file emitted it.
+fn render_split_project_yaml(
+    name: &str,
+    display_name: Option<&str>,
+    repo: &str,
+    work_dir: &Path,
+) -> Result<(String, String)> {
+    let flat = render_project_yaml(name, None, repo, work_dir, Some("in-repo"))?;
+    let mut project = shelbi_core::Project::from_yaml_str(&flat).map_err(|e| anyhow!(e))?;
+    // The id lives in the filename/registry dir, never a YAML key, but the
+    // committed file's `name:` is pick-up's anchor — force it to the id.
+    project.name = name.to_string();
+    project.label = Some(name.to_string());
+    project.display_name = display_name.map(str::to_string);
+    project.config_mode = Some(shelbi_core::ConfigMode::InRepo);
+    let shared = project.to_shared_yaml_string().map_err(|e| anyhow!(e))?;
+    let local = project.to_local_yaml_string().map_err(|e| anyhow!(e))?;
+    Ok((shared, local))
+}
+
 /// Publish a new local registry entry while atomically arming its first-launch
 /// greeting with respect to dashboard bootstrap.
-fn write_new_project_registration(project: &str, yaml_path: &Path, yaml: &str) -> Result<bool> {
+///
+/// `registration_path` is the file that makes the project discoverable: the
+/// flat `~/.shelbi/projects/<name>.yaml` for a global project, or the split
+/// `~/.shelbi/projects/<name>/local.yaml` for an in-repo one. Either way the
+/// under-lock existence check considers *both* shapes, so a project already
+/// registered in one layout is never double-registered in the other.
+fn write_new_project_registration(
+    project: &str,
+    registration_path: &Path,
+    body: &str,
+) -> Result<bool> {
     use std::io::Write;
+
+    // The split registration lives one directory deeper
+    // (`projects/<name>/local.yaml`); its parent may not exist yet on a fresh
+    // in-repo init. Materialize it before staging the temp sibling.
+    if let Some(parent) = registration_path.parent() {
+        shelbi_state::ensure_dir(parent).map_err(|e| anyhow!(e))?;
+    }
 
     // Build the complete registration under a sibling temp name first. A
     // process crash at any point before the final hard link therefore leaves
     // no discoverable partial or fully written-but-unarmed project.
-    let (temp_path, mut temp_file) = crate::wizard::create_sibling_temp(yaml_path)?;
-    if let Err(error) = temp_file.write_all(yaml.as_bytes()) {
+    let (temp_path, mut temp_file) = crate::wizard::create_sibling_temp(registration_path)?;
+    if let Err(error) = temp_file.write_all(body.as_bytes()) {
         drop(temp_file);
         let _ = std::fs::remove_file(&temp_path);
         return Err(error).with_context(|| format!("writing {}", temp_path.display()));
@@ -524,17 +588,15 @@ fn write_new_project_registration(project: &str, yaml_path: &Path, yaml: &str) -
     // If the process dies between those two steps, retry sees no registration
     // and completes the pending publication safely.
     let _dashboard_lock = shelbi_state::lock_dashboard(project).map_err(|e| anyhow!(e))?;
-    let split_registration = yaml_path
-        .parent()
-        .expect("project registration has a parent")
-        .join(project)
-        .join("local.yaml");
-    if yaml_path.exists() || split_registration.exists() {
+    let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
+    let flat_registration = projects_dir.join(format!("{project}.yaml"));
+    let split_registration = projects_dir.join(project).join("local.yaml");
+    if flat_registration.exists() || split_registration.exists() {
         let _ = std::fs::remove_file(&temp_path);
         return Ok(false);
     }
     shelbi_state::arm_contextual_greeting(project).map_err(|e| anyhow!(e))?;
-    let publish = std::fs::hard_link(&temp_path, yaml_path);
+    let publish = std::fs::hard_link(&temp_path, registration_path);
     let _ = std::fs::remove_file(&temp_path);
     match publish {
         Ok(()) => Ok(true),
@@ -545,8 +607,13 @@ fn write_new_project_registration(project: &str, yaml_path: &Path, yaml: &str) -
             shelbi_state::claim_contextual_greeting(project).map_err(|e| anyhow!(e))?;
             Ok(false)
         }
-        Err(error) => Err(error)
-            .with_context(|| format!("publishing {} as {}", temp_path.display(), yaml_path.display())),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "publishing {} as {}",
+                temp_path.display(),
+                registration_path.display()
+            )
+        }),
     }
 }
 
@@ -576,6 +643,20 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
         }
     }
 
+    // In-repo projects are born as a two-file split; render both halves up
+    // front so the fresh-registration branch (local.yaml) and the committed
+    // shared write below draw from the same source.
+    let in_repo_split = if mode == InitMode::InRepo {
+        Some(render_split_project_yaml(
+            &resolved.name,
+            resolved.display_name.as_deref(),
+            &resolved.path.to_string_lossy(),
+            &resolved.path,
+        )?)
+    } else {
+        None
+    };
+
     if registration_exists {
         let existing_path = if yaml_path.is_file() {
             yaml_path.clone()
@@ -587,31 +668,49 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
             existing_path.display()
         );
     } else {
-        // Global mode leaves `repo` empty; in-repo mode records the project
-        // root and routes shared config into `<repo>/.shelbi`.
-        let (repo_field, config_mode): (String, Option<&str>) = match mode {
-            InitMode::InRepo => (
-                resolved.path.to_string_lossy().into_owned(),
-                Some("in-repo"),
-            ),
-            InitMode::Global => (String::new(), None),
-        };
-        let yaml = render_project_yaml(
-            &resolved.name,
-            resolved.display_name.as_deref(),
-            &repo_field,
-            &resolved.path,
-            config_mode,
-        )?;
-        if write_new_project_registration(&resolved.name, &yaml_path, &yaml)? {
-            println!("✓ wrote project: {}", yaml_path.display());
-        } else {
-            println!("(project YAML already exists at {})", yaml_path.display());
+        match mode {
+            InitMode::InRepo => {
+                // No flat `<name>.yaml` — the registration IS the user-local
+                // half at `~/.shelbi/projects/<name>/local.yaml`. The loader
+                // treats a present `local.yaml` as authoritative in-repo state
+                // (see `shelbi_state::load_project`), so the split is what
+                // subsequent opens read.
+                let (_shared, local) =
+                    in_repo_split.as_ref().expect("in-repo split rendered above");
+                let local_path = projects_dir.join(&resolved.name).join("local.yaml");
+                if write_new_project_registration(&resolved.name, &local_path, local)? {
+                    println!("✓ registered project (in-repo): {}", local_path.display());
+                } else {
+                    println!(
+                        "(project registration already exists at {})",
+                        local_path.display()
+                    );
+                }
+            }
+            InitMode::Global => {
+                // Global mode leaves `repo` empty and keeps the flat layout.
+                let yaml = render_project_yaml(
+                    &resolved.name,
+                    resolved.display_name.as_deref(),
+                    "",
+                    &resolved.path,
+                    None,
+                )?;
+                if write_new_project_registration(&resolved.name, &yaml_path, &yaml)? {
+                    println!("✓ wrote project: {}", yaml_path.display());
+                } else {
+                    println!("(project YAML already exists at {})", yaml_path.display());
+                }
+            }
         }
     }
 
-    if mode == InitMode::InRepo {
-        write_in_repo_config(&resolved.path, &resolved.name, resolved.display_name.as_deref())?;
+    // In-repo mode: write the committed shared half. Idempotent — a
+    // pre-existing committed file (a teammate's, or a prior run's) is left
+    // untouched — so a re-run that finds the local.yaml already published but
+    // the repo file missing still heals the split.
+    if let Some((shared, _local)) = in_repo_split.as_ref() {
+        write_in_repo_shared(&resolved.path, shared)?;
     }
 
     write_workspace_settings_template(&resolved.name)?;
@@ -667,15 +766,16 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
     Ok(())
 }
 
-/// Write `<repo>/.shelbi/project.yaml` carrying the canonical project
-/// name. Idempotent — a pre-existing file is left alone (a previous
-/// run, or a teammate committed it).
+/// Write the committed shared half to `<repo>/.shelbi/project.yaml`.
+/// Idempotent — a pre-existing file is left alone (a previous run, or a
+/// teammate committed it): the committed config is a git-tracked contract
+/// with every future clone, so init never clobbers one it finds.
 ///
-/// The shape stays minimal on purpose: the *committed* config is a
-/// contract with every future clone of the repo, so the shared surface
-/// is the one field that has to be stable while the rest of the config
-/// schema evolves.
-fn write_in_repo_config(root: &Path, name: &str, display_name: Option<&str>) -> Result<()> {
+/// The body is the shared half of the split ([`render_split_project_yaml`]):
+/// the canonical `name:` (the pick-up anchor) plus every shared field
+/// ([`shelbi_core::SHARED_PROJECT_FIELDS`]) — `config_mode: in-repo`,
+/// `default_branch`, `orchestrator`, `agent_runners`, and so on.
+fn write_in_repo_shared(root: &Path, shared_body: &str) -> Result<()> {
     let dir = root.join(".shelbi");
     let path = dir.join("project.yaml");
     if path.exists() {
@@ -683,25 +783,9 @@ fn write_in_repo_config(root: &Path, name: &str, display_name: Option<&str>) -> 
         return Ok(());
     }
     shelbi_state::ensure_dir(&dir).map_err(|e| anyhow!(e))?;
-    // `display_name` is a shared field, so it belongs in the committed half
-    // alongside the canonical `name`. Rendered through serde so a label with
-    // YAML-significant characters (spaces, colons) is quoted correctly rather
-    // than string-interpolated.
-    let doc = InRepoConfigYaml { name, display_name };
-    let body = serde_yaml::to_string(&doc).context("serializing in-repo config")?;
-    std::fs::write(&path, body)?;
+    std::fs::write(&path, shared_body)?;
     println!("✓ wrote in-repo config: {}", path.display());
     Ok(())
-}
-
-/// The committed `<repo>/.shelbi/project.yaml` shape: the canonical slug plus
-/// the optional human-readable label. Kept minimal on purpose — the committed
-/// config is a contract with every future clone.
-#[derive(serde::Serialize)]
-struct InRepoConfigYaml<'a> {
-    name: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    display_name: Option<&'a str>,
 }
 
 /// Best-effort read of the canonical `name:` from a committed
@@ -818,33 +902,65 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
         );
     }
 
-    // Write the local registry entry. Repo/work_dir default to the
-    // repo root; the user can add remote machines and workspaces after
-    // the fact. Same body shape as fresh init so the loader treats
-    // both alike.
-    let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
-    let yaml_path = projects_dir.join(format!("{}.yaml", local_alias));
     // Pick-up is inherently an in-repo project: the repo already carries a
-    // committed `<repo>/.shelbi/project.yaml`, so record `config_mode:
-    // in-repo` (with `repo` pointing at the checkout) and the teammate's
-    // agents/workflows/statuses resolve to — and materialize under — the
-    // repo's committed `.shelbi/`, not a divergent global copy.
-    let yaml = render_project_yaml(
+    // committed `<repo>/.shelbi/project.yaml`, which we NEVER rewrite. So we
+    // register only the user-local half at
+    // `~/.shelbi/projects/<alias>/local.yaml` (repo/work_dir default to the
+    // checkout; the user can add remote machines and workspaces later) and read
+    // the committed shared half in place. The teammate's agents/workflows/
+    // statuses then resolve to — and materialize under — the repo's committed
+    // `.shelbi/`, not a divergent global copy.
+    //
+    // That split only loads when the committed file is a COMPLETE shared half.
+    // A repo whose committed config predates the shared/local split is a
+    // name-only stub (see the `IN_REPO_CONFIG_REL` doc comment), and a split
+    // registration against it wouldn't merge into a valid project. For that
+    // legacy shape we fall back to the historical flat registration so pick-up
+    // still yields a loadable project.
+    let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
+    // The committed `<repo>/.shelbi/project.yaml` already carries any
+    // `display_name`; the local mirror keys everything on the alias slug.
+    let (_shared, local_body) = render_split_project_yaml(
         &local_alias,
-        // The committed `<repo>/.shelbi/project.yaml` already carries any
-        // `display_name`; the local mirror keys everything on the alias slug.
         None,
         &repo_root.to_string_lossy(),
         &repo_root,
-        Some("in-repo"),
     )?;
-    if !write_new_project_registration(&local_alias, &yaml_path, &yaml)? {
-        bail!(
-            "a shelbi project named `{local_alias}` was registered concurrently; retry \
-             `shelbi init --pick-up` to choose the next available local alias"
-        );
-    }
-    println!("✓ registered project: {}", yaml_path.display());
+    let committed_text = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    let committed_is_complete_shared =
+        shelbi_core::Project::from_split_yaml_str(&committed_text, &local_body).is_ok();
+
+    let registration_path = if committed_is_complete_shared {
+        let local_path = projects_dir.join(&local_alias).join("local.yaml");
+        if !write_new_project_registration(&local_alias, &local_path, &local_body)? {
+            bail!(
+                "a shelbi project named `{local_alias}` was registered concurrently; retry \
+                 `shelbi init --pick-up` to choose the next available local alias"
+            );
+        }
+        println!("✓ registered project (in-repo): {}", local_path.display());
+        local_path
+    } else {
+        // Legacy name-only committed config: keep the full picture locally in a
+        // flat registration so the project opens without a complete shared half.
+        let yaml_path = projects_dir.join(format!("{}.yaml", local_alias));
+        let yaml = render_project_yaml(
+            &local_alias,
+            None,
+            &repo_root.to_string_lossy(),
+            &repo_root,
+            Some("in-repo"),
+        )?;
+        if !write_new_project_registration(&local_alias, &yaml_path, &yaml)? {
+            bail!(
+                "a shelbi project named `{local_alias}` was registered concurrently; retry \
+                 `shelbi init --pick-up` to choose the next available local alias"
+            );
+        }
+        println!("✓ registered project: {}", yaml_path.display());
+        yaml_path
+    };
 
     write_workspace_settings_template(&local_alias)?;
     let outcomes = shelbi_state::self_heal_default_agents(&local_alias).map_err(|e| anyhow!(e))?;
@@ -895,6 +1011,7 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
         canonical_name,
         local_alias,
         suffixed_from,
+        registration_path,
     })
 }
 
@@ -907,6 +1024,12 @@ struct PickUpOutcome {
     /// `Some(canonical_name)` when the local alias diverged from the
     /// canonical due to a collision, `None` when they match.
     suffixed_from: Option<String>,
+    /// The local registration file that was written — the split
+    /// `~/.shelbi/projects/<alias>/local.yaml` for a normal in-repo pick-up,
+    /// or the flat `~/.shelbi/projects/<alias>.yaml` for the legacy fallback.
+    /// Threaded out so the `next:` hint points at the file the user actually
+    /// edits to add machines/workspaces.
+    registration_path: PathBuf,
 }
 
 /// Resolve the repo root for `--pick-up`: `--root` wins, otherwise walk
@@ -1449,23 +1572,61 @@ mod tests {
         };
         scaffold_project(&resolved, InitMode::InRepo).unwrap();
 
-        // Global side still exists (same registry mechanism).
-        assert!(home.join("projects/team-app.yaml").is_file());
-        // The registry YAML records the mode + repo so the loader routes
-        // config paths into the repo on every subsequent open.
-        let registry = std::fs::read_to_string(home.join("projects/team-app.yaml")).unwrap();
-        assert!(registry.contains("config_mode: in-repo"), "got: {registry}");
+        // In-repo projects are born split: NO flat `<name>.yaml`. The
+        // registration is the user-local half under the registry dir.
         assert!(
-            registry.contains(&format!("repo: {}", project_root.display())),
-            "in-repo registry must record the repo path, got: {registry}"
+            !home.join("projects/team-app.yaml").is_file(),
+            "in-repo mode must NOT write a flat registry YAML"
+        );
+        let local = home.join("projects/team-app/local.yaml");
+        assert!(local.is_file(), "expected user-local half at {}", local.display());
+        let local_body = std::fs::read_to_string(&local).unwrap();
+        // The user-local half carries repo/machines; shared fields (name,
+        // config_mode, orchestrator, …) must NOT leak into it.
+        assert!(
+            local_body.contains(&format!("repo: {}", project_root.display())),
+            "local.yaml must record the repo path, got: {local_body}"
+        );
+        assert!(
+            !local_body.contains("config_mode"),
+            "config_mode is a shared field — it must not appear in local.yaml: {local_body}"
+        );
+        assert!(
+            !local_body.contains("orchestrator"),
+            "orchestrator is a shared field — it must not appear in local.yaml: {local_body}"
         );
 
-        // In-repo side is what pick-up will detect on a teammate's
-        // clone. Shape is intentionally minimal — just the canonical name.
+        // The committed shared half is what pick-up detects on a teammate's
+        // clone. It now carries the full shared surface, anchored on the id.
         let committed = project_root.join(IN_REPO_CONFIG_REL);
         assert!(committed.is_file());
         let body = std::fs::read_to_string(&committed).unwrap();
-        assert_eq!(body.trim(), "name: team-app");
+        assert!(
+            body.lines().any(|l| l == "name: team-app"),
+            "committed config must anchor the canonical id under `name:`, got: {body}"
+        );
+        assert!(
+            body.contains("config_mode: in-repo"),
+            "committed config must record the mode, got: {body}"
+        );
+        assert!(
+            body.contains("orchestrator:") && body.contains("agent_runners:"),
+            "committed config must carry the shared fields, got: {body}"
+        );
+        assert!(
+            !body.contains("\nrepo:") && !body.starts_with("repo:"),
+            "repo is a user-local field — it must not appear in the committed half: {body}"
+        );
+        // pick-up's name anchor still resolves off the committed file.
+        assert_eq!(
+            read_in_repo_name(&committed).unwrap().as_deref(),
+            Some("team-app")
+        );
+        // The split round-trips back through the loader into an in-repo project.
+        let loaded = shelbi_state::load_project("team-app").unwrap();
+        assert_eq!(loaded.config_mode, Some(shelbi_core::ConfigMode::InRepo));
+        assert_eq!(loaded.repo, project_root.to_string_lossy());
+        assert_eq!(loaded.workspaces.len(), 2);
         let tasks = shelbi_state::list_tasks("team-app").unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].task.title, shelbi_state::WELCOME_TASK_TITLE);
@@ -1585,6 +1746,104 @@ mod tests {
         assert!(shelbi_state::claim_contextual_greeting("shared-2").unwrap());
         assert!(!shelbi_state::claim_contextual_greeting("shared-2").unwrap());
         assert!(!shelbi_state::claim_contextual_greeting("shared").unwrap());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A teammate's repo whose committed `<repo>/.shelbi/project.yaml` is a
+    /// COMPLETE shared half (the new fresh-init shape) is picked up as the
+    /// two-file split: only the user-local half is written, and no flat
+    /// `<alias>.yaml` is created. The committed file is never touched.
+    #[test]
+    fn pick_up_writes_split_for_complete_committed_config() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_dir("pickup-split-home");
+        let repo_root = fresh_dir("pickup-split-repo");
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::ensure_root_subdirs().unwrap();
+
+        // Commit a complete shared half exactly as fresh in-repo init would.
+        let (shared, _local) =
+            render_split_project_yaml("teamproj", None, &repo_root.to_string_lossy(), &repo_root)
+                .unwrap();
+        std::fs::create_dir_all(repo_root.join(".shelbi")).unwrap();
+        std::fs::write(repo_root.join(IN_REPO_CONFIG_REL), &shared).unwrap();
+        let committed_before = std::fs::read_to_string(repo_root.join(IN_REPO_CONFIG_REL)).unwrap();
+
+        let outcome = run_pick_up(Args {
+            project: None,
+            root: Some(repo_root.clone()),
+            runner: None,
+            default_branch: None,
+            github_url: None,
+            orchestrator_runner: None,
+            mode: None,
+            pick_up: true,
+        })
+        .unwrap();
+        assert_eq!(outcome.local_alias, "teamproj");
+
+        // Split registration: local.yaml present, no flat file.
+        assert!(
+            home.join("projects/teamproj/local.yaml").is_file(),
+            "pick-up must write the user-local half"
+        );
+        assert!(
+            !home.join("projects/teamproj.yaml").exists(),
+            "pick-up of a complete committed config must NOT write a flat registry YAML"
+        );
+        assert_eq!(
+            outcome.registration_path,
+            home.join("projects/teamproj/local.yaml")
+        );
+        // The committed file is a read-only contract — pick-up never rewrites it.
+        assert_eq!(
+            std::fs::read_to_string(repo_root.join(IN_REPO_CONFIG_REL)).unwrap(),
+            committed_before
+        );
+        // It loads back as an in-repo project through the split.
+        let loaded = shelbi_state::load_project("teamproj").unwrap();
+        assert_eq!(loaded.config_mode, Some(shelbi_core::ConfigMode::InRepo));
+        assert_eq!(loaded.repo, repo_root.to_string_lossy());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Reverse of the above: a repo whose committed config is the legacy
+    /// name-only stub can't form a loadable split, so pick-up falls back to the
+    /// historical flat registration rather than writing an unloadable
+    /// `local.yaml`.
+    #[test]
+    fn pick_up_falls_back_to_flat_for_legacy_committed_stub() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_dir("pickup-legacy-home");
+        let repo_root = fresh_dir("pickup-legacy-repo");
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::ensure_root_subdirs().unwrap();
+
+        std::fs::create_dir_all(repo_root.join(".shelbi")).unwrap();
+        std::fs::write(repo_root.join(IN_REPO_CONFIG_REL), "name: legacy\n").unwrap();
+
+        let outcome = run_pick_up(Args {
+            project: None,
+            root: Some(repo_root.clone()),
+            runner: None,
+            default_branch: None,
+            github_url: None,
+            orchestrator_runner: None,
+            mode: None,
+            pick_up: true,
+        })
+        .unwrap();
+        assert_eq!(outcome.local_alias, "legacy");
+        assert!(
+            home.join("projects/legacy.yaml").is_file(),
+            "legacy stub pick-up must fall back to a flat registration"
+        );
+        assert!(!home.join("projects/legacy/local.yaml").exists());
+        // The flat fallback is itself loadable.
+        let loaded = shelbi_state::load_project("legacy").unwrap();
+        assert_eq!(loaded.config_mode, Some(shelbi_core::ConfigMode::InRepo));
 
         std::env::remove_var("SHELBI_HOME");
     }
