@@ -163,37 +163,50 @@ applies. The end state assumes a **uniform fleet** — every machine has every
 runner kind installed — so once agents own selection, runner availability needs
 no per-workspace field (§8).
 
-### 5. Project-side overrides: `agents.<name>` in `project.yaml`
+### 5. Project config: a top-level `runners:` fleet + `agents.<name>.runner`
+
+The project's runner config is **not** nested under each agent. It's a single
+top-level `runners:` map, keyed by runner **kind**, that defines the fleet (the
+concrete launcher — the evolution of today's `agent_runners`) and *optionally*
+sets a `model` / `reasoning_effort` for that kind. Each agent then names the kind
+it runs on with a plain `runner:`.
 
 ```yaml
 # project.yaml
-runner_kinds:               # project-level kind -> concrete agent_runners entry
-  claude: my-claude         # only needed when a kind maps to MORE THAN ONE entry
+runners:                    # top-level: the project's runner fleet, keyed by kind
+  claude:
+    command: claude         # concrete launcher (flags, integration, … as agent_runners today)
+    # model / reasoning_effort omitted → each agent's manifest preference applies
+  codex:
+    command: codex
+    model: gpt-5            # set here → authoritative for EVERY codex agent
 agents:
   orchestrator:
-    runner: codex               # pin the runner kind (project decides; no preferred_ prefix)...
-    runners:
-      codex:
-        model: gpt-5            # ...and set that kind's model/effort
+    runner: codex           # which kind this agent runs on (project decides; no preferred_ prefix)
   review:
-    runners:
-      claude:
-        model: claude-opus-4-8  # keep the kind, bump just the model
+    runner: claude          # claude kind; model comes from review's manifest (e.g. opus)
 ```
 
-The project side uses **`runner`**, not `preferred_runner`: the `preferred_`
-prefix lives only in the agent manifest (a recommendation), while the project's
-`runner` is authoritative (§1). Only the keys a project wants to change appear;
-everything else falls through to the manifest (block-level merge — a
-`review.runners.claude.model` override leaves the manifest's `reasoning_effort`
-intact).
+Two rules make this work:
 
-**Runner-kind → concrete-runner mapping (resolved decision Q3).** A kind resolves
-to a concrete `agent_runners` entry by a layered rule, specific-overrides-general
-like §4: (1) if exactly one runner of a kind exists, the mapping is automatic;
-(2) with several, a project-level `runner_kinds:` default per kind resolves it;
-(3) an individual `agents.<name>` override may still name the concrete entry to
-disambiguate further. Most projects only ever hit (1).
+- **Optional, field-level model/effort.** A top-level `runners.<kind>` block that
+  sets `model` and/or `reasoning_effort` is **authoritative for every agent of
+  that kind**; a field it omits falls through to that agent's manifest preference,
+  then the built-in default (§4). So to keep per-agent differentiation (`review`
+  on Opus, `developer` on Sonnet, both Claude), leave `runners.claude.model`
+  unset and let each manifest decide; to impose a house model on a kind, set it
+  once at the top level.
+
+- **`runner`, not `preferred_runner`.** The `preferred_` prefix lives only in the
+  agent manifest (a recommendation); the project's `runner:` and top-level
+  `runners:` values are authoritative (§1).
+
+**Runner-kind → concrete-runner mapping (revised, supersedes the earlier Q3
+answer).** Because the top-level `runners:` map is keyed by kind, there is exactly
+**one concrete runner per kind**, so the mapping is direct — no separate
+`runner_kinds:` indirection and no multiple-runners-of-one-kind disambiguation.
+(If a project ever genuinely needs two configs of the same kind, that's a
+follow-up, not v1.)
 
 ### 6. `permissions_mode`: a ceiling, not a free override
 
