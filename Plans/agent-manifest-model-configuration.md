@@ -214,8 +214,22 @@ stable anchor that makes that possible.
 
 ### 8. Migration
 
-- **Additive, non-breaking.** `Workspace.runner` remains as the fallback (§4);
-  existing projects keep working with no `agent.yaml` present.
+- **Additive first, then a removal (resolved decision Q5).** Phase 1 is
+  additive: `agent.yaml` resolves above `Workspace.runner`, and existing projects
+  keep working with no manifest present. Phase 2, once dogfooding proves the
+  resolution chain, **removes** **`Workspace.runner`** **outright** — the agent/project
+  layers become the sole runner source.
+
+- **Uniform-fleet assumption (resolved decision Q5a).** Removing
+  `Workspace.runner` deletes the only field that recorded which runner kinds are
+  installed on a machine. For this milestone we assume a **uniform fleet** (every
+  machine has every runner kind), so dispatch resolves purely from agent/project
+  and never checks availability — trivially true for today's all-Claude hub
+  slots. **Follow-up (filed, not this milestone):** if heterogeneous machines
+  appear, reintroduce availability as an explicit machine/workspace **capability
+  declaration** (`runner_kinds: [claude, codex]`), keyed off the per-kind
+  `CapabilityLadder` that already exists — the same moment the per-kind manifest
+  blocks (§2) start earning their keep on foreign fleets.
 
 - **Dogfood before codify** (per project convention): add
   `agents/*/agent.yaml` to *this* project first and prove the resolution chain
