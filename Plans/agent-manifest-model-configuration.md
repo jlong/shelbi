@@ -153,17 +153,30 @@ no per-workspace field (§8).
 
 ```yaml
 # project.yaml
+runner_kinds:               # project-level kind -> concrete agent_runners entry
+  claude: my-claude         # only needed when a kind maps to MORE THAN ONE entry
 agents:
   orchestrator:
-    runner: codex           # runner KIND; project maps to a concrete agent_runners entry
-    model: gpt-5            # overrides the orchestrator package's preferred_model
+    preferred_runner: codex     # swap the default runner kind...
+    runners:
+      codex:
+        model: gpt-5            # ...and set that kind's model/effort
   review:
-    model: claude-opus-4-8  # keep the kind, bump the model
+    runners:
+      claude:
+        model: claude-opus-4-8  # keep the kind, bump just the model
 ```
 
 Only the keys a project wants to change appear; everything else falls through to
-the manifest. When a runner *kind* maps to multiple `agent_runners` entries, an
-override may name the concrete entry instead of the kind to disambiguate.
+the manifest (block-level merge — a `review.runners.claude.model` override leaves
+the manifest's `reasoning_effort` intact).
+
+**Runner-kind → concrete-runner mapping (resolved decision Q3).** A kind resolves
+to a concrete `agent_runners` entry by a layered rule, specific-overrides-general
+like §4: (1) if exactly one runner of a kind exists, the mapping is automatic;
+(2) with several, a project-level `runner_kinds:` default per kind resolves it;
+(3) an individual `agents.<name>` override may still name the concrete entry to
+disambiguate further. Most projects only ever hit (1).
 
 ### 6. `permissions_mode`: a ceiling, not a free override
 
