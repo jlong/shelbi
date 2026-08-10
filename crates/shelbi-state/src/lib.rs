@@ -774,16 +774,27 @@ fn sibling_lock_path(path: &Path) -> PathBuf {
 ///   the migrated config through here without a mode flag.
 pub fn load_project(project: &str) -> Result<Project> {
     let global_path = projects_dir()?.join(format!("{project}.yaml"));
-    let mut p = match read_to_string_at(&global_path) {
-        Ok(text) => {
-            warn_legacy_workers_key(project, &text);
-            warn_project_name_is_now_a_label(project, &text);
-            Project::from_yaml_str(&text)?
+    // The in-repo split is authoritative: once
+    // `~/.shelbi/projects/<name>/local.yaml` exists, the committed shared half
+    // plus that local half ARE the project's config. A stale flat
+    // `<name>.yaml` left behind (a pre-migration global registration, a hand
+    // copy) must never shadow it — `local.yaml`-present ⟺ in-repo mode. Only
+    // when there is no split do we read the flat global file.
+    let split_present = projects_dir()?.join(project).join("local.yaml").is_file();
+    let mut p = if split_present {
+        load_project_split(project)?
+    } else {
+        match read_to_string_at(&global_path) {
+            Ok(text) => {
+                warn_legacy_workers_key(project, &text);
+                warn_project_name_is_now_a_label(project, &text);
+                Project::from_yaml_str(&text)?
+            }
+            // No global YAML and no split — a genuinely missing project.
+            // `load_project_split` produces the both-paths-named error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => load_project_split(project)?,
+            Err(e) => return Err(shelbi_core::Error::Io(e)),
         }
-        // No global YAML — this is either an in-repo project (migrated)
-        // or a genuinely missing one. `load_project_split` disambiguates.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => load_project_split(project)?,
-        Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
     // The project **id** is the config file's basename (`shelbi.yaml` → `shelbi`),
     // not any YAML key — the on-disk `name:` is now a free-form display label.
@@ -841,10 +852,18 @@ pub fn load_project(project: &str) -> Result<Project> {
 /// back to the two-file in-repo split. Both branches are read-only.
 fn load_project_bare(project: &str) -> Result<Project> {
     let global_path = projects_dir()?.join(format!("{project}.yaml"));
-    let mut p = match read_to_string_at(&global_path) {
-        Ok(text) => Project::from_yaml_str(&text)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => load_project_split(project)?,
-        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    // Same precedence as [`load_project`]: a present `local.yaml` (the in-repo
+    // split) wins over any stale flat `<name>.yaml`, so config-path resolution
+    // learns the real mode instead of a shadowing global registration.
+    let split_present = projects_dir()?.join(project).join("local.yaml").is_file();
+    let mut p = if split_present {
+        load_project_split(project)?
+    } else {
+        match read_to_string_at(&global_path) {
+            Ok(text) => Project::from_yaml_str(&text)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => load_project_split(project)?,
+            Err(e) => return Err(shelbi_core::Error::Io(e)),
+        }
     };
     // The id is the filename stem — see [`load_project`].
     p.name = project.to_string();
@@ -5808,6 +5827,51 @@ mod tests {
         assert_eq!(loaded.name, "myapp");
         assert_eq!(loaded.config_mode, Some(shelbi_core::ConfigMode::InRepo));
         assert_eq!(loaded.repo, repo.to_string_lossy());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A stale flat `<name>.yaml` sitting alongside an in-repo split must NOT
+    /// shadow it: once `local.yaml` exists, the committed shared + local halves
+    /// are authoritative. Guards the "stale flat file cannot shadow the split"
+    /// invariant fresh in-repo init and migration both depend on.
+    #[test]
+    fn stale_flat_yaml_does_not_shadow_in_repo_split() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        let repo = fresh_repo();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut p = fixture_project("myapp", None);
+        p.repo = repo.to_string_lossy().into_owned();
+        p.machines[0].work_dir = repo.clone();
+        save_project(&p).unwrap();
+        // Produce the split (writes both halves, retires the global YAML).
+        apply_migration_plan(&plan_in_repo_migration("myapp").unwrap()).unwrap();
+        assert!(home.join("projects/myapp/local.yaml").is_file());
+
+        // Resurrect a STALE flat file pointing somewhere else, as if an old
+        // global registration were left behind next to the split.
+        std::fs::write(
+            home.join("projects/myapp.yaml"),
+            "name: myapp\nrepo: /stale/wrong/path\nmachines: []\n\
+             orchestrator: {runner: claude}\n\
+             agent_runners: {claude: {command: claude, flags: []}}\n",
+        )
+        .unwrap();
+
+        // The split wins in both the full and the bare (config-mode) loaders.
+        let loaded = load_project("myapp").unwrap();
+        assert_eq!(loaded.config_mode, Some(shelbi_core::ConfigMode::InRepo));
+        assert_eq!(
+            loaded.repo,
+            repo.to_string_lossy(),
+            "the committed+local split must win over the stale flat file"
+        );
+        assert_eq!(
+            config_project_dir("myapp").unwrap(),
+            repo.join(".shelbi"),
+            "config-path resolution must route through the split, not the stale flat"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
