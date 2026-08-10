@@ -275,6 +275,7 @@ into the design above.
    multi-runner-first: a `runners:` map keyed by runner kind, each block carrying
    `model` + `reasoning_effort`, with `preferred_runner` naming the default.
    Reflected in §1–§3, §5.
+
    - **Field naming is asymmetric by layer:** the agent manifest uses
      `preferred_runner` (a recommendation); the project override uses plain
      `runner` (authoritative — no `preferred_` prefix). The agent recommends, the
