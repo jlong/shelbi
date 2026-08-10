@@ -307,18 +307,24 @@ jobs:
           # formula lands on the tap's main with no manual step. Fail the job
           # loudly (rather than leaving the PR open) if the check goes red, the
           # merge is blocked, or CI never registers a check.
+          attempts=20
           status=0
-          for attempt in $(seq 1 12); do
+          for attempt in $(seq 1 "$attempts"); do
             status=0
-            gh pr checks "$PR_URL" --watch --fail-fast || status=$?
+            # Capture output so we can recognise the "checks haven't registered
+            # yet" state, then echo it to the log for the run record.
+            output=$(gh pr checks "$PR_URL" --watch --fail-fast 2>&1) || status=$?
+            printf '%s\n' "$output"
             if [ "$status" -eq 0 ]; then
               break
             fi
-            # Exit code 8 means no checks have been reported yet; give the tap CI
-            # a moment to register the run before retrying. Any other non-zero is
-            # a real failure and should stop the job.
-            if [ "$status" -eq 8 ] && [ "$attempt" -lt 12 ]; then
-              echo "No checks reported on the tap PR yet (attempt ${attempt}); waiting for CI to start..."
+            # "No checks reported yet" is signalled inconsistently by gh: exit 8
+            # in some versions, but exit 1 + a "no checks reported" message in
+            # others (observed on v0.8.0). Treat either as "CI hasn't registered
+            # a run yet" and keep polling. Any other non-zero is a real failure.
+            if { [ "$status" -eq 8 ] || printf '%s' "$output" | grep -qi "no checks reported"; } \
+              && [ "$attempt" -lt "$attempts" ]; then
+              echo "No checks reported on the tap PR yet (attempt ${attempt}/${attempts}); waiting for CI to start..."
               sleep 15
               continue
             fi
