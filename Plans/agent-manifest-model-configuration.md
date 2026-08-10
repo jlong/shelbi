@@ -12,7 +12,7 @@ up agents to eventually be distributable packages.
 Two gaps today, both stemming from the same root: an agent (role) has no
 runner-agnostic config of its own.
 
-1. **Model/runner config lives on the** ***workspace*****, not the agent.** A
+1. **Model/runner config lives on the** ***workspace***\*\*, not the agent.\*\* A
    `Workspace` carries `runner: String` (`crates/shelbi-core/src/model.rs:916`),
    which names an entry in the project's `agent_runners` map
    (`AgentRunnerSpec { command, flags, prompt_injection, dialog_signatures, integration }`). There is **no** **`model`** **field** — the model is baked into
@@ -52,9 +52,14 @@ name: adversarial-reviewer          # package identity (stable across installs)
 version: 1.2.0                      # manifest version (semver)
 description: Adversarial code review before a human sees the branch
 
-preferred_runner: claude            # a runner KIND (see §2), not a project-local name
-preferred_model: claude-opus-4-8    # logical model id, applied per-runner (see §3)
-preferred_reasoning_effort: high    # optional; thinking/effort for models that support it
+preferred_runner: claude            # which runners: block is the default (a KIND, see §2)
+runners:                            # per-runner-kind config; the manifest is multi-runner-first
+  claude:
+    model: claude-opus-4-8          # logical model id, applied per-adapter (see §3)
+    reasoning_effort: high          # per-runner value; travels with this runner (see §3)
+  codex:
+    model: gpt-5
+    reasoning_effort: high
 
 permissions_mode: read-only         # a request; project caps it, never escalated up (see §6)
 
