@@ -142,10 +142,12 @@ task/status override  →  project agents.<name> override  →  agent.yaml prefe
   graceful-degradation target when a preferred runner kind isn't installed on
   the chosen machine).
 
-`Workspace.runner` is **retained as a fallback** below the agent layer, not
-removed — it is currently required and every existing project sets it, so this
-is additive. When an agent resolves a runner, it wins; when it doesn't, the
-workspace's runner still applies. No breaking migration (§8).
+`Workspace.runner` is **retained as a fallback only through the migration
+window**, then removed (§8). While present it sits below the agent layer: when an
+agent resolves a runner it wins; when it doesn't, the workspace's runner still
+applies. The end state assumes a **uniform fleet** — every machine has every
+runner kind installed — so once agents own selection, runner availability needs
+no per-workspace field (§8).
 
 ### 5. Project-side overrides: `agents.<name>` in `project.yaml`
 
