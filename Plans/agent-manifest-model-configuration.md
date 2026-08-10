@@ -103,20 +103,24 @@ runner of a kind, the mapping is automatic; with several, the project picks
 (see §5). This keeps packages portable across projects that name their runners
 differently.
 
-### 3. Model application is per-runner-adapter
+### 3. Model *and* effort application is per-runner-adapter
 
-`preferred_model: claude-opus-4-8` is a **logical** value. Turning it into a
-launch flag is runner-specific (`--model` for Claude/Codex; something else, or
-nothing, for a generic runner). So the manifest carries the *value* and the
-resolved runner's adapter (`RunnerKind` / `shelbi_agent::RunnerAdapter`) carries
-the *how*. This is the same seam that already owns launch-flag assembly, so
-model injection becomes one more adapter responsibility rather than a string
+A `model` like `claude-opus-4-8` is a **logical** value; turning it into a launch
+flag is runner-specific (`--model` for Claude/Codex; something else, or nothing,
+for a generic runner). The same is true of `reasoning_effort` (Claude thinking
+budget vs Codex effort) — both are per-runner values, which is why they live
+*inside* each `runners:` block rather than as top-level scalars. So each block
+carries the *values* and the resolved runner's adapter (`RunnerKind` /
+`shelbi_agent::RunnerAdapter`) carries the *how*. This is the same seam that
+already owns launch-flag assembly (`with_permission_mode`, `with_continue`), so
+model and effort injection become adapter responsibilities rather than strings
 spliced into `agent_runners.flags` by hand.
 
-Consequence: a runner override (§4) usually carries its **own** model — if a
-project overrides an Opus-preferring agent onto Codex, the manifest's
-`claude-opus-4-8` is meaningless, so the override supplies `gpt-5`. Treat
-`(runner, model)` as travelling together in an override.
+Consequence: because the manifest is multi-runner-first, `model` and
+`reasoning_effort` **travel together per runner kind**. Overriding an agent from
+Claude onto Codex selects the `codex` block (its own `gpt-5` + effort) rather
+than leaving a stale `claude-opus-4-8` behind; an override that introduces a new
+kind supplies that block's `(model, reasoning_effort)` together.
 
 ### 4. Resolution / precedence
 
