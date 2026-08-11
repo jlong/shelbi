@@ -619,7 +619,7 @@ fn input_box_lines(screen: &str) -> Option<Vec<String>> {
     let rules: Vec<usize> = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| is_input_box_rule(line))
+        .filter(|(_, line)| crate::ready::is_input_box_rule(line))
         .map(|(i, _)| i)
         .collect();
     if rules.len() < 2 {
@@ -633,25 +633,6 @@ fn input_box_lines(screen: &str) -> Option<Vec<String>> {
             .map(|l| strip_input_glyph(l).trim().to_string())
             .collect(),
     )
-}
-
-/// A plain horizontal border that can fence Claude's live input box.
-/// `─── text ───` title rules contain letters and are deliberately
-/// excluded.
-fn is_input_box_rule(line: &str) -> bool {
-    const BORDER: &[char] = &['─', '╭', '╮', '╰', '╯'];
-    let trimmed = line.trim();
-    trimmed.chars().count() >= 3 && trimmed.chars().all(|c| BORDER.contains(&c))
-}
-
-/// Index of the top border of the last live input box in `screen`.
-fn input_box_top(screen: &str) -> Option<usize> {
-    let rules = screen
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| is_input_box_rule(line).then_some(index))
-        .collect::<Vec<_>>();
-    (rules.len() >= 2).then(|| rules[rules.len() - 2])
 }
 
 /// Strip claude's leading input-prompt glyph (`❯` or a plain `>`) plus any
@@ -849,44 +830,13 @@ pub(crate) fn claude_is_processing(screen: &str) -> bool {
 
 /// Strong current-turn signal used only for busy-pane queue classification.
 /// A normal busy Claude pane can omit the interrupt footer and have its
-/// `shelbi:working` title overwritten, leaving only the live spinner row. We
-/// accept that row when it is immediately above the live input box and has
-/// Claude's streaming-token grammar. A completed `⏺ Done. (... tokens)` row
-/// is not a spinner and therefore stays false.
+/// `shelbi:working` title overwritten, leaving only the live spinner row. The
+/// shared [`crate::ready::is_claude_working`] accepts that row when it is
+/// immediately above the live input box and has Claude's streaming-token
+/// grammar; a completed `⏺ Done. (... tokens)` row is not a spinner and stays
+/// false.
 fn claude_is_actively_processing(screen: &str) -> bool {
-    claude_is_interruptible(screen) || claude_has_live_spinner(screen)
-}
-
-fn claude_has_live_spinner(screen: &str) -> bool {
-    let Some(top) = input_box_top(screen) else {
-        return false;
-    };
-    let lines = screen.lines().collect::<Vec<_>>();
-    let Some(line) = lines[..top]
-        .iter()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-    else {
-        return false;
-    };
-    let line = line.trim();
-    let spinner_glyph = line.chars().next().is_some_and(|glyph| {
-        matches!(
-            glyph,
-            '·' | '✳' | '✻' | '✶' | '✽' | '✺' | '✹' | '✸' | '✷' | '✵'
-        )
-    });
-    spinner_glyph
-        && line.contains('…')
-        && (line.contains(" · ↑ ") || line.contains(" · ↓ "))
-        && line.ends_with("tokens)")
-}
-
-/// Interrupt footer signal. Unlike [`claude_is_processing`], this excludes a
-/// bare `tokens)` match because completed-turn footers remain in idle history.
-fn claude_is_interruptible(screen: &str) -> bool {
-    let lower = screen.to_ascii_lowercase();
-    lower.contains("esc to interrupt") || lower.contains("ctrl+c to stop")
+    crate::ready::is_claude_working(screen)
 }
 
 #[cfg(test)]

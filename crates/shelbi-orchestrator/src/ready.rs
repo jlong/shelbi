@@ -97,6 +97,68 @@ pub fn is_claude_busy(screen: &str) -> bool {
     lower.contains("esc to interrupt") || lower.contains("ctrl+c to stop")
 }
 
+/// True when Claude is *actively processing a turn*, from either positive busy
+/// signal: the interrupt footer ([`is_claude_busy`]) or the live spinner row
+/// ([`has_live_spinner`]).
+///
+/// [`is_claude_busy`] alone matches only the `esc to interrupt` / `ctrl+c to
+/// stop` footer, which current Claude Code builds omit from their compact
+/// spinner line (`✻ Crunching… (1m 2s · ↓ 39.0k tokens)` — a glyph, a gerund,
+/// an elapsed timer, and a streaming-token counter, no interrupt hint). A pane
+/// mid-turn still draws its input box footer below that spinner, so the footer
+/// alone read a hard-working pane as awaiting input — which latched the yellow
+/// `?` badge on the workspace row and never cleared when the slot resumed work.
+/// Adding the spinner row as a second positive signal closes that gap. Use this
+/// (not the bare footer) wherever "is this pane running a turn" drives state.
+pub fn is_claude_working(screen: &str) -> bool {
+    is_claude_busy(screen) || has_live_spinner(screen)
+}
+
+/// True when Claude's live spinner row is on screen: its animated glyph + a
+/// `Gerund…`, the `· ↑/↓ N tokens)` streaming counter, positioned immediately
+/// above the live input box. The positional + grammar check is what keeps a
+/// completed `⏺ Done. (… tokens)` row, or a stale `tokens)` lingering in the
+/// scrollback, from reading as busy — a bare `tokens)` substring is not enough.
+pub fn has_live_spinner(screen: &str) -> bool {
+    let Some(top) = input_box_top(screen) else {
+        return false;
+    };
+    let lines: Vec<&str> = screen.lines().collect();
+    let Some(line) = lines[..top].iter().rev().find(|l| !l.trim().is_empty()) else {
+        return false;
+    };
+    let line = line.trim();
+    let spinner_glyph = line.chars().next().is_some_and(|glyph| {
+        matches!(
+            glyph,
+            '·' | '✳' | '✻' | '✶' | '✽' | '✺' | '✹' | '✸' | '✷' | '✵'
+        )
+    });
+    spinner_glyph
+        && line.contains('…')
+        && (line.contains(" · ↑ ") || line.contains(" · ↓ "))
+        && line.ends_with("tokens)")
+}
+
+/// Index of the top border of the last live input box in `screen`, or `None`
+/// when no box is drawn (a modal, or a capture taken before Claude drew it).
+fn input_box_top(screen: &str) -> Option<usize> {
+    let rules: Vec<usize> = screen
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| is_input_box_rule(line).then_some(index))
+        .collect();
+    (rules.len() >= 2).then(|| rules[rules.len() - 2])
+}
+
+/// A plain horizontal border that can fence Claude's live input box.
+/// `─── text ───` title rules contain letters and are deliberately excluded.
+pub(crate) fn is_input_box_rule(line: &str) -> bool {
+    const BORDER: &[char] = &['─', '╭', '╮', '╰', '╯'];
+    let trimmed = line.trim();
+    trimmed.chars().count() >= 3 && trimmed.chars().all(|c| BORDER.contains(&c))
+}
+
 /// True when the captured pane shows claude's "trust this folder" dialog.
 pub fn is_trust_dialog(screen: &str) -> bool {
     let s = screen.to_ascii_lowercase();
@@ -526,6 +588,59 @@ mod tests {
         assert!(is_input_ready("⏵⏵ auto mode on (shift+tab to cycle)"));
         assert!(is_input_ready("⏸ plan mode on (shift+tab to cycle)"));
         assert!(is_input_ready("? for shortcuts"));
+    }
+
+    // Captured live 2026-08-11 from a hard-working Claude Opus 4.8 pane. Note
+    // what's NOT here: no `esc to interrupt` anywhere (the compact spinner drops
+    // it), and the input-box footer (`auto mode on (shift+tab to cycle)`) is
+    // drawn *even mid-turn*. So `is_claude_busy` reads false and `is_input_ready`
+    // reads true — the exact combination that latched the AwaitingInput `?`.
+    const BUSY_SPINNER_NO_INTERRUPT: &str = "\
+✻ Crunching… (10m 20s · ↓ 39.0k tokens)
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+
+    #[test]
+    fn claude_working_detects_compact_spinner_without_interrupt_footer() {
+        // THE REGRESSION this task fixes: the bare `esc to interrupt` footer is
+        // gone from current builds, so `is_claude_busy` alone can't see a busy
+        // pane. The live spinner row must still prove the turn is running.
+        assert!(!is_claude_busy(BUSY_SPINNER_NO_INTERRUPT));
+        assert!(is_input_ready(BUSY_SPINNER_NO_INTERRUPT));
+        assert!(has_live_spinner(BUSY_SPINNER_NO_INTERRUPT));
+        assert!(is_claude_working(BUSY_SPINNER_NO_INTERRUPT));
+    }
+
+    #[test]
+    fn claude_working_still_matches_the_interrupt_footer() {
+        // Older / wider-terminal renderings keep the hint; both signals count.
+        let esc = "· Working… (esc to interrupt)";
+        assert!(is_claude_busy(esc));
+        assert!(is_claude_working(esc));
+    }
+
+    #[test]
+    fn claude_working_false_at_a_ready_prompt() {
+        // A genuinely idle pane: input box, permission footer, no spinner row.
+        assert!(!is_claude_working(INPUT_BOX_SCREEN));
+        assert!(!has_live_spinner(INPUT_BOX_SCREEN));
+    }
+
+    #[test]
+    fn has_live_spinner_rejects_a_completed_turn_row() {
+        // A finished `⏺ Done. (… tokens)` line above the box is not a spinner:
+        // wrong leading glyph, no gerund `…`, no `· ↑/↓ ` token-rate. Guards
+        // against a stale completed-turn row reading as busy.
+        let done = "\
+⏺ Done. (1m 4s · 12.0k tokens)
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+        assert!(!has_live_spinner(done));
+        assert!(!is_claude_working(done));
     }
 
     #[test]
