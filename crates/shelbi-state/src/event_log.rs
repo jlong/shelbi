@@ -683,7 +683,138 @@ pub fn write_event_cursor(project: &str, cursor: u64) -> Result<()> {
     // Deliberately do not load or create the global index here. Upgrade
     // migration must be able to observe a legacy cursor while the index is
     // still absent; the next read initializes both under this same lock.
+    //
+    // `atomic_write` writes to a per-process temp file (`create` truncates) and
+    // `rename`s it over `path`, so a reader never observes a half-written or
+    // *concatenated* cursor even under concurrent writers — the whole point of
+    // the sibling `write_event_cursor_atomicity_never_concatenates` regression
+    // test. The prior garbled `<old><new>` cursor value that motivated it could
+    // only have come from a non-atomic writer that has since been retired.
     atomic_write(&path, cursor.to_string().as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// Single-consumer event follower registry
+//
+// The durable claim/ack feed (`shelbi orchestrator events next --follow`) is a
+// *consuming* reader of the delivery queue. Two of them running for one project
+// race: each independently claims batches, so N live followers make any single
+// one miss ~(N-1)/N of batches until the visibility timeout redelivers them —
+// which is exactly how a follower leaked by a prior orchestrator restart
+// silently starved the live self-drain and made it miss a Zen toggle. The
+// passive `shelbi events tail --follow` accelerator does not consume and so is
+// never registered here; only the consuming feed is.
+//
+// The registry enforces *one consuming follower per project* on a
+// last-writer-wins basis: a starting follower records its PID and asks any
+// prior live owner to stop, and every follower re-checks the recorded owner
+// each tick so a superseded one exits itself. Between the two, a leaked or
+// duplicate follower can neither linger nor starve the primary.
+
+/// Path to a project's single-consumer follower registry: the PID of the
+/// process currently running `shelbi orchestrator events next --follow`. A
+/// sibling of `event-cursor` in the project config dir, runner-agnostic and
+/// never under `.claude/`.
+pub fn event_follower_path(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("event-follower"))
+}
+
+fn event_follower_lock_path(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("event-follower.lock"))
+}
+
+/// Is `pid` a live process we could signal? `kill(pid, 0)` runs the
+/// existence/permission check without delivering a signal: rc 0 or `EPERM`
+/// (alive but not ours) both mean live; `ESRCH` means gone.
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    false
+}
+
+/// Ask a prior follower to stop. SIGTERM, not SIGKILL: the feed installs a
+/// handler that turns it into a clean, message-bearing exit and releases its
+/// claim. A missed signal is still covered — the prior follower self-exits when
+/// its next [`event_follower_owner`] check no longer names it.
+#[cfg(unix)]
+fn signal_terminate(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_terminate(_pid: u32) {}
+
+fn read_follower_pid(path: &Path) -> Result<Option<u32>> {
+    match fs::read_to_string(path) {
+        // A garbled/empty registry reads as "no owner" rather than an error:
+        // the worst case is one redundant claim, never a wedged follower.
+        Ok(text) => Ok(text.trim().parse().ok()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
+/// Claim single-consumer ownership of a project's event follower for the
+/// current process, tearing down any prior live owner.
+///
+/// Serializes the read-signal-write under the follower lock so two
+/// simultaneously-starting followers can't both believe they won. Returns the
+/// claimed PID (this process's) to hand to [`release_event_follower`] at exit.
+///
+/// Last-writer-wins: whoever claims most recently owns the feed, and every
+/// follower polls [`event_follower_owner`] so the losers exit themselves. That
+/// is what makes an orchestrator restart leave zero prior consuming followers
+/// and what stops a leaked follower from co-consuming with the live drain.
+pub fn claim_event_follower(project: &str) -> Result<u32> {
+    let self_pid = std::process::id();
+    let path = event_follower_path(project)?;
+    let _lock = acquire_file_lock(&event_follower_lock_path(project)?)?;
+    if let Some(prior) = read_follower_pid(&path)? {
+        if prior != self_pid && process_is_alive(prior) {
+            signal_terminate(prior);
+        }
+    }
+    atomic_write(&path, self_pid.to_string().as_bytes())?;
+    Ok(self_pid)
+}
+
+/// The PID currently recorded as the project's event follower, or `None` when
+/// none is registered (or the registry is absent/empty/garbled). Read without
+/// the lock: a follower calls this every tick to notice it was superseded, and
+/// a momentarily-stale read only costs one extra tick before it exits.
+pub fn event_follower_owner(project: &str) -> Result<Option<u32>> {
+    read_follower_pid(&event_follower_path(project)?)
+}
+
+/// Release ownership iff the registry still names `pid`. A follower that was
+/// superseded (the file now names a newer owner) leaves it untouched so it
+/// never clobbers its successor's claim; a follower that still owns it clears
+/// the file so no stale PID lingers to be needlessly signalled next time.
+pub fn release_event_follower(project: &str, pid: u32) -> Result<()> {
+    let path = event_follower_path(project)?;
+    let _lock = acquire_file_lock(&event_follower_lock_path(project)?)?;
+    if read_follower_pid(&path)? == Some(pid) {
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(shelbi_core::Error::Io(e)),
+        }
+    } else {
+        Ok(())
+    }
 }
 
 /// Stable delivery id for a drained event range: `shelbi-event/<project>/<from>-<through>`.
@@ -4252,5 +4383,136 @@ mod tests {
             MessageDelivery::Unknown
         );
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Regression guard for the garbled `2833840333762` (`2833840` + `333762`)
+    /// cursor: `write_event_cursor` goes through `atomic_write`, which
+    /// `create`-truncates a temp file and `rename`s it into place, so a shorter
+    /// value fully replaces a longer one and concurrent writers never interleave
+    /// their bytes into a concatenation.
+    #[test]
+    fn write_event_cursor_atomicity_never_concatenates() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Assert on the raw registry bytes: this is the writer's atomicity
+        // property, isolated from the read-side legacy-cursor normalization
+        // (which would rewrite a cursor sitting ahead of an empty log's head).
+        let cursor_file = event_cursor_path("cur").unwrap();
+        write_event_cursor("cur", 2_833_840).unwrap();
+        write_event_cursor("cur", 333_762).unwrap();
+        let raw = fs::read_to_string(&cursor_file).unwrap();
+        assert_eq!(
+            raw.trim(),
+            "333762",
+            "a shorter cursor must fully replace the longer prior value"
+        );
+
+        // Concurrent writers each land a whole value; the persisted file always
+        // parses back to exactly one of them, never a splice of two.
+        let writers: Vec<_> = (0..8u64)
+            .map(|i| std::thread::spawn(move || write_event_cursor("cur", 1_000_000 + i).unwrap()))
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let final_cursor: u64 = fs::read_to_string(&cursor_file).unwrap().trim().parse().expect(
+            "the cursor file must always hold one clean integer, never a concatenation of writes",
+        );
+        assert!(
+            (1_000_000..1_000_008).contains(&final_cursor),
+            "cursor {final_cursor} is not a clean single write"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// Claiming records this process as the project's single event follower;
+    /// releasing (while we still own it) clears the registry.
+    #[test]
+    fn event_follower_claim_records_owner_and_release_clears_it() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        assert_eq!(event_follower_owner("fol").unwrap(), None);
+        let pid = claim_event_follower("fol").unwrap();
+        assert_eq!(pid, std::process::id());
+        assert_eq!(event_follower_owner("fol").unwrap(), Some(pid));
+
+        release_event_follower("fol", pid).unwrap();
+        assert_eq!(event_follower_owner("fol").unwrap(), None);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A follower leaked by a prior session (its PID sitting in the registry)
+    /// is superseded on the next claim: the newest follower takes the slot. The
+    /// prior owner is signalled only when still alive; either way ownership
+    /// transfers, which is what stops a leaked consumer from co-draining.
+    #[test]
+    fn event_follower_claim_supersedes_a_prior_owner() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A high, almost-certainly-unused PID stands in for the leaked prior
+        // follower — claiming must not depend on it being alive, and using a
+        // dead PID keeps the test from signalling any real process.
+        let prior: u32 = 0x7fff_fff0;
+        atomic_write(
+            &event_follower_path("fol").unwrap(),
+            prior.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(event_follower_owner("fol").unwrap(), Some(prior));
+
+        let pid = claim_event_follower("fol").unwrap();
+        assert_eq!(pid, std::process::id());
+        assert_eq!(event_follower_owner("fol").unwrap(), Some(pid));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A superseded follower calling `release` with its own (now stale) PID must
+    /// not clobber the successor's claim — release only clears the registry when
+    /// it still names the releaser.
+    #[test]
+    fn event_follower_release_leaves_a_successors_claim_intact() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let current = claim_event_follower("fol").unwrap();
+        let superseded_pid: u32 = 424_242; // an older follower that lost the slot
+        release_event_follower("fol", superseded_pid).unwrap();
+        assert_eq!(
+            event_follower_owner("fol").unwrap(),
+            Some(current),
+            "releasing a stale PID must not clear the live owner"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A garbled/partial registry (the follower-file analogue of the cursor
+    /// concatenation bug) reads as unowned rather than erroring, so at worst one
+    /// redundant claim happens — never a wedged follower.
+    #[test]
+    fn event_follower_owner_treats_garbled_registry_as_unowned() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        atomic_write(&event_follower_path("fol").unwrap(), b"not-a-pid\n").unwrap();
+        assert_eq!(event_follower_owner("fol").unwrap(), None);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = fs::remove_dir_all(&home);
     }
 }

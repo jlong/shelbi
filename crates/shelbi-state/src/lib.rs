@@ -101,9 +101,10 @@ pub use event_log::{
     append_task_edit_event, append_task_event, append_workspace_dialog_event,
     append_workspace_event, append_workspace_pane_event, append_workspace_pause_event,
     append_worktree_detach_event, append_zen_dryrun_event, append_zen_mode_event, delivery_id,
-    emit_event_body, event_cursor_path, event_log_current_base, event_log_head, events_log_path,
+    claim_event_follower, emit_event_body, event_cursor_path, event_follower_owner,
+    event_follower_path, event_log_current_base, event_log_head, events_log_path,
     message_delivery_status, read_event_log_from, read_or_initialize_event_cursor,
-    task_event_body, write_event_cursor,
+    release_event_follower, task_event_body, write_event_cursor,
     EventEnvelope, EventKind, EventLogRead, HandoffCause, MessageDelivery, ZenHeartbeatCue, DAEMON_ACK,
     ORCH_EVENT_CALLBACK_SOCK_ENV, READY_MARKER_HANDOFF_ALIASES, READY_MARKER_HANDOFF_CAUSE,
 };

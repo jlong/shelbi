@@ -84,7 +84,7 @@ fn claude_orchestrator_argv_is_frozen() {
         &claude_runner(),
         "myapp",
         Path::new("/tmp/myapp"),
-        crate::ORCH_BOOTSTRAP_PROMPT,
+        &crate::orch_bootstrap_prompt_base("myapp"),
     );
     assert_golden("claude/orchestrator-argv.txt", &argv);
 }
