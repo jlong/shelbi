@@ -1397,26 +1397,40 @@ fn sidebar_cmd(shelbi_bin: &str, project_name: &str) -> String {
 /// it runs the "Bootstrap on session start" sequence from its
 /// `instructions.md` without waiting for the user to type "start
 /// monitoring". The prompt names every step verbatim so the agent can't
-/// elide arming the `shelbi orchestrator events next --follow` durable feed —
-/// that's the step that turns auto-dispatch back on after a cold start.
-const ORCH_BOOTSTRAP_PROMPT: &str = "Run the \"Bootstrap on session start\" sequence \
+/// elide the two-part event watch that turns auto-dispatch back on after a
+/// cold start: a passive `shelbi events tail --follow` accelerator plus the
+/// authoritative self-driven `shelbi orchestrator events next` drain.
+///
+/// The accelerator is deliberately the *non-consuming* `events tail --follow`,
+/// not a background `orchestrator events next --follow`: two consuming
+/// followers race on the delivery queue and each miss ~half the batches, so a
+/// consuming accelerator co-running with the self-drain (or leaked by a prior
+/// session) silently starves it. `events tail` only mirrors the log, so it can
+/// never claim a batch out from under the drain.
+fn orch_bootstrap_prompt_base(project_name: &str) -> String {
+    format!(
+        "Run the \"Bootstrap on session start\" sequence \
     from your instructions now: snapshot `shelbi task list`, `shelbi workspace list`, and \
     `shelbi zen status`; scan recent `~/.shelbi/events.log` for a \
     `zen=off reason=crash-recovery` line; then start \
-    `shelbi orchestrator events next --follow` in the background and watch it with the \
-    Monitor tool so auto-dispatch reacts to new event batches. Apply each batch's facts \
-    through the reaction rules, then run its `shelbi orchestrator events ack \
-    <delivery-id>` command — ack only after reacting, so a crash re-delivers an \
-    unacked batch. That background feed is only a latency accelerator and can die \
-    unnoticed (a reaped host shell prints no signal). Liveness rides the unified stream \
-    itself: the hub always writes at least a heartbeat on its idle cadence, so if no line \
-    — batch or heartbeat — arrives for well past the heartbeat interval, the follower \
-    died; restart it. Your source of truth is the \
-    self-driven drain from the \"Polling-only event drain\" section: before every \
-    user-facing reply and on every heartbeat, run \
-    `shelbi orchestrator events next --follow --max-lifetime 2s`, apply every returned \
-    task/workspace/heartbeat/pane-death fact through the normal reaction rules, ack each \
-    batch, and only then answer — a pull you drive cannot go silently blind.";
+    `shelbi events tail --follow --project {project_name}` in the background and watch it \
+    with the Monitor tool so auto-dispatch reacts to new lines the instant they land. That \
+    tail is a *non-consuming* latency accelerator — it mirrors the event log without \
+    claiming from the durable delivery queue, so it never competes with the drain below. \
+    It can still die unnoticed (a reaped host shell prints no signal); liveness rides the \
+    unified stream itself: the hub always writes at least a heartbeat on its idle cadence, \
+    so if no line — event or heartbeat — arrives for well past the heartbeat interval, the \
+    tail died; restart it. Your source of truth is the self-driven drain from the \
+    \"Polling-only event drain\" section, the only *consuming* reader you run: before \
+    every user-facing reply and on every heartbeat (and whenever the tail shows a new \
+    line), run `shelbi orchestrator events next --follow --max-lifetime 2s`, apply every \
+    returned task/workspace/heartbeat/pane-death fact through the normal reaction rules, \
+    run each batch's `shelbi orchestrator events ack <delivery-id>` command — ack only \
+    after reacting, so a crash re-delivers an unacked batch — and only then answer. A pull \
+    you drive cannot go silently blind, and because it is the sole consuming follower \
+    (Shelbi tears down any leaked prior one on start) it never returns a false \"no batch\"."
+    )
+}
 
 /// Compose the recurring orchestrator bootstrap with the optional one-shot
 /// first-project welcome. Repository inspection stays inside the local agent
@@ -1427,8 +1441,9 @@ pub(crate) fn orchestrator_bootstrap_prompt(
     repo_root: &std::path::Path,
     contextual_greeting: bool,
 ) -> String {
+    let base = orch_bootstrap_prompt_base(project_name);
     if !contextual_greeting {
-        return ORCH_BOOTSTRAP_PROMPT.to_string();
+        return base;
     }
 
     // JSON quoting keeps control characters and Markdown delimiters in an
@@ -1436,7 +1451,7 @@ pub(crate) fn orchestrator_bootstrap_prompt(
     let repo = serde_json::to_string(repo_root.to_string_lossy().as_ref())
         .expect("serializing a string cannot fail");
     format!(
-        "{ORCH_BOOTSTRAP_PROMPT}\n\n\
+        "{base}\n\n\
          [SHELBI_FIRST_PROJECT_GREETING]\n\
          After that bootstrap, make your first user-facing message a one-time welcome for \
          Shelbi project `{project_name}`. Before writing it, spend no more than a few seconds \
@@ -2548,7 +2563,7 @@ mod pane_cmd_tests {
             &spec,
             "myapp",
             std::path::Path::new("/tmp/myapp"),
-            ORCH_BOOTSTRAP_PROMPT,
+            &orch_bootstrap_prompt_base("myapp"),
         );
         assert!(
             out.starts_with("claude "),
@@ -2634,7 +2649,7 @@ mod pane_cmd_tests {
             false,
         );
 
-        assert_eq!(prompt, ORCH_BOOTSTRAP_PROMPT);
+        assert_eq!(prompt, orch_bootstrap_prompt_base("shaft"));
         assert!(!prompt.contains("SHELBI_FIRST_PROJECT_GREETING"));
         assert!(!prompt.contains("Welcome to shaft"));
     }
@@ -2722,7 +2737,7 @@ mod pane_cmd_tests {
             &spec,
             "myapp",
             std::path::Path::new("/tmp/myapp"),
-            ORCH_BOOTSTRAP_PROMPT,
+            &orch_bootstrap_prompt_base("myapp"),
         );
         // The runner's own flags must land before `--append-system-prompt`
         // (so `--permission-mode` isn't consumed by the wrong parser) and
@@ -2761,7 +2776,7 @@ mod pane_cmd_tests {
             &spec,
             "shelbi",
             std::path::Path::new("/Users/jlong/Workspaces/shelbi"),
-            ORCH_BOOTSTRAP_PROMPT,
+            &orch_bootstrap_prompt_base("shelbi"),
         );
         assert!(
             out.starts_with("codex --print "),
@@ -2876,7 +2891,7 @@ mod pane_cmd_tests {
             &spec,
             "myapp",
             std::path::Path::new("/tmp/myapp"),
-            ORCH_BOOTSTRAP_PROMPT,
+            &orch_bootstrap_prompt_base("myapp"),
         );
         assert_eq!(out, "aider --foo");
     }
@@ -2896,7 +2911,7 @@ mod pane_cmd_tests {
             &spec,
             "myapp",
             std::path::Path::new("/tmp/myapp"),
-            ORCH_BOOTSTRAP_PROMPT,
+            &orch_bootstrap_prompt_base("myapp"),
         );
         assert!(
             out.contains("'Run the \"Bootstrap on session start\""),
@@ -2917,7 +2932,7 @@ mod pane_cmd_tests {
             &spec,
             "myapp",
             std::path::Path::new("/tmp/myapp"),
-            ORCH_BOOTSTRAP_PROMPT,
+            &orch_bootstrap_prompt_base("myapp"),
         );
         assert!(
             out.contains("orchestrator/scheduler for project `myapp`"),

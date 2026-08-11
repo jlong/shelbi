@@ -232,8 +232,18 @@ fn run_feed(project: &str, max_lifetime: Option<Duration>) -> Result<()> {
             anyhow!("failed to install signal handler {sig} for the event feed: {e}")
         })?;
     }
-    let outcome = feed_loop(project, max_lifetime, &signal)?;
-    emit_feed_notice(project, &outcome)
+    // Claim single-consumer ownership before streaming: this tears down any
+    // prior live follower for the project (SIGTERM) so a leaked one from an
+    // earlier orchestrator session can't co-consume and starve this drain.
+    // `feed_loop` polls the registry and stops with `Superseded` if a newer
+    // follower later takes over from us.
+    let self_pid = shelbi_state::claim_event_follower(project).map_err(|e| anyhow!(e))?;
+    let outcome = feed_loop(project, max_lifetime, &signal);
+    // Release only if we still own it — a follower we superseded leaves the
+    // registry naming its successor. Best-effort: a release failure must not
+    // mask the loop's own outcome.
+    let _ = shelbi_state::release_event_follower(project, self_pid);
+    emit_feed_notice(project, &outcome?)
 }
 
 /// The `--follow` poll loop, factored out of [`run_feed`] so it is testable
@@ -261,14 +271,27 @@ fn feed_loop(
     max_lifetime: Option<Duration>,
     signal: &AtomicUsize,
 ) -> Result<FeedOutcome> {
+    let self_pid = std::process::id();
     feed_loop_with(
         project,
         max_lifetime,
         signal,
         FEED_POLL,
         FEED_VISIBILITY_TIMEOUT,
+        &|| feed_superseded(project, self_pid),
         &mut |batch| emit_feed_batch(batch),
     )
+}
+
+/// True when a newer consuming follower has taken over this project's registry
+/// (its recorded PID no longer names us) — the signal for this follower to exit
+/// so at most one consuming follower is ever live. A missing/uninitialized
+/// registry is deliberately *not* a supersede: an ad-hoc drain or a test that
+/// never called [`shelbi_state::claim_event_follower`] must run normally, and a
+/// transient read error fails open (keep serving) rather than kill a healthy
+/// feed on a filesystem hiccup.
+fn feed_superseded(project: &str, self_pid: u32) -> bool {
+    matches!(shelbi_state::event_follower_owner(project), Ok(Some(owner)) if owner != self_pid)
 }
 
 /// [`feed_loop`] with the poll cadence, visibility timeout, and batch emitter
@@ -281,6 +304,7 @@ fn feed_loop_with(
     signal: &AtomicUsize,
     poll: Duration,
     visibility_timeout: Duration,
+    superseded: &dyn Fn() -> bool,
     emit: &mut dyn FnMut(&FeedBatch) -> Result<()>,
 ) -> Result<FeedOutcome> {
     let start = Instant::now();
@@ -294,6 +318,12 @@ fn feed_loop_with(
         let sig = signal.load(Ordering::Relaxed);
         if sig != 0 {
             return Ok(FeedOutcome::Terminated { signal: sig as i32 });
+        }
+        // A newer follower claimed the registry: stand down so exactly one
+        // consuming follower stays live. Checked before scanning so a
+        // superseded follower stops claiming batches immediately.
+        if superseded() {
+            return Ok(FeedOutcome::Superseded);
         }
         if let Some(limit) = max_lifetime {
             if start.elapsed() >= limit {
@@ -374,6 +404,9 @@ enum FeedOutcome {
     Expired { after: Duration },
     /// A catchable termination signal arrived (SIGTERM/SIGHUP/SIGINT).
     Terminated { signal: i32 },
+    /// A newer consuming follower took over the project's single-consumer
+    /// registry, so this one stood down to keep exactly one follower live.
+    Superseded,
 }
 
 /// The recovery instruction spelled out on every terminal notice so the
@@ -405,6 +438,12 @@ fn emit_feed_notice(project: &str, outcome: &FeedOutcome) -> Result<()> {
             feed: "terminated",
             project: project.to_string(),
             reason: format!("received signal {signal}"),
+            note: FEED_RECOVERY_NOTE,
+        },
+        FeedOutcome::Superseded => FeedNotice {
+            feed: "superseded",
+            project: project.to_string(),
+            reason: "a newer follower for this project took over the consumer slot".to_string(),
             note: FEED_RECOVERY_NOTE,
         },
     };
@@ -1692,6 +1731,7 @@ mod tests {
             &signal,
             Duration::from_millis(5),
             Duration::ZERO,
+            &|| false,
             &mut |batch| {
                 deliveries.push(batch.delivery_id.clone());
                 Ok(())
@@ -1929,5 +1969,74 @@ mod tests {
             !response.events[0].metadata.contains_key("supervision"),
             "pane death delivery must not be conflated with auto-restart"
         );
+    }
+
+    /// A follower whose registry slot was taken over by a newer one stands down
+    /// on its next tick with a clean `Superseded` outcome — the mechanism that
+    /// keeps exactly one consuming follower live per project.
+    #[test]
+    fn feed_loop_stands_down_when_superseded_by_a_newer_follower() {
+        let (_guard, _tmp) = setup_home();
+        let signal = AtomicUsize::new(0);
+        // No lifetime cap and no signal: only a supersede can stop this loop,
+        // so the clean exit proves the supersede path drives it.
+        let outcome = feed_loop_with(
+            "demo",
+            None,
+            &signal,
+            Duration::from_millis(5),
+            Duration::ZERO,
+            &|| true,
+            &mut |_batch| Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(outcome, FeedOutcome::Superseded));
+    }
+
+    /// `feed_superseded` is the registry check the live loop runs: the recorded
+    /// owner keeps serving, any other PID (a leaked/duplicate follower) is told
+    /// to stand down, and an unclaimed project never falsely supersedes.
+    #[test]
+    fn feed_superseded_tracks_the_registry_owner() {
+        let (_guard, _tmp) = setup_home();
+        // Nobody has claimed the slot: an ad-hoc drain must run normally.
+        assert!(!feed_superseded("demo", std::process::id()));
+
+        let owner = shelbi_state::claim_event_follower("demo").unwrap();
+        assert!(!feed_superseded("demo", owner));
+        assert!(feed_superseded("demo", owner.wrapping_add(1)));
+    }
+
+    /// Repro for the starvation bug: two would-be consumers, a burst of events,
+    /// and the single-consumer owner still observes every event in one batch —
+    /// no false "no batch" caused by a co-running consumer. The registry is what
+    /// guarantees only the owner drains; a second follower is superseded rather
+    /// than left to claim batches the owner then misses.
+    #[test]
+    fn single_owner_sees_every_event_in_a_burst_despite_a_second_follower() {
+        let (_guard, _tmp) = setup_home();
+
+        // The primary claims the sole consumer slot.
+        let primary = shelbi_state::claim_event_follower("demo").unwrap();
+
+        // A burst lands while a second (now-stale) follower notionally co-runs.
+        for i in 0..6 {
+            append_workspace_event("demo", &format!("w{i}"), None, WorkspaceState::Working)
+                .unwrap();
+        }
+
+        // The owner is never superseded, so its drain from the durable cursor
+        // surfaces the whole burst as one batch — every event, within one pass.
+        assert!(!feed_superseded("demo", primary));
+        let batch = scan_feed_batch("demo", 0).unwrap().unwrap();
+        assert_eq!(
+            batch.events.len(),
+            6,
+            "the single owner must observe every burst event, not a fraction"
+        );
+
+        // The second follower, holding any other PID, is told to stand down —
+        // so it can never claim a batch out from under the primary.
+        assert!(feed_superseded("demo", primary.wrapping_add(1)));
     }
 }

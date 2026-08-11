@@ -121,7 +121,7 @@ fn test_bridge(
         tui_ready_deadline: Instant::now() + TUI_READY_TIMEOUT,
         protocol_unsupported: false,
         bootstrap_sent,
-        bootstrap_prompt: crate::ORCH_BOOTSTRAP_PROMPT.into(),
+        bootstrap_prompt: crate::orch_bootstrap_prompt_base(PROJECT),
         bootstrap_blocked_generation: None,
         bootstrap_retry_not_before: Instant::now(),
         bootstrap_message_id: format!("shelbi-bootstrap/{THREAD_ID}/1"),
@@ -279,7 +279,7 @@ fn bootstrap_rejection_without_notification_rehydrates_and_retries_exact_thread(
         assert_eq!(start["params"]["threadId"], THREAD_ID);
         assert_eq!(
             start["params"]["input"][0]["text"],
-            crate::ORCH_BOOTSTRAP_PROMPT
+            crate::orch_bootstrap_prompt_base(PROJECT)
         );
         assert!(!start["params"]["input"][0]["text"]
             .as_str()

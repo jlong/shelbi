@@ -29,6 +29,12 @@ pub enum EventsCmd {
         /// and *all* matching lines are printed.
         #[arg(long)]
         since: Option<String>,
+        /// Only show lines scoped to this project (`project=<name>`). This is
+        /// the passive, *non-consuming* accelerator the orchestrator watches:
+        /// it never claims from the durable delivery queue, so it can run
+        /// alongside `orchestrator events next` without starving that drain.
+        #[arg(long)]
+        project: Option<String>,
         /// Stream new transitions as they're appended. Exit on Ctrl-C.
         #[arg(short = 'f', long)]
         follow: bool,
@@ -45,10 +51,24 @@ pub fn run(cmd: EventsCmd) -> Result<()> {
         EventsCmd::Tail {
             lines,
             since,
+            project,
             follow,
             format,
-        } => tail(lines, since, follow, format),
+        } => tail(lines, since, project, follow, format),
     }
+}
+
+/// Whether a raw `events.log` line is scoped to `project`. A passive tail
+/// filter, so it keys only on the modern `project=<name>` field the unified
+/// stream always carries; legacy lines that predate project scoping are
+/// excluded rather than guessed at. `None` keeps every line (hub-global tail).
+fn line_in_project(line: &str, project: Option<&str>) -> bool {
+    let Some(project) = project else {
+        return true;
+    };
+    line.split_whitespace()
+        .filter_map(|tok| tok.strip_prefix("project="))
+        .any(|p| p == project)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -57,24 +77,39 @@ pub enum EventFormat {
     Envelope,
 }
 
-fn tail(lines: usize, since: Option<String>, follow: bool, format: EventFormat) -> Result<()> {
+fn tail(
+    lines: usize,
+    since: Option<String>,
+    project: Option<String>,
+    follow: bool,
+    format: EventFormat,
+) -> Result<()> {
     let path = shelbi_state::events_log_path().map_err(|e| anyhow!(e))?;
+    let project = project.as_deref();
 
     let (initial, end_offset) = match fs::read(&path) {
         Ok(buf) => {
             let len = buf.len() as u64;
             let text = String::from_utf8_lossy(&buf).into_owned();
+            // Project scoping applies at every stage: the `-n` window and the
+            // `--since` cutoff both count from the project's own lines, not the
+            // hub-global stream, so `-n 20 --project foo` shows the last 20 foo
+            // lines rather than whatever 20 happen to trail the shared log.
+            let scoped: Vec<&str> = text
+                .lines()
+                .filter(|line| line_in_project(line, project))
+                .collect();
             let filtered: Vec<&str> = if let Some(spec) = since.as_deref() {
                 let cutoff = Utc::now()
                     - chrono::Duration::from_std(parse_duration(spec)?)
                         .map_err(|e| anyhow!("duration `{spec}` out of range: {e}"))?;
-                text.lines()
+                scoped
+                    .into_iter()
                     .filter(|line| line_after(line, cutoff))
                     .collect()
             } else {
-                let all: Vec<&str> = text.lines().collect();
-                let start = all.len().saturating_sub(lines);
-                all[start..].to_vec()
+                let start = scoped.len().saturating_sub(lines);
+                scoped[start..].to_vec()
             };
             let initial = filtered
                 .iter()
@@ -94,14 +129,19 @@ fn tail(lines: usize, since: Option<String>, follow: bool, format: EventFormat) 
         return Ok(());
     }
 
-    follow_from(&path, end_offset, format)
+    follow_from(&path, end_offset, project, format)
 }
 
 /// `tail -f` shape: park at `start_offset` and print any newly appended
 /// bytes. Polling cadence (250ms) matches the workspace poller's typical
 /// inter-tick gap — fast enough to feel live, slow enough that a 10-workspace
 /// project barely touches the filesystem.
-fn follow_from(path: &std::path::PathBuf, start_offset: u64, format: EventFormat) -> Result<()> {
+fn follow_from(
+    path: &std::path::PathBuf,
+    start_offset: u64,
+    project: Option<&str>,
+    format: EventFormat,
+) -> Result<()> {
     let interval = Duration::from_millis(250);
     let mut offset = start_offset;
     let mut pending = String::new();
@@ -136,7 +176,7 @@ fn follow_from(path: &std::path::PathBuf, start_offset: u64, format: EventFormat
         while let Some(nl) = pending.find('\n') {
             let line = pending[..nl].to_string();
             pending.drain(..=nl);
-            if !line.is_empty() {
+            if !line.is_empty() && line_in_project(&line, project) {
                 print_event(&line, format)?;
             }
         }
@@ -227,6 +267,29 @@ mod tests {
         let recent = "2026-06-19T12:00:01+00:00 workspace=alpha working -> awaiting_input";
         assert!(!line_after(old, cutoff));
         assert!(line_after(recent, cutoff));
+    }
+
+    #[test]
+    fn line_in_project_matches_only_the_scoped_field() {
+        let mine = "2026-01-02T03:04:05+00:00 project=demo workspace=alpha working -> idle";
+        let other = "2026-01-02T03:04:06+00:00 project=other workspace=beta working -> idle";
+        // A legacy line predating project scoping carries no `project=` field.
+        let legacy = "2026-01-02T03:04:07+00:00 workspace=gamma none -> working";
+
+        // No filter keeps every line (hub-global tail).
+        assert!(line_in_project(mine, None));
+        assert!(line_in_project(legacy, None));
+
+        // Scoped to `demo`: only the demo line survives; a same-workspace-name
+        // line in another project must not leak through, and an unscoped legacy
+        // line is excluded rather than guessed at.
+        assert!(line_in_project(mine, Some("demo")));
+        assert!(!line_in_project(other, Some("demo")));
+        assert!(!line_in_project(legacy, Some("demo")));
+
+        // A substring of a project name must not match — `project=demo` is not
+        // in scope `dem`.
+        assert!(!line_in_project(mine, Some("dem")));
     }
 
     #[test]
