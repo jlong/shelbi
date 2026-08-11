@@ -50,6 +50,8 @@ fn test_project() -> Project {
         machines: Vec::new(),
         editor: None,
         workspaces: Vec::new(),
+        runners: Default::default(),
+        agents: Default::default(),
         detected_shapes: Vec::new(),
     }
 }

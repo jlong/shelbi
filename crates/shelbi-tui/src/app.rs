@@ -1776,6 +1776,8 @@ mod tests {
                 branch_prefix: Some("shelbi".into()),
                 ..Default::default()
             },
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         }
     }

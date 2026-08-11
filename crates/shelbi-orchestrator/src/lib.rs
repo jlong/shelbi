@@ -3630,6 +3630,8 @@ mod reload_target_tmux_tests {
             }],
             editor: None,
             workspaces: Vec::new(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -4423,6 +4425,8 @@ mod reload_workspace_tmux_tests {
             workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
         };

@@ -7,7 +7,7 @@
 //! (`session_id`, `--resume`, streaming JSON), but the v1 surface stays
 //! intentionally minimal.
 
-use shelbi_core::{AgentRunnerSpec, CapabilityLadder, RunnerKind};
+use shelbi_core::{AgentRunnerSpec, CapabilityLadder, ReasoningEffort, RunnerKind};
 
 /// POSIX shell-quoting, re-exported from `shelbi-core` so the historical
 /// `shelbi_agent::shell_escape` path keeps working for the command-string
@@ -201,6 +201,77 @@ impl RunnerAdapter {
         out
     }
 
+    /// Return a copy of `spec` with the resolved `model` injected as the
+    /// runner's model-selection flag. This is the adapter's job — a `model`
+    /// like `claude-opus-4-8` is a *logical* value; the flag that carries it is
+    /// runner-specific (`--model` for Claude and Codex; nothing for a generic
+    /// runner Shelbi can't drive). When the resolved model takes precedence over
+    /// a model already baked into `flags` (the legacy `--model` in `agent_runners`
+    /// form), the stale flag pair is stripped first so the launched line carries
+    /// exactly one model. `None` (nothing resolved) returns the spec unchanged so
+    /// a project still relying on model-in-flags keeps working.
+    pub fn with_model(self, spec: &AgentRunnerSpec, model: Option<&str>) -> AgentRunnerSpec {
+        let Some(model) = model else {
+            return spec.clone();
+        };
+        let flag = match self.kind {
+            // Claude and Codex both select the model with `--model <id>`.
+            RunnerKind::Claude | RunnerKind::Codex => "--model",
+            // A generic runner has no model contract Shelbi knows how to drive.
+            RunnerKind::Generic => return spec.clone(),
+        };
+        let mut out = spec.clone();
+        out.flags = strip_flag_with_value(&out.flags, &["--model", "-m"]);
+        out.flags.push(flag.into());
+        out.flags.push(model.into());
+        out
+    }
+
+    /// Return a copy of `spec` with the resolved `reasoning_effort` injected as
+    /// the runner's effort knob. Per-adapter mapping: Claude takes `--effort
+    /// <level>` (its `low`/`medium`/`high`/`max` scale lines up 1:1); Codex takes
+    /// a config override `-c model_reasoning_effort="<value>"`, and since Codex's
+    /// top tier is `xhigh` the `Max` level lands there. A generic runner has no
+    /// effort contract, so it's a no-op. `None` returns the spec unchanged.
+    /// Idempotent-ish: if the same effort flag is already present it isn't added
+    /// twice.
+    pub fn with_reasoning_effort(
+        self,
+        spec: &AgentRunnerSpec,
+        effort: Option<ReasoningEffort>,
+    ) -> AgentRunnerSpec {
+        let Some(effort) = effort else {
+            return spec.clone();
+        };
+        match self.kind {
+            RunnerKind::Claude => {
+                if spec
+                    .flags
+                    .iter()
+                    .any(|f| f == "--effort" || f.starts_with("--effort="))
+                {
+                    return spec.clone();
+                }
+                let mut out = spec.clone();
+                out.flags.push("--effort".into());
+                out.flags.push(effort.as_str().into());
+                out
+            }
+            RunnerKind::Codex => {
+                let value = codex_effort_value(effort);
+                let override_arg = format!("model_reasoning_effort=\"{value}\"");
+                if spec.flags.iter().any(|f| f == &override_arg) {
+                    return spec.clone();
+                }
+                let mut out = spec.clone();
+                out.flags.push("-c".into());
+                out.flags.push(override_arg);
+                out
+            }
+            RunnerKind::Generic => spec.clone(),
+        }
+    }
+
     /// Return a copy of `spec` with `--continue` appended when this runner is
     /// `claude` and `resume` is set. See the free [`with_continue`] wrapper
     /// for the full rationale.
@@ -253,6 +324,58 @@ pub fn with_permission_mode(spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSp
 /// in `flags` isn't given a second copy.
 pub fn with_continue(spec: &AgentRunnerSpec, resume: bool) -> AgentRunnerSpec {
     RunnerAdapter::for_spec(spec).with_continue(spec, resume)
+}
+
+/// Free-function form of [`RunnerAdapter::with_model`] — detects the runner
+/// kind from `spec`, then injects the resolved model as the runner's
+/// model-selection flag. `None` returns the spec unchanged.
+pub fn with_model(spec: &AgentRunnerSpec, model: Option<&str>) -> AgentRunnerSpec {
+    RunnerAdapter::for_spec(spec).with_model(spec, model)
+}
+
+/// Free-function form of [`RunnerAdapter::with_reasoning_effort`].
+pub fn with_reasoning_effort(
+    spec: &AgentRunnerSpec,
+    effort: Option<ReasoningEffort>,
+) -> AgentRunnerSpec {
+    RunnerAdapter::for_spec(spec).with_reasoning_effort(spec, effort)
+}
+
+/// Codex's `model_reasoning_effort` accepts `minimal|low|medium|high|xhigh`;
+/// Shelbi's scale tops out at `Max`, which maps onto Codex's highest tier
+/// (`xhigh`). The rest map 1:1.
+fn codex_effort_value(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Max => "xhigh",
+    }
+}
+
+/// Remove any `--flag value` (or `--flag=value`) pairs whose flag name matches
+/// one of `names`, preserving the order of everything else. Used to drop a
+/// stale model flag before injecting the resolved one so a launched command
+/// never carries two `--model`s.
+fn strip_flag_with_value(flags: &[String], names: &[&str]) -> Vec<String> {
+    let mut out = Vec::with_capacity(flags.len());
+    let mut skip_next = false;
+    for f in flags {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        // `--flag=value` — a single token; drop it outright.
+        if names.iter().any(|n| f == n || f.starts_with(&format!("{n}="))) {
+            // Bare `--flag` consumes the following value token too.
+            if names.iter().any(|n| f == n) {
+                skip_next = true;
+            }
+            continue;
+        }
+        out.push(f.clone());
+    }
+    out
 }
 
 /// How a runner receives hub→workspace messages (a `shelbi message`).
@@ -720,5 +843,100 @@ mod tests {
         };
         let out = with_continue(&spec, true);
         assert_eq!(out.flags, vec!["--permission-mode", "auto", "--continue"]);
+    }
+
+    fn bare(command: &str) -> AgentRunnerSpec {
+        AgentRunnerSpec {
+            command: command.into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        }
+    }
+
+    #[test]
+    fn with_model_injects_claude_model_flag() {
+        let out = with_model(&bare("claude"), Some("claude-opus-4-8"));
+        assert_eq!(out.flags, vec!["--model", "claude-opus-4-8"]);
+    }
+
+    #[test]
+    fn with_model_injects_codex_model_flag() {
+        let out = with_model(&bare("codex"), Some("gpt-5"));
+        assert_eq!(out.flags, vec!["--model", "gpt-5"]);
+    }
+
+    #[test]
+    fn with_model_none_leaves_spec_untouched() {
+        // No resolved model → model-in-flags (legacy `agent_runners`) survives.
+        let mut spec = bare("claude");
+        spec.flags = vec!["--model".into(), "claude-opus-4-8".into()];
+        let out = with_model(&spec, None);
+        assert_eq!(out.flags, vec!["--model", "claude-opus-4-8"]);
+    }
+
+    #[test]
+    fn with_model_replaces_legacy_model_in_flags() {
+        // A resolved model takes precedence over a `--model` baked into flags;
+        // the launched line must carry exactly one model.
+        let mut spec = bare("claude");
+        spec.flags = vec![
+            "--model".into(),
+            "claude-sonnet-5".into(),
+            "--verbose".into(),
+        ];
+        let out = with_model(&spec, Some("claude-opus-4-8"));
+        assert_eq!(out.flags, vec!["--verbose", "--model", "claude-opus-4-8"]);
+    }
+
+    #[test]
+    fn with_model_is_noop_for_generic_runner() {
+        let out = with_model(&bare("aider"), Some("gpt-5"));
+        assert!(out.flags.is_empty(), "generic runner has no model contract");
+    }
+
+    #[test]
+    fn with_reasoning_effort_injects_claude_effort_flag() {
+        let out = with_reasoning_effort(&bare("claude"), Some(ReasoningEffort::High));
+        assert_eq!(out.flags, vec!["--effort", "high"]);
+    }
+
+    #[test]
+    fn with_reasoning_effort_maps_max_to_codex_xhigh() {
+        let out = with_reasoning_effort(&bare("codex"), Some(ReasoningEffort::Max));
+        assert_eq!(out.flags, vec!["-c", "model_reasoning_effort=\"xhigh\""]);
+    }
+
+    #[test]
+    fn with_reasoning_effort_codex_low_medium_high_pass_through() {
+        let out = with_reasoning_effort(&bare("codex"), Some(ReasoningEffort::Medium));
+        assert_eq!(out.flags, vec!["-c", "model_reasoning_effort=\"medium\""]);
+    }
+
+    #[test]
+    fn with_reasoning_effort_none_is_noop() {
+        let out = with_reasoning_effort(&bare("claude"), None);
+        assert!(out.flags.is_empty());
+    }
+
+    #[test]
+    fn with_reasoning_effort_is_noop_for_generic_runner() {
+        let out = with_reasoning_effort(&bare("aider"), Some(ReasoningEffort::High));
+        assert!(out.flags.is_empty());
+    }
+
+    #[test]
+    fn model_and_effort_compose_for_claude() {
+        // The dispatch path applies model then effort; both reach the launched
+        // Claude command line via the adapter.
+        let out = with_reasoning_effort(
+            &with_model(&bare("claude"), Some("claude-opus-4-8")),
+            Some(ReasoningEffort::High),
+        );
+        assert_eq!(
+            out.flags,
+            vec!["--model", "claude-opus-4-8", "--effort", "high"]
+        );
     }
 }

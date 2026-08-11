@@ -46,10 +46,12 @@ pub use root::{
 };
 
 pub use agent_workspaces::{
-    agent_divergence, agent_instructions_path, agent_settings_path, agent_shared_preamble_path,
+    agent_divergence, agent_instructions_path, agent_manifest_path, agent_settings_path,
+    agent_shared_preamble_path,
     agent_skills_dir, agent_workspace_dir, classify_agent_divergence, compose_agent_prompt,
     content_hash, count_agent_skills, default_agent_body, default_agent_settings, is_default_agent,
-    legacy_claude_md_path, list_agents, load_agent_settings, load_shared_preamble,
+    legacy_claude_md_path, list_agents, load_agent_manifest, load_agent_settings,
+    load_shared_preamble,
     materialize_default_agents, maybe_emit_claude_md_migration_hint, orchestrator_handoff_path,
     reset_claude_md_migration_hint, self_heal_default_agents, self_heal_orchestrator_agent,
     take_orchestrator_handoff, AgentDivergence, AgentMaterializeOutcome, BundledAgent, BundledSkill,
@@ -3018,6 +3020,8 @@ mod tests {
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
