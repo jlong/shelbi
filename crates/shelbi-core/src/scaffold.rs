@@ -468,7 +468,7 @@ workspaces:
 - name: dev
   machine: hub
   runner: claude
-- name: rev
+- name: review
   machine: hub
   runner: claude
   tags:
@@ -516,7 +516,7 @@ agent_runners:
             .machines
             .iter()
             .any(|m| m.host.as_deref() == Some("devbox.local")));
-        // The two active slots (dev + rev) plus the uncommented extra (bob).
+        // The two active slots (dev + review) plus the uncommented extra (bob).
         assert_eq!(p.workspaces.len(), 3);
         assert!(p.workspaces.iter().any(|w| w.runner == "codex"));
         assert!(p

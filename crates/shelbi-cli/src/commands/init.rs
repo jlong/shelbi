@@ -497,7 +497,7 @@ fn render_project_yaml(
                 tags: vec![],
             },
             WorkspaceYaml {
-                name: "rev",
+                name: "review",
                 machine: "hub",
                 runner: "claude",
                 tags: vec!["review"],
@@ -1222,7 +1222,7 @@ mod tests {
         assert!(project
             .workspaces
             .iter()
-            .any(|w| project.effective_tags(w).contains("review")));
+            .any(|w| w.name == "review" && project.effective_tags(w).contains("review")));
     }
 
     /// The id lives in the filename, so the scaffolded YAML carries the
@@ -1281,7 +1281,7 @@ mod tests {
             assert!(yaml.contains(needle), "missing commented section {needle}");
         }
         // The commented extras stay inert: the parsed project carries only the
-        // active starter pool (dev + rev) and one machine until the user opts in.
+        // active starter pool (dev + review) and one machine until the user opts in.
         let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(project.workspaces.len(), 2);
         assert_eq!(project.machines.len(), 1);
