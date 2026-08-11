@@ -1312,7 +1312,7 @@ fn record_limit_recovery_from_screen(
     if !workspace_is_paused(&workspace.name, last_known) {
         return false;
     }
-    let observed = if shelbi_orchestrator::ready::is_claude_busy(screen) {
+    let observed = if shelbi_orchestrator::ready::is_claude_working(screen) {
         Some(WorkspaceState::Working)
     } else if shelbi_orchestrator::ready::is_input_ready(screen)
         && !shelbi_orchestrator::submit::input_holds_unsubmitted_prompt(screen, LIMIT_RESUME_PROMPT)
@@ -2672,10 +2672,12 @@ struct PollOutcome {
 ///
 /// Returns `None` when neither signal is present (startup, a modal, a
 /// mid-repaint capture) so the caller falls back to the title marker. Busy is
-/// checked first: while a turn runs the footer shows `esc to interrupt` and the
-/// input box is not offered.
+/// checked first, via [`ready::is_claude_working`]: current Claude builds draw
+/// the input box footer *even mid-turn* and drop the `esc to interrupt` hint
+/// from their compact spinner (`✻ Crunching… (1m · ↓ 39k tokens)`), so the
+/// live spinner row — not the footer alone — is what proves a turn is running.
 fn live_workspace_state(screen: &str) -> Option<WorkspaceState> {
-    if shelbi_orchestrator::ready::is_claude_busy(screen) {
+    if shelbi_orchestrator::ready::is_claude_working(screen) {
         Some(WorkspaceState::Working)
     } else if shelbi_orchestrator::ready::is_input_ready(screen) {
         Some(WorkspaceState::AwaitingInput)
@@ -3723,6 +3725,34 @@ mod tests {
             last_transition: Some(ts(50)),
         });
         let resumed = live_workspace_state("· Working… esc to interrupt").unwrap();
+        let out = decide("alpha", Some("t".into()), prior, resumed, ts(200));
+        assert!(out.transitioned);
+        assert_eq!(out.prev_state, Some(WorkspaceState::AwaitingInput));
+        assert_eq!(out.status.state, WorkspaceState::Working);
+        assert_eq!(out.status.last_transition, ts(200));
+    }
+
+    #[test]
+    fn live_compact_spinner_clears_latched_awaiting_input() {
+        // THE MISSED REAL-WORLD EDGE (captured live 2026-08-11): current Claude
+        // builds draw the input-box footer even mid-turn and drop `esc to
+        // interrupt` from the compact spinner, so the resumed pane matches
+        // `is_input_ready` while a turn runs. Before this fix `live_workspace_state`
+        // read that as AwaitingInput and the `?` never cleared even as the worker
+        // ground away. The live spinner row must drive `awaiting_input -> working`.
+        let resumed_screen = "\
+✻ Crunching… (2m 3s · ↓ 12.4k tokens)
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+        let prior = Some(PriorState {
+            state: WorkspaceState::AwaitingInput,
+            last_transition: Some(ts(50)),
+        });
+        let resumed = live_workspace_state(resumed_screen)
+            .expect("a live spinner row must resolve to a state");
+        assert_eq!(resumed, WorkspaceState::Working);
         let out = decide("alpha", Some("t".into()), prior, resumed, ts(200));
         assert!(out.transitioned);
         assert_eq!(out.prev_state, Some(WorkspaceState::AwaitingInput));
