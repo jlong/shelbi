@@ -1592,6 +1592,94 @@ pub struct StartSpec<'a> {
     pub agent: Option<&'a str>,
 }
 
+/// The runner spec + permission mode a dispatch should launch with, after the
+/// agent-manifest resolution chain. Returned by [`resolve_workspace_launch`].
+pub struct ResolvedWorkspaceLaunch {
+    /// The concrete runner spec — the launcher for the resolved runner kind,
+    /// with the resolved `model` / `reasoning_effort` already injected as launch
+    /// flags via the adapter.
+    pub runner: shelbi_core::AgentRunnerSpec,
+    /// The permission mode, clamped to the project ceiling (never escalated).
+    pub permission_mode: String,
+}
+
+/// Resolve which runner spec + permission mode a dispatch launches with, given
+/// the agent (role) it's dispatching. This is the single seam both launch paths
+/// go through — the remote/SSH [`deploy_and_spawn`] and the local
+/// `shelbi open --as-pane` wrapper — so the two can't drift on which model /
+/// effort / permission mode an agent runs with.
+///
+/// The chain (see [`shelbi_core::resolve_agent_launch`]): project
+/// `agents.<name>.runner` → manifest `preferred_runner` → built-in default for
+/// the kind; project `runners.<kind>` → manifest `runners.<kind>` → default for
+/// model/effort; and the project's `workspace_permissions_mode` clamps the
+/// agent's requested `permissions_mode` down.
+///
+/// `Workspace.runner` is retained as the **fallback** for this migration
+/// window: it supplies the concrete launcher when the project declares no
+/// top-level `runners.<kind>` fleet entry, and it's the whole answer when no
+/// agent is being dispatched (a bare sidebar-click pane) or the agent ships no
+/// manifest and the project adds no override.
+pub fn resolve_workspace_launch(
+    project: &shelbi_core::Project,
+    workspace: &WorkspaceSpec,
+    agent: Option<&str>,
+) -> Result<ResolvedWorkspaceLaunch> {
+    // Migration-window fallback base: the workspace's own runner.
+    let workspace_runner = project
+        .runner(&workspace.runner)
+        .ok_or_else(|| Error::UnknownRunner(workspace.runner.clone()))?
+        .clone();
+
+    // No agent (bare pane) → nothing role-specific to resolve.
+    let Some(agent) = agent else {
+        return Ok(ResolvedWorkspaceLaunch {
+            runner: workspace_runner,
+            permission_mode: project.workspace_permissions_mode.clone(),
+        });
+    };
+
+    let manifest = shelbi_state::load_agent_manifest(&project.name, agent)
+        .map_err(|e| Error::Other(format!("loading agent.yaml for agent `{agent}`: {e}")))?;
+
+    // Pure back-compat shortcut: nothing anywhere selects a runner/model for
+    // this agent (no manifest, no per-agent project pin, no runner fleet), so
+    // the resolution would just reproduce the workspace runner + project mode.
+    if manifest.is_none() && !project.agents.contains_key(agent) && project.runners.is_empty() {
+        return Ok(ResolvedWorkspaceLaunch {
+            runner: workspace_runner,
+            permission_mode: project.workspace_permissions_mode.clone(),
+        });
+    }
+
+    let resolved = shelbi_core::resolve_agent_launch(project, agent, manifest.as_ref());
+
+    // Concrete launcher for the resolved kind: the project fleet entry when
+    // present, else the workspace's own runner (migration fallback).
+    let base = shelbi_core::project_runner_spec(project, resolved.kind)
+        .cloned()
+        .unwrap_or(workspace_runner);
+
+    // Only inject the resolved model/effort when the concrete launcher actually
+    // *is* the resolved kind. If we fell back to a different-kind workspace
+    // runner (the preferred kind has no fleet entry — graceful degradation),
+    // cross-injecting one kind's model onto another's launcher would be wrong.
+    let base_kind = shelbi_agent::RunnerAdapter::for_spec(&base).kind();
+    let runner = if base_kind == resolved.kind {
+        shelbi_agent::with_reasoning_effort(
+            &shelbi_agent::with_model(&base, resolved.model.as_deref()),
+            resolved.effort,
+        )
+    } else {
+        base
+    };
+
+    Ok(ResolvedWorkspaceLaunch {
+        runner,
+        permission_mode: resolved.permission_mode,
+    })
+}
+
 /// Tear down the workspace's pane, switch its worktree to `branch` (creating
 /// the worktree off `default_branch` and the branch off `default_branch` if
 /// needed), and start the runner with an initial prompt. Bails on a dirty
@@ -1602,11 +1690,15 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         .machine(&spec.workspace.machine)
         .ok_or_else(|| Error::UnknownMachine(spec.workspace.machine.clone()))?
         .clone();
-    let runner = spec
-        .project
-        .runner(&spec.workspace.runner)
-        .ok_or_else(|| Error::UnknownRunner(spec.workspace.runner.clone()))?
-        .clone();
+    // Resolve the runner (kind + model + effort) and permission mode from the
+    // dispatched agent's manifest chain — falling back to `Workspace.runner`
+    // when no agent/manifest/override selects one. The local `--as-pane`
+    // wrapper re-derives the same result from `$SHELBI_AGENT` so the two paths
+    // launch identically.
+    let ResolvedWorkspaceLaunch {
+        runner,
+        permission_mode,
+    } = resolve_workspace_launch(spec.project, spec.workspace, spec.agent)?;
 
     let host = machine.host();
     let worktree = workspace_worktree(&machine, spec.workspace);
@@ -1624,7 +1716,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //     prompt on every command — exactly the bug we're trying to avoid.
     //     Surface it up front so the failure mode is "shelbi rejected this
     //     machine" instead of "my workspace keeps pausing for no reason."
-    require_auto_mode_supported(&host, &runner, &spec.project.workspace_permissions_mode)?;
+    require_auto_mode_supported(&host, &runner, &permission_mode)?;
 
     // 0b. Clear any stale review marker left in the worktree from a previous
     //     task before we reuse the worktree — otherwise the poller could read
@@ -1727,6 +1819,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         project: spec.project,
         workspace: spec.workspace,
         runner: &runner,
+        permission_mode: &permission_mode,
         host: &host,
         worktree: &worktree,
         addr: &addr,
@@ -1775,11 +1868,11 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         .machine(&spec.workspace.machine)
         .ok_or_else(|| Error::UnknownMachine(spec.workspace.machine.clone()))?
         .clone();
-    let runner = spec
-        .project
-        .runner(&spec.workspace.runner)
-        .ok_or_else(|| Error::UnknownRunner(spec.workspace.runner.clone()))?
-        .clone();
+    // Same manifest-chain resolution as the dev-start path.
+    let ResolvedWorkspaceLaunch {
+        runner,
+        permission_mode,
+    } = resolve_workspace_launch(spec.project, spec.workspace, spec.agent)?;
 
     let host = machine.host();
     let worktree = workspace_worktree(&machine, spec.workspace);
@@ -1789,7 +1882,7 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // same rationale as the dev path. Held until this function returns.
     let _dispatch_lock = shelbi_state::lock_workspace(&spec.project.name, &spec.workspace.name)?;
 
-    require_auto_mode_supported(&host, &runner, &spec.project.workspace_permissions_mode)?;
+    require_auto_mode_supported(&host, &runner, &permission_mode)?;
 
     // Clear any stale review marker before we relaunch so the poller can't read
     // an old task id and misfire. A task being resumed is in `in_progress`, so
@@ -1852,6 +1945,7 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         project: spec.project,
         workspace: spec.workspace,
         runner: &runner,
+        permission_mode: &permission_mode,
         host: &host,
         worktree: &worktree,
         addr: &addr,
@@ -1871,6 +1965,11 @@ struct SpawnArgs<'a> {
     project: &'a Project,
     workspace: &'a WorkspaceSpec,
     runner: &'a shelbi_core::AgentRunnerSpec,
+    /// Permission mode already clamped to the project ceiling (see
+    /// [`resolve_workspace_launch`]). Threaded here rather than re-read from
+    /// `project.workspace_permissions_mode` so an agent's tighter request
+    /// reaches the launch command.
+    permission_mode: &'a str,
     host: &'a Host,
     worktree: &'a Path,
     addr: &'a TmuxAddr,
@@ -2031,6 +2130,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
                 session: &a.addr.session,
                 window: &a.addr.window,
                 task_id: a.task_id,
+                agent: a.agent,
                 project: &a.project.name,
                 hub_sock: &hub_sock.to_string_lossy(),
                 pane_cmd: &pane_cmd,
@@ -2063,7 +2163,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
             // (`shelbi open --as-pane`) uses, so the two host paths can't drift.
             let launch = workspace_launch_command_with_startup_prompt(
                 a.runner,
-                &a.project.workspace_permissions_mode,
+                a.permission_mode,
                 a.agent.is_some(),
                 a.resume,
                 startup_prompt_rel,
@@ -3586,6 +3686,11 @@ struct LocalPaneTmuxArgs<'a> {
     session: &'a str,
     window: &'a str,
     task_id: &'a str,
+    /// The dispatched agent (role). Injected as `SHELBI_AGENT` so the
+    /// `--as-pane` wrapper re-resolves the same runner/model/effort/permission
+    /// mode from the agent manifest chain instead of re-deriving it from the
+    /// workspace runner. `None` on a bare (agentless) launch.
+    agent: Option<&'a str>,
     project: &'a str,
     hub_sock: &'a str,
     /// Deterministic dev-server port for a review workspace, injected as
@@ -3635,6 +3740,14 @@ fn local_pane_tmux_argv(a: LocalPaneTmuxArgs<'_>) -> Vec<String> {
     argv.push(project_env);
     argv.push("-e".into());
     argv.push(hub_env);
+    // The dispatched agent (role), so the `--as-pane` wrapper resolves the same
+    // runner/model/effort/permission mode from the manifest chain the dispatch
+    // path used. Omitted on a bare (agentless) launch — the wrapper then falls
+    // back to the workspace runner.
+    if let Some(agent) = a.agent {
+        argv.push("-e".into());
+        argv.push(format!("SHELBI_AGENT={agent}"));
+    }
     // Review workspaces pin a deterministic dev-server PORT so the review
     // agent binds a slot that won't collide with a concurrent review
     // workspace. Dev workspaces pass `None` and get none.
@@ -4991,8 +5104,163 @@ mod tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         }
+    }
+
+    /// Write an `agent.yaml` under `<SHELBI_HOME>/projects/<project>/agents/<name>/`.
+    fn write_agent_manifest(home: &Path, project: &str, agent: &str, yaml: &str) {
+        let dir = home.join(format!("projects/{project}/agents/{agent}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.yaml"), yaml).unwrap();
+    }
+
+    /// End-to-end resolution through `resolve_workspace_launch`: a Claude agent
+    /// manifest declaring a model + effort, resolved against a project that
+    /// carries a top-level `runners.claude` fleet entry, reaches the launched
+    /// command as `--model` / `--effort` flags via the adapter. The `read-only`
+    /// request clamps to the project's `auto` ceiling (→ claude `plan`).
+    #[test]
+    fn resolve_workspace_launch_injects_model_effort_and_clamps_perms() {
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("resolve-launch-claude");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_agent_manifest(
+            &home,
+            "myapp",
+            "review",
+            "name: review\npreferred_runner: claude\nrunners:\n  claude:\n    model: claude-opus-4-8\n    reasoning_effort: high\npermissions_mode: read-only\n",
+        );
+
+        // Project ships a top-level claude fleet entry (the concrete launcher).
+        let mut project = fixture_project();
+        project.runners.insert(
+            shelbi_core::RunnerKind::Claude,
+            shelbi_core::ProjectRunnerConfig {
+                spec: AgentRunnerSpec {
+                    command: "claude".into(),
+                    flags: vec![],
+                    prompt_injection: None,
+                    dialog_signatures: vec![],
+                    integration: None,
+                },
+                model: None,
+                reasoning_effort: None,
+            },
+        );
+
+        let resolved =
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("review")).unwrap();
+        assert_eq!(resolved.runner.command, "claude");
+        assert_eq!(
+            resolved.runner.flags,
+            vec!["--model", "claude-opus-4-8", "--effort", "high"]
+        );
+        // `read-only` request ≤ `auto` ceiling → honored, mapped to claude `plan`.
+        assert_eq!(resolved.permission_mode, "plan");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Two agents in the same project resolve to different (runner, model)
+    /// pairs — the milestone's differentiation acceptance. `review` runs Claude
+    /// on Opus; `developer` runs Codex on gpt-5 (with its own effort), because
+    /// the project pins developer onto the codex kind.
+    #[test]
+    fn resolve_workspace_launch_differentiates_two_agents() {
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("resolve-launch-two");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_agent_manifest(
+            &home,
+            "myapp",
+            "review",
+            "name: review\npreferred_runner: claude\nrunners:\n  claude:\n    model: claude-opus-4-8\n",
+        );
+        write_agent_manifest(
+            &home,
+            "myapp",
+            "developer",
+            "name: developer\npreferred_runner: claude\nrunners:\n  claude:\n    model: claude-sonnet-5\n  codex:\n    model: gpt-5\n    reasoning_effort: high\n",
+        );
+
+        let mut project = fixture_project();
+        // Fleet: both kinds available as concrete launchers.
+        for (kind, cmd) in [
+            (shelbi_core::RunnerKind::Claude, "claude"),
+            (shelbi_core::RunnerKind::Codex, "codex"),
+        ] {
+            project.runners.insert(
+                kind,
+                shelbi_core::ProjectRunnerConfig {
+                    spec: AgentRunnerSpec {
+                        command: cmd.into(),
+                        flags: vec![],
+                        prompt_injection: None,
+                        dialog_signatures: vec![],
+                        integration: None,
+                    },
+                    model: None,
+                    reasoning_effort: None,
+                },
+            );
+        }
+        // Project pins developer onto codex (authoritative over the manifest's
+        // claude preference); review keeps its manifest's claude default.
+        project.agents.insert(
+            "developer".into(),
+            shelbi_core::ProjectAgentConfig {
+                runner: Some(shelbi_core::RunnerKind::Codex),
+            },
+        );
+
+        let review =
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("review")).unwrap();
+        let developer =
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("developer")).unwrap();
+
+        assert_eq!(review.runner.command, "claude");
+        assert_eq!(review.runner.flags, vec!["--model", "claude-opus-4-8"]);
+
+        assert_eq!(developer.runner.command, "codex");
+        assert_eq!(
+            developer.runner.flags,
+            vec!["--model", "gpt-5", "-c", "model_reasoning_effort=\"high\""]
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// No manifest, no project override → pure back-compat: the workspace's own
+    /// runner and the project-wide permission mode, untouched.
+    #[test]
+    fn resolve_workspace_launch_falls_back_to_workspace_runner() {
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("resolve-launch-fallback");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        // Agent name with no agent.yaml on disk and no project override.
+        let resolved =
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("developer")).unwrap();
+        assert_eq!(resolved.runner.command, "claude");
+        assert!(resolved.runner.flags.is_empty());
+        assert_eq!(resolved.permission_mode, "auto");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -8273,6 +8541,7 @@ mod rebase_git_tests {
             session: "shelbi-demo",
             window: "alpha",
             task_id: "feat-race",
+            agent: None,
             project: "demo",
             hub_sock: "/tmp/shelbi-hub.sock",
             port: None,
@@ -8331,6 +8600,7 @@ mod rebase_git_tests {
             session: "shelbi-demo",
             window: "bravo",
             task_id: "bug-x",
+            agent: None,
             project: "demo",
             hub_sock: "/Users/dev/.shelbi/hub.sock",
             port: None,
@@ -8357,6 +8627,7 @@ mod rebase_git_tests {
             session: "shelbi-demo",
             window: "review-2",
             task_id: "fix-login",
+            agent: None,
             project: "demo",
             hub_sock: "/tmp/shelbi-hub.sock",
             port: Some(3010),
@@ -8377,6 +8648,49 @@ mod rebase_git_tests {
         assert!(
             port_at < sh_at,
             "PORT must precede the sh -c positional: {argv:?}"
+        );
+    }
+
+    /// The dispatched agent name rides a `-e SHELBI_AGENT=<name>` triplet so
+    /// the local `--as-pane` wrapper can re-resolve the same runner/model/effort
+    /// the dispatch chose, before the final `sh -c` positional. A bare
+    /// (agentless) launch injects no such triplet.
+    #[test]
+    fn local_pane_tmux_argv_injects_agent_name() {
+        let argv = local_pane_tmux_argv(LocalPaneTmuxArgs {
+            create_new_session: true,
+            session: "shelbi-demo",
+            window: "alpha",
+            task_id: "feat-x",
+            agent: Some("review"),
+            project: "demo",
+            hub_sock: "/tmp/shelbi-hub.sock",
+            port: None,
+            pane_cmd: "shelbi --project demo open alpha --as-pane",
+        });
+        let at = argv
+            .iter()
+            .position(|s| s == "SHELBI_AGENT=review")
+            .unwrap_or_else(|| panic!("SHELBI_AGENT -e missing: {argv:?}"));
+        assert_eq!(argv[at - 1], "-e", "agent payload not preceded by -e: {argv:?}");
+        let sh_at = argv.iter().position(|s| s == "sh").unwrap();
+        assert!(at < sh_at, "SHELBI_AGENT must precede the sh -c positional: {argv:?}");
+
+        // Agentless launch → no SHELBI_AGENT triplet.
+        let bare = local_pane_tmux_argv(LocalPaneTmuxArgs {
+            create_new_session: true,
+            session: "shelbi-demo",
+            window: "alpha",
+            task_id: "feat-x",
+            agent: None,
+            project: "demo",
+            hub_sock: "/tmp/shelbi-hub.sock",
+            port: None,
+            pane_cmd: "shelbi --project demo open alpha --as-pane",
+        });
+        assert!(
+            !bare.iter().any(|s| s.starts_with("SHELBI_AGENT=")),
+            "bare launch must not inject SHELBI_AGENT: {bare:?}"
         );
     }
 
@@ -8942,6 +9256,8 @@ mod sync_worktree_git_tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -9619,6 +9935,8 @@ mod sync_worktree_freshcut_tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -10000,6 +10318,8 @@ mod sync_worktree_freshcut_tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         };
 

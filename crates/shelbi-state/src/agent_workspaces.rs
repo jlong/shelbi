@@ -269,6 +269,31 @@ pub fn load_agent_settings(project: &str, agent: &str) -> Result<Option<String>>
     }
 }
 
+/// `agents/<role>/agent.yaml` — the runner-agnostic agent manifest that
+/// declares the agent's preferred runner, per-runner model/effort, permission
+/// posture, and compatibility requirements. Sits alongside `instructions.md`,
+/// `skills/`, and the Claude-only `settings.json`.
+pub fn agent_manifest_path(project: &str, agent: &str) -> Result<PathBuf> {
+    Ok(agent_workspace_dir(project, agent)?.join("agent.yaml"))
+}
+
+/// Load and parse `agents/<role>/agent.yaml` if it exists. A **missing**
+/// manifest is non-fatal — `Ok(None)` — so dispatch falls back to
+/// `Workspace.runner` under the additive migration. A *present but malformed*
+/// manifest is a hard error (`Err`): silently ignoring a typo'd runner/model
+/// would launch on the wrong model with no signal.
+pub fn load_agent_manifest(
+    project: &str,
+    agent: &str,
+) -> Result<Option<shelbi_core::AgentManifest>> {
+    let path = agent_manifest_path(project, agent)?;
+    match fs::read_to_string(&path) {
+        Ok(s) => Ok(Some(shelbi_core::AgentManifest::from_yaml_str(&s)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::Io(e)),
+    }
+}
+
 /// `~/.shelbi/projects/<project>/agents/_shared/preamble.md` — the
 /// optional, per-project shared preamble that gets prepended to every
 /// dispatched agent's `instructions.md`.
@@ -1100,6 +1125,38 @@ mod tests {
         ));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// A missing `agent.yaml` is non-fatal — `Ok(None)` — so dispatch falls
+    /// back to `Workspace.runner`. A present manifest parses; a malformed one is
+    /// a hard error so a typo can't silently launch on the wrong model.
+    #[test]
+    fn load_agent_manifest_absent_present_and_malformed() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Absent → Ok(None).
+        assert!(load_agent_manifest("p", "review").unwrap().is_none());
+
+        // Present → parsed.
+        let dir = home.join("projects/p/agents/review");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("agent.yaml"),
+            "name: review\npreferred_runner: claude\nrunners:\n  claude:\n    model: claude-opus-4-8\n",
+        )
+        .unwrap();
+        let m = load_agent_manifest("p", "review").unwrap().unwrap();
+        assert_eq!(m.name, "review");
+        assert_eq!(m.preferred_runner, Some(shelbi_core::RunnerKind::Claude));
+
+        // Malformed (unknown runner kind key) → Err, not a silent None.
+        fs::write(dir.join("agent.yaml"), "name: review\npreferred_runner: 42\n").unwrap();
+        assert!(load_agent_manifest("p", "review").is_err());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = fs::remove_dir_all(&home);
     }
 
     /// `shelbi init` happy path: both default agents land on disk with

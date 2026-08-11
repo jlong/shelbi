@@ -2671,6 +2671,8 @@ mod pr_create_tests {
             workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
         }
@@ -9028,6 +9030,8 @@ mod probe_tests {
                 ..ZenConfig::default()
             },
             heartbeat: HeartbeatConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
         }

@@ -1,3 +1,4 @@
+pub mod agent_manifest;
 pub mod error;
 pub mod integration;
 pub mod model;
@@ -9,6 +10,10 @@ pub mod system_memory;
 pub mod workflow;
 pub mod workspace_names;
 
+pub use agent_manifest::{
+    clamp_permission_mode, project_runner_spec, resolve_agent_launch, AgentManifest, AgentRequires,
+    ReasoningEffort, ResolvedAgentLaunch, RunnerManifestConfig,
+};
 pub use error::{Error, Result};
 pub use integration::{CapabilityLadder, IntegrationMode};
 pub use model::{
@@ -19,7 +24,7 @@ pub use model::{
     validate_workflow_name, Agent,
     AgentRunnerSpec, Column, ConfigMode, DialogSignature, ForwardMode, GitConfig, HeartbeatConfig,
     Host, Machine, MachineKind, MergeStrategy, OrchestratorSpec, ParamDiagnostic, Project,
-    ProjectShape,
+    ProjectAgentConfig, ProjectRunnerConfig, ProjectShape,
     PromptInjectionKind, PromptInjectionSpec, RunnerKind, Session, SessionProject, Status, Task,
     TaskZenConfig,
     TmuxAddr, WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS,

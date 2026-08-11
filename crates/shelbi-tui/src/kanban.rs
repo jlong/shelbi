@@ -3557,6 +3557,8 @@ mod tests {
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         };
         shelbi_state::save_project(&project).unwrap();
@@ -5276,6 +5278,8 @@ mod tests {
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         };
         shelbi_state::save_project(&project).unwrap();

@@ -49,6 +49,13 @@ const ENV_TASK_ID: &str = "TASK_ID";
 /// override.
 const ENV_HUB_SOCK: &str = "SHELBI_HUB_SOCK";
 
+/// Env var naming the dispatched agent (role) for this pane. Injected by the
+/// dispatch path (`local_pane_tmux_argv`) so the wrapper resolves the same
+/// runner / model / effort / permission mode from the agent manifest chain the
+/// dispatch used. Unset on a bare (sidebar-click) launch — the wrapper then
+/// falls back to resolving from any assigned task, else the workspace runner.
+const ENV_AGENT: &str = "SHELBI_AGENT";
+
 /// Marker Shelbi exports into managed panes. The hub's `pre-commit` guard is
 /// a no-op unless this is present, so it governs Shelbi's own agents without
 /// touching the human's plain-shell commits. See
@@ -78,16 +85,18 @@ pub fn run(
     machine: &Machine,
     resume: bool,
 ) -> Result<()> {
-    let runner = project
-        .runner(&workspace.runner)
-        .ok_or_else(|| {
-            anyhow!(
-                "workspace `{}` references unknown runner `{}`",
-                workspace.name,
-                workspace.runner,
-            )
-        })?
-        .clone();
+    // Resolve the runner (kind + model + effort) and permission mode through the
+    // same agent-manifest chain the dispatch path used. The dispatched agent is
+    // handed to us via `$SHELBI_AGENT`; a bare (sidebar-click) launch has none,
+    // and the resolver falls back to the workspace's own runner. This keeps the
+    // local wrapper and the remote dispatch path launching identically (see
+    // `orch_workspace::resolve_workspace_launch`).
+    let agent = std::env::var(ENV_AGENT).ok().filter(|s| !s.is_empty());
+    let orch_workspace::ResolvedWorkspaceLaunch {
+        runner,
+        permission_mode,
+    } = orch_workspace::resolve_workspace_launch(project, workspace, agent.as_deref())
+        .map_err(|e| anyhow!("resolving runner for workspace `{}`: {e}", workspace.name))?;
     let worktree = orch_workspace::workspace_worktree(machine, workspace);
     let worktree_str = worktree.to_string_lossy().into_owned();
 
@@ -192,7 +201,7 @@ pub fn run(
     // same runner / permission-mode / startup-prompt logic and can't drift.
     let launch_full = orch_workspace::workspace_launch_command_with_startup_prompt(
         &runner,
-        &project.workspace_permissions_mode,
+        &permission_mode,
         has_agent_instructions,
         resume,
         startup_prompt_rel,
@@ -1054,6 +1063,8 @@ mod tests {
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         }
     }

@@ -124,6 +124,23 @@ pub struct Project {
     /// [`Project::merge_strategy`].
     #[serde(default)]
     pub git: GitConfig,
+    /// The project's runner **fleet**, keyed by canonical [`RunnerKind`]: one
+    /// entry per kind is the concrete launcher (the evolution of
+    /// [`agent_runners`](Self::agent_runners)), optionally carrying a house
+    /// `model` / `reasoning_effort` authoritative for every agent of that kind.
+    /// Kind → concrete runner is a direct lookup (no indirection). Additive:
+    /// empty on existing projects, which keep resolving through `agent_runners`
+    /// + `Workspace.runner`. See [`crate::agent_manifest::resolve_agent_launch`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub runners: BTreeMap<RunnerKind, ProjectRunnerConfig>,
+    /// Per-agent project overrides, keyed by the agent's directory name. Today
+    /// this carries only `runner:` — which runner *kind* the project pins that
+    /// agent onto (authoritative over the manifest's `preferred_runner`). There
+    /// is deliberately no per-agent model/effort block: per-agent
+    /// differentiation comes from each agent's manifest, and a house model is
+    /// set once at the kind level in [`runners`](Self::runners).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, ProjectAgentConfig>,
 
     // --- user-local -------------------------------------------------------
     pub repo: String,
@@ -189,6 +206,8 @@ pub const SHARED_PROJECT_FIELDS: &[&str] = &[
     "zen",
     "heartbeat",
     "git",
+    "runners",
+    "agents",
 ];
 
 /// YAML keys that belong in the *user-local* half of a split project
@@ -1102,7 +1121,7 @@ impl Host {
 // ---------------------------------------------------------------------------
 // Agent runner / orchestrator runner
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentRunnerSpec {
     /// Executable to invoke (e.g. "claude", "codex").
     pub command: String,
@@ -1144,7 +1163,7 @@ pub struct AgentRunnerSpec {
 /// ladder all key off — every one of those decisions reasons about a
 /// `RunnerKind` (in practice through `shelbi_agent::RunnerAdapter`) rather than
 /// re-deriving the basename itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RunnerKind {
     Claude,
@@ -1239,6 +1258,32 @@ impl AgentRunnerSpec {
         }
         default_prompt_injection(&self.command)
     }
+}
+
+/// One entry in a project's top-level `runners:` fleet (keyed by
+/// [`RunnerKind`]). Carries the concrete launcher — the same fields as
+/// [`AgentRunnerSpec`], flattened so the YAML reads like today's
+/// `agent_runners` entry (`command`, `flags`, …) — plus an optional house
+/// `model` / `reasoning_effort` that, when set, is authoritative for **every**
+/// agent of that kind (a field it omits falls through to the agent manifest).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectRunnerConfig {
+    #[serde(flatten)]
+    pub spec: AgentRunnerSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<crate::agent_manifest::ReasoningEffort>,
+}
+
+/// Per-agent project override (keyed by the agent's directory name in
+/// [`Project::agents`]). Pins which runner *kind* the project runs that agent
+/// on — authoritative over the manifest's `preferred_runner`. No `preferred_`
+/// prefix: the agent recommends, the project decides.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectAgentConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<RunnerKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3163,6 +3208,60 @@ updated_at: 2026-06-19T00:00:00Z
     }
 
     #[test]
+    fn project_yaml_parses_top_level_runners_fleet_and_agent_pins() {
+        // The evolving runner config: a top-level `runners:` map keyed by kind
+        // (each carrying the concrete launcher + optional house model/effort)
+        // plus an `agents:` block pinning a kind per agent. Additive — a project
+        // without them (below) parses to empty maps.
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+runners:
+  claude:
+    command: claude
+  codex:
+    command: codex
+    model: gpt-5
+agents:
+  orchestrator:
+    runner: codex
+  review:
+    runner: claude
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        // Kind → concrete runner is a direct lookup; codex carries a house model.
+        let codex = p.runners.get(&RunnerKind::Codex).unwrap();
+        assert_eq!(codex.spec.command, "codex");
+        assert_eq!(codex.model.as_deref(), Some("gpt-5"));
+        assert!(p.runners.get(&RunnerKind::Claude).unwrap().model.is_none());
+        // Per-agent pins.
+        assert_eq!(
+            p.agents.get("orchestrator").unwrap().runner,
+            Some(RunnerKind::Codex)
+        );
+        assert_eq!(p.agents.get("review").unwrap().runner, Some(RunnerKind::Claude));
+
+        // A project omitting both keys parses them as empty (no behavior change).
+        let bare = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        let p2: Project = serde_yaml::from_str(bare).unwrap();
+        assert!(p2.runners.is_empty());
+        assert!(p2.agents.is_empty());
+    }
+
+    #[test]
     fn project_yaml_omits_new_workspace_keys_and_uses_defaults() {
         let yaml = r#"
 name: p
@@ -3282,6 +3381,8 @@ workspace_settings_template: /etc/shelbi/p.json
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         };
         assert!(project.validate_workspaces().is_ok());
@@ -3388,6 +3489,8 @@ workspaces:
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -3647,6 +3750,8 @@ workspaces:
             zen,
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -4938,6 +5043,8 @@ git:
                 tags: vec!["review".to_string()],
                 slot: None,
             }],
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
         }
     }

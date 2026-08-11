@@ -1741,6 +1741,8 @@ mod tests {
             workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
         }
@@ -1811,6 +1813,8 @@ mod tests {
             workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
         };
@@ -1890,6 +1894,8 @@ mod tests {
             workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
         };
@@ -1967,6 +1973,8 @@ mod tests {
             workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
         };
@@ -2268,6 +2276,8 @@ mod tests {
             workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig {
                 base_branch: None,
