@@ -65,8 +65,19 @@ pub enum ConfigCmd {
         /// Apply every auto-heal write-back (as hub start / `shelbi reload`
         /// do), instead of only reporting. Needs-judgment findings are still
         /// left for you to resolve.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["needs_judgment", "apply_finding"])]
         apply: bool,
+        /// Show only the needs-judgment findings — the channel the orchestrator
+        /// ingests at boot to surface to you. Each carries a stable id, the
+        /// surface + location, the legacy form, the proposed fix, and why it
+        /// needs judgment. Read-only.
+        #[arg(long, conflicts_with = "apply_finding")]
+        needs_judgment: bool,
+        /// Apply exactly ONE finding by its stable id (from `--needs-judgment`),
+        /// reusing the auto-heal write-back for a single user-approved fix and
+        /// leaving every other finding untouched.
+        #[arg(long, value_name = "ID")]
+        apply_finding: Option<String>,
         /// Diagnostic output format.
         #[arg(long, value_enum, default_value_t = LintFormat::Human)]
         format: LintFormat,
@@ -117,9 +128,21 @@ pub fn run(project: Option<String>, explicit_project: bool, cmd: ConfigCmd) -> R
             staged,
             format,
         } => lint(project, explicit_project, all, staged, format),
-        ConfigCmd::Upgrade { all, apply, format } => {
-            upgrade(project, explicit_project, all, apply, format)
-        }
+        ConfigCmd::Upgrade {
+            all,
+            apply,
+            needs_judgment,
+            apply_finding,
+            format,
+        } => upgrade(
+            project,
+            explicit_project,
+            all,
+            apply,
+            needs_judgment,
+            apply_finding,
+            format,
+        ),
         ConfigCmd::ListActions => list_actions(project),
         ConfigCmd::DumpKeybindings { out, force } => dump_keybindings(out, force),
         ConfigCmd::Check => check(project),
@@ -186,14 +209,60 @@ fn lint(
 /// selected projects (plus the shared global surfaces) and print the classified
 /// findings. With `apply`, additionally perform every auto-heal write-back (the
 /// same pass hub start / `shelbi reload` run) before printing the residual.
+/// `--needs-judgment` prints only the orchestrator-facing needs-judgment channel;
+/// `--apply-finding <id>` applies exactly one user-approved finding.
+#[allow(clippy::too_many_arguments)]
 fn upgrade(
     project: Option<String>,
     explicit_project: bool,
     all: bool,
     apply: bool,
+    needs_judgment: bool,
+    apply_finding: Option<String>,
     format: LintFormat,
 ) -> Result<()> {
     let projects = selected_projects(project, explicit_project, all)?;
+
+    // Targeted single-finding apply: resolve exactly one user-approved finding.
+    if let Some(id) = apply_finding {
+        let applied = super::config_upgrade_apply::apply_single_finding(&projects, &id)?;
+        match format {
+            LintFormat::Human => {
+                for change in &applied {
+                    println!(
+                        "healed [{}] {} ({}): {}",
+                        change.code,
+                        change.detail,
+                        change.logical_id,
+                        change.file.display()
+                    );
+                }
+                println!("applied finding {id} ({} change(s))", applied.len());
+            }
+            LintFormat::Json => println!("{}", serde_json::to_string_pretty(&applied_json(&applied))?),
+        }
+        return Ok(());
+    }
+
+    // Read-only needs-judgment channel view — the half the orchestrator surfaces.
+    // Ingest the persisted channel the on-start pass wrote (the literal boot
+    // channel), scoped to the selected project(s); if no channel file exists yet
+    // (invoked outside an on-start pass), derive it fresh so the command still
+    // answers. Either way the finding ids match `--apply-finding` (they're
+    // content-stable), so an id read here resolves the same finding on apply.
+    if needs_judgment {
+        let report = match super::config_upgrade::load_findings()? {
+            Some(r) => super::config_upgrade::filter_to_projects(&r, &projects),
+            None => super::config_upgrade::detect(&projects)?,
+        };
+        let nj = super::config_upgrade::needs_judgment_report(&report);
+        match format {
+            LintFormat::Human => print!("{}", super::config_upgrade::render_needs_judgment(&nj)),
+            LintFormat::Json => println!("{}", serde_json::to_string_pretty(&nj)?),
+        }
+        return Ok(());
+    }
+
     let report = super::config_upgrade::detect(&projects)?;
     let report = if apply {
         let applied = super::config_upgrade_apply::apply_auto_heal(&projects, &report);
@@ -219,6 +288,25 @@ fn upgrade(
         LintFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
     }
     Ok(())
+}
+
+/// JSON projection of the applied changes for `--apply-finding --format json`.
+/// Built inline so `AppliedChange` need not carry a `Serialize` derive.
+fn applied_json(applied: &[super::config_upgrade_apply::AppliedChange]) -> serde_json::Value {
+    serde_json::Value::Array(
+        applied
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "scope": c.scope,
+                    "logical_id": c.logical_id,
+                    "code": c.code,
+                    "file": c.file.display().to_string(),
+                    "detail": c.detail,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Resolve the project name without erroring when none is configured —

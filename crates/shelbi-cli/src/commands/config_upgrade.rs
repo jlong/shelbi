@@ -13,22 +13,25 @@
 //! anything that requires judgment is handed to the orchestrator*:
 //!
 //! * [`Classification::AutoHeal`] — a deterministic, non-lossy, unambiguous
-//!   rewrite exists. (This slice only *detects and reports* these; the
-//!   write-back is a follow-up.)
+//!   rewrite exists. The on-start pass applies these itself (the write-back
+//!   lives in [`super::config_upgrade_apply`]).
 //! * [`Classification::NeedsJudgment`] — ambiguous, potentially lossy, or the
-//!   correct target isn't mechanically determinable. Emitted for the
-//!   orchestrator to surface to the user. When unsure, a finding lands here
-//!   rather than risk a lossy auto-heal.
+//!   correct target isn't mechanically determinable. Never auto-applied;
+//!   written to the orchestrator channel to surface to the user. When unsure, a
+//!   finding lands here rather than risk a lossy auto-heal.
 //!
-//! ## Scope of this slice (detection + classification only)
+//! ## Where this module sits in the pass
 //!
-//! This module runs on hub start and `shelbi reload`, classifies every
-//! finding, discloses a `config-upgrade` line on `events.log`, and writes the
-//! structured findings file the orchestrator ingests. It does **not** rewrite
-//! any file yet — auto-heal write-back and the orchestrator apply-loop are the
-//! next two slices. Because nothing is written, the sniffers are free to be
-//! liberal about *detecting* a legacy form; the classification records whether
-//! a later slice may heal it automatically.
+//! This module owns **detection + classification** and the **emit** step. The
+//! full on-start pass ([`run_and_emit`]) runs on hub start and `shelbi reload`:
+//! it detects, applies every auto-heal via [`super::config_upgrade_apply`],
+//! re-detects the residual, discloses a `config-upgrade` line per project on
+//! `events.log`, and writes the residual to the structured findings file
+//! ([`FINDINGS_FILE`]) the orchestrator ingests at boot. The needs-judgment
+//! half of that file is the channel the orchestrator surfaces to the user; a
+//! single approved finding is then applied via
+//! [`super::config_upgrade_apply::apply_single_finding`] (the targeted
+//! `shelbi config upgrade --apply-finding <id>` path).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -42,8 +45,9 @@ use super::config_surfaces::{live_entries, locate_key, InventoryEntry, Location,
 
 /// Bumped when the on-disk findings file (`FINDINGS_FILE`) changes shape so a
 /// mismatched orchestrator can refuse an unknown schema instead of
-/// mis-parsing it.
-pub const FINDINGS_SCHEMA_VERSION: u32 = 1;
+/// mis-parsing it. Bumped to 2 in slice 3: each finding now carries a stable
+/// `id` (for the targeted `--apply-finding` path) and a `rationale`.
+pub const FINDINGS_SCHEMA_VERSION: u32 = 2;
 
 /// Findings file the orchestrator ingests at boot. Lives at the top of
 /// `~/.shelbi/` next to `events.log`; removed by the pass when a project set is
@@ -73,6 +77,11 @@ impl Classification {
 /// One deprecation detected on one config surface.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpgradeFinding {
+    /// Stable content-derived handle for this finding, unique within a report
+    /// and identical across restarts for the same still-unresolved finding.
+    /// The token the orchestrator passes to `shelbi config upgrade
+    /// --apply-finding <id>` once the user approves a needs-judgment fix.
+    pub id: String,
     /// The surface's stable id from the inventory (`project.<name>.workflow.task`).
     pub logical_id: String,
     /// `global` or `project:<name>` — lets the orchestrator group per project.
@@ -83,10 +92,14 @@ pub struct UpgradeFinding {
     pub classification: Classification,
     /// Stable machine token for the deprecation kind.
     pub code: String,
-    /// What is deprecated, in one line.
+    /// What is deprecated (the legacy form), in one line.
     pub message: String,
     /// The rewrite an auto-heal would apply, or the decision a human must make.
     pub proposed_fix: String,
+    /// Why this finding needs judgment — the reason it can't self-heal.
+    /// Empty for [`Classification::AutoHeal`] findings (they carry no such
+    /// question); populated for [`Classification::NeedsJudgment`].
+    pub rationale: String,
 }
 
 /// The whole pass's result over a selected project set.
@@ -124,6 +137,69 @@ impl UpgradeReport {
 /// Absolute path of the orchestrator-handoff findings file.
 pub fn findings_path() -> Result<PathBuf> {
     Ok(shelbi_state::shelbi_home()?.join(FINDINGS_FILE))
+}
+
+/// Read the persisted orchestrator-handoff channel written by the on-start pass
+/// ([`emit`]). Returns `Ok(None)` when no channel is present (a clean config
+/// left no file), and errors only on a present-but-unreadable / schema-mismatched
+/// file so a stale format never silently mis-parses. This is the boot-ingestion
+/// entry point: the same JSON [`emit`] wrote is read back verbatim.
+pub fn load_findings() -> Result<Option<UpgradeReport>> {
+    let path = findings_path()?;
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let report: UpgradeReport = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    if report.schema_version != FINDINGS_SCHEMA_VERSION {
+        anyhow::bail!(
+            "{} is schema v{} but this shelbi understands v{}; rerun `shelbi reload` \
+             (or hub start) to regenerate it",
+            path.display(),
+            report.schema_version,
+            FINDINGS_SCHEMA_VERSION
+        );
+    }
+    Ok(Some(report))
+}
+
+/// Retain only findings in scope for `projects`: the shared `global` surfaces
+/// plus any `project:<name>` whose `<name>` is selected. The channel file is
+/// hub-global (one file for every scanned project), so a single project's
+/// orchestrator filters it down to what's actually its own.
+pub fn filter_to_projects(report: &UpgradeReport, projects: &[String]) -> UpgradeReport {
+    let selected: BTreeSet<&str> = projects.iter().map(String::as_str).collect();
+    UpgradeReport {
+        schema_version: report.schema_version,
+        shelbi_version: report.shelbi_version.clone(),
+        findings: report
+            .findings
+            .iter()
+            .filter(|f| match f.scope.strip_prefix("project:") {
+                Some(p) => selected.contains(p),
+                None => f.scope == "global",
+            })
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Project a report down to only its [`Classification::NeedsJudgment`] findings —
+/// the half of the channel the orchestrator surfaces to the user. Order is
+/// preserved from the source report (already sorted by file/location/code).
+pub fn needs_judgment_report(report: &UpgradeReport) -> UpgradeReport {
+    UpgradeReport {
+        schema_version: report.schema_version,
+        shelbi_version: report.shelbi_version.clone(),
+        findings: report
+            .findings
+            .iter()
+            .filter(|f| f.classification == Classification::NeedsJudgment)
+            .cloned()
+            .collect(),
+    }
 }
 
 /// Detect (and classify) every deprecation across `projects` plus the shared
@@ -616,7 +692,9 @@ fn sniff_zen_danger_paths(
                 Classification::NeedsJudgment,
                 "ZEN_DANGER_PATHS_CONFLICT",
                 "`zen.danger_paths` sets both `extend:` and `override:` — only one is allowed",
-                "Choose either `extend:` (add to defaults) or `override:` (replace defaults), not both.",
+                "Merge both into a single `extend:` (the built-in danger paths plus every path \
+                 from both lists — the safe superset). If you meant `override:` (drop the \
+                 built-in defaults), edit it by hand instead.",
                 locate_key(text, "danger_paths"),
             ));
         }
@@ -888,6 +966,7 @@ fn sibling_finding(
     fix: &str,
 ) -> UpgradeFinding {
     UpgradeFinding {
+        id: finding_id(&entry.scope, &entry.logical_id, code, message, fix),
         logical_id: entry.logical_id.clone(),
         scope: entry.scope.clone(),
         file: file.to_path_buf(),
@@ -896,6 +975,7 @@ fn sibling_finding(
         code: code.to_string(),
         message: message.to_string(),
         proposed_fix: fix.to_string(),
+        rationale: String::new(),
     }
 }
 
@@ -910,7 +990,12 @@ fn finding(
     proposed_fix: &str,
     location: Location,
 ) -> UpgradeFinding {
+    let rationale = match classification {
+        Classification::NeedsJudgment => needs_judgment_rationale(code).to_string(),
+        Classification::AutoHeal => String::new(),
+    };
     UpgradeFinding {
+        id: finding_id(&entry.scope, &entry.logical_id, code, message, proposed_fix),
         logical_id: entry.logical_id.clone(),
         scope: entry.scope.clone(),
         file: entry.canonical_path.clone(),
@@ -919,6 +1004,59 @@ fn finding(
         code: code.to_string(),
         message: message.to_string(),
         proposed_fix: proposed_fix.to_string(),
+        rationale,
+    }
+}
+
+/// A stable, content-derived id for a finding. It hashes the identifying tuple
+/// — scope, surface, code, and the specific message/fix (which embed the exact
+/// key/name the finding is about) — so the *same* unresolved finding hashes to
+/// the *same* id on every boot (the channel never accumulates duplicates), while
+/// two distinct findings never collide. FNV-1a keeps it dependency-free and
+/// deterministic across runs of the same binary.
+fn finding_id(scope: &str, logical_id: &str, code: &str, message: &str, proposed_fix: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for part in [scope, "\x1f", logical_id, "\x1f", code, "\x1f", message, "\x1f", proposed_fix] {
+        for b in part.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("cfg-{h:016x}")
+}
+
+/// Why a needs-judgment finding of `code` can't self-heal — the reason handed to
+/// the orchestrator (and through it, the user) alongside the proposed fix. When
+/// a code has no specific entry, a generic "ambiguous / potentially lossy" note
+/// is used so nothing surfaces without a rationale.
+fn needs_judgment_rationale(code: &str) -> &'static str {
+    match code {
+        "PROJECT_UNKNOWN_KEY" => {
+            "An unrecognized key could be a typo, a stale field, or data you still \
+             want — dropping or renaming it mechanically risks losing intent."
+        }
+        "PROJECT_NAME_LOOKS_LIKE_ID" => {
+            "Whether this is the human label to keep or an intended rename of the \
+             project id can't be inferred — the two have opposite effects."
+        }
+        "PROJECT_DISPLAY_NAME_DEPRECATED" => {
+            "`display_name:` and `name:` disagree and `name:` isn't the old id, so \
+             which one is the real label is a choice only you can make."
+        }
+        "PROJECT_REMOVED_KEY" => {
+            "This removed key still holds data; dropping it could discard something \
+             you meant to keep, so it needs confirmation rather than a silent drop."
+        }
+        "ZEN_DANGER_PATHS_CONFLICT" => {
+            "`extend:` adds to the built-in danger paths; `override:` replaces them. \
+             Setting both is contradictory, and resolving it depends on whether you \
+             meant to keep or drop the defaults — a security-relevant choice."
+        }
+        "WORKFLOW_OWNER_AGENT_CONFLICT" => {
+            "A legacy named `owner:` conflicts with an explicit `agent:`; which agent \
+             should own the status is a decision, not a mechanical rewrite."
+        }
+        _ => "This form is ambiguous or potentially lossy, so a human should confirm the fix.",
     }
 }
 
@@ -983,6 +1121,40 @@ pub fn render_human(report: &UpgradeReport) -> String {
             report.needs_judgment_count()
         ));
     }
+    out
+}
+
+/// Human render of the needs-judgment channel: one block per finding with the
+/// stable `id` (for `--apply-finding`), surface + location, legacy form, proposed
+/// fix, and the rationale. Mirrors the shape the orchestrator surfaces to the
+/// user. `report` should already be a needs-judgment projection.
+pub fn render_needs_judgment(report: &UpgradeReport) -> String {
+    if report.findings.is_empty() {
+        return "no needs-judgment config findings: nothing to resolve\n".to_string();
+    }
+    let mut out = String::new();
+    for f in &report.findings {
+        out.push_str(&format!(
+            "[{}] {} ({})\n",
+            f.id,
+            f.code,
+            scope_label(&f.scope),
+        ));
+        out.push_str(&format!(
+            "  where: {}:{}:{}\n",
+            f.file.display(),
+            f.location.line,
+            f.location.column,
+        ));
+        out.push_str(&format!("  legacy form: {}\n", f.message));
+        out.push_str(&format!("  proposed fix: {}\n", f.proposed_fix));
+        out.push_str(&format!("  why it needs judgment: {}\n", f.rationale));
+    }
+    out.push_str(&format!(
+        "{} needs-judgment finding(s) — apply one you've approved with \
+         `shelbi config upgrade --apply-finding <id>`\n",
+        report.findings.len()
+    ));
     out
 }
 
@@ -1397,5 +1569,151 @@ workspaces:
         // A subsequent clean pass removes the stale file.
         emit(&empty_report()).unwrap();
         assert!(!path.exists(), "stale findings file not cleared");
+    }
+
+    // ---- slice 3: needs-judgment channel --------------------------------
+
+    #[test]
+    fn needs_judgment_findings_carry_stable_id_and_rationale() {
+        // A needs-judgment finding gets a non-empty id + rationale; an auto-heal
+        // finding gets an id but an empty rationale (it carries no such question).
+        let nj = project_findings("mystery_field: 3\n");
+        let f = find(&nj, "PROJECT_UNKNOWN_KEY").expect("nj finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(f.id.starts_with("cfg-"), "id: {}", f.id);
+        assert!(!f.rationale.is_empty(), "nj finding missing rationale");
+
+        let ah = project_findings("workers:\n- name: w1\n  machine: hub\n");
+        let g = find(&ah, "PROJECT_WORKERS_KEY_DEPRECATED").expect("auto-heal finding");
+        assert_eq!(g.classification, Classification::AutoHeal);
+        assert!(g.id.starts_with("cfg-"), "id: {}", g.id);
+        assert!(g.rationale.is_empty(), "auto-heal finding should carry no rationale");
+
+        // The same finding hashes to the same id on a second detection (stable
+        // across restarts → the channel never accumulates duplicates).
+        let again = project_findings("mystery_field: 3\n");
+        assert_eq!(find(&again, "PROJECT_UNKNOWN_KEY").unwrap().id, f.id);
+    }
+
+    #[test]
+    fn on_start_pass_channels_needs_judgment_and_never_applies_it() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        // A config with BOTH an auto-heal form (workspace `runner:`) and a
+        // needs-judgment one (zen.danger_paths extend+override conflict).
+        let legacy = "\
+name: demo
+repo: /tmp/demo
+machines:
+- name: hub
+  kind: local
+  work_dir: /tmp/demo
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+workspaces:
+- name: w1
+  machine: hub
+  runner: claude
+zen:
+  danger_paths:
+    extend:
+    - .env
+    override:
+    - secrets/**
+";
+        let path = home.join("projects/demo.yaml");
+        std::fs::write(&path, legacy).unwrap();
+
+        let outcome = run_for_project("demo");
+        // The auto-heal ran...
+        assert!(
+            outcome.applied.iter().any(|c| c.code == "WORKSPACE_RUNNER_REMOVED"),
+            "auto-heal did not run: {:?}",
+            outcome.applied
+        );
+        // ...but the needs-judgment finding was NOT applied.
+        assert!(
+            !outcome.applied.iter().any(|c| c.code == "ZEN_DANGER_PATHS_CONFLICT"),
+            "needs-judgment finding was auto-applied"
+        );
+
+        // On disk: runner gone, but the danger_paths conflict is untouched.
+        let healed: Value = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let ws = &healed.as_mapping().unwrap().get(Value::String("workspaces".into())).unwrap()
+            .as_sequence().unwrap()[0];
+        assert!(ws.as_mapping().unwrap().get(Value::String("runner".into())).is_none());
+        let dp = get(get(&healed, "zen").unwrap(), "danger_paths").unwrap();
+        let dpm = dp.as_mapping().unwrap();
+        assert!(dpm.contains_key(Value::String("extend".into())));
+        assert!(dpm.contains_key(Value::String("override".into())), "conflict was resolved on start");
+
+        // The channel file carries the needs-judgment finding with id + rationale.
+        let channel = load_findings().unwrap().expect("channel written on start");
+        let nj = needs_judgment_report(&channel);
+        let f = nj
+            .findings
+            .iter()
+            .find(|f| f.code == "ZEN_DANGER_PATHS_CONFLICT")
+            .expect("conflict not in channel");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(f.id.starts_with("cfg-"));
+        assert!(!f.rationale.is_empty());
+        assert!(f.proposed_fix.contains("extend"));
+    }
+
+    #[test]
+    fn no_needs_judgment_leaves_an_empty_channel() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        // Only an auto-heal form (workspace `runner:`); no needs-judgment.
+        let legacy = "\
+name: demo
+repo: /tmp/demo
+machines:
+- name: hub
+  kind: local
+  work_dir: /tmp/demo
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+workspaces:
+- name: w1
+  machine: hub
+  runner: claude
+";
+        std::fs::write(home.join("projects/demo.yaml"), legacy).unwrap();
+        run_for_project("demo");
+
+        // The auto-heal fully resolved the config, so no channel file lingers.
+        assert!(
+            load_findings().unwrap().is_none(),
+            "clean-after-heal config left a stale channel"
+        );
+
+        // And a config that is clean from the start writes no channel at all.
+        std::fs::write(
+            home.join("projects/demo.yaml"),
+            "name: demo\nrepo: /tmp/demo\nmachines:\n- name: hub\n  kind: local\n  work_dir: /tmp/demo\norchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\nworkspaces:\n- name: w1\n  machine: hub\n",
+        )
+        .unwrap();
+        run_for_project("demo");
+        let nj = load_findings()
+            .unwrap()
+            .map(|r| needs_judgment_report(&r))
+            .unwrap_or_else(empty_report);
+        assert!(nj.findings.is_empty(), "clean config surfaced needs-judgment");
     }
 }

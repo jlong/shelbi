@@ -299,6 +299,20 @@ is quiet.
    non-consuming accelerator that lowers latency between these drains, never as
    the thing that guarantees delivery.
 
+4. **Read the config-upgrade needs-judgment channel.** The hub runs a
+   version-agnostic config validate-and-upgrade pass on start and on every
+   `shelbi reload`: it auto-heals the deterministic legacy forms itself, then
+   hands the rest — the findings that need a human decision — to you. Ingest that
+   channel once at bootstrap:
+
+       shelbi config upgrade --needs-judgment --format json
+
+   Empty output means nothing needs resolving — say nothing about it. A non-empty
+   list means surface it to the user per `## Configuration upgrade findings`
+   below. The same signal can also arrive mid-session as a `project=<you>
+   config-upgrade needs_judgment=<N>` line on `events.log` (`N > 0`); react to it
+   the same way. This is a read — it never blocks dispatch.
+
 If the Workspaces snapshot shows the pool is **empty**, run the first-boot
 workspace-provisioning interview below before you start dispatching — a project
 with no workspaces can't do any work.
@@ -513,6 +527,15 @@ One bullet per event prefix. React to every matching line.
   retrying. This one you surface: tell the user the pane keeps crashing and is
   now left down for them to investigate.
 
+- `project=<you> config-upgrade needs_judgment=<N>` (with `N > 0`) → the config
+  validate-and-upgrade pass auto-healed what it safely could and left `N`
+  finding(s) that need a human decision. Match the `project=<you>` scope first —
+  another project's config-upgrade line rides your hub-global tail. Read the
+  channel (`shelbi config upgrade --needs-judgment --format json`) and surface
+  the findings per `## Configuration upgrade findings`. The companion
+  `auto_heal=<M>` count on the same line is informational (already applied);
+  only `needs_judgment > 0` needs you.
+
 - `project=<name> heartbeat` → bounded sweep. Do exactly these three
   things, then stop:
 
@@ -699,6 +722,57 @@ tweak. Suggest by default; edit only with direction.
 Config suggestions never block dispatch or merge flows and never
 interrupt an answer to the user — batch them into at most one short note
 per reply.
+
+## Configuration upgrade findings
+
+Users may be sitting on a config authored by any past Shelbi release, and no
+config carries a schema version — so on start and on every `shelbi reload` the
+hub runs a version-agnostic validate-and-upgrade pass that sniffs each live
+config file for deprecated forms. It splits what it finds in two:
+
+- **Auto-heal** — a deterministic, non-lossy rewrite exists (a renamed key, a
+  tag shorthand, a moved binding). The hub applies these itself and discloses
+  each on `events.log`. Nothing for you to do.
+- **Needs-judgment** — ambiguous or potentially lossy: a typo vs. real data, a
+  relabel vs. a rename, a `zen.danger_paths` that sets both `extend:` and
+  `override:`. These are **never** applied automatically — they're handed to
+  **you** to resolve *with the user*. This is the whole point of the split.
+
+Read the channel with:
+
+    shelbi config upgrade --needs-judgment --format json
+
+Each finding is one JSON object with:
+
+- `id` — a stable handle you pass to `--apply-finding`.
+- `code` — the deprecation kind (e.g. `ZEN_DANGER_PATHS_CONFLICT`).
+- `scope`, `file`, `location` — where it is.
+- `message` — the legacy form, in one line.
+- `proposed_fix` — the concrete fix, ready to describe to the user.
+- `rationale` — *why* it needs judgment (what can't be inferred mechanically).
+
+**Surface, don't auto-fix.** When the channel is non-empty, fold it into your
+next user-facing reply: name each finding's surface, the legacy form, the
+proposed fix, and the rationale, and ask the user how they want to proceed. One
+consolidated note, not a lecture per finding.
+
+**Applying an approved finding.** Once the user approves a specific fix, apply
+exactly that one finding — reusing the same atomic write-back the auto-heal pass
+uses — with:
+
+    shelbi config upgrade --apply-finding <id>
+
+It resolves that single finding and leaves the rest untouched. Some findings
+have a genuinely mechanical resolution once approved (the `danger_paths`
+extend+override conflict resolves to the safe superset); others have no
+mechanical fix at all (an unknown key that might be a typo or real data), and
+the command will refuse them with a pointer to edit the file directly. In that
+case make the edit yourself per `## Configuration is yours` (it's your config
+surface), validate it parses, and tell the user what you changed. Re-running the
+`--needs-judgment` read afterward confirms the finding is gone.
+
+Never apply a needs-judgment finding the user hasn't approved — the decision
+gate is the entire reason these aren't auto-healed.
 
 ## How to decide
 
