@@ -169,6 +169,10 @@ const REVIEW_SKILLS: &[BundledSkill] = &[BundledSkill {
 /// case) means the role ships an empty `skills/` directory.
 pub struct BundledAgent {
     pub name: &'static str,
+    /// One-line, human/marketplace-facing description. Rendered as the
+    /// `description:` field of the scaffolded `agent.yaml` and used as the
+    /// agent's display label (falling back to the directory name).
+    pub description: &'static str,
     pub instructions: &'static str,
     pub settings_template: Option<&'static str>,
     pub skills: &'static [BundledSkill],
@@ -188,41 +192,91 @@ pub struct BundledAgent {
 pub const DEFAULT_AGENTS: &[BundledAgent] = &[
     BundledAgent {
         name: ORCHESTRATOR_AGENT,
+        description: "Coordinates the board and dispatches tasks to worker agents",
         instructions: DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
         settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
         skills: &[],
     },
     BundledAgent {
         name: DEVELOPER_AGENT,
+        description: "Implements a dispatched task on its own branch",
         instructions: DEFAULT_DEVELOPER_INSTRUCTIONS,
         settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
         skills: &[],
     },
     BundledAgent {
         name: REVIEW_AGENT,
+        description: "Loads a finished branch for human review and runs it",
         instructions: DEFAULT_REVIEW_INSTRUCTIONS,
         settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
         skills: REVIEW_SKILLS,
     },
     BundledAgent {
         name: QA_AGENT,
+        description: "Verifies a change against its acceptance criteria",
         instructions: DEFAULT_QA_INSTRUCTIONS,
         settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
         skills: &[],
     },
     BundledAgent {
         name: SECURITY_AGENT,
+        description: "Reviews a diff for defensive security issues",
         instructions: DEFAULT_SECURITY_INSTRUCTIONS,
         settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
         skills: &[],
     },
     BundledAgent {
         name: ADVERSARIAL_AGENT,
+        description: "Adversarial code review before a human sees the branch",
         instructions: DEFAULT_ADVERSARIAL_INSTRUCTIONS,
         settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
         skills: &[],
     },
 ];
+
+/// Render the self-documenting `agent.yaml` manifest scaffolded for a default
+/// agent. Following the project's scaffold convention (see
+/// [`shelbi_core::scaffold`]), the **required identity** is active and every
+/// optional knob ships as a commented, grounded example under a docs pointer —
+/// opening the file is enough to see how to pin a model or tighten permissions.
+///
+/// Deliberately conservative: the active fields are only `name` /
+/// `description` / `preferred_runner: claude` (all default agents run on Claude,
+/// which is also the built-in default, so this is inert on behavior). `model`,
+/// `reasoning_effort`, and `permissions_mode` ship **commented** so a
+/// `shelbi reload` that drops this file into an existing project never silently
+/// changes the model, effort, or permission posture a dispatch already used —
+/// the migration stays non-breaking.
+pub fn bundled_agent_manifest_yaml(agent: &BundledAgent) -> String {
+    format!(
+        "## Shelbi agent manifest — full reference: https://shelbi.dev/docs/configuration/agents\n\
+         ## Runner-agnostic identity + recommended runner/model for this agent (role).\n\
+         ## The consuming project overrides these via its top-level `runners:` fleet\n\
+         ## and per-agent `agents.<name>.runner` pins; see the reference above.\n\
+         name: {name}\n\
+         description: {description}\n\
+         ## Which runner KIND this agent recommends by default (claude | codex | generic).\n\
+         ## A recommendation only — the project's `agents.<name>.runner` wins.\n\
+         preferred_runner: claude\n\
+         ## Per-runner-kind model + reasoning effort this agent recommends. Uncomment\n\
+         ## and edit to pin a model; a field the project's `runners.<kind>` block sets\n\
+         ## overrides it, a field it omits falls through to here. effort: low|medium|high|max.\n\
+         # runners:\n\
+         #   claude:\n\
+         #     model: claude-opus-4-8\n\
+         #     reasoning_effort: high\n\
+         ## Permission posture this agent REQUESTS. Clamped DOWN to the project ceiling\n\
+         ## (workspace_permissions_mode), never escalated. read-only maps to Claude's plan mode.\n\
+         # permissions_mode: read-only\n\
+         ## Compatibility hints (advisory this milestone; enforced at install in a future\n\
+         ## marketplace flow). runner_kinds lists the kinds this agent can run on.\n\
+         # requires:\n\
+         #   runner_kinds: [claude]\n\
+         #   shelbi: \">=0.8\"\n",
+        name = agent.name,
+        description = agent.description,
+    )
+}
 
 /// `~/.shelbi/projects/<project>/agents/<agent>/`. The directory name
 /// IS the agent's stable identifier — that's what downstream callers
@@ -825,6 +879,13 @@ fn self_heal_bundled_agents(
             // shouldn't be left without the message-tail hooks.
             ensure_agent_settings_present(project, agent)?;
 
+            // Same seam for the runner-agnostic `agent.yaml`: a workspace
+            // materialized before the manifest shipped (or one whose manifest
+            // was deleted) shouldn't be left without it. Existence-guarded and
+            // additive — the bundled manifest ships model/effort commented, so
+            // this never changes a dispatch's resolved runner/model.
+            ensure_agent_manifest_present(project, agent)?;
+
             // Same seam for bundled skills: a workspace materialized before
             // this role shipped a skill (or one the user deleted) shouldn't
             // be left without it. Missing → drop the default back in;
@@ -1034,10 +1095,33 @@ fn write_bundled_agent(project: &str, agent: &BundledAgent) -> Result<()> {
             settings.as_bytes(),
         )?;
     }
+    // The runner-agnostic `agent.yaml` manifest. Atomic for the same Shelbi
+    // ContextStore docs/planning:reviews/adversarial-2026-07/state-runtime.md F8
+    // reason as `instructions.md`.
+    atomic_write(
+        &agent_manifest_path(project, agent.name)?,
+        bundled_agent_manifest_yaml(agent).as_bytes(),
+    )?;
     for skill in agent.skills {
         write_bundled_skill(project, agent.name, skill)?;
     }
     Ok(())
+}
+
+/// Self-heal seam for the per-agent `agent.yaml` manifest. Existence-guarded,
+/// exactly like the bundled skills and (in the missing case) the settings
+/// file: a workspace materialized before this file shipped — or one whose
+/// manifest a user deleted — gets the bundled default dropped back in; a
+/// present manifest (current *or* a genuine user customization) is left
+/// untouched. Because the bundled manifest ships model/effort/permissions
+/// *commented*, dropping it into an existing project changes no dispatch's
+/// resolved runner/model — the self-heal is purely additive.
+fn ensure_agent_manifest_present(project: &str, agent: &BundledAgent) -> Result<()> {
+    let path = agent_manifest_path(project, agent.name)?;
+    if path.exists() {
+        return Ok(());
+    }
+    atomic_write(&path, bundled_agent_manifest_yaml(agent).as_bytes())
 }
 
 /// Write one bundled skill file under `<workspace>/skills/`, creating any
@@ -1127,8 +1211,8 @@ mod tests {
         p
     }
 
-    /// A missing `agent.yaml` is non-fatal — `Ok(None)` — so dispatch falls
-    /// back to `Workspace.runner`. A present manifest parses; a malformed one is
+    /// A missing `agent.yaml` is non-fatal — `Ok(None)` — so dispatch resolves
+    /// from the built-in defaults. A present manifest parses; a malformed one is
     /// a hard error so a typo can't silently launch on the wrong model.
     #[test]
     fn load_agent_manifest_absent_present_and_malformed() {
@@ -1238,6 +1322,77 @@ mod tests {
             fs::read_to_string(agent_instructions_path("p", ADVERSARIAL_AGENT).unwrap()).unwrap(),
             DEFAULT_ADVERSARIAL_INSTRUCTIONS
         );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// `shelbi init` scaffolds a working `agent.yaml` for every default agent:
+    /// present, parseable through the shipped [`shelbi_core::AgentManifest`]
+    /// parser (which validates), carrying the agent's identity and the built-in
+    /// `preferred_runner: claude`. The optional model/effort/permissions knobs
+    /// ship commented, so `load_agent_manifest` reads them back as `None`.
+    #[test]
+    fn materialize_scaffolds_working_agent_manifests() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+
+        for agent in DEFAULT_AGENTS {
+            let path = agent_manifest_path("p", agent.name).unwrap();
+            assert!(path.is_file(), "{}: agent.yaml missing", agent.name);
+
+            // Parses through the real loader (hard-errors on a malformed
+            // manifest), so a shipped default can never be broken YAML.
+            let m = load_agent_manifest("p", agent.name)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{}: manifest should load", agent.name));
+            assert_eq!(m.name, agent.name);
+            assert_eq!(m.description.as_deref(), Some(agent.description));
+            assert_eq!(m.preferred_runner, Some(shelbi_core::RunnerKind::Claude));
+            // Model / effort / permissions ship commented → resolve to None, so
+            // dropping the manifest into an existing project is behavior-inert.
+            assert!(m.runners.is_empty(), "{}: model must ship commented", agent.name);
+            assert!(
+                m.permissions_mode.is_none(),
+                "{}: permissions must ship commented",
+                agent.name
+            );
+        }
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Self-heal is existence-guarded for the manifest: a workspace missing its
+    /// `agent.yaml` (materialized before the file shipped, or the user deleted
+    /// it) gets the bundled default dropped back in; a user-customized manifest
+    /// is preserved untouched.
+    #[test]
+    fn self_heal_restores_missing_manifest_and_preserves_edits() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+
+        // Delete the developer manifest and hand-edit the review one.
+        let dev_manifest = agent_manifest_path("p", DEVELOPER_AGENT).unwrap();
+        fs::remove_file(&dev_manifest).unwrap();
+        let review_manifest = agent_manifest_path("p", REVIEW_AGENT).unwrap();
+        let custom = "name: review\ndescription: my custom reviewer\npreferred_runner: claude\n";
+        fs::write(&review_manifest, custom).unwrap();
+
+        self_heal_default_agents("p").unwrap();
+
+        // Missing → restored from the bundled default.
+        assert!(dev_manifest.is_file(), "developer manifest should be restored");
+        assert_eq!(
+            fs::read_to_string(&dev_manifest).unwrap(),
+            bundled_agent_manifest_yaml(&DEFAULT_AGENTS[1]),
+        );
+        // Customized → preserved untouched.
+        assert_eq!(fs::read_to_string(&review_manifest).unwrap(), custom);
 
         std::env::remove_var("SHELBI_HOME");
     }

@@ -41,8 +41,9 @@ both halves; `shelbi init --pick-up` writes just the user-local half and reads
 the already-committed shared half in place:
 
 - **Shared** fields (`SHARED_PROJECT_FIELDS`) — `name`, `display_name`,
-  `default_branch`, `default_workflow`, `orchestrator`, `agent_runners`, `zen`,
-  `heartbeat`, `git`, and the rest — live in the committed
+  `default_branch`, `default_workflow`, `orchestrator`, `agent_runners`,
+  `runners`, `agents`, `zen`, `heartbeat`, `git`, and the rest — live in the
+  committed
   `<repo>/.shelbi/project.yaml`, so every clone shares them.
 - **User-local** fields (`LOCAL_PROJECT_FIELDS`) — `repo`, `machines`,
   `workspaces`, `editor` — live in a per-machine
@@ -96,7 +97,7 @@ agent_runners:
     command: codex
     flags: []
 workspaces:
-  - { name: alice, machine: hub, runner: claude }
+  - { name: alice, machine: hub }
 ```
 
 ## Top-level fields
@@ -111,6 +112,8 @@ workspaces:
 | `machines` | list of [Machine](#machines) | yes | — | The hosts workspaces run on. User-local. |
 | `orchestrator` | [Orchestrator](#orchestrator) | yes | — | Which runner boots the orchestrator. |
 | `agent_runners` | map of name → [AgentRunner](#agent-runners) | yes | — | The command lines agents and the orchestrator are launched with. |
+| `runners` | map of [RunnerKind](/docs/configuration/agents#runner-kinds) → [ProjectRunner](/docs/configuration/agents#project-runners) | no | `{}` | The kind-keyed runner fleet plus an optional house `model` / `reasoning_effort` per kind. The evolution of `agent_runners`; see [agents](/docs/configuration/agents). Additive: empty projects keep resolving through `agent_runners`. |
+| `agents` | map of name → [ProjectAgent](/docs/configuration/agents#per-agent-pins) | no | `{}` | Per-agent overrides, keyed by the agent's directory name. Pins which runner kind the project runs that agent on. See [agents](/docs/configuration/agents). |
 | `workspaces` | list of [Workspace](#workspaces) | no | `[]` | Fixed pool of workspace slots. User-local. |
 | `zen` | [Zen](#zen) | no | all defaults | Zen Mode check list, CI timeout, and danger paths. |
 | `editor` | string | no | `$EDITOR` | Editor invoked by `shelbi … edit` commands. User-local. |
@@ -190,15 +193,20 @@ prompt carries a polling contract that tails `.shelbi/messages/<task-id>.log`.
 The chosen channel (hooks or polling) is recorded per launch in the events log.
 
 `orchestrator.runner` only controls the dashboard/orchestrator pane. It does
-not change worker slots. Worker slots use their own
-[`workspaces[].runner`](#workspaces) value, so a project can run a Codex
-orchestrator while still dispatching tasks to Claude workers, or mix Claude
-and Codex workers in the same pool.
+not change worker slots. A worker slot no longer selects a runner: the
+dispatched **agent** (role) owns runner/model resolution through its
+[`agent.yaml` manifest](/docs/configuration/agents), and the project's runner
+fleet supplies the concrete launcher. So a project can run a Codex orchestrator
+while dispatching a task agent onto Claude, or run one agent on Opus and another
+on Sonnet, all resolved per agent rather than per slot. See
+[agents](/docs/configuration/agents) for the manifest and the precedence chain.
 
 ## agent_runners
 
 A map from runner name to the command line agents are launched with.
-Referenced by `orchestrator.runner` and `workspaces[].runner`.
+Referenced by `orchestrator.runner`, and used as the concrete launcher an
+[agent](/docs/configuration/agents) resolves onto (kind-keyed lookup, bridged
+from this map when no top-level [`runners`](#runners) fleet is declared).
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -216,6 +224,49 @@ agent_runners:
     flags: []
 ```
 
+<Callout>
+  Model-in-flags stays supported: an `agent_runners` entry that bakes
+  `--model` into `flags` keeps working. When an [agent](/docs/configuration/agents)
+  resolves a model, that model takes precedence and the stale baked flag is
+  replaced, so the launched line always carries exactly one model.
+</Callout>
+
+## runners
+
+An optional, kind-keyed **runner fleet** that layers on top of
+`agent_runners`: one entry per [runner kind](/docs/configuration/agents#runner-kinds)
+(`claude` / `codex` / `generic`) carrying the concrete launcher plus an optional
+house `model` / `reasoning_effort` authoritative for **every** agent of that
+kind. A field it omits falls through to each agent's `agent.yaml` recommendation.
+Empty by default; when empty, a kind resolves through the `agent_runners` bridge.
+See [agents](/docs/configuration/agents#project-runners) for the full shape and
+the resolution precedence.
+
+```yaml
+runners:
+  claude:
+    command: claude
+    # model / reasoning_effort omitted -> each agent's manifest decides
+  codex:
+    command: codex
+    model: gpt-5          # authoritative for every codex agent
+```
+
+## agents
+
+Per-agent overrides keyed by the agent's directory name. Today each entry
+carries a single `runner:` field that pins which [runner kind](/docs/configuration/agents#runner-kinds)
+the project runs that agent on, authoritative over the manifest's
+`preferred_runner`. There is deliberately no per-agent model block: per-agent
+differentiation comes from each agent's manifest, and a house model is set once
+at the kind level in [`runners`](#runners).
+
+```yaml
+agents:
+  orchestrator: { runner: codex }
+  review:       { runner: claude }
+```
+
 ## workspaces
 
 The fixed pool of workspace slots. Each owns a stable worktree on its
@@ -227,36 +278,25 @@ cleared context) between assignments. See
 | --- | --- | --- | --- | --- |
 | `name` | string | yes | — | Workspace identifier. Names the worktree at `<machine.work_dir>/.shelbi/wt/<name>`. |
 | `machine` | string | yes | — | Name of a [machine](#machines) this slot runs on. |
-| `runner` | string | yes | — | Name of an [agent runner](#agent-runners) this slot boots. |
 | `tags` | list of string | no | `[]` | Capability tags for this slot. A workspace's *effective* tags are these unioned with its machine's [`tags`](#machines). Tag-based routing picks a free workspace whose effective tags are a superset of a status's required [`tags`](/docs/configuration/workflow#statuses). Accepts a scalar `tag:` alias and a bare string as shorthand for a one-element list. Elided when empty. |
 | `slot` | integer | no | declaration-order index | Numeric slot exported to transition [`run`](/docs/configuration/workflow#transitions) commands as `$SLOT` (e.g. to derive a per-slot port). When unset, falls back to the slot's zero-based index among its machine's workspaces. Elided when unset. |
 
 ```yaml
 workspaces:
-  - { name: alice, machine: hub, runner: claude }
-  - { name: bob,   machine: m2,  runner: codex }
-  - { name: rev,   machine: hub, runner: claude, tags: [review], slot: 0 }
+  - { name: alice, machine: hub }
+  - { name: bob,   machine: m2 }
+  - { name: rev,   machine: hub, tags: [review], slot: 0 }
 ```
 
-To switch existing worker slots after setup, use:
-
-```bash
-shelbi workspace set-runner codex --all
-```
-
-That command edits the same `workspaces[].runner` fields shown above and
-validates that `codex` is declared in `agent_runners`. You can also update
-the YAML directly by changing each desired workspace row:
-
-```yaml
-workspaces:
-  - { name: alice, machine: hub, runner: codex }
-  - { name: bob,   machine: m2,  runner: codex }
-```
-
-Leave `orchestrator.runner` unchanged unless you also want to change the
-dashboard/orchestrator pane. Run `shelbi workspace list` afterward; its
-`RUNNER` column shows the runner each workspace will launch.
+<Callout type="note" title="A workspace no longer selects a runner">
+  Runner/model/effort are resolved per dispatch from the **agent** that runs in
+  the slot (see [agents](/docs/configuration/agents)), not from the workspace.
+  A legacy `runner:` key on a workspace is accepted-and-ignored on load and
+  dropped on the next save, so an existing project migrates with no manual step.
+  To change which runner an agent uses, set `agents.<name>.runner` (a
+  [runner kind](/docs/configuration/agents#runner-kinds)) or a house model in
+  [`runners`](#runners).
+</Callout>
 
 Route a slot to review work by giving it the `review` tag. See
 [review workspaces](/docs/concepts/review-workspaces) for the tag-routing

@@ -45,9 +45,10 @@ pub enum WorkspaceCmd {
         /// Machine to place the workspace on. Defaults to the local hub.
         #[arg(long)]
         machine: Option<String>,
-        /// Runner for the workspace. Defaults to an existing workspace's runner
-        /// (or the sole declared runner when there's exactly one).
-        #[arg(long)]
+        /// Retired: a workspace no longer selects a runner — the dispatched
+        /// agent owns runner/model resolution. Accepted-and-ignored so an
+        /// existing script keeps working; will be removed in a later release.
+        #[arg(long, hide = true)]
         runner: Option<String>,
     },
     /// Remove a workspace from the pool and tear down its worktree + pane.
@@ -58,20 +59,10 @@ pub enum WorkspaceCmd {
         #[arg(long)]
         force: bool,
     },
-    /// List declared workspaces with their host, runner name, currently
-    /// loaded agent (or `-` when idle), and state
+    /// List declared workspaces with their host, currently loaded agent (or
+    /// `-` when idle), integration tier, and state
     /// (`idle` / `in_progress: <task-id>`).
     List,
-    /// Change the runner assigned to existing workspace slots.
-    SetRunner {
-        /// Runner name declared under `agent_runners`.
-        runner: String,
-        /// Workspace names to update. Omit with `--all` to update every slot.
-        names: Vec<String>,
-        /// Update every declared workspace.
-        #[arg(long)]
-        all: bool,
-    },
     /// Kill a workspace's tmux pane. Releases the workspace's in-flight task back
     /// to `todo` (unassigned) so the board doesn't show an orphaned
     /// in_progress card; pass `--keep-task` to leave the task in place.
@@ -94,8 +85,8 @@ pub enum WorkspaceCmd {
 
 pub fn run(project_opt: Option<String>, cmd: WorkspaceCmd) -> Result<()> {
     let project = require_project(project_opt)?;
-    // Version gate: `stop` and `set-runner` mutate board/config state;
-    // the views warn and proceed.
+    // Version gate: `add`/`rm`/`stop` mutate board/config state; the views
+    // warn and proceed.
     match &cmd {
         WorkspaceCmd::List | WorkspaceCmd::Status { .. } => super::hub_version::warn_on_mismatch(),
         _ => super::hub_version::ensure_daemon_matches_for_mutation()?,
@@ -105,12 +96,17 @@ pub fn run(project_opt: Option<String>, cmd: WorkspaceCmd) -> Result<()> {
             name,
             machine,
             runner,
-        } => add(&project, &name, machine.as_deref(), runner.as_deref()),
+        } => {
+            if runner.is_some() {
+                eprintln!(
+                    "shelbi: --runner is retired and ignored — a workspace no longer selects a \
+                     runner; the dispatched agent owns runner/model resolution"
+                );
+            }
+            add(&project, &name, machine.as_deref())
+        }
         WorkspaceCmd::Rm { name, force } => rm(&project, &name, force),
         WorkspaceCmd::List => list(&project),
-        WorkspaceCmd::SetRunner { runner, names, all } => {
-            set_runner(&project, &runner, &names, all)
-        }
         WorkspaceCmd::Stop { name, keep_task } => stop(&project, &name, keep_task),
         WorkspaceCmd::Status { name } => status(&project, name.as_deref()),
     }
@@ -126,12 +122,11 @@ pub fn run(project_opt: Option<String>, cmd: WorkspaceCmd) -> Result<()> {
 /// having added the name, so when the orchestrator merges the hooks and re-runs
 /// `workspace add <name>`, the name-collision guard doesn't refuse the re-run.
 /// The worktree materialize is idempotent, so re-running is cheap.
-fn add(project: &str, name: &str, machine: Option<&str>, runner: Option<&str>) -> Result<()> {
+fn add(project: &str, name: &str, machine: Option<&str>) -> Result<()> {
     let mut p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
 
-    let spec = plan_workspace_add(&p, name, machine, runner)?;
+    let spec = plan_workspace_add(&p, name, machine)?;
     let machine_name = spec.machine.clone();
-    let runner_name = spec.runner.clone();
 
     let machine = p
         .machine(&machine_name)
@@ -140,11 +135,11 @@ fn add(project: &str, name: &str, machine: Option<&str>, runner: Option<&str>) -
     orch_workspace::materialize_idle_worktree(project, &machine, &spec, p.base_branch())
         .map_err(|e| anyhow!(e))?;
 
-    // Wire Shelbi's Claude hooks into settings.local.json. Only meaningful for
-    // Claude runners (codex/other pollers ignore the file), so skip the wiring
-    // for a non-Claude runner but still succeed the add.
+    // Wire Shelbi's Claude hooks into settings.local.json. Only meaningful when
+    // the project's baseline runner is Claude (codex/other pollers ignore the
+    // file), so skip the wiring otherwise but still succeed the add.
     let is_claude = p
-        .runner(&runner_name)
+        .default_runner_spec()
         .map(|r| shelbi_agent::RunnerAdapter::for_command(&r.command).is_claude())
         .unwrap_or(false);
     if is_claude {
@@ -177,7 +172,7 @@ fn add(project: &str, name: &str, machine: Option<&str>, runner: Option<&str>) -
     // Wiring succeeded — now persist the pool entry.
     p.workspaces.push(spec);
     save_workspace_config(&p)?;
-    println!("✓ added workspace `{name}` (machine {machine_name}, runner {runner_name})");
+    println!("✓ added workspace `{name}` (machine {machine_name})");
     Ok(())
 }
 
@@ -190,7 +185,6 @@ fn plan_workspace_add(
     p: &shelbi_core::Project,
     name: &str,
     machine: Option<&str>,
-    runner: Option<&str>,
 ) -> Result<WorkspaceSpec> {
     // Name must be a valid id (used as a tmux window + worktree dir name) and
     // must not collide — exactly, or by slug — with an existing workspace.
@@ -216,13 +210,12 @@ fn plan_workspace_add(
     let spec = WorkspaceSpec {
         name: name.to_string(),
         machine: resolve_add_machine(p, machine)?,
-        runner: resolve_add_runner(p, runner)?,
         tags: Vec::new(),
         slot: None,
     };
 
-    // Validate machine/runner references via a dry-run clone so a bad
-    // `--machine`/`--runner` fails before any disk work.
+    // Validate the machine reference via a dry-run clone so a bad `--machine`
+    // fails before any disk work.
     let mut candidate = p.clone();
     candidate.workspaces.push(spec.clone());
     candidate.validate_workspaces().map_err(|e| anyhow!(e))?;
@@ -247,38 +240,6 @@ fn resolve_add_machine(p: &shelbi_core::Project, machine: Option<&str>) -> Resul
 }
 
 /// Resolve the runner for `workspace add`: the explicit `--runner`, else an
-/// existing workspace's runner, else the sole declared runner. Errors when
-/// `--runner` is unknown or when no default can be inferred.
-fn resolve_add_runner(p: &shelbi_core::Project, runner: Option<&str>) -> Result<String> {
-    if let Some(name) = runner {
-        if !p.agent_runners.contains_key(name) {
-            return Err(anyhow!(
-                "runner `{name}` is not declared in agent_runners (known: {})",
-                p.agent_runners
-                    .keys()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        return Ok(name.to_string());
-    }
-    if let Some(w) = p.workspaces.first() {
-        return Ok(w.runner.clone());
-    }
-    if p.agent_runners.len() == 1 {
-        return Ok(p.agent_runners.keys().next().unwrap().clone());
-    }
-    Err(anyhow!(
-        "no default runner: pass --runner (known: {})",
-        p.agent_runners
-            .keys()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
-}
-
 /// `shelbi workspace rm <name>` — remove a workspace from the pool and tear
 /// down its worktree + pane. Refuses a workspace holding an active
 /// (in-progress/review) task unless `--force`.
@@ -398,16 +359,16 @@ fn review_assignments(
 fn workspace_integration_modes(
     project: &shelbi_core::Project,
 ) -> BTreeMap<String, IntegrationMode> {
+    // A workspace no longer selects a runner; its integration tier follows the
+    // project's baseline runner (uniform-fleet assumption).
+    let mode = project
+        .default_runner_spec()
+        .map(|runner| workspace_integration_mode(&runner.command))
+        .unwrap_or(IntegrationMode::Degraded);
     project
         .workspaces
         .iter()
-        .map(|workspace| {
-            let mode = project
-                .runner(&workspace.runner)
-                .map(|runner| workspace_integration_mode(&runner.command))
-                .unwrap_or(IntegrationMode::Degraded);
-            (workspace.name.clone(), mode)
-        })
+        .map(|workspace| (workspace.name.clone(), mode))
         .collect()
 }
 
@@ -543,8 +504,8 @@ fn render_list_with_occupied(
 ) -> Result<Vec<String>> {
     let mut out = Vec::with_capacity(workspaces.len() + 1);
     out.push(format!(
-        "{:<12} {:<8} {:<14} {:<14} {:<13} {}",
-        "NAME", "HOST", "RUNNER", "AGENT", "INTEG", "STATE"
+        "{:<12} {:<8} {:<14} {:<13} {}",
+        "NAME", "HOST", "AGENT", "INTEG", "STATE"
     ));
     for workspace in workspaces {
         let mine: Vec<&Task> = in_progress
@@ -595,74 +556,11 @@ fn render_list_with_occupied(
             .copied()
             .unwrap_or(IntegrationMode::Conventional);
         out.push(format!(
-            "{:<12} {:<8} {:<14} {:<14} {:<13} {}",
-            workspace.name, workspace.machine, workspace.runner, agent, integ, state
+            "{:<12} {:<8} {:<14} {:<13} {}",
+            workspace.name, workspace.machine, agent, integ, state
         ));
     }
     Ok(out)
-}
-
-fn set_runner(project: &str, runner: &str, names: &[String], all: bool) -> Result<()> {
-    let mut p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    let changed = update_workspace_runners(&mut p, runner, names, all)?;
-    save_workspace_config(&p)?;
-    let scope = if all {
-        "all workspaces".to_string()
-    } else {
-        changed.join(", ")
-    };
-    println!("✓ set runner `{runner}` for {scope}");
-    Ok(())
-}
-
-fn update_workspace_runners(
-    project: &mut shelbi_core::Project,
-    runner: &str,
-    names: &[String],
-    all: bool,
-) -> Result<Vec<String>> {
-    if !project.agent_runners.contains_key(runner) {
-        return Err(anyhow!(
-            "runner `{runner}` is not declared in agent_runners (known: {})",
-            project
-                .agent_runners
-                .keys()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    if all && !names.is_empty() {
-        return Err(anyhow!("pass either workspace names or --all, not both"));
-    }
-    if !all && names.is_empty() {
-        return Err(anyhow!(
-            "name at least one workspace, or pass --all to update every workspace"
-        ));
-    }
-
-    let targets: std::collections::BTreeSet<&str> = names.iter().map(String::as_str).collect();
-    let known: std::collections::BTreeSet<&str> =
-        project.workspaces.iter().map(|w| w.name.as_str()).collect();
-    if !all {
-        let missing: Vec<&str> = targets.difference(&known).copied().collect();
-        if !missing.is_empty() {
-            return Err(anyhow!(
-                "unknown workspace(s): {} (known: {})",
-                missing.join(", "),
-                known.into_iter().collect::<Vec<_>>().join(", ")
-            ));
-        }
-    }
-
-    let mut changed = Vec::new();
-    for workspace in &mut project.workspaces {
-        if all || targets.contains(workspace.name.as_str()) {
-            workspace.runner = runner.to_string();
-            changed.push(workspace.name.clone());
-        }
-    }
-    Ok(changed)
 }
 
 fn save_workspace_config(project: &shelbi_core::Project) -> Result<()> {
@@ -941,11 +839,10 @@ mod tests {
         }
     }
 
-    fn make_workspace(name: &str, machine: &str, runner: &str) -> WorkspaceSpec {
+    fn make_workspace(name: &str, machine: &str) -> WorkspaceSpec {
         WorkspaceSpec {
             name: name.to_string(),
             machine: machine.to_string(),
-            runner: runner.to_string(),
             tags: Vec::new(),
             slot: None,
         }
@@ -954,8 +851,8 @@ mod tests {
     #[test]
     fn render_list_emits_header_followed_by_one_row_per_workspace() {
         let workspaces = vec![
-            make_workspace("alpha", "hub", "opus-4-7"),
-            make_workspace("bravo", "hub", "opus-4-7"),
+            make_workspace("alpha", "hub"),
+            make_workspace("bravo", "hub"),
         ];
         let assigned = make_task("aw-task-1", Column::in_progress(), 0, Some("alpha"));
         let in_progress: Vec<&Task> = vec![&assigned];
@@ -967,14 +864,13 @@ mod tests {
         let header = &rows[0];
         let name_at = header.find("NAME").unwrap();
         let host_at = header.find("HOST").unwrap();
-        let runner_at = header.find("RUNNER").unwrap();
         let agent_at = header.find("AGENT").unwrap();
         let state_at = header.find("STATE").unwrap();
         assert!(name_at < host_at);
-        assert!(host_at < runner_at);
-        assert!(runner_at < agent_at);
+        assert!(host_at < agent_at);
         assert!(agent_at < state_at);
-        // The legacy `claude` column is gone.
+        // A workspace no longer selects a runner, so there is no RUNNER column.
+        assert!(!header.contains("RUNNER"));
         assert!(!header.contains("CLAUDE"));
         assert!(!header.contains("MODEL"));
         // The integration tier column sits between AGENT and STATE so STATE
@@ -987,8 +883,8 @@ mod tests {
     #[test]
     fn render_list_surfaces_per_workspace_integration_tier() {
         let workspaces = vec![
-            make_workspace("alpha", "hub", "opus-4-7"),
-            make_workspace("bravo", "hub", "opus-4-7"),
+            make_workspace("alpha", "hub"),
+            make_workspace("bravo", "hub"),
         ];
         let in_progress: Vec<&Task> = Vec::new();
         // alpha runs a hook-capable runner (conventional); bravo's runner is
@@ -1029,8 +925,8 @@ mod tests {
     }
 
     #[test]
-    fn render_list_active_workspace_surfaces_runner_and_default_agent() {
-        let workspaces = vec![make_workspace("alpha", "hub", "opus-4-7")];
+    fn render_list_active_workspace_surfaces_default_agent() {
+        let workspaces = vec![make_workspace("alpha", "hub")];
         let task = make_task("aw-fix-login", Column::in_progress(), 0, Some("alpha"));
         let in_progress: Vec<&Task> = vec![&task];
 
@@ -1038,8 +934,6 @@ mod tests {
         let row = &rows[1];
         assert!(row.contains("alpha"), "row: {row}");
         assert!(row.contains("hub"), "row: {row}");
-        // RUNNER reads the workspace runner name verbatim.
-        assert!(row.contains("opus-4-7"), "row: {row}");
         // Tasks without an explicit `agent:` frontmatter fall back to the
         // default task agent.
         assert!(row.contains(DEFAULT_TASK_AGENT), "row: {row}");
@@ -1051,14 +945,13 @@ mod tests {
 
     #[test]
     fn render_list_honors_explicit_agent_frontmatter() {
-        let workspaces = vec![make_workspace("delta", "devbox", "sonnet-4-6")];
+        let workspaces = vec![make_workspace("delta", "devbox")];
         let mut task = make_task("aw-write-tests", Column::in_progress(), 0, Some("delta"));
         task.params.insert("agent".into(), "qa".into());
         let in_progress: Vec<&Task> = vec![&task];
 
         let rows = render_list(&workspaces, &in_progress).unwrap();
         let row = &rows[1];
-        assert!(row.contains("sonnet-4-6"), "row: {row}");
         // The task's `agent: qa` wins over the developer default.
         assert!(
             row.contains(" qa "),
@@ -1069,7 +962,7 @@ mod tests {
 
     #[test]
     fn render_list_idle_workspace_uses_placeholder_agent_and_idle_state() {
-        let workspaces = vec![make_workspace("bravo", "hub", "opus-4-7")];
+        let workspaces = vec![make_workspace("bravo", "hub")];
         // No in-progress tasks at all — bravo is idle.
         let in_progress: Vec<&Task> = Vec::new();
 
@@ -1091,7 +984,7 @@ mod tests {
 
     #[test]
     fn render_list_marks_unassigned_live_slot_as_orphaned_session() {
-        let workspaces = vec![make_workspace("delta", "devbox", "sonnet-4-6")];
+        let workspaces = vec![make_workspace("delta", "devbox")];
         let in_progress: Vec<&Task> = Vec::new();
         let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::Orphaned)]);
 
@@ -1116,7 +1009,7 @@ mod tests {
     /// orphaned because only in-progress assignments counted as "occupied".
     #[test]
     fn render_list_review_slot_serving_handoff_is_not_orphaned() {
-        let mut ws = make_workspace("review-1", "hub", "opus-4-7");
+        let mut ws = make_workspace("review-1", "hub");
         ws.tags = vec!["review".to_string()];
         let workspaces = vec![ws];
         let in_progress: Vec<&Task> = Vec::new();
@@ -1150,7 +1043,7 @@ mod tests {
     /// dispatch while the user is in it.
     #[test]
     fn render_list_marks_user_shell_slot_as_occupied() {
-        let workspaces = vec![make_workspace("delta", "devbox", "sonnet-4-6")];
+        let workspaces = vec![make_workspace("delta", "devbox")];
         let in_progress: Vec<&Task> = Vec::new();
         let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::UserShell)]);
 
@@ -1177,7 +1070,7 @@ mod tests {
     /// with the one-line reason — instead of hanging or aborting the table.
     #[test]
     fn render_list_marks_unprobeable_machine_workspaces_unreachable() {
-        let workspaces = vec![make_workspace("delta", "devbox", "sonnet-4-6")];
+        let workspaces = vec![make_workspace("delta", "devbox")];
         let in_progress: Vec<&Task> = Vec::new();
         let occupied = BTreeMap::from([(
             "delta".to_string(),
@@ -1207,7 +1100,7 @@ mod tests {
 
     #[test]
     fn render_list_prefers_assigned_task_over_orphan_marker() {
-        let workspaces = vec![make_workspace("delta", "devbox", "sonnet-4-6")];
+        let workspaces = vec![make_workspace("delta", "devbox")];
         let task = make_task("bug-fix", Column::in_progress(), 0, Some("delta"));
         let in_progress: Vec<&Task> = vec![&task];
         let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::Orphaned)]);
@@ -1230,8 +1123,8 @@ mod tests {
         // alpha has a task; bravo is on the same host but idle. The bravo
         // row should not show alpha's task.
         let workspaces = vec![
-            make_workspace("alpha", "hub", "opus-4-7"),
-            make_workspace("bravo", "hub", "opus-4-7"),
+            make_workspace("alpha", "hub"),
+            make_workspace("bravo", "hub"),
         ];
         let task = make_task("aw-fix-login", Column::in_progress(), 0, Some("alpha"));
         let in_progress: Vec<&Task> = vec![&task];
@@ -1253,7 +1146,7 @@ mod tests {
     /// accidentally diverges the alias gets caught.
     #[test]
     fn deprecation_alias_prints_the_same_columns() {
-        let workspaces = vec![make_workspace("alpha", "hub", "opus-4-7")];
+        let workspaces = vec![make_workspace("alpha", "hub")];
         let in_progress: Vec<&Task> = Vec::new();
         let canonical = render_list(&workspaces, &in_progress).unwrap();
         // The alias arm in main.rs forwards into `commands::workspace::run`,
@@ -1262,13 +1155,16 @@ mod tests {
         // list` would render too — modulo the one-line stderr nag the
         // alias arm prints before dispatching.
         assert!(canonical[0].contains("NAME"));
-        assert!(canonical[0].contains("RUNNER"));
         assert!(canonical[0].contains("AGENT"));
         assert!(canonical[0].contains("STATE"));
+        assert!(!canonical[0].contains("RUNNER"));
         assert!(!canonical[0].contains("CLAUDE"));
     }
 
-    fn mixed_runner_project() -> Project {
+    /// A two-slot project. The workspace YAML keeps the retired `runner:` key
+    /// on purpose — an existing project config must still load with it present
+    /// (accepted-and-ignored); a workspace no longer selects a runner.
+    fn two_slot_project() -> Project {
         let mut p = Project::from_yaml_str(
             r#"
 name: p
@@ -1293,7 +1189,7 @@ workspaces:
         p
     }
 
-    fn mixed_runner_in_repo_project() -> Project {
+    fn two_slot_in_repo_project() -> Project {
         let mut p = Project::from_yaml_str(
             r#"
 name: p
@@ -1308,8 +1204,8 @@ agent_runners:
   claude: { command: claude, flags: [] }
   codex: { command: codex, flags: [] }
 workspaces:
-  - { name: alpha, machine: hub, runner: claude }
-  - { name: bravo, machine: hub, runner: codex }
+  - { name: alpha, machine: hub }
+  - { name: bravo, machine: hub }
 "#,
         )
         .unwrap();
@@ -1319,66 +1215,47 @@ workspaces:
     }
 
     #[test]
-    fn render_list_makes_mixed_workspace_runners_obvious() {
-        let p = mixed_runner_project();
-        let rows = render_list(&p.workspaces, &[]).unwrap();
-
-        assert!(rows[0].contains("RUNNER"));
-        assert!(rows[1].contains("alpha"), "row: {}", rows[1]);
-        assert!(rows[1].contains("claude"), "row: {}", rows[1]);
-        assert!(rows[2].contains("bravo"), "row: {}", rows[2]);
-        assert!(rows[2].contains("codex"), "row: {}", rows[2]);
-    }
-
-    #[test]
-    fn plan_workspace_add_defaults_machine_and_runner() {
-        let p = mixed_runner_project();
-        // No overrides: local hub machine + first existing workspace's runner.
-        let spec = plan_workspace_add(&p, "charlie", None, None).unwrap();
+    fn plan_workspace_add_defaults_machine() {
+        let p = two_slot_project();
+        // No machine override: the local hub is chosen.
+        let spec = plan_workspace_add(&p, "charlie", None).unwrap();
         assert_eq!(spec.name, "charlie");
         assert_eq!(spec.machine, "hub");
-        assert_eq!(spec.runner, "claude"); // alpha's runner
         assert!(spec.tags.is_empty());
         assert_eq!(spec.slot, None);
     }
 
     #[test]
-    fn plan_workspace_add_honors_overrides() {
-        let p = mixed_runner_project();
-        // Bind the overrides so the shelbi-agent grep-guard (which forbids a
-        // basename literal wrapped in Some(...) outside RunnerKind::from_command)
-        // stays green.
-        let machine = Some("hub");
-        let runner_override = "codex";
-        let spec = plan_workspace_add(&p, "charlie", machine, Some(runner_override)).unwrap();
+    fn plan_workspace_add_honors_machine_override() {
+        let p = two_slot_project();
+        let spec = plan_workspace_add(&p, "charlie", Some("hub")).unwrap();
         assert_eq!(spec.machine, "hub");
-        assert_eq!(spec.runner, "codex");
     }
 
     #[test]
     fn plan_workspace_add_rejects_exact_and_slug_collisions() {
-        let p = mixed_runner_project();
+        let p = two_slot_project();
         // Exact name.
-        let err = plan_workspace_add(&p, "alpha", None, None).unwrap_err();
+        let err = plan_workspace_add(&p, "alpha", None).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
         // Slug collision: `alpha-` is a valid id but normalizes (trailing `-`
         // trimmed) onto the existing `alpha`.
-        let err2 = plan_workspace_add(&p, "alpha-", None, None).unwrap_err();
+        let err2 = plan_workspace_add(&p, "alpha-", None).unwrap_err();
         assert!(err2.to_string().contains("slug-collides"), "{err2}");
     }
 
     #[test]
     fn plan_workspace_add_rejects_invalid_name() {
-        let p = mixed_runner_project();
-        let err = plan_workspace_add(&p, "Has Spaces", None, None).unwrap_err();
+        let p = two_slot_project();
+        let err = plan_workspace_add(&p, "Has Spaces", None).unwrap_err();
         assert!(err.to_string().contains("invalid workspace name"), "{err}");
     }
 
     #[test]
-    fn plan_workspace_add_rejects_unknown_runner() {
-        let p = mixed_runner_project();
-        let err = plan_workspace_add(&p, "charlie", None, Some("aider")).unwrap_err();
-        assert!(err.to_string().contains("agent_runners"), "{err}");
+    fn plan_workspace_add_rejects_unknown_machine() {
+        let p = two_slot_project();
+        let err = plan_workspace_add(&p, "charlie", Some("ghost")).unwrap_err();
+        assert!(err.to_string().contains("unknown machine"), "{err}");
     }
 
     #[test]
@@ -1388,20 +1265,28 @@ workspaces:
         std::env::set_var("SHELBI_HOME", &home);
 
         // Persist a project so load/save round-trips through disk.
-        let p = mixed_runner_project();
+        let p = two_slot_project();
         shelbi_state::save_project(&p).unwrap();
 
         // Simulate the pool mutation halves of add/rm (the disk-touching
         // worktree steps are covered by the orchestrator crate). Add appends;
         // rm removes; both go through the same save path the commands use.
         let mut after_add = shelbi_state::load_project("p").unwrap();
-        let spec = plan_workspace_add(&after_add, "charlie", None, None).unwrap();
+        let spec = plan_workspace_add(&after_add, "charlie", None).unwrap();
         after_add.workspaces.push(spec);
         save_workspace_config(&after_add).unwrap();
 
         let reloaded = shelbi_state::load_project("p").unwrap();
         assert!(reloaded.workspace("charlie").is_some());
         assert_eq!(reloaded.workspaces.len(), 3);
+        // The retired per-workspace `runner:` key is dropped on save — a
+        // clean, no-manual-step migration for an existing config.
+        assert!(
+            !std::fs::read_to_string(home.join("projects/p.yaml"))
+                .unwrap()
+                .contains("runner: claude"),
+            "workspace runner key must not survive a save"
+        );
 
         let mut after_rm = reloaded;
         after_rm.workspaces.retain(|w| w.name != "charlie");
@@ -1419,46 +1304,19 @@ workspaces:
     }
 
     #[test]
-    fn update_workspace_runners_can_bulk_switch_to_codex() {
-        let mut p = mixed_runner_project();
-        let changed = update_workspace_runners(&mut p, "codex", &[], true).unwrap();
-
-        assert_eq!(changed, vec!["alpha", "bravo"]);
-        assert!(p.workspaces.iter().all(|w| w.runner == "codex"));
-        assert_eq!(p.orchestrator.runner, "codex");
-    }
-
-    #[test]
-    fn update_workspace_runners_can_switch_selected_slots_only() {
-        let mut p = mixed_runner_project();
-        let names = vec!["alpha".to_string()];
-        let changed = update_workspace_runners(&mut p, "codex", &names, false).unwrap();
-
-        assert_eq!(changed, vec!["alpha"]);
-        assert_eq!(p.workspace("alpha").unwrap().runner, "codex");
-        assert_eq!(p.workspace("bravo").unwrap().runner, "codex");
-    }
-
-    #[test]
-    fn update_workspace_runners_rejects_unknown_runner() {
-        let mut p = mixed_runner_project();
-        let err = update_workspace_runners(&mut p, "aider", &[], true).unwrap_err();
-        assert!(err.to_string().contains("agent_runners"));
-    }
-
-    #[test]
     fn save_workspace_config_writes_local_yaml_for_in_repo_projects() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        let mut p = mixed_runner_in_repo_project();
-        update_workspace_runners(&mut p, "codex", &[], true).unwrap();
+        let mut p = two_slot_in_repo_project();
+        let spec = plan_workspace_add(&p, "charlie", None).unwrap();
+        p.workspaces.push(spec);
         save_workspace_config(&p).unwrap();
 
         let local = std::fs::read_to_string(home.join("projects/p/local.yaml")).unwrap();
         assert!(local.contains("workspaces:"), "local.yaml: {local}");
-        assert!(local.contains("runner: codex"), "local.yaml: {local}");
+        assert!(local.contains("charlie"), "local.yaml: {local}");
         assert!(!home.join("projects/p.yaml").exists());
 
         std::env::remove_var("SHELBI_HOME");

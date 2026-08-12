@@ -49,10 +49,10 @@ The pool is declared up front in the project YAML and stays fixed:
 
 ```yaml
 workspaces:
-  - { name: alpha,   machine: hub,    runner: claude }
-  - { name: bravo,   machine: hub,    runner: claude }
-  - { name: charlie, machine: devbox, runner: claude }
-  - { name: delta,   machine: devbox, runner: claude }
+  - { name: alpha,   machine: hub }
+  - { name: bravo,   machine: hub }
+  - { name: charlie, machine: devbox }
+  - { name: delta,   machine: devbox }
 ```
 
 This is deliberate. Workspaces are not allocated on demand. They are *named
@@ -92,8 +92,8 @@ machines:
     tags: [review]              # every slot on hub inherits `review`
 
 workspaces:
-  - { name: alpha, machine: hub, runner: claude }                 # effective: {review}
-  - { name: bravo, machine: hub, runner: claude, tags: [gpu] }    # effective: {review, gpu}
+  - { name: alpha, machine: hub }                 # effective: {review}
+  - { name: bravo, machine: hub, tags: [gpu] }    # effective: {review, gpu}
 ```
 
 Both fields accept a scalar `tag:` alias and a bare string as shorthand for a
@@ -130,8 +130,8 @@ workspaces on one machine avoid colliding on a port:
 
 ```yaml
 workspaces:
-  - { name: review-0, machine: hub, runner: claude, tags: [review], slot: 0 }
-  - { name: review-1, machine: hub, runner: claude, tags: [review], slot: 1 }
+  - { name: review-0, machine: hub, tags: [review], slot: 0 }
+  - { name: review-1, machine: hub, tags: [review], slot: 1 }
 ```
 
 Alongside `$SLOT`, every transition command also gets `$SHELBI_TASK`,

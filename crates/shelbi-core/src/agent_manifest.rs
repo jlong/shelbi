@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AgentRunnerSpec, Project, RunnerKind};
+use crate::model::{Project, RunnerKind};
 
 /// A coarse reasoning-effort dial that travels *with* a runner kind inside a
 /// [`RunnerManifestConfig`]. Greenfield: there is no shared ordinal scale on the
@@ -113,9 +113,54 @@ pub struct AgentManifest {
 }
 
 impl AgentManifest {
-    /// Parse a manifest from an `agent.yaml` string.
+    /// Parse a manifest from an `agent.yaml` string. The parsed manifest is
+    /// [`validate`](Self::validate)d before it is returned, so a syntactically
+    /// valid but semantically broken manifest (empty `name`, a
+    /// `preferred_runner` the agent's own `requires.runner_kinds` excludes) is
+    /// a hard error with a clear message rather than a silent
+    /// wrong-runner/model dispatch.
     pub fn from_yaml_str(s: &str) -> crate::Result<Self> {
-        Ok(serde_yaml::from_str(s)?)
+        let manifest: Self = serde_yaml::from_str(s)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Semantic validation beyond serde's shape check. Returns a clear,
+    /// actionable error (`crate::Error::Other`) for each way a manifest can be
+    /// well-formed YAML yet wrong:
+    ///
+    /// - **empty `name`** — the manifest must carry a package identity; a blank
+    ///   one would make the agent unaddressable in a marketplace and reads as a
+    ///   copy/paste slip.
+    /// - **`preferred_runner` the agent can't run** — when the manifest both
+    ///   names a `preferred_runner` and declares `requires.runner_kinds`, the
+    ///   preferred kind must appear in that compatibility list; recommending a
+    ///   default the agent itself says it can't run is a contradiction the
+    ///   resolver would otherwise honor blindly.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(crate::Error::Other(
+                "agent.yaml `name` must not be empty".to_string(),
+            ));
+        }
+        if let (Some(preferred), Some(requires)) = (self.preferred_runner, &self.requires) {
+            if !requires.runner_kinds.is_empty() && !requires.runner_kinds.contains(&preferred) {
+                let allowed = requires
+                    .runner_kinds
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(crate::Error::Other(format!(
+                    "agent.yaml `preferred_runner: {}` is not in `requires.runner_kinds` [{}] \
+                     for agent `{}`",
+                    preferred.as_str(),
+                    allowed,
+                    self.name,
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The preferred display label: the manifest `description` when set. The
@@ -241,18 +286,10 @@ pub fn resolve_agent_launch(
     }
 }
 
-/// The concrete launcher for a runner kind, drawn from the project's top-level
-/// `runners:` fleet (one entry per kind → a direct lookup). `None` when the
-/// project declares no fleet entry for `kind` — the caller then falls back to
-/// `Workspace.runner` for this migration window (the plan's §8).
-pub fn project_runner_spec(project: &Project, kind: RunnerKind) -> Option<&AgentRunnerSpec> {
-    project.runners.get(&kind).map(|r| &r.spec)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ProjectAgentConfig, ProjectRunnerConfig};
+    use crate::model::{AgentRunnerSpec, ProjectAgentConfig, ProjectRunnerConfig};
 
     fn manifest_yaml() -> &'static str {
         r#"
@@ -309,6 +346,32 @@ requires:
         assert!(m.preferred_runner.is_none());
         assert!(m.runners.is_empty());
         assert!(m.permissions_mode.is_none());
+    }
+
+    #[test]
+    fn validate_rejects_empty_name_and_incompatible_preferred_runner() {
+        // Empty name → rejected at parse time.
+        let err = AgentManifest::from_yaml_str("name: \"\"\n").unwrap_err();
+        assert!(err.to_string().contains("`name` must not be empty"), "{err}");
+
+        // preferred_runner outside requires.runner_kinds → rejected, and the
+        // message names the offending kind and the allowed set.
+        let err = AgentManifest::from_yaml_str(
+            "name: r\npreferred_runner: codex\nrequires:\n  runner_kinds: [claude]\n",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("preferred_runner: codex"), "{msg}");
+        assert!(msg.contains("claude"), "{msg}");
+
+        // preferred_runner IN requires.runner_kinds → accepted.
+        assert!(AgentManifest::from_yaml_str(
+            "name: r\npreferred_runner: claude\nrequires:\n  runner_kinds: [claude, codex]\n",
+        )
+        .is_ok());
+
+        // No requires block → preferred_runner is unconstrained.
+        assert!(AgentManifest::from_yaml_str("name: r\npreferred_runner: codex\n").is_ok());
     }
 
     fn base_project() -> Project {

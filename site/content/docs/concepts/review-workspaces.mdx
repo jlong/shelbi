@@ -145,9 +145,9 @@ machines:
     tags: [review]
 
 workspaces:
-  - { name: alpha,    machine: hub, runner: claude }                 # dev slot
-  - { name: bravo,    machine: hub, runner: claude }                 # dev slot
-  - { name: review-0, machine: hub, runner: claude, tags: [review], slot: 3000 }
+  - { name: alpha,    machine: hub }                 # dev slot
+  - { name: bravo,    machine: hub }                 # dev slot
+  - { name: review-0, machine: hub, tags: [review], slot: 3000 }
 ```
 
 ```yaml

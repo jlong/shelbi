@@ -390,7 +390,6 @@ mod tests {
             workspaces: vec![WorkspaceSpec {
                 name: "alice".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             }],

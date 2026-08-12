@@ -2662,7 +2662,6 @@ mod pr_create_tests {
             workspaces: vec![WorkspaceSpec {
                 name: "ws1".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             }],
@@ -9016,7 +9015,6 @@ mod probe_tests {
             workspaces: vec![WorkspaceSpec {
                 name: "ws1".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             }],
@@ -11272,7 +11270,6 @@ printf 'target:%s\\n' \"$CARGO_TARGET_DIR\"";
         let workspace = WorkspaceSpec {
             name: "ws2".into(),
             machine: machine.name.clone(),
-            runner: "claude".into(),
             tags: Vec::new(),
             slot: None,
         };

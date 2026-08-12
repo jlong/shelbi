@@ -868,7 +868,6 @@ mod tests {
         let workspace = WorkspaceSpec {
             name: "alpha".into(),
             machine: "hub".into(),
-            runner: "stub".into(),
             tags: Vec::new(),
             slot: None,
         };
@@ -928,7 +927,6 @@ mod tests {
         let workspace = WorkspaceSpec {
             name: "alpha".into(),
             machine: "hub".into(),
-            runner: "stub".into(),
             tags: Vec::new(),
             slot: None,
         };
@@ -981,7 +979,6 @@ mod tests {
         let workspace = WorkspaceSpec {
             name: "bravo".into(),
             machine: "hub".into(),
-            runner: "stub".into(),
             tags: Vec::new(),
             slot: None,
         };
@@ -1039,8 +1036,12 @@ mod tests {
         workspace: WorkspaceSpec,
         runner: AgentRunnerSpec,
     ) -> Project {
+        // A workspace no longer selects a runner; key the fleet by the runner's
+        // detected kind and point the orchestrator (the project baseline the
+        // agent-less pane wrapper resolves through) at that same key.
+        let runner_key = shelbi_core::RunnerKind::detect(&runner).as_str().to_string();
         let mut runners = BTreeMap::new();
-        runners.insert(workspace.runner.clone(), runner);
+        runners.insert(runner_key.clone(), runner);
         Project {
             name: name.into(),
             label: None,
@@ -1051,7 +1052,7 @@ mod tests {
             config_mode: None,
             machines: vec![machine],
             orchestrator: OrchestratorSpec {
-                runner: workspace.runner.clone(),
+                runner: runner_key,
             },
             agent_runners: runners,
             editor: None,
@@ -1345,7 +1346,6 @@ mod tests {
         let workspace = WorkspaceSpec {
             name: "alpha".into(),
             machine: "hub".into(),
-            runner: "stub".into(),
             tags: Vec::new(),
             slot: None,
         };
@@ -1402,7 +1402,6 @@ mod tests {
         let workspace = WorkspaceSpec {
             name: "alpha".into(),
             machine: "hub".into(),
-            runner: "stub".into(),
             tags: Vec::new(),
             slot: None,
         };
@@ -1454,7 +1453,6 @@ mod tests {
         let workspace = WorkspaceSpec {
             name: "alpha".into(),
             machine: "hub".into(),
-            runner: "stub".into(),
             tags: Vec::new(),
             slot: None,
         };
@@ -1515,7 +1513,6 @@ mod tests {
         let workspace = WorkspaceSpec {
             name: "alpha".into(),
             machine: "hub".into(),
-            runner: "stub".into(),
             tags: Vec::new(),
             slot: None,
         };
@@ -1633,7 +1630,6 @@ mod tests {
         let workspace = WorkspaceSpec {
             name: "alpha".into(),
             machine: "hub".into(),
-            runner: "stub".into(),
             tags: Vec::new(),
             slot: None,
         };
@@ -1702,7 +1698,6 @@ mod tests {
         let workspace = WorkspaceSpec {
             name: "alpha".into(),
             machine: "hub".into(),
-            runner: "stub".into(),
             tags: Vec::new(),
             slot: None,
         };
@@ -1773,7 +1768,6 @@ mod tests {
         let workspace = WorkspaceSpec {
             name: "alpha".into(),
             machine: "hub".into(),
-            runner: "stub".into(),
             tags: Vec::new(),
             slot: None,
         };
@@ -1830,7 +1824,6 @@ mod tests {
         let workspace = WorkspaceSpec {
             name: "alpha".into(),
             machine: "hub".into(),
-            runner: "stub".into(),
             tags: Vec::new(),
             slot: None,
         };

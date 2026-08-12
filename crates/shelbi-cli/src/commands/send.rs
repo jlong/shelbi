@@ -209,10 +209,14 @@ fn resolve_target(project: &Project, id: &str) -> Result<ResolvedTarget> {
         })?;
         let addr =
             orch_workspace::workspace_tmux_addr(project, workspace).map_err(|e| anyhow!(e))?;
-        let runner = project.runner(&workspace.runner).ok_or_else(|| {
+        // A workspace no longer selects a runner; a plain `send` to a slot
+        // (no dispatched agent to resolve) targets the project's baseline
+        // runner for its submit/prompt-injection profile.
+        let runner = project.default_runner_spec().ok_or_else(|| {
             anyhow!(
-                "workspace `{id}` references runner `{}` which is not declared in agent_runners",
-                workspace.runner
+                "project `{}` declares no runner (orchestrator runner `{}` not in agent_runners)",
+                project.name,
+                project.orchestrator.runner
             )
         })?;
         return Ok(ResolvedTarget::Workspace {
@@ -380,7 +384,6 @@ mod tests {
             vec![WorkspaceSpec {
                 name: "alpha".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             }],
@@ -408,7 +411,6 @@ mod tests {
             vec![WorkspaceSpec {
                 name: "delta".into(),
                 machine: "devbox".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             }],
@@ -427,17 +429,21 @@ mod tests {
     }
 
     #[test]
-    fn workspace_resolution_retains_codex_runner_for_submit_gating() {
-        let project = project_with_workspaces(
+    fn workspace_send_uses_project_baseline_runner_for_submit_gating() {
+        // A workspace no longer selects a runner; a plain `send` to a slot
+        // targets the project's baseline (orchestrator) runner. With a codex
+        // baseline, the codex submit profile (UI verifier, non-Claude UI) is
+        // what gates delivery.
+        let mut project = project_with_workspaces(
             "demo",
             vec![WorkspaceSpec {
                 name: "bravo".into(),
                 machine: "hub".into(),
-                runner: "codex".into(),
                 tags: Vec::new(),
                 slot: None,
             }],
         );
+        project.orchestrator.runner = "codex".into();
         match resolve_target(&project, "bravo").unwrap() {
             ResolvedTarget::Workspace { runner, .. } => {
                 assert_eq!(runner.command, "/opt/homebrew/bin/codex");
@@ -506,14 +512,12 @@ mod tests {
                 WorkspaceSpec {
                     name: "alpha".into(),
                     machine: "hub".into(),
-                    runner: "claude".into(),
                     tags: Vec::new(),
                     slot: None,
                 },
                 WorkspaceSpec {
                     name: "bravo".into(),
                     machine: "hub".into(),
-                    runner: "claude".into(),
                     tags: Vec::new(),
                     slot: None,
                 },

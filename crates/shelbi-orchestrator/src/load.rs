@@ -588,21 +588,18 @@ mod tests {
                 WorkspaceSpec {
                     name: "alpha".into(),
                     machine: "hub".into(),
-                    runner: "claude".into(),
                     tags: Vec::new(),
                     slot: None,
                 },
                 WorkspaceSpec {
                     name: "review-1".into(),
                     machine: "hub".into(),
-                    runner: "claude".into(),
                     tags: vec!["review".into()],
                     slot: None,
                 },
                 WorkspaceSpec {
                     name: "review-2".into(),
                     machine: "hub".into(),
-                    runner: "claude".into(),
                     tags: vec!["review".into()],
                     slot: None,
                 },
