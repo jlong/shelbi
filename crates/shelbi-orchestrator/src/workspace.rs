@@ -2707,7 +2707,16 @@ pub fn render_workspace_settings_preferring_agent(
     // `settings.json` or a project-wide `workspace-settings.json.template` left
     // on disk by an older shelbi still carries the relative form, and both flow
     // through this function before deploy.
-    Ok(anchor_shelbi_hook_paths(&template))
+    //
+    // Then wrap each anchored path in shell double-quotes so a worktree path
+    // containing a space (e.g. `/Users/j/To Do/…`) survives `/bin/sh`
+    // word-splitting when Claude runs the hook — an unquoted `$CLAUDE_PROJECT_DIR`
+    // expansion would split and fire `No such file or directory`. Ordered after
+    // anchoring so both legacy relative and legacy anchored-but-unquoted sources
+    // land on the quoted form; each pass is idempotent.
+    Ok(quote_shelbi_hook_commands(&anchor_shelbi_hook_paths(
+        &template,
+    )))
 }
 
 /// Rewrite relative Shelbi hook commands (`".shelbi/hooks/…"`) to the
@@ -2724,6 +2733,67 @@ fn anchor_shelbi_hook_paths(settings: &str) -> String {
         "\".shelbi/hooks/",
         "\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/",
     )
+}
+
+/// Wrap an anchored Shelbi hook command's path in shell double-quotes so a
+/// worktree path containing a space survives `/bin/sh` word-splitting. Claude
+/// Code runs each hook command through `/bin/sh`, so the unquoted value
+/// `$CLAUDE_PROJECT_DIR/.shelbi/hooks/x.sh` splits on the space in a path like
+/// `/Users/j/To Do/…` — the hook then fires `No such file or directory` and the
+/// pane-state title / message-tail signal is lost.
+///
+/// Rewrites the JSON value `"$CLAUDE_PROJECT_DIR/.shelbi/hooks/x.sh"` to
+/// `"\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/x.sh\""` — the shell double-quotes are
+/// literal characters *inside* the JSON string, so the parsed command Claude
+/// runs is `"$CLAUDE_PROJECT_DIR/.shelbi/hooks/x.sh"` (quoted for the shell).
+/// Run after [`anchor_shelbi_hook_paths`] so every Shelbi command is already in
+/// the `$CLAUDE_PROJECT_DIR/…` form this matches.
+///
+/// Idempotent: a value already carrying the `\"` shell-quote wrapper (the
+/// byte before the JSON open-quote is a backslash) is left untouched, so a
+/// re-deploy never double-wraps. Scoped to Shelbi's exclusive `.shelbi/hooks/`
+/// namespace — a user-authored hook pointing elsewhere is never rewritten.
+fn quote_shelbi_hook_commands(settings: &str) -> String {
+    const MARKER: &str = "$CLAUDE_PROJECT_DIR/.shelbi/hooks/";
+    let bytes = settings.as_bytes();
+    let mut out = String::with_capacity(settings.len() + 16);
+    let mut cursor = 0usize; // byte index of the next unemitted char
+    let mut search = 0usize; // where to resume scanning for the marker
+    while let Some(rel) = settings[search..].find(MARKER) {
+        let marker = search + rel;
+        // The anchored form always places the marker immediately after the JSON
+        // string's opening quote. If the preceding byte isn't that quote this
+        // isn't a value we understand — skip it rather than guess.
+        if marker == 0 || bytes[marker - 1] != b'"' {
+            search = marker + MARKER.len();
+            continue;
+        }
+        let open_quote = marker - 1;
+        // Already wrapped? The wrapped form is `"\"$CLAUDE…`, so the byte before
+        // the JSON open-quote is a backslash. Leave it alone (idempotent).
+        if open_quote > 0 && bytes[open_quote - 1] == b'\\' {
+            search = marker + MARKER.len();
+            continue;
+        }
+        // Find the JSON string's closing quote: the first `"` at/after the
+        // marker. A Shelbi command path carries no embedded quote, so the next
+        // `"` terminates the value.
+        let Some(close_rel) = settings[marker..].find('"') else {
+            break; // malformed tail — leave it verbatim
+        };
+        let close_quote = marker + close_rel;
+        // Emit up to and including the JSON open-quote, then the shell-quote
+        // wrapper around the path, then the JSON close-quote.
+        out.push_str(&settings[cursor..=open_quote]);
+        out.push_str("\\\"");
+        out.push_str(&settings[marker..close_quote]);
+        out.push_str("\\\"");
+        out.push('"');
+        cursor = close_quote + 1;
+        search = cursor;
+    }
+    out.push_str(&settings[cursor..]);
+    out
 }
 
 /// Relative path (from the worktree root) of Claude Code's local settings
@@ -6285,6 +6355,67 @@ mod tests {
         // A user-authored hook outside Shelbi's namespace is untouched.
         let user = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"./my-hook.sh"}]}]}}"#;
         assert_eq!(anchor_shelbi_hook_paths(user), user);
+    }
+
+    /// The shipped block wraps each anchored path in shell double-quotes
+    /// (literal `\"` inside the JSON string) so a worktree path with a space
+    /// survives `/bin/sh` word-splitting. The `.shelbi/hooks/` marker still
+    /// sits mid-string, so the classifiers must keep recognizing it.
+    const TEST_SHELBI_BLOCK_QUOTED: &str = r#"{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/session-start.sh\"" } ] }
+    ]
+  }
+}
+"#;
+
+    #[test]
+    fn quote_shelbi_hook_commands_wraps_and_is_idempotent() {
+        // Anchored-but-unquoted Shelbi command → shell-double-quoted.
+        let anchored = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"$CLAUDE_PROJECT_DIR/.shelbi/hooks/pane-working.sh"}]}]}}"#;
+        let quoted = quote_shelbi_hook_commands(anchored);
+        assert!(
+            quoted.contains(
+                r#""command":"\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/pane-working.sh\"""#
+            ),
+            "command must be wrapped in literal shell double-quotes: {quoted}"
+        );
+        // The result is still valid JSON, and the parsed command carries the
+        // literal shell quotes (what `/bin/sh` needs to keep a spaced path whole).
+        let v: serde_json::Value = serde_json::from_str(&quoted).unwrap();
+        assert_eq!(
+            v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+            "\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/pane-working.sh\"",
+        );
+        // Idempotent: a second pass never double-wraps.
+        assert_eq!(quote_shelbi_hook_commands(&quoted), quoted);
+
+        // Composes with anchoring: a legacy *relative* command is anchored then
+        // quoted, matching the full deploy-time pipeline.
+        let relative = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":".shelbi/hooks/stop.sh"}]}]}}"#;
+        let healed = quote_shelbi_hook_commands(&anchor_shelbi_hook_paths(relative));
+        assert!(
+            healed.contains(r#""\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/stop.sh\"""#),
+            "relative command must end up anchored and quoted: {healed}"
+        );
+        let _: serde_json::Value = serde_json::from_str(&healed).unwrap();
+
+        // A user-authored hook outside Shelbi's namespace is untouched.
+        let user = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"$CLAUDE_PROJECT_DIR/my-hook.sh"}]}]}}"#;
+        assert_eq!(quote_shelbi_hook_commands(user), user);
+    }
+
+    #[test]
+    fn classifiers_recognize_shell_quoted_command_form() {
+        // Regression: the shipped command now wraps the anchored path in shell
+        // double-quotes. Both classifiers must still recognize the block as
+        // Shelbi-owned via the `.shelbi/hooks/` marker, or a relaunch would
+        // fail case-2 refresh and re-merge, duplicating the block.
+        let v: serde_json::Value =
+            serde_json::from_str(TEST_SHELBI_BLOCK_QUOTED).unwrap();
+        assert!(is_shelbi_only_settings(&v));
+        assert!(settings_contain_shelbi_hooks(&v));
     }
 
     #[test]
