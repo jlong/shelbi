@@ -219,6 +219,11 @@ pub(super) fn run_foreground() -> Result<()> {
     prepare_socket(&sock)?;
     prune_stale_control_masters();
     reconcile_forward_modes();
+    // Version-agnostic config validate-and-upgrade pass, run once before the
+    // daemon starts serving — the natural "reconcile before serving" window,
+    // alongside the housekeeping sweeps above. Best-effort: it emits findings
+    // to events.log / the orchestrator handoff file and never blocks serving.
+    let _ = crate::commands::config_upgrade::run_startup_pass();
 
     // Tighten the umask around bind() so the socket inode is created
     // 0600 from the very start. Without this there is a window between

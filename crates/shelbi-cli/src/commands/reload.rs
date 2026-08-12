@@ -96,6 +96,14 @@ fn run_all(project_opt: Option<String>) -> Result<()> {
         shelbi_state::scaffold_project_statuses(&project_name).map_err(|e| anyhow!(e))?;
     }
     let outcomes = self_heal_zen_automation(&project_name, true)?;
+    // Version-agnostic config validate-and-upgrade pass: detect + classify
+    // every legacy/deprecated form, disclose a `config-upgrade` line on
+    // events.log, and write the orchestrator-handoff findings file. Runs after
+    // the existing self-heals (so it reports the true post-heal state) and
+    // before the orchestrator respawns (so a fresh instance ingests the
+    // findings). Detection-only in this slice — it never rewrites config.
+    let upgrade = crate::commands::config_upgrade::run_for_project(&project_name);
+    print_config_upgrade_summary(&project_name, &upgrade);
     let report = shelbi_orchestrator::reload(&project_name).map_err(|e| anyhow!(e))?;
     print_report(&project_name, &report);
     for outcome in outcomes {
@@ -171,6 +179,25 @@ fn print_default_workflow_migration(m: &shelbi_state::DefaultWorkflowMigration) 
     }
     if m.default_workflow_set_to_task {
         println!("✓ set default_workflow: task (migrated from the legacy `default`)");
+    }
+}
+
+/// Summarize the config validate-and-upgrade pass. Silent when the config is
+/// already current so a clean reload stays quiet; otherwise it points the user
+/// at the read-only `shelbi config upgrade` detail and notes that
+/// needs-judgment findings were handed to the orchestrator.
+fn print_config_upgrade_summary(project: &str, report: &crate::commands::config_upgrade::UpgradeReport) {
+    if report.is_empty() {
+        return;
+    }
+    let auto = report.auto_heal_count();
+    let judg = report.needs_judgment_count();
+    println!(
+        "config-upgrade: {auto} auto-heal, {judg} needs-judgment finding(s) for `{project}` \
+         (run `shelbi config upgrade -p {project}` for detail)"
+    );
+    if judg > 0 {
+        println!("  → needs-judgment findings handed to the orchestrator to resolve with you");
     }
 }
 

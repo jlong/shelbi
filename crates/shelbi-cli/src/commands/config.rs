@@ -52,6 +52,19 @@ pub enum ConfigCmd {
         #[arg(long, value_enum, default_value_t = LintFormat::Human)]
         format: LintFormat,
     },
+    /// Detect deprecated/legacy configuration forms and classify each as
+    /// auto-heal or needs-judgment. Version-agnostic (content-based), so it
+    /// works for a config authored by any past release. Read-only: this
+    /// reports the findings the on-start upgrade pass would act on; it does
+    /// not rewrite anything.
+    Upgrade {
+        /// Include every locally registered project.
+        #[arg(long)]
+        all: bool,
+        /// Diagnostic output format.
+        #[arg(long, value_enum, default_value_t = LintFormat::Human)]
+        format: LintFormat,
+    },
     /// Print every action with its mode, name, description, and the
     /// chord(s) bound to it after the keys.yaml merge.
     ListActions,
@@ -98,6 +111,7 @@ pub fn run(project: Option<String>, explicit_project: bool, cmd: ConfigCmd) -> R
             staged,
             format,
         } => lint(project, explicit_project, all, staged, format),
+        ConfigCmd::Upgrade { all, format } => upgrade(project, explicit_project, all, format),
         ConfigCmd::ListActions => list_actions(project),
         ConfigCmd::DumpKeybindings { out, force } => dump_keybindings(out, force),
         ConfigCmd::Check => check(project),
@@ -156,6 +170,24 @@ fn lint(
     }
     if !report.is_clean() {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `config upgrade`: run the version-agnostic deprecation detector over the
+/// selected projects (plus the shared global surfaces) and print the
+/// classified findings. Read-only — no write-back in this slice.
+fn upgrade(
+    project: Option<String>,
+    explicit_project: bool,
+    all: bool,
+    format: LintFormat,
+) -> Result<()> {
+    let projects = selected_projects(project, explicit_project, all)?;
+    let report = super::config_upgrade::detect(&projects)?;
+    match format {
+        LintFormat::Human => print!("{}", super::config_upgrade::render_human(&report)),
+        LintFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
     }
     Ok(())
 }
