@@ -833,6 +833,7 @@ mod tests {
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
+            launch: None,
             created_at: now,
             updated_at: now,
             params: std::collections::BTreeMap::new(),

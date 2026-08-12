@@ -92,11 +92,34 @@ pub fn run(
     // local wrapper and the remote dispatch path launching identically (see
     // `orch_workspace::resolve_workspace_launch`).
     let agent = std::env::var(ENV_AGENT).ok().filter(|s| !s.is_empty());
+    // Per-task `launch:` override — the top tier of the resolution chain. Load
+    // it from the inherited `$TASK_ID` (a dispatch injects it via tmux `-e`
+    // before this wrapper runs, and unlike `assigned_task_for_workspace` a
+    // load-by-id isn't subject to the assignment-save race that can leave the
+    // reverse lookup empty mid-dispatch); fall back to the workspace's
+    // assignment for a sidebar-click launch that inherits no `$TASK_ID`. This
+    // keeps the local wrapper and the remote dispatch resolving the SAME
+    // override — both read the task's `launch:` block. Best-effort: any read
+    // failure just means no override, falling through to the project/manifest
+    // chain unchanged.
+    let launch_override = std::env::var(ENV_TASK_ID)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|tid| shelbi_state::load_task(&project.name, &tid).ok())
+        .map(|tf| tf.task.launch)
+        .unwrap_or_else(|| {
+            assigned_task_for_workspace(&project.name, &workspace.name).and_then(|t| t.launch)
+        });
     let orch_workspace::ResolvedWorkspaceLaunch {
         runner,
         permission_mode,
-    } = orch_workspace::resolve_workspace_launch(project, workspace, agent.as_deref())
-        .map_err(|e| anyhow!("resolving runner for workspace `{}`: {e}", workspace.name))?;
+    } = orch_workspace::resolve_workspace_launch(
+        project,
+        workspace,
+        agent.as_deref(),
+        launch_override.as_ref(),
+    )
+    .map_err(|e| anyhow!("resolving runner for workspace `{}`: {e}", workspace.name))?;
     let worktree = orch_workspace::workspace_worktree(machine, workspace);
     let worktree_str = worktree.to_string_lossy().into_owned();
 
@@ -1601,6 +1624,7 @@ mod tests {
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
+            launch: None,
             created_at: now,
             updated_at: now,
             params: std::collections::BTreeMap::new(),

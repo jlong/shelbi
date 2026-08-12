@@ -1590,6 +1590,14 @@ pub struct StartSpec<'a> {
     /// exercise the spawn path in isolation) can opt out without
     /// fabricating an agent name.
     pub agent: Option<&'a str>,
+    /// Per-task launch override (the task frontmatter `launch:` block), sitting
+    /// at the TOP of the agent-launch resolution chain — above the project
+    /// config and the agent's `agent.yaml`. `None` when the task sets none, in
+    /// which case resolution is byte-identical to the project/manifest chain.
+    /// Threaded here rather than re-loaded from the task because the caller
+    /// already holds the parsed task (a bare `task_id` without a frontmatter
+    /// file yet carries no override).
+    pub launch_override: Option<&'a shelbi_core::TaskLaunchConfig>,
 }
 
 /// The runner spec + permission mode a dispatch should launch with, after the
@@ -1609,11 +1617,13 @@ pub struct ResolvedWorkspaceLaunch {
 /// `shelbi open --as-pane` wrapper — so the two can't drift on which model /
 /// effort / permission mode an agent runs with.
 ///
-/// The chain (see [`shelbi_core::resolve_agent_launch`]): project
-/// `agents.<name>.runner` → manifest `preferred_runner` → built-in default for
-/// the kind; project `runners.<kind>` → manifest `runners.<kind>` → default for
-/// model/effort; and the project's `workspace_permissions_mode` clamps the
-/// agent's requested `permissions_mode` down.
+/// The chain (see [`shelbi_core::resolve_agent_launch`]): task/status
+/// `launch_override` → project `agents.<name>.runner` → manifest
+/// `preferred_runner` → built-in default for the kind; task/status
+/// `launch_override` → project `runners.<kind>` → manifest `runners.<kind>` →
+/// default for model/effort; and the project's `workspace_permissions_mode`
+/// clamps the requested `permissions_mode` (task override winning over the
+/// manifest's) down.
 ///
 /// A workspace no longer carries a runner of its own. The concrete launcher for
 /// the resolved kind comes from the project fleet
@@ -1625,9 +1635,13 @@ pub fn resolve_workspace_launch(
     project: &shelbi_core::Project,
     _workspace: &WorkspaceSpec,
     agent: Option<&str>,
+    task_override: Option<&shelbi_core::TaskLaunchConfig>,
 ) -> Result<ResolvedWorkspaceLaunch> {
-    // No agent (bare pane) → nothing role-specific to resolve; launch on the
-    // project's baseline runner under the project-wide permission mode.
+    // No agent (bare pane) → no role manifest to resolve, and a bare pane
+    // carries no dispatched task, so `task_override` is always `None` here in
+    // practice. Launch on the project's baseline runner under the project-wide
+    // permission mode, byte-for-byte as before — the override tier applies only
+    // on the agent path below.
     let Some(agent) = agent else {
         let runner = project
             .default_runner_spec()
@@ -1642,7 +1656,8 @@ pub fn resolve_workspace_launch(
     let manifest = shelbi_state::load_agent_manifest(&project.name, agent)
         .map_err(|e| Error::Other(format!("loading agent.yaml for agent `{agent}`: {e}")))?;
 
-    let resolved = shelbi_core::resolve_agent_launch(project, agent, manifest.as_ref());
+    let resolved =
+        shelbi_core::resolve_agent_launch(project, agent, manifest.as_ref(), task_override);
 
     // Concrete launcher for the resolved kind, drawn from the project fleet
     // (top-level `runners:` → legacy `agent_runners` bridge). Graceful
@@ -1696,7 +1711,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     let ResolvedWorkspaceLaunch {
         runner,
         permission_mode,
-    } = resolve_workspace_launch(spec.project, spec.workspace, spec.agent)?;
+    } = resolve_workspace_launch(spec.project, spec.workspace, spec.agent, spec.launch_override)?;
 
     let host = machine.host();
     let worktree = workspace_worktree(&machine, spec.workspace);
@@ -1870,7 +1885,7 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     let ResolvedWorkspaceLaunch {
         runner,
         permission_mode,
-    } = resolve_workspace_launch(spec.project, spec.workspace, spec.agent)?;
+    } = resolve_workspace_launch(spec.project, spec.workspace, spec.agent, spec.launch_override)?;
 
     let host = machine.host();
     let worktree = workspace_worktree(&machine, spec.workspace);
@@ -5221,7 +5236,7 @@ mod tests {
         );
 
         let resolved =
-            resolve_workspace_launch(&project, &project.workspaces[0], Some("review")).unwrap();
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("review"), None).unwrap();
         assert_eq!(resolved.runner.command, "claude");
         assert_eq!(
             resolved.runner.flags,
@@ -5290,9 +5305,9 @@ mod tests {
         );
 
         let review =
-            resolve_workspace_launch(&project, &project.workspaces[0], Some("review")).unwrap();
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("review"), None).unwrap();
         let developer =
-            resolve_workspace_launch(&project, &project.workspaces[0], Some("developer")).unwrap();
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("developer"), None).unwrap();
 
         assert_eq!(review.runner.command, "claude");
         assert_eq!(review.runner.flags, vec!["--model", "claude-opus-4-8"]);
@@ -5301,6 +5316,85 @@ mod tests {
         assert_eq!(
             developer.runner.flags,
             vec!["--model", "gpt-5", "-c", "model_reasoning_effort=\"high\""]
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// End-to-end: a per-task `launch:` override sits at the top of both chains.
+    /// The project pins `review` onto codex/gpt-5 and the manifest recommends
+    /// claude, but a task override forcing claude + opus + high effort wins all
+    /// the way through to the launched `--model`/`--effort` flags — while a
+    /// `None` override on the same setup resolves to the project's codex pin
+    /// unchanged (the override tier is purely additive when absent).
+    #[test]
+    fn resolve_workspace_launch_task_override_wins_top_of_chain() {
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("resolve-launch-task-override");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_agent_manifest(
+            &home,
+            "myapp",
+            "review",
+            "name: review\npreferred_runner: claude\nrunners:\n  claude:\n    model: claude-sonnet-5\n",
+        );
+
+        let mut project = fixture_project();
+        // Fleet: both kinds available as concrete launchers.
+        for (kind, cmd) in [
+            (shelbi_core::RunnerKind::Claude, "claude"),
+            (shelbi_core::RunnerKind::Codex, "codex"),
+        ] {
+            project.runners.insert(
+                kind,
+                shelbi_core::ProjectRunnerConfig {
+                    spec: AgentRunnerSpec {
+                        command: cmd.into(),
+                        flags: vec![],
+                        prompt_injection: None,
+                        dialog_signatures: vec![],
+                        integration: None,
+                    },
+                    model: Some(if kind == shelbi_core::RunnerKind::Codex {
+                        "gpt-5".into()
+                    } else {
+                        "claude-sonnet-5".into()
+                    }),
+                    reasoning_effort: None,
+                },
+            );
+        }
+        // Project pins review onto codex.
+        project.agents.insert(
+            "review".into(),
+            shelbi_core::ProjectAgentConfig {
+                runner: Some(shelbi_core::RunnerKind::Codex),
+            },
+        );
+
+        // No override → the project's codex pin resolves (baseline behavior).
+        let plain =
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("review"), None).unwrap();
+        assert_eq!(plain.runner.command, "codex");
+
+        // Task override forces claude + opus + high effort — top of the chain.
+        let over = shelbi_core::TaskLaunchConfig {
+            runner: Some(shelbi_core::RunnerKind::Claude),
+            model: Some("claude-opus-4-8".into()),
+            effort: Some(shelbi_core::ReasoningEffort::High),
+            permission_mode: None,
+        };
+        let resolved =
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("review"), Some(&over))
+                .unwrap();
+        assert_eq!(resolved.runner.command, "claude");
+        assert_eq!(
+            resolved.runner.flags,
+            vec!["--model", "claude-opus-4-8", "--effort", "high"]
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -5322,7 +5416,7 @@ mod tests {
         let project = fixture_project();
         // Agent name with no agent.yaml on disk and no project override.
         let resolved =
-            resolve_workspace_launch(&project, &project.workspaces[0], Some("developer")).unwrap();
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("developer"), None).unwrap();
         assert_eq!(resolved.runner.command, "claude");
         assert!(resolved.runner.flags.is_empty());
         assert_eq!(resolved.permission_mode, "auto");
@@ -5355,7 +5449,7 @@ mod tests {
         // No manifest, no override → the baked `--model` flags pass through
         // unchanged. A project still on model-in-flags keeps working.
         let plain =
-            resolve_workspace_launch(&project, &project.workspaces[0], Some("developer")).unwrap();
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("developer"), None).unwrap();
         assert_eq!(plain.runner.command, "claude");
         assert_eq!(plain.runner.flags, vec!["--model", "legacy-baked-model"]);
 
@@ -5368,7 +5462,7 @@ mod tests {
             "name: review\npreferred_runner: claude\nrunners:\n  claude:\n    model: claude-opus-4-8\n",
         );
         let resolved =
-            resolve_workspace_launch(&project, &project.workspaces[0], Some("review")).unwrap();
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("review"), None).unwrap();
         assert_eq!(resolved.runner.command, "claude");
         assert_eq!(
             resolved.runner.flags,
@@ -5660,6 +5754,7 @@ mod tests {
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
+            launch: None,
             params: BTreeMap::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -10502,6 +10597,7 @@ mod sync_worktree_freshcut_tests {
             branch: "shelbi/task-ev",
             task_body: "",
             agent: None,
+            launch_override: None,
         });
 
         let events = std::fs::read_to_string(home.join("events.log")).unwrap_or_default();

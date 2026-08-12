@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Project, RunnerKind};
+use crate::model::{Project, RunnerKind, TaskLaunchConfig};
 
 /// A coarse reasoning-effort dial that travels *with* a runner kind inside a
 /// [`RunnerManifestConfig`]. Greenfield: there is no shared ordinal scale on the
@@ -235,48 +235,67 @@ pub struct ResolvedAgentLaunch {
 
 /// Resolve runner kind + model + effort + permission mode for `agent_name`,
 /// honoring the full precedence chain from the plan (§4). `manifest` is the
-/// agent's parsed `agent.yaml`, or `None` when it ships none.
+/// agent's parsed `agent.yaml`, or `None` when it ships none. `task_override`
+/// is the per-task/per-status override (task frontmatter `launch:`), or `None`
+/// when the task sets none — passing `None` resolves byte-identically to the
+/// project/manifest chain alone.
 ///
-/// **Runner kind** (highest→lowest): project `agents.<name>.runner` →
-/// `agent.yaml` `preferred_runner` → built-in default (Claude). (A task/status
-/// override sits above all of these; it has no config surface yet and is passed
-/// as `None` today.)
+/// **Runner kind** (highest→lowest): task/status `launch.runner` → project
+/// `agents.<name>.runner` → `agent.yaml` `preferred_runner` → built-in default
+/// (Claude).
 ///
-/// **Model / effort** (highest→lowest, each field independent): project
-/// top-level `runners.<kind>.{model,reasoning_effort}` → `agent.yaml`
-/// `runners.<kind>.{model,reasoning_effort}` → built-in default (none).
+/// **Model / effort** (highest→lowest, each field independent): task/status
+/// `launch.{model,effort}` → project top-level
+/// `runners.<kind>.{model,reasoning_effort}` → `agent.yaml`
+/// `runners.<kind>.{model,reasoning_effort}` → built-in default (none). The
+/// `<kind>` these resolve against is the runner kind resolved above, so a
+/// task-level `launch.runner` also redirects which `runners.<kind>` block the
+/// model/effort chains read.
 ///
-/// **Permission mode**: the project ceiling (`workspace_permissions_mode`)
-/// clamps the agent's request downward (see [`clamp_permission_mode`]).
+/// **Permission mode**: a ceiling clamp, never an escalation. The request is
+/// the task/status `launch.permission_mode` (winning over the manifest's
+/// `permissions_mode`), and the project ceiling
+/// (`workspace_permissions_mode`) clamps it downward (see
+/// [`clamp_permission_mode`]) — a task override can only tighten, never widen.
 pub fn resolve_agent_launch(
     project: &Project,
     agent_name: &str,
     manifest: Option<&AgentManifest>,
+    task_override: Option<&TaskLaunchConfig>,
 ) -> ResolvedAgentLaunch {
     // --- runner kind chain -------------------------------------------------
-    let kind = project
-        .agents
-        .get(agent_name)
-        .and_then(|a| a.runner)
+    // task/status override sits at the top; the rest of the chain is
+    // unchanged, so a `None` override falls straight through to it.
+    let kind = task_override
+        .and_then(|o| o.runner)
+        .or_else(|| project.agents.get(agent_name).and_then(|a| a.runner))
         .or_else(|| manifest.and_then(|m| m.preferred_runner))
         .unwrap_or(RunnerKind::Claude);
 
     // --- model / effort chains (field-independent) -------------------------
+    // The task override wins over the project's and manifest's per-kind blocks
+    // for the resolved kind.
     let project_runner = project.runners.get(&kind);
     let manifest_runner = manifest.and_then(|m| m.runners.get(&kind));
 
-    let model = project_runner
-        .and_then(|r| r.model.clone())
+    let model = task_override
+        .and_then(|o| o.model.clone())
+        .or_else(|| project_runner.and_then(|r| r.model.clone()))
         .or_else(|| manifest_runner.and_then(|r| r.model.clone()));
-    let effort = project_runner
-        .and_then(|r| r.reasoning_effort)
+    let effort = task_override
+        .and_then(|o| o.effort)
+        .or_else(|| project_runner.and_then(|r| r.reasoning_effort))
         .or_else(|| manifest_runner.and_then(|r| r.reasoning_effort));
 
     // --- permission mode: project ceiling clamps the request down ----------
-    let permission_mode = clamp_permission_mode(
-        &project.workspace_permissions_mode,
-        manifest.and_then(|m| m.permissions_mode.as_deref()),
-    );
+    // The task override's request wins over the manifest's, but both are only
+    // ever *requests* — the project ceiling clamps either one down, so a task
+    // can never escalate above it.
+    let permission_request = task_override
+        .and_then(|o| o.permission_mode.as_deref())
+        .or_else(|| manifest.and_then(|m| m.permissions_mode.as_deref()));
+    let permission_mode =
+        clamp_permission_mode(&project.workspace_permissions_mode, permission_request);
 
     ResolvedAgentLaunch {
         kind,
@@ -399,7 +418,7 @@ workspaces: []
     fn kind_falls_through_manifest_preferred_then_default() {
         let project = base_project();
         // No manifest, no project override → built-in Claude default.
-        let r = resolve_agent_launch(&project, "review", None);
+        let r = resolve_agent_launch(&project, "review", None, None);
         assert_eq!(r.kind, RunnerKind::Claude);
 
         // Manifest recommends codex → honored when the project is silent.
@@ -407,7 +426,7 @@ workspaces: []
             "name: r\npreferred_runner: codex\nrunners:\n  codex:\n    model: gpt-5\n",
         )
         .unwrap();
-        let r = resolve_agent_launch(&project, "review", Some(&m));
+        let r = resolve_agent_launch(&project, "review", Some(&m), None);
         assert_eq!(r.kind, RunnerKind::Codex);
         assert_eq!(r.model.as_deref(), Some("gpt-5"));
     }
@@ -422,7 +441,7 @@ workspaces: []
             "name: r\npreferred_runner: claude\nrunners:\n  codex:\n    model: gpt-5\n  claude:\n    model: claude-opus-4-8\n",
         )
         .unwrap();
-        let r = resolve_agent_launch(&project, "review", Some(&m));
+        let r = resolve_agent_launch(&project, "review", Some(&m), None);
         // Project pins codex over the manifest's claude preference; the codex
         // block's model + effort travel together with the chosen kind.
         assert_eq!(r.kind, RunnerKind::Codex);
@@ -451,7 +470,7 @@ workspaces: []
             "name: r\npreferred_runner: claude\nrunners:\n  claude:\n    model: claude-opus-4-8\n    reasoning_effort: high\n",
         )
         .unwrap();
-        let r = resolve_agent_launch(&project, "review", Some(&m));
+        let r = resolve_agent_launch(&project, "review", Some(&m), None);
         // Model comes from the project (authoritative); effort falls through to
         // the manifest since the project omitted it.
         assert_eq!(r.model.as_deref(), Some("claude-sonnet-5"));
@@ -475,5 +494,143 @@ workspaces: []
             clamp_permission_mode("acceptEdits", Some("bypassPermissions")),
             "acceptEdits"
         );
+    }
+
+    #[test]
+    fn task_override_wins_over_project_and_manifest() {
+        let mut project = base_project();
+        // Project pins review onto codex, with a project-level codex model.
+        project.agents.insert(
+            "review".into(),
+            ProjectAgentConfig {
+                runner: Some(RunnerKind::Codex),
+            },
+        );
+        project.runners.insert(
+            RunnerKind::Codex,
+            ProjectRunnerConfig {
+                spec: AgentRunnerSpec {
+                    command: "codex".into(),
+                    flags: vec![],
+                    prompt_injection: None,
+                    dialog_signatures: vec![],
+                    integration: None,
+                },
+                model: Some("gpt-5".into()),
+                reasoning_effort: Some(ReasoningEffort::Medium),
+            },
+        );
+        // Manifest recommends its own claude block too.
+        let m = AgentManifest::from_yaml_str(
+            "name: r\npreferred_runner: claude\nrunners:\n  claude:\n    model: claude-sonnet-5\n    reasoning_effort: low\n",
+        )
+        .unwrap();
+
+        // Task override forces claude + a specific model + effort — it sits at
+        // the very top of every chain, so it beats both the project's codex pin
+        // and the manifest's claude block.
+        let over = TaskLaunchConfig {
+            runner: Some(RunnerKind::Claude),
+            model: Some("claude-opus-4-8".into()),
+            effort: Some(ReasoningEffort::High),
+            permission_mode: None,
+        };
+        let r = resolve_agent_launch(&project, "review", Some(&m), Some(&over));
+        assert_eq!(r.kind, RunnerKind::Claude);
+        assert_eq!(r.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(r.effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn task_override_runner_redirects_model_effort_kind() {
+        let mut project = base_project();
+        // Project has house model/effort for BOTH kinds. The task overrides only
+        // the runner kind (to codex) and leaves model/effort unset, so they must
+        // resolve against the *codex* block, not claude's.
+        for (kind, cmd, model) in [
+            (RunnerKind::Claude, "claude", "claude-sonnet-5"),
+            (RunnerKind::Codex, "codex", "gpt-5"),
+        ] {
+            project.runners.insert(
+                kind,
+                ProjectRunnerConfig {
+                    spec: AgentRunnerSpec {
+                        command: cmd.into(),
+                        flags: vec![],
+                        prompt_injection: None,
+                        dialog_signatures: vec![],
+                        integration: None,
+                    },
+                    model: Some(model.into()),
+                    reasoning_effort: Some(ReasoningEffort::High),
+                },
+            );
+        }
+        let over = TaskLaunchConfig {
+            runner: Some(RunnerKind::Codex),
+            model: None,
+            effort: None,
+            permission_mode: None,
+        };
+        let r = resolve_agent_launch(&project, "review", None, Some(&over));
+        assert_eq!(r.kind, RunnerKind::Codex);
+        // model/effort come from the codex block the override redirected to.
+        assert_eq!(r.model.as_deref(), Some("gpt-5"));
+        assert_eq!(r.effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn absent_task_override_falls_through_unchanged() {
+        // A `None` override must resolve byte-identically to the project /
+        // manifest chain alone: same result with and without the tier.
+        let mut project = base_project();
+        project.agents.insert(
+            "review".into(),
+            ProjectAgentConfig {
+                runner: Some(RunnerKind::Codex),
+            },
+        );
+        let m = AgentManifest::from_yaml_str(
+            "name: r\npreferred_runner: claude\nrunners:\n  codex:\n    model: gpt-5\n    reasoning_effort: high\npermissions_mode: read-only\n",
+        )
+        .unwrap();
+        let without = resolve_agent_launch(&project, "review", Some(&m), None);
+        let with_empty =
+            resolve_agent_launch(&project, "review", Some(&m), Some(&TaskLaunchConfig::default()));
+        assert_eq!(without, with_empty);
+        assert_eq!(without.kind, RunnerKind::Codex);
+        assert_eq!(without.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn task_override_permission_request_clamps_to_ceiling() {
+        // Project ceiling is `auto` (base_project default). A task requesting the
+        // looser `full-access` is clamped down to the ceiling, never escalated.
+        let project = base_project();
+        assert_eq!(project.workspace_permissions_mode, "auto");
+        let escalate = TaskLaunchConfig {
+            permission_mode: Some("full-access".into()),
+            ..Default::default()
+        };
+        let r = resolve_agent_launch(&project, "review", None, Some(&escalate));
+        assert_eq!(r.permission_mode, "auto");
+
+        // A tighter request (read-only) is honored, mapped to claude's `plan`.
+        let tighten = TaskLaunchConfig {
+            permission_mode: Some("read-only".into()),
+            ..Default::default()
+        };
+        let r = resolve_agent_launch(&project, "review", None, Some(&tighten));
+        assert_eq!(r.permission_mode, "plan");
+
+        // The task request wins over the manifest's: manifest asks read-only but
+        // the task asks (and is granted) the equal-to-ceiling `auto`.
+        let m = AgentManifest::from_yaml_str("name: r\npermissions_mode: read-only\n").unwrap();
+        let task_auto = TaskLaunchConfig {
+            permission_mode: Some("auto".into()),
+            ..Default::default()
+        };
+        let r = resolve_agent_launch(&project, "review", Some(&m), Some(&task_auto));
+        assert_eq!(r.permission_mode, "auto");
     }
 }

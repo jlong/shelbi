@@ -278,6 +278,7 @@ statuses:
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
+            launch: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             params: std::collections::BTreeMap::new(),

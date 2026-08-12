@@ -461,6 +461,7 @@ fn dispatch_task_onto(
         branch: &branch,
         task_body: &tf.body,
         agent: agent.as_deref(),
+        launch_override: tf.task.launch.as_ref(),
     }) {
         Ok(addr) => addr,
         Err(e) => {
@@ -504,6 +505,7 @@ mod tests {
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
+            launch: None,
             params: params
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), serde_yaml::Value::from(*v)))
@@ -541,6 +543,7 @@ mod tests {
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
+            launch: None,
             params: BTreeMap::new(),
             created_at: now,
             updated_at: now,
@@ -804,6 +807,7 @@ mod tests {
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
+            launch: None,
             params: BTreeMap::new(),
             created_at: now,
             updated_at: now,

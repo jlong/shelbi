@@ -2843,6 +2843,7 @@ fn redispatch_workspace(
             branch: &branch,
             task_body: &tf.body,
             agent: Some(&agent),
+            launch_override: tf.task.launch.as_ref(),
         },
     )
     .map_err(|e| e.to_string())?;
@@ -4258,6 +4259,7 @@ mod tests {
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
+            launch: None,
             created_at: now,
             updated_at: now,
             params: std::collections::BTreeMap::new(),
