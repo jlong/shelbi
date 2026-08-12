@@ -3252,18 +3252,21 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE).unwrap();
         // Commands anchor the hook path with $CLAUDE_PROJECT_DIR so they
-        // resolve from any CWD, not just the worktree root.
+        // resolve from any CWD, not just the worktree root, and wrap it in
+        // shell double-quotes so a worktree path containing a space survives
+        // `/bin/sh` word-splitting. The quotes are literal characters inside
+        // the JSON string value, so the parsed command carries them.
         assert_eq!(
             v["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-            "$CLAUDE_PROJECT_DIR/.shelbi/hooks/session-start.sh",
+            "\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/session-start.sh\"",
         );
         assert_eq!(
             v["hooks"]["Stop"][0]["hooks"][0]["command"],
-            "$CLAUDE_PROJECT_DIR/.shelbi/hooks/pane-idle.sh",
+            "\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/pane-idle.sh\"",
         );
         assert_eq!(
             v["hooks"]["Stop"][1]["hooks"][0]["command"],
-            "$CLAUDE_PROJECT_DIR/.shelbi/hooks/stop.sh",
+            "\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/stop.sh\"",
         );
     }
 
