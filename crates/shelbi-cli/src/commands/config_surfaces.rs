@@ -157,6 +157,20 @@ pub fn lint_live(projects: &[String]) -> Result<LintReport> {
     result
 }
 
+/// Enumerate every Shelbi-owned configuration surface for `projects` against
+/// its **live** canonical path — no staging, no copy. This is the discovery
+/// primitive the version-agnostic upgrade pass (`config_upgrade`) sniffs over:
+/// surface enumeration stays here, in one place, so the upgrade layer and the
+/// lint layer can never disagree about what counts as a Shelbi surface.
+///
+/// Entries are returned sorted by `logical_id`, each carrying the live
+/// `canonical_path` and its `exists` flag as of this call.
+pub fn live_entries(projects: &[String]) -> Result<Vec<InventoryEntry>> {
+    let mut entries = collect_entries(projects)?;
+    entries.sort_by(|a, b| a.logical_id.cmp(&b.logical_id));
+    Ok(entries)
+}
+
 pub fn lint_staged(staged: &Path, selected_projects: Option<&[String]>) -> Result<LintReport> {
     let manifest_path = staged.join(MANIFEST_FILE);
     let text = fs::read_to_string(&manifest_path).with_context(|| {
@@ -1386,7 +1400,7 @@ fn find_entry<'a>(entries: &'a [&InventoryEntry], logical_id: &str) -> Option<&'
         .find(|entry| entry.logical_id == logical_id)
 }
 
-fn locate_key(text: &str, key: &str) -> Location {
+pub(crate) fn locate_key(text: &str, key: &str) -> Location {
     for (line_index, line) in text.lines().enumerate() {
         let trimmed = line.trim_start();
         if trimmed.starts_with(key)

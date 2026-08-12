@@ -5,6 +5,7 @@ pub mod archive;
 pub mod attach;
 pub mod config;
 mod config_surfaces;
+mod config_upgrade;
 pub mod daemon;
 pub mod diff;
 pub mod events;
