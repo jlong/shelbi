@@ -174,6 +174,23 @@ fn local_workspace_pane_id(session: &str, window: &str) -> Result<String> {
         .ok_or_else(|| Error::Other(format!("workspace window `{window}` has no pane")))
 }
 
+/// Whether `pane_id` is currently a live pane **of the review window**
+/// (`session:window`). The review panel is spawned run-once (no respawn loop),
+/// so a crash / accidental Ctrl-C / any exit that bypasses
+/// [`close_review_interface`]'s teardown closes the pane but leaves its id
+/// stashed in [`PANEL_KEY`]. The reuse path must confirm the pane is actually
+/// present — and present in the *review* window, not stranded elsewhere — before
+/// trusting a stashed panel id; otherwise it re-focuses a window whose review
+/// sidebar has vanished (the "sidebar disappears and never comes back" bug).
+/// A `list-panes` failure (window gone) or an absent id reads as not-live so the
+/// caller (re)spawns.
+fn panel_pane_live(session: &str, window: &str, pane_id: &str) -> bool {
+    let target = format!("{session}:{window}");
+    tmux_capture(&["list-panes", "-t", &target, "-F", "#{pane_id}"])
+        .map(|out| out.lines().any(|l| l.trim() == pane_id))
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Open / switch / close
 
@@ -246,18 +263,26 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
         });
     }
 
-    // Reuse: the interface is already up on this same task — just re-focus its
-    // window (switching windows relocates nothing). Avoids splitting a second
-    // panel on a repeat click.
-    if read_session_var(&session, PANEL_KEY).is_some()
-        && read_session_var(&session, TASK_KEY).as_deref() == Some(task_id)
-    {
-        let _ = tmux_run(&["select-window", "-t", &review_win]);
-        return Ok(ReviewOpenOutcome::Opened(review_win));
-    }
-    // A panel left over from another task (or a crash) is torn down first so we
-    // never leak its panes or stack a second panel into the window.
-    if read_session_var(&session, PANEL_KEY).is_some() {
+    // Reuse: the interface is already up on this same task AND its panel pane is
+    // still live in the review window — just re-focus (switching windows
+    // relocates nothing). Avoids splitting a second panel on a repeat click.
+    //
+    // The panel is run-once (no respawn loop), so a crash / accidental Ctrl-C /
+    // any exit that bypasses `close_review_interface` closes the pane but leaves
+    // its id stashed in PANEL_KEY. Verifying liveness before re-focusing is the
+    // guard that keeps a dead panel from resurfacing as a blank review sidebar:
+    // a dead (or wrong-window) panel falls through to the teardown + (re)spawn
+    // below instead of re-focusing a window whose sidebar has vanished.
+    if let Some(panel) = read_session_var(&session, PANEL_KEY) {
+        if read_session_var(&session, TASK_KEY).as_deref() == Some(task_id)
+            && panel_pane_live(&session, &ws.name, &panel)
+        {
+            let _ = tmux_run(&["select-window", "-t", &review_win]);
+            return Ok(ReviewOpenOutcome::Opened(review_win));
+        }
+        // A panel left over from another task, or one that crashed/exited (dead,
+        // or stranded in the wrong window), is torn down first so we never leak
+        // its panes or stack a second panel into the window before (re)spawning.
         let _ = close_review_interface(project_name);
     }
 
@@ -874,6 +899,69 @@ mod tests {
             .map(|s| s.success())
             .unwrap_or(false);
         assert!(ok, "failed to create window `{name}` in `{session}`");
+    }
+
+    /// The liveness guard behind the reuse path: `panel_pane_live` is true only
+    /// while a pane with that id is actually present **in the review window**.
+    /// A killed panel (the run-once crash the fix targets), a bogus id, and a
+    /// live pane living in a *different* window all read as not-live, so the
+    /// reuse path (re)spawns instead of re-focusing a blank review sidebar.
+    #[test]
+    fn panel_pane_live_tracks_the_review_window_pane() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
+
+        let session = format!("shelbi-panel-live-{}", std::process::id());
+        crate::tmux_test_support::start_session(&session, "holder");
+        add_window(&session, "review-1");
+        add_window(&session, "other");
+
+        // Split a "panel" pane into the review window and capture its id.
+        let review_target = format!("{session}:review-1");
+        let panel_id = std::process::Command::new("tmux")
+            .args([
+                "split-window", "-h", "-d", "-t", &review_target, "-P", "-F", "#{pane_id}", "sh",
+                "-c", "sleep 600",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .expect("split a panel pane into the review window");
+        assert!(!panel_id.is_empty(), "captured a panel pane id");
+
+        // Live in the review window => true; a bogus id => false.
+        assert!(
+            panel_pane_live(&session, "review-1", &panel_id),
+            "a live pane in the review window reads as live"
+        );
+        assert!(
+            !panel_pane_live(&session, "review-1", "%999999"),
+            "a bogus pane id reads as not-live"
+        );
+
+        // The same live pane, queried against a *different* window, reads as
+        // not-live — the guard is window-scoped so a stranded panel (wrong
+        // target) triggers a (re)spawn rather than a false reuse.
+        assert!(
+            !panel_pane_live(&session, "other", &panel_id),
+            "a pane live elsewhere is not-live for the review window target"
+        );
+
+        // Kill the panel pane (the run-once crash): the guard now reads not-live.
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-pane", "-t", &panel_id])
+            .status();
+        assert!(
+            !panel_pane_live(&session, "review-1", &panel_id),
+            "a crashed/killed panel pane is detected as not-live"
+        );
+
+        crate::tmux_test_support::kill_session(&session);
     }
 
     /// Accepting a review item closes *only* the review-tagged slot's window,
