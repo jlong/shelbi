@@ -54,13 +54,19 @@ pub enum ConfigCmd {
     },
     /// Detect deprecated/legacy configuration forms and classify each as
     /// auto-heal or needs-judgment. Version-agnostic (content-based), so it
-    /// works for a config authored by any past release. Read-only: this
-    /// reports the findings the on-start upgrade pass would act on; it does
-    /// not rewrite anything.
+    /// works for a config authored by any past release. Read-only by default:
+    /// it reports the findings the on-start upgrade pass would act on. With
+    /// `--apply` it performs the same auto-heal write-backs the on-start pass
+    /// does (disclosing each on events.log) and prints the residual findings.
     Upgrade {
         /// Include every locally registered project.
         #[arg(long)]
         all: bool,
+        /// Apply every auto-heal write-back (as hub start / `shelbi reload`
+        /// do), instead of only reporting. Needs-judgment findings are still
+        /// left for you to resolve.
+        #[arg(long)]
+        apply: bool,
         /// Diagnostic output format.
         #[arg(long, value_enum, default_value_t = LintFormat::Human)]
         format: LintFormat,
@@ -111,7 +117,9 @@ pub fn run(project: Option<String>, explicit_project: bool, cmd: ConfigCmd) -> R
             staged,
             format,
         } => lint(project, explicit_project, all, staged, format),
-        ConfigCmd::Upgrade { all, format } => upgrade(project, explicit_project, all, format),
+        ConfigCmd::Upgrade { all, apply, format } => {
+            upgrade(project, explicit_project, all, apply, format)
+        }
         ConfigCmd::ListActions => list_actions(project),
         ConfigCmd::DumpKeybindings { out, force } => dump_keybindings(out, force),
         ConfigCmd::Check => check(project),
@@ -175,16 +183,37 @@ fn lint(
 }
 
 /// `config upgrade`: run the version-agnostic deprecation detector over the
-/// selected projects (plus the shared global surfaces) and print the
-/// classified findings. Read-only — no write-back in this slice.
+/// selected projects (plus the shared global surfaces) and print the classified
+/// findings. With `apply`, additionally perform every auto-heal write-back (the
+/// same pass hub start / `shelbi reload` run) before printing the residual.
 fn upgrade(
     project: Option<String>,
     explicit_project: bool,
     all: bool,
+    apply: bool,
     format: LintFormat,
 ) -> Result<()> {
     let projects = selected_projects(project, explicit_project, all)?;
     let report = super::config_upgrade::detect(&projects)?;
+    let report = if apply {
+        let applied = super::config_upgrade_apply::apply_auto_heal(&projects, &report);
+        if matches!(format, LintFormat::Human) {
+            for change in &applied {
+                println!(
+                    "healed [{}] {} ({}): {}",
+                    change.code,
+                    change.detail,
+                    change.logical_id,
+                    change.file.display()
+                );
+            }
+            println!("auto-healed {} finding(s)", applied.len());
+        }
+        // Re-detect so the printed report reflects the post-heal residual.
+        super::config_upgrade::detect(&projects)?
+    } else {
+        report
+    };
     match format {
         LintFormat::Human => print!("{}", super::config_upgrade::render_human(&report)),
         LintFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),

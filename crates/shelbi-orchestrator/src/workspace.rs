@@ -2743,7 +2743,13 @@ pub fn render_workspace_settings_preferring_agent(
 /// namespace, so any command under it is Shelbi's own — anchoring it is strictly
 /// a correctness fix and never rewrites a user-authored hook (those point
 /// elsewhere, e.g. `./my-hook.sh`).
-fn anchor_shelbi_hook_paths(settings: &str) -> String {
+///
+/// Exposed so the version-agnostic config validate-and-upgrade pass
+/// (`shelbi-cli`'s `config_upgrade`) drives the *same* transform when it
+/// write-back-heals a `SETTINGS_HOOK_PATH_UNANCHORED` finding — one source of
+/// truth for the anchoring rule, so the deploy-time heal and the upgrade pass
+/// can never disagree.
+pub fn anchor_shelbi_hook_paths(settings: &str) -> String {
     settings.replace(
         "\".shelbi/hooks/",
         "\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/",
@@ -2768,7 +2774,11 @@ fn anchor_shelbi_hook_paths(settings: &str) -> String {
 /// byte before the JSON open-quote is a backslash) is left untouched, so a
 /// re-deploy never double-wraps. Scoped to Shelbi's exclusive `.shelbi/hooks/`
 /// namespace — a user-authored hook pointing elsewhere is never rewritten.
-fn quote_shelbi_hook_commands(settings: &str) -> String {
+///
+/// Exposed so the config validate-and-upgrade pass drives the *same* transform
+/// when it write-back-heals a `SETTINGS_HOOK_CMD_UNQUOTED` finding (see
+/// [`anchor_shelbi_hook_paths`] for the same rationale).
+pub fn quote_shelbi_hook_commands(settings: &str) -> String {
     const MARKER: &str = "$CLAUDE_PROJECT_DIR/.shelbi/hooks/";
     let bytes = settings.as_bytes();
     let mut out = String::with_capacity(settings.len() + 16);

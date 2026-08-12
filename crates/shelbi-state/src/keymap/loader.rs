@@ -814,6 +814,22 @@ fn legacy_zen_toggle_chord() -> Option<String> {
     Some(chord.to_string())
 }
 
+/// Drive the legacy `config.yaml::keymap.zen_toggle` migration on demand,
+/// outside a full keymap load. The version-agnostic config validate-and-upgrade
+/// pass calls this to write-back-heal a `KEYMAP_ZEN_TOGGLE_LEGACY` finding by
+/// copying the chord into `keys.yaml::defaults.global.zen_toggle` and clearing
+/// the legacy field, exactly as a normal [`load_keymaps`] would.
+///
+/// Returns `Some(chord)` when a migration was performed, or `None` when there
+/// was nothing to migrate or the migration had to be safe-skipped (for example
+/// `keys.yaml` already sets an explicit `zen_toggle`, or a file was
+/// unreadable), matching the semantics [`load_keymaps`] uses. Idempotent: a
+/// second call after a successful migration sees the legacy field back at its
+/// default and returns `None`.
+pub fn heal_legacy_zen_toggle() -> Option<String> {
+    migrate_legacy_zen_toggle()
+}
+
 /// One-shot migration: copy a non-default `config.yaml::keymap.zen_toggle`
 /// into `keys.yaml::defaults.global.zen_toggle`, then reset the legacy
 /// `config.yaml` field to its default so subsequent loads stop seeing
