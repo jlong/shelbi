@@ -152,40 +152,83 @@ pub fn detect(projects: &[String]) -> Result<UpgradeReport> {
     })
 }
 
-/// Run the pass for one project (plus the shared global surfaces) and emit its
-/// results. Best-effort: a detection or emission error is logged and swallowed
-/// so the caller's primary job (reload, serve) is never blocked. Returns the
-/// report for callers that want to print a summary.
-pub fn run_for_project(project: &str) -> UpgradeReport {
+/// Outcome of a full validate-and-upgrade pass: the auto-heal write-backs that
+/// were applied this run, plus the *residual* report (what still needs
+/// attention after healing — needs-judgment findings and any auto-heal a
+/// best-effort apply had to skip). On a clean config both are empty.
+#[derive(Debug)]
+pub struct UpgradeOutcome {
+    pub applied: Vec<super::config_upgrade_apply::AppliedChange>,
+    pub residual: UpgradeReport,
+}
+
+impl Default for UpgradeOutcome {
+    fn default() -> Self {
+        Self {
+            applied: Vec::new(),
+            residual: empty_report(),
+        }
+    }
+}
+
+/// Run the pass for one project (plus the shared global surfaces): detect,
+/// apply every auto-heal, and emit the residual findings. Best-effort: a
+/// detection or emission error is logged and swallowed so the caller's primary
+/// job (reload, serve) is never blocked.
+pub fn run_for_project(project: &str) -> UpgradeOutcome {
     run_and_emit(&[project.to_string()])
 }
 
-/// Whole-hub startup pass: detect across every registered project and emit.
-/// Best-effort — never propagates, so a broken config on one project can't
-/// stop the daemon from serving.
-pub fn run_startup_pass() -> UpgradeReport {
+/// Whole-hub startup pass: detect + auto-heal across every registered project,
+/// then emit. Best-effort — never propagates, so a broken config on one
+/// project can't stop the daemon from serving.
+pub fn run_startup_pass() -> UpgradeOutcome {
     let projects = match super::config_surfaces::discover_project_names() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("shelbi config-upgrade: could not enumerate projects: {e}");
-            return empty_report();
+            return UpgradeOutcome::default();
         }
     };
     run_and_emit(&projects)
 }
 
-fn run_and_emit(projects: &[String]) -> UpgradeReport {
-    let report = match detect(projects) {
+/// Detect, apply auto-heals, re-detect the residual, and emit it.
+///
+/// Ordering is deliberate: **detect → apply → re-detect → emit**. Applying
+/// before the emit means the orchestrator-handoff findings file and the
+/// events.log summary reflect the *post-heal* state — a form that auto-healed
+/// this run is not re-surfaced to the orchestrator. Only `AutoHeal` findings
+/// are applied here; `NeedsJudgment` findings are left for slice 3's
+/// orchestrator channel. The re-detect doubles as the idempotency contract: on
+/// a config that's already current (or a second consecutive run) `apply`
+/// writes nothing and the residual equals the initial detection.
+fn run_and_emit(projects: &[String]) -> UpgradeOutcome {
+    let before = match detect(projects) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("shelbi config-upgrade: detection failed: {e}");
-            return empty_report();
+            return UpgradeOutcome::default();
         }
     };
-    if let Err(e) = emit(&report) {
+    let applied = super::config_upgrade_apply::apply_auto_heal(projects, &before);
+    // Re-detect only when something actually changed; otherwise the initial
+    // report already is the residual (and re-reading disk would be wasted work).
+    let residual = if applied.is_empty() {
+        before
+    } else {
+        match detect(projects) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("shelbi config-upgrade: post-heal re-detection failed: {e}");
+                before
+            }
+        }
+    };
+    if let Err(e) = emit(&residual) {
         eprintln!("shelbi config-upgrade: emitting findings failed: {e}");
     }
-    report
+    UpgradeOutcome { applied, residual }
 }
 
 fn empty_report() -> UpgradeReport {
@@ -256,7 +299,7 @@ fn per_project_counts(report: &UpgradeReport) -> Vec<(String, usize, usize)> {
 }
 
 /// `project:demo` -> `demo`; `global` -> `global`.
-fn scope_label(scope: &str) -> &str {
+pub(crate) fn scope_label(scope: &str) -> &str {
     scope.strip_prefix("project:").unwrap_or(scope)
 }
 
@@ -299,7 +342,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
 /// and have since been deleted from the model. Dropping one is an auto-heal
 /// *only* when it carries no real data (an inert default) — a removed key that
 /// still holds user data routes to needs_judgment so nothing is silently lost.
-const REMOVED_PROJECT_KEYS: &[&str] = &["contextstore_sync", "assistant_name", "review"];
+pub(crate) const REMOVED_PROJECT_KEYS: &[&str] = &["contextstore_sync", "assistant_name", "review"];
 
 fn sniff_project_registration(
     project: &str,
@@ -611,7 +654,7 @@ fn sniff_statuses(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFindi
 /// (the single normalization table) so this never drifts from the loader; the
 /// extra `wire_str` guard keeps the legitimate on-disk snake_case wire form
 /// (`in_progress`) from being mistaken for a deprecation.
-fn legacy_status_id(raw: &str) -> Option<String> {
+pub(crate) fn legacy_status_id(raw: &str) -> Option<String> {
     let canonical = Column::from_status_id(raw);
     let trimmed = raw.trim();
     if canonical.as_str() != trimmed && canonical.wire_str() != trimmed {
@@ -897,14 +940,14 @@ fn contains_unescaped(haystack: &str, needle: &str) -> bool {
 }
 
 /// Mapping lookup by string key on a [`Value`], returning the child value.
-fn get<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+pub(crate) fn get<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     value.as_mapping()?.get(Value::String(key.to_string()))
 }
 
 /// A value that carries no real data: null, empty map, empty sequence, or a
 /// `false` flag. Used to tell an inert removed-key default (safe drop) from one
 /// that still holds user data (needs judgment).
-fn is_inert(v: &Value) -> bool {
+pub(crate) fn is_inert(v: &Value) -> bool {
     match v {
         Value::Null => true,
         Value::Bool(b) => !b,

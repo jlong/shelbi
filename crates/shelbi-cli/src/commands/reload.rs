@@ -97,11 +97,12 @@ fn run_all(project_opt: Option<String>) -> Result<()> {
     }
     let outcomes = self_heal_zen_automation(&project_name, true)?;
     // Version-agnostic config validate-and-upgrade pass: detect + classify
-    // every legacy/deprecated form, disclose a `config-upgrade` line on
-    // events.log, and write the orchestrator-handoff findings file. Runs after
-    // the existing self-heals (so it reports the true post-heal state) and
-    // before the orchestrator respawns (so a fresh instance ingests the
-    // findings). Detection-only in this slice — it never rewrites config.
+    // every legacy/deprecated form, apply the auto-heal write-backs (disclosing
+    // each on events.log as a `config-upgrade` line), and write the
+    // orchestrator-handoff findings file for what still needs judgment. Runs
+    // after the existing self-heals (so it reconciles with, rather than fights,
+    // them) and before the orchestrator respawns (so a fresh instance ingests
+    // the residual findings).
     let upgrade = crate::commands::config_upgrade::run_for_project(&project_name);
     print_config_upgrade_summary(&project_name, &upgrade);
     let report = shelbi_orchestrator::reload(&project_name).map_err(|e| anyhow!(e))?;
@@ -186,15 +187,26 @@ fn print_default_workflow_migration(m: &shelbi_state::DefaultWorkflowMigration) 
 /// already current so a clean reload stays quiet; otherwise it points the user
 /// at the read-only `shelbi config upgrade` detail and notes that
 /// needs-judgment findings were handed to the orchestrator.
-fn print_config_upgrade_summary(project: &str, report: &crate::commands::config_upgrade::UpgradeReport) {
-    if report.is_empty() {
+fn print_config_upgrade_summary(
+    project: &str,
+    outcome: &crate::commands::config_upgrade::UpgradeOutcome,
+) {
+    let healed = outcome.applied.len();
+    if healed > 0 {
+        println!(
+            "config-upgrade: auto-healed {healed} legacy config form(s) for `{project}` \
+             (each disclosed on events.log)"
+        );
+    }
+    let residual = &outcome.residual;
+    if residual.is_empty() {
         return;
     }
-    let auto = report.auto_heal_count();
-    let judg = report.needs_judgment_count();
+    let auto = residual.auto_heal_count();
+    let judg = residual.needs_judgment_count();
     println!(
-        "config-upgrade: {auto} auto-heal, {judg} needs-judgment finding(s) for `{project}` \
-         (run `shelbi config upgrade -p {project}` for detail)"
+        "config-upgrade: {auto} auto-heal, {judg} needs-judgment finding(s) still open for \
+         `{project}` (run `shelbi config upgrade -p {project}` for detail)"
     );
     if judg > 0 {
         println!("  → needs-judgment findings handed to the orchestrator to resolve with you");

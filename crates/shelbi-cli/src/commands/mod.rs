@@ -6,6 +6,7 @@ pub mod attach;
 pub mod config;
 mod config_surfaces;
 mod config_upgrade;
+mod config_upgrade_apply;
 pub mod daemon;
 pub mod diff;
 pub mod events;
