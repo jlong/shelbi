@@ -132,11 +132,13 @@ const WORKSPACES_EXTRA: Section = Section {
     prose: &[
         "Add more workspaces to the pool above. Each owns a worktree at",
         "<machine.work_dir>/.shelbi/wt/<name> and picks up tasks from the board.",
-        "Tags route work: a status can require tags, and a slot tagged `review` is",
-        "the surface the Reviewer agent loads a branch onto for a human to run",
-        "(scalar `tag:` also accepted).",
+        "A workspace no longer selects a runner — the dispatched agent owns",
+        "runner/model resolution (see the agents:/runners: reference). Tags route",
+        "work: a status can require tags, and a slot tagged `review` is the surface",
+        "the Reviewer agent loads a branch onto for a human to run (scalar `tag:`",
+        "also accepted).",
     ],
-    yaml: "- { name: bob, machine: hub, runner: codex }\n",
+    yaml: "- { name: bob, machine: hub, tags: [gpu] }\n",
 };
 
 /// Optional top-level project keys, none of which the required file emits, so
@@ -452,7 +454,10 @@ mod tests {
     /// renderer emits (name/repo/default_branch/default_workflow/machines/
     /// orchestrator/workspaces/agent_runners), used to exercise the decoration
     /// and uncomment round-trip. `workspaces:` sits between `orchestrator:` and
-    /// `agent_runners:` so the extra-workspace splice lands in the pool.
+    /// `agent_runners:` so the extra-workspace splice lands in the pool. The
+    /// two starter slots keep a legacy `runner:` key on purpose: `shelbi init`
+    /// no longer emits it, but an existing project YAML that still carries it
+    /// must decorate and parse (accepted-and-ignored) with no manual edit.
     const REQUIRED_PROJECT: &str = "\
 name: myapp
 repo: ''
@@ -518,7 +523,10 @@ agent_runners:
             .any(|m| m.host.as_deref() == Some("devbox.local")));
         // The two active slots (dev + review) plus the uncommented extra (bob).
         assert_eq!(p.workspaces.len(), 3);
-        assert!(p.workspaces.iter().any(|w| w.runner == "codex"));
+        assert!(p
+            .workspaces
+            .iter()
+            .any(|w| p.effective_tags(w).contains("gpu")));
         assert!(p
             .workspaces
             .iter()

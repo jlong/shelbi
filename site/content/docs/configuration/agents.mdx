@@ -1,0 +1,186 @@
+---
+title: Agents
+order: 31
+summary: Field-by-field reference for agent.yaml — the runner-agnostic agent manifest — plus the project runner fleet, per-agent pins, and the runner/model resolution precedence.
+---
+
+An **agent** is a role: a system prompt plus a skill set, living under
+`~/.shelbi/projects/<id>/agents/<name>/`. Alongside its `instructions.md`,
+`skills/`, and (Claude-only) `settings.json`, each agent carries a
+runner-agnostic **manifest** at `agent.yaml` that declares its recommended
+runner and model. The consuming project overrides those recommendations to fit
+its own runner fleet.
+
+`shelbi init` scaffolds a self-documenting `agent.yaml` for every default agent,
+with the identity active and every optional knob commented out beneath a pointer
+back to this page.
+
+## Where it lives
+
+```
+~/.shelbi/projects/<id>/agents/<name>/
+  agent.yaml        # the manifest (this page)
+  instructions.md   # system prompt
+  skills/           # agent-scoped skills
+  settings.json     # Claude Code hooks (Claude only)
+```
+
+A missing `agent.yaml` is non-fatal: resolution falls back to the built-in
+defaults. A present-but-malformed manifest is a hard error, so a typo can never
+silently launch on the wrong model.
+
+## agent.yaml
+
+```yaml
+name: adversarial-reviewer          # package identity (stable across installs)
+version: 1.2.0                      # manifest version (semver); advisory today
+description: Adversarial code review before a human sees the branch
+
+preferred_runner: claude            # which runners: block is the default (a KIND)
+runners:                            # per-runner-kind recommendations
+  claude:
+    model: claude-opus-4-8          # logical model id, applied per adapter
+    reasoning_effort: high          # low | medium | high | max
+  codex:
+    model: gpt-5
+    reasoning_effort: high
+
+permissions_mode: read-only         # a request; the project caps it (never up)
+
+requires:                           # compatibility hints (advisory this milestone)
+  runner_kinds: [claude, codex]     # kinds this agent can run on
+  shelbi: ">=0.8"
+```
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `name` | string | yes | — | Package identity, independent of the install directory. Must be non-empty. The directory name is how a *project* addresses the agent; `name` is how a *marketplace* would. |
+| `version` | string | no | — | Manifest version (semver). Advisory this milestone. |
+| `description` | string | no | — | Human/marketplace-facing summary. When set it is the preferred display label (falling back to the directory name). |
+| `preferred_runner` | [RunnerKind](#runner-kinds) | no | `claude` | Which runner kind the agent recommends by default. A recommendation only: the project's `agents.<name>.runner` wins. |
+| `runners` | map of [RunnerKind](#runner-kinds) → `{ model?, reasoning_effort? }` | no | `{}` | Per-kind model + effort the agent recommends. Both optional and resolved field by field. |
+| `permissions_mode` | string | no | — | The permission posture the agent requests. Clamped down to the project ceiling, never escalated (see [permissions](#permissions-are-a-ceiling)). |
+| `requires` | `{ runner_kinds?, shelbi? }` | no | — | Compatibility hints. `runner_kinds` lists the kinds the agent can run on; `shelbi` is a semver range for the host. Advisory this milestone; enforced at install in a future marketplace flow. |
+
+Validation runs at parse time: `name` must be non-empty, and when both
+`preferred_runner` and `requires.runner_kinds` are set the preferred kind must
+appear in that list (an agent cannot recommend a runner it declares it cannot
+run on).
+
+The `preferred_` prefix is deliberate and lives **only** on the agent side: the
+agent *recommends* (`preferred_runner`), the project *decides* (`runner`).
+
+## Runner kinds
+
+`preferred_runner`, `requires.runner_kinds`, the project `runners` fleet, and
+`agents.<name>.runner` all name a canonical **runner kind**, never a
+project-local runner key. This keeps a distributable agent portable across
+projects that configure their fleets differently.
+
+| Kind | Adapter |
+| --- | --- |
+| `claude` | Claude Code. `--model` and `--effort` flags; `--append-system-prompt` wiring. |
+| `codex` | Codex. `--model` and `-c model_reasoning_effort="…"`; the `max` level maps to Codex `xhigh`. |
+| `generic` | Any other runner. No model/effort contract Shelbi drives. |
+
+A `model` like `claude-opus-4-8` is a *logical* value; turning it into a launch
+flag is the resolved kind's adapter's job. Because model and effort live inside
+each `runners:` block, they **travel together per kind**: overriding an agent
+from Claude onto Codex selects the `codex` block (its own model + effort) rather
+than leaving a stale Claude model behind.
+
+## Project runners
+
+The project's runner fleet is a single top-level `runners:` map keyed by
+[runner kind](#runner-kinds). Each entry is the concrete launcher (the same
+fields as an [`agent_runners`](/docs/configuration/project#agent-runners) entry,
+the fleet's evolution) plus an optional house `model` / `reasoning_effort`.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `command` | string | yes | — | Executable to invoke. |
+| `flags` | list of string | no | `[]` | Extra flags appended to every invocation. |
+| `dialog_signatures` | list of object | no | built-in set | Blocking-dialog signatures, as in `agent_runners`. |
+| `model` | string | no | — | House model for **every** agent of this kind. When set it is authoritative; when omitted, each agent's manifest recommendation applies. |
+| `reasoning_effort` | `low` \| `medium` \| `high` \| `max` | no | — | House effort for every agent of this kind. Same field-level override rule as `model`. |
+
+```yaml
+# project.yaml
+runners:
+  claude:
+    command: claude
+    # model / reasoning_effort omitted -> each agent's manifest decides
+  codex:
+    command: codex
+    model: gpt-5          # authoritative for every codex agent
+```
+
+Kind to concrete-runner is a direct lookup: exactly one entry per kind, no
+indirection. When a kind has no `runners` entry, resolution bridges to the
+legacy [`agent_runners`](/docs/configuration/project#agent-runners) map keyed by
+the kind's canonical name, so a project predating the fleet keeps working with
+no manual migration.
+
+## Per-agent pins
+
+The `agents:` map pins which runner kind the project runs a given agent on,
+keyed by the agent's directory name. This is authoritative over the manifest's
+`preferred_runner`. There is no per-agent model block: per-agent differentiation
+comes from each agent's manifest, and a house model is set once per kind in
+`runners`.
+
+```yaml
+# project.yaml
+agents:
+  orchestrator: { runner: codex }   # this role runs on the codex kind
+  review:       { runner: claude }  # claude kind; model from review's manifest
+```
+
+## Resolution and precedence
+
+Two chains resolve per dispatch, both highest to lowest.
+
+**Runner kind** (which kind an agent runs on):
+
+```
+project agents.<name>.runner  ->  agent.yaml preferred_runner  ->  built-in default (claude)
+```
+
+**Model / effort** (the values for the resolved kind, each field independent):
+
+```
+project runners.<kind>.{model,reasoning_effort}  ->  agent.yaml runners.<kind>.{model,reasoning_effort}  ->  built-in default (none)
+```
+
+Each field resolves independently: a project `runners.claude` block that sets
+`model` but omits `reasoning_effort` overrides only the model; effort still falls
+through to the agent's manifest. So to keep two Claude agents on different models
+(`review` on Opus, `developer` on Sonnet), leave `runners.claude.model` unset
+and let each manifest decide; to impose one house model on a kind, set it once at
+the fleet level.
+
+Model-in-flags stays supported: an `agent_runners` entry that bakes `--model`
+into `flags` keeps working, and a resolved manifest model takes precedence, the
+stale flag being replaced so the launch line carries exactly one model.
+
+## Permissions are a ceiling
+
+Unlike model (taste), `permissions_mode` is a security boundary, so it resolves
+with the opposite asymmetry: the project's
+[`workspace_permissions_mode`](/docs/configuration/project#top-level-fields) is a
+**ceiling**. An agent may request equal-or-tighter and gets it; a request looser
+than the ceiling is clamped down, never granted. The plan's generic names map
+onto Claude's modes at launch: `read-only` becomes `plan`, `full-access` becomes
+`bypassPermissions`; `auto` / `default` / `acceptEdits` pass through unchanged.
+An unrecognized mode ranks as `default`, so a typo can never widen the ceiling.
+
+## Migration from Workspace.runner
+
+Earlier versions selected a runner per **workspace** slot
+(`workspaces[].runner`). That selector is removed: a workspace no longer picks a
+runner, and runner/model resolution is owned by the agent and project layers
+described here. A legacy `runner:` key on a workspace is accepted-and-ignored on
+load and dropped on the next save, so an existing project migrates with no manual
+step. This milestone assumes a **uniform fleet** (every machine has every runner
+kind installed); a machine/workspace capability declaration for heterogeneous
+fleets is a filed follow-up.

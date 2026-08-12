@@ -1615,26 +1615,26 @@ pub struct ResolvedWorkspaceLaunch {
 /// model/effort; and the project's `workspace_permissions_mode` clamps the
 /// agent's requested `permissions_mode` down.
 ///
-/// `Workspace.runner` is retained as the **fallback** for this migration
-/// window: it supplies the concrete launcher when the project declares no
-/// top-level `runners.<kind>` fleet entry, and it's the whole answer when no
-/// agent is being dispatched (a bare sidebar-click pane) or the agent ships no
-/// manifest and the project adds no override.
+/// A workspace no longer carries a runner of its own. The concrete launcher for
+/// the resolved kind comes from the project fleet
+/// ([`shelbi_core::Project::runner_for_kind`], which bridges legacy
+/// `agent_runners`); an agent-less launch (a bare sidebar-click pane) resolves
+/// to the project's baseline runner
+/// ([`shelbi_core::Project::default_runner_spec`]).
 pub fn resolve_workspace_launch(
     project: &shelbi_core::Project,
-    workspace: &WorkspaceSpec,
+    _workspace: &WorkspaceSpec,
     agent: Option<&str>,
 ) -> Result<ResolvedWorkspaceLaunch> {
-    // Migration-window fallback base: the workspace's own runner.
-    let workspace_runner = project
-        .runner(&workspace.runner)
-        .ok_or_else(|| Error::UnknownRunner(workspace.runner.clone()))?
-        .clone();
-
-    // No agent (bare pane) → nothing role-specific to resolve.
+    // No agent (bare pane) → nothing role-specific to resolve; launch on the
+    // project's baseline runner under the project-wide permission mode.
     let Some(agent) = agent else {
+        let runner = project
+            .default_runner_spec()
+            .cloned()
+            .ok_or_else(|| Error::UnknownRunner(project.orchestrator.runner.clone()))?;
         return Ok(ResolvedWorkspaceLaunch {
-            runner: workspace_runner,
+            runner,
             permission_mode: project.workspace_permissions_mode.clone(),
         });
     };
@@ -1642,30 +1642,28 @@ pub fn resolve_workspace_launch(
     let manifest = shelbi_state::load_agent_manifest(&project.name, agent)
         .map_err(|e| Error::Other(format!("loading agent.yaml for agent `{agent}`: {e}")))?;
 
-    // Pure back-compat shortcut: nothing anywhere selects a runner/model for
-    // this agent (no manifest, no per-agent project pin, no runner fleet), so
-    // the resolution would just reproduce the workspace runner + project mode.
-    if manifest.is_none() && !project.agents.contains_key(agent) && project.runners.is_empty() {
-        return Ok(ResolvedWorkspaceLaunch {
-            runner: workspace_runner,
-            permission_mode: project.workspace_permissions_mode.clone(),
-        });
-    }
-
     let resolved = shelbi_core::resolve_agent_launch(project, agent, manifest.as_ref());
 
-    // Concrete launcher for the resolved kind: the project fleet entry when
-    // present, else the workspace's own runner (migration fallback).
-    let base = shelbi_core::project_runner_spec(project, resolved.kind)
-        .cloned()
-        .unwrap_or(workspace_runner);
+    // Concrete launcher for the resolved kind, drawn from the project fleet
+    // (top-level `runners:` → legacy `agent_runners` bridge). Graceful
+    // degradation when the resolved kind has no launcher: fall back to the
+    // project baseline so a dispatch onto an under-declared fleet still starts.
+    let (base, base_is_resolved_kind) = match project.runner_for_kind(resolved.kind) {
+        Some(spec) => (spec.clone(), true),
+        None => (
+            project
+                .default_runner_spec()
+                .cloned()
+                .ok_or_else(|| Error::UnknownRunner(resolved.kind.as_str().to_string()))?,
+            false,
+        ),
+    };
 
     // Only inject the resolved model/effort when the concrete launcher actually
-    // *is* the resolved kind. If we fell back to a different-kind workspace
-    // runner (the preferred kind has no fleet entry — graceful degradation),
-    // cross-injecting one kind's model onto another's launcher would be wrong.
-    let base_kind = shelbi_agent::RunnerAdapter::for_spec(&base).kind();
-    let runner = if base_kind == resolved.kind {
+    // *is* the resolved kind. If we fell back to a different-kind baseline
+    // runner (graceful degradation), cross-injecting one kind's model onto
+    // another's launcher would be wrong.
+    let runner = if base_is_resolved_kind {
         shelbi_agent::with_reasoning_effort(
             &shelbi_agent::with_model(&base, resolved.model.as_deref()),
             resolved.effort,
@@ -5086,14 +5084,12 @@ mod tests {
                 WorkspaceSpec {
                     name: "alice".into(),
                     machine: "hub".into(),
-                    runner: "claude".into(),
                     tags: Vec::new(),
                     slot: None,
                 },
                 WorkspaceSpec {
                     name: "bob".into(),
                     machine: "m2".into(),
-                    runner: "claude".into(),
                     tags: Vec::new(),
                     slot: None,
                 },
@@ -5241,10 +5237,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// No manifest, no project override → pure back-compat: the workspace's own
-    /// runner and the project-wide permission mode, untouched.
+    /// No manifest, no project override → pure back-compat: the concrete
+    /// launcher comes from the legacy `agent_runners` bridge
+    /// ([`shelbi_core::Project::runner_for_kind`]) for the built-in Claude
+    /// default kind, and the project-wide permission mode applies untouched.
     #[test]
-    fn resolve_workspace_launch_falls_back_to_workspace_runner() {
+    fn resolve_workspace_launch_falls_back_to_legacy_agent_runner() {
         let _g = crate::test_lock::acquire();
         let tmp = agent_test_tmpdir("resolve-launch-fallback");
         let home = tmp.join("home");
@@ -5258,6 +5256,55 @@ mod tests {
         assert_eq!(resolved.runner.command, "claude");
         assert!(resolved.runner.flags.is_empty());
         assert_eq!(resolved.permission_mode, "auto");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// End-to-end model-in-flags back-compat (the milestone's acceptance): a
+    /// project whose only runner declaration is a legacy `agent_runners` entry
+    /// that bakes `--model` into `flags` keeps working, and a resolved manifest
+    /// model takes precedence over the baked one via the adapter.
+    #[test]
+    fn resolve_workspace_launch_model_in_flags_back_compat() {
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("resolve-launch-legacy-flags");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Legacy shape: no top-level `runners:` fleet; the model is baked into
+        // the `agent_runners.claude` flags the old way.
+        let mut project = fixture_project();
+        project
+            .agent_runners
+            .get_mut("claude")
+            .unwrap()
+            .flags = vec!["--model".into(), "legacy-baked-model".into()];
+
+        // No manifest, no override → the baked `--model` flags pass through
+        // unchanged. A project still on model-in-flags keeps working.
+        let plain =
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("developer")).unwrap();
+        assert_eq!(plain.runner.command, "claude");
+        assert_eq!(plain.runner.flags, vec!["--model", "legacy-baked-model"]);
+
+        // A manifest that resolves a model wins: the stale baked pair is
+        // stripped and the resolved model is what reaches the launch line.
+        write_agent_manifest(
+            &home,
+            "myapp",
+            "review",
+            "name: review\npreferred_runner: claude\nrunners:\n  claude:\n    model: claude-opus-4-8\n",
+        );
+        let resolved =
+            resolve_workspace_launch(&project, &project.workspaces[0], Some("review")).unwrap();
+        assert_eq!(resolved.runner.command, "claude");
+        assert_eq!(
+            resolved.runner.flags,
+            vec!["--model", "claude-opus-4-8"],
+            "resolved manifest model must take precedence over the baked --model"
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -6049,21 +6096,18 @@ mod tests {
             WorkspaceSpec {
                 name: "alpha".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             },
             WorkspaceSpec {
                 name: "review-1".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: vec!["review".to_string()],
                 slot: None,
             },
             WorkspaceSpec {
                 name: "review-2".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: vec!["review".to_string()],
                 slot: None,
             },
@@ -6641,10 +6685,10 @@ mod tests {
         // string is byte-for-byte identical — one constructor, two hosts, no
         // drift.
         let p = fixture_project(); // permissions_mode = "auto"; both use claude
-        let local_ws = &p.workspaces[0]; // alice, Host::Local
-        let remote_ws = &p.workspaces[1]; // bob, Host::Ssh
-        let local_runner = p.runner(&local_ws.runner).unwrap();
-        let remote_runner = p.runner(&remote_ws.runner).unwrap();
+        // A workspace no longer selects a runner; both slots resolve to the
+        // project's baseline (claude) runner.
+        let local_runner = p.default_runner_spec().unwrap();
+        let remote_runner = p.default_runner_spec().unwrap();
 
         // With an agent deployed: claude gets --permission-mode + the
         // instructions system-prompt. Both hosts produce the same shape.
@@ -9238,14 +9282,12 @@ mod sync_worktree_git_tests {
                 WorkspaceSpec {
                     name: "alice".into(),
                     machine: "hub".into(),
-                    runner: "claude".into(),
                     tags: Vec::new(),
                     slot: None,
                 },
                 WorkspaceSpec {
                     name: "bob".into(),
                     machine: "hub".into(),
-                    runner: "claude".into(),
                     tags: Vec::new(),
                     slot: None,
                 },
@@ -10306,7 +10348,6 @@ mod sync_worktree_freshcut_tests {
             workspaces: vec![WorkspaceSpec {
                 name: "alice".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             }],

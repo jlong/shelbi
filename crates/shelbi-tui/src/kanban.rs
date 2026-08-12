@@ -3540,14 +3540,12 @@ mod tests {
                 shelbi_core::WorkspaceSpec {
                     name: "alpha".into(),
                     machine: "hub".into(),
-                    runner: "claude".into(),
                     tags: Vec::new(),
                     slot: None,
                 },
                 shelbi_core::WorkspaceSpec {
                     name: "bravo".into(),
                     machine: "hub".into(),
-                    runner: "claude".into(),
                     tags: Vec::new(),
                     slot: None,
                 },

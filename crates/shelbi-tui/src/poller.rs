@@ -888,8 +888,11 @@ fn poll_one(
     // state reverts after a confirmed send or fresh live busy/input evidence;
     // Claude's title alone is not enough because it stays stale across the
     // modal and is commonly clobbered again during resume.
+    // A workspace no longer selects a runner; use the project's baseline
+    // runner for this best-effort "is the pane on Claude?" gate (the
+    // usage-limit modal is Claude-specific).
     let runner_is_claude = project
-        .runner(&workspace.runner)
+        .default_runner_spec()
         .is_some_and(|runner| shelbi_agent::RunnerAdapter::for_spec(runner).is_claude());
     if !runner_is_claude && *limit_resume != LimitResumeState::Idle {
         if limit_resume.tracked_task().is_some() {
@@ -1153,7 +1156,9 @@ fn maybe_emit_dialog_event(
     screen: Option<&str>,
     last_dialog: &mut Option<String>,
 ) {
-    let Some(runner) = project.runner(&workspace.runner) else {
+    // Best-effort dialog detection against the project's baseline runner — a
+    // workspace no longer carries a runner of its own.
+    let Some(runner) = project.default_runner_spec() else {
         return;
     };
     let signatures = runner.effective_dialog_signatures();
@@ -1789,11 +1794,11 @@ fn limit_resume_eligible_now(project_name: &str, workspace_name: &str, task_id: 
     let Ok(project) = shelbi_state::load_project(project_name) else {
         return false;
     };
-    let Some(workspace) = project.workspace(workspace_name) else {
+    let Some(_workspace) = project.workspace(workspace_name) else {
         return false;
     };
     let runner_is_claude = project
-        .runner(&workspace.runner)
+        .default_runner_spec()
         .is_some_and(|runner| shelbi_agent::RunnerAdapter::for_spec(runner).is_claude());
     runner_is_claude && current_task_for(&project, workspace_name).as_deref() == Some(task_id)
 }
@@ -4225,7 +4230,6 @@ mod tests {
             workspaces: vec![WorkspaceSpec {
                 name: "alpha".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             }],

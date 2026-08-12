@@ -22,19 +22,19 @@ shelbi workspace list
 ```
 
 ```
-NAME      HOST      RUNNER   AGENT      STATE
-alpha     hub       claude   -          idle
-bravo     hub       claude   -          idle
-charlie   hub       claude   -          idle
-delta     devbox    codex    -          idle
-echo      devbox    claude   -          idle
-foxtrot   devbox    codex    -          idle
+NAME      HOST      AGENT      INTEG          STATE
+alpha     hub       -          conventional   idle
+bravo     hub       -          conventional   idle
+charlie   hub       -          conventional   idle
+delta     devbox    -          conventional   idle
+echo      devbox    -          conventional   idle
+foxtrot   devbox    -          conventional   idle
 ```
 
-Every row should show `idle` under `STATE` and `-` under `AGENT`.
-The `RUNNER` column is the configured `workspaces[].runner` value, so it
-is where you confirm whether each slot will launch Claude, Codex, or
-another declared runner. Nothing is loaded yet. If a pane is dead, jump
+Every row should show `idle` under `STATE` and `-` under `AGENT`. A slot no
+longer selects a runner: which runner (and model) each dispatch launches is
+resolved from the [agent](/docs/configuration/agents) that runs there. Nothing
+is loaded yet. If a pane is dead, jump
 to the workspace (`Enter` on its sidebar row): the session may have
 stalled on a permission dialog, and resolving it puts the workspace back
 in the rotation.

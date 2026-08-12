@@ -4416,7 +4416,6 @@ mod reload_workspace_tmux_tests {
             workspaces: vec![WorkspaceSpec {
                 name: "alpha".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             }],

@@ -1732,7 +1732,6 @@ mod tests {
             workspaces: vec![WorkspaceSpec {
                 name: workspace.into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             }],
@@ -1804,7 +1803,6 @@ mod tests {
             workspaces: vec![WorkspaceSpec {
                 name: "never-spawned".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             }],

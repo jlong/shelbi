@@ -3490,7 +3490,6 @@ mod tests {
         shelbi_core::WorkspaceSpec {
             name: name.to_string(),
             machine: "local".to_string(),
-            runner: "claude".to_string(),
             tags: Vec::new(),
             slot: None,
         }

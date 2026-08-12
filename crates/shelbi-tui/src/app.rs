@@ -1755,14 +1755,12 @@ mod tests {
                 WorkspaceSpec {
                     name: "alpha".into(),
                     machine: "hub".into(),
-                    runner: "claude".into(),
                     tags: Vec::new(),
                     slot: None,
                 },
                 WorkspaceSpec {
                     name: "delta".into(),
                     machine: "devbox".into(),
-                    runner: "claude".into(),
                     tags: Vec::new(),
                     slot: None,
                 },
@@ -1985,7 +1983,6 @@ mod tests {
         project.workspaces.push(WorkspaceSpec {
             name: "rev-1".into(),
             machine: "hub".into(),
-            runner: "claude".into(),
             tags: vec!["review".into()],
             slot: None,
         });
@@ -2098,7 +2095,6 @@ mod tests {
         p.workspaces.push(shelbi_core::WorkspaceSpec {
             name: "review-1".into(),
             machine: "hub".into(),
-            runner: "claude".into(),
             tags: vec!["review".to_string()],
             slot: None,
         });
@@ -2117,7 +2113,6 @@ mod tests {
         p.workspaces.push(shelbi_core::WorkspaceSpec {
             name: "review-2".into(),
             machine: "hub".into(),
-            runner: "claude".into(),
             tags: vec!["review".to_string()],
             slot: None,
         });
@@ -2666,28 +2661,24 @@ mod tests {
             shelbi_core::WorkspaceSpec {
                 name: "alpha".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             },
             shelbi_core::WorkspaceSpec {
                 name: "bravo".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             },
             shelbi_core::WorkspaceSpec {
                 name: "charlie".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             },
             shelbi_core::WorkspaceSpec {
                 name: "delta".into(),
                 machine: "devbox".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             },

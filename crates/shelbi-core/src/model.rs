@@ -129,8 +129,9 @@ pub struct Project {
     /// [`agent_runners`](Self::agent_runners)), optionally carrying a house
     /// `model` / `reasoning_effort` authoritative for every agent of that kind.
     /// Kind → concrete runner is a direct lookup (no indirection). Additive:
-    /// empty on existing projects, which keep resolving through `agent_runners`
-    /// + `Workspace.runner`. See [`crate::agent_manifest::resolve_agent_launch`].
+    /// empty on existing projects, which keep resolving through the legacy
+    /// `agent_runners` bridge in [`Project::runner_for_kind`]. See
+    /// [`crate::agent_manifest::resolve_agent_launch`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub runners: BTreeMap<RunnerKind, ProjectRunnerConfig>,
     /// Per-agent project overrides, keyed by the agent's directory name. Today
@@ -694,6 +695,47 @@ impl Project {
         self.agent_runners.get(name)
     }
 
+    /// The concrete launcher for a runner **kind** — the single source of
+    /// truth now that `Workspace.runner` is gone and agents own runner
+    /// selection (see [`crate::agent_manifest::resolve_agent_launch`]).
+    ///
+    /// Resolution, highest-to-lowest, under the uniform-fleet assumption
+    /// (every machine has every runner kind):
+    ///
+    /// 1. the project's top-level [`runners`](Self::runners) fleet entry for
+    ///    the kind (the modern, kind-keyed declaration);
+    /// 2. the legacy [`agent_runners`](Self::agent_runners) entry keyed by the
+    ///    kind's canonical name (`claude` / `codex` / `generic`) — the bridge
+    ///    that keeps projects predating the `runners:` fleet working with no
+    ///    manual migration;
+    /// 3. any `agent_runners` entry whose *detected* kind matches (a runner
+    ///    registered under a non-canonical key, e.g. a wrapper binary pinned
+    ///    with `integration:`).
+    pub fn runner_for_kind(&self, kind: RunnerKind) -> Option<&AgentRunnerSpec> {
+        if let Some(cfg) = self.runners.get(&kind) {
+            return Some(&cfg.spec);
+        }
+        if let Some(spec) = self.agent_runners.get(kind.as_str()) {
+            return Some(spec);
+        }
+        self.agent_runners
+            .values()
+            .find(|spec| RunnerKind::detect(spec) == kind)
+    }
+
+    /// The project's **baseline** runner: the concrete launcher the
+    /// orchestrator itself runs on. This is what agent-less contexts — a bare
+    /// sidebar-click pane, the hub poller's best-effort dialog / usage-limit
+    /// detection, `shelbi send` to a workspace with no dispatched role — reason
+    /// about now that a workspace carries no runner of its own. Under the
+    /// uniform-fleet model it is a sound default for "what runner is (or would
+    /// be) in this pane"; a dispatch with a known agent resolves precisely
+    /// through [`crate::agent_manifest::resolve_agent_launch`] instead.
+    pub fn default_runner_spec(&self) -> Option<&AgentRunnerSpec> {
+        self.runner(&self.orchestrator.runner)
+            .or_else(|| self.runner_for_kind(RunnerKind::Claude))
+    }
+
     pub fn workspace(&self, name: &str) -> Option<&WorkspaceSpec> {
         self.workspaces.iter().find(|w| w.name == name)
     }
@@ -786,9 +828,11 @@ impl Project {
             if self.machine(&w.machine).is_none() {
                 return Err(crate::Error::UnknownMachine(w.machine.clone()));
             }
-            if self.runner(&w.runner).is_none() {
-                return Err(crate::Error::UnknownRunner(w.runner.clone()));
-            }
+            // No per-workspace runner check: a workspace no longer selects a
+            // runner. The dispatched agent owns runner resolution and the
+            // project fleet supplies the concrete launcher
+            // ([`Project::runner_for_kind`]); the orchestrator-runner check
+            // above already guarantees at least one usable runner is declared.
         }
         Ok(())
     }
@@ -917,9 +961,16 @@ fn retain_fields(value: &mut serde_yaml::Value, keep: &[&str]) {
 // Workspace (declared agent in project YAML)
 
 /// A workspace is a long-lived slot on a machine: one stable worktree, one
-/// runner. Workspaces pick up tasks from the board and switch branches between
-/// assignments (with cleared context). The worktree path is derived as
+/// tmux pane. Workspaces pick up tasks from the board and switch branches
+/// between assignments (with cleared context). The worktree path is derived as
 /// `<machine.work_dir>/.shelbi/wt/<workspace-name>` — not configurable yet.
+///
+/// A workspace does **not** select a runner. Runner/model/effort are resolved
+/// per dispatch from the *agent* (role) that runs there
+/// ([`crate::agent_manifest::resolve_agent_launch`]), and the project's fleet
+/// supplies the concrete launcher ([`Project::runner_for_kind`]). The legacy
+/// per-workspace `runner:` key is accepted-and-ignored on load for a clean
+/// migration (see [`WorkspaceSpecRaw`]).
 ///
 /// Deserializes through [`WorkspaceSpecRaw`] (`#[serde(from = …)]`) so the
 /// wire form can (a) accept the scalar `tag:` / bare-string `tags:`
@@ -932,7 +983,6 @@ fn retain_fields(value: &mut serde_yaml::Value, keep: &[&str]) {
 pub struct WorkspaceSpec {
     pub name: String,
     pub machine: String,
-    pub runner: String,
     /// Free-form capability tags for this slot. The workspace's *effective*
     /// tags are these unioned with its machine's tags — see
     /// [`Project::effective_tags`]. Used by tag-based routing (a status may
@@ -959,7 +1009,16 @@ pub struct WorkspaceSpec {
 struct WorkspaceSpecRaw {
     name: String,
     machine: String,
-    runner: String,
+    /// **Retired selector.** A workspace no longer picks its own runner — the
+    /// dispatched *agent* owns runner/model resolution
+    /// ([`crate::agent_manifest::resolve_agent_launch`]) and the project's
+    /// fleet supplies the concrete launcher ([`Project::runner_for_kind`]).
+    /// The field is kept here, read-only and ignored, purely so an existing
+    /// project YAML that still carries `runner:` on a workspace loads without a
+    /// manual edit and is rewritten without it on the next save. It is never
+    /// re-serialized ([`WorkspaceSpec`] has no such field).
+    #[serde(default)]
+    runner: Option<String>,
     #[serde(default, alias = "tag", deserialize_with = "de_string_or_seq")]
     tags: Vec<String>,
     #[serde(default)]
@@ -981,10 +1040,12 @@ impl From<WorkspaceSpecRaw> for WorkspaceSpec {
                 tags.push("review".to_string());
             }
         }
+        // `raw.runner` is intentionally dropped — a workspace no longer selects
+        // a runner (see the field docs on `WorkspaceSpecRaw`).
+        let _ = raw.runner;
         WorkspaceSpec {
             name: raw.name,
             machine: raw.machine,
-            runner: raw.runner,
             tags,
             slot: raw.slot,
         }
@@ -3371,7 +3432,6 @@ workspace_settings_template: /etc/shelbi/p.json
             workspaces: vec![WorkspaceSpec {
                 name: "alice".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: Vec::new(),
                 slot: None,
             }],
@@ -3391,7 +3451,6 @@ workspace_settings_template: /etc/shelbi/p.json
         bad.workspaces.push(WorkspaceSpec {
             name: "bob".into(),
             machine: "ghost".into(),
-            runner: "claude".into(),
             tags: Vec::new(),
             slot: None,
         });
@@ -3400,19 +3459,9 @@ workspace_settings_template: /etc/shelbi/p.json
             Err(crate::Error::UnknownMachine(_))
         ));
 
-        let mut bad2 = project.clone();
-        bad2.workspaces.push(WorkspaceSpec {
-            name: "bob".into(),
-            machine: "hub".into(),
-            runner: "ghost".into(),
-            tags: Vec::new(),
-            slot: None,
-        });
-        assert!(matches!(
-            bad2.validate_workspaces(),
-            Err(crate::Error::UnknownRunner(_))
-        ));
-
+        // A workspace no longer selects a runner, so there is no per-workspace
+        // UnknownRunner case anymore — only the orchestrator's runner is
+        // validated against the fleet.
         let mut bad3 = project.clone();
         bad3.orchestrator.runner = "ghost".into();
         assert!(matches!(
@@ -3501,7 +3550,6 @@ workspaces:
         WorkspaceSpec {
             name: name.into(),
             machine: machine.into(),
-            runner: "claude".into(),
             tags: if review {
                 vec!["review".to_string()]
             } else {
@@ -3587,6 +3635,48 @@ workspaces:
         let y = serde_yaml::to_string(&rev).unwrap();
         assert!(!y.contains("role"), "unexpected role key on the wire: {y}");
         assert!(y.contains("review"), "review tag should serialize: {y}");
+    }
+
+    #[test]
+    fn legacy_workspace_runner_is_accepted_and_dropped() {
+        // Migration tolerance: an existing project YAML that still carries the
+        // retired per-workspace `runner:` selector loads without error and the
+        // key is dropped — never re-serialized — so the next save rewrites the
+        // workspace in the runner-less shape with no manual edit.
+        let w: WorkspaceSpec =
+            serde_yaml::from_str("{ name: dev, machine: hub, runner: codex }").unwrap();
+        assert_eq!(w.name, "dev");
+        assert_eq!(w.machine, "hub");
+        let y = serde_yaml::to_string(&w).unwrap();
+        assert!(!y.contains("runner"), "runner key must not round-trip: {y}");
+    }
+
+    #[test]
+    fn runner_for_kind_bridges_legacy_agent_runners() {
+        // With no top-level `runners:` fleet, a kind resolves through the
+        // legacy `agent_runners` map keyed by the kind's canonical name — the
+        // non-breaking bridge for projects that predate the fleet.
+        let p = Project::from_yaml_str(
+            "name: p\nrepo: r\nworkspace_permissions_mode: auto\n\
+             machines:\n  - { name: hub, kind: local, work_dir: /tmp }\n\
+             orchestrator:\n  runner: claude\n\
+             agent_runners:\n  claude:\n    command: claude\n  codex:\n    command: codex\n\
+             workspaces: []\n",
+        )
+        .unwrap();
+        assert_eq!(
+            p.runner_for_kind(RunnerKind::Claude).map(|r| r.command.as_str()),
+            Some("claude")
+        );
+        assert_eq!(
+            p.runner_for_kind(RunnerKind::Codex).map(|r| r.command.as_str()),
+            Some("codex")
+        );
+        // The project baseline follows the orchestrator's declared runner.
+        assert_eq!(
+            p.default_runner_spec().map(|r| r.command.as_str()),
+            Some("claude")
+        );
     }
 
     #[test]
@@ -5039,7 +5129,6 @@ git:
             workspaces: vec![WorkspaceSpec {
                 name: "alpha".into(),
                 machine: "hub".into(),
-                runner: "claude".into(),
                 tags: vec!["review".to_string()],
                 slot: None,
             }],

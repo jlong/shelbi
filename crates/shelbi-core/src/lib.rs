@@ -11,8 +11,8 @@ pub mod workflow;
 pub mod workspace_names;
 
 pub use agent_manifest::{
-    clamp_permission_mode, project_runner_spec, resolve_agent_launch, AgentManifest, AgentRequires,
-    ReasoningEffort, ResolvedAgentLaunch, RunnerManifestConfig,
+    clamp_permission_mode, resolve_agent_launch, AgentManifest, AgentRequires, ReasoningEffort,
+    ResolvedAgentLaunch, RunnerManifestConfig,
 };
 pub use error::{Error, Result};
 pub use integration::{CapabilityLadder, IntegrationMode};

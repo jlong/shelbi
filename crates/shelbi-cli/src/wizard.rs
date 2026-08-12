@@ -2531,10 +2531,17 @@ mod tests {
 
         let project = shelbi_state::load_project("shaft").unwrap();
         assert_eq!(project.orchestrator.runner, "codex");
-        assert!(project
-            .workspaces
-            .iter()
-            .all(|workspace| workspace.runner == "codex"));
+        // A workspace no longer selects a runner; the project's baseline runner
+        // (the orchestrator's) is the codex fleet entry. Compare through the
+        // centralized kind API rather than a raw basename literal so the check
+        // stays confined to `RunnerKind::from_command` (see the
+        // `runner_basename_checks_are_confined_to_adapter_detection` guard).
+        assert_eq!(
+            project
+                .default_runner_spec()
+                .map(|r| shelbi_core::RunnerKind::from_command(&r.command)),
+            Some(shelbi_core::RunnerKind::Codex)
+        );
         assert!(launch_home.join("sessions/default.yaml").is_file());
         shelbi_state::load_session("default").unwrap();
         assert!(launch_home.join("config.yaml").is_file());

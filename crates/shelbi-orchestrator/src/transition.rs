@@ -664,7 +664,6 @@ transitions:
         p.workspaces = vec![WorkspaceSpec {
             name: "alpha".into(),
             machine: "hub".into(),
-            runner: "claude".into(),
             tags: Vec::new(),
             slot: None,
         }];

@@ -39,9 +39,9 @@ machine so every slot on it inherits the tag:
 
 ```yaml
 workspaces:
-  - { name: alpha,    machine: hub, runner: claude }
-  - { name: bravo,    machine: hub, runner: claude }
-  - { name: review-0, machine: hub, runner: claude, tags: [review], slot: 3000 }
+  - { name: alpha,    machine: hub }
+  - { name: bravo,    machine: hub }
+  - { name: review-0, machine: hub, tags: [review], slot: 3000 }
 ```
 
 `tags` accepts a bare string as shorthand (`tags: review`). The `slot: 3000`
