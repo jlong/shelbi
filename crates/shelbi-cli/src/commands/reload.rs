@@ -209,7 +209,11 @@ fn print_config_upgrade_summary(
          `{project}` (run `shelbi config upgrade -p {project}` for detail)"
     );
     if judg > 0 {
-        println!("  → needs-judgment findings handed to the orchestrator to resolve with you");
+        println!(
+            "  → {judg} needs-judgment finding(s) handed to the orchestrator to resolve with you \
+             (`shelbi config upgrade --needs-judgment -p {project}` to view; \
+             `--apply-finding <id>` to apply one you approve)"
+        );
     }
 }
 

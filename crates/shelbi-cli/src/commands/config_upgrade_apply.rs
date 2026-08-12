@@ -111,6 +111,73 @@ pub fn apply_auto_heal(projects: &[String], report: &UpgradeReport) -> Vec<Appli
     applied
 }
 
+/// Needs-judgment codes that have a deterministic resolution the user can
+/// approve for a targeted apply. Everything else routes to a human editing the
+/// file directly (a genuine ambiguity — a typo vs. data, one agent vs. another),
+/// so `apply_single_finding` refuses them with a pointer to the proposed fix.
+///
+/// `ZEN_DANGER_PATHS_CONFLICT` is the one entry: once the user accepts the
+/// safe-superset resolution (keep the built-in defaults plus every listed path),
+/// the rewrite is mechanical — see the conflict branch in `rewrite_registration`.
+const RESOLVABLE_NEEDS_JUDGMENT: &[&str] = &["ZEN_DANGER_PATHS_CONFLICT"];
+
+/// Apply exactly ONE finding, identified by its stable [`UpgradeFinding::id`],
+/// reusing the same atomic write-back machinery as the bulk auto-heal pass. This
+/// is the targeted path the orchestrator invokes once the user approves a
+/// needs-judgment fix (`shelbi config upgrade --apply-finding <id>`).
+///
+/// The finding is re-detected fresh (never trusted from a possibly-stale channel
+/// file) and matched by id, then handed to [`apply_auto_heal`] as a
+/// single-finding report — so only that finding's code, on that one surface, is
+/// touched; every other finding is left untouched. A needs-judgment finding is
+/// applied only when its code is in [`RESOLVABLE_NEEDS_JUDGMENT`]; approving it
+/// promotes it to `AutoHeal` for this one write so the existing healer resolves
+/// it. Returns the change(s) written (empty if a healer safe-skipped).
+pub fn apply_single_finding(projects: &[String], id: &str) -> anyhow::Result<Vec<AppliedChange>> {
+    let report = super::config_upgrade::detect(projects)?;
+    let Some(finding) = report.findings.iter().find(|f| f.id == id) else {
+        anyhow::bail!(
+            "no config-upgrade finding with id `{id}` (it may already be resolved — \
+             rerun `shelbi config upgrade --needs-judgment` for the current channel)"
+        );
+    };
+
+    if finding.classification == Classification::NeedsJudgment
+        && !RESOLVABLE_NEEDS_JUDGMENT.contains(&finding.code.as_str())
+    {
+        anyhow::bail!(
+            "finding `{id}` [{}] has no mechanical resolution — apply its fix by editing \
+             {} directly: {}",
+            finding.code,
+            finding.file.display(),
+            finding.proposed_fix
+        );
+    }
+
+    // A single-finding report, promoted to AutoHeal so the shared write-back
+    // applies it. Cloning keeps every other field (surface, location, code) so
+    // the healer targets the exact construct this finding describes.
+    let mut approved = finding.clone();
+    approved.classification = Classification::AutoHeal;
+    let single = UpgradeReport {
+        schema_version: report.schema_version,
+        shelbi_version: report.shelbi_version.clone(),
+        findings: vec![approved],
+    };
+
+    let applied = apply_auto_heal(projects, &single);
+    if applied.is_empty() {
+        anyhow::bail!(
+            "could not apply finding `{id}` [{}] to {} — its on-disk form wasn't in the \
+             expected shape; apply the fix by hand: {}",
+            finding.code,
+            finding.file.display(),
+            finding.proposed_fix
+        );
+    }
+    Ok(applied)
+}
+
 /// Dispatch a single surface's auto-heal findings to the right healer, mirroring
 /// the detection dispatch in [`super::config_upgrade`].
 fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &mut Vec<AppliedChange>) {
@@ -248,6 +315,35 @@ fn rewrite_registration(text: &str, codes: &BTreeSet<&str>) -> Option<(String, V
                     wrapper.insert(vs("extend"), dp);
                     zen.insert(vs("danger_paths"), Value::Mapping(wrapper));
                     changes.push(("ZEN_DANGER_PATHS_BARE_SEQ", "danger_paths->extend".into()));
+                }
+            }
+        }
+    }
+
+    // `zen.danger_paths: { extend: A, override: B }` -> `{ extend: A ∪ B }`.
+    // Detection classifies this as NeedsJudgment (the extend-vs-override intent
+    // can't be inferred), so this branch NEVER fires on the unattended auto-heal
+    // pass — `apply_auto_heal` filters to AutoHeal findings and this code is not
+    // one. It runs only through the targeted `apply_single_finding` path, where
+    // the user has explicitly approved the documented safe-superset resolution:
+    // keep the built-in defaults (extend) plus every path from both lists.
+    if codes.contains("ZEN_DANGER_PATHS_CONFLICT") {
+        if let Some(zen) = map.get_mut(vs("zen")).and_then(Value::as_mapping_mut) {
+            if let Some(dp) = zen.get_mut(vs("danger_paths")).and_then(Value::as_mapping_mut) {
+                let extend = dp.get(vs("extend")).and_then(Value::as_sequence).cloned();
+                let overridden = dp.get(vs("override")).and_then(Value::as_sequence).cloned();
+                if let (Some(ext), Some(ovr)) = (extend, overridden) {
+                    let mut merged: Vec<Value> = Vec::new();
+                    for v in ext.into_iter().chain(ovr) {
+                        if !merged.contains(&v) {
+                            merged.push(v);
+                        }
+                    }
+                    let mut wrapper = Mapping::new();
+                    wrapper.insert(vs("extend"), Value::Sequence(merged));
+                    zen.insert(vs("danger_paths"), Value::Mapping(wrapper));
+                    changes
+                        .push(("ZEN_DANGER_PATHS_CONFLICT", "extend+override->extend".into()));
                 }
             }
         }
@@ -1141,5 +1237,94 @@ workspaces:
         // Idempotent.
         let report2 = detect(&["demo".to_string()]).unwrap();
         assert_eq!(report2.auto_heal_count(), 0, "residual: {report2:?}");
+    }
+
+    // ---- slice 3: targeted single-finding apply --------------------------
+
+    #[test]
+    fn apply_single_finding_resolves_one_nj_and_leaves_the_rest() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        // Two needs-judgment findings: a resolvable danger_paths conflict and an
+        // unknown top-level key (no mechanical resolution).
+        let legacy = "\
+name: demo
+repo: /tmp/demo
+mystery_field: 3
+machines:
+- name: hub
+  kind: local
+  work_dir: /tmp/demo
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+workspaces:
+- name: w1
+  machine: hub
+zen:
+  danger_paths:
+    extend:
+    - .env
+    override:
+    - secrets/**
+";
+        let path = home.join("projects/demo.yaml");
+        std::fs::write(&path, legacy).unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        let conflict = report
+            .findings
+            .iter()
+            .find(|f| f.code == "ZEN_DANGER_PATHS_CONFLICT")
+            .expect("conflict finding");
+        let unknown = report
+            .findings
+            .iter()
+            .find(|f| f.code == "PROJECT_UNKNOWN_KEY")
+            .expect("unknown-key finding");
+
+        // Apply exactly the conflict finding.
+        let applied =
+            apply_single_finding(&["demo".to_string()], &conflict.id).expect("apply conflict");
+        assert_eq!(applied.len(), 1, "expected one change: {applied:?}");
+        assert_eq!(applied[0].code, "ZEN_DANGER_PATHS_CONFLICT");
+
+        // danger_paths is now a single `extend:` = union of both lists; the
+        // `override:` is gone. The unknown key is untouched.
+        let healed: Value = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let dp = get(get(&healed, "zen").unwrap(), "danger_paths").unwrap();
+        let dpm = dp.as_mapping().unwrap();
+        assert!(!dpm.contains_key(vs("override")), "override not dropped");
+        let ext = dpm.get(vs("extend")).and_then(Value::as_sequence).unwrap();
+        let paths: Vec<&str> = ext.iter().filter_map(Value::as_str).collect();
+        assert_eq!(paths, vec![".env", "secrets/**"], "union not as expected");
+        assert!(
+            healed.as_mapping().unwrap().contains_key(vs("mystery_field")),
+            "unrelated needs-judgment finding was touched"
+        );
+
+        // The conflict is resolved, so its id no longer detects.
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report2.findings.iter().any(|f| f.code == "ZEN_DANGER_PATHS_CONFLICT"),
+            "conflict still present after apply"
+        );
+
+        // A needs-judgment finding with no mechanical resolution is refused.
+        let err = apply_single_finding(&["demo".to_string()], &unknown.id).unwrap_err();
+        assert!(
+            err.to_string().contains("no mechanical resolution"),
+            "expected refusal, got: {err}"
+        );
+
+        // An unknown id is a clean error, not a panic.
+        let err = apply_single_finding(&["demo".to_string()], "cfg-deadbeef").unwrap_err();
+        assert!(err.to_string().contains("no config-upgrade finding"), "got: {err}");
     }
 }
