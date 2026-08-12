@@ -404,6 +404,7 @@ fn add_with_stdin(project: &str, args: AddArgs, stdin_body: Option<String>) -> R
         depends_on: dedup_preserving_order(args.depends_on.clone()),
         prefers_machine: args.prefers_machine.clone(),
         zen: None,
+        launch: None,
         created_at: now,
         updated_at: now,
         params: std::collections::BTreeMap::new(),
@@ -1083,6 +1084,9 @@ fn start(
         let branch_owned = branch.clone();
         let body_owned = tf.body.clone();
         let agent_owned = agent_name.clone();
+        // The task-level `launch:` override rides into the thread as an owned
+        // clone; `StartSpec` borrows it back below.
+        let launch_owned = tf.task.launch.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = shelbi_orchestrator::workspace::start_workspace_on_task(
@@ -1093,6 +1097,7 @@ fn start(
                     branch: &branch_owned,
                     task_body: &body_owned,
                     agent: Some(agent_owned.as_str()),
+                    launch_override: launch_owned.as_ref(),
                 },
             );
             // The receiver is gone if we already timed out — ignore the error.
@@ -1349,6 +1354,7 @@ fn resume(
             branch: &branch,
             task_body: &tf.body,
             agent: Some(agent_name.as_str()),
+            launch_override: tf.task.launch.as_ref(),
         },
     ) {
         Ok(addr) => addr,
@@ -1841,6 +1847,7 @@ mod tests {
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
+            launch: None,
             created_at: now,
             updated_at: now,
             params: std::collections::BTreeMap::new(),

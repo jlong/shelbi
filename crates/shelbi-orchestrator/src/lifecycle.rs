@@ -317,6 +317,7 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             prefers_machine: None,
             zen: None,
+            launch: None,
             created_at: now,
             updated_at: now,
             params: BTreeMap::new(),

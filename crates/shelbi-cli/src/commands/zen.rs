@@ -795,6 +795,7 @@ mod tests {
                 checks_additional: Vec::new(),
                 checks_only: Vec::new(),
             }),
+            launch: None,
             created_at: now,
             updated_at: now,
             params: std::collections::BTreeMap::new(),

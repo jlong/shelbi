@@ -26,7 +26,7 @@ pub use model::{
     Host, Machine, MachineKind, MergeStrategy, OrchestratorSpec, ParamDiagnostic, Project,
     ProjectAgentConfig, ProjectRunnerConfig, ProjectShape,
     PromptInjectionKind, PromptInjectionSpec, RunnerKind, Session, SessionProject, Status, Task,
-    TaskZenConfig,
+    TaskLaunchConfig, TaskZenConfig,
     TmuxAddr, WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS,
     DEFAULT_WORKFLOW_NAME, HEARTBEAT_DEFAULT, KNOWN_OPTIONAL_TASK_FIELDS, LOCAL_PROJECT_FIELDS,
     MAX_TASK_ID_LEN, SHARED_PROJECT_FIELDS, SUBTASK_WORKFLOW_NAME, TASK_WORKFLOW_NAME,

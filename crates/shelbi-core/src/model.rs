@@ -1731,6 +1731,15 @@ pub struct Task {
     /// adjust the check set against the project default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zen: Option<TaskZenConfig>,
+    /// Per-task launch overrides: the runner kind / model / effort /
+    /// permission mode this task should launch with, sitting at the TOP of
+    /// the agent-launch resolution chain (above the project config and the
+    /// agent's `agent.yaml` manifest). Lives under `launch:` in the task
+    /// frontmatter. `None` means "no task-level override — resolve from the
+    /// project/manifest chain as usual." See [`TaskLaunchConfig`] and
+    /// [`crate::resolve_agent_launch`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<TaskLaunchConfig>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// Free-form parameters carried at the top level of the task's
@@ -1863,6 +1872,7 @@ pub const KNOWN_OPTIONAL_TASK_FIELDS: &[&str] = &[
     "workflow",
     "prefers_machine",
     "zen",
+    "launch",
 ];
 
 /// A post-deserialize problem [`Task::validate_params`] found in a task's
@@ -2381,6 +2391,39 @@ pub struct TaskZenConfig {
     /// Takes precedence over `checks_additional`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks_only: Vec<String>,
+}
+
+/// Per-task launch overrides — the highest-precedence tier of the
+/// agent-launch resolution chain, above the project config and the agent's
+/// `agent.yaml` manifest. Lives under `launch:` in the task frontmatter.
+/// Every field is optional so a task can override just one dimension (say,
+/// bump only the model) and let the rest fall through to the project /
+/// manifest / built-in default chain.
+///
+/// The runner-kind override (`runner`) selects which kind resolves; the
+/// `model` / `effort` overrides then apply to *that* resolved kind. The
+/// `permission_mode` field is a **request**, not an escalation: like the
+/// manifest's, it is clamped to the project's `workspace_permissions_mode`
+/// ceiling by [`crate::resolve_agent_launch`], so a task can only tighten
+/// (or match) the project's permission mode, never loosen it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskLaunchConfig {
+    /// Force this task onto a specific runner kind, overriding the project's
+    /// `agents.<name>.runner` and the manifest's `preferred_runner`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<RunnerKind>,
+    /// Model for the resolved kind, overriding the project's
+    /// `runners.<kind>.model` and the manifest's `runners.<kind>.model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning effort for the resolved kind, overriding the project's and
+    /// manifest's `runners.<kind>.reasoning_effort`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<crate::agent_manifest::ReasoningEffort>,
+    /// Requested permission mode. Clamped to the project ceiling (never
+    /// escalated) — see [`crate::clamp_permission_mode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
 }
 
 /// Resolve the effective check list for a task: `checks_only` replaces
@@ -2952,6 +2995,7 @@ agent_runners:
             depends_on: vec!["b".into(), "c".into()],
             prefers_machine: None,
             zen: None,
+            launch: None,
             created_at: now,
             updated_at: now,
             params: BTreeMap::new(),
@@ -2983,6 +3027,7 @@ agent_runners:
             depends_on: vec![],
             prefers_machine: Some("devbox".into()),
             zen: None,
+            launch: None,
             created_at: now,
             updated_at: now,
             params: BTreeMap::new(),
@@ -3859,6 +3904,7 @@ workspaces:
             depends_on: vec![],
             prefers_machine: None,
             zen,
+            launch: None,
             created_at: now,
             updated_at: now,
             params: BTreeMap::new(),
@@ -3990,6 +4036,52 @@ updated_at: 2026-06-19T00:00:00Z
         assert!(t.zen.is_none());
         let back = serde_yaml::to_string(&t).unwrap();
         assert!(!back.contains("zen"));
+    }
+
+    #[test]
+    fn task_launch_override_parses_from_frontmatter_and_round_trips() {
+        let yaml = r#"
+id: a
+title: A
+column: todo
+priority: 0
+launch:
+  runner: codex
+  model: gpt-5
+  effort: high
+  permission_mode: read-only
+created_at: 2026-06-19T00:00:00Z
+updated_at: 2026-06-19T00:00:00Z
+"#;
+        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let over = t.launch.clone().expect("launch block parsed");
+        assert_eq!(over.runner, Some(crate::RunnerKind::Codex));
+        assert_eq!(over.model.as_deref(), Some("gpt-5"));
+        assert_eq!(
+            over.effort,
+            Some(crate::agent_manifest::ReasoningEffort::High)
+        );
+        assert_eq!(over.permission_mode.as_deref(), Some("read-only"));
+        // The override is a typed field, not a flattened param.
+        assert!(!t.params.contains_key("launch"));
+        // Round-trips through YAML unchanged.
+        let back: Task = serde_yaml::from_str(&serde_yaml::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back.launch, t.launch);
+    }
+
+    #[test]
+    fn task_launch_absent_defaults_to_none_and_omitted_on_wire() {
+        let yaml = r#"
+id: a
+title: A
+column: todo
+priority: 0
+created_at: 2026-06-19T00:00:00Z
+updated_at: 2026-06-19T00:00:00Z
+"#;
+        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        assert!(t.launch.is_none());
+        assert!(!serde_yaml::to_string(&t).unwrap().contains("launch"));
     }
 
     #[test]

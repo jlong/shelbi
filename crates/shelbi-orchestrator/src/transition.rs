@@ -457,6 +457,7 @@ mod tests {
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
+            launch: None,
             params: BTreeMap::new(),
             created_at: now,
             updated_at: now,
