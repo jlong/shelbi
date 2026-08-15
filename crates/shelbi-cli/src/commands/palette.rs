@@ -1363,7 +1363,7 @@ fn project_indicator(loaded: bool, active: bool) -> ProjectIndicator {
 /// - Active — a filled `●` whose green fill breathes (transparent-green ⇄
 ///   full-green) via [`shelbi_tui::theme::project_pulse_color`].
 /// - Loaded-idle — a hollow `○` ring in the palette green token.
-/// - Unloaded — a hollow `○` ring in the neutral token.
+/// - Unloaded — a small filled `•` dot in the neutral token.
 ///
 /// All three glyphs are single display cells, so the leading ` X ` slot keeps
 /// a fixed width and rows stay aligned regardless of state.
@@ -1371,7 +1371,7 @@ fn project_status_style(indicator: ProjectIndicator, phase: f32) -> (&'static st
     match indicator {
         ProjectIndicator::Active => ("●", shelbi_tui::theme::project_pulse_color(phase)),
         ProjectIndicator::LoadedIdle => ("○", shelbi_tui::theme::PROJECT_STATUS_GREEN),
-        ProjectIndicator::Unloaded => ("○", shelbi_tui::theme::PROJECT_STATUS_NEUTRAL),
+        ProjectIndicator::Unloaded => ("•", shelbi_tui::theme::PROJECT_STATUS_NEUTRAL),
     }
 }
 
@@ -1964,8 +1964,8 @@ mod tests {
     #[test]
     fn project_status_style_paints_each_state() {
         // Active: filled disc, green fill (pulse color varies with phase but
-        // stays a green Rgb). Loaded-idle: green ring. Unloaded: neutral ring.
-        // All three are single display cells so rows stay aligned.
+        // stays a green Rgb). Loaded-idle: green ring. Unloaded: small filled
+        // neutral dot. All three are single display cells so rows stay aligned.
         let (active_glyph, active_color) = project_status_style(ProjectIndicator::Active, 0.5);
         assert_eq!(active_glyph, "●");
         assert!(matches!(active_color, Color::Rgb(0, _, 0)));
@@ -1976,7 +1976,7 @@ mod tests {
 
         let (unloaded_glyph, unloaded_color) =
             project_status_style(ProjectIndicator::Unloaded, 0.0);
-        assert_eq!(unloaded_glyph, "○");
+        assert_eq!(unloaded_glyph, "•");
         assert_eq!(unloaded_color, shelbi_tui::theme::PROJECT_STATUS_NEUTRAL);
 
         assert_eq!(active_glyph.chars().count(), idle_glyph.chars().count());
