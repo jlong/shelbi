@@ -38,6 +38,10 @@ pub fn sidebar_loop<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> Result
         // setup a click would — so arriving at a review window either way
         // lands the review sidebar/interface identically.
         app.poll_active_window();
+        // Heal a review window whose own panel (left-nav) pane died in place
+        // while it's the active window — the panel is run-once and can't rebuild
+        // itself, and `poll_active_window` only fires on a window *change*.
+        app.poll_review_panes();
 
         draw_sidebar_self_healing(term, app)?;
 

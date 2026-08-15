@@ -191,6 +191,36 @@ fn panel_pane_live(session: &str, window: &str, pane_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `pane_id` is a live pane **anywhere** in the running tmux server.
+///
+/// Unlike [`panel_pane_live`] (scoped to one window) this queries every pane,
+/// because the editor/diff panes normally live in the hidden stash session, not
+/// the review window — they're only *swapped* into the middle on demand. The
+/// reuse guard for a stashed pane id must confirm the pane still exists before
+/// trusting it: a content pane whose `exec`'d process exited (Vim `:q`, difftool
+/// quit) leaves a dead id in its session var, and swapping in that corpse would
+/// fail or resurrect nothing. An absent id (or a `list-panes` failure) reads as
+/// not-live so the caller recreates the pane.
+fn pane_alive_anywhere(pane_id: &str) -> bool {
+    tmux_capture(&["list-panes", "-a", "-F", "#{pane_id}"])
+        .map(|out| out.lines().any(|l| l.trim() == pane_id))
+        .unwrap_or(false)
+}
+
+/// Whether the review window (`session:window`) is the client's currently
+/// active window. Auto-recovery of a dead middle content pane must fire *only*
+/// while the review window is the active context: after the reviewer hits the
+/// Back button ([`focus_dashboard`]) the panel process keeps ticking but its
+/// window is no longer showing, and rebuilding a pane then would be a surprise
+/// (and races the interface teardown). Mirrors the window-active discrimination
+/// the sidebar's [`crate`]-external poll uses. A `display-message` failure reads
+/// as not-active so recovery stays conservative.
+fn review_window_active(session: &str, window: &str) -> bool {
+    tmux_capture(&["display-message", "-p", "-t", session, "#{window_name}"])
+        .map(|w| w.trim() == window)
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Open / switch / close
 
@@ -386,13 +416,100 @@ pub fn show_review_view(project_name: &str, task_id: &str, view: ReviewMidView) 
     if target == current_mid {
         return Ok(()); // Already showing.
     }
-    // Swap the target pane into the middle position; whatever was there
-    // (chat or editor) parks in the target's home window, never killed — so
-    // both sessions survive the switch.
-    tmux_run(&["swap-pane", "-s", &target, "-t", &current_mid])?;
+    if pane_alive_anywhere(&current_mid) {
+        // Normal switch: swap the target pane into the middle position; whatever
+        // was there (chat or editor) parks in the target's home window, never
+        // killed — so both survive the switch.
+        tmux_run(&["swap-pane", "-s", &target, "-t", &current_mid])?;
+    } else {
+        // Recovery: the middle pane died in place (Vim `:q`, difftool exit), so
+        // the review window collapsed to just its panel and there is nothing to
+        // swap against. Join the target back beside the panel instead, rebuilding
+        // `panel | target`. The `window-layout-changed` clamp hook re-clamps the
+        // panel to the sidebar width afterwards. Reuses [`PANEL_KEY`] as the
+        // anchor; if even the panel is gone the interface is torn down and
+        // there's nothing safe to rebuild.
+        let panel = read_session_var(&session, PANEL_KEY).ok_or_else(|| {
+            Error::Other("review interface is not open (no panel to anchor to)".into())
+        })?;
+        tmux_run(&["join-pane", "-h", "-s", &target, "-t", &panel])?;
+    }
     set_session_var(&session, MID_KEY, &target)?;
     let _ = tmux_run(&["select-pane", "-t", &target]);
     Ok(())
+}
+
+/// Resolve the review window name (`session:<name>`) for the review slot
+/// `task_id` is assigned to. `None` when the project/task can't be loaded or the
+/// task isn't on a workspace — the poll-tick detectors below then read as
+/// "nothing to recover".
+fn review_window_name(project_name: &str, task_id: &str) -> Option<String> {
+    let project = shelbi_state::load_project(project_name).ok()?;
+    let tf = shelbi_state::load_task(project_name, task_id).ok()?;
+    let name = tf
+        .task
+        .assigned_to
+        .as_deref()
+        .and_then(|n| project.workspace(n))
+        .map(|w| w.name.clone())?;
+    Some(name)
+}
+
+/// Poll-tick check (run by the review panel's own loop): has the pane occupying
+/// the middle content slot died **in place**, so the mid view should fall back
+/// to Chat?
+///
+/// True only when the review window is the active context AND the middle pane is
+/// a *content* pane (editor / diff, not chat) that is no longer live. This is
+/// the detection half of the Vim-`:q` / difftool-exit recovery: the panel loop
+/// then drives the same `ShowChat` view-switch a click on the Chat entry would,
+/// so the recovery converges with the manual path. Idempotent: once Chat is back
+/// in the middle (or while the content pane is live) it reads false, so a live
+/// pane is never rebuilt and the view is never double-switched. Guarded to the
+/// active review window so it never fires after a Back-to-dashboard.
+pub fn mid_content_pane_dead(project_name: &str, task_id: &str) -> bool {
+    let session = format!("shelbi-{project_name}");
+    let Some(window) = review_window_name(project_name, task_id) else {
+        return false;
+    };
+    // Only recover while the review window is the active context — not after a
+    // Back-to-dashboard (`focus_dashboard`) where the panel keeps ticking, and
+    // not during the interface teardown that follows a quit.
+    if !review_window_active(&session, &window) {
+        return false;
+    }
+    let Some(mid) = read_session_var(&session, MID_KEY) else {
+        return false;
+    };
+    // The chat pane is the default view; a dead chat is an agent-pane concern
+    // (handled by workspace supervision), not a mid-content fallback — and
+    // falling back to Chat when Chat itself is the dead middle would be a no-op.
+    if read_session_var(&session, CHAT_KEY).as_deref() == Some(mid.as_str()) {
+        return false;
+    }
+    // A content pane still live in the review window needs no recovery.
+    !panel_pane_live(&session, &window, &mid)
+}
+
+/// Poll-tick check (run by the dashboard sidebar's loop): has the review
+/// window's own panel (left-nav) pane died **in place**, so it must be rebuilt?
+///
+/// The panel is run-once (no respawn loop), so a crash / accidental Ctrl-C that
+/// bypassed the interface teardown closes the pane but leaves its id stashed in
+/// [`PANEL_KEY`]. The panel process can't rebuild itself, so the dashboard
+/// sidebar loop — which survives the panel's death — detects it here and
+/// re-opens the interface. True only when a stashed panel id exists and is no
+/// longer live in the review window; a live panel (or a closed interface) reads
+/// false so nothing is rebuilt needlessly.
+pub fn review_panel_pane_dead(project_name: &str, task_id: &str) -> bool {
+    let session = format!("shelbi-{project_name}");
+    let Some(window) = review_window_name(project_name, task_id) else {
+        return false;
+    };
+    let Some(panel) = read_session_var(&session, PANEL_KEY) else {
+        return false;
+    };
+    !panel_pane_live(&session, &window, &panel)
 }
 
 /// Create the editor pane in the review worktree if it doesn't exist yet,
@@ -410,7 +527,14 @@ fn ensure_editor_pane(
     session: &str,
 ) -> Result<String> {
     if let Some(existing) = read_session_var(session, EDITOR_KEY) {
-        return Ok(existing);
+        // Reuse only a *live* editor pane. A stashed id whose process exited
+        // (Vim `:q`) is stale — treat it as absent and fall through to spawn a
+        // fresh pane so re-selecting "Edit in <editor>" rebuilds it rather than
+        // swapping in a corpse.
+        if pane_alive_anywhere(&existing) {
+            return Ok(existing);
+        }
+        unset_session_var(session, EDITOR_KEY);
     }
     let machine = project
         .machine(&ws.machine)
@@ -477,7 +601,13 @@ fn ensure_diff_pane(
     session: &str,
 ) -> Result<String> {
     if let Some(existing) = read_session_var(session, DIFF_KEY) {
-        return Ok(existing);
+        // Reuse only a *live* diff pane. A stashed id whose `git difftool`
+        // exited is stale — treat it as absent so re-selecting "View Diff"
+        // rebuilds the pane rather than swapping in a dead one.
+        if pane_alive_anywhere(&existing) {
+            return Ok(existing);
+        }
+        unset_session_var(session, DIFF_KEY);
     }
     let machine = project
         .machine(&ws.machine)
@@ -1009,6 +1139,166 @@ mod tests {
         );
 
         crate::tmux_test_support::kill_session(&session);
+    }
+
+    /// `pane_alive_anywhere` is true for a live pane in any session/window and
+    /// false once its process exits — the guard `ensure_editor_pane` /
+    /// `ensure_diff_pane` use to treat a stashed-but-dead content pane id as
+    /// absent so re-selecting the view rebuilds it.
+    #[test]
+    fn pane_alive_anywhere_tracks_a_pane_across_its_death() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
+
+        let session = format!("shelbi-alive-anywhere-{}", std::process::id());
+        crate::tmux_test_support::start_session(&session, "holder");
+        // Park a pane in its own window (as the editor/diff panes live in the
+        // stash), not the review window — `pane_alive_anywhere` is server-wide.
+        let pane = std::process::Command::new("tmux")
+            .args([
+                "new-window", "-d", "-t", &format!("{session}:"), "-n", "stash", "-P", "-F",
+                "#{pane_id}", "sh", "-c", "read x",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .expect("spawned a stash pane");
+
+        assert!(pane_alive_anywhere(&pane), "a live pane reads as alive");
+        assert!(!pane_alive_anywhere("%999999"), "a bogus id reads as not-alive");
+
+        // End the pane's process (the `:q` / difftool-exit analogue).
+        let _ = std::process::Command::new("tmux")
+            .args(["send-keys", "-t", &pane, "Enter"])
+            .status();
+        // Give tmux a beat to reap the pane.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !pane_alive_anywhere(&pane),
+            "a pane whose process exited reads as not-alive"
+        );
+
+        crate::tmux_test_support::kill_session(&session);
+    }
+
+    /// The poll-tick detectors: `mid_content_pane_dead` fires only for a dead
+    /// *content* pane while the review window is active, and
+    /// `review_panel_pane_dead` fires for a dead panel pane — the idempotent
+    /// guards behind the auto-recovery.
+    #[test]
+    fn poll_detectors_flag_only_dead_panes_in_the_active_review_window() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
+
+        let proj = format!("review-poll-{}", std::process::id());
+        let home = std::env::temp_dir().join(format!("shelbi-review-poll-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        shelbi_state::save_project(&demo_project(&proj)).unwrap();
+        shelbi_state::save_task(&proj, &task_on("t-rev", "review-1", Column::review()), "body")
+            .unwrap();
+
+        let session = format!("shelbi-{proj}");
+        crate::tmux_test_support::start_session(&session, "holder");
+        add_window(&session, "review-1");
+
+        // The review-1 window's base pane stands in for the chat/agent pane; a
+        // split pane stands in for the swapped-in content (editor/diff) pane.
+        let chat = local_workspace_pane_id(&session, "review-1").unwrap();
+        let review_target = format!("{session}:review-1");
+        let content = std::process::Command::new("tmux")
+            .args([
+                "split-window", "-h", "-d", "-t", &review_target, "-P", "-F", "#{pane_id}", "sh",
+                "-c", "read x",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .expect("split a content pane into the review window");
+        // A separate panel pane for the nav-pane detector.
+        let panel = std::process::Command::new("tmux")
+            .args([
+                "split-window", "-h", "-d", "-t", &review_target, "-P", "-F", "#{pane_id}", "sh",
+                "-c", "sleep 600",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .expect("split a panel pane into the review window");
+
+        set_session_var(&session, CHAT_KEY, &chat).unwrap();
+        set_session_var(&session, MID_KEY, &content).unwrap();
+        set_session_var(&session, PANEL_KEY, &panel).unwrap();
+        // Make the review window the active one so the active-context guard passes.
+        let _ = tmux_run(&["select-window", "-t", &review_target]);
+
+        // Live content pane, review window active => no recovery (idempotent).
+        assert!(
+            !mid_content_pane_dead(&proj, "t-rev"),
+            "a live content pane needs no fallback"
+        );
+        assert!(
+            !review_panel_pane_dead(&proj, "t-rev"),
+            "a live panel pane needs no rebuild"
+        );
+
+        // Kill the content pane (Vim `:q` / difftool exit): the mid detector fires.
+        let _ = std::process::Command::new("tmux")
+            .args(["send-keys", "-t", &content, "Enter"])
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            mid_content_pane_dead(&proj, "t-rev"),
+            "a dead content pane triggers the Chat fallback"
+        );
+
+        // When the middle *is* the chat pane, no fallback — that's the default
+        // view and a dead chat is an agent-pane (supervision) concern.
+        set_session_var(&session, MID_KEY, &chat).unwrap();
+        assert!(
+            !mid_content_pane_dead(&proj, "t-rev"),
+            "a chat mid pane is never a content-fallback case"
+        );
+
+        // Switching away from the review window silences the mid detector even
+        // with a dead content pane recorded — recovery only fires while active.
+        set_session_var(&session, MID_KEY, &content).unwrap();
+        let _ = tmux_run(&["select-window", "-t", &format!("{session}:holder")]);
+        assert!(
+            !mid_content_pane_dead(&proj, "t-rev"),
+            "recovery is suppressed when the review window isn't active"
+        );
+
+        // Kill the panel pane: the nav-pane detector fires (window-scoped, so it
+        // doesn't depend on the active window).
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-pane", "-t", &panel])
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            review_panel_pane_dead(&proj, "t-rev"),
+            "a dead panel pane triggers a rebuild"
+        );
+
+        crate::tmux_test_support::kill_session(&session);
+        match prev_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Accepting a review item closes *only* the review-tagged slot's window,

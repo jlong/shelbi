@@ -989,6 +989,29 @@ impl App {
         self.on_active_window(active);
     }
 
+    /// Rebuild a review window's own panel (left-nav) pane if it has died in
+    /// place while that window is the active one. The panel is run-once, so a
+    /// crash / accidental Ctrl-C closes it without tearing the interface down,
+    /// and — the panel process being dead — it can't rebuild itself. This
+    /// dashboard-side loop survives the panel's death, so it heals it here on
+    /// the normal poll cadence: [`App::poll_active_window`] only runs setup on a
+    /// window *change*, so a panel that dies while its review window is already
+    /// current would otherwise sit vanished until the user navigated away and
+    /// back. Idempotent — a live panel is left untouched, and [`open_ready_review`]
+    /// (via the interface's own reuse guard) tears down and respawns only a dead
+    /// one.
+    pub fn poll_review_panes(&mut self) {
+        let Some(active) = self.active_window_name() else {
+            return;
+        };
+        let Some(task_id) = review_task_for_window(&active, &self.ready_review) else {
+            return;
+        };
+        if shelbi_orchestrator::review_ui::review_panel_pane_dead(&self.project_name, &task_id) {
+            self.open_ready_review(&task_id);
+        }
+    }
+
     /// Change-tracking + dispatch half of [`App::poll_active_window`], split
     /// out from the tmux read so the routing is unit-testable with a synthetic
     /// window name. A no-op when `active` matches the last-seen window (the
