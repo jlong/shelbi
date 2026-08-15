@@ -250,8 +250,18 @@ impl DialogSignature {
 /// detection until the user adds signatures in project.yaml.
 ///
 /// The `claude` set covers the interactive dialogs seen to freeze a whole
-/// board in practice: the first-run workspace-trust prompt and a
-/// tool-permission confirm.
+/// board in practice: the first-run workspace-trust prompt, a tool-permission
+/// confirm, and the interactive question/selection widget claude renders for
+/// an `AskUserQuestion`-style prompt. That widget draws neither the idle input
+/// box nor the busy spinner, so without a signature a worker that asks a
+/// question in a headless workspace blocks silently forever while its pane
+/// title still reads `shelbi:working` (observed live 2026-08-12: a slot sat on
+/// a scope-question widget for ~42 minutes with nothing surfacing it). The
+/// footer strings (`Enter to select`, `n to add notes`) are the widget's stable
+/// chrome across single- vs multi-line prompt variants, and — like every other
+/// signature here — the substring match is vetoed by an active input box / busy
+/// footer, so a pane merely *showing* the words (editing this code, a diff,
+/// chat about the feature) is never flagged.
 ///
 /// The usage-limit stall is deliberately *not* a signature here. A plain
 /// substring like "usage limit reached" matches any pane that merely mentions
@@ -268,6 +278,17 @@ pub fn default_dialog_signatures(command: &str) -> Vec<DialogSignature> {
             DialogSignature::new("trust", "Do you trust the files"),
             DialogSignature::new("trust", "trust this folder"),
             DialogSignature::new("permission", "Enter to confirm"),
+            // Interactive question/selection widget (`AskUserQuestion`). Two
+            // anchors so single- and multi-select variants both match: the
+            // single-select footer's `Enter to select`, and the `n to add
+            // notes` affordance present across variants. Listed after the
+            // permission confirm so a multi-select widget that shows `Enter to
+            // confirm` still resolves to a dialog (as `permission`) — either
+            // way the slot surfaces as blocked. Detection order in
+            // `detect_blocking_dialog` is first-match, so the earlier trust /
+            // permission kinds win when their wording is also present.
+            DialogSignature::new("question", "Enter to select"),
+            DialogSignature::new("question", "to add notes"),
         ],
         RunnerKind::Codex | RunnerKind::Generic => Vec::new(),
     }
@@ -4500,10 +4521,21 @@ updated_at: 2026-06-19T00:00:00Z
         let sigs = default_dialog_signatures("claude");
         assert!(sigs.iter().any(|s| s.kind == "trust"));
         assert!(sigs.iter().any(|s| s.kind == "permission"));
+        // The interactive question/selection widget (`AskUserQuestion`) ships a
+        // signature too, so a worker asking a question in a headless workspace
+        // surfaces as blocked instead of reading `working` forever.
+        assert!(sigs.iter().any(|s| s.kind == "question"));
         assert!(
             !sigs.iter().any(|s| s.kind == "usage-limit"),
             "usage-limit must not be a naive substring signature"
         );
+
+        // The permission confirm is listed before the question anchors so a
+        // multi-select widget showing `Enter to confirm` still resolves (as
+        // `permission`) via `detect_blocking_dialog`'s first-match order.
+        let permission_at = sigs.iter().position(|s| s.kind == "permission").unwrap();
+        let question_at = sigs.iter().position(|s| s.kind == "question").unwrap();
+        assert!(permission_at < question_at);
 
         // A basename is used, so an absolute path to the same binary still
         // resolves the built-ins.
