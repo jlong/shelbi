@@ -96,6 +96,7 @@ pub enum EventKind {
     Message,
     Clarification,
     Dispatch,
+    ReviewReady,
     Send,
     Rebase,
     Ci,
@@ -112,7 +113,13 @@ impl EventKind {
         // Prefix events may also carry `task=` / `workspace=` metadata. Match
         // their discriminator before those broad field-based branches or a
         // send verdict is mislabeled as an ordinary workspace event.
-        if body.starts_with("send ") || body == "send" {
+        if body.starts_with("review-ready ") || body == "review-ready" {
+            // A review-ready line carries `task=` / `workspace=` metadata, so
+            // match its leading discriminator before the broad field branches
+            // below or the "review is serving" signal would be mislabeled as an
+            // ordinary task/workspace transition.
+            EventKind::ReviewReady
+        } else if body.starts_with("send ") || body == "send" {
             EventKind::Send
         } else if body.contains(" heartbeat") || body.ends_with(" heartbeat") {
             EventKind::Heartbeat
@@ -1557,6 +1564,94 @@ pub fn append_dispatch_event(
     ))
 }
 
+/// The structured fields of a `review-ready` signal — the one event that tells
+/// the orchestrator WHAT is in review and WHERE, emitted once a review
+/// workspace's server is confirmed up for a loaded task. See
+/// [`append_review_ready_event`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewReadyEvent<'a> {
+    /// Project scope (`events.log` is hub-global — see [`append_workspace_event`]).
+    pub project: &'a str,
+    /// The task id now serving on the review slot.
+    pub task_id: &'a str,
+    /// The task's human title (from frontmatter).
+    pub title: &'a str,
+    /// The review workspace's name.
+    pub workspace: &'a str,
+    /// The tmux pane target of the review slot (`session:window`), so the
+    /// orchestrator jumps straight to it rather than grepping `tmux list-panes`.
+    pub pane: &'a str,
+    /// The checked-out review worktree path, so the reviewer opens the exact
+    /// tree rather than reverse-engineering it from `git worktree list`.
+    pub worktree: &'a str,
+    /// The review slot's served port, when the workspace boots a server.
+    pub port: Option<u16>,
+    /// The resolved reviewable URL, when the serve recipe declared one.
+    pub url: Option<&'a str>,
+    /// The review notes the reviewer should check (acceptance criteria /
+    /// summary distilled from the task body). Free text — whitespace folds to
+    /// underscores so the record stays a single parseable line.
+    pub notes: &'a str,
+}
+
+/// Append the `review-ready` signal to `~/.shelbi/events.log`:
+///
+/// ```text
+/// <rfc3339> review-ready project=<p> task=<id> workspace=<ws> state=serving pane=<target> worktree=<path>[ port=<port>][ url=<url>] title=<title…> notes=<notes…>
+/// ```
+///
+/// Emitted by the hub poller on the *edge* into the review slot's `serving`
+/// sub-state — the moment its `ready:` probe first confirms the branch is up
+/// for a loaded task. Distinct from the load-*start* `dispatch … status=review-load`
+/// line: that fires when the branch is first claimed onto an idle slot (nothing
+/// serving yet), whereas this fires only once the review is actually ready to
+/// inspect. The poller's `serving` transition dedupe gates it to once per load,
+/// so a slot that stays serving across ticks does not re-emit.
+///
+/// The leading `review-ready` keyword is the discriminator [`EventKind::from_body`]
+/// keys on ([`EventKind::ReviewReady`]) so the line classifies as its own kind
+/// rather than an ordinary task/workspace transition, even though it carries
+/// `task=` / `workspace=` metadata. Identifier fields (`project`, `task`,
+/// `workspace`) are pinned to the strict [`sanitize_field`] allowlist; the
+/// location and free-text fields (`pane`, `worktree`, `url`, `title`, `notes`)
+/// fold whitespace to underscores via [`sanitize_reason`] so their `:` / `/`
+/// separators survive while the line stays a single parseable record. `title`
+/// and `notes` are length-bounded so one over-long task can't blow up the line.
+pub fn append_review_ready_event(ev: &ReviewReadyEvent) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(ev.project);
+    let task_id = sanitize_field(ev.task_id);
+    let workspace = sanitize_field(ev.workspace);
+    let pane = sanitize_reason(ev.pane);
+    let worktree = sanitize_reason(ev.worktree);
+    let title = sanitize_reason(&truncate_with_ellipsis(ev.title, REVIEW_READY_TITLE_BUDGET));
+    let notes = sanitize_reason(&truncate_with_ellipsis(ev.notes, REVIEW_READY_NOTES_BUDGET));
+    let mut line = format!(
+        "{ts} review-ready project={project} task={task_id} workspace={workspace} \
+         state=serving pane={pane} worktree={worktree}"
+    );
+    if let Some(port) = ev.port {
+        line.push_str(&format!(" port={port}"));
+    }
+    if let Some(url) = ev.url {
+        let url = sanitize_reason(url);
+        if !url.is_empty() {
+            line.push_str(&format!(" url={url}"));
+        }
+    }
+    // `title` / `notes` trail the structured tokens so a consumer can key on the
+    // fixed-position fields above without their free text shifting positions.
+    line.push_str(&format!(" title={title} notes={notes}"));
+    append_event_line(&line)
+}
+
+/// Char budget for the `title=` field of a `review-ready` line.
+const REVIEW_READY_TITLE_BUDGET: usize = 120;
+/// Char budget for the `notes=` field of a `review-ready` line — larger than
+/// the title so a distilled acceptance-criteria summary survives, but still
+/// bounded so one verbose task can't dominate the event stream.
+const REVIEW_READY_NOTES_BUDGET: usize = 400;
+
 /// Append `<rfc3339> send project=<project> workspace=<name> status=<status> detail=<detail>`
 /// to `~/.shelbi/events.log`. Records the delivery verdict of a
 /// `shelbi send` (verified pane-injection): `status=submitted` when the
@@ -2331,6 +2426,90 @@ mod tests {
             "2026-07-06T12:04:00+00:00 project=demo task=fix-login ci pr=42 check=build conclusion=failure head_sha=deadbeef",
         );
         assert_eq!(red.kind, EventKind::Ci);
+    }
+
+    #[test]
+    fn review_ready_event_carries_location_and_notes_and_classifies() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_review_ready_event(&ReviewReadyEvent {
+            project: "demo",
+            task_id: "fix-login",
+            title: "Fix the login redirect loop",
+            workspace: "review",
+            pane: "shelbi-demo:review",
+            worktree: "/repo/.shelbi/wt/review",
+            port: Some(4310),
+            url: Some("http://localhost:4310"),
+            notes: "Redirect resolves once; no loop on refresh",
+        })
+        .unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let line = log.lines().next_back().expect("one line written");
+
+        // Human-readable structured tokens are all present on the single line.
+        assert!(line.contains(" review-ready "), "line: {line}");
+        assert!(line.contains(" project=demo "));
+        assert!(line.contains(" task=fix-login "));
+        assert!(line.contains(" workspace=review "));
+        assert!(line.contains(" state=serving "));
+        assert!(line.contains(" pane=shelbi-demo:review "));
+        assert!(line.contains(" worktree=/repo/.shelbi/wt/review "));
+        assert!(line.contains(" port=4310 "));
+        assert!(line.contains(" url=http://localhost:4310 "));
+        // Free text folds whitespace to underscores so the record stays one line.
+        assert!(line.contains(" title=Fix_the_login_redirect_loop "));
+        assert!(line.contains("notes=Redirect_resolves_once;_no_loop_on_refresh"));
+
+        // It classifies as its own kind despite carrying task=/workspace= fields.
+        let env = EventEnvelope::from_log_line(line);
+        assert_eq!(env.kind, EventKind::ReviewReady);
+        assert_eq!(env.project.as_deref(), Some("demo"));
+        assert_eq!(
+            serde_json::to_value(&env).unwrap()["kind"],
+            serde_json::json!("review-ready")
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn review_ready_event_omits_absent_port_and_url_and_bounds_notes() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let long_notes = "verify ".repeat(200); // well over the notes budget
+        append_review_ready_event(&ReviewReadyEvent {
+            project: "demo",
+            task_id: "diff-only",
+            title: "",
+            workspace: "review",
+            pane: "shelbi-demo:review",
+            worktree: "/repo/.shelbi/wt/review",
+            port: None,
+            url: None,
+            notes: &long_notes,
+        })
+        .unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let line = log.lines().next_back().unwrap();
+        // A diff-only review (no server) carries neither port nor url.
+        assert!(!line.contains(" port="), "line: {line}");
+        assert!(!line.contains(" url="), "line: {line}");
+        // The over-long notes are ellipsis-truncated, keeping the line bounded.
+        assert!(line.contains('…'), "notes should be truncated: {line}");
+        assert!(line.len() < 600, "line unexpectedly long: {}", line.len());
+        // Still a single record.
+        assert_eq!(log.lines().count(), 1);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

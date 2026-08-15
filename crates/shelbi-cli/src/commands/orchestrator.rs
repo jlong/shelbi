@@ -774,6 +774,11 @@ fn line_belongs_to_project(scope: &ProjectScope, parsed: &ParsedLine) -> bool {
 }
 
 fn event_kind(parsed: &ParsedLine) -> String {
+    // Match the review-ready discriminator before the broad `task=` / `workspace=`
+    // branches: a review-ready line carries both as metadata but is its own kind.
+    if parsed.fields.contains_key("review-ready") {
+        return "review_ready".into();
+    }
     if parsed.fields.contains_key("heartbeat") {
         return "heartbeat".into();
     }
@@ -847,6 +852,7 @@ impl ParsedLine {
                 || *part == "send"
                 || *part == "rebase"
                 || *part == "zen-dryrun"
+                || *part == "review-ready"
             {
                 fields.insert((*part).to_string(), "true".into());
             }
@@ -1301,6 +1307,58 @@ mod tests {
         assert_eq!(workspace.workspace.as_deref(), Some("alpha"));
         assert_eq!(workspace.from.as_deref(), Some("working"));
         assert_eq!(workspace.to.as_deref(), Some("awaiting_input"));
+    }
+
+    #[test]
+    fn drain_surfaces_review_ready_with_distinct_kind_and_location_metadata() {
+        let (_guard, _tmp) = setup_home();
+        shelbi_state::append_review_ready_event(&shelbi_state::ReviewReadyEvent {
+            project: "demo",
+            task_id: "fix-login",
+            title: "Fix the login redirect loop",
+            workspace: "review",
+            pane: "shelbi-demo:review",
+            worktree: "/repo/.shelbi/wt/review",
+            port: Some(4310),
+            url: Some("http://localhost:4310"),
+            notes: "Redirect resolves once; no loop on refresh",
+        })
+        .unwrap();
+
+        let response = drain_once("demo", 0).unwrap();
+        assert_eq!(response.events.len(), 1);
+        let ev = &response.events[0];
+
+        // Its own kind — not mislabeled as a task/workspace transition despite
+        // carrying task=/workspace= metadata (it has no `->` edge).
+        assert_eq!(ev.kind, "review_ready");
+        assert_eq!(ev.task.as_deref(), Some("fix-login"));
+        assert_eq!(ev.workspace.as_deref(), Some("review"));
+
+        // The structured location payload the orchestrator keys on to jump
+        // straight to the pane + worktree without discovery.
+        assert_eq!(ev.metadata.get("state").map(String::as_str), Some("serving"));
+        assert_eq!(
+            ev.metadata.get("pane").map(String::as_str),
+            Some("shelbi-demo:review")
+        );
+        assert_eq!(
+            ev.metadata.get("worktree").map(String::as_str),
+            Some("/repo/.shelbi/wt/review")
+        );
+        assert_eq!(ev.metadata.get("port").map(String::as_str), Some("4310"));
+        assert_eq!(
+            ev.metadata.get("url").map(String::as_str),
+            Some("http://localhost:4310")
+        );
+        assert!(ev
+            .metadata
+            .get("title")
+            .is_some_and(|t| t.contains("Fix_the_login")));
+        assert!(ev
+            .metadata
+            .get("notes")
+            .is_some_and(|n| n.contains("Redirect_resolves_once")));
     }
 
     #[test]
