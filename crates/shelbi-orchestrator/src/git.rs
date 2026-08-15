@@ -602,6 +602,107 @@ pub(crate) fn lookup_pr_base(host: &Host, wt: &str, pr: u64) -> Result<String> {
     Ok(base)
 }
 
+/// A pull request GitHub already reports as **MERGED**, discovered by
+/// [`lookup_merged_pr`]. Carries exactly what [`crate::actions::merge`] needs
+/// to treat an out-of-band merge (`gh pr merge`, a human clicking merge in
+/// the UI) as already satisfied without re-integrating: the PR number, the
+/// merge commit SHA GitHub recorded (`None` only in the rare window before
+/// GitHub materializes it), and the branch it merged into (`base`) so a
+/// restack cascade lands children on the ref GitHub actually used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MergedPr {
+    pub(crate) pr: u64,
+    pub(crate) sha: Option<String>,
+    pub(crate) base: String,
+}
+
+/// Detect a *merged* GitHub PR for `branch`, returning the most recent one if
+/// GitHub has already integrated it out-of-band. Used by
+/// [`crate::actions::merge`] to make the `review -> done` transition
+/// idempotent: once the PR is merged and its branch deleted, the hub-side
+/// fetch path errors "branch not on origin" and strands the card even though
+/// the code is fully shipped. Spotting the merged PR lets `merge` record the
+/// existing merge SHA and advance instead.
+///
+/// Degraded to `None` when `origin` isn't a GitHub remote — the same
+/// tolerance [`lookup_open_pr_tolerant`] applies — so a purely-local project
+/// falls through to the hub-side merge rather than erroring here. A real gh
+/// failure (auth, network) still propagates.
+///
+/// `--limit 1` takes the most recently merged PR for the head. A branch that
+/// was merged, deleted, re-created, and merged again is a degenerate case
+/// where the latest merge is the one worth recording.
+pub(crate) fn lookup_merged_pr(host: &Host, wt: &str, branch: &str) -> Result<Option<MergedPr>> {
+    let out = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh",
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "merged",
+            "--limit",
+            "1",
+            "--json",
+            "number,mergeCommit,baseRefName",
+            // `.[0] // empty` yields nothing for an empty array (jq would
+            // otherwise choke on indexing `null`), so no merged PR prints a
+            // blank line that [`parse_merged_pr`] reads as `None`.
+            "--jq",
+            r#".[0] // empty | "\(.number) \(.mergeCommit.oid // "") \(.baseRefName)""#,
+        ],
+    )?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains(
+            "none of the git remotes configured for this repository point to a known GitHub host",
+        ) {
+            return Ok(None);
+        }
+        return Err(Error::Command {
+            cmd: format!("gh pr list --head {branch} --state merged"),
+            status: out.status.to_string(),
+            stderr: stderr.into_owned(),
+        });
+    }
+    parse_merged_pr(&String::from_utf8_lossy(&out.stdout), branch)
+}
+
+/// Parse the single `"<number> <mergeCommitOid> <baseRefName>"` line
+/// [`lookup_merged_pr`]'s `--jq` emits. Split out so the empty / populated
+/// cases are unit-testable without gh. Git branch names and SHAs never
+/// contain spaces, so `splitn(3, ' ')` recovers the three fields even when
+/// the OID slot is empty (`"564  main"` → `["564", "", "main"]`).
+fn parse_merged_pr(stdout: &str, branch: &str) -> Result<Option<MergedPr>> {
+    let line = stdout.trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = line.splitn(3, ' ');
+    let number = parts.next().unwrap_or("");
+    let oid = parts.next().unwrap_or("");
+    let base = parts.next().unwrap_or("").trim();
+    let pr = number.parse::<u64>().map_err(|_| {
+        Error::Other(format!(
+            "gh pr list --state merged returned non-numeric PR number `{number}` for branch `{branch}`"
+        ))
+    })?;
+    if base.is_empty() {
+        return Err(Error::Other(format!(
+            "gh pr list --state merged: merged PR #{pr} for branch `{branch}` has an empty baseRefName"
+        )));
+    }
+    let sha = (!oid.is_empty()).then(|| oid.to_string());
+    Ok(Some(MergedPr {
+        pr,
+        sha,
+        base: base.to_string(),
+    }))
+}
+
 /// Backoff schedule for [`wait_for_merge_commit_sha`] — ~15s total, enough
 /// to cover GitHub's usual post-merge bookkeeping lag without stalling a
 /// merge-queue acknowledgement for long.
@@ -816,6 +917,51 @@ mod tests {
         assert_eq!(parse_open_pr_list("", "b").unwrap(), None);
         assert_eq!(parse_open_pr_list("\n", "b").unwrap(), None);
         assert_eq!(parse_open_pr_list("42\n", "b").unwrap(), Some(42));
+    }
+
+    #[test]
+    fn merged_pr_none_for_empty_output() {
+        // `.[0] // empty` prints nothing when no merged PR exists.
+        assert_eq!(parse_merged_pr("", "b").unwrap(), None);
+        assert_eq!(parse_merged_pr("\n", "b").unwrap(), None);
+    }
+
+    #[test]
+    fn merged_pr_parses_number_sha_and_base() {
+        assert_eq!(
+            parse_merged_pr("564 feedfacecafebeef main\n", "b").unwrap(),
+            Some(MergedPr {
+                pr: 564,
+                sha: Some("feedfacecafebeef".into()),
+                base: "main".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn merged_pr_tolerates_empty_merge_commit_oid() {
+        // GitHub can report MERGED before recording the commit; the OID slot
+        // is blank (`"564  main"`) and we surface `sha: None` rather than
+        // mis-parsing the base as the SHA.
+        assert_eq!(
+            parse_merged_pr("564  main", "b").unwrap(),
+            Some(MergedPr {
+                pr: 564,
+                sha: None,
+                base: "main".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn merged_pr_rejects_empty_base() {
+        assert!(parse_merged_pr("564 deadbeef ", "b").is_err());
+        assert!(parse_merged_pr("564", "b").is_err());
+    }
+
+    #[test]
+    fn merged_pr_rejects_non_numeric_number() {
+        assert!(parse_merged_pr("not-a-number deadbeef main", "b").is_err());
     }
 
     #[test]
