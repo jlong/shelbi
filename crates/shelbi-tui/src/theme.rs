@@ -40,7 +40,7 @@ pub const PROJECT_STATUS_NEUTRAL: Color = Color::DarkGray;
 /// dim trough (near-transparent against the dark popup) up to full green and
 /// back down once per cycle. Kept close to a calm ~1.6s breath rather than a
 /// blink.
-pub const PROJECT_PULSE_PERIOD: Duration = Duration::from_millis(1600);
+pub const PROJECT_PULSE_PERIOD: Duration = Duration::from_millis(1143);
 
 /// Fill color for the active-project pulse at animation `phase` (wrapped into
 /// `[0.0, 1.0)`). A raised cosine breathes the green channel between a dim
