@@ -6,7 +6,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
@@ -22,6 +22,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
+use shelbi_core::StatusCategory;
 use shelbi_palette::{Entry, EntryKind};
 use shelbi_state::keymap::{
     load_keymaps, GlobalAction, KeyChord, KeymapDiagnostic, Keymaps, PaletteAction,
@@ -180,6 +181,12 @@ struct State {
     /// second column can paint the same loaded/unloaded glyphs the
     /// switch-project sub-picker uses.
     loaded_projects: std::collections::HashSet<String>,
+    /// Names of projects that currently have active work in progress — at
+    /// least one task in the `active` [`StatusCategory`]. These take the
+    /// pulsing-green indicator; a loaded project not in this set gets the
+    /// idle green ring. Snapshotted in `new` alongside `loaded_projects`
+    /// (the picker is a single-shot popup, so the sets can't drift under it).
+    active_projects: std::collections::HashSet<String>,
     /// Selection index into `projects` for the second column.
     project_selected: usize,
     /// Which column Up/Down/Enter act on. Only meaningful while the
@@ -220,6 +227,10 @@ impl State {
         // screen) so the column can paint the same glyphs the sub-picker does.
         let loaded_projects: std::collections::HashSet<String> =
             super::quit_shelbi::project_names().into_iter().collect();
+        // Projects with at least one active-category task get the pulsing
+        // indicator. Computed from on-disk task state (same snapshot-once
+        // rationale as `loaded_projects`).
+        let active_projects = active_work_projects(&projects);
         Ok(Self {
             query: String::new(),
             selected: 0,
@@ -227,6 +238,7 @@ impl State {
             project: project.to_string(),
             projects,
             loaded_projects,
+            active_projects,
             project_selected: 0,
             focus: Focus::Commands,
         })
@@ -321,9 +333,13 @@ fn picker_loop<B: ratatui::backend::Backend>(
         .global
         .first_chord_for(GlobalAction::OpenPalette)
         .copied();
+    // Anchor the pulse animation to the picker's open time so the active
+    // project indicator breathes across the 150ms poll-timeout repaints.
+    let anim_start = Instant::now();
     loop {
         let results = state.results();
-        term.draw(|f| render(f, state, &results))?;
+        let phase = pulse_phase(anim_start);
+        term.draw(|f| render(f, state, &results, phase))?;
 
         if event::poll(Duration::from_millis(150))? {
             if let Event::Key(k) = event::read()? {
@@ -425,7 +441,7 @@ fn picker_loop<B: ratatui::backend::Backend>(
     }
 }
 
-fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
+fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)], phase: f32) {
     let area = f.area();
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -530,7 +546,7 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
     // Second column: the other registered projects. Rendered only on an empty
     // query (see `projects_column_visible`).
     if let Some(area) = projects_area {
-        render_projects_column(f, area, state);
+        render_projects_column(f, area, state, phase);
     }
 
     // Footer. The projects-column hint only shows while that column is up so
@@ -571,7 +587,7 @@ fn selection_style(focused: bool) -> Style {
 /// switch-project sub-picker paints. The projects column is narrow, so rows are
 /// glyph + label only; ratatui clips a label too wide for the column rather
 /// than overflowing the popup.
-fn render_projects_column(f: &mut Frame, area: Rect, state: &State) {
+fn render_projects_column(f: &mut Frame, area: Rect, state: &State, phase: f32) {
     let block = Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(Color::DarkGray));
@@ -593,7 +609,11 @@ fn render_projects_column(f: &mut Frame, area: Rect, state: &State) {
         .projects
         .iter()
         .map(|p| {
-            let (glyph, glyph_color) = project_status_glyph(state.loaded_projects.contains(&p.name));
+            let indicator = project_indicator(
+                state.loaded_projects.contains(&p.name),
+                state.active_projects.contains(&p.name),
+            );
+            let (glyph, glyph_color) = project_status_style(indicator, phase);
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {glyph} "), Style::default().fg(glyph_color)),
                 Span::raw(p.display_label()),
@@ -1220,6 +1240,9 @@ fn run_project_picker<B: ratatui::backend::Backend>(
     // than per-frame.
     let loaded: std::collections::HashSet<String> =
         super::quit_shelbi::project_names().into_iter().collect();
+    // Projects with active-category work in progress — the pulsing indicator.
+    // Snapshotted once alongside `loaded` (the sub-picker owns the screen).
+    let active = active_work_projects(&projects);
 
     let opener_close = keymaps
         .global
@@ -1227,10 +1250,16 @@ fn run_project_picker<B: ratatui::backend::Backend>(
         .copied();
     let mut query = String::new();
     let mut selected = 0usize;
+    // Anchor the pulse to the sub-picker's open time so the active indicator
+    // breathes across the 150ms poll-timeout repaints.
+    let anim_start = Instant::now();
 
     loop {
         let results = filter_projects(&projects, &query);
-        term.draw(|f| render_project_picker(f, current, &query, &results, selected, &loaded))?;
+        let phase = pulse_phase(anim_start);
+        term.draw(|f| {
+            render_project_picker(f, current, &query, &results, selected, &loaded, &active, phase)
+        })?;
 
         if event::poll(Duration::from_millis(150))? {
             if let Event::Key(k) = event::read()? {
@@ -1301,20 +1330,97 @@ fn filter_projects(projects: &[ProjectSummary], query: &str) -> Vec<ProjectSumma
     hits.into_iter().map(|(p, _)| p).collect()
 }
 
-/// Leading status glyph + color for a project row in the switch-project
-/// picker: a green filled circle for a loaded project (live `shelbi-<name>`
-/// session), a dim hollow circle for an unloaded one. Reuses the same glyph
-/// pair the task board uses for Running/Queued so the surfaces read
-/// consistently, and both glyphs share the fixed ` X ` render width so loaded
-/// and unloaded rows stay aligned.
-fn project_status_glyph(loaded: bool) -> (&'static str, Color) {
-    if loaded {
-        ("●", Color::Green)
+/// The three live states the project-status indicator can be in, in
+/// precedence order. Not-loaded wins first (an unloaded project can't be
+/// running live work), then active work, then plain loaded-idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectIndicator {
+    /// Loaded and has active-category work in progress — pulsing green fill.
+    Active,
+    /// Loaded but no active work — green ring, no fill.
+    LoadedIdle,
+    /// Not loaded — neutral/gray ring, no fill.
+    Unloaded,
+}
+
+/// Resolve a project's indicator from its two live inputs. Not-loaded
+/// dominates: a project with no live `shelbi-<name>` session shows the
+/// neutral ring even if a stale active-category task lingers on disk, because
+/// nothing is actually progressing it.
+fn project_indicator(loaded: bool, active: bool) -> ProjectIndicator {
+    if !loaded {
+        ProjectIndicator::Unloaded
+    } else if active {
+        ProjectIndicator::Active
     } else {
-        ("○", Color::DarkGray)
+        ProjectIndicator::LoadedIdle
     }
 }
 
+/// Leading status glyph + color for a project row, given its live indicator
+/// and the current pulse `phase`:
+///
+/// - Active — a filled `●` whose green fill breathes (transparent-green ⇄
+///   full-green) via [`shelbi_tui::theme::project_pulse_color`].
+/// - Loaded-idle — a hollow `○` ring in the palette green token.
+/// - Unloaded — a hollow `○` ring in the neutral token.
+///
+/// All three glyphs are single display cells, so the leading ` X ` slot keeps
+/// a fixed width and rows stay aligned regardless of state.
+fn project_status_style(indicator: ProjectIndicator, phase: f32) -> (&'static str, Color) {
+    match indicator {
+        ProjectIndicator::Active => ("●", shelbi_tui::theme::project_pulse_color(phase)),
+        ProjectIndicator::LoadedIdle => ("○", shelbi_tui::theme::PROJECT_STATUS_GREEN),
+        ProjectIndicator::Unloaded => ("○", shelbi_tui::theme::PROJECT_STATUS_NEUTRAL),
+    }
+}
+
+/// The set of projects that currently have active work in progress — at least
+/// one task in the `active` [`StatusCategory`]. Each project's tasks and
+/// status catalog are read from disk; a project whose task list can't be read
+/// simply doesn't make the set (degrades to the idle ring rather than failing
+/// the picker).
+fn active_work_projects(projects: &[ProjectSummary]) -> std::collections::HashSet<String> {
+    projects
+        .iter()
+        .filter(|p| project_has_active_work(&p.name))
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// True when `project` has at least one task sitting in an `active`-category
+/// status. The category is resolved through the project's `statuses.yaml`
+/// (so a renamed custom `active` status still counts), falling back to the
+/// column's built-in category when the status isn't declared there.
+fn project_has_active_work(project: &str) -> bool {
+    let tasks = match shelbi_state::list_tasks(project) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    if tasks.is_empty() {
+        return false;
+    }
+    let statuses = shelbi_state::load_project_statuses(project).ok();
+    tasks.iter().any(|tf| {
+        let col = &tf.task.column;
+        let category = statuses
+            .as_ref()
+            .and_then(|s| s.get(col.as_str()))
+            .map(|st| st.category)
+            .unwrap_or_else(|| col.category());
+        category == StatusCategory::Active
+    })
+}
+
+/// Current pulse phase in `[0.0, 1.0)`, derived from how long the picker has
+/// been open. Feeds [`project_status_style`] so the active indicator breathes
+/// as the render loop repaints.
+fn pulse_phase(start: Instant) -> f32 {
+    let period = shelbi_tui::theme::PROJECT_PULSE_PERIOD.as_secs_f32();
+    (start.elapsed().as_secs_f32() / period).fract()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_project_picker(
     f: &mut Frame,
     current: &str,
@@ -1322,6 +1428,8 @@ fn render_project_picker(
     results: &[ProjectSummary],
     selected: usize,
     loaded: &std::collections::HashSet<String>,
+    active: &std::collections::HashSet<String>,
+    phase: f32,
 ) {
     let area = f.area();
     let layout = Layout::default()
@@ -1368,7 +1476,9 @@ fn render_project_picker(
             } else {
                 "workspaces"
             };
-            let (glyph, glyph_color) = project_status_glyph(loaded.contains(&p.name));
+            let indicator =
+                project_indicator(loaded.contains(&p.name), active.contains(&p.name));
+            let (glyph, glyph_color) = project_status_style(indicator, phase);
             // Show the human-readable label. When it differs from the slug,
             // trail a dimmed `(slug)` so the id stays discoverable.
             let label = p.display_label();
@@ -1835,22 +1945,51 @@ mod tests {
     }
 
     #[test]
-    fn project_status_glyph_distinguishes_loaded_from_unloaded() {
-        // Loaded: green filled circle. Unloaded: dim hollow circle. Both are
-        // single display cells, so the leading ` X ` slot stays the same width
-        // and rows stay aligned regardless of load state.
-        let (loaded_glyph, loaded_color) = project_status_glyph(true);
-        assert_eq!(loaded_glyph, "●");
-        assert_eq!(loaded_color, Color::Green);
-
-        let (unloaded_glyph, unloaded_color) = project_status_glyph(false);
-        assert_eq!(unloaded_glyph, "○");
-        assert_eq!(unloaded_color, Color::DarkGray);
-
+    fn project_indicator_resolves_the_three_states_in_precedence_order() {
+        // Not-loaded dominates — even a stale on-disk active task can't light
+        // the pulse for a project with no live session.
         assert_eq!(
-            loaded_glyph.chars().count(),
-            unloaded_glyph.chars().count()
+            project_indicator(false, false),
+            ProjectIndicator::Unloaded
         );
+        assert_eq!(project_indicator(false, true), ProjectIndicator::Unloaded);
+        // Loaded + active work → the pulsing indicator; loaded + idle → ring.
+        assert_eq!(project_indicator(true, true), ProjectIndicator::Active);
+        assert_eq!(
+            project_indicator(true, false),
+            ProjectIndicator::LoadedIdle
+        );
+    }
+
+    #[test]
+    fn project_status_style_paints_each_state() {
+        // Active: filled disc, green fill (pulse color varies with phase but
+        // stays a green Rgb). Loaded-idle: green ring. Unloaded: neutral ring.
+        // All three are single display cells so rows stay aligned.
+        let (active_glyph, active_color) = project_status_style(ProjectIndicator::Active, 0.5);
+        assert_eq!(active_glyph, "●");
+        assert!(matches!(active_color, Color::Rgb(0, _, 0)));
+
+        let (idle_glyph, idle_color) = project_status_style(ProjectIndicator::LoadedIdle, 0.0);
+        assert_eq!(idle_glyph, "○");
+        assert_eq!(idle_color, shelbi_tui::theme::PROJECT_STATUS_GREEN);
+
+        let (unloaded_glyph, unloaded_color) =
+            project_status_style(ProjectIndicator::Unloaded, 0.0);
+        assert_eq!(unloaded_glyph, "○");
+        assert_eq!(unloaded_color, shelbi_tui::theme::PROJECT_STATUS_NEUTRAL);
+
+        assert_eq!(active_glyph.chars().count(), idle_glyph.chars().count());
+        assert_eq!(idle_glyph.chars().count(), unloaded_glyph.chars().count());
+    }
+
+    #[test]
+    fn active_pulse_fill_breathes_across_the_cycle() {
+        // The filled disc's fill must actually change between phases so the
+        // pulse is visible; the trough and peak differ in the green channel.
+        let (_, trough) = project_status_style(ProjectIndicator::Active, 0.0);
+        let (_, peak) = project_status_style(ProjectIndicator::Active, 0.5);
+        assert_ne!(trough, peak, "the fill must cycle between phases");
     }
 
     #[test]
@@ -2045,6 +2184,8 @@ mod tests {
 
     /// Build a projects-sidebar [`State`] with a single loaded project and the
     /// given focus/selection, for the `render_projects_column` render tests.
+    /// The project is loaded-but-idle (no active work), so it renders the
+    /// green ring rather than the pulse.
     fn projects_column_state(focus: Focus, project_selected: usize) -> State {
         let mut loaded = std::collections::HashSet::new();
         loaded.insert("web".to_string());
@@ -2062,6 +2203,7 @@ mod tests {
                 last_launched: None,
             }],
             loaded_projects: loaded,
+            active_projects: std::collections::HashSet::new(),
             project_selected,
             focus,
         }
@@ -2071,7 +2213,8 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        term.draw(|f| render_projects_column(f, f.area(), state))
+        // Phase 0.0 keeps any pulse deterministic for the render assertions.
+        term.draw(|f| render_projects_column(f, f.area(), state, 0.0))
             .unwrap();
         term.backend().buffer().clone()
     }
@@ -2089,26 +2232,49 @@ mod tests {
 
     #[test]
     fn projects_column_keeps_the_loaded_glyph_green_when_its_row_is_selected() {
-        // Focused + selected on the loaded project: the selection bar must not
-        // repaint the green `●` white/gray — the highlight patches bg + weight
-        // only, so the glyph keeps its status color.
+        // Focused + selected on the loaded-but-idle project: the selection bar
+        // must not repaint the green ring `○` white/gray — the highlight
+        // patches bg + weight only, so the glyph keeps its status color.
         let state = projects_column_state(Focus::Projects, 0);
         let buf = draw_projects_column(&state);
         let mut found = false;
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
                 let cell = &buf[(x, y)];
-                if cell.symbol() == "●" {
+                if cell.symbol() == "○" {
                     assert_eq!(
                         cell.fg,
-                        Color::Green,
-                        "the selected loaded glyph must stay green"
+                        shelbi_tui::theme::PROJECT_STATUS_GREEN,
+                        "the selected loaded-idle ring must stay green"
                     );
                     found = true;
                 }
             }
         }
-        assert!(found, "the loaded project's green glyph should render");
+        assert!(found, "the loaded project's green ring should render");
+    }
+
+    #[test]
+    fn projects_column_pulses_a_filled_green_disc_for_active_work() {
+        // A loaded project with active work renders the filled `●` disc in a
+        // green Rgb pulse fill — distinct from the loaded-idle ring.
+        let mut state = projects_column_state(Focus::Commands, 0);
+        state.active_projects.insert("web".to_string());
+        let buf = draw_projects_column(&state);
+        let mut found = false;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                if cell.symbol() == "●" {
+                    assert!(
+                        matches!(cell.fg, Color::Rgb(0, _, 0)),
+                        "the active disc must render a green pulse fill"
+                    );
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "an active project should render the filled disc");
     }
 
     #[test]
