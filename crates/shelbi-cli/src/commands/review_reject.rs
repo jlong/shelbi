@@ -1,34 +1,42 @@
 //! `shelbi __review-reject-reason --out PATH` — the reject-reason prompt,
 //! meant to run inside a `tmux display-popup` (centered, `-B`-borderless so the
 //! widget's own frame is the only border — the same surface style as the
-//! `__review-confirm` popup). It shows a bordered textbox for the rejection
-//! reason plus `[ Reject ]` / `[ Cancel ]` buttons.
+//! `__review-confirm` popup). It shows a bordered **multi-line** text area for
+//! the rejection reason plus `[ Reject ]` / `[ Cancel ]` buttons.
 //!
-//! On submit it writes the typed reason to `PATH` and exits 0; on cancel it
-//! writes nothing and exits non-zero. The launcher (the review panel) reads
-//! `PATH` back to drive the existing `reject_review_task` transition — the same
-//! plumbing the old inline prompt used, only the input surface moved out into a
-//! popover. Empty reasons can't submit, matching the old inline prompt.
+//! Reviewers routinely need multi-paragraph feedback (findings, repro steps,
+//! rationale), so the reason field is a real editor: `Enter` inserts a line
+//! break, and submitting is a distinct action — `Ctrl-D` from anywhere, or
+//! `Tab` to the `[ Reject ]` button and press `Enter`/`Space`. Arrow keys,
+//! `Home`/`End`, `Backspace` (across line boundaries) and `Delete` edit the
+//! text as expected.
+//!
+//! On submit it writes the typed reason — newlines preserved verbatim — to
+//! `PATH` and exits 0; on cancel it writes nothing and exits non-zero. The
+//! launcher (the review panel) reads `PATH` back to drive the existing
+//! `reject_review_task` transition — the same plumbing the old inline prompt
+//! used, only the input surface grew from one line to many. Blank reasons
+//! can't submit, matching the old inline prompt.
 
 use std::io;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
+    backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame, Terminal,
-    backend::CrosstermBackend,
 };
 
-/// What currently holds focus. The textbox is the default focus so the
+/// What currently holds focus. The text area is the default focus so the
 /// reviewer can start typing immediately; `Tab` cycles through the two
 /// buttons and back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -40,7 +48,7 @@ enum Focus {
 }
 
 impl Focus {
-    /// Tab order: textbox → Reject → Cancel → textbox.
+    /// Tab order: text area → Reject → Cancel → text area.
     fn next(self) -> Focus {
         match self {
             Focus::Text => Focus::Reject,
@@ -59,35 +67,172 @@ impl Focus {
     }
 }
 
+/// A minimal multi-line text buffer with a cursor — enough to compose a
+/// rejection reason. Lines are stored as `Vec<char>` so cursor columns are
+/// plain indices (no UTF-8 byte-boundary bookkeeping), and there is always at
+/// least one line so `row`/`col` are never out of range.
+#[derive(Debug, Clone)]
+struct TextArea {
+    lines: Vec<Vec<char>>,
+    /// Cursor line (0-based, always `< lines.len()`).
+    row: usize,
+    /// Cursor column as a char index into `lines[row]` (`0..=len`).
+    col: usize,
+}
+
+impl Default for TextArea {
+    fn default() -> Self {
+        Self {
+            lines: vec![Vec::new()],
+            row: 0,
+            col: 0,
+        }
+    }
+}
+
+impl TextArea {
+    /// The whole buffer as a string, lines rejoined with `\n`. This is what is
+    /// carried through to the reject path, so internal newlines survive
+    /// verbatim.
+    fn text(&self) -> String {
+        self.lines
+            .iter()
+            .map(|l| l.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A reason that is empty or all-whitespace can't be submitted.
+    fn is_blank(&self) -> bool {
+        self.text().trim().is_empty()
+    }
+
+    /// Insert a printable char at the cursor and advance past it.
+    fn insert(&mut self, c: char) {
+        self.lines[self.row].insert(self.col, c);
+        self.col += 1;
+    }
+
+    /// Split the current line at the cursor, pushing the tail onto a new line
+    /// below and moving the cursor to its start.
+    fn newline(&mut self) {
+        let tail = self.lines[self.row].split_off(self.col);
+        self.lines.insert(self.row + 1, tail);
+        self.row += 1;
+        self.col = 0;
+    }
+
+    /// Delete the char before the cursor; at the start of a line, join it onto
+    /// the end of the previous line (the cursor lands at the join point).
+    fn backspace(&mut self) {
+        if self.col > 0 {
+            self.lines[self.row].remove(self.col - 1);
+            self.col -= 1;
+        } else if self.row > 0 {
+            let cur = self.lines.remove(self.row);
+            self.row -= 1;
+            self.col = self.lines[self.row].len();
+            self.lines[self.row].extend(cur);
+        }
+    }
+
+    /// Delete the char under the cursor; at the end of a line, pull the next
+    /// line up onto it (the cursor stays put).
+    fn delete(&mut self) {
+        if self.col < self.lines[self.row].len() {
+            self.lines[self.row].remove(self.col);
+        } else if self.row + 1 < self.lines.len() {
+            let next = self.lines.remove(self.row + 1);
+            self.lines[self.row].extend(next);
+        }
+    }
+
+    fn move_left(&mut self) {
+        if self.col > 0 {
+            self.col -= 1;
+        } else if self.row > 0 {
+            self.row -= 1;
+            self.col = self.lines[self.row].len();
+        }
+    }
+
+    fn move_right(&mut self) {
+        if self.col < self.lines[self.row].len() {
+            self.col += 1;
+        } else if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = 0;
+        }
+    }
+
+    fn move_up(&mut self) {
+        if self.row > 0 {
+            self.row -= 1;
+            self.col = self.col.min(self.lines[self.row].len());
+        } else {
+            self.col = 0;
+        }
+    }
+
+    fn move_down(&mut self) {
+        if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = self.col.min(self.lines[self.row].len());
+        } else {
+            self.col = self.lines[self.row].len();
+        }
+    }
+
+    fn move_home(&mut self) {
+        self.col = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.col = self.lines[self.row].len();
+    }
+}
+
 /// The result of feeding one key to the prompt. Split from the event loop so
 /// the key logic is unit-testable without a terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
-    /// Stay open (typed a char, moved focus, or tried to submit an empty
-    /// reason).
+    /// Stay open (edited the text, moved the cursor/focus, or tried to submit a
+    /// blank reason).
     Continue,
-    /// Submit the (non-empty) reason.
+    /// Submit the (non-blank) reason.
     Submit,
     /// Dismiss without rejecting.
     Cancel,
 }
 
-/// Pure prompt state — the typed reason and current focus. Side-effect free so
-/// [`RejectPrompt::key`] can be exercised in unit tests.
+/// Pure prompt state — the multi-line reason buffer and current focus.
+/// Side-effect free so [`RejectPrompt::key`] can be exercised in unit tests.
 #[derive(Debug, Clone, Default)]
 struct RejectPrompt {
-    reason: String,
+    text: TextArea,
     focus: Focus,
 }
 
 impl RejectPrompt {
-    /// Feed one key. `Esc` always cancels; `Tab`/`BackTab` cycle focus;
-    /// `Enter`/`Space` activate the focused button (or submit from the
-    /// textbox); `Left`/`Right` move between the buttons when one is focused;
-    /// printable chars and `Backspace` edit the reason only when the textbox
-    /// is focused.
-    fn key(&mut self, code: KeyCode) -> Outcome {
-        match code {
+    /// Feed one key event.
+    ///
+    /// `Ctrl-D` submits from any focus (the primary submit affordance now that
+    /// `Enter` inside the editor inserts a newline). `Esc` always cancels;
+    /// `Tab`/`BackTab` cycle focus. On a button, `Enter`/`Space` activate it and
+    /// `Left`/`Right` toggle between the two buttons. In the text area, `Enter`
+    /// inserts a line break, arrows / `Home` / `End` move the cursor,
+    /// `Backspace` / `Delete` edit (joining across line boundaries), and
+    /// printable chars are typed.
+    fn key(&mut self, key: KeyEvent) -> Outcome {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // Ctrl-D is the dedicated submit key — reachable from the text area
+        // without leaving it, and from the buttons too.
+        if ctrl && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')) {
+            return self.try_submit();
+        }
+
+        match key.code {
             KeyCode::Esc => Outcome::Cancel,
             KeyCode::Tab => {
                 self.focus = self.focus.next();
@@ -97,15 +242,13 @@ impl RejectPrompt {
                 self.focus = self.focus.prev();
                 Outcome::Continue
             }
-            KeyCode::Enter => match self.focus {
-                Focus::Cancel => Outcome::Cancel,
-                Focus::Text | Focus::Reject => self.try_submit(),
-            },
-            // Space activates a focused button; inside the textbox it types a
-            // literal space (handled by the general `Char` arm below).
+
+            // --- Button focus ---------------------------------------------
+            KeyCode::Enter if self.focus == Focus::Reject => self.try_submit(),
+            KeyCode::Enter if self.focus == Focus::Cancel => Outcome::Cancel,
             KeyCode::Char(' ') if self.focus == Focus::Reject => self.try_submit(),
             KeyCode::Char(' ') if self.focus == Focus::Cancel => Outcome::Cancel,
-            // Left/Right nudge between the two buttons when a button is focused.
+            // Left/Right toggle between the two buttons when a button is focused.
             KeyCode::Left | KeyCode::Right if self.focus != Focus::Text => {
                 self.focus = match self.focus {
                     Focus::Cancel => Focus::Reject,
@@ -113,22 +256,60 @@ impl RejectPrompt {
                 };
                 Outcome::Continue
             }
+
+            // --- Text-area focus ------------------------------------------
+            // Enter inserts a newline rather than submitting.
+            KeyCode::Enter if self.focus == Focus::Text => {
+                self.text.newline();
+                Outcome::Continue
+            }
             KeyCode::Backspace if self.focus == Focus::Text => {
-                self.reason.pop();
+                self.text.backspace();
                 Outcome::Continue
             }
-            KeyCode::Char(c) if self.focus == Focus::Text => {
-                self.reason.push(c);
+            KeyCode::Delete if self.focus == Focus::Text => {
+                self.text.delete();
                 Outcome::Continue
             }
+            KeyCode::Left if self.focus == Focus::Text => {
+                self.text.move_left();
+                Outcome::Continue
+            }
+            KeyCode::Right if self.focus == Focus::Text => {
+                self.text.move_right();
+                Outcome::Continue
+            }
+            KeyCode::Up if self.focus == Focus::Text => {
+                self.text.move_up();
+                Outcome::Continue
+            }
+            KeyCode::Down if self.focus == Focus::Text => {
+                self.text.move_down();
+                Outcome::Continue
+            }
+            KeyCode::Home if self.focus == Focus::Text => {
+                self.text.move_home();
+                Outcome::Continue
+            }
+            KeyCode::End if self.focus == Focus::Text => {
+                self.text.move_end();
+                Outcome::Continue
+            }
+            // Printable chars type into the buffer. Guard on `!ctrl` so stray
+            // control chords (Ctrl-A, …) don't land as literal text.
+            KeyCode::Char(c) if self.focus == Focus::Text && !ctrl => {
+                self.text.insert(c);
+                Outcome::Continue
+            }
+
             _ => Outcome::Continue,
         }
     }
 
-    /// A reason must be non-blank to submit; an empty submit is a no-op that
+    /// A reason must be non-blank to submit; a blank submit is a no-op that
     /// keeps the popup open (matching the old inline prompt).
     fn try_submit(&self) -> Outcome {
-        if self.reason.trim().is_empty() {
+        if self.text.is_blank() {
             Outcome::Continue
         } else {
             Outcome::Submit
@@ -136,8 +317,9 @@ impl RejectPrompt {
     }
 }
 
-/// Render + drive the reject-reason popup. On submit, writes the trimmed reason
-/// to `out` and returns `true`; on cancel, writes nothing and returns `false`.
+/// Render + drive the reject-reason popup. On submit, writes the reason
+/// (newlines preserved) to `out` and returns `true`; on cancel, writes nothing
+/// and returns `false`.
 pub fn run(out: String) -> Result<bool> {
     let mut term = setup_terminal()?;
     // Restore the terminal on any early return / panic — the caller reads our
@@ -153,7 +335,7 @@ pub fn run(out: String) -> Result<bool> {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                match prompt.key(k.code) {
+                match prompt.key(k) {
                     Outcome::Submit => break true,
                     Outcome::Cancel => break false,
                     Outcome::Continue => {}
@@ -164,7 +346,9 @@ pub fn run(out: String) -> Result<bool> {
 
     restore_terminal(&mut term)?;
     if submitted {
-        std::fs::write(&out, prompt.reason.trim())
+        // Write the reason verbatim (internal newlines intact); the launcher
+        // trims the outer whitespace on read-back.
+        std::fs::write(&out, prompt.text.text())
             .with_context(|| format!("writing reject reason to {out}"))?;
     }
     Ok(submitted)
@@ -183,14 +367,13 @@ fn render(f: &mut Frame, prompt: &RejectPrompt) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // label / textbox (3 lines: border + content + border) / spacer / buttons
-    // / hint.
+    // label / text area (grows to fill) / spacer / buttons / hint.
     let rows = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(3),
+        Constraint::Min(3),
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Min(1),
+        Constraint::Length(1),
     ])
     .split(inner);
 
@@ -202,7 +385,7 @@ fn render(f: &mut Frame, prompt: &RejectPrompt) {
         rows[0],
     );
 
-    render_textbox(f, prompt, rows[1]);
+    render_textarea(f, prompt, rows[1]);
 
     let buttons = Line::from(vec![
         button("[ Reject ]", prompt.focus == Focus::Reject),
@@ -214,16 +397,17 @@ fn render(f: &mut Frame, prompt: &RejectPrompt) {
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "Enter reject · Esc cancel · Tab focus",
+            "Ctrl-D reject · Enter newline · Esc cancel · Tab focus",
             Style::default().fg(Color::DarkGray),
         ))),
         rows[4],
     );
 }
 
-/// The bordered reason textbox. Its border brightens to cyan when focused; a
-/// block cursor always trails the text so the field reads as an input.
-fn render_textbox(f: &mut Frame, prompt: &RejectPrompt, area: Rect) {
+/// The bordered, multi-line reason area. Its border brightens to cyan when
+/// focused, and a reverse-video block cursor marks the caret. When the caret
+/// scrolls past the visible height the content scrolls to keep it in view.
+fn render_textarea(f: &mut Frame, prompt: &RejectPrompt, area: Rect) {
     let focused = prompt.focus == Focus::Text;
     let border = if focused { Color::Cyan } else { Color::DarkGray };
     let block = Block::default()
@@ -231,13 +415,49 @@ fn render_textbox(f: &mut Frame, prompt: &RejectPrompt, area: Rect) {
         .border_style(Style::default().fg(border));
     let text_area = block.inner(area);
     f.render_widget(block, area);
+
+    let visible = text_area.height.max(1) as usize;
+    // Keep the caret row on screen: scroll just enough that it sits on the last
+    // visible line once the buffer outgrows the box.
+    let scroll = prompt.text.row.saturating_sub(visible.saturating_sub(1));
+
+    let lines = textarea_lines(prompt, focused);
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("{}▌", prompt.reason),
-            Style::default().fg(Color::White),
-        ))),
+        Paragraph::new(Text::from(lines)).scroll((scroll as u16, 0)),
         text_area,
     );
+}
+
+/// Render each buffer line to a styled `Line`. On the caret's line (when
+/// focused) the char under the caret — or a trailing space at end-of-line — is
+/// drawn reverse-video so the caret is visible mid-line and at the end.
+fn textarea_lines(prompt: &RejectPrompt, focused: bool) -> Vec<Line<'static>> {
+    let ta = &prompt.text;
+    let cursor = Style::default().add_modifier(Modifier::REVERSED);
+    let plain = Style::default().fg(Color::White);
+    ta.lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            if !(focused && i == ta.row) {
+                return Line::from(Span::styled(line.iter().collect::<String>(), plain));
+            }
+            let before: String = line[..ta.col].iter().collect();
+            let (under, after): (String, String) = if ta.col < line.len() {
+                (
+                    line[ta.col].to_string(),
+                    line[ta.col + 1..].iter().collect(),
+                )
+            } else {
+                (" ".to_string(), String::new())
+            };
+            Line::from(vec![
+                Span::styled(before, plain),
+                Span::styled(under, cursor),
+                Span::styled(after, plain),
+            ])
+        })
+        .collect()
 }
 
 /// A button span. The focused button is reverse-video + bold (a solid
@@ -288,6 +508,35 @@ mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
 
+    /// Feed a plain (no-modifier) key.
+    fn press(prompt: &mut RejectPrompt, code: KeyCode) -> Outcome {
+        prompt.key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Feed a Ctrl-chorded key.
+    fn press_ctrl(prompt: &mut RejectPrompt, code: KeyCode) -> Outcome {
+        prompt.key(KeyEvent::new(code, KeyModifiers::CONTROL))
+    }
+
+    fn typed(prompt: &mut RejectPrompt, text: &str) {
+        for c in text.chars() {
+            assert_eq!(press(prompt, KeyCode::Char(c)), Outcome::Continue);
+        }
+    }
+
+    fn text_prompt(reason: &str) -> RejectPrompt {
+        // Compose the reason through the key path so cursor state is realistic.
+        let mut prompt = RejectPrompt::default();
+        for c in reason.chars() {
+            if c == '\n' {
+                press(&mut prompt, KeyCode::Enter);
+            } else {
+                press(&mut prompt, KeyCode::Char(c));
+            }
+        }
+        prompt
+    }
+
     fn render_to_string(prompt: &RejectPrompt, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| render(f, prompt)).unwrap();
@@ -303,18 +552,32 @@ mod tests {
     }
 
     #[test]
-    fn popover_renders_frame_textbox_cursor_and_both_buttons() {
-        let prompt = RejectPrompt {
-            reason: "needs a test".into(),
-            focus: Focus::Text,
-        };
-        let out = render_to_string(&prompt, 60, 11);
+    fn popover_renders_frame_textarea_and_both_buttons() {
+        let prompt = text_prompt("needs a test");
+        let out = render_to_string(&prompt, 60, 16);
         assert!(out.contains("Reject task"), "titled frame: {out}");
         assert!(out.contains("Reason for rejecting:"), "label: {out}");
-        // The textbox shows the typed reason with a trailing block cursor.
-        assert!(out.contains("needs a test▌"), "textbox + cursor: {out}");
+        assert!(out.contains("needs a test"), "text area shows the reason: {out}");
         assert!(out.contains("[ Reject ]"), "reject button: {out}");
         assert!(out.contains("[ Cancel ]"), "cancel button: {out}");
+    }
+
+    #[test]
+    fn hint_advertises_the_submit_and_newline_keys() {
+        let out = render_to_string(&RejectPrompt::default(), 60, 16);
+        assert!(out.contains("Ctrl-D reject"), "submit hint shown: {out}");
+        assert!(out.contains("Enter newline"), "newline hint shown: {out}");
+    }
+
+    #[test]
+    fn multiple_lines_render_on_separate_rows() {
+        // Each buffer line lands on its own screen row inside the text box.
+        let prompt = text_prompt("line one\nline two");
+        let out = render_to_string(&prompt, 60, 16);
+        let one = out.lines().position(|r| r.contains("line one"));
+        let two = out.lines().position(|r| r.contains("line two"));
+        assert!(one.is_some() && two.is_some(), "both lines rendered: {out}");
+        assert!(one.unwrap() < two.unwrap(), "second line is below first: {out}");
     }
 
     #[test]
@@ -322,12 +585,9 @@ mod tests {
         // The focused button carries the reverse-video highlight; an unfocused
         // one does not. Assert on the rendered cell modifiers rather than the
         // glyphs (both buttons print the same label text either way).
-        use ratatui::style::Modifier;
-        let prompt = RejectPrompt {
-            reason: "x".into(),
-            focus: Focus::Reject,
-        };
-        let mut term = Terminal::new(TestBackend::new(60, 11)).unwrap();
+        let mut prompt = text_prompt("x");
+        prompt.focus = Focus::Reject;
+        let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
         term.draw(|f| render(f, &prompt)).unwrap();
         let buf = term.backend().buffer().clone();
         let reversed_cells = (0..buf.area.height).any(|y| {
@@ -336,14 +596,8 @@ mod tests {
         assert!(reversed_cells, "the focused button must be reverse-video");
     }
 
-    fn typed(prompt: &mut RejectPrompt, text: &str) {
-        for c in text.chars() {
-            assert_eq!(prompt.key(KeyCode::Char(c)), Outcome::Continue);
-        }
-    }
-
     #[test]
-    fn textbox_is_focused_by_default() {
+    fn textarea_is_focused_by_default() {
         assert_eq!(RejectPrompt::default().focus, Focus::Text);
     }
 
@@ -351,97 +605,162 @@ mod tests {
     fn typing_appends_to_the_reason_and_backspace_deletes() {
         let mut prompt = RejectPrompt::default();
         typed(&mut prompt, "abc");
-        assert_eq!(prompt.reason, "abc");
-        assert_eq!(prompt.key(KeyCode::Backspace), Outcome::Continue);
-        assert_eq!(prompt.reason, "ab");
+        assert_eq!(prompt.text.text(), "abc");
+        assert_eq!(press(&mut prompt, KeyCode::Backspace), Outcome::Continue);
+        assert_eq!(prompt.text.text(), "ab");
     }
 
     #[test]
-    fn space_is_typed_into_the_textbox_not_treated_as_activate() {
+    fn space_is_typed_into_the_textarea_not_treated_as_activate() {
         let mut prompt = RejectPrompt::default();
         typed(&mut prompt, "a b");
-        assert_eq!(prompt.reason, "a b");
+        assert_eq!(prompt.text.text(), "a b");
     }
 
     #[test]
-    fn enter_submits_only_a_non_empty_reason_from_the_textbox() {
+    fn enter_inserts_a_newline_in_the_textarea_rather_than_submitting() {
         let mut prompt = RejectPrompt::default();
-        // Empty reason: Enter is a no-op, popup stays open.
-        assert_eq!(prompt.key(KeyCode::Enter), Outcome::Continue);
-        typed(&mut prompt, "please fix the null deref");
-        assert_eq!(prompt.key(KeyCode::Enter), Outcome::Submit);
+        typed(&mut prompt, "first");
+        assert_eq!(press(&mut prompt, KeyCode::Enter), Outcome::Continue);
+        typed(&mut prompt, "second");
+        assert_eq!(prompt.text.text(), "first\nsecond");
+    }
+
+    #[test]
+    fn newline_splits_the_line_at_the_cursor() {
+        let mut prompt = RejectPrompt::default();
+        typed(&mut prompt, "abcd");
+        // Move the cursor back two chars, then split: "ab" | "cd".
+        press(&mut prompt, KeyCode::Left);
+        press(&mut prompt, KeyCode::Left);
+        assert_eq!(press(&mut prompt, KeyCode::Enter), Outcome::Continue);
+        assert_eq!(prompt.text.text(), "ab\ncd");
+    }
+
+    #[test]
+    fn backspace_at_line_start_joins_with_the_previous_line() {
+        let mut prompt = RejectPrompt::default();
+        typed(&mut prompt, "one");
+        press(&mut prompt, KeyCode::Enter);
+        typed(&mut prompt, "two");
+        // Cursor is at the start of "two" after Home.
+        press(&mut prompt, KeyCode::Home);
+        assert_eq!(press(&mut prompt, KeyCode::Backspace), Outcome::Continue);
+        assert_eq!(prompt.text.text(), "onetwo");
+    }
+
+    #[test]
+    fn delete_at_line_end_pulls_up_the_next_line() {
+        let mut prompt = RejectPrompt::default();
+        typed(&mut prompt, "one");
+        press(&mut prompt, KeyCode::Enter);
+        typed(&mut prompt, "two");
+        // Move to the end of the first line, then Delete joins "two" up.
+        press(&mut prompt, KeyCode::Up);
+        press(&mut prompt, KeyCode::End);
+        assert_eq!(press(&mut prompt, KeyCode::Delete), Outcome::Continue);
+        assert_eq!(prompt.text.text(), "onetwo");
+    }
+
+    #[test]
+    fn arrow_up_down_move_between_lines_and_clamp_the_column() {
+        let mut prompt = RejectPrompt::default();
+        typed(&mut prompt, "long line");
+        press(&mut prompt, KeyCode::Enter);
+        typed(&mut prompt, "hi");
+        // Cursor at end of "hi" (col 2). Up to the long line keeps col 2, so
+        // typing lands after "lo".
+        press(&mut prompt, KeyCode::Up);
+        typed(&mut prompt, "X");
+        assert_eq!(prompt.text.text(), "loXng line\nhi");
+    }
+
+    #[test]
+    fn ctrl_d_submits_a_non_blank_reason_from_the_textarea() {
+        let mut prompt = RejectPrompt::default();
+        // Blank: Ctrl-D is a no-op, popup stays open.
+        assert_eq!(press_ctrl(&mut prompt, KeyCode::Char('d')), Outcome::Continue);
+        typed(&mut prompt, "please fix\nthe null deref");
+        assert_eq!(press_ctrl(&mut prompt, KeyCode::Char('d')), Outcome::Submit);
+        // The multi-line reason survives intact.
+        assert_eq!(prompt.text.text(), "please fix\nthe null deref");
+    }
+
+    #[test]
+    fn ctrl_d_submits_even_when_a_button_holds_focus() {
+        let mut prompt = text_prompt("fix it");
+        prompt.focus = Focus::Cancel;
+        assert_eq!(press_ctrl(&mut prompt, KeyCode::Char('d')), Outcome::Submit);
     }
 
     #[test]
     fn esc_cancels_from_any_focus() {
         for focus in [Focus::Text, Focus::Reject, Focus::Cancel] {
-            let mut prompt = RejectPrompt {
-                reason: "some reason".into(),
-                focus,
-            };
-            assert_eq!(prompt.key(KeyCode::Esc), Outcome::Cancel, "focus={focus:?}");
+            let mut prompt = text_prompt("some reason");
+            prompt.focus = focus;
+            assert_eq!(press(&mut prompt, KeyCode::Esc), Outcome::Cancel, "focus={focus:?}");
         }
     }
 
     #[test]
-    fn tab_cycles_focus_through_textbox_and_both_buttons() {
+    fn tab_cycles_focus_through_textarea_and_both_buttons() {
         let mut prompt = RejectPrompt::default();
         assert_eq!(prompt.focus, Focus::Text);
-        prompt.key(KeyCode::Tab);
+        press(&mut prompt, KeyCode::Tab);
         assert_eq!(prompt.focus, Focus::Reject);
-        prompt.key(KeyCode::Tab);
+        press(&mut prompt, KeyCode::Tab);
         assert_eq!(prompt.focus, Focus::Cancel);
-        prompt.key(KeyCode::Tab);
+        press(&mut prompt, KeyCode::Tab);
         assert_eq!(prompt.focus, Focus::Text);
         // BackTab reverses.
-        prompt.key(KeyCode::BackTab);
+        press(&mut prompt, KeyCode::BackTab);
         assert_eq!(prompt.focus, Focus::Cancel);
     }
 
     #[test]
-    fn enter_on_the_reject_button_submits_a_non_empty_reason() {
-        let mut prompt = RejectPrompt {
-            reason: "fix it".into(),
-            focus: Focus::Reject,
-        };
-        assert_eq!(prompt.key(KeyCode::Enter), Outcome::Submit);
+    fn enter_or_space_on_the_reject_button_submits_a_non_blank_reason() {
+        for code in [KeyCode::Enter, KeyCode::Char(' ')] {
+            let mut prompt = text_prompt("fix it");
+            prompt.focus = Focus::Reject;
+            assert_eq!(press(&mut prompt, code), Outcome::Submit, "{code:?}");
+        }
     }
 
     #[test]
-    fn reject_button_cannot_submit_an_empty_reason() {
-        let mut prompt = RejectPrompt {
-            reason: "   ".into(),
-            focus: Focus::Reject,
-        };
-        assert_eq!(prompt.key(KeyCode::Enter), Outcome::Continue);
-        assert_eq!(prompt.key(KeyCode::Char(' ')), Outcome::Continue);
+    fn reject_button_cannot_submit_a_blank_reason() {
+        let mut prompt = text_prompt("   ");
+        prompt.focus = Focus::Reject;
+        assert_eq!(press(&mut prompt, KeyCode::Enter), Outcome::Continue);
+        assert_eq!(press(&mut prompt, KeyCode::Char(' ')), Outcome::Continue);
     }
 
     #[test]
     fn enter_or_space_on_the_cancel_button_cancels() {
         for code in [KeyCode::Enter, KeyCode::Char(' ')] {
-            let mut prompt = RejectPrompt {
-                reason: "fix it".into(),
-                focus: Focus::Cancel,
-            };
-            assert_eq!(prompt.key(code), Outcome::Cancel, "{code:?}");
+            let mut prompt = text_prompt("fix it");
+            prompt.focus = Focus::Cancel;
+            assert_eq!(press(&mut prompt, code), Outcome::Cancel, "{code:?}");
         }
     }
 
     #[test]
-    fn arrow_keys_move_between_buttons_but_not_from_the_textbox() {
+    fn arrow_keys_move_between_buttons_but_edit_the_cursor_in_the_textarea() {
         // On a button, Left/Right toggle between Reject and Cancel.
         let mut prompt = RejectPrompt {
             focus: Focus::Reject,
             ..Default::default()
         };
-        prompt.key(KeyCode::Right);
+        press(&mut prompt, KeyCode::Right);
         assert_eq!(prompt.focus, Focus::Cancel);
-        prompt.key(KeyCode::Left);
+        press(&mut prompt, KeyCode::Left);
         assert_eq!(prompt.focus, Focus::Reject);
-        // From the textbox, arrows don't move focus (they're inert here).
+        // From the text area, arrows move the caret (not focus): type "ab",
+        // Left, then "X" lands between a and b.
         let mut prompt = RejectPrompt::default();
-        prompt.key(KeyCode::Right);
-        assert_eq!(prompt.focus, Focus::Text);
+        typed(&mut prompt, "ab");
+        press(&mut prompt, KeyCode::Left);
+        assert_eq!(prompt.focus, Focus::Text, "arrows keep textarea focus");
+        typed(&mut prompt, "X");
+        assert_eq!(prompt.text.text(), "aXb");
     }
 }
