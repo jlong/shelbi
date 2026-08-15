@@ -60,6 +60,14 @@ pub enum DeleteOutcome {
     /// Per the workflow spec, the branch will be replaced naturally on
     /// that workspace's next dispatch.
     Skipped { reason: String },
+    /// A **review** slot still had the branch checked out, so the local ref
+    /// couldn't be `git branch -D`'d (git refuses to delete a branch checked
+    /// out in a linked worktree). The branch WAS removed from origin — the
+    /// remote delete is a remote-side fact a worktree doesn't gate — and the
+    /// local ref is cleaned when the review slot frees. Distinct from
+    /// [`DeleteOutcome::Skipped`], which touches nothing: on the accept path a
+    /// held review branch must still leave `origin/<branch>` gone.
+    RemoteDeletedLocalDeferred { workspace: String },
     /// Branch wasn't present in either location — there was nothing to do.
     NotPresent,
 }
@@ -74,6 +82,9 @@ impl DeleteOutcome {
             DeleteOutcome::Skipped { reason } => {
                 let safe = reason.replace('\n', " ");
                 format!("skipped:{safe}")
+            }
+            DeleteOutcome::RemoteDeletedLocalDeferred { workspace } => {
+                format!("remote-deleted-local-deferred:{workspace}")
             }
             DeleteOutcome::NotPresent => "not-present".to_string(),
         }
@@ -1354,18 +1365,41 @@ pub fn close_pr(project: &Project, task: &Task) -> Result<Option<u64>> {
 
 /// Delete the task's branch from origin and from the hub's local refs.
 ///
-/// Skipped when any of the project's workspaces currently has the branch
-/// checked out in its worktree — yanking the branch out from under an
-/// active task would force the workspace into a detached HEAD on its next
-/// fetch. Returns [`DeleteOutcome::NotPresent`] when the branch is already
-/// gone in both places (idempotent).
+/// Returns [`DeleteOutcome::NotPresent`] when the branch is already gone in
+/// both places (idempotent).
+///
+/// **Worktree-held branches.** A branch checked out in a linked worktree
+/// can't be `git branch -D`'d — git refuses. How that gates the delete
+/// depends on which slot holds it:
+///
+/// - A **non-review** (dev) workspace actively holding the branch skips the
+///   delete entirely ([`DeleteOutcome::Skipped`]) — yanking a branch out from
+///   under live work would force that workspace into a detached HEAD on its
+///   next fetch, and the branch is replaced naturally on its next dispatch.
+/// - A **review** slot holding the branch is the accept path: the work is
+///   merged and the slot is being torn down, so `origin/<branch>` must still
+///   go. The remote delete runs; only the local `git branch -D` defers (the
+///   ref is cleaned when the slot frees), reported as
+///   [`DeleteOutcome::RemoteDeletedLocalDeferred`]. Without this, an accepted
+///   task's branch stayed on origin forever (`gh` warned `cannot delete
+///   branch … used by worktree` and the whole delete no-op'd).
 pub fn delete_branch(project: &Project, task: &Task) -> Result<DeleteOutcome> {
     let branch = require_branch(task)?;
 
-    if let Some(workspace_name) = workspace_holding_branch(project, &branch)? {
-        return Ok(DeleteOutcome::Skipped {
-            reason: format!("branch is checked out in workspace `{workspace_name}`"),
-        });
+    let holder = workspace_holding_branch(project, &branch)?;
+    // A dev slot actively holding the branch blocks the whole delete; a review
+    // slot only defers the local ref (the remote delete still runs below).
+    let holder_is_review = holder.as_deref().is_some_and(|name| {
+        project
+            .workspace(name)
+            .is_some_and(|ws| project.effective_tags(ws).contains("review"))
+    });
+    if let Some(ref workspace_name) = holder {
+        if !holder_is_review {
+            return Ok(DeleteOutcome::Skipped {
+                reason: format!("branch is checked out in workspace `{workspace_name}`"),
+            });
+        }
     }
 
     if let Some(child_id) = deferred_multi_parent_child_needing_branch(project, task, &branch) {
@@ -1403,6 +1437,15 @@ pub fn delete_branch(project: &Project, task: &Task) -> Result<DeleteOutcome> {
                 });
             }
         }
+    }
+
+    // A review slot still has the branch checked out, so `git branch -D` from
+    // the hub would fail (`cannot delete branch … checked out at <worktree>`).
+    // The remote is gone; defer the local ref for the slot to clean up.
+    if let Some(workspace_name) = holder {
+        return Ok(DeleteOutcome::RemoteDeletedLocalDeferred {
+            workspace: workspace_name,
+        });
     }
 
     if local_present {
@@ -1562,6 +1605,13 @@ mod tests {
         assert!(line.starts_with("skipped:"));
         assert!(line.contains("alice"));
         assert!(!line.contains('\n'));
+        assert_eq!(
+            DeleteOutcome::RemoteDeletedLocalDeferred {
+                workspace: "review-1".into()
+            }
+            .as_line(),
+            "remote-deleted-local-deferred:review-1"
+        );
     }
 
     #[test]
@@ -1843,6 +1893,105 @@ mod tests {
         // Branch must still exist.
         let wt = repo.to_string_lossy().into_owned();
         assert!(local_branch_exists(&Host::Local, &wt, "feature").unwrap());
+    }
+
+    /// Origin-bearing repo with one **review**-tagged workspace whose
+    /// worktree has `branch` checked out — the accept-path shape where the
+    /// branch is merged but the review slot still holds it.
+    fn project_with_review_workspace_holding(
+        local: &std::path::Path,
+        workspace: &str,
+        branch: &str,
+    ) -> Project {
+        let wt_path = local.join(".shelbi").join("wt").join(workspace);
+        std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
+        run_git(local, &["worktree", "add", wt_path.to_str().unwrap(), branch]);
+
+        let mut runners = BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+                integration: None,
+            },
+        );
+        Project {
+            name: "fixture".into(),
+            label: None,
+            display_name: None,
+            repo: local.to_string_lossy().into(),
+            default_branch: "main".into(),
+            default_workflow: None,
+            config_mode: None,
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: local.to_path_buf(),
+                host: None,
+                tags: Vec::new(),
+                forward: None,
+            }],
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workspaces: vec![WorkspaceSpec {
+                name: workspace.into(),
+                machine: "hub".into(),
+                tags: vec!["review".into()],
+                slot: None,
+            }],
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
+            zen: ZenConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
+            runners: Default::default(),
+            agents: Default::default(),
+            detected_shapes: Vec::new(),
+            git: shelbi_core::GitConfig::default(),
+        }
+    }
+
+    #[test]
+    fn delete_branch_removes_remote_but_defers_local_when_review_slot_holds_it() {
+        // Accept path: the branch is merged, but the review slot still has it
+        // checked out. `git branch -D` from the hub can't run (git refuses to
+        // delete a branch checked out in a linked worktree), but the REMOTE
+        // delete must still land — otherwise the accepted task's branch lives
+        // on origin forever. The local ref is left for the slot to clean up.
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        let project = project_with_review_workspace_holding(&local, "review-1", "feature");
+        let wt = local.to_string_lossy().into_owned();
+
+        assert!(
+            remote_branch_exists(&Host::Local, &wt, "feature").unwrap(),
+            "precondition: origin/feature exists"
+        );
+
+        let out = delete_branch(&project, &task_on_branch("t", "feature")).unwrap();
+        assert_eq!(
+            out,
+            DeleteOutcome::RemoteDeletedLocalDeferred {
+                workspace: "review-1".into()
+            },
+            "{out:?}"
+        );
+
+        // Remote is gone; local ref survives (deferred).
+        assert!(
+            !remote_branch_exists(&Host::Local, &wt, "feature").unwrap(),
+            "origin/feature must be deleted even though a review worktree holds it"
+        );
+        assert!(
+            local_branch_exists(&Host::Local, &wt, "feature").unwrap(),
+            "local feature ref is deferred (still checked out in the review worktree)"
+        );
     }
 
     #[test]

@@ -631,6 +631,22 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
     // the workflow doesn't declare errors, naming the declared statuses.
     let column = resolve_move_target(&workflow, to)?;
 
+    // Status ids for the edge we're crossing (used to fire the edge's
+    // transition actions below). `column` is the target, `tf.task.column`
+    // the current position.
+    let from_status = tf.task.column.as_str().to_string();
+    let to_status = column.as_str().to_string();
+    // Does this edge declare a `merge`? An accept move (e.g. `review -> done`)
+    // must actually integrate the branch, not just re-color the card. The
+    // merge is GATED before the column move (below) so a failed or absent
+    // merge never leaves the board reading the target status with an open PR
+    // / unmerged branch, and the edge's remaining actions (`delete_branch`,
+    // …) fire after the move.
+    let declares_merge = column != tf.task.column
+        && workflow
+            .actions_for_transition(&from_status, &to_status)
+            .contains(&shelbi_core::TransitionAction::Merge);
+
     // Lifecycle hook: a move INTO `in_progress` cuts the task's branch on
     // the hub (with depends_on awareness — see
     // `shelbi_orchestrator::lifecycle`) and persists `branch:` onto the
@@ -649,13 +665,46 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
             .map_err(|e| anyhow!(e))?;
     }
 
+    // Gated merge for an accept edge. Integrate the branch (via the PR when
+    // one is open — the path a protected `main` accepts) BEFORE the card
+    // moves. A failed merge emits a `merge … status=failed` event and aborts
+    // the move: the task stays put rather than showing the target status with
+    // nothing merged. Loaded once here and reused for the post-move cleanup.
+    let project_yaml_for_actions = if declares_merge {
+        let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
+        let ws_label = tf
+            .task
+            .assigned_to
+            .clone()
+            .unwrap_or_else(|| "cli".to_string());
+        shelbi_orchestrator::transition::run_gated_merge(
+            &project_yaml,
+            project,
+            &tf.task,
+            &tf.body,
+            &workflow,
+            &from_status,
+            &to_status,
+            &ws_label,
+        )
+        .map_err(|e| {
+            anyhow!(
+                "merge for `{id}` failed; leaving it in `{from_status}` \
+                 (NOT advancing to `{to_status}`): {e}"
+            )
+        })?;
+        Some(project_yaml)
+    } else {
+        None
+    };
+
     let moved = shelbi_state::move_task(project, id, column.clone()).map_err(|e| anyhow!(e))?;
-    if let Some((from, to_col, workflow)) = moved {
+    if let Some((from, to_col, moved_wf)) = &moved {
         let reason = reason.unwrap_or("user:cli");
         if let Err(e) = shelbi_state::append_task_event(
             project,
             id,
-            &workflow,
+            moved_wf,
             from.clone(),
             to_col.clone(),
             reason,
@@ -678,6 +727,31 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
             }
         }
     }
+
+    // Merge already landed and gated the move above; now fire the edge's
+    // remaining actions (`delete_branch`, `push_branch`, `run:`/`ready:`),
+    // skipping `merge` so it isn't re-run. Best-effort — the move already
+    // happened, so a cleanup failure warns rather than rolling it back.
+    if let (Some(project_yaml), Some(_)) = (project_yaml_for_actions.as_ref(), moved.as_ref()) {
+        match shelbi_orchestrator::transition::execute_transition_except(
+            project_yaml,
+            project,
+            &tf.task,
+            &tf.body,
+            &workflow,
+            &from_status,
+            &to_status,
+            &[shelbi_core::TransitionAction::Merge],
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "warning: post-merge cleanup for `{id}` failed (merge already landed): {e}"
+                );
+            }
+        }
+    }
+
     println!("✓ {id} → {column}");
     Ok(())
 }

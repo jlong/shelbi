@@ -671,26 +671,72 @@ fn review_panel_cmd(shelbi_bin: &str, project_name: &str, task_id: &str) -> Stri
 
 /// **Approve**: move the task out of its review status via the normal
 /// forward (accept) transition — the same move the Kanban board makes on a
-/// card sent one column right. Everything wired to that move (merge on
-/// accept, review-workspace teardown, slot free) fires through the existing
-/// orchestrator reaction to the emitted move event; no merge logic lives
-/// here.
+/// card sent one column right.
+///
+/// The accept edge's `merge` action is GATED before the column move: the
+/// branch is integrated (via its open PR — the path a protected `main`
+/// accepts) and a `merge` event emitted BEFORE the card leaves `review`, so
+/// a failed or absent merge never leaves the board reading `done` with an
+/// open PR / unmerged branch. On merge failure the move is abandoned and the
+/// error propagated so the reviewer sees it. The edge's remaining cleanup
+/// (`delete_branch`, review-workspace teardown, slot free) fires after the
+/// move — the teardown half is [`close_review_window`], called by the caller.
 pub fn approve_review_task(project_name: &str, task_id: &str) -> Result<()> {
     let project = shelbi_state::load_project(project_name)?;
     let tf = shelbi_state::load_task(project_name, task_id)?;
     let workflow = shelbi_state::load_task_workflow(project_name, &project, &tf.task)
         .unwrap_or_else(|_| shelbi_core::default_workflow());
-    let current = tf.task.column.as_str();
+    let from_status = tf.task.column.as_str().to_string();
     let target = workflow
-        .forward_status(current)
+        .forward_status(&from_status)
         .map(|s| Column::from_status_id(&s.id))
         .ok_or_else(|| {
             Error::Other(format!(
-                "no accept transition out of status `{current}` in this workflow"
+                "no accept transition out of status `{from_status}` in this workflow"
             ))
         })?;
+    let to_status = target.as_str().to_string();
+
+    // Gate the move on the accept edge's `merge` (a no-op for an edge that
+    // declares none). A failed merge aborts the accept — the task stays in
+    // review with the error surfaced — rather than advancing to done with an
+    // open PR.
+    let ws_label = tf
+        .task
+        .assigned_to
+        .clone()
+        .unwrap_or_else(|| "board".to_string());
+    let merged = crate::transition::run_gated_merge(
+        &project,
+        project_name,
+        &tf.task,
+        &tf.body,
+        &workflow,
+        &from_status,
+        &to_status,
+        &ws_label,
+    )?
+    .is_some();
+
     if let Some((from, to, wf)) = shelbi_state::move_task(project_name, task_id, target)? {
         let _ = shelbi_state::append_task_event(project_name, task_id, &wf, from, to, "user:review");
+    }
+
+    // Fire the edge's remaining actions (delete_branch, …) after the move,
+    // skipping `merge` so it isn't re-run. Best-effort — the move landed.
+    if merged {
+        if let Err(e) = crate::transition::execute_transition_except(
+            &project,
+            project_name,
+            &tf.task,
+            &tf.body,
+            &workflow,
+            &from_status,
+            &to_status,
+            &[shelbi_core::TransitionAction::Merge],
+        ) {
+            tracing::warn!(task = %task_id, error = %e, "post-merge accept cleanup failed (merge already landed)");
+        }
     }
     Ok(())
 }
