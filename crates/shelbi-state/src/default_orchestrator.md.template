@@ -185,10 +185,11 @@ enforces one consuming follower per project — a starting `events next` tears
 down any prior live one — but the accelerator staying non-consuming is what
 keeps the single consumer slot yours.
 
-The accelerator is a child process — a background shell you launch and watch —
-and its life is tied to yours: when your session is compacted, respawned, or
-simply moves on, that shell can be reaped with no signal delivered to you, and a
-watcher tailing its output file cannot tell a dead producer from a quiet board.
+The accelerator is a child process — a single `Monitor` you launch, its
+`command` being the follower itself — and its life is tied to yours: when your
+session is compacted, respawned, or simply moves on, that process can be reaped
+with no signal delivered to you, and a watch cannot tell a dead producer from a
+quiet board.
 (This is not hypothetical: a follow process was once reaped after a couple of
 batches and nothing restarted it, so ~14h of handoffs arrived unseen.) Two
 mechanisms close that gap, and you must rely on both:
@@ -235,15 +236,20 @@ before answering the user:
      (write-then-delete), so re-running the same command later will
      not re-surface the note; treat any handoff block you see as
      one-shot guidance from a previous session or from the user.
-2. Start the **non-consuming** accelerator `shelbi events tail --follow
-   --project <you>` in the background using the Bash tool's
-   `run_in_background: true`, and watch it with `Monitor`. This is a passive
-   mirror of your project's event lines — it never claims from the durable
-   delivery queue, so it cannot starve the self-drain in step 3 (a background
-   `orchestrator events next --follow` *would*: two consuming followers race and
-   each miss batches the other claimed). Treat every new line it shows as a
-   trigger to run the self-drain and react. Do **not** ack against the tail —
-   acking is the drain's job; the tail carries no `delivery_id`.
+2. Start the **non-consuming** accelerator as **one** process: pass the
+   follower command directly to the `Monitor` tool as its `command`
+   (`Monitor(command: "shelbi events tail --follow --project <you>", persistent:
+   true)`). Monitor already runs the command in the background and turns each
+   emitted line into a notification, so that single Monitor IS both "run in the
+   background" and "watch it." Do **not** launch the follower as a separate
+   `Bash run_in_background` process and then `tail -f` its output with a second
+   Monitor — that is two processes doing one job. This is a passive mirror of
+   your project's event lines — it never claims from the durable delivery queue,
+   so it cannot starve the self-drain in step 3 (an `orchestrator events next
+   --follow` accelerator *would*: two consuming followers race and each miss
+   batches the other claimed). Treat every new line it shows as a trigger to run
+   the self-drain and react. Do **not** ack against the tail — acking is the
+   drain's job; the tail carries no `delivery_id`.
 
    `project=<name> heartbeat` lines are emitted by the hub poller on an adaptive
    cadence (not user input) — standard while work is in flight, backing off on a
@@ -376,11 +382,11 @@ fire again. Then continue with the normal bootstrap and start dispatching.
 
 **This is your source of truth**, not just a fallback for runners that cannot
 receive Monitor callbacks. It is the drain **every** orchestrator must run,
-because the background `shelbi events tail --follow` accelerator can die without
+because the `shelbi events tail --follow` accelerator Monitor can die without
 signalling you (a reaped host shell, a `SIGKILL`, a compacted session) and a
-watch tailing a dead process's output looks exactly like a quiet board. A pull
-you drive yourself cannot be silently switched off, so it — not the background
-tail — is what guarantees you never miss an event. It is also the single
+watch of a dead process looks exactly like a quiet board. A pull you drive
+yourself cannot be silently switched off, so it — not the background tail — is
+what guarantees you never miss an event. It is also the single
 consuming follower per project (Shelbi tears down any leaked prior one on
 start), so it never returns a false "no batch" because a co-running consumer
 claimed the batch first. Run it before every user-facing reply and on every
@@ -401,10 +407,11 @@ config dir
 So the discipline is claim → react → ack, once per turn. If you crash between
 claim and ack, the same batch (same delivery id) comes back — apply its facts
 and ack; a duplicate ack of an already-acked batch is a harmless no-op, so you
-never miss or replay an event. A background `shelbi events tail --follow
---project <you>` watched with Monitor is still worth running as a *non-consuming*
-latency accelerator (it surfaces new lines the instant they land, without
-claiming from the delivery queue), but it never replaces this drain. Never run a
+never miss or replay an event. A single `shelbi events tail --follow --project
+<you>` Monitor (its `command`, not a `Bash run_in_background` process wrapped in
+a second tail Monitor) is still worth running as a *non-consuming* latency
+accelerator (it surfaces new lines the instant they land, without claiming from
+the delivery queue), but it never replaces this drain. Never run a
 second `orchestrator events next --follow` as the accelerator — a consuming
 reader is the wrong tool for a passive watch and racing consumers is the bug this
 discipline exists to avoid.
@@ -668,11 +675,14 @@ The `shelbi` CLI is on your PATH. Commands you'll use most:
   turn; ack each batch with `shelbi orchestrator events ack <delivery-id>` after
   reacting (see "Polling-only event drain").
 - `shelbi events tail [--follow] [--project <name>]` — raw, *non-consuming*
-  event-log view. Run `--follow --project <you>` in the background as your
-  latency accelerator (see "Bootstrap on session start"): it mirrors new lines
-  without claiming from the delivery queue, so it never competes with the drain.
-  Also handy for humans and quick inspection. Do not ack against it — it carries
-  no `delivery_id`.
+  event-log view. For the live feed, pass the `--follow --project <you>` command
+  directly to the `Monitor` tool as its `command` — one process
+  (`Monitor(command: "shelbi events tail --follow --project <you>", persistent:
+  true)`); do not wrap it in `Bash run_in_background` plus a separate tail
+  Monitor. As your latency accelerator (see "Bootstrap on session start") it
+  mirrors new lines without claiming from the delivery queue, so it never
+  competes with the drain. Also handy for humans and quick inspection. Do not
+  ack against it — it carries no `delivery_id`.
 - `shelbi zen status` — current mode + configured local checks.
 - `shelbi zen scan` — print one mechanically-eligible `backlog`-category
   task id per line (input to your auto-promote judgment).
