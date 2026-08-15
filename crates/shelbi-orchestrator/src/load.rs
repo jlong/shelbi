@@ -112,6 +112,63 @@ pub fn free_review_workspaces(project_name: &str) -> Result<Vec<WorkspaceSpec>> 
         .collect())
 }
 
+/// One review-tagged workspace and the active task (if any) currently loaded
+/// on it. The sidebar's "load onto which review workspace?" picker reads this
+/// to list *every* review slot with its free/occupied state — the superset of
+/// [`free_review_workspaces`], which drops the occupied ones. Eviction (below)
+/// then lets a load target an occupied slot, so the picker must show them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSlot {
+    /// The `review`-tagged workspace name.
+    pub name: String,
+    /// The task currently loaded on this slot, or `None` when it's free.
+    pub occupant: Option<ReviewSlotOccupant>,
+}
+
+/// The task currently occupying a [`ReviewSlot`] — its id (what eviction acts
+/// on) and title (what the picker shows in quotes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSlotOccupant {
+    pub task_id: String,
+    pub title: String,
+}
+
+/// Every `review`-tagged workspace for `project_name`, in declaration order,
+/// each paired with the active task currently loaded on it (`None` when free).
+///
+/// The picker/confirm dialog's data source: unlike [`free_review_workspaces`]
+/// it lists occupied slots too, so a human can deliberately reuse one (evicting
+/// its current task back to the queue). "Occupied" uses the same in-progress +
+/// review-column scan the busy check does, so the two never disagree.
+pub fn review_slots(project_name: &str) -> Result<Vec<ReviewSlot>> {
+    let project = shelbi_state::load_project(project_name)?;
+    let mut active = shelbi_state::list_column(project_name, Column::in_progress())?;
+    active.extend(shelbi_state::list_column(project_name, Column::review())?);
+    Ok(review_slots_from(&project, &active))
+}
+
+/// Pure slot enumeration for [`review_slots`]: map each `review`-tagged
+/// workspace (declaration order) to the active task assigned to it. Split out
+/// with no I/O so the free/occupied labeling is unit-testable on in-memory
+/// fixtures.
+fn review_slots_from(project: &Project, active: &[TaskFile]) -> Vec<ReviewSlot> {
+    let review_tag: BTreeSet<String> = std::iter::once("review".to_string()).collect();
+    project
+        .workspaces_matching(&review_tag)
+        .into_iter()
+        .map(|w| ReviewSlot {
+            name: w.name.clone(),
+            occupant: active
+                .iter()
+                .find(|tf| tf.task.assigned_to.as_deref() == Some(w.name.as_str()))
+                .map(|tf| ReviewSlotOccupant {
+                    task_id: tf.task.id.clone(),
+                    title: tf.task.title.clone(),
+                }),
+        })
+        .collect()
+}
+
 /// Load a Queued-for-Review task onto a *specific* review workspace.
 ///
 /// The workspace-targeted counterpart to [`load_task_by_id`]: the caller (the
@@ -135,6 +192,95 @@ pub fn load_review_task(project_name: &str, task_id: &str, workspace_name: &str)
     // taken, or a task already serving elsewhere, that a race snuck in.
     let _guard = shelbi_state::lock_review_load(project_name)?;
     load_review_task_locked(project_name, task_id, workspace_name)
+}
+
+/// Load `task_id` onto `workspace_name`, first **evicting** whatever other task
+/// currently occupies that review slot back to the review queue.
+///
+/// The reuse-an-occupied-slot counterpart to [`load_review_task`]: the sidebar
+/// picker lets a human target a slot already serving another task, so this
+/// clears the occupant (un-serves it and drops its review-slot assignment, so
+/// it re-appears as Queued/Pending — not accepted or rejected) *before* the
+/// [`load_review_task_locked`] busy guard would otherwise reject the slot. Both
+/// the eviction and the load run under one hold of the review-load lock, so no
+/// concurrent claim can slip a third task onto the freed slot in between.
+///
+/// A no-op eviction (the slot is free, or already holds `task_id` itself — the
+/// same-slot resume case) leaves this identical to [`load_review_task`], which
+/// is why the non-evicting callers can route through it unchanged.
+pub fn load_review_task_evicting(
+    project_name: &str,
+    task_id: &str,
+    workspace_name: &str,
+) -> Result<String> {
+    shelbi_state::ensure_daemon_matches_for_mutation()?;
+    let _guard = shelbi_state::lock_review_load(project_name)?;
+    evict_review_slot_locked(project_name, workspace_name, task_id)?;
+    load_review_task_locked(project_name, task_id, workspace_name)
+}
+
+/// Return whatever review-column task currently occupies `workspace_name`
+/// (other than `keep`) to the review queue, so the caller can load a new task
+/// onto the freed slot. Returns the evicted task's id, or `None` when the slot
+/// is free / already holds `keep`.
+///
+/// "Return to the queue" mirrors how a review slot is otherwise cleared: tear
+/// the serving session down ([`crate::review_ui::close_review_window`], the
+/// same close the accept path uses) and drop the task's review-slot
+/// `assigned_to` so [`crate::load`]'s split reads it as Queued/Pending again.
+/// The task stays in the Review column — it is neither accepted nor rejected,
+/// just un-loaded. The teardown is best-effort (a missing/dead window must not
+/// block the eviction's authoritative board change); the assignment clear is
+/// not. Runs with the review-load lock already held (see
+/// [`load_review_task_evicting`]).
+fn evict_review_slot_locked(
+    project_name: &str,
+    workspace_name: &str,
+    keep: &str,
+) -> Result<Option<String>> {
+    // Only review-column tasks are "loaded for review"; an in-progress task on
+    // the slot (an odd state) isn't ours to bounce back to the review queue —
+    // leave it for `load_review_task_locked`'s busy guard to reject.
+    let review = shelbi_state::list_column(project_name, Column::review())?;
+    let Some(occupant) = review
+        .into_iter()
+        .find(|tf| tf.task.id != keep && tf.task.assigned_to.as_deref() == Some(workspace_name))
+    else {
+        return Ok(None);
+    };
+    let evicted_id = occupant.task.id.clone();
+
+    // Tear down the occupant's serving window first, while its `assigned_to`
+    // still names the slot (that's what `close_review_window` derives from).
+    // Best-effort: a slot whose window already died (or a test env with no
+    // tmux) must still have its board state cleared below.
+    if let Err(e) = crate::review_ui::close_review_window(project_name, &evicted_id) {
+        tracing::warn!(
+            project = %project_name,
+            task = %evicted_id,
+            workspace = %workspace_name,
+            error = %e,
+            "review-slot eviction: tearing down the occupant's window failed; \
+             clearing its assignment anyway",
+        );
+    }
+
+    // Re-load fresh to get the current body (list_column's copy is enough for
+    // the task, but a fresh load keeps the body authoritative) and drop the
+    // review-slot assignment, keeping the task in Review → it re-appears as
+    // Queued/Pending for a later free slot or another manual load.
+    let mut tf = shelbi_state::load_task(project_name, &evicted_id)?;
+    tf.task.assigned_to = None;
+    tf.task.updated_at = chrono::Utc::now();
+    shelbi_state::save_task(project_name, &tf.task, &tf.body)?;
+
+    let _ = shelbi_state::append_dispatch_event(
+        &evicted_id,
+        workspace_name,
+        "review-evict",
+        "returned to review queue so the slot could be reused",
+    );
+    Ok(Some(evicted_id))
 }
 
 /// The body of [`load_review_task`], run with the project-scoped review-load
@@ -1013,6 +1159,87 @@ mod tests {
         let after = shelbi_state::load_task("demo", "t-queued").unwrap();
         assert_eq!(after.task.assigned_to.as_deref(), Some("alpha"));
         assert!(after.task.branch.is_none());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- picker enumeration + eviction (reuse an occupied slot) -------------
+
+    #[test]
+    fn review_slots_lists_every_slot_with_its_free_or_occupied_state() {
+        let project = tagged_project();
+        // review-1 holds a task, review-2 is free. Both review slots appear in
+        // declaration order (the dev slot `alpha` never does), each carrying
+        // its occupant (or `None`) — the picker's data source.
+        let active = [tf(review_task_pri("t-x", Some("review-1"), 0))];
+        let slots = review_slots_from(&project, &active);
+        assert_eq!(
+            slots,
+            vec![
+                ReviewSlot {
+                    name: "review-1".into(),
+                    occupant: Some(ReviewSlotOccupant {
+                        task_id: "t-x".into(),
+                        title: "t-x".into(),
+                    }),
+                },
+                ReviewSlot {
+                    name: "review-2".into(),
+                    occupant: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn evict_review_slot_returns_the_occupant_to_the_queue() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+
+        // review-1 is serving `t-loaded`; a picker choice targets it for a new
+        // task, so `t-loaded` must be bounced back to the queue first.
+        shelbi_state::save_task("demo", &review_task("t-loaded", "review-1"), "body").unwrap();
+
+        let evicted = evict_review_slot_locked("demo", "review-1", "t-queued").unwrap();
+        assert_eq!(evicted.as_deref(), Some("t-loaded"));
+
+        // Bounced back, not accepted/rejected: still in the Review column, but
+        // its review-slot assignment is dropped so it reads as Queued/Pending.
+        let after = shelbi_state::load_task("demo", "t-loaded").unwrap();
+        assert_eq!(after.task.column, Column::review());
+        assert_eq!(after.task.assigned_to, None);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn evict_review_slot_is_a_noop_for_a_free_slot_or_the_same_task() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+
+        // `t-self` already owns review-1 (a same-slot resume, keep == occupant)
+        // and review-2 is free. Neither is an eviction: nobody else to bounce.
+        shelbi_state::save_task("demo", &review_task("t-self", "review-1"), "body").unwrap();
+
+        assert_eq!(
+            evict_review_slot_locked("demo", "review-1", "t-self").unwrap(),
+            None,
+            "the slot's own occupant is never evicted (same-slot resume)"
+        );
+        assert_eq!(
+            evict_review_slot_locked("demo", "review-2", "t-new").unwrap(),
+            None,
+            "a free slot has nothing to evict"
+        );
+        // `t-self` is untouched by either no-op eviction.
+        let after = shelbi_state::load_task("demo", "t-self").unwrap();
+        assert_eq!(after.task.assigned_to.as_deref(), Some("review-1"));
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

@@ -711,14 +711,16 @@ impl App {
         }
     }
 
-    /// Raise the "Load onto a review workspace?" confirm for a Queued row as a
-    /// centered tmux `display-popup` (the same surface style as the palette
-    /// popup), rather than an overlay boxed inside the sidebar rect. Resolves a
-    /// free `review`-tagged slot up front so the popup can name the target (or
-    /// report none free), then launches the confirm. Only a confirming exit
-    /// starts the load, onto that same slot — so the dev pane is never
-    /// dispatched to and cancel is a no-op. A no-op when a prior load is still
-    /// running, so two clicks can't stack dispatches.
+    /// Raise the "Load for review" dialog for a Queued row as a centered tmux
+    /// `display-popup` (the same surface style as the palette popup), rather
+    /// than an overlay boxed inside the sidebar rect. Enumerates *every*
+    /// `review`-tagged slot with its free/occupied state so the popup can pick
+    /// its shape: a yes/no confirm when there's exactly one slot, a picker when
+    /// there's more than one. The chosen slot comes back from the popup; the
+    /// load onto it evicts any occupant back to the queue. Only a confirming
+    /// exit starts the load, onto a *review* workspace — so the dev pane is
+    /// never dispatched to and cancel is a no-op. A no-op when a prior load is
+    /// still running, so two clicks can't stack dispatches.
     fn open_review_load_prompt(&mut self, id: &str) {
         if self.review_job.is_some() {
             self.status_line = "a review load is already in progress…".into();
@@ -730,21 +732,31 @@ impl App {
             .find(|e| e.task_id == *id)
             .map(|e| e.title.clone())
             .unwrap_or_else(|| id.to_string());
-        let workspace = match shelbi_orchestrator::load::free_review_workspaces(&self.project_name) {
-            Ok(free) => free.into_iter().next().map(|w| w.name),
+        let slots = match shelbi_orchestrator::load::review_slots(&self.project_name) {
+            Ok(slots) => slots,
             Err(e) => {
                 self.status_line = format!("review slots query failed: {e}");
                 return;
             }
         };
-        // The confirm renders in a centered tmux popup whose exit code carries
-        // the decision (0 = confirm, non-zero = cancel / none-free). Blocking
-        // the sidebar loop here is fine: the popup is modal, exactly as the
-        // palette popup blocks its launcher until it closes.
-        if review_confirm_popup(&task_title, workspace.as_deref()) {
-            if let Some(workspace) = workspace {
-                self.start_review_load(id.to_string(), workspace);
-            }
+        // A Loading queued row already occupies its own slot; don't render that
+        // as "serving <this task>" (and don't offer to evict the very task
+        // being loaded) — a same-slot pick is a resume, so show it as available.
+        let slots: Vec<_> = slots
+            .into_iter()
+            .map(|mut s| {
+                if s.occupant.as_ref().is_some_and(|o| o.task_id == id) {
+                    s.occupant = None;
+                }
+                s
+            })
+            .collect();
+        // The dialog renders in a centered tmux popup and returns the chosen
+        // slot name (or None on cancel). Blocking the sidebar loop here is
+        // fine: the popup is modal, exactly as the palette popup blocks its
+        // launcher until it closes.
+        if let Some(workspace) = review_load_dialog(&task_title, &slots) {
+            self.start_review_load(id.to_string(), workspace);
         }
     }
 
@@ -821,7 +833,12 @@ impl App {
         let tid = task_id.clone();
         let ws = workspace.clone();
         std::thread::spawn(move || {
-            let result = shelbi_orchestrator::load::load_review_task(&project, &tid, &ws)
+            // The evicting loader is a safe superset of the plain one: it
+            // bounces any *other* task off `ws` back to the review queue first,
+            // and is a no-op when the slot is free or already holds this task
+            // (the Ready-but-unlaunched resume path), so both callers route
+            // through it unchanged.
+            let result = shelbi_orchestrator::load::load_review_task_evicting(&project, &tid, &ws)
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);
         });
@@ -1501,43 +1518,68 @@ fn status_order(s: Status) -> u8 {
     }
 }
 
-/// Launch the review-load confirm as a centered `tmux display-popup` running
-/// `shelbi __review-confirm`, so the confirm reads as a full-terminal modal
-/// rather than a box inside the sidebar column. Sized smaller than the palette
-/// (70%×60%) since it's a short yes/no. Unlike the palette, this popup passes
-/// `-B` and lets the widget draw its own cyan titled border, so exactly one
-/// frame shows.
+/// Launch the "Load for review" dialog as a centered `tmux display-popup`
+/// running `shelbi __review-confirm`, so it reads as a full-terminal modal
+/// rather than a box inside the sidebar column. Passes every review slot (its
+/// name and occupant) so the subcommand renders a one-slot confirm or a
+/// multi-slot picker. Unlike the palette, this popup passes `-B` and lets the
+/// widget draw its own cyan titled border, so exactly one frame shows.
 ///
-/// Returns `true` only when the popup exits 0 (the user confirmed and a slot
-/// was free); a cancel, an informational "none free" dismiss, or any tmux
-/// failure all map to `false`, the safe no-op. Blocks until the popup closes,
+/// Returns `Some(workspace)` — the slot the user chose to load onto — only when
+/// the popup exits 0 (Load) and wrote a non-empty choice; a cancel, an
+/// informational "no slots" dismiss, or any tmux/IO failure all map to `None`,
+/// the safe no-op. The chosen name round-trips through a temp file (a
+/// `display-popup -E` child's stdout goes to the popup pane, not back to us), the
+/// same pattern the reject-reason popup uses. Blocks until the popup closes,
 /// which is exactly the modal behavior we want.
-fn review_confirm_popup(title: &str, workspace: Option<&str>) -> bool {
-    let Ok(bin) = std::env::current_exe() else {
-        return false;
-    };
+fn review_load_dialog(
+    title: &str,
+    slots: &[shelbi_orchestrator::load::ReviewSlot],
+) -> Option<String> {
+    let bin = std::env::current_exe().ok()?;
     let bin = bin.to_string_lossy();
+    // Per-process temp path — the sidebar handles one load prompt at a time
+    // (the popup blocks its loop), so the pid alone avoids collisions.
+    let out = std::env::temp_dir().join(format!("shelbi-review-load-{}.txt", std::process::id()));
     let mut cmd = format!(
-        "{} __review-confirm --title {}",
+        "{} __review-confirm --title {} --out {}",
         shelbi_agent::shell_escape(&bin),
         shelbi_agent::shell_escape(title),
+        shelbi_agent::shell_escape(&out.to_string_lossy()),
     );
-    if let Some(ws) = workspace {
-        cmd.push_str(&format!(" --workspace {}", shelbi_agent::shell_escape(ws)));
+    for slot in slots {
+        cmd.push_str(&format!(
+            " --slot {} --occupant {}",
+            shelbi_agent::shell_escape(&slot.name),
+            shelbi_agent::shell_escape(
+                slot.occupant.as_ref().map(|o| o.title.as_str()).unwrap_or("")
+            ),
+        ));
     }
-    // `-B` suppresses tmux's own popup border so only the widget's cyan
-    // titled block frames the modal (one border, not two). `-h 9` leaves room
-    // for the title, question, and button row without clipping.
-    run_tmux([
+    // Height scales with the slot count: title + blank + N slot rows + blank +
+    // buttons, inside the border. The one/zero-slot variants collapse to a
+    // short confirm, so floor at 9 to keep them from clipping.
+    let height = (slots.len() as u16 + 6).max(9);
+    let _ = std::fs::remove_file(&out);
+    // `-B` suppresses tmux's own popup border so only the widget's cyan titled
+    // block frames the modal (one border, not two).
+    let ok = run_tmux([
         "display-popup",
         "-B",
         "-E",
         "-w",
         "60",
         "-h",
-        "9",
+        &height.to_string(),
         cmd.as_str(),
-    ])
+    ]);
+    let chosen = ok
+        .then(|| std::fs::read_to_string(&out).ok())
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let _ = std::fs::remove_file(&out);
+    chosen
 }
 
 /// Run `tmux ARGS`. Returns true on success.

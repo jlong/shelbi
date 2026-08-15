@@ -394,16 +394,22 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__palette")]
     Palette { project: String },
-    /// (internal) Render the "Load for review" yes/no confirm — meant to be
-    /// invoked inside a `tmux display-popup` by the sidebar. Exits 0 on
-    /// confirm, non-zero on cancel / no free slot. Not for direct use.
+    /// (internal) Render the "Load for review" dialog — a confirm (one slot) or
+    /// a picker (many) — meant to be invoked inside a `tmux display-popup` by
+    /// the sidebar. Writes the chosen slot name to `--out` and exits 0 on Load,
+    /// non-zero on cancel. `--slot`/`--occupant` are positional pairs (one per
+    /// review slot; an empty occupant means free). Not for direct use.
     #[command(hide = true)]
     #[command(name = "__review-confirm")]
     ReviewConfirm {
         #[arg(long)]
         title: String,
         #[arg(long)]
-        workspace: Option<String>,
+        out: String,
+        #[arg(long = "slot")]
+        slots: Vec<String>,
+        #[arg(long = "occupant")]
+        occupants: Vec<String>,
     },
     /// (internal) Render the reject-reason prompt — a bordered textbox plus
     /// `[ Reject ]` / `[ Cancel ]` buttons, meant to be invoked inside a
@@ -519,11 +525,26 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Popup) => commands::popup::run(),
         Some(Cmd::Palette { project }) => commands::palette::run(project),
-        Some(Cmd::ReviewConfirm { title, workspace }) => {
-            // The sidebar reads our exit code as the decision: 0 = confirm,
-            // non-zero = cancel / no free slot.
-            let confirmed = commands::review_confirm::run(title, workspace)?;
-            std::process::exit(if confirmed { 0 } else { 1 });
+        Some(Cmd::ReviewConfirm {
+            title,
+            out,
+            slots,
+            occupants,
+        }) => {
+            // Zip the positional `--slot`/`--occupant` pairs into slots; an
+            // empty occupant means the slot is free.
+            let slots = slots
+                .into_iter()
+                .zip(occupants.into_iter().chain(std::iter::repeat(String::new())))
+                .map(|(name, occ)| commands::review_confirm::Slot {
+                    name,
+                    occupant: (!occ.is_empty()).then_some(occ),
+                })
+                .collect();
+            // The sidebar reads the chosen slot from `--out`; the exit code
+            // (0 = Load, non-zero = cancel) gates whether it reads it.
+            let loaded = commands::review_confirm::run(title, out, slots)?;
+            std::process::exit(if loaded { 0 } else { 1 });
         }
         Some(Cmd::ReviewRejectReason { out }) => {
             // The review panel reads our exit code (0 = submitted, non-zero =
