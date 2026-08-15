@@ -573,6 +573,23 @@ mod tests {
 ────────────────────────────────────────────────────
   ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents";
 
+    // The interactive question/selection widget claude renders for an
+    // `AskUserQuestion`-style prompt. Like the trust dialog it draws a modal
+    // box with a `❯` option cursor and its own footer — and crucially it draws
+    // *neither* the idle input-box footer (`shift+tab to cycle` / `for
+    // shortcuts`) nor a busy spinner row, so the pane-state heuristics read it
+    // as neither working nor awaiting input and the poller latched it as
+    // `working`. Observed live 2026-08-12 sitting ~42 minutes with 0 commits.
+    const QUESTION_WIDGET_SCREEN: &str = "\
+╭─── Question ──────────────────────────────────────╮
+│ Which scope should this change target?            │
+│                                                   │
+│ ❯ 1. Just the poller                              │
+│   2. Poller and orchestrator                      │
+│   3. The whole workspace                          │
+╰───────────────────────────────────────────────────╯
+ Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel";
+
     #[test]
     fn input_ready_detects_live_input_box_not_trust_dialog() {
         assert!(is_input_ready(INPUT_BOX_SCREEN));
@@ -714,6 +731,50 @@ mod tests {
             detect_blocking_dialog(TRUST_DIALOG_SCREEN, &sigs).as_deref(),
             Some("trust")
         );
+    }
+
+    #[test]
+    fn detect_blocking_dialog_flags_the_question_widget() {
+        // A worker parked on an interactive question/selection widget in a
+        // headless workspace must surface as blocked (`dialog:question`) — it
+        // draws no idle input box and no busy spinner, so nothing else moves it
+        // off `working`. This is the fix for the 2026-08-12 silent-block.
+        let sigs = shelbi_core::default_dialog_signatures("claude");
+        assert_eq!(
+            detect_blocking_dialog(QUESTION_WIDGET_SCREEN, &sigs).as_deref(),
+            Some("question")
+        );
+
+        // The widget itself is neither working nor a ready input box, so the
+        // veto in `detect_blocking_dialog` does not fire on it.
+        assert!(!is_input_ready(QUESTION_WIDGET_SCREEN));
+        assert!(!is_claude_busy(QUESTION_WIDGET_SCREEN));
+        assert!(!is_claude_working(QUESTION_WIDGET_SCREEN));
+    }
+
+    #[test]
+    fn detect_blocking_dialog_ignores_the_widget_footer_while_working() {
+        // Robustness against the false positive: a worker whose pane merely
+        // *shows* the widget's footer strings — editing this detector, a diff,
+        // chat about the feature — must not be flagged while a live footer /
+        // spinner proves the pane is working. Same veto that guards the trust /
+        // permission signatures.
+        let sigs = shelbi_core::default_dialog_signatures("claude");
+
+        // Active turn: the compact spinner footer vetoes.
+        let busy_editing = "\
+    DialogSignature::new(\"question\", \"Enter to select\"),
+    DialogSignature::new(\"question\", \"to add notes\"),
+
+· Working… (esc to interrupt)";
+        assert!(is_claude_busy(busy_editing));
+        assert!(detect_blocking_dialog(busy_editing, &sigs).is_none());
+
+        // Idle at the input box: the ready footer vetoes just the same.
+        let ready_editing =
+            format!("{busy_editing}\n  ⏵⏵ accept edits on (shift+tab to cycle)");
+        assert!(is_input_ready(&ready_editing));
+        assert!(detect_blocking_dialog(&ready_editing, &sigs).is_none());
     }
 
     #[test]
