@@ -238,6 +238,14 @@ pub struct App {
     /// pane doesn't flood `tui.log` at the 200ms render cadence; cleared
     /// once the size recovers. See [`App::note_sidebar_area`].
     last_collapse_warn: Option<Instant>,
+    /// Name of the tmux window last seen active in this project's session,
+    /// tracked by [`App::poll_active_window`] so an *externally-initiated*
+    /// window switch (a native tmux tab / prefix key, not a Shelbi nav click)
+    /// runs the same per-window setup a click would. `None` until the first
+    /// poll observes the active window. Only a *change* triggers setup, so a
+    /// window that's already current (including one we just switched to
+    /// ourselves) is a no-op.
+    last_active_window: Option<String>,
 }
 
 /// A review load running on a worker thread. Holds the channel the thread
@@ -275,6 +283,7 @@ impl App {
             review_job: None,
             render_panics: 0,
             last_collapse_warn: None,
+            last_active_window: None,
         }
     }
 
@@ -954,6 +963,60 @@ impl App {
         }
     }
 
+    /// Detect an externally-initiated tmux window switch and run the same
+    /// per-window setup a Shelbi nav click would. Called once per sidebar
+    /// loop tick (like [`App::poll_review_load`]): it reads the session's
+    /// currently-active window and, when it has *changed* since the last
+    /// tick, dispatches into the shared setup routine for that window.
+    ///
+    /// This closes the gap where arriving at a review window via a native
+    /// tmux tab / prefix key (a `select-window` Shelbi didn't initiate) left
+    /// the window half-initialized — the review sidebar/interface was only
+    /// ever stood up on an explicit nav click. Now both paths converge on
+    /// [`App::open_ready_review`] → [`shelbi_orchestrator::review_ui::open_review_interface`],
+    /// whose reuse guard makes re-entering an already-set-up window a no-op
+    /// (no duplicate panel, no re-init). Non-review windows (dashboard, dev
+    /// slots, anything not a serving review slot) map to nothing and are
+    /// left untouched.
+    ///
+    /// Note the window we switch to ourselves inside the setup routine is
+    /// itself an active-window change; the next tick observes it, re-maps to
+    /// the same task, and the idempotent reuse path re-focuses it — harmless.
+    pub fn poll_active_window(&mut self) {
+        let Some(active) = self.active_window_name() else {
+            return;
+        };
+        self.on_active_window(active);
+    }
+
+    /// Change-tracking + dispatch half of [`App::poll_active_window`], split
+    /// out from the tmux read so the routing is unit-testable with a synthetic
+    /// window name. A no-op when `active` matches the last-seen window (the
+    /// idempotent guard that keeps a window we're already on — including one we
+    /// just switched to ourselves — from re-running setup every tick); a
+    /// non-review window updates the tracker and does nothing else.
+    fn on_active_window(&mut self, active: String) {
+        if self.last_active_window.as_deref() == Some(active.as_str()) {
+            return; // No change since the last tick — nothing to set up.
+        }
+        self.last_active_window = Some(active.clone());
+        if let Some(task_id) = review_task_for_window(&active, &self.ready_review) {
+            self.open_ready_review(&task_id);
+        }
+    }
+
+    /// Name of the tmux window currently active in this project's session
+    /// (`shelbi-<project>`), or `None` when tmux can't be queried (no server,
+    /// unit-test env). Targets the session so the reported window is the one
+    /// the attached client is viewing, regardless of which pane hosts the
+    /// sidebar.
+    fn active_window_name(&self) -> Option<String> {
+        let session = format!("shelbi-{}", self.project_name);
+        capture_tmux(["display-message", "-p", "-t", &session, "#{window_name}"])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
     /// Flip `state.json::zen_mode` between On and Off via the shared
     /// [`shelbi_state::toggle_zen_mode`] path — same read/write/log
     /// dance as the palette's "Toggle Zen Mode" entry and the CLI's
@@ -1163,6 +1226,13 @@ pub struct ReviewEntry {
     pub branch: String,
     /// `machine:port` URL badge (Serving only); `None` while Loading / Pending.
     pub location: Option<String>,
+    /// Name of the `review`-tagged workspace this task is loaded onto, when
+    /// assigned (Serving / Loading). This is also the task's tmux **window
+    /// name** (`shelbi-<proj>:<workspace>`), so the active-window-change
+    /// detector ([`App::poll_active_window`]) can map a window the user
+    /// switched to back to the review task whose interface it must stand up.
+    /// `None` for a Pending task not yet on a slot (no window to switch to).
+    pub workspace: Option<String>,
     /// Which lifecycle state drives this row's section + glyph.
     pub state: ReviewState,
 }
@@ -1289,6 +1359,9 @@ fn split_review_sections(
                 .clone()
                 .unwrap_or_else(|| format!("user/{}", task.id)),
             location,
+            // The fallback path runs only when the project can't be loaded, so
+            // no workspace assignment is resolvable — every row is Pending.
+            workspace: None,
             state,
         };
 
@@ -1302,7 +1375,10 @@ fn split_review_sections(
             return (Vec::new(), queued);
         }
     };
-    let entry = |task: &shelbi_core::Task, location: Option<String>, state: ReviewState| {
+    let entry = |task: &shelbi_core::Task,
+                 location: Option<String>,
+                 workspace: Option<String>,
+                 state: ReviewState| {
         let workflow = shelbi_state::load_task_workflow(project_name, &project, task).ok();
         let branch =
             shelbi_orchestrator::branch::branch_name_for_task(&project, workflow.as_ref(), task)
@@ -1316,6 +1392,7 @@ fn split_review_sections(
             title: task.title.clone(),
             branch,
             location,
+            workspace,
             state,
         }
     };
@@ -1332,13 +1409,23 @@ fn split_review_sections(
         match loaded_on {
             Some(ws) if review_workspace_is_serving(&project, ws, &tf.task.id) => {
                 let location = Some(format!("{}:{}", ws.machine, ws.name));
-                ready.push(entry(&tf.task, location, ReviewState::Serving));
+                ready.push(entry(
+                    &tf.task,
+                    location,
+                    Some(ws.name.clone()),
+                    ReviewState::Serving,
+                ));
             }
             // Assigned to a review slot but the server hasn't confirmed serving
             // yet — loading, not ready. No location until it's actually up.
-            Some(_) => queued.push(entry(&tf.task, None, ReviewState::Loading)),
+            Some(ws) => queued.push(entry(
+                &tf.task,
+                None,
+                Some(ws.name.clone()),
+                ReviewState::Loading,
+            )),
             // Not on a review slot at all — waiting for a free one.
-            None => queued.push(entry(&tf.task, None, ReviewState::Pending)),
+            None => queued.push(entry(&tf.task, None, None, ReviewState::Pending)),
         }
     }
     (ready, queued)
@@ -1595,6 +1682,35 @@ where
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Run `tmux ARGS` and return its trimmed-of-nothing stdout on success, or
+/// `None` when tmux isn't reachable or the command failed (no server, a bad
+/// target, the unit-test env). The caller trims/filters as needed.
+fn capture_tmux<I, S>(args: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let out = std::process::Command::new("tmux").args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Map the newly-active tmux window `window` to the Ready-for-Review task
+/// whose interface must be stood up, or `None` when the window isn't a
+/// serving review slot (the dashboard, a dev workspace, an unrecognized
+/// window — none need review setup). A review task's tmux window is named for
+/// the `review`-tagged workspace it's loaded onto (the entry's `workspace`
+/// field), so the match is a direct name comparison. Pure so the window→task
+/// routing is unit-testable without a live tmux server.
+fn review_task_for_window(window: &str, ready: &[ReviewEntry]) -> Option<String> {
+    ready
+        .iter()
+        .find(|e| e.workspace.as_deref() == Some(window))
+        .map(|e| e.task_id.clone())
 }
 
 #[cfg(test)]
@@ -2438,6 +2554,7 @@ mod tests {
             title: "Ready task".into(),
             branch: "shelbi/r".into(),
             location: Some("hub:3000".into()),
+            workspace: Some("review-1".into()),
             state: ReviewState::Serving,
         }];
         app.queued_review = vec![ReviewEntry {
@@ -2445,6 +2562,7 @@ mod tests {
             title: "Queued task".into(),
             branch: "shelbi/q".into(),
             location: None,
+            workspace: None,
             state: ReviewState::Pending,
         }];
         // No workspaces/agents so the row layout is exactly: 3 nav, blank,
@@ -3804,6 +3922,95 @@ mod tests {
         assert!(
             app.status_line.contains("loading t-1 onto review-1"),
             "got: {}",
+            app.status_line
+        );
+    }
+
+    fn serving_entry(task_id: &str, workspace: &str) -> ReviewEntry {
+        ReviewEntry {
+            task_id: task_id.into(),
+            title: format!("{task_id} title"),
+            branch: format!("shelbi/{task_id}"),
+            location: Some(format!("hub:{workspace}")),
+            workspace: Some(workspace.into()),
+            state: ReviewState::Serving,
+        }
+    }
+
+    #[test]
+    fn review_task_for_window_maps_a_serving_slots_window_to_its_task() {
+        let ready = vec![
+            serving_entry("alpha", "review-1"),
+            serving_entry("beta", "review-2"),
+        ];
+        // A window named for a serving review slot resolves to the task on it.
+        assert_eq!(
+            review_task_for_window("review-2", &ready).as_deref(),
+            Some("beta")
+        );
+        // Non-review windows (dashboard, dev slots) and unknown names map to
+        // nothing — those need no review setup.
+        assert!(review_task_for_window("dashboard", &ready).is_none());
+        assert!(review_task_for_window("w-some-dev-task", &ready).is_none());
+        assert!(review_task_for_window("review-3", &ready).is_none());
+    }
+
+    #[test]
+    fn review_task_for_window_ignores_entries_without_a_workspace() {
+        // A Pending entry (not on a slot yet) carries no workspace, so it can
+        // never match a window — there's no window to have switched to.
+        let ready = vec![ReviewEntry {
+            task_id: "pending".into(),
+            title: "Pending".into(),
+            branch: "shelbi/pending".into(),
+            location: None,
+            workspace: None,
+            state: ReviewState::Pending,
+        }];
+        assert!(review_task_for_window("", &ready).is_none());
+        assert!(review_task_for_window("review-1", &ready).is_none());
+    }
+
+    #[test]
+    fn on_active_window_dispatches_setup_only_on_a_change_to_a_review_window() {
+        let mut app = App::new_sidebar("demo");
+        app.ready_review = vec![serving_entry("alpha", "review-1")];
+
+        // First switch to a review window dispatches setup. With no tmux/
+        // project in the unit-test env `open_review_interface` errors, which
+        // surfaces on the status line naming the task — proof the window→task
+        // route fired.
+        app.on_active_window("review-1".into());
+        assert_eq!(app.last_active_window.as_deref(), Some("review-1"));
+        assert!(
+            app.status_line.contains("alpha"),
+            "setup should have dispatched for the task on review-1, got: {}",
+            app.status_line
+        );
+
+        // Re-entering the same window is a no-op: clear the status line and
+        // confirm a repeat tick doesn't re-run setup.
+        app.status_line.clear();
+        app.on_active_window("review-1".into());
+        assert!(
+            app.status_line.is_empty(),
+            "re-entering an already-current window must not re-run setup, got: {}",
+            app.status_line
+        );
+    }
+
+    #[test]
+    fn on_active_window_leaves_non_review_windows_untouched() {
+        let mut app = App::new_sidebar("demo");
+        app.ready_review = vec![serving_entry("alpha", "review-1")];
+
+        // Switching to the dashboard (or any non-review window) tracks the
+        // change but runs no setup and leaves the status line alone.
+        app.on_active_window("dashboard".into());
+        assert_eq!(app.last_active_window.as_deref(), Some("dashboard"));
+        assert!(
+            app.status_line.is_empty(),
+            "a non-review window must not touch the status line, got: {}",
             app.status_line
         );
     }
