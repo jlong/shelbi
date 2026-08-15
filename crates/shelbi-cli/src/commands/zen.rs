@@ -494,6 +494,9 @@ fn print_status(project: &str, state: &State) -> Result<()> {
         Some(ts) => println!("last crash: {}", ts.to_rfc3339()),
         None => println!("last crash: never"),
     }
+    if let Some(record) = &state.orchestrator_last_crash_record {
+        println!("last crash record: {record}");
+    }
     let in_flight = count_in_flight_zen(project, state.zen_mode).unwrap_or(0);
     println!("in-flight zen tasks: {in_flight}");
     Ok(())

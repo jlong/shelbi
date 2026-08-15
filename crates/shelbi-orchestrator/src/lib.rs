@@ -1673,15 +1673,31 @@ fn orchestrator_pane_cmd(
     // `SHELBI_MANAGED_CONTEXT=1` marks this as a Shelbi-managed pane so the
     // hub commit guard (a no-op elsewhere) blocks the orchestrator from
     // committing directly on a protected branch. See `githook`.
+    //
+    // Crash-record capture (`__orch-record-exit`) runs on both exit paths:
+    // once after the agent returns (`exit:$RC`, catching a claude panic /
+    // non-zero exit / a signal that killed only the agent — the wrapper
+    // survives and reports the code), and from a `SIGHUP` trap (the pane /
+    // session being torn down under the wrapper). SIGHUP is what every tmux
+    // teardown delivers — graceful (`quit`, `reload`) and crash alike — but
+    // the graceful paths clear `zen_last_crashed_at` first, so the hook
+    // discriminates and only a real crash writes a record. The `__rec` shell
+    // function keeps the shell-escaped `{bin}`/`{proj}` out of the
+    // single-quoted trap body, dodging nested-quote breakage. The trap
+    // `exit`s so a torn-down pane doesn't fall through to the graceful
+    // `__zen-orch-exit` (which would clear the crash marker we want kept).
     format!(
         "cd {wd} && \
          export SHELBI_PROJECT={proj} SHELBI_TMUX_SESSION={sess} SHELBI_MANAGED_CONTEXT=1 && \
+         __rec() {{ {bin} __orch-record-exit {proj} \"$1\" \"$TMUX_PANE\"; }}; \
          {bin} __zen-orch-start {proj}; \
+         trap '__rec signal:SIGHUP; exit 129' HUP; \
          ({bin} __zen-heartbeat {proj}; \
             while sleep {interval}; do {bin} __zen-heartbeat {proj}; done) & \
          HB=$!; \
          {launch}; \
          RC=$?; \
+         __rec exit:$RC; \
          kill $HB 2>/dev/null; \
          wait $HB 2>/dev/null; \
          {bin} __zen-orch-exit {proj}; \
@@ -2499,6 +2515,26 @@ mod pane_cmd_tests {
         assert!(!out.contains(" exec "), "exec would skip the cleanup hooks");
         // Exit code of the agent is preserved.
         assert!(out.contains("RC=$?") && out.contains("exit $RC"));
+        // Crash-record capture runs on both exit paths: the post-agent-return
+        // call (`__rec exit:$RC`) and the SIGHUP teardown trap.
+        assert!(
+            out.contains("__orch-record-exit myapp"),
+            "missing crash-record hook"
+        );
+        assert!(out.contains("__rec exit:$RC"), "missing post-return capture");
+        let trap_idx = out
+            .find("trap '__rec signal:SIGHUP; exit 129' HUP")
+            .expect("missing SIGHUP crash-capture trap");
+        // The trap is armed before the agent launches so a teardown mid-run is
+        // caught.
+        assert!(trap_idx < launch_idx, "trap must be armed before launch");
+        // The post-return capture precedes the graceful exit hook — it must
+        // see the crash marker still set (the exit hook clears it).
+        let rec_exit_idx = out.find("__rec exit:$RC").expect("missing __rec exit");
+        assert!(
+            rec_exit_idx < exit_idx,
+            "crash capture must run before __zen-orch-exit clears the marker"
+        );
     }
 
     #[test]

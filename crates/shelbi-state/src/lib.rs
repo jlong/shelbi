@@ -1116,6 +1116,17 @@ pub struct State {
     /// transition, a Zen re-eval, …) crashed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zen_last_crashed_at: Option<DateTime<Utc>>,
+    /// Filesystem pointer to the most recent orchestrator crash record
+    /// ([`record_orchestrator_crash`]). Unlike [`zen_last_crashed_at`] — a
+    /// bare liveness heartbeat — this points at a persisted post-mortem
+    /// carrying the exit code/signal, a tail of the dead pane's output, and
+    /// whether a config self-heal ran that boot. Set the moment an
+    /// unexpected orchestrator exit is captured; kept (not cleared on a clean
+    /// start) as the last-known-crash pointer until the next crash overwrites
+    /// it, so `shelbi status` / `shelbi zen status` can surface it for the
+    /// next orchestrator instance and the user to diagnose from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_last_crash_record: Option<String>,
     /// Persisted Kanban workspace filter — `None` means "All workspaces". The
     /// Tasks TUI restores this on each launch so the user's last view
     /// survives a respawn or project switch.
@@ -1838,6 +1849,79 @@ pub fn zen_check_crash_recovery(project: &str) -> Result<ZenCrashRecovery> {
             Ok(ZenCrashRecovery::NoCrash)
         }
     })
+}
+
+/// Directory holding this project's orchestrator crash records — one file
+/// per captured unexpected exit, newest surfaced via
+/// [`State::orchestrator_last_crash_record`]. Lives under the project's
+/// state dir (not the config half) so it travels with `state.json`.
+pub fn crash_records_dir(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("crashes"))
+}
+
+/// A captured orchestrator-pane crash, ready to persist via
+/// [`record_orchestrator_crash`].
+#[derive(Debug, Clone, Default)]
+pub struct OrchestratorCrash {
+    /// Short exit token, mirroring the pane-wrapper vocabulary:
+    /// `exit:<code>` for a non-zero agent exit, `signal:SIG<NAME>` for a
+    /// signal-driven death.
+    pub reason: String,
+    /// Tail of the dead pane's output (stderr + stdout), best-effort. Empty
+    /// when the pane was already gone by capture time (e.g. an abrupt
+    /// whole-session teardown) — the record is still worth writing for the
+    /// reason + boot context.
+    pub output_tail: String,
+    /// Whether a config self-heal / validate-and-upgrade pass ran during the
+    /// same boot (scanned from `events.log`). The refuted 2026-08-15
+    /// ordering hypothesis was about self-heal, so keep recording it: it lets
+    /// a future post-mortem confirm or rule that class out at a glance.
+    pub self_heal_ran: bool,
+}
+
+/// Persist an orchestrator crash record and stamp the state pointer.
+///
+/// Writes a human-readable markdown file under [`crash_records_dir`] named
+/// by capture time, sets [`State::orchestrator_last_crash_record`] to its
+/// path, and returns that path. The caller (the dying orchestrator pane's
+/// `__orch-record-exit` hook) invokes this best-effort — every failure mode
+/// is surfaced as an `Err` for the caller to swallow, so a write hiccup
+/// never blocks pane teardown or respawn.
+pub fn record_orchestrator_crash(project: &str, crash: &OrchestratorCrash) -> Result<PathBuf> {
+    let dir = crash_records_dir(project)?;
+    ensure_dir(&dir)?;
+    let now = Utc::now();
+    // Filesystem-safe stamp (no colons); nanoseconds disambiguate two
+    // crashes inside the same second.
+    let stamp = now.format("%Y%m%dT%H%M%S").to_string();
+    let file = dir.join(format!("{stamp}-{:09}.md", now.timestamp_subsec_nanos()));
+    let tail = if crash.output_tail.trim().is_empty() {
+        "(unavailable — pane was already gone at capture time)".to_string()
+    } else {
+        crash.output_tail.clone()
+    };
+    let body = format!(
+        "# Orchestrator crash record\n\
+         \n\
+         - project: {project}\n\
+         - recorded_at: {recorded_at}\n\
+         - reason: {reason}\n\
+         - config_self_heal_this_boot: {self_heal}\n\
+         \n\
+         ## Pane output tail\n\
+         \n\
+         ```\n{tail}\n```\n",
+        recorded_at = now.to_rfc3339(),
+        reason = crash.reason,
+        self_heal = crash.self_heal_ran,
+    );
+    atomic_write(&file, body.as_bytes())?;
+    let path_str = file.to_string_lossy().into_owned();
+    update_state(project, |state| {
+        state.orchestrator_last_crash_record = Some(path_str.clone());
+        Ok(())
+    })?;
+    Ok(file)
 }
 
 /// Read `state.json` for `project`. Returns `State::default()` when the
@@ -4481,6 +4565,57 @@ mod tests {
         // Second call on an already-clean state is a no-op.
         zen_clear_crash("p").unwrap();
         assert!(read_state("p").unwrap().zen_last_crashed_at.is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn record_orchestrator_crash_writes_file_and_stamps_pointer() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let crash = OrchestratorCrash {
+            reason: "signal:SIGHUP".into(),
+            output_tail: "panic: boom\nat frame 1\n".into(),
+            self_heal_ran: true,
+        };
+        let path = record_orchestrator_crash("p", &crash).unwrap();
+
+        // File exists under the project's crashes/ dir and carries the fields.
+        assert!(path.starts_with(crash_records_dir("p").unwrap()));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("reason: signal:SIGHUP"), "body: {body}");
+        assert!(
+            body.contains("config_self_heal_this_boot: true"),
+            "body: {body}"
+        );
+        assert!(body.contains("panic: boom"), "body: {body}");
+
+        // State pointer now names the record.
+        let ptr = read_state("p")
+            .unwrap()
+            .orchestrator_last_crash_record
+            .expect("pointer must be set");
+        assert_eq!(ptr, path.to_string_lossy());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn record_orchestrator_crash_notes_missing_output_tail() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let crash = OrchestratorCrash {
+            reason: "exit:139".into(),
+            output_tail: "   \n".into(), // whitespace-only == unavailable
+            self_heal_ran: false,
+        };
+        let path = record_orchestrator_crash("p", &crash).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("(unavailable"), "body: {body}");
+
         std::env::remove_var("SHELBI_HOME");
     }
 
