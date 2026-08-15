@@ -32,7 +32,9 @@ hub daemon with the platform supervisor (launchd on macOS, systemd --user
 on Linux) so it auto-starts at login and is restarted on crash.
 
 Options:
-  --no-daemon   Skip `shelbi daemon install` at the end.
+  --no-daemon   Skip `shelbi daemon install` at the end. A daemon that is
+                already running is still restarted onto the new binary; one
+                that isn't running stays down (nothing is registered).
   -h, --help    Show this message.
 USAGE
       exit 0
@@ -166,5 +168,25 @@ if [[ $install_daemon -eq 1 ]]; then
 
   Once lingering is on, the daemon survives logout and reboots.
 LINGER
+  fi
+else
+  # --no-daemon: the caller does not want us to register/supervise a daemon,
+  # so we never *start* one here. But if a daemon is already running it is now
+  # serving the OLD binary we just replaced — the "stale binary hides merged
+  # fixes" failure mode. Detect that via the daemon's own status surface (not
+  # raw pgrep) and, only when one is actually running, restart it onto the
+  # freshly installed binary. `daemon status` always exits 0, so we key off its
+  # printed running marker: `state:  running` on macOS (launchd), `Active:
+  # active (running)` on Linux (systemd). A not-installed / inactive / "not
+  # running" / loaded-but-unspawned daemon matches neither, so we leave it be.
+  daemon_status="$("$INSTALL_PATH" daemon status 2>/dev/null || true)"
+  if [[ "$daemon_status" =~ state:[[:space:]]+running ]] ||
+     [[ "$daemon_status" =~ Active:[[:space:]]+active[[:space:]]+\(running\) ]]; then
+    echo
+    echo "==> restarting already-running daemon onto the new binary (--no-daemon: not registering one)"
+    # Prefer the first-class restart path: it refreshes the unit and relaunches
+    # on this binary, matching the default path's effect without registering a
+    # supervisor for a daemon that wasn't running before.
+    "$INSTALL_PATH" daemon restart
   fi
 fi
