@@ -919,7 +919,7 @@ fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect
 /// stdout goes to the popup pane, not back to us, so the popup writes the
 /// reason to `--out PATH` on submit and exits 0; we read it back. The file is
 /// removed before launch (so a stale one can't masquerade as a submit) and
-/// after read. Mirrors the launch pattern of `App::review_confirm_popup` in
+/// after read. Mirrors the launch pattern of `App::review_load_dialog` in
 /// `app.rs` — `-B` suppresses tmux's own border so only the widget's frame
 /// shows. Any tmux/IO failure degrades to `None` (a no-op), never a crash.
 fn reject_reason_popup() -> Option<String> {
