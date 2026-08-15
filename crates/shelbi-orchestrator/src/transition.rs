@@ -119,6 +119,80 @@ pub fn execute_merge_action(
     }))
 }
 
+/// Run — and GATE an "accept" move on — the `merge` action of the
+/// `from -> to` edge, emitting a `merge` event on the wire either way.
+///
+/// This is the shared entry point for every human/agent accept path that
+/// advances a task by *moving its card* rather than by writing a ready
+/// marker: the CLI `shelbi task move --to <done>` and the board Approve
+/// button. Those paths used to move the card and emit only a
+/// `task_transition`, never firing the edge's `merge` — so a `review -> done`
+/// edge on a repo with a PR-only ruleset showed the board `done` while the
+/// PR stayed open and `main` never advanced (the silent-no-op incident this
+/// guards against). Gating the move on the merge here is the fix.
+///
+/// Returns:
+/// - `Ok(Some(detail))` — the edge declared `merge` and it succeeded; a
+///   `merge … status=ok` event carrying the integration SHA was emitted.
+///   The caller should proceed with the column move, then fire the edge's
+///   remaining actions with [`execute_transition_except`] skipping `merge`.
+/// - `Ok(None)` — the edge declares no `merge`; nothing ran and no event was
+///   emitted. The caller proceeds with a plain move (unchanged behavior).
+/// - `Err(_)` — the merge failed; a `merge … status=failed` event was
+///   emitted and the caller MUST NOT advance the task to `done` (leaving a
+///   stranded PR reading as done is the exact failure we refuse).
+///
+/// `workspace_label` is the `workspace=` field on the emitted merge event —
+/// the task's assigned slot when it has one, else a caller-supplied fallback
+/// (`cli`, `board`). The event `base=` is the edge's effective merge target.
+#[allow(clippy::too_many_arguments)]
+pub fn run_gated_merge(
+    project: &Project,
+    project_name: &str,
+    task: &Task,
+    task_body: &str,
+    workflow: &Workflow,
+    from: &str,
+    to: &str,
+    workspace_label: &str,
+) -> Result<Option<String>> {
+    if !workflow
+        .actions_for_transition(from, to)
+        .contains(&TransitionAction::Merge)
+    {
+        return Ok(None);
+    }
+    // `base=` for the event: the edge's effective target, falling back to the
+    // project base when the edge names none. Resolved here (not inside the
+    // primitive) so both the ok and failed events carry a meaningful base.
+    let base = resolve_effective_target(workflow, task, from, to)?
+        .unwrap_or_else(|| project.base_branch().to_string());
+    match execute_merge_action(project, project_name, task, task_body, workflow, from, to) {
+        Ok(Some(outcome)) => {
+            let detail = outcome.line.replace('\n', "; ");
+            if let Err(e) =
+                shelbi_state::append_merge_event(&task.id, workspace_label, &base, "ok", &detail)
+            {
+                tracing::warn!(task = %task.id, error = %e, "append_merge_event (ok) failed");
+            }
+            Ok(Some(detail))
+        }
+        // The `contains(Merge)` guard above already returned for the no-merge
+        // edge, so `execute_merge_action` returning `None` here would be a
+        // logic error; treat it as "nothing merged" rather than panicking.
+        Ok(None) => Ok(None),
+        Err(e) => {
+            let detail = e.to_string();
+            if let Err(ev) =
+                shelbi_state::append_merge_event(&task.id, workspace_label, &base, "failed", &detail)
+            {
+                tracing::warn!(task = %task.id, error = %ev, "append_merge_event (failed) failed");
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Like [`execute_transition`] but skips any [`TransitionAction`] listed in
 /// `skip`. The poller's handoff-less auto-advance passes
 /// `&[TransitionAction::Merge]` here after it has already run (and gated on)
@@ -506,6 +580,47 @@ transitions:
             out.is_empty(),
             "undeclared edge should run nothing: {out:?}"
         );
+    }
+
+    #[test]
+    fn run_gated_merge_is_a_clean_noop_for_a_non_merge_edge() {
+        // An edge that declares actions but not `merge` must return Ok(None)
+        // without touching git/gh — so an ordinary (non-accept) card move
+        // stays a pure status change and no merge event is fabricated. The
+        // empty-worktree project would blow up if any primitive ran.
+        let wf = workflow_with_edge("close_pr", None);
+        let task = bare_task("t-1");
+        let out = run_gated_merge(
+            &bare_project(),
+            "fixture",
+            &task,
+            "body",
+            &wf,
+            "review",
+            "done",
+            "cli",
+        )
+        .expect("non-merge edge is a clean no-op");
+        assert!(out.is_none(), "no merge declared → Ok(None): {out:?}");
+    }
+
+    #[test]
+    fn run_gated_merge_is_a_clean_noop_for_an_undeclared_edge() {
+        // No transition at all for this edge → no merge, no event, no git.
+        let wf = workflow_with_edge("merge", None);
+        let task = bare_task("t-2");
+        let out = run_gated_merge(
+            &bare_project(),
+            "fixture",
+            &task,
+            "body",
+            &wf,
+            "in-progress",
+            "review",
+            "cli",
+        )
+        .expect("undeclared edge is a clean no-op");
+        assert!(out.is_none(), "undeclared edge → Ok(None): {out:?}");
     }
 
     #[test]
