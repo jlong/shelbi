@@ -100,14 +100,15 @@ pub use event_log::{
     append_merge_event, append_message_ack_event, append_message_event, append_project_event,
     append_push_event,
     append_rebase_event, append_review_ready_event, append_send_event, append_settings_selfheal_event, append_supervision_event,
-    append_task_edit_event, append_task_event, append_workspace_dialog_event,
+    append_task_edit_event, append_task_event, append_task_event_actions_skipped,
+    append_workspace_dialog_event,
     append_workspace_event, append_workspace_pane_event, append_workspace_pause_event,
     append_worktree_detach_event, append_zen_dryrun_event, append_zen_mode_event, delivery_id,
     claim_event_follower, emit_event_body, event_cursor_path, event_follower_owner,
     event_follower_path, event_log_current_base, event_log_head, events_log_path,
     message_delivery_status, read_event_log_from, read_or_initialize_event_cursor,
     release_event_follower, task_event_body, write_event_cursor,
-    EventEnvelope, EventKind, EventLogRead, HandoffCause, MessageDelivery, ReviewReadyEvent, ZenHeartbeatCue, DAEMON_ACK,
+    EventEnvelope, EventKind, EventLogRead, HandoffCause, MessageDelivery, ReviewReadyEvent, ZenHeartbeatCue, ACTIONS_SKIPPED_MARKER, DAEMON_ACK,
     ORCH_EVENT_CALLBACK_SOCK_ENV, READY_MARKER_HANDOFF_ALIASES, READY_MARKER_HANDOFF_CAUSE,
 };
 pub use workspace_status::{
