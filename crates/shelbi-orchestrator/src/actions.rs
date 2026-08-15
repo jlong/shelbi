@@ -46,8 +46,8 @@ use shelbi_core::{validate_branch, Column, Error, Host, MergeStrategy, Project, 
 
 use crate::git::{
     compose_pr_body, gh_pr_merge, head_commit_subject, locate_hub_workdir,
-    locate_workspace_worktree, lookup_open_pr, lookup_pr_base, parse_pr_number_from_url,
-    run_in_dir, wait_for_merge_commit_sha,
+    locate_workspace_worktree, lookup_merged_pr, lookup_open_pr, lookup_pr_base,
+    parse_pr_number_from_url, run_in_dir, wait_for_merge_commit_sha,
 };
 use crate::workspace::workspace_worktree;
 
@@ -108,6 +108,20 @@ pub enum MergeOutcome {
     /// SHA is the resulting remote tip of `target`; the hub work_dir's
     /// own checkout is never touched.
     HubSide { sha: String, target: String },
+    /// No *open* PR existed, but GitHub reports a PR for the branch already
+    /// **MERGED** — someone landed it out-of-band (`gh pr merge`, or a human
+    /// merging in the GitHub UI). The transition is treated as already
+    /// satisfied: nothing re-integrates, `target` is never advanced a second
+    /// time, and `sha` is the *existing* merge commit GitHub recorded (`None`
+    /// only in the rare window before GitHub materializes it). `pr` is the
+    /// merged PR number; `target` is the branch it merged into. This is what
+    /// makes `review -> done` idempotent w.r.t. an out-of-band merge instead
+    /// of stranding the card once its branch is deleted from origin.
+    AlreadyMerged {
+        pr: u64,
+        sha: Option<String>,
+        target: String,
+    },
 }
 
 impl MergeOutcome {
@@ -122,6 +136,12 @@ impl MergeOutcome {
                 format!("pr:{pr}:{}", sha.as_deref().unwrap_or("sha-pending"))
             }
             MergeOutcome::HubSide { sha, target } => format!("hub:{target}:{sha}"),
+            MergeOutcome::AlreadyMerged { pr, sha, target } => {
+                format!(
+                    "already-merged:{pr}:{}:{target}",
+                    sha.as_deref().unwrap_or("sha-pending")
+                )
+            }
         }
     }
 
@@ -133,6 +153,7 @@ impl MergeOutcome {
         match self {
             MergeOutcome::ViaPr { sha, .. } => sha.as_deref(),
             MergeOutcome::HubSide { sha, .. } => Some(sha),
+            MergeOutcome::AlreadyMerged { sha, .. } => sha.as_deref(),
         }
     }
 }
@@ -359,9 +380,18 @@ where
 /// Integrate the task's branch into the target branch using the project's
 /// configured [`MergeStrategy`].
 ///
-/// Two paths share this primitive, picked by whether a PR is currently
-/// open for the branch:
+/// Three paths share this primitive, picked in order by the state of the
+/// branch's PR:
 ///
+/// - **already-merged path** — when no PR is *open* but GitHub reports a
+///   PR for the branch already **MERGED** (someone landed it out-of-band
+///   via `gh pr merge` or the GitHub UI), the transition is already
+///   satisfied. `merge` records the existing merge SHA and skips
+///   re-integration entirely — see [`MergeOutcome::AlreadyMerged`]. This
+///   keeps `review -> done` idempotent instead of stranding the card once
+///   the merged branch is deleted from origin. Checked *after* the open-PR
+///   probe (an open PR always wins) and *before* the hub-side fetch (whose
+///   "branch not on origin" error is exactly what we're avoiding).
 /// - **`gh pr merge` path** — when an open PR exists, the hub runs
 ///   `gh pr merge <pr> --<strategy>`. GitHub picks the merge commit and
 ///   we read the SHA back via `gh pr view --json mergeCommit` (polling —
@@ -424,6 +454,25 @@ pub fn merge(
         let pr_base = lookup_pr_base(&host, &wt, pr)?;
         let sha = merge_via_pr(&host, &wt, pr, strategy)?;
         (MergeOutcome::ViaPr { pr, sha }, pr_base)
+    } else if let Some(merged) = lookup_merged_pr(&host, &wt, &branch)? {
+        // No open PR, but GitHub already has a MERGED one for this branch:
+        // the orchestrator (or a human) landed it out-of-band with
+        // `gh pr merge` or the GitHub UI. Re-integrating is impossible and
+        // pointless — the branch is typically already deleted from origin
+        // (so `merge_hub_side` would error "branch not on origin"), and
+        // re-pushing it wouldn't help (the auto-rebase onto the advanced
+        // target leaves an empty squash → "nothing to merge"). Treat the
+        // transition as satisfied: record the *existing* merge SHA and
+        // restack children onto the branch GitHub actually merged into
+        // (the PR's stored base), mirroring the ViaPr path.
+        (
+            MergeOutcome::AlreadyMerged {
+                pr: merged.pr,
+                sha: merged.sha,
+                target: merged.base.clone(),
+            },
+            merged.base,
+        )
     } else {
         let sha = merge_hub_side(&host, &wt, &branch, &target, strategy, &task.id)?;
         (
@@ -2340,6 +2389,27 @@ mod tests {
         };
         assert_eq!(hub.as_line(), "hub:main:beadc0de");
         assert_eq!(hub.sha(), Some("beadc0de"));
+
+        let already = MergeOutcome::AlreadyMerged {
+            pr: 564,
+            sha: Some("c0ffee1234".into()),
+            target: "main".into(),
+        };
+        assert_eq!(already.as_line(), "already-merged:564:c0ffee1234:main");
+        assert_eq!(already.sha(), Some("c0ffee1234"));
+
+        // Out-of-band merge whose SHA GitHub hadn't recorded yet — same
+        // stable placeholder token the ViaPr path uses.
+        let already_pending = MergeOutcome::AlreadyMerged {
+            pr: 564,
+            sha: None,
+            target: "main".into(),
+        };
+        assert_eq!(
+            already_pending.as_line(),
+            "already-merged:564:sha-pending:main"
+        );
+        assert_eq!(already_pending.sha(), None);
     }
 
     #[test]
@@ -3942,6 +4012,152 @@ transitions:
         assert_eq!(
             main_after, main_before,
             "origin/main must NOT have advanced — the merge belongs on feature"
+        );
+    }
+
+    /// Install a gh stub on PATH whose body is `script`, point HOME/SHELL at
+    /// it so `run_in_dir`'s login shell resolves the stub, and return
+    /// `(tempdir, prev_shell, prev_home)`. Restore with [`restore_stub_env`].
+    /// Mirrors the login-shell mechanics documented on
+    /// `merge_via_pr_restacks_children_onto_the_prs_stored_base`.
+    fn install_gh_stub(
+        script: &str,
+    ) -> (
+        tempfile::TempDir,
+        Option<std::ffi::OsString>,
+        Option<std::ffi::OsString>,
+    ) {
+        let stub = tempfile::tempdir().unwrap();
+        let bin = stub.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("gh"), script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        std::fs::write(
+            stub.path().join(".profile"),
+            format!("export PATH=\"{}:$PATH\"\n", bin.display()),
+        )
+        .unwrap();
+        let prev_shell = std::env::var_os("SHELL");
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("SHELL", "/bin/sh");
+        std::env::set_var("HOME", stub.path());
+        (stub, prev_shell, prev_home)
+    }
+
+    fn restore_stub_env(
+        prev_shell: Option<std::ffi::OsString>,
+        prev_home: Option<std::ffi::OsString>,
+    ) {
+        match prev_shell {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn merge_treats_an_already_merged_pr_as_success_and_never_touches_the_target() {
+        // Live 2026-08-15 incident: PRs merged out-of-band with `gh pr merge`
+        // (branch deleted) stranded their cards in `review` because the
+        // hub-side path errored "branch not on origin". merge() must now spot
+        // the MERGED PR, record its existing merge SHA, and advance — without
+        // re-integrating or advancing origin/main a second time.
+        let _g = auto_fire_lock();
+
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        let wt = local.to_string_lossy().into_owned();
+        let main_before = run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/main"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // No open PR for the branch; a MERGED PR #564 whose merge commit is
+        // `abc123def` and whose base was `main`. The branch itself is *not*
+        // on origin (never created) — the already-merged path must not depend
+        // on it, exactly the deleted-branch case.
+        let (_stub, prev_shell, prev_home) = install_gh_stub(
+            r#"#!/bin/sh
+case "$*" in
+  *"--state merged"*) echo "564 abc123def main" ;;
+  *"pr list"*) : ;;
+esac
+exit 0
+"#,
+        );
+        let home = fresh_shelbi_home("already-merged");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut task = bare_task("t");
+        task.branch = Some("gone-topic".into());
+        write_task_file("fixture", &task);
+
+        let project = project_with_no_workspaces(&local);
+        let result = merge(&project, "fixture", &task, None);
+
+        restore_stub_env(prev_shell, prev_home);
+
+        let result = result.expect("an already-merged PR must resolve, not error");
+        assert_eq!(
+            result.merge,
+            MergeOutcome::AlreadyMerged {
+                pr: 564,
+                sha: Some("abc123def".into()),
+                target: "main".into(),
+            },
+            "merge must record the existing merge SHA from the MERGED PR"
+        );
+        assert!(result.restacks.is_empty(), "{:?}", result.restacks);
+
+        // origin/main must be exactly where it was — nothing re-integrated.
+        let main_after = run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(
+            main_after, main_before,
+            "origin/main must NOT advance for an already-merged PR"
+        );
+    }
+
+    #[test]
+    fn merge_still_errors_for_a_genuinely_unmerged_unpushed_branch() {
+        // The guard against a false "already merged": no open PR, no merged
+        // PR, and the branch never reached origin. merge() must still fail
+        // loudly (pointing at push_branch) rather than silently advancing.
+        let _g = auto_fire_lock();
+
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+
+        // gh reports nothing for either state — no open PR, no merged PR.
+        let (_stub, prev_shell, prev_home) = install_gh_stub(
+            "#!/bin/sh\nexit 0\n",
+        );
+        let home = fresh_shelbi_home("genuinely-unmerged");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut task = bare_task("t");
+        task.branch = Some("never-pushed".into());
+        write_task_file("fixture", &task);
+
+        let project = project_with_no_workspaces(&local);
+        let result = merge(&project, "fixture", &task, None);
+
+        restore_stub_env(prev_shell, prev_home);
+
+        let err = result.expect_err("an unmerged, unpushed branch must still error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not on origin") && msg.contains("push_branch"),
+            "error must point at push_branch; got: {msg}"
         );
     }
 
