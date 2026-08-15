@@ -286,6 +286,24 @@ impl ReviewPanel {
         }
     }
 
+    /// Fall the mid view back to Chat after its content pane (Vim / difftool)
+    /// died in place. Mirrors `activate_row(Switch(Chat))` — sets the active
+    /// view and returns [`PanelEffect::ShowChat`] — and moves the selection
+    /// highlight to the Chat entry, so a poll-tick auto-recovery drives the
+    /// exact same view-switch (and leaves the panel in the same visible state)
+    /// a click on the Chat entry would. Kept as its own method so the recovery
+    /// converges with the click path without duplicating the effect mapping.
+    pub fn recover_to_chat(&mut self) -> PanelEffect {
+        if let Some(idx) = self
+            .rows()
+            .iter()
+            .position(|r| matches!(r, PanelRow::Switch(SwitchItem::Chat)))
+        {
+            self.selected = idx;
+        }
+        self.activate_row(PanelRow::Switch(SwitchItem::Chat))
+    }
+
     /// Activate the selected row (Enter / Space).
     pub fn activate(&mut self) -> PanelEffect {
         let rows = self.rows();
@@ -786,6 +804,20 @@ fn review_panel_loop<B: Backend>(
 ) -> Result<()> {
     while !app.should_quit {
         term.draw(|f| render_full(f, app, f.area()))?;
+        // Recover a dead middle content pane before waiting on input, on the
+        // same cadence as the event poll below. When the mid view's `exec`'d
+        // process exits (Vim `:q`, difftool quit) its pane dies in place; fall
+        // the view back to Chat via the same `ShowChat` effect a click on the
+        // Chat entry produces, so the window never sits showing a dead pane.
+        // `mid_content_pane_dead` is guarded to the active review window and is
+        // idempotent (false once Chat is back / while the pane is live), so a
+        // live pane is never rebuilt and the view is never double-switched.
+        if app.active_view != ActiveView::Chat
+            && shelbi_orchestrator::review_ui::mid_content_pane_dead(project_name, &app.task_id)
+        {
+            let effect = app.recover_to_chat();
+            perform_effect(app, project_name, effect);
+        }
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
@@ -1308,6 +1340,38 @@ mod tests {
         // Back to Chat.
         select_switch(&mut app, SwitchItem::Chat);
         assert_eq!(app.activate(), PanelEffect::ShowChat);
+        assert_eq!(app.active_view, ActiveView::Chat);
+    }
+
+    /// The dead-mid-pane recovery (`recover_to_chat`) drives the exact same
+    /// effect + active-view state a click on the Chat entry produces: from a
+    /// Vim / Diff mid view it returns `ShowChat`, flips the active view back to
+    /// Chat, and moves the selection highlight onto the Chat switch so the panel
+    /// reads identically either way. This is the state-machine half of the
+    /// poll-tick recovery in `review_panel_loop`.
+    #[test]
+    fn recover_to_chat_mirrors_the_chat_switch_click() {
+        let mut app = panel(true);
+        // Simulate the user having switched the mid view to the editor.
+        select_switch(&mut app, SwitchItem::Vim);
+        assert_eq!(app.activate(), PanelEffect::ShowVim);
+        assert_eq!(app.active_view, ActiveView::Vim);
+
+        // The editor pane died (Vim `:q`): recovery falls the view back to Chat.
+        assert_eq!(app.recover_to_chat(), PanelEffect::ShowChat);
+        assert_eq!(app.active_view, ActiveView::Chat);
+        // Selection now sits on the Chat switch, matching the click path.
+        let chat_idx = app
+            .rows()
+            .iter()
+            .position(|r| matches!(r, PanelRow::Switch(SwitchItem::Chat)))
+            .unwrap();
+        assert_eq!(app.selected, chat_idx, "selection moves onto the Chat entry");
+
+        // Idempotent: recovering again while already on Chat is still a ShowChat
+        // no-op switch (the loop guards on `active_view != Chat` so it never even
+        // calls this again, but the method itself must stay stable).
+        assert_eq!(app.recover_to_chat(), PanelEffect::ShowChat);
         assert_eq!(app.active_view, ActiveView::Chat);
     }
 
