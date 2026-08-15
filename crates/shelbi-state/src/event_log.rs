@@ -1138,12 +1138,46 @@ pub fn append_task_event(
     to: Column,
     reason: &str,
 ) -> Result<()> {
+    write_task_event_line(&task_event_body(project, task_id, workflow, from, to, reason))
+}
+
+/// The marker token appended to a task-move event line when the move
+/// deliberately advanced the card WITHOUT running the transition's action
+/// list — the `shelbi task move --skip-transition-actions` recovery escape
+/// hatch. Kept as its own token, separate from `reason=`, so the board
+/// history stays honest that side effects (`merge` / `delete_branch` /
+/// `push_branch` / `open_pr` / `close_pr` / …) were bypassed independent of
+/// the user-supplied `--reason`.
+pub const ACTIONS_SKIPPED_MARKER: &str = "actions=skipped";
+
+/// Like [`append_task_event`] but stamps [`ACTIONS_SKIPPED_MARKER`] onto the
+/// line: the move crossed the edge but ran NONE of its transition actions.
+/// The marker is appended after the standard body so it never collides with
+/// the `reason=` token.
+pub fn append_task_event_actions_skipped(
+    project: &str,
+    task_id: &str,
+    workflow: &str,
+    from: Column,
+    to: Column,
+    reason: &str,
+) -> Result<()> {
+    let body = format!(
+        "{} {ACTIONS_SKIPPED_MARKER}",
+        task_event_body(project, task_id, workflow, from, to, reason)
+    );
+    write_task_event_line(&body)
+}
+
+/// Timestamp `body`, append it to `~/.shelbi/events.log`, and fall back to the
+/// socket emitter when the log isn't writable — the shared tail of the
+/// `append_task_event*` family.
+fn write_task_event_line(body: &str) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
-    let body = task_event_body(project, task_id, workflow, from, to, reason);
     let line = format!("{ts} {body}");
     match append_event_line(&line) {
         Ok(()) => Ok(()),
-        Err(e) if is_permission_denied(&e) => emit_event_body(&body),
+        Err(e) if is_permission_denied(&e) => emit_event_body(body),
         Err(e) => Err(e),
     }
 }

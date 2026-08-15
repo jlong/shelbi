@@ -60,6 +60,18 @@ pub enum TaskCmd {
         /// user-driven ones. Defaults to `user:cli`.
         #[arg(long, value_name = "REASON")]
         reason: Option<String>,
+        /// FOOTGUN / recovery escape hatch: advance the card to `--to`
+        /// WITHOUT running the destination transition's actions (`merge`,
+        /// `delete_branch`, `push_branch`, `open_pr`, `close_pr`, …). Use
+        /// only when the underlying git work was already done out of band —
+        /// e.g. a PR merged by hand — so the transition's `merge` would
+        /// re-fail on an already-merged branch and strand the card. Skipping
+        /// `merge` means the branch is genuinely NOT merged by Shelbi;
+        /// skipping `push_branch`/`open_pr` means no PR is opened. The move is
+        /// stamped `actions=skipped` in the event log so the board history is
+        /// honest that side effects were bypassed.
+        #[arg(long)]
+        skip_transition_actions: bool,
     },
     /// Assign a task to a workspace. Workspace must be declared in project YAML.
     Assign {
@@ -295,7 +307,18 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
         } => list(&project, status.as_deref(), ready, workflow.as_deref()),
         TaskCmd::Show { id } => show(&project, &id),
         TaskCmd::Depends(args) => depends(&project, args),
-        TaskCmd::Move { id, to, reason } => move_to(&project, &id, &to, reason.as_deref()),
+        TaskCmd::Move {
+            id,
+            to,
+            reason,
+            skip_transition_actions,
+        } => move_to(
+            &project,
+            &id,
+            &to,
+            reason.as_deref(),
+            skip_transition_actions,
+        ),
         TaskCmd::Assign { id, to } => assign(&project, &id, &to),
         TaskCmd::Unassign { id } => unassign(&project, &id),
         TaskCmd::Start {
@@ -622,7 +645,13 @@ fn depends(project: &str, args: DependsArgs) -> Result<()> {
     Ok(())
 }
 
-fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()> {
+fn move_to(
+    project: &str,
+    id: &str,
+    to: &str,
+    reason: Option<&str>,
+    skip_transition_actions: bool,
+) -> Result<()> {
     let tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
     let workflow = resolve_task_workflow(project, &tf.task)?;
     // Resolve the destination against the task's workflow. A task's position
@@ -642,7 +671,15 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
     // merge never leaves the board reading the target status with an open PR
     // / unmerged branch, and the edge's remaining actions (`delete_branch`,
     // …) fire after the move.
-    let declares_merge = column != tf.task.column
+    //
+    // `--skip-transition-actions` forces this off: the recovery escape hatch
+    // advances the card WITHOUT running the merge (or any other action), for
+    // when the git work already landed out of band and the merge would
+    // re-fail. `declares_merge` gates the gated-merge block AND the post-move
+    // cleanup below, so clearing it here is enough to bypass the whole action
+    // list — the move is stamped `actions=skipped` in the event log instead.
+    let declares_merge = !skip_transition_actions
+        && column != tf.task.column
         && workflow
             .actions_for_transition(&from_status, &to_status)
             .contains(&shelbi_core::TransitionAction::Merge);
@@ -701,14 +738,15 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
     let moved = shelbi_state::move_task(project, id, column.clone()).map_err(|e| anyhow!(e))?;
     if let Some((from, to_col, moved_wf)) = &moved {
         let reason = reason.unwrap_or("user:cli");
-        if let Err(e) = shelbi_state::append_task_event(
-            project,
-            id,
-            moved_wf,
-            from.clone(),
-            to_col.clone(),
-            reason,
-        ) {
+        // Stamp `actions=skipped` on the line when the escape hatch bypassed
+        // the transition's actions, so the board history stays honest that
+        // side effects were NOT run — kept distinct from the user's `reason`.
+        let append = if skip_transition_actions {
+            shelbi_state::append_task_event_actions_skipped
+        } else {
+            shelbi_state::append_task_event
+        };
+        if let Err(e) = append(project, id, moved_wf, from.clone(), to_col.clone(), reason) {
             match shelbi_state::move_task(project, id, from.clone()) {
                 Ok(_) => {
                     return Err(anyhow!(
@@ -2059,7 +2097,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         shelbi_state::save_task("p", &task_in(Column::backlog(), "a"), "").unwrap();
-        move_to("p", "a", "todo", None).unwrap();
+        move_to("p", "a", "todo", None, false).unwrap();
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
@@ -2095,6 +2133,7 @@ mod tests {
             "b",
             "in_progress",
             Some("orchestrator:auto-dispatch workspace=alpha"),
+            false,
         )
         .unwrap();
 
@@ -2131,6 +2170,7 @@ mod tests {
             "promo",
             "todo",
             Some("orchestrator:zen-promote category=2"),
+            false,
         )
         .unwrap();
 
@@ -2169,6 +2209,7 @@ mod tests {
             "denied",
             "todo",
             Some("orchestrator:zen-promote category=2"),
+            false,
         )
         .unwrap_err()
         .to_string();
@@ -2198,7 +2239,7 @@ mod tests {
 
         shelbi_state::save_task("p", &task_in(Column::todo(), "c"), "").unwrap();
         // Already in `todo` — move_task short-circuits, no event line.
-        move_to("p", "c", "todo", None).unwrap();
+        move_to("p", "c", "todo", None, false).unwrap();
 
         let path = shelbi_state::events_log_path().unwrap();
         assert!(
@@ -2239,7 +2280,9 @@ statuses:
         task.workflow = Some("research".into());
         shelbi_state::save_task("p", &task, "").unwrap();
 
-        let err = move_to("p", "d", "review", None).unwrap_err().to_string();
+        let err = move_to("p", "d", "review", None, false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("workflow `research`"), "{err}");
         // The error lists valid status ids (stable identifiers) in kebab
         // form. Pull out the `(valid: ...)` segment so the assertion on
@@ -2305,7 +2348,7 @@ statuses:
 
         // `--to qa`: a declared custom status is now a real move target and
         // the task lands there (its stored position id is the custom id).
-        move_to("p", "t", "qa", None).unwrap();
+        move_to("p", "t", "qa", None, false).unwrap();
         assert_eq!(
             shelbi_state::load_task("p", "t")
                 .unwrap()
@@ -2318,7 +2361,9 @@ statuses:
         // A status absent from this workflow (`review`) still errors, and
         // the valid-status list names the declared ids (never the undeclared
         // target). Task stays put.
-        let err = move_to("p", "t", "review", None).unwrap_err().to_string();
+        let err = move_to("p", "t", "review", None, false)
+            .unwrap_err()
+            .to_string();
         let valid = err
             .split_once("(valid:")
             .and_then(|(_, tail)| tail.split_once(')'))
@@ -2338,12 +2383,119 @@ statuses:
         );
 
         // A core status the workflow declares still moves successfully.
-        move_to("p", "t", "done", None).unwrap();
+        move_to("p", "t", "done", None, false).unwrap();
         assert_eq!(
             shelbi_state::load_task("p", "t").unwrap().task.column,
             Column::done(),
         );
 
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn move_to_skip_transition_actions_advances_without_running_them() {
+        // `--skip-transition-actions` recovery escape hatch: a `review -> done`
+        // edge that declares `merge` + `delete_branch` still advances the card,
+        // but NONE of the actions fire. Firing the merge here would fail (no
+        // repo/PR in this test), so a clean advance is itself proof the action
+        // list was bypassed — and the line is stamped `actions=skipped`,
+        // independent of the user-supplied `--reason`.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let wf_dir = shelbi_state::workflows_dir("p").unwrap();
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("mergewf.yaml"),
+            r#"name: mergewf
+statuses:
+  - { id: backlog,     owner: user                       }
+  - { id: todo,        owner: agent, agent: orchestrator  }
+  - { id: in-progress, owner: agent, agent: developer     }
+  - { id: review,      owner: user                        }
+  - { id: done,        owner: user                        }
+transitions:
+  - { from: review, to: done, actions: [merge, delete_branch] }
+"#,
+        )
+        .unwrap();
+
+        let mut task = task_in(Column::review(), "t");
+        task.workflow = Some("mergewf".into());
+        shelbi_state::save_task("p", &task, "").unwrap();
+
+        move_to("p", "t", "done", Some("recovery:pr-merged-by-hand"), true).unwrap();
+
+        // Card advanced despite the merge-declaring edge.
+        assert_eq!(
+            shelbi_state::load_task("p", "t").unwrap().task.column,
+            Column::done(),
+        );
+
+        // Exactly one line — the task move. No `merge … status=…` line, because
+        // the action list never ran. The line carries BOTH the user's
+        // `reason=` and a distinct `actions=skipped` marker.
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1, "log: {log}");
+        let line = lines[0];
+        assert!(line.contains(" review -> done "), "line: {line}");
+        assert!(line.contains(" reason=recovery:pr-merged-by-hand "), "line: {line}");
+        assert!(line.ends_with(" actions=skipped"), "line: {line}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn move_to_without_skip_flag_still_runs_the_merge_action() {
+        // The complement: WITHOUT the flag, the same `review -> done` edge fires
+        // its `merge`, which fails here (the task has no branch/PR) and aborts
+        // the move — the card stays in `review`. This is the pre-existing
+        // behavior the flag deliberately does NOT change, and it proves the
+        // action actually runs when the flag is absent.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        let sock = short_test_socket("move-merge-run");
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::set_var("SHELBI_HUB_SOCK", &sock);
+        // The gated merge needs a loadable project YAML + repo to be reached.
+        crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
+
+        let wf_dir = shelbi_state::workflows_dir("p").unwrap();
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("mergewf.yaml"),
+            r#"name: mergewf
+statuses:
+  - { id: backlog,     owner: user                       }
+  - { id: todo,        owner: agent, agent: orchestrator  }
+  - { id: in-progress, owner: agent, agent: developer     }
+  - { id: review,      owner: user                        }
+  - { id: done,        owner: user                        }
+transitions:
+  - { from: review, to: done, actions: [merge] }
+"#,
+        )
+        .unwrap();
+
+        let mut task = task_in(Column::review(), "t");
+        task.workflow = Some("mergewf".into());
+        shelbi_state::save_task("p", &task, "").unwrap();
+
+        let err = move_to("p", "t", "done", None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("merge"), "err: {err}");
+        assert_eq!(
+            shelbi_state::load_task("p", "t").unwrap().task.column,
+            Column::review(),
+            "a failed merge must leave the card in review, not advance it",
+        );
+
+        std::env::remove_var("SHELBI_HUB_SOCK");
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -2360,7 +2512,7 @@ statuses:
         // A default-workflow task (no explicit `workflow:` field).
         shelbi_state::save_task("p", &task_in(Column::todo(), "c"), "").unwrap();
 
-        move_to("p", "c", "canceled", None).unwrap();
+        move_to("p", "c", "canceled", None, false).unwrap();
         let reloaded = shelbi_state::load_task("p", "c").unwrap();
         assert_eq!(reloaded.task.column, Column::canceled());
         assert_eq!(reloaded.task.column.as_str(), "canceled");
@@ -2482,7 +2634,7 @@ workspaces:
         write_project_yaml(&home, "p");
         shelbi_state::save_task("p", &task_in(Column::backlog(), "f"), "").unwrap();
 
-        move_to("p", "f", "todo", None).unwrap();
+        move_to("p", "f", "todo", None, false).unwrap();
 
         assert_eq!(
             shelbi_state::load_task("p", "f").unwrap().task.column,
@@ -2736,7 +2888,7 @@ statuses:
         task.workflow = Some("nonexistent".into());
         shelbi_state::save_task("p", &task, "").unwrap();
 
-        move_to("p", "e", "review", None).unwrap();
+        move_to("p", "e", "review", None, false).unwrap();
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         assert!(log.contains(" task=e "), "{log}");
