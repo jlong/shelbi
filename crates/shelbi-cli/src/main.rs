@@ -376,6 +376,19 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__zen-orch-exit")]
     ZenOrchExit { project: String },
+    /// (internal) Best-effort crash-record capture the orchestrator pane
+    /// wrapper runs on every exit path (agent return + SIGHUP trap). Writes a
+    /// post-mortem only for a genuine crash. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__orch-record-exit")]
+    OrchRecordExit {
+        project: String,
+        /// Short exit token — `exit:<code>` or `signal:SIG<NAME>`.
+        reason: String,
+        /// The orchestrator pane's tmux id (`$TMUX_PANE`), for the output-tail
+        /// capture. Optional: absent/empty just yields a record with no tail.
+        pane: Option<String>,
+    },
     /// (internal) Run the palette picker — meant to be invoked inside a
     /// `tmux display-popup`. Not for direct use.
     #[command(hide = true)]
@@ -521,6 +534,15 @@ fn main() -> Result<()> {
         Some(Cmd::ZenOrchStart { project }) => commands::zen_lifecycle::orch_start(&project),
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),
         Some(Cmd::ZenOrchExit { project }) => commands::zen_lifecycle::orch_exit(&project),
+        Some(Cmd::OrchRecordExit {
+            project,
+            reason,
+            pane,
+        }) => commands::zen_lifecycle::orch_record_exit(
+            &project,
+            &reason,
+            pane.as_deref().filter(|s| !s.is_empty()),
+        ),
     }
 }
 

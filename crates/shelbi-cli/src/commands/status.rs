@@ -246,6 +246,9 @@ fn print_zen_full(zen: &ZenSnapshot) {
         Some(ts) => println!("last crash: {}", ts.to_rfc3339()),
         None => println!("last crash: never"),
     }
+    if let Some(record) = &zen.last_crash_record {
+        println!("last crash record: {record}");
+    }
     if zen.crash_recovery_event {
         println!(
             "crash-recovery: recent `zen=off reason=crash-recovery` event in events.log — \
@@ -379,6 +382,10 @@ pub(crate) fn workspace_idle_busy(project: &str) -> Result<(usize, usize)> {
 struct ZenSnapshot {
     mode: ZenModeState,
     last_crashed_at: Option<DateTime<Utc>>,
+    /// Pointer to the most recent orchestrator crash record, when one was
+    /// captured. Surfaced beneath `last crash` so the post-mortem (exit
+    /// code/signal + output tail) is one open away.
+    last_crash_record: Option<String>,
     /// True when the tail of `events.log` shows a recent
     /// `project=<name> zen=off reason=crash-recovery` line. Surfaced
     /// separately from `mode` because the mode was reset to `off` at
@@ -404,6 +411,7 @@ fn zen_snapshot(project: &str) -> Result<ZenSnapshot> {
     Ok(ZenSnapshot {
         mode: state.zen_mode,
         last_crashed_at: state.zen_last_crashed_at,
+        last_crash_record: state.orchestrator_last_crash_record,
         crash_recovery_event,
     })
 }
