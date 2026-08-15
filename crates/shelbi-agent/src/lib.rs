@@ -457,12 +457,80 @@ mod tests {
         }
     }
 
+    /// True when any component of `path` is a `tests` directory — i.e. the file
+    /// is a Cargo integration-test target, which is entirely test code.
+    fn is_integration_test_file(path: &std::path::Path) -> bool {
+        path.components().any(|c| c.as_os_str() == "tests")
+    }
+
+    /// Return `text` with the bodies of `#[cfg(test)]` modules removed, so the
+    /// runner-basename guard only inspects production code.
+    ///
+    /// Test modules routinely carry config-*data* assertions such as
+    /// `assert_eq!(value.as_str(), Some("claude"))` that are string-equality
+    /// checks, not runner-basename *dispatch* branches. The bare-substring grep
+    /// can't tell the two apart, so scanning test code produced false positives
+    /// (the codify migration and the config-upgrade slice-2 tests each bounced a
+    /// review over a `Some("claude")` assertion that violated nothing). Stripping
+    /// the test modules first keeps the guard pointed at the code it actually
+    /// governs. Brace-depth counting is a heuristic, which is all this guard
+    /// needs — a `#[cfg(test)]` attribute by definition marks test-only code.
+    fn strip_cfg_test_modules(text: &str) -> String {
+        let mut out = String::new();
+        let mut in_test = false;
+        let mut depth: i32 = 0;
+        let mut saw_open = false;
+        for line in text.lines() {
+            if !in_test {
+                if line.trim_start().starts_with("#[cfg(test)]") {
+                    in_test = true;
+                    depth = 0;
+                    saw_open = false;
+                    // Fall through to brace counting; the attribute line itself
+                    // rarely opens the module body.
+                } else {
+                    out.push_str(line);
+                    out.push('\n');
+                    continue;
+                }
+            }
+            for ch in line.chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        saw_open = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if saw_open {
+                // Module body closed once braces balance back out.
+                if depth <= 0 {
+                    in_test = false;
+                }
+            } else if line.contains(';') {
+                // A single-item `#[cfg(test)]` attribute (e.g. `#[cfg(test)] use
+                // ...;` or `mod tests;`) with no inline body — nothing to strip
+                // past this line.
+                in_test = false;
+            }
+            // Lines inside the test module are dropped from `out`.
+        }
+        out
+    }
+
     /// Grep-guard: the runner *basename* classification is allowed to live in
     /// exactly one place — [`shelbi_core::RunnerKind::from_command`] in
     /// `shelbi-core/src/model.rs`. Every other module must reason about a
     /// [`RunnerAdapter`] / [`RunnerKind`] instead of re-deriving `claude` /
     /// `codex` from the command string. This keeps the consolidation from
     /// silently eroding back into scattered branches.
+    ///
+    /// The basename check applies to *production* code only: test modules and
+    /// integration-test files hold config-data assertions of the same textual
+    /// shape (`Some("claude")`) that are not dispatch checks, so they are
+    /// stripped/skipped before the grep (see [`strip_cfg_test_modules`]).
     #[test]
     fn runner_basename_checks_are_confined_to_adapter_detection() {
         // The crates workspace root: `.../crates/shelbi-agent` → `.../crates`.
@@ -501,18 +569,64 @@ mod tests {
                     file.display()
                 );
             }
-            if file.ends_with(&allowed) {
+            if file.ends_with(&allowed) || is_integration_test_file(file) {
                 continue;
             }
+            let production = strip_cfg_test_modules(&text);
             for needle in &basename_needles {
                 assert!(
-                    !text.contains(needle.as_str()),
+                    !production.contains(needle.as_str()),
                     "runner basename check `{needle}` must be confined to \
-                     RunnerKind::from_command, but appears in {}",
+                     RunnerKind::from_command, but appears in production code in {}",
                     file.display()
                 );
             }
         }
+    }
+
+    /// The confinement guard must catch a real basename dispatch branch in
+    /// production code while ignoring the identical textual shape when it is a
+    /// config-data assertion inside a `#[cfg(test)]` module — the false-positive
+    /// class that bounced two reviews.
+    #[test]
+    fn basename_guard_is_confined_to_production_code() {
+        let needle = format!("Some({:?})", "claude");
+
+        // Direction 1 — a genuine runner-basename dispatch branch in production
+        // code is still visible to the grep after stripping.
+        let production_dispatch = "\
+fn detect(command: &str) -> RunnerKind {
+    match std::path::Path::new(command).file_name().and_then(|s| s.to_str()) {
+        Some(\"claude\") => RunnerKind::Claude,
+        _ => RunnerKind::Generic,
+    }
+}
+";
+        assert!(
+            strip_cfg_test_modules(production_dispatch).contains(&needle),
+            "a real basename dispatch branch in production code must still be caught"
+        );
+
+        // Direction 2 — the same textual shape as a data assertion inside a
+        // `#[cfg(test)]` module is stripped and does not trip the guard.
+        let test_only = "\
+fn detect(_command: &str) -> RunnerKind {
+    RunnerKind::Generic
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn integration_field_round_trips() {
+        assert_eq!(value.as_str(), Some(\"claude\"));
+    }
+}
+";
+        assert!(
+            !strip_cfg_test_modules(test_only).contains(&needle),
+            "a Some(\"claude\") data assertion inside a #[cfg(test)] module must \
+             not trip the guard"
+        );
     }
 
     #[test]
