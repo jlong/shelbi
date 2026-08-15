@@ -33,6 +33,11 @@ pub fn sidebar_loop<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> Result
         // Drain any in-flight background review load so the spinner/outcome
         // shows up on the next frame without the UI thread ever blocking.
         app.poll_review_load();
+        // Detect an externally-initiated tmux window switch (a native tab /
+        // prefix key, not a Shelbi nav click) and run the same per-window
+        // setup a click would — so arriving at a review window either way
+        // lands the review sidebar/interface identically.
+        app.poll_active_window();
 
         draw_sidebar_self_healing(term, app)?;
 

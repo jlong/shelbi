@@ -1303,6 +1303,7 @@ mod tests {
             title: "Palette fuzzy-match fix".into(),
             branch: "shelbi/palette-fuzzy-match-fix".into(),
             location: Some("hub:3000".into()),
+            workspace: Some("review-1".into()),
             state: crate::app::ReviewState::Serving,
         }];
         app.queued_review = vec![crate::app::ReviewEntry {
@@ -1310,6 +1311,7 @@ mod tests {
             title: "Rework onboarding copy".into(),
             branch: "shelbi/rework-onboarding-copy".into(),
             location: None,
+            workspace: None,
             state: crate::app::ReviewState::Pending,
         }];
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
