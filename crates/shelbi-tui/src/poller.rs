@@ -3233,17 +3233,26 @@ fn ensure_review_marker_and_serving_state(
             ),
         }
     }
-    record_review_serving(project, workspace, task_id, last_known);
+    record_review_serving(project, workspace, task_id, url, last_known);
 }
 
 /// Persist the `serving` sub-state for a review slot, emitting a
 /// `... -> serving` event on the edge into it. Rides the same [`decide`]
 /// dedupe machinery as the other states: while the slot stays serving only
 /// `last_seen` moves and no further event fires.
+///
+/// On that same edge — and only there — it also emits the `review-ready`
+/// signal (task + title + review notes + pane/worktree/url location), so the
+/// orchestrator learns WHAT is in review and WHERE without hunting the pane or
+/// grepping worktrees. Gating on `outcome.transitioned` is what satisfies the
+/// "nothing for the pending-load state, fires once when ready" contract: a slot
+/// still booting never reaches here (its probe hasn't passed), and a slot that
+/// stays serving across ticks doesn't re-emit.
 fn record_review_serving(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     task_id: &str,
+    url: Option<&str>,
     last_known: &mut Option<WorkspaceState>,
 ) {
     let prior = load_prior(&workspace.name, last_known);
@@ -3266,9 +3275,70 @@ fn record_review_serving(
         ) {
             tracing::warn!(workspace = %workspace.name, error = %e, "append_workspace_event (serving) failed");
         }
+        emit_review_ready(project, workspace, task_id, url);
         tracing::info!(workspace = %workspace.name, task = %task_id, "review slot serving");
     }
     *last_known = Some(WorkspaceState::Serving);
+}
+
+/// Emit the `review-ready` signal for a review slot that just reached serving.
+/// Best-effort: every field shelbi already knows internally (pane target,
+/// worktree path, served port/url, task title/notes) is gathered here so the
+/// orchestrator doesn't reverse-engineer them. A failure to resolve the machine
+/// or load the task degrades gracefully — the location payload is still worth
+/// emitting, so we fall back to an empty title/notes rather than skipping the
+/// signal entirely.
+fn emit_review_ready(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    task_id: &str,
+    url: Option<&str>,
+) {
+    let Some(machine) = project.machine(&workspace.machine) else {
+        tracing::warn!(
+            workspace = %workspace.name,
+            machine = %workspace.machine,
+            "review-ready: unknown machine; skipping signal",
+        );
+        return;
+    };
+    let worktree =
+        shelbi_orchestrator::workspace::workspace_worktree(machine, workspace).to_string_lossy().into_owned();
+    let pane = match shelbi_orchestrator::workspace::workspace_tmux_addr(project, workspace) {
+        Ok(addr) => addr.target(),
+        Err(e) => {
+            tracing::warn!(workspace = %workspace.name, error = %e, "review-ready: tmux addr resolution failed");
+            String::new()
+        }
+    };
+    let port = workspace.slot.and_then(|s| u16::try_from(s).ok());
+
+    // Title + review notes come from the task body; a load failure isn't fatal
+    // to the signal (location alone is actionable).
+    let (title, notes) = match shelbi_state::load_task(&project.name, task_id) {
+        Ok(tf) => (
+            tf.task.title.clone(),
+            shelbi_orchestrator::workspace::review_ready_notes(&tf.body),
+        ),
+        Err(e) => {
+            tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "review-ready: task load failed; emitting location only");
+            (String::new(), String::new())
+        }
+    };
+
+    if let Err(e) = shelbi_state::append_review_ready_event(&shelbi_state::ReviewReadyEvent {
+        project: &project.name,
+        task_id,
+        title: &title,
+        workspace: &workspace.name,
+        pane: &pane,
+        worktree: &worktree,
+        port,
+        url,
+        notes: &notes,
+    }) {
+        tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_review_ready_event failed");
+    }
 }
 
 /// Reap a review slot whose task is resolved (no review-column task points at
@@ -3597,7 +3667,7 @@ mod tests {
 
         let ws = project.workspaces[0].clone();
         let mut last_known = None;
-        record_review_serving(&project, &ws, "t-serve", &mut last_known);
+        record_review_serving(&project, &ws, "t-serve", None, &mut last_known);
 
         let s = shelbi_state::load_workspace_status(&ws.name)
             .unwrap()
@@ -3608,10 +3678,98 @@ mod tests {
         let first_transition = s.last_transition;
 
         // Same state again → not a transition; last_transition is preserved.
-        record_review_serving(&project, &ws, "t-serve", &mut last_known);
+        record_review_serving(&project, &ws, "t-serve", None, &mut last_known);
         let s2 = shelbi_state::load_workspace_status(&ws.name).unwrap().unwrap();
         assert_eq!(s2.state, WorkspaceState::Serving);
         assert_eq!(s2.last_transition, first_transition);
+
+        match prior_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn record_review_serving_emits_review_ready_once_on_the_serving_edge() {
+        // Criterion: the review-ready signal fires exactly once — on the edge
+        // into serving — and carries the task title + notes + pane/worktree/url
+        // location. A second (deduped) tick emits no further review-ready line,
+        // so the pending/steady-state case stays silent.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = review_serving_home();
+        let prior_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.name = "demo".into();
+        project.workspaces[0].tags = vec!["review".into()];
+        project.workspaces[0].slot = Some(4310);
+        shelbi_state::save_project(&project).unwrap();
+
+        // A task with an Acceptance Criteria section to distill (the column is
+        // irrelevant here — the emitter reads only the title + body).
+        let mut task = in_progress_task("t-serve", "alpha");
+        task.title = "Fix the login redirect loop".into();
+        let body = "\
+Intro prose.
+
+## Acceptance Criteria
+- The redirect resolves once
+- No loop on refresh
+";
+        shelbi_state::save_task(&project.name, &task, body).unwrap();
+
+        let ws = project.workspaces[0].clone();
+        let mut last_known = None;
+        record_review_serving(
+            &project,
+            &ws,
+            "t-serve",
+            Some("http://localhost:4310"),
+            &mut last_known,
+        );
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let rr: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(" review-ready "))
+            .collect();
+        assert_eq!(rr.len(), 1, "exactly one review-ready line: {log}");
+        let line = rr[0];
+        assert!(line.contains(" task=t-serve "), "line: {line}");
+        assert!(line.contains(" workspace=alpha "), "line: {line}");
+        assert!(line.contains(" state=serving "), "line: {line}");
+        // Pane target + worktree path shelbi already knows internally.
+        assert!(line.contains(" pane=shelbi-demo:alpha "), "line: {line}");
+        assert!(
+            line.contains(" worktree=") && line.contains("/.shelbi/wt/alpha "),
+            "line: {line}"
+        );
+        assert!(line.contains(" port=4310 "), "line: {line}");
+        assert!(line.contains(" url=http://localhost:4310 "), "line: {line}");
+        assert!(line.contains("title=Fix_the_login_redirect_loop"), "line: {line}");
+        assert!(
+            line.contains("notes=The_redirect_resolves_once;_No_loop_on_refresh"),
+            "line: {line}"
+        );
+
+        // Deduped tick: no second review-ready line.
+        record_review_serving(
+            &project,
+            &ws,
+            "t-serve",
+            Some("http://localhost:4310"),
+            &mut last_known,
+        );
+        let log2 = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert_eq!(
+            log2.lines().filter(|l| l.contains(" review-ready ")).count(),
+            1,
+            "steady-state serving must not re-emit: {log2}"
+        );
 
         match prior_home {
             Some(h) => std::env::set_var("SHELBI_HOME", h),

@@ -337,6 +337,126 @@ fn review_ready_probe_passes(
     )
 }
 
+/// Distill the review notes an orchestrator/reviewer should check from a task's
+/// markdown `body` — the payload of the `review-ready` signal's `notes=` field.
+///
+/// Preference order, so the notes point at *what to verify* rather than restate
+/// the whole task:
+///
+/// 1. The **Acceptance Criteria** section, if present — its bullets flattened
+///    into `"a; b; c"`, with list markers (`-`, `*`, `1.`) and GitHub task
+///    checkboxes (`[ ]` / `[x]`) stripped. This is the section reviewers grade
+///    against.
+/// 2. Otherwise the **first prose paragraph** (skipping headings, horizontal
+///    rules, and blank lines) as a one-line summary.
+/// 3. An empty string when the body carries neither — the emitter still fires
+///    (location alone is useful); it just carries no notes.
+///
+/// The result is a single line (inner whitespace collapsed); the emitter bounds
+/// its length. Matching is case-insensitive and tolerant of `##`-level headings
+/// so it works across the task templates in the repo.
+pub fn review_ready_notes(body: &str) -> String {
+    if let Some(criteria) = acceptance_criteria_summary(body) {
+        return criteria;
+    }
+    first_prose_paragraph(body)
+}
+
+/// True for a markdown heading line (`#`, `##`, …). Leading whitespace is
+/// tolerated so an indented heading inside a list still reads as a section break.
+fn is_heading(line: &str) -> bool {
+    line.trim_start().starts_with('#')
+}
+
+/// The text of a heading line with its `#` markers stripped and lowercased,
+/// for case-insensitive section matching.
+fn heading_text_lower(line: &str) -> String {
+    line.trim_start()
+        .trim_start_matches('#')
+        .trim()
+        .to_lowercase()
+}
+
+/// Strip a leading markdown list marker (`-`, `*`, `+`, or `1.` / `2)`) and any
+/// GitHub task checkbox (`[ ]` / `[x]`) from a bullet line, returning the inner
+/// text. A non-bullet line is returned trimmed and unchanged.
+fn strip_list_marker(line: &str) -> String {
+    let t = line.trim();
+    let rest = if let Some(r) = t
+        .strip_prefix("- ")
+        .or_else(|| t.strip_prefix("* "))
+        .or_else(|| t.strip_prefix("+ "))
+    {
+        r
+    } else if let Some((num, r)) = t.split_once(['.', ')']) {
+        // Ordered marker like `1.` / `2)` — only when the head is all digits.
+        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+            r.trim_start()
+        } else {
+            t
+        }
+    } else {
+        t
+    };
+    // Drop a task checkbox if one leads the bullet text.
+    let rest = rest
+        .strip_prefix("[ ] ")
+        .or_else(|| rest.strip_prefix("[x] "))
+        .or_else(|| rest.strip_prefix("[X] "))
+        .unwrap_or(rest);
+    rest.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Collect the Acceptance-Criteria section's items into `"a; b; c"`, or `None`
+/// when the body has no such heading (or it's empty). Stops at the next heading
+/// of any level so a trailing section doesn't bleed in.
+fn acceptance_criteria_summary(body: &str) -> Option<String> {
+    let mut lines = body.lines();
+    // Advance to the acceptance-criteria heading.
+    for line in lines.by_ref() {
+        if is_heading(line) && heading_text_lower(line).contains("acceptance criteria") {
+            break;
+        }
+    }
+    let mut items: Vec<String> = Vec::new();
+    for line in lines {
+        if is_heading(line) {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let item = strip_list_marker(trimmed);
+        if !item.is_empty() {
+            items.push(item);
+        }
+    }
+    if items.is_empty() {
+        None
+    } else {
+        Some(items.join("; "))
+    }
+}
+
+/// The first prose paragraph of a body as a one-line summary: skips headings,
+/// horizontal rules (`---`), and blank lines, then joins the contiguous run of
+/// text lines that follows. Empty when the body is all structure.
+fn first_prose_paragraph(body: &str) -> String {
+    let mut para: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "---" || is_heading(line) {
+            if para.is_empty() {
+                continue;
+            }
+            break;
+        }
+        para.push(trimmed.to_string());
+    }
+    para.join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Write the review-serving marker (`<worktree>/.claude/shelbi-review-loaded`)
 /// naming `task_id`, optionally followed by the reviewable `url`. Atomic — a
 /// sibling `.tmp` is written and renamed into place so the sidebar never reads
@@ -10633,5 +10753,70 @@ mod sync_worktree_freshcut_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod review_ready_notes_tests {
+    //! Pure-function tests for [`review_ready_notes`] — the distillation of a
+    //! task body into the `review-ready` signal's `notes=` payload. No I/O, so
+    //! they run everywhere.
+    use super::review_ready_notes;
+
+    #[test]
+    fn prefers_acceptance_criteria_bullets_flattened() {
+        let body = "\
+Some intro prose about the change.
+
+## Acceptance Criteria
+- [ ] A review-ready event fires when the server is up
+- [x] It carries the pane target and worktree path
+- Nothing is emitted for the pending-load state
+
+## Technical Details
+- irrelevant follow-on section
+";
+        let notes = review_ready_notes(body);
+        assert_eq!(
+            notes,
+            "A review-ready event fires when the server is up; \
+             It carries the pane target and worktree path; \
+             Nothing is emitted for the pending-load state"
+        );
+        // The trailing Technical Details section must not bleed in.
+        assert!(!notes.contains("irrelevant"));
+    }
+
+    #[test]
+    fn strips_ordered_markers_and_matches_heading_case_insensitively() {
+        let body = "\
+### acceptance criteria
+1. first check
+2) second check
+";
+        assert_eq!(review_ready_notes(body), "first check; second check");
+    }
+
+    #[test]
+    fn falls_back_to_first_prose_paragraph_without_criteria() {
+        let body = "\
+# Title heading
+
+This is the summary paragraph
+spanning two lines.
+
+More detail that should not be included.
+";
+        assert_eq!(
+            review_ready_notes(body),
+            "This is the summary paragraph spanning two lines."
+        );
+    }
+
+    #[test]
+    fn empty_when_body_is_all_structure() {
+        // No criteria section and no prose — location alone still ships.
+        assert_eq!(review_ready_notes("## Heading only\n\n---\n"), "");
+        assert_eq!(review_ready_notes(""), "");
     }
 }
