@@ -115,10 +115,29 @@ pub fn is_claude_working(screen: &str) -> bool {
 }
 
 /// True when Claude's live spinner row is on screen: its animated glyph + a
-/// `Gerund…`, the `· ↑/↓ N tokens)` streaming counter, positioned immediately
-/// above the live input box. The positional + grammar check is what keeps a
-/// completed `⏺ Done. (… tokens)` row, or a stale `tokens)` lingering in the
-/// scrollback, from reading as busy — a bare `tokens)` substring is not enough.
+/// `Gerund…` + a parenthetical elapsed timer (`(45s`, `(1m 2s`, …), positioned
+/// immediately above the live input box.
+///
+/// ## Why the match is on the structural shell, not the token suffix
+///
+/// An earlier version keyed on the streaming-token suffix — it hard-required
+/// `· ↑/↓ N` and `ends_with("tokens)")`. That suffix is present only *while
+/// tokens are streaming*. Between tool calls / during extended thinking Claude
+/// draws a non-token spinner like `✻ Julienning… (45s · thought for 1s)`,
+/// `✻ Working… (45s)`, or a tool-use-counter form — no `tokens)`, no interrupt
+/// footer. Those read as idle, so a hard-working pane flapped
+/// `working ↔ awaiting_input` every couple of poll ticks and flashed the yellow
+/// `?` badge mid-turn. Matching the spinner by its invariant shell (glyph +
+/// gerund + elapsed timer) classifies every live-spinner form as working, which
+/// removes the flap edge entirely.
+///
+/// ## What still keeps a completed turn from reading as busy
+///
+/// The positional guard (immediately above the input box) plus the grammar
+/// check: a finished `⏺ Done. (1m 4s · 12.0k tokens)` row carries the `⏺` glyph
+/// (not a spinner glyph) and no gerund `…`, and a stale `tokens)` lingering in
+/// the scrollback isn't the row directly above the box. A bare `tokens)`
+/// substring was never enough and still isn't required.
 pub fn has_live_spinner(screen: &str) -> bool {
     let Some(top) = input_box_top(screen) else {
         return false;
@@ -134,10 +153,21 @@ pub fn has_live_spinner(screen: &str) -> bool {
             '·' | '✳' | '✻' | '✶' | '✽' | '✺' | '✹' | '✸' | '✷' | '✵'
         )
     });
-    spinner_glyph
-        && line.contains('…')
-        && (line.contains(" · ↑ ") || line.contains(" · ↓ "))
-        && line.ends_with("tokens)")
+    spinner_glyph && line.contains('…') && has_elapsed_timer(line)
+}
+
+/// True when `line` carries Claude's spinner elapsed-timer parenthetical: an
+/// open paren immediately followed by a digit run and a unit (`(45s`, `(1m 2s`,
+/// `(1h 5m`). This is the one part present in *every* live-spinner form — the
+/// token counter, `thought for …`, and tool-use tails vary or vanish, but the
+/// elapsed timer always leads the parenthetical. `(esc to interrupt)` and
+/// `(shift+tab to cycle)` have no leading digit, so they don't match.
+fn has_elapsed_timer(line: &str) -> bool {
+    line.match_indices('(').any(|(open, _)| {
+        let rest = &line[open + 1..];
+        let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        digits > 0 && rest[digits..].starts_with(['s', 'm', 'h'])
+    })
 }
 
 /// Index of the top border of the last live input box in `screen`, or `None`
@@ -628,6 +658,92 @@ mod tests {
         assert!(is_input_ready(BUSY_SPINNER_NO_INTERRUPT));
         assert!(has_live_spinner(BUSY_SPINNER_NO_INTERRUPT));
         assert!(is_claude_working(BUSY_SPINNER_NO_INTERRUPT));
+    }
+
+    // Captured mid-turn while Claude was thinking between tool calls: no
+    // streaming-token counter, no `esc to interrupt` footer — just the elapsed
+    // timer and a `thought for …` tail. This is the exact form that flapped
+    // `working ↔ awaiting_input` because the old detector demanded `tokens)`.
+    const THINKING_SPINNER_NO_TOKENS: &str = "\
+✻ Julienning… (45s · thought for 1s)
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+
+    // Elapsed-only spinner — the barest live form, no parenthetical tail at all.
+    const ELAPSED_ONLY_SPINNER: &str = "\
+✳ Working… (45s)
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+
+    // Tool-use-counter spinner form: elapsed timer plus a running tool count.
+    const TOOL_USE_SPINNER: &str = "\
+✶ Herding… (1m 12s · 3 tool uses)
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+
+    #[test]
+    fn claude_working_detects_non_token_spinner_forms() {
+        // THE FLAP this task fixes: every one of these is a live spinner with no
+        // streaming-token suffix and no interrupt footer. The old detector saw
+        // only the input-box footer and read them as AwaitingInput.
+        for (label, screen) in [
+            ("thinking/thought-for", THINKING_SPINNER_NO_TOKENS),
+            ("elapsed-only", ELAPSED_ONLY_SPINNER),
+            ("tool-use counter", TOOL_USE_SPINNER),
+        ] {
+            assert!(!is_claude_busy(screen), "{label}: no interrupt footer");
+            assert!(is_input_ready(screen), "{label}: footer drawn mid-turn");
+            assert!(has_live_spinner(screen), "{label}: spinner must be seen");
+            assert!(is_claude_working(screen), "{label}: pane is working");
+        }
+    }
+
+    #[test]
+    fn has_live_spinner_still_matches_the_token_streaming_form() {
+        // The original streaming form must keep working after the broadening.
+        assert!(has_live_spinner(BUSY_SPINNER_NO_INTERRUPT));
+    }
+
+    #[test]
+    fn has_live_spinner_rejects_footer_parentheticals_as_timers() {
+        // A spinner glyph + `…` but only a non-timer parenthetical
+        // (`esc to interrupt`, no leading digit) must not read as an elapsed
+        // timer — that path is `is_claude_busy`'s, not the spinner's.
+        let no_timer = "\
+· Working… (esc to interrupt)
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+        assert!(!has_live_spinner(no_timer));
+        // But it IS still working via the interrupt footer.
+        assert!(is_claude_working(no_timer));
+    }
+
+    #[test]
+    fn claude_working_stable_across_a_multi_tick_turn() {
+        // Regression against the flap: within one turn Claude alternates between
+        // streaming tokens and thinking. Every sampled frame must read Working,
+        // so the state never oscillates to AwaitingInput and back.
+        let frames = [
+            BUSY_SPINNER_NO_INTERRUPT, // streaming tokens
+            THINKING_SPINNER_NO_TOKENS, // thinking between tool calls
+            ELAPSED_ONLY_SPINNER,       // spun up a fresh step
+            TOOL_USE_SPINNER,           // running tools
+            BUSY_SPINNER_NO_INTERRUPT,  // streaming again
+        ];
+        for (i, frame) in frames.iter().enumerate() {
+            assert!(
+                is_claude_working(frame),
+                "frame {i} must stay Working, not flap to AwaitingInput"
+            );
+        }
     }
 
     #[test]
