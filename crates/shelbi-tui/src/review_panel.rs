@@ -935,16 +935,17 @@ fn reject_reason_popup() -> Option<String> {
         shelbi_agent::shell_escape(&out.to_string_lossy()),
     );
     let _ = std::fs::remove_file(&out);
-    // `-h 11` leaves room for the label, bordered textbox, button row, and
-    // hint without clipping.
+    // `-h 18` leaves room for the label, a several-line bordered text area, the
+    // button row, and the hint without clipping — the reason field is now a
+    // multi-line editor, so it wants the extra vertical space.
     let ok = run_tmux([
         "display-popup",
         "-B",
         "-E",
         "-w",
-        "60",
+        "70",
         "-h",
-        "11",
+        "18",
         cmd.as_str(),
     ]);
     let reason = ok.then(|| std::fs::read_to_string(&out).ok()).flatten();
