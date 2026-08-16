@@ -18,6 +18,7 @@ shelbi-tmux = { workspace = true }
 shelbi-ssh = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+unicode-width = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
