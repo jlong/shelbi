@@ -122,6 +122,16 @@ pub enum MergeOutcome {
         sha: Option<String>,
         target: String,
     },
+    /// No open *and* no merged PR, but the hub-side probe found the branch's
+    /// content is already present on `target` — an ancestor branch, or an
+    /// empty `git merge --squash` (its work landed earlier under a different
+    /// SHA, e.g. a prior squash that GitHub records under no PR we can see).
+    /// `merge` ran as a satisfied no-op: nothing is re-integrated, `target`
+    /// is never advanced, and no new commit is produced (so
+    /// [`MergeOutcome::sha`] is `None`). This is the PR-less backstop to
+    /// [`MergeOutcome::AlreadyMerged`] that keeps a double-merge harmless even
+    /// for purely-local projects with no `gh`.
+    AlreadyIntegrated { target: String },
 }
 
 impl MergeOutcome {
@@ -142,6 +152,9 @@ impl MergeOutcome {
                     sha.as_deref().unwrap_or("sha-pending")
                 )
             }
+            MergeOutcome::AlreadyIntegrated { target } => {
+                format!("already-integrated:{target}")
+            }
         }
     }
 
@@ -154,6 +167,7 @@ impl MergeOutcome {
             MergeOutcome::ViaPr { sha, .. } => sha.as_deref(),
             MergeOutcome::HubSide { sha, .. } => Some(sha),
             MergeOutcome::AlreadyMerged { sha, .. } => sha.as_deref(),
+            MergeOutcome::AlreadyIntegrated { .. } => None,
         }
     }
 }
@@ -380,9 +394,15 @@ where
 /// Integrate the task's branch into the target branch using the project's
 /// configured [`MergeStrategy`].
 ///
-/// Three paths share this primitive, picked in order by the state of the
-/// branch's PR:
+/// Paths share this primitive, checked in order:
 ///
+/// - **`gh pr merge` path** — when an open PR exists, the hub runs
+///   `gh pr merge <pr> --<strategy>`. GitHub picks the merge commit and
+///   we read the SHA back via `gh pr view --json mergeCommit` (polling —
+///   GitHub records it asynchronously). The PR's own base wins; we don't
+///   re-target it from `target_override` because `open_pr` was already
+///   responsible for picking the right base, and the child restack
+///   cascade uses that stored base (`baseRefName`) as its target.
 /// - **already-merged path** — when no PR is *open* but GitHub reports a
 ///   PR for the branch already **MERGED** (someone landed it out-of-band
 ///   via `gh pr merge` or the GitHub UI), the transition is already
@@ -392,19 +412,18 @@ where
 ///   the merged branch is deleted from origin. Checked *after* the open-PR
 ///   probe (an open PR always wins) and *before* the hub-side fetch (whose
 ///   "branch not on origin" error is exactly what we're avoiding).
-/// - **`gh pr merge` path** — when an open PR exists, the hub runs
-///   `gh pr merge <pr> --<strategy>`. GitHub picks the merge commit and
-///   we read the SHA back via `gh pr view --json mergeCommit` (polling —
-///   GitHub records it asynchronously). The PR's own base wins; we don't
-///   re-target it from `target_override` because `open_pr` was already
-///   responsible for picking the right base, and the child restack
-///   cascade uses that stored base (`baseRefName`) as its target.
-/// - **Hub-side fetch path** — when no PR is open, the hub fetches the
-///   branch (and `target`) from origin, fast-forwards `target` to
-///   `origin/target`, runs `git merge --<strategy>` against `target`,
-///   then pushes `target` back to origin. The hub's work_dir must be
+/// - **Hub-side fetch path** — when no PR is open or merged, the hub
+///   fetches the branch (and `target`) from origin, runs
+///   `git merge --<strategy>` against `origin/<target>` in a throwaway
+///   worktree, then pushes the result to origin. The hub's work_dir must be
 ///   clean of user changes (`.shelbi/` is ignored, the same way
-///   `shelbi merge` preflight does it).
+///   `shelbi merge` preflight does it). If the fetch shows the branch's
+///   content is *already* on `target` (an ancestor branch, or an empty
+///   `git merge --squash` because a prior squash landed it under another
+///   SHA), the merge is a satisfied no-op — [`MergeOutcome::AlreadyIntegrated`]
+///   — rather than an error. This is the PR-less backstop to the
+///   already-merged path: it keeps a double-merge harmless even for
+///   purely-local projects with no `gh` to probe.
 ///
 /// The effective target is `target_override` (the per-transition `target:`
 /// from the workflow YAML) if set, else [`Project::base_branch`]. The
@@ -474,14 +493,27 @@ pub fn merge(
             merged.base,
         )
     } else {
-        let sha = merge_hub_side(&host, &wt, &branch, &target, strategy, &task.id)?;
-        (
-            MergeOutcome::HubSide {
-                sha,
-                target: target.clone(),
-            },
-            target,
-        )
+        // No open or merged PR. Fetch and merge hub-side — but if the branch's
+        // content is already on `target` (an ancestor, or an empty squash
+        // because a prior merge landed it under another SHA that no visible
+        // PR records), report the no-op so the transition still advances. This
+        // is the PR-less backstop to the already-merged path above; it covers
+        // purely-local projects with no `gh` to probe.
+        match merge_hub_side(&host, &wt, &branch, &target, strategy, &task.id)? {
+            HubMerge::Merged(sha) => (
+                MergeOutcome::HubSide {
+                    sha,
+                    target: target.clone(),
+                },
+                target,
+            ),
+            HubMerge::AlreadyIntegrated => (
+                MergeOutcome::AlreadyIntegrated {
+                    target: target.clone(),
+                },
+                target,
+            ),
+        }
     };
 
     let restacks = restack_children(project, project_name, task, &branch, &merged_target);
@@ -1011,15 +1043,34 @@ fn merge_via_pr(host: &Host, wt: &str, pr: u64, strategy: MergeStrategy) -> Resu
     wait_for_merge_commit_sha(host, wt, pr)
 }
 
-/// Hub-side fetch + local merge — used when no PR exists for the branch.
-/// Steps:
-/// 1. Refuse if the branch never made it to origin — that's a workflow
+/// Outcome of [`merge_hub_side`]: either a fresh integration commit landed,
+/// or the branch turned out to be already integrated into the target and the
+/// merge was a satisfied no-op. Split from the raw SHA so the idempotency
+/// path stays type-checked rather than smuggled through a sentinel string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HubMerge {
+    /// A `git merge --<strategy>` produced a new tip pushed to
+    /// `origin/<target>`; the wrapped value is that SHA.
+    Merged(String),
+    /// The branch is present on origin but adds nothing to `target` (it is an
+    /// ancestor of the target, or its content already landed under a
+    /// different SHA — a prior squash). Nothing was pushed.
+    AlreadyIntegrated,
+}
+
+/// Hub-side fetch + local merge — used when no *open* PR exists for the
+/// branch. Steps:
+/// 1. If the branch never made it to origin, refuse — that's a workflow
 ///    contract violation: `merge` runs after `push_branch` (or after the
 ///    user pushed the branch some other way). The error names the missing
-///    ref so the operator can fix it.
+///    ref so the operator can fix it. (A branch already *merged and deleted*
+///    is caught earlier by the MERGED-PR check in [`merge`], so it never
+///    reaches this refusal.)
 /// 2. `git fetch origin <target> <branch>` so we have the latest tips.
-/// 3. Refuse if the branch has no commits beyond `origin/<target>` — a
-///    no-op merge would record yesterday's HEAD as a "merge SHA."
+/// 3. If the branch has no commits beyond `origin/<target>`, it is already
+///    integrated (an ancestor of the target) — return
+///    [`HubMerge::AlreadyIntegrated`] so the transition proceeds, rather than
+///    erroring or recording yesterday's HEAD as a "merge SHA."
 /// 4. Run `git merge --<strategy>` against `origin/<branch>` in a
 ///    throwaway temp worktree detached at `origin/<target>` — the same
 ///    isolation [`restack`] uses. Each concurrent merge gets its own
@@ -1027,7 +1078,10 @@ fn merge_via_pr(host: &Host, wt: &str, pr: u64, strategy: MergeStrategy) -> Resu
 ///    interleave git state in the shared work_dir, and the hub's
 ///    checked-out branch never moves (matching the ViaPr path, which
 ///    doesn't touch the local checkout either). For `--squash`, follow
-///    with a commit since `--squash` only stages.
+///    with a commit since `--squash` only stages — but if the squash stages
+///    nothing (the branch's content is already on the target under another
+///    SHA), return [`HubMerge::AlreadyIntegrated`] instead of failing on the
+///    empty commit.
 /// 5. Push the resulting tip to `origin/<target>` and return its SHA.
 ///
 /// The hub's local `<target>` branch ref is deliberately left alone:
@@ -1043,7 +1097,7 @@ fn merge_hub_side(
     target: &str,
     strategy: MergeStrategy,
     task_id: &str,
-) -> Result<String> {
+) -> Result<HubMerge> {
     // Probe `origin` for the branch *before* fetching so we can surface
     // the workflow-contract violation directly. A bare `git fetch
     // origin <branch>` against a missing ref dies with `couldn't find
@@ -1063,9 +1117,10 @@ fn merge_hub_side(
         || format!("git -C {wt} fetch origin -- {target} {branch}"),
     )?;
 
-    // Guard against "no commits beyond target." A no-op merge is not what
-    // any caller wants; bailing here surfaces the misconfiguration loudly
-    // instead of returning yesterday's HEAD as the "merge SHA."
+    // Idempotency: no commits beyond target means the branch is already an
+    // ancestor of it — its work is integrated. Report the no-op so the
+    // transition proceeds (delete_branch runs, the card advances) instead of
+    // failing and stranding a task whose change already shipped.
     let ahead = run_capture_stdout(
         host,
         wt,
@@ -1077,9 +1132,7 @@ fn merge_hub_side(
         ],
     )?;
     if ahead.trim() == "0" {
-        return Err(Error::Other(format!(
-            "branch `{branch}` has no commits beyond `{target}` — nothing to merge"
-        )));
+        return Ok(HubMerge::AlreadyIntegrated);
     }
 
     // Ancestry guard: refuse to squash-merge a branch cut from the wrong
@@ -1127,7 +1180,7 @@ fn merge_and_push_in_worktree(
     target: &str,
     strategy: MergeStrategy,
     task_id: &str,
-) -> Result<String> {
+) -> Result<HubMerge> {
     let origin_branch = format!("origin/{branch}");
     match strategy {
         MergeStrategy::Squash => {
@@ -1137,6 +1190,16 @@ fn merge_and_push_in_worktree(
                 &["git", "merge", "--squash", &origin_branch],
                 || format!("git -C {tmp} merge --squash origin/{branch}"),
             )?;
+            // Idempotency: if `--squash` staged nothing, the branch's content
+            // is already on the target (it landed earlier under a different
+            // SHA — e.g. a prior `zen pr-merge`). Committing here would fail
+            // with "nothing to commit" and strand the card; report the no-op
+            // instead so the transition proceeds. This backstops the
+            // MERGED-PR check in `merge` and works even for non-GitHub
+            // projects where no PR exists to probe.
+            if !worktree_has_staged_changes(host, tmp)? {
+                return Ok(HubMerge::AlreadyIntegrated);
+            }
             // `--squash` only stages; we still owe a commit. The message
             // matches the legacy `shelbi merge` shape so log readers see
             // the same prefix regardless of which path produced the
@@ -1178,7 +1241,17 @@ fn merge_and_push_in_worktree(
             "post-merge `git rev-parse HEAD` returned empty output in {tmp}"
         )));
     }
-    Ok(sha)
+    Ok(HubMerge::Merged(sha))
+}
+
+/// Whether the worktree at `tmp` has anything staged in its index. Used after
+/// `git merge --squash` to distinguish a real merge (changes to commit) from
+/// an already-integrated no-op (nothing staged). `git diff --cached --quiet`
+/// exits 0 when the index matches HEAD and 1 when it differs, so a
+/// non-success exit means there *are* staged changes.
+fn worktree_has_staged_changes(host: &Host, tmp: &str) -> Result<bool> {
+    let out = run_in_dir(host, tmp, &["git", "diff", "--cached", "--quiet"])?;
+    Ok(!out.status.success())
 }
 
 /// Ancestry guard for [`merge_hub_side`]: refuse to squash-merge a branch
@@ -2410,6 +2483,14 @@ mod tests {
             "already-merged:564:sha-pending:main"
         );
         assert_eq!(already_pending.sha(), None);
+
+        // Hub-side no-op (no PR) — the branch's content was already on the
+        // target, so no new commit and no pr token.
+        let already_integrated = MergeOutcome::AlreadyIntegrated {
+            target: "develop".into(),
+        };
+        assert_eq!(already_integrated.as_line(), "already-integrated:develop");
+        assert_eq!(already_integrated.sha(), None);
     }
 
     #[test]
@@ -2516,6 +2597,19 @@ mod tests {
         run_git(local, &["checkout", "main"]);
     }
 
+    /// Unwrap a [`HubMerge::Merged`] to its SHA, panicking on
+    /// [`HubMerge::AlreadyIntegrated`]. The success-path merge tests all
+    /// expect a fresh integration commit, so an already-integrated result is
+    /// a test bug rather than an outcome to assert on.
+    fn expect_merged_sha(outcome: HubMerge) -> String {
+        match outcome {
+            HubMerge::Merged(sha) => sha,
+            HubMerge::AlreadyIntegrated => {
+                panic!("expected a fresh hub-side merge, got AlreadyIntegrated")
+            }
+        }
+    }
+
     #[test]
     fn hub_side_squash_merges_branch_into_target() {
         let (_tmp, _remote, local) = fixture_repo_with_origin();
@@ -2527,15 +2621,10 @@ mod tests {
             .trim()
             .to_string();
 
-        let sha = merge_hub_side(
-            &Host::Local,
-            &wt,
-            "feature",
-            "main",
-            MergeStrategy::Squash,
-            "t",
-        )
-        .unwrap();
+        let sha = expect_merged_sha(
+            merge_hub_side(&Host::Local, &wt, "feature", "main", MergeStrategy::Squash, "t")
+                .unwrap(),
+        );
         assert!(!sha.is_empty());
 
         // The squashed change landed on origin/main — integration is a
@@ -2701,10 +2790,13 @@ mod tests {
     }
 
     #[test]
-    fn no_commits_beyond_target_errors_instead_of_recording_a_no_op() {
-        // If feature is identical to main, there's nothing to merge.
-        // Returning the current HEAD as the "merge SHA" would silently
-        // log a successful integration that did nothing — refuse loudly.
+    fn no_commits_beyond_target_is_an_already_integrated_no_op() {
+        // If feature is identical to main, there's nothing to merge — the
+        // branch is already an ancestor of the target, so its work has
+        // shipped. The idempotent merge reports this as a satisfied no-op so
+        // the transition proceeds (delete_branch runs, the card advances)
+        // rather than erroring and stranding a task whose change is already
+        // in the base. origin/main must not move.
         let (_tmp, _remote, local) = fixture_repo_with_origin();
         // `feature` was branched off init but never advanced, so it's
         // sitting at the same SHA as main. Push it so origin/feature
@@ -2712,7 +2804,13 @@ mod tests {
         run_git(&local, &["push", "origin", "feature"]);
         let wt = local.to_string_lossy().into_owned();
 
-        let err = merge_hub_side(
+        let main_before =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/main"])
+                .unwrap()
+                .trim()
+                .to_string();
+
+        let outcome = merge_hub_side(
             &Host::Local,
             &wt,
             "feature",
@@ -2720,9 +2818,20 @@ mod tests {
             MergeStrategy::Squash,
             "t",
         )
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("no commits beyond"), "{msg}");
+        .unwrap();
+        assert_eq!(outcome, HubMerge::AlreadyIntegrated);
+
+        // The target never moved — no empty merge commit was recorded.
+        run_or_command_err(&Host::Local, &wt, &["git", "fetch", "origin"], || {
+            "git fetch origin".into()
+        })
+        .unwrap();
+        let main_after =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/main"])
+                .unwrap()
+                .trim()
+                .to_string();
+        assert_eq!(main_before, main_after, "target must not move on a no-op");
     }
 
     /// On top of `fixture_repo_with_origin`, model a stacked workflow whose
@@ -2800,15 +2909,10 @@ mod tests {
         .unwrap();
         assert!(!pre.status.success(), "subB should not descend pre-merge");
 
-        let sha = merge_hub_side(
-            &Host::Local,
-            &wt,
-            "subB",
-            "feature",
-            MergeStrategy::Squash,
-            "t",
-        )
-        .unwrap();
+        let sha = expect_merged_sha(
+            merge_hub_side(&Host::Local, &wt, "subB", "feature", MergeStrategy::Squash, "t")
+                .unwrap(),
+        );
         assert!(!sha.is_empty());
 
         // Refresh remote-tracking refs the push/merge advanced.
@@ -2912,15 +3016,10 @@ mod tests {
                 .trim()
                 .to_string();
 
-        let sha = merge_hub_side(
-            &Host::Local,
-            &wt,
-            "feature",
-            "main",
-            MergeStrategy::Squash,
-            "t",
-        )
-        .unwrap();
+        let sha = expect_merged_sha(
+            merge_hub_side(&Host::Local, &wt, "feature", "main", MergeStrategy::Squash, "t")
+                .unwrap(),
+        );
         assert!(!sha.is_empty());
 
         run_or_command_err(&Host::Local, &wt, &["git", "fetch", "origin"], || {
@@ -2935,6 +3034,63 @@ mod tests {
         assert_eq!(
             branch_before, branch_after,
             "descendant branch must not be rebased/force-pushed"
+        );
+    }
+
+    #[test]
+    fn content_already_in_base_is_an_already_integrated_no_op() {
+        // The reported failure class: the branch's content already landed on
+        // the target under a *different* SHA (a prior `zen pr-merge` squashed
+        // it in), so the branch's own commit is not an ancestor of the
+        // target. A second squash stages nothing and `git commit` would fail
+        // "nothing to commit," stranding the card. The idempotent merge must
+        // detect the empty squash and report AlreadyIntegrated instead —
+        // with no PR to probe (purely local), proving the hub-side content
+        // check stands on its own.
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        advance_feature_with_origin(&local);
+
+        // Land feature's content on main under a new SHA via a squash, then
+        // push — mirroring what a prior merge / `zen pr-merge` already did.
+        run_git(&local, &["checkout", "main"]);
+        run_git(&local, &["merge", "--squash", "feature"]);
+        run_git(&local, &["commit", "-q", "-m", "squashed feature earlier"]);
+        run_git(&local, &["push", "origin", "main"]);
+        let wt = local.to_string_lossy().into_owned();
+
+        let main_before =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/main"])
+                .unwrap()
+                .trim()
+                .to_string();
+
+        // feature's own commit is NOT an ancestor of main (squash made a new
+        // SHA), so the ahead-count guard does not short-circuit — the empty
+        // squash inside the worktree is what has to be caught.
+        let outcome = merge_hub_side(
+            &Host::Local,
+            &wt,
+            "feature",
+            "main",
+            MergeStrategy::Squash,
+            "t",
+        )
+        .unwrap();
+        assert_eq!(outcome, HubMerge::AlreadyIntegrated);
+
+        // origin/main never got an empty commit on top.
+        run_or_command_err(&Host::Local, &wt, &["git", "fetch", "origin"], || {
+            "git fetch origin".into()
+        })
+        .unwrap();
+        let main_after =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/main"])
+                .unwrap()
+                .trim()
+                .to_string();
+        assert_eq!(
+            main_before, main_after,
+            "no empty squash commit may land on the target"
         );
     }
 
@@ -2956,15 +3112,10 @@ mod tests {
         run_git(&local, &["add", "README.md"]);
         let wt = local.to_string_lossy().into_owned();
 
-        let sha = merge_hub_side(
-            &Host::Local,
-            &wt,
-            "feature",
-            "main",
-            MergeStrategy::Squash,
-            "t",
-        )
-        .unwrap();
+        let sha = expect_merged_sha(
+            merge_hub_side(&Host::Local, &wt, "feature", "main", MergeStrategy::Squash, "t")
+                .unwrap(),
+        );
 
         // The squash commit contains exactly the feature's file — none of
         // the hub work_dir's dirt.
@@ -3084,7 +3235,7 @@ mod tests {
                                 MergeStrategy::Squash,
                                 branch,
                             ) {
-                                Ok(sha) => return sha,
+                                Ok(outcome) => return expect_merged_sha(outcome),
                                 Err(e) if attempt < 5 => {
                                     eprintln!("{branch} attempt {attempt} retrying: {e}");
                                     std::thread::sleep(std::time::Duration::from_millis(50));
