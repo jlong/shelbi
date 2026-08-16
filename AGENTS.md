@@ -31,6 +31,33 @@ over SSH. The repo is a Rust workspace plus a Next.js marketing/docs site.
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - Site: `cd site && npm run lint && npm run build`
 
+## Changing shipped defaults (existing installs don't get them for free)
+
+Shelbi copies its default agent instructions, `zenmode.md`, workflows, keys, and
+other config into each project at `shelbi init`. After that the project owns its
+copy — users edit them freely and Shelbi's self-heal preserves those edits. So
+**editing a shipped default template only reaches NEW projects.** Every
+already-initialized project keeps its forked copy untouched.
+
+When you change a default that existing projects should adopt, pair the template
+edit with a **config-upgrade sniffer** so existing installs self-heal on next
+boot (`crates/shelbi-cli/src/commands/config_upgrade.rs`; surfaces in
+`config_surfaces.rs` already include `zenmode.md`, per-agent `instructions.md`,
+workflows, and the global/project YAMLs):
+
+- **Auto-healable** (deterministic, non-lossy rewrite): add an `AutoHeal` sniffer
+  plus its write-back in `config_upgrade_apply.rs`. The on-start pass applies it
+  and discloses a `config-upgrade` line per project on `events.log`.
+- **Needs judgment** (user-customizable prose, ambiguous, or potentially lossy —
+  most instruction / `zenmode.md` changes): add a `NeedsJudgment` sniffer. It is
+  written to the findings file the orchestrator ingests at boot, and the
+  orchestrator repairs its own copy with judgment, preserving customizations.
+  When unsure, classify `NeedsJudgment` rather than risk a lossy auto-heal.
+
+A PR that edits a `*.template` / default config (or a shipped workflow /
+instructions file) but adds no config-upgrade sniffer is incomplete for existing
+users. Ship both.
+
 ## Git discipline
 
 - Never commit on `main`. At `shelbi init` (with disclosure) Shelbi installs a
