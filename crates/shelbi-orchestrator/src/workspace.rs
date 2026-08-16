@@ -4401,14 +4401,14 @@ fn review_recipe_section(project: &Project, task_id: &str, port: Option<u16>) ->
     Some(render_review_recipe_section(&recipe))
 }
 
-/// Render a resolved review serve recipe as a prompt section the Review agent
-/// runs verbatim. The `## Review serve recipe` heading is the anchor the Review
-/// charter keys off to tell "serve this branch" apart from a diff-only review.
+/// Render a resolved review recipe as a prompt section the Review agent runs
+/// verbatim. The `## Review recipe` heading is the anchor the Review charter
+/// keys off to tell "bring this branch up" apart from a no-recipe review.
 fn render_review_recipe_section(r: &shelbi_core::ResolvedReviewRecipe) -> String {
     use std::fmt::Write as _;
     let mut s = String::from(
-        "\n\n---\n## Review serve recipe\n\n\
-         The workflow declares how to boot this branch for review. Run it \
+        "\n\n---\n## Review recipe\n\n\
+         The workflow declares how to bring this branch up for review. Run it \
          verbatim — do NOT auto-detect a framework or a port; the review slot's \
          port is already substituted below.\n\n",
     );
@@ -5224,8 +5224,8 @@ mod tests {
             port: Some(4310),
         };
         let section = render_review_recipe_section(&recipe);
-        // The charter keys off this exact heading to tell "serve" from diff-only.
-        assert!(section.contains("## Review serve recipe"), "{section}");
+        // The charter keys off this exact heading to tell "bring up" from no-recipe.
+        assert!(section.contains("## Review recipe"), "{section}");
         assert!(section.contains("`site`"), "{section}");
         assert!(section.contains("npm run dev -- -p 4310"), "{section}");
         assert!(section.contains("curl -sf http://localhost:4310"), "{section}");

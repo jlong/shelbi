@@ -408,7 +408,47 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         && (id.ends_with(".settings") || id.ends_with("workspace-settings-template"))
     {
         sniff_settings_json(entry, &text, out);
+    } else if matches!(entry.format, SurfaceFormat::Markdown)
+        && id.contains(".agent.review.")
+        && (id.ends_with(".instructions") || id.contains(".skill."))
+    {
+        sniff_review_instructions(entry, &text, out);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Review agent instructions / load-run skill (Markdown prose)
+
+/// Phrases that only appear in the pre-2026-08 server-centric review charter.
+/// The medium-agnostic rewrite ("bring up whatever the workflow declares; when
+/// it declares nothing, present the diff and say nothing") drops all of them,
+/// so any live review-agent prose still carrying one is a forked copy on the
+/// old wording. Bare "server" is deliberately absent — the new prose still
+/// names a web server as one example medium, so only these distinctive legacy
+/// phrases mark the deprecation.
+const LEGACY_REVIEW_WORDING: &[&str] = &["serve recipe", "diff-only", "why no server came up"];
+
+/// Detect the pre-rename server-centric wording in the review agent's
+/// instructions (or its bundled load-run skill). The fix is a prose refresh a
+/// user may have forked and customized — never a mechanical, non-lossy rewrite
+/// — so it routes to [`Classification::NeedsJudgment`] for the orchestrator to
+/// repair its own copy rather than silently clobbering local edits.
+fn sniff_review_instructions(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    let Some(marker) = LEGACY_REVIEW_WORDING.iter().find(|m| text.contains(**m)) else {
+        return;
+    };
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        "REVIEW_INSTRUCTIONS_SERVER_CENTRIC",
+        &format!(
+            "review agent prose uses the pre-rename server-centric wording (`{marker}`)"
+        ),
+        "Refresh from the shipped medium-agnostic review defaults: `## Review recipe` \
+         (not `## Review serve recipe`); when no recipe is declared, bring nothing up and \
+         say nothing about it (no `diff-only` / `why no server came up` narration).",
+        Location { line: 1, column: 1 },
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,6 +1096,11 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
             "A legacy named `owner:` conflicts with an explicit `agent:`; which agent \
              should own the status is a decision, not a mechanical rewrite."
         }
+        "REVIEW_INSTRUCTIONS_SERVER_CENTRIC" => {
+            "These are prose instructions a project may have forked and customized, so \
+             the medium-agnostic wording can't be merged in mechanically without risking \
+             local edits — the orchestrator refreshes its own copy instead."
+        }
         _ => "This form is ambiguous or potentially lossy, so a human should confirm the fix.",
     }
 }
@@ -1465,6 +1510,80 @@ mod tests {
             &mut out,
         );
         assert!(out.is_empty(), "clean template flagged: {:?}", codes(&out));
+    }
+
+    // ---- review agent instructions (medium-agnostic rewrite) ------------
+
+    #[test]
+    fn legacy_server_centric_review_prose_is_needs_judgment() {
+        let e = entry(
+            "project.demo.agent.review.instructions",
+            "project:demo",
+            SurfaceFormat::Markdown,
+        );
+        // Each distinctive legacy phrase, on its own, must trip the sniffer.
+        for legacy in [
+            "Look for a ## Review serve recipe section.",
+            "this is a diff-only review; say so.",
+            "explain why no server came up.",
+        ] {
+            let mut out = Vec::new();
+            sniff_review_instructions(&e, legacy, &mut out);
+            let f = find(&out, "REVIEW_INSTRUCTIONS_SERVER_CENTRIC")
+                .unwrap_or_else(|| panic!("no finding for legacy prose: {legacy:?}"));
+            assert_eq!(f.classification, Classification::NeedsJudgment);
+            assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+        }
+    }
+
+    #[test]
+    fn medium_agnostic_review_prose_is_clean() {
+        // The shipped, post-rewrite wording carries none of the legacy markers.
+        let e = entry(
+            "project.demo.agent.review.instructions",
+            "project:demo",
+            SurfaceFormat::Markdown,
+        );
+        let mut out = Vec::new();
+        sniff_review_instructions(
+            &e,
+            "Look in it for a ## Review recipe section. No recipe → bring nothing up; \
+             present the diff and say nothing about it. A web server is one example medium.",
+            &mut out,
+        );
+        assert!(
+            out.is_empty(),
+            "medium-agnostic prose flagged: {:?}",
+            codes(&out)
+        );
+    }
+
+    #[test]
+    fn shipped_review_defaults_are_clean_under_the_sniffer() {
+        // Guard against drift: the actual shipped review template + skill must
+        // never trip their own deprecation sniffer.
+        let instr = entry(
+            "project.demo.agent.review.instructions",
+            "project:demo",
+            SurfaceFormat::Markdown,
+        );
+        let mut out = Vec::new();
+        sniff_review_instructions(
+            &instr,
+            shelbi_state::DEFAULT_REVIEW_INSTRUCTIONS,
+            &mut out,
+        );
+        let skill = entry(
+            "project.demo.agent.review.skill.load-run-detection.SKILL",
+            "project:demo",
+            SurfaceFormat::Markdown,
+        );
+        sniff_review_instructions(&skill, shelbi_state::DEFAULT_REVIEW_LOAD_RUN_SKILL, &mut out);
+        assert!(
+            out.is_empty(),
+            "shipped review defaults tripped the sniffer: {:?}",
+            codes(&out)
+        );
     }
 
     // ---- detect + emit (home-scoped) ------------------------------------

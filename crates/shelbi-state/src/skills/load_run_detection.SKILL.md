@@ -1,43 +1,47 @@
 ---
 name: load-run-detection
 description: >
-  How the Review agent boots a branch for review: run the workflow's serve
-  recipe (handed to you in your dispatch prompt, fully resolved) verbatim,
-  health-check it, and hand a URL to the human. Use when a review workspace
-  has a branch checked out and you need to stand up its dev server.
+  How the Review agent brings a branch up for review: run the workflow's
+  review recipe (handed to you in your dispatch prompt, fully resolved)
+  verbatim, health-check it, and hand it to the human. Use when a review
+  workspace has a branch checked out and you need to bring up whatever the
+  workflow declares.
 ---
 
-# Running the review serve recipe
+# Running the review recipe
 
 You are on a review workspace and need to make the checked-out branch
-**runnable** for a human. The *how* is not yours to guess — it is declared
+**reviewable** for a human. The *how* is not yours to guess — it is declared
 by the workflow and handed to you, already resolved, in your dispatch
 prompt.
 
 ## The recipe is the source of truth
 
-Look in your dispatch prompt for a **`## Review serve recipe`** section. It
+Look in your dispatch prompt for a **`## Review recipe`** section. It
 carries, with the review slot's port **already substituted in**:
 
 - a **working directory** (relative to the worktree root),
 - an optional **setup** command (install/build — must exit 0),
-- the **serve** command (the dev server, bound to your slot's port),
+- the **serve/run** command (whatever brings the reviewable thing up —
+  a web server, a desktop app, a simulator build — bound to your slot's
+  port when it takes one),
 - an optional **ready** probe, and
-- the **reviewable URL**.
+- the **reviewable URL** when the recipe declares one.
 
 Run it **verbatim**. Do not auto-detect the framework, do not rewrite the
 port flag, and do not read a `PORT` environment variable to pick a port —
 the workflow already made these decisions, workflow-scoped, so a monorepo's
-app / site / docs each serve correctly and concurrent review slots don't
+app / site / docs each run correctly and concurrent review slots don't
 collide on a port.
 
-## No recipe → diff-only
+## No recipe → bring nothing up
 
-If your dispatch prompt has **no** `## Review serve recipe` section, the
-workflow declares no way to serve this branch. That is a **diff-only**
-review: report it in your summary, emit the ready signal with no URL, and
-stop. **Never** fabricate a server or fall back to a framework default
-port — an unrequested server on port 3000 is the exact failure this
+If your dispatch prompt has **no** `## Review recipe` section, the workflow
+declares no way to bring anything up for this branch. Bring **nothing** up:
+present the diff, emit the ready signal with no URL, and stop. Do **not**
+narrate the absence — say nothing about it in your summary. **Never**
+auto-detect a framework or launch anything the workflow didn't declare;
+bringing up an unrequested app or server is the exact failure this
 prevents.
 
 ## Unresolved port → stop and report
@@ -58,11 +62,11 @@ setsid sh -c '<resolved serve command>' >/tmp/review-serve.log 2>&1 &
 #   (or a dedicated tmux window: tmux new-window -d -n serve '<serve cmd>')
 ```
 
-The recipe's serve command already has its port substituted — there is
+The recipe's serve/run command already has its port substituted — there is
 nothing to fill in. To **refresh** for a new branch or a tweak, kill the
-running server first
+running process first
 (`lsof -ti tcp:<port> | xargs kill 2>/dev/null || true`), then start it
-again, so you never stack two servers on one port. You do not reap the port
+again, so you never stack two on one port. You do not reap the port
 at review end — the workflow's review-exit transition kills it by port.
 
 ## Readiness
@@ -81,7 +85,7 @@ that probe does — and your fallback when the app has no HTTP surface
 
 ## Guardrails
 
-- The setup command is one-shot and must exit 0 before you serve.
+- The setup command is one-shot and must exit 0 before you bring it up.
 - If setup or the build **fails**, that is a finding — report it, don't
   patch the project. Loading is your job; fixing is not.
 - Run the recipe verbatim; never invent a port.

@@ -2103,23 +2103,43 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
     }
 
     /// The review charter (§6) must be explicit that the agent loads and
-    /// serves and does NOT modify code — plus carry the recipe-driven
-    /// load/serve mechanics (run the injected serve recipe verbatim, diff-only
-    /// when there is none, the ready signal) so a copy edit can't quietly gut
-    /// the role's contract.
+    /// brings up and does NOT modify code — plus carry the recipe-driven
+    /// load/run mechanics (run the injected review recipe verbatim, bring
+    /// nothing up when there is none, the ready signal) so a copy edit can't
+    /// quietly gut the role's contract.
     #[test]
     fn review_template_contains_required_charter_language() {
-        // Load-and-serve, not keep-coding — the whole point of the role.
+        // Load-and-bring-up, not keep-coding — the whole point of the role.
         assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("do not modify code"));
-        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("runnable for a human"));
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("reviewable for a human"));
         // The human-requested-tweak carve-out must survive edits — it's the
         // sole case the review agent touches code.
         assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("tweak"));
-        // Load/serve mechanics: the workflow's serve recipe (injected into the
-        // dispatch prompt) is the single source of truth, run verbatim.
-        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("Review serve recipe"));
+        // Load/run mechanics: the workflow's review recipe (injected into the
+        // dispatch prompt) is the single source of truth, run verbatim. The
+        // section header must match the injected one (`## Review recipe`).
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("Review recipe"));
         assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("verbatim"));
-        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("diff-only"));
+        // Medium-neutral: no server-centric framing anywhere in the charter.
+        assert!(
+            !DEFAULT_REVIEW_INSTRUCTIONS.contains("serve recipe"),
+            "charter must not use the server-centric `serve recipe` framing"
+        );
+        assert!(
+            !DEFAULT_REVIEW_INSTRUCTIONS.contains("diff-only"),
+            "charter must not narrate a `diff-only` review"
+        );
+        assert!(
+            !DEFAULT_REVIEW_INSTRUCTIONS.contains("port 3000"),
+            "charter must not use the `port 3000` framing"
+        );
+        // No-recipe path: bring nothing up and say nothing about it — the
+        // whole point of the medium-agnostic rewrite.
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("Bring **nothing** up"));
+        assert!(
+            !DEFAULT_REVIEW_INSTRUCTIONS.contains("why no server came up"),
+            "the no-recipe summary must not explain a missing server"
+        );
         // The phantom project-config hook and the "$PORT arrives in the env"
         // contract are gone — an unset port must fail loudly, not silently
         // serve on a framework default.
@@ -2141,17 +2161,26 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
 
     /// The bundled load/run skill ships with valid frontmatter (Claude Code
     /// needs `name:` + `description:` to load it) and teaches the recipe-driven
-    /// contract: run the injected serve recipe verbatim, diff-only when there
-    /// is none, never auto-detect a framework default port.
+    /// contract: run the injected review recipe verbatim, bring nothing up when
+    /// there is none, never auto-detect a framework or an undeclared port.
     #[test]
     fn review_load_run_skill_has_frontmatter_and_recipe_contract() {
         assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.starts_with("---"));
         assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("name: load-run-detection"));
         assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("description:"));
-        // Recipe-driven: the serve recipe is the source of truth, run verbatim.
-        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("Review serve recipe"));
+        // Recipe-driven: the review recipe is the source of truth, run verbatim.
+        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("Review recipe"));
         assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("verbatim"));
-        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("diff-only"));
+        // Medium-neutral no-recipe path: bring nothing up, no server framing.
+        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("Bring **nothing** up"));
+        assert!(
+            !DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("diff-only"),
+            "skill must not use the `diff-only` framing"
+        );
+        assert!(
+            !DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("port 3000"),
+            "skill must not use the `port 3000` framing"
+        );
     }
 
     /// `shelbi init` materializes the review agent alongside the others,
