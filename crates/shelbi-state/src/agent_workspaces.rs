@@ -2028,10 +2028,10 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
             "shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"
         ));
         assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains(
-            "advances only the frozen base ref from `base_sha` to\n  `integration_sha` with Git's compare-and-swap lease"
+            "advances only the frozen base ref from `base_sha`\n  to `integration_sha` with Git's compare-and-swap lease"
         ));
         assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS
-            .contains("Describe atomicity only\n  at that remote-ref update boundary"));
+            .contains("Describe atomicity\n  only at that remote-ref update boundary"));
         assert!(
             crate::zenmode::migrate_legacy_zen_commands(DEFAULT_ORCHESTRATOR_INSTRUCTIONS)
                 .is_none(),

@@ -1,4 +1,4 @@
-Zen: auto-promote eligible backlog, review each handoff yourself (diff vs the task's acceptance criteria + scope), and run the exact-provenance merge flow without asking.
+Zen: auto-promote eligible backlog, review each handoff yourself (diff vs the task's acceptance criteria + scope), and finalize passing work by moving it to done (the workflow's review->done transition owns the merge) without asking.
 
 # Zen Mode policy
 
@@ -84,8 +84,8 @@ conditions to the report:
    `reason=zen:danger-path` with the paths.
 
 If all four pre-PR probe conditions pass, review the diff against the task
-yourself before opening a PR; only if your review passes do the
-pr-create/ci-watch/pr-merge steps run:
+yourself before opening a PR; only if your review passes do the CI + merge
+steps run:
 
 5. **Review the diff against the task.** A green mechanical probe proves the
    branch builds and does not conflict; it does not prove the branch does what
@@ -107,33 +107,59 @@ pr-create/ci-watch/pr-merge steps run:
    one-line summary. For a project that wants a genuinely independent,
    de-biased reviewer instead of this self-review, wire a `qa`/`adversarial`
    gate into the workflow (a first-class status) rather than reviewing here.
+**The workflow's `review -> done` transition owns the merge — do NOT run `shelbi
+zen pr-merge` as part of this finalize.** In the default `task` workflow that
+transition is `actions: [push_branch, merge]`, and the earlier `in-progress ->
+review` transition already ran `push_branch` + `open_pr`, so a PR for this branch
+already exists. Your job is to gate on green CI and then *trigger that
+transition* by moving the card to `done`. Running `zen pr-merge` first
+double-merges: it squash-merges + deletes the branch itself, and then the
+transition's `merge` action finds the branch already merged and strands the card
+in `review` ("branch not on origin" / empty-commit failure). One merge, owned by
+the workflow.
+
 6. Freeze the probe's `repository`, `repository_id`, `base_branch`, `base_sha`,
-   `integration_sha`, and `head_sha`. Run `shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
+   `integration_sha`, and `head_sha`. If the branch has no open PR or its
+   provenance drifted, run `shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
    using those exact values, and also pass `--match-published-head-commit <published_head_sha>`
-   from the probe's `published_head_sha` field. When the probe rebased the branch
-   onto a moved base, `head_sha` is a local-only commit while `published_head_sha`
-   is the pre-rebase tip the remote branch still points at; that flag lets
-   pr-create replace the tip it reviewed instead of refusing it as a concurrent
-   update. Capture the PR number it prints. Exit code 75 means the push landed
-   but GitHub's PR view had not caught up yet: re-run the exact same command (it
-   is idempotent). Exit code 1 is a real mismatch: leave the task in `handoff`
-   and re-probe.
+   from the probe's `published_head_sha` field, to (re)open and realign the PR so
+   CI runs. When the probe rebased the branch onto a moved base, `head_sha` is a
+   local-only commit while `published_head_sha` is the pre-rebase tip the remote
+   branch still points at; that flag lets pr-create replace the tip it reviewed
+   instead of refusing it as a concurrent update. Capture the PR number it
+   prints. Exit code 75 means the push landed but GitHub's PR view had not caught
+   up yet: re-run the exact same command (it is idempotent). Exit code 1 is a
+   real mismatch: leave the task in `handoff` and re-probe.
 7. Run `shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --timeout 15m`
    using that same probe identity. Stdout is `green`,
    `red:<check>:<summary>`, or `timeout`. The condition: must be `green`.
    Any identity movement fails closed; never recompute or substitute a probe
    field after CI begins.
-8. If green, run `shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
-   with that same identity. The command verifies the candidate has sole parent
-   `base_sha` and the exact tree of `head_sha`, then atomically advances only
-   `refs/heads/<base_branch>` from `base_sha` to `integration_sha` with Git's
-   compare-and-swap lease. If branch protection, rulesets, a merge queue, a
-   fork, permissions, or a non-squash strategy prevent that exact-ref path,
-   leave the task in `handoff` and follow the command's human-review action.
-   Only after a candidate SHA result, move the task into `done` and emit
-   `reason=orchestrator:zen-merge` with the merge SHA.
+8. If green, finalize by moving the task to `done` — the transition merges:
+   `shelbi task move <task-id> --to done --reason "orchestrator:zen-merge
+   ci-green(<pr-number>)"`. The `review -> done` transition squash-merges into
+   `<base_branch>` and deletes the branch — this is the only merge. Do **not**
+   run `zen pr-merge` here.
 9. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
    or `reason=zen:ci-timeout`.
+
+## Release flow
+
+`shelbi zen pr-merge` is **not** part of the ordinary review->done finalize above
+— that merge is owned by the workflow transition. It remains the right tool for
+the **Release flow**: version-bump / package-manager PRs (a Cargo version bump, a
+Homebrew-tap formula PR) that are *not* governed by a `review -> done`
+transition. Once you have authorization to cut a release, carrying it to
+published is part of the flow — those mechanical bump PRs get CI-green + scope
+verification, not a human review gate. For such a PR, after its CI is green, land
+it with the exact-provenance
+`shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
+(or `gh pr merge <n> --squash --delete-branch` for a tap PR on another repo). The
+command verifies the candidate has sole parent `base_sha` and the exact tree of
+`head_sha`, then atomically advances only `refs/heads/<base_branch>` from
+`base_sha` to `integration_sha` with Git's compare-and-swap lease. If branch
+protection, rulesets, a merge queue, a fork, permissions, or a non-squash
+strategy prevent that exact-ref path, follow the command's human-review action.
 
 ## Customization
 

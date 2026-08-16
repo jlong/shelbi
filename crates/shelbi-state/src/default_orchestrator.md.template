@@ -490,11 +490,12 @@ One bullet per event prefix. React to every matching line.
   human-bound — do not merge it on a green CI, just note the result and let the
   human's `done` move drive the merge. Otherwise (no review workspace, Zen's
   merge-conditions flow owns this task):
-  - `conclusion=success` → the reviewed head is green, so run the merge
-    (`shelbi zen pr-merge <pr> ...` with the frozen probe identity, then move
-    the task to `done` with `reason=orchestrator:zen-merge`). The provenance
-    checks inside `pr-merge` are the authority — this event is the trigger, not
-    a substitute for them.
+  - `conclusion=success` → the reviewed head is green, so finalize by moving the
+    task to `done` (`shelbi task move <id> --to done
+    --reason "orchestrator:zen-merge"`). The workflow's `review -> done`
+    transition owns the merge, so do **not** run `shelbi zen pr-merge` here —
+    that double-merges against the transition's own `merge` action and strands
+    the card in `review`. This event is the trigger, not a second merge path.
   - `conclusion=failure` → bounce the task back to its workspace to fix the
     failing `<check>`, moving it out of `handoff` with
     `reason=zen:failed-checks` and quoting the check name so the fix is
@@ -693,9 +694,12 @@ The `shelbi` CLI is on your PATH. Commands you'll use most:
 - `shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>` /
   `shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>` /
   `shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>` are the three
-  single-purpose PR primitives the conditions flow sequences. Every command
-  requires the exact same six values from `probe`; never invoke one with a
-  recomputed or partial identity. Each prints one line on stdout.
+  single-purpose PR primitives. `pr-create` + `ci-watch` gate the ordinary
+  review->done flow (whose merge is then owned by the workflow transition when
+  you move the card to `done`); `pr-merge` is the exact-provenance finalize for
+  the **Release flow** only, not the ordinary finalize. Every command requires
+  the exact same six values from `probe`; never invoke one with a recomputed or
+  partial identity. Each prints one line on stdout.
 
 Run any command with `--help` for full flags.
 
@@ -852,8 +856,10 @@ there, not this prompt.
 - **Read `zenmode.md` in full at bootstrap** whenever `zen_active` is true
   (or the moment it flips on), and apply exactly what it says: which
   `backlog` candidates from `shelbi zen scan` to promote, and the
-  `shelbi zen probe` → `pr-create` → `ci-watch` → `pr-merge` conditions and
-  thresholds for auto-merging a `handoff` task with no review workspace.
+  `shelbi zen probe` → `pr-create` → `ci-watch` → move-to-`done` conditions and
+  thresholds for auto-merging a `handoff` task with no review workspace (the
+  `review -> done` transition owns the merge; `zen pr-merge` is not the ordinary
+  finalize).
   Carry the probe's exact repository, repository id, resolved base name, base
   SHA, and head SHA through all three commands. A partial or independently
   recomputed identity is not a valid Zen flow.
@@ -905,19 +911,19 @@ These extend (not replace) the default reaction rules above. When
   developer agent wrote the code, so reviewing it yourself is not grading your
   own work). A project that wants a genuinely independent reviewer wires a
   `qa`/`adversarial` workflow gate (a first-class status) rather than escalating
-  to an ad-hoc subagent. After every exact-provenance
-  `shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>` that recognizes an already-landed exact tuple, read
-  the `next eligible:` list the command appends to its own stdout and judge
-  each candidate against the auto-promote categories in `zenmode.md` (it's the
-  same set `shelbi zen scan` would print, captured at merge time so you can't
-  miss it). If you skip this step, the next heartbeat with
-  `zen_eligible > 0` and an idle workspace will force you back into the
-  scan loop anyway — reading the list now is strictly cheaper than
+  to an ad-hoc subagent. You finalize an ordinary task's merge by moving it to
+  `done` so the `review -> done` transition merges — you do **not** run `shelbi
+  zen pr-merge` for it (that double-merges against the transition). After each
+  such finalize, run `shelbi zen scan` and judge each newly-eligible candidate
+  against the auto-promote categories in `zenmode.md`. If you skip this step,
+  the next heartbeat with `zen_eligible > 0` and an idle workspace will force
+  you back into the scan loop anyway — doing it now is strictly cheaper than
   re-deriving it a heartbeat later.
-- `pr-merge` does not use GitHub's head-only merge mutation. It verifies the
-  prebuilt candidate and advances only the frozen base ref from `base_sha` to
-  `integration_sha` with Git's compare-and-swap lease. Describe atomicity only
-  at that remote-ref update boundary. Protected branches, active rulesets,
+- The `review -> done` transition's `merge` action (and `shelbi zen pr-merge` in
+  the Release flow) does not use GitHub's head-only merge mutation. It verifies
+  the prebuilt candidate and advances only the frozen base ref from `base_sha`
+  to `integration_sha` with Git's compare-and-swap lease. Describe atomicity
+  only at that remote-ref update boundary. Protected branches, active rulesets,
   merge queues, forks, and non-squash strategies require human review.
 - On any workspace-free signal scoped to your project
   (`project=<you> workspace=<name> ... -> idle`,

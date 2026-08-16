@@ -39,7 +39,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
-use shelbi_core::{validate_project_name, Column, LOCAL_PROJECT_FIELDS, SHARED_PROJECT_FIELDS};
+use shelbi_core::{
+    validate_project_name, Column, ProjectStatuses, StatusCategory, LOCAL_PROJECT_FIELDS,
+    SHARED_PROJECT_FIELDS,
+};
 
 use super::config_surfaces::{live_entries, locate_key, InventoryEntry, Location, SurfaceFormat};
 
@@ -212,6 +215,10 @@ pub fn detect(projects: &[String]) -> Result<UpgradeReport> {
     }
     // File-shape (sibling-rename) sniffers work off the entry set as a whole.
     sniff_renamed_siblings(&entries, &mut findings);
+    // The Zen finalize sniffer is per-project and cross-surface (it correlates a
+    // prose surface with the project's workflow transitions), so it also runs
+    // over the whole entry set rather than one surface at a time.
+    sniff_zen_finalize(&entries, &mut findings);
 
     findings.sort_by(|a, b| {
         (&a.file, a.location.line, a.location.column, &a.code).cmp(&(
@@ -1020,6 +1027,248 @@ fn sibling_finding(
 }
 
 // ---------------------------------------------------------------------------
+// Zen finalize (review->done) double-merge sniffer
+
+/// Flag a `zenmode.md` or orchestrator `instructions.md` whose merge/finalize
+/// prose still runs `shelbi zen pr-merge` as part of the ordinary review->done
+/// finalize, in a project whose `review -> done` transition *already* merges.
+///
+/// That combination double-merges: `zen pr-merge` squash-merges + deletes the
+/// branch, and then the transition's own `merge` action finds the branch already
+/// merged and strands the card in `review`. The corrected policy is
+/// gate-then-transition — gate on green CI (`zen ci-watch`), then finalize by
+/// moving the card to `done` and let the transition own the single merge.
+///
+/// This is a *cross-surface, per-project* sniffer (it correlates a prose surface
+/// with the project's workflow YAML), so it takes the whole entry set. The prose
+/// is user-customizable, so every finding is [`Classification::NeedsJudgment`]:
+/// there is no safe deterministic rewrite of free-form instructions.
+fn sniff_zen_finalize(entries: &[InventoryEntry], out: &mut Vec<UpgradeFinding>) {
+    // Group the project surfaces by scope so the workflow-transition check and
+    // the prose sniff share one project's entries.
+    let mut by_project: std::collections::BTreeMap<&str, Vec<&InventoryEntry>> =
+        std::collections::BTreeMap::new();
+    for e in entries {
+        if e.scope.starts_with("project:") {
+            by_project.entry(e.scope.as_str()).or_default().push(e);
+        }
+    }
+
+    for project_entries in by_project.values() {
+        // Only the projects whose review->done transition owns a merge can
+        // double-merge — everywhere else `zen pr-merge` is the legitimate
+        // finalize, not a deprecation. Conservative gate.
+        if !project_review_done_merges(project_entries) {
+            continue;
+        }
+        for entry in project_entries {
+            if !entry.exists {
+                continue;
+            }
+            let is_zenmode = entry.logical_id.ends_with(".zenmode");
+            let is_orchestrator_instructions = entry
+                .logical_id
+                .ends_with(".agent.orchestrator.instructions");
+            if !(is_zenmode || is_orchestrator_instructions) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&entry.canonical_path) else {
+                continue;
+            };
+            if let Some(line) = deprecated_pr_merge_finalize_line(&text) {
+                out.push(finding(
+                    entry,
+                    Classification::NeedsJudgment,
+                    "ZEN_PR_MERGE_DOUBLE_MERGE",
+                    "the review->done finalize runs `shelbi zen pr-merge` and then moves the task \
+                     to `done`, but this project's `review -> done` transition already merges — \
+                     running both double-merges the branch and strands the card in `review`",
+                    "Drop `shelbi zen pr-merge` from the review->done finalize: gate on green CI \
+                     with `shelbi zen ci-watch`, then finalize by moving the card (`shelbi task \
+                     move <task> --to done`) and let the workflow's `review -> done` transition \
+                     own the single merge. Keep `zen pr-merge` only for the Release flow (external \
+                     version-bump / Homebrew-tap PRs, which no review->done transition governs).",
+                    Location { line, column: 1 },
+                ));
+            }
+        }
+    }
+}
+
+/// True when any of `project`'s workflows declares a transition from a
+/// **handoff**-category status to a **done**-category status whose actions
+/// include `merge` — the "review -> done transition already merges" precondition
+/// for the double-merge hazard. Status categories are resolved from the
+/// project's `statuses.yaml`; when it's absent the built-in default ids
+/// (`review` = handoff, `done` = done) are the fallback so a stock project still
+/// gates correctly.
+fn project_review_done_merges(entries: &[&InventoryEntry]) -> bool {
+    let statuses = entries
+        .iter()
+        .find(|e| e.logical_id.ends_with(".statuses") && e.exists)
+        .and_then(|e| std::fs::read_to_string(&e.canonical_path).ok())
+        .and_then(|t| ProjectStatuses::from_yaml_str(&t).ok());
+
+    let category_of = |id: &str| -> Option<StatusCategory> {
+        if let Some(s) = statuses.as_ref().and_then(|s| s.get(id)) {
+            return Some(s.category);
+        }
+        match id {
+            "done" => Some(StatusCategory::Done),
+            "review" => Some(StatusCategory::Handoff),
+            _ => None,
+        }
+    };
+
+    for entry in entries {
+        if !entry.logical_id.contains(".workflow.") || !entry.exists {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&entry.canonical_path) else {
+            continue;
+        };
+        let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+            continue;
+        };
+        let Some(transitions) = get(&value, "transitions").and_then(Value::as_sequence) else {
+            continue;
+        };
+        for t in transitions {
+            let has_merge = get(t, "actions")
+                .and_then(Value::as_sequence)
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("merge")));
+            if !has_merge {
+                continue;
+            }
+            let (Some(from), Some(to)) = (
+                get(t, "from").and_then(Value::as_str),
+                get(t, "to").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if category_of(from) == Some(StatusCategory::Handoff)
+                && category_of(to) == Some(StatusCategory::Done)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The 1-based line of the first `zen pr-merge` finalize *step* in `text`, or
+/// `None` if the prose is already on the corrected gate-then-transition policy.
+///
+/// Conservative content-sniff — a line is a deprecated finalize step only when
+/// **all** hold:
+/// * it mentions `zen pr-merge` (a casual mention of the bare `pr-merge`
+///   sub-command in a slash-separated pipeline like `ci-watch → pr-merge` is not
+///   matched — only the qualified `zen pr-merge` command);
+/// * it is **not** in a `Release`-flow section (that `zen pr-merge` is legitimate
+///   and stays);
+/// * it is **not** a negation/warning (the corrected prose says "you do NOT run
+///   `zen pr-merge`" / "running it double-merges", which mention the command only
+///   to forbid it);
+/// * it reads as an **imperative** to run the command (the mention line, or one
+///   of the two preceding non-Release lines, carries a run verb) — this excludes
+///   the CLI-reference block that merely lists `pr-merge` as an available
+///   primitive.
+///
+/// The whole document must also, outside any Release section, instruct moving a
+/// task to `done` — the "…then move to `done`" half of the deprecated finalize.
+/// Both guards together separate the deprecated finalize from the corrected
+/// prose, the Release flow, and a bare command listing.
+fn deprecated_pr_merge_finalize_line(text: &str) -> Option<usize> {
+    let lines: Vec<&str> = text.lines().collect();
+    // Precompute, per line: whether it sits inside a `Release` heading's section,
+    // and a normalized-lowercase form with markdown emphasis (`*`) and code
+    // backticks stripped — so `do **not** run \`shelbi zen pr-merge\`` still reads
+    // as the "do not run" negation and the bare command text, despite the markup
+    // and despite soft-wrapping that can split the command across lines.
+    let mut in_release = false;
+    let mut release_flags = Vec::with_capacity(lines.len());
+    let mut lowers = Vec::with_capacity(lines.len());
+    for line in &lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            let heading = trimmed.trim_start_matches('#').to_ascii_lowercase();
+            in_release = heading.contains("release");
+        }
+        release_flags.push(in_release);
+        lowers.push(line.to_ascii_lowercase().replace(['*', '`'], ""));
+    }
+
+    let has_move_to_done = (0..lines.len())
+        .any(|i| !release_flags[i] && mentions_move_to_done(&lowers[i]));
+    if !has_move_to_done {
+        return None;
+    }
+
+    let join_window = |range: std::ops::RangeInclusive<usize>| -> String {
+        // Collapse all whitespace (including each line's indentation) to single
+        // spaces so a marker like "do not run" still matches when the negation
+        // and the command wrap across two indented lines.
+        range
+            .filter(|&j| j < lines.len() && !release_flags[j])
+            .flat_map(|j| lowers[j].split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    for i in 0..lines.len() {
+        if release_flags[i] || !lowers[i].contains("zen pr-merge") {
+            continue;
+        }
+        // A negation/warning mention (the corrected prose) is never a step. The
+        // warning framing can wrap either side of the command — "owns the merge —
+        // do not run \n`zen pr-merge`" before it, "Running `zen pr-merge` first
+        // \ndouble-merges" after it — so scan two lines each way.
+        if is_negated_pr_merge(&join_window(i.saturating_sub(2)..=i + 2)) {
+            continue;
+        }
+        // Only an imperative "run" mention is the deprecated finalize step; a bare
+        // CLI-reference listing has no run verb in its (backward) window. Look
+        // back, not forward, so an unrelated later "run scan" can't promote a
+        // reference mention into a false step.
+        if mentions_run_verb(&join_window(i.saturating_sub(2)..=i)) {
+            return Some(i + 1);
+        }
+    }
+    None
+}
+
+/// A line that instructs moving a task/card to the `done` status — the finalize
+/// half of the deprecated flow (and the whole of the corrected one).
+fn mentions_move_to_done(lower: &str) -> bool {
+    lower.contains("--to done")
+        || (lower.contains("move") && lower.contains("done"))
+}
+
+/// A line carrying a run verb, marking a `zen pr-merge` mention as an imperative
+/// step rather than a reference listing.
+fn mentions_run_verb(lower: &str) -> bool {
+    lower.contains("run") || lower.contains("if green")
+}
+
+/// A `zen pr-merge` mention that *forbids* or *warns against* the command rather
+/// than instructing it — the corrected prose ("you do NOT run `zen pr-merge`",
+/// "running it double-merges", "the transition owns the merge").
+fn is_negated_pr_merge(lower: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "do not run",
+        "don't run",
+        "not run",
+        "double-merge",
+        "double merge",
+        "owns the merge",
+        "instead of",
+        "no longer",
+        "must not",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 
 fn finding(
@@ -1100,6 +1349,12 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
             "These are prose instructions a project may have forked and customized, so \
              the medium-agnostic wording can't be merged in mechanically without risking \
              local edits — the orchestrator refreshes its own copy instead."
+        }
+        "ZEN_PR_MERGE_DOUBLE_MERGE" => {
+            "The merge/finalize prose is free-form and user-customizable, so the corrected \
+             gate-then-transition policy can't be applied by a mechanical rewrite without \
+             risking loss of local edits — the orchestrator repairs its own copy with judgment, \
+             preserving customizations."
         }
         _ => "This form is ambiguous or potentially lossy, so a human should confirm the fix.",
     }
@@ -1834,5 +2089,161 @@ workspaces:
             .map(|r| needs_judgment_report(&r))
             .unwrap_or_else(empty_report);
         assert!(nj.findings.is_empty(), "clean config surfaced needs-judgment");
+    }
+
+    // ---- zen finalize (review->done) double-merge ------------------------
+
+    const DEPRECATED_ZENMODE: &str = "\
+# Zen Mode policy
+
+## Merge conditions
+
+8. If green, run `shelbi zen pr-merge <pr-number> --match-repository <r>` with that
+   identity. Only after a candidate SHA result, move the task into `done`.
+";
+
+    const CORRECTED_ZENMODE: &str = "\
+# Zen Mode policy
+
+## Merge conditions
+
+The workflow's `review -> done` transition owns the merge — you do NOT run
+`shelbi zen pr-merge`. Running `zen pr-merge` first double-merges.
+
+8. If green, finalize with `shelbi task move <task-id> --to done` and let the
+   transition own the single merge.
+
+## Release flow
+
+Once authorized, open the release PR; when CI is green, squash-merge it yourself.
+";
+
+    #[test]
+    fn deprecated_pr_merge_finalize_flags_deprecated_and_ignores_the_rest() {
+        // Deprecated finalize: an imperative `zen pr-merge` step + a move to done.
+        assert!(deprecated_pr_merge_finalize_line(DEPRECATED_ZENMODE).is_some());
+
+        // Corrected prose: every `zen pr-merge` mention is a negation/warning.
+        assert!(deprecated_pr_merge_finalize_line(CORRECTED_ZENMODE).is_none());
+
+        // Release-flow `zen pr-merge` (in a `## Release flow` section) is fine.
+        let release_only = "\
+# Zen Mode policy
+
+## Merge conditions
+
+8. If green, finalize by moving the card: `shelbi task move <task> --to done`.
+
+## Release flow
+
+Open the release PR; once green, run `shelbi zen pr-merge <pr> --match-repository <r>`
+to land the version bump.
+";
+        assert!(deprecated_pr_merge_finalize_line(release_only).is_none());
+
+        // A bare CLI-reference listing of the `pr-merge` primitive (no run verb
+        // in the mention window) is not a finalize step.
+        let reference = "\
+# Zen Mode policy
+
+## Merge conditions
+
+Finalize by moving the card: `shelbi task move <task> --to done`.
+
+## Commands
+
+- `shelbi zen pr-create <task> --match-repository <r>` /
+  `shelbi zen ci-watch <pr> --match-repository <r>` /
+  `shelbi zen pr-merge <pr> --match-repository <r>` are the three PR primitives.
+";
+        assert!(deprecated_pr_merge_finalize_line(reference).is_none());
+
+        // A doc that never instructs moving to `done` isn't the finalize context.
+        let no_finalize = "8. run `shelbi zen pr-merge <pr> --match-repository <r>`.\n";
+        assert!(deprecated_pr_merge_finalize_line(no_finalize).is_none());
+    }
+
+    fn write_zen_project(home: &Path, zenmode: &str, merge_action: &str) {
+        std::fs::write(home.join("projects/demo.yaml"), "repo: /tmp/demo\n").unwrap();
+        let workflows = home.join("projects/demo/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(
+            workflows.join("statuses.yaml"),
+            "statuses:\n- id: review\n  name: Review\n  category: handoff\n\
+             - id: done\n  name: Done\n  category: done\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workflows.join("task.yaml"),
+            format!(
+                "name: task\nstatuses:\n- id: review\n- id: done\n\
+                 transitions:\n- from: review\n  to: done\n  actions:\n  - {merge_action}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(home.join("projects/demo/zenmode.md"), zenmode).unwrap();
+    }
+
+    #[test]
+    fn zen_finalize_finding_fires_only_when_transition_merges_and_prose_is_deprecated() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME"]);
+        guard.set("SHELBI_HOME", &home);
+
+        // Deprecated zenmode + a `review -> done` transition that merges: flagged.
+        write_zen_project(&home, DEPRECATED_ZENMODE, "merge");
+        let report = detect(&["demo".to_string()]).unwrap();
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.code == "ZEN_PR_MERGE_DOUBLE_MERGE")
+            .expect("deprecated zenmode not flagged");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert_eq!(f.scope, "project:demo");
+        assert!(f.logical_id.ends_with(".zenmode"), "surface: {}", f.logical_id);
+        assert!(f.proposed_fix.contains("--to done"), "fix: {}", f.proposed_fix);
+        assert!(!f.rationale.is_empty());
+        assert!(f.id.starts_with("cfg-"));
+
+        // Same deprecated prose, but the transition does NOT merge (the finalize
+        // legitimately owns the merge via `zen pr-merge`): no finding.
+        let home2 = fresh_home();
+        let guard2 = EnvGuard::new(&["SHELBI_HOME"]);
+        guard2.set("SHELBI_HOME", &home2);
+        write_zen_project(&home2, DEPRECATED_ZENMODE, "push_branch");
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report.findings.iter().any(|f| f.code == "ZEN_PR_MERGE_DOUBLE_MERGE"),
+            "flagged a project whose transition doesn't merge"
+        );
+
+        // Corrected prose + a merging transition: no false positive.
+        let home3 = fresh_home();
+        let guard3 = EnvGuard::new(&["SHELBI_HOME"]);
+        guard3.set("SHELBI_HOME", &home3);
+        write_zen_project(&home3, CORRECTED_ZENMODE, "merge");
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report.findings.iter().any(|f| f.code == "ZEN_PR_MERGE_DOUBLE_MERGE"),
+            "corrected zenmode falsely flagged"
+        );
+    }
+
+    #[test]
+    fn shipped_default_templates_carry_the_corrected_flow() {
+        // Belt-and-suspenders: a fresh `shelbi init` ships these two Markdown
+        // surfaces, and the sniffer must not fire on either (acceptance:
+        // "fresh init yields no finding"). This also guards future template
+        // edits from silently reintroducing the double-merge finalize.
+        assert!(
+            deprecated_pr_merge_finalize_line(shelbi_state::DEFAULT_ZENMODE).is_none(),
+            "shipped default zenmode.md still trips the double-merge sniffer"
+        );
+        assert!(
+            deprecated_pr_merge_finalize_line(shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS)
+                .is_none(),
+            "shipped default orchestrator instructions.md still trips the double-merge sniffer"
+        );
     }
 }
