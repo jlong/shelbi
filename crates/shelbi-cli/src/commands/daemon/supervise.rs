@@ -458,8 +458,15 @@ fn legacy_gui_target(uid: u32) -> String {
 /// install.
 #[cfg(target_os = "macos")]
 fn migrate_legacy_launchd(uid: u32) {
+    // Silence stdout/stderr like [`bootstrap_launchd`] does: when no
+    // legacy-labeled daemon is loaded (every fresh install, and every
+    // upgrade that isn't from a pre-rename version), `bootout` exits
+    // non-zero and prints "Boot-out failed: 3: No such process". That is
+    // the expected no-op case, not an error the installer should surface.
     let _ = Command::new("launchctl")
         .args(["bootout", &legacy_gui_target(uid)])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     match legacy_launch_agent_plist_path() {
         Ok(path) if path.exists() => match fs::remove_file(&path) {
