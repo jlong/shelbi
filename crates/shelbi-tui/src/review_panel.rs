@@ -41,6 +41,7 @@ use ratatui::{
     widgets::{List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
+use unicode_width::UnicodeWidthStr;
 
 /// Which middle-pane view is currently shown. `Browser` isn't a persistent
 /// view — it opens the system browser — so only `Chat` / `Diff` / `Vim` are
@@ -366,6 +367,15 @@ impl ReviewPanel {
 
 }
 
+/// Display column width of `s`, honoring wide glyphs. The sidebar's folder
+/// emoji renders as a 2-cell glyph, so a plain `chars().count()` under-counts
+/// it by a column and any budget derived from that overruns the row. Measuring
+/// with `unicode-width` is what lets the folder row reserve the emoji's real
+/// width before truncating the path.
+fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
 /// Left-truncate `path` to at most `width` columns, prefixing `...` when it's
 /// clipped, so the tail (the folder name the reviewer cares about) always
 /// stays visible: `/a/b/c/.shelbi/wt/review` → `...ct/.shelbi/wt/review`.
@@ -381,6 +391,23 @@ pub fn truncate_left(path: &str, width: usize) -> String {
     let keep = width - 3;
     let tail: String = chars[chars.len() - keep..].iter().collect();
     format!("...{tail}")
+}
+
+/// The folder emoji + space that prefixes the sidebar's worktree row. Kept as a
+/// named constant so the budget math and the rendered line can never drift.
+const FOLDER_PREFIX: &str = "📂 ";
+
+/// Compose the sidebar folder row — `"📂 <path>"` — fitting the whole line
+/// (emoji + space + path) within `width` columns. The prefix renders as a
+/// 2-cell emoji plus a 1-cell space, so its display width is reserved *before*
+/// left-truncating the path; otherwise the composed line runs ~3 columns past
+/// `width` and the terminal clips the tail — the final folder segment the
+/// reviewer needs (`wt/review` clipped to `wt/rev`). Front elision with `...`
+/// still kicks in once the reserved budget requires it.
+fn folder_row_text(worktree: &str, width: usize) -> String {
+    let budget = width.saturating_sub(display_width(FOLDER_PREFIX)).max(1);
+    let label = truncate_left(worktree, budget);
+    format!("{FOLDER_PREFIX}{label}")
 }
 
 /// 1-col horizontal padding shared by every non-nav row. The switch nav block
@@ -648,13 +675,12 @@ fn render_row(app: &ReviewPanel, row: &PanelRow, selected: bool, width: usize) -
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ))),
         PanelRow::Folder => {
-            let label = truncate_left(&app.worktree, width.max(1));
             let style = if selected {
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)
             };
-            ListItem::new(Line::from(Span::styled(format!("📂 {label}"), style)))
+            ListItem::new(Line::from(Span::styled(folder_row_text(&app.worktree, width), style)))
         }
         PanelRow::Blank => ListItem::new(Line::raw("")),
         PanelRow::Section(label) => ListItem::new(Line::from(Span::styled(
@@ -1073,6 +1099,39 @@ mod tests {
         assert_eq!(truncate_left("short", 20), "short");
         assert!(truncate_left("/very/long/path/here", 12).starts_with("..."));
         assert!(truncate_left("/very/long/path/here", 12).ends_with("path/here"));
+    }
+
+    #[test]
+    fn folder_row_reserves_the_emoji_prefix_before_truncating() {
+        // Regression: the composed "📂 <path>" line used to hand the full row
+        // width to truncate_left and then prepend the emoji, overrunning the
+        // row by the prefix's ~3 cells and clipping the tail (`wt/review` →
+        // `wt/rev`). Reserve the prefix width first.
+        let worktree = "/Users/jlong/Workspaces/32pixels/ContextStore/.shelbi/wt/review";
+        for width in [16_usize, 20, 24, 30, 40] {
+            let line = folder_row_text(worktree, width);
+            // (a) The whole composed line fits within the row — no right clip.
+            assert!(
+                display_width(&line) <= width,
+                "line {line:?} (w={}) overruns row width {width}",
+                display_width(&line),
+            );
+            // (b) The final path segment survives intact — the reviewer's
+            // identifying folder name, never a clipped `wt/rev`.
+            assert!(
+                line.ends_with("wt/review"),
+                "line {line:?} lost the trailing segment at width {width}",
+            );
+            // Still emoji-prefixed.
+            assert!(line.starts_with(FOLDER_PREFIX));
+        }
+
+        // Front elision still engages once the prefix-reserved budget is tight.
+        let tight = folder_row_text(worktree, 18);
+        assert!(
+            tight.contains("..."),
+            "expected front elision at a narrow width, got {tight:?}",
+        );
     }
 
     #[test]
