@@ -614,6 +614,14 @@ A workspace is free when no `active`-category task is assigned to it. Derive
 free-status from your bootstrap snapshot and keep it current from the
 event stream — don't re-run `shelbi workspace list` on every event.
 
+**Exclude `review`-tagged workspaces from the dev-dispatch pool.** A review
+slot (a workspace whose effective tags include `review`) exists only to load a
+handed-off branch and serve it for a human to inspect — it is filled from the
+review queue, not by auto-dispatch. An idle review slot is **not** available dev
+capacity, so never pick it as a target for a normal task. `shelbi task start` /
+`task assign` enforce this too — they refuse a review slot unless a human passes
+`--force` — but keep review slots out of your candidate set in the first place.
+
 One exception: an otherwise-free workspace can be **occupied by the user**.
 Clicking an idle workspace in the sidebar opens a plain shell in its window,
 and `shelbi workspace list` shows that slot as `occupied (user shell)`. Skip

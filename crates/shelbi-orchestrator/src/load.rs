@@ -992,6 +992,37 @@ mod tests {
         );
     }
 
+    /// The CLI `task start`/`task assign` review-slot guard (which refuses to
+    /// route a normal dev task onto a `review`-tagged slot without `--force`)
+    /// lives in the CLI handlers only. The autoload review path never goes
+    /// through them: a review-routed task (unassigned, or still on its dev slot)
+    /// is planned straight onto a free review slot with no `--force` involved.
+    /// This pins that the guard leaves the legitimate review-load path alone.
+    #[test]
+    fn plan_routes_review_task_onto_review_slot_without_force() {
+        let project = tagged_project();
+        // A queued review card still pointing at its dev slot, plus one still
+        // unassigned — both belong on a review slot, and the planner puts them
+        // there directly (the autoloader never consults the CLI guard).
+        let review = [
+            tf(review_task_pri("from-dev", Some("alpha"), 0)),
+            tf(review_task_pri("unassigned", None, 1)),
+        ];
+        let free = vec![
+            project.workspace("review-1").unwrap().clone(),
+            project.workspace("review-2").unwrap().clone(),
+        ];
+        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new());
+        assert_eq!(
+            plan,
+            vec![
+                ("from-dev".to_string(), "review-1".to_string()),
+                ("unassigned".to_string(), "review-2".to_string()),
+            ],
+            "autoload must still place review-routed tasks onto review slots",
+        );
+    }
+
     #[test]
     fn plan_skips_tasks_already_serving_on_a_review_slot() {
         let project = tagged_project();
