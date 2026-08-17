@@ -334,10 +334,11 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
         } => {
             // Two-line review entry (spec §16). Line 1: decoration badge +
             // title, with the `machine:port` URL right-aligned only when the
-            // review server is confirmed serving (Ready — cyan ✓); a Queued
-            // task (loading ▶ or pending ·) has no location yet. Line 2:
-            // branch, dim. The badge glyph/color come from `row.decoration()`,
-            // the single source shared with the palette.
+            // review server is confirmed serving (Ready — cyan ✓); a still-
+            // loading Ready task (▶, no ✓) or a Queued pending task (·) has no
+            // location yet. Line 2: branch, dim. The badge glyph/color come
+            // from `row.decoration()`, the single source shared with the
+            // palette — so the ✓ is gated on Serving, never on section.
             let dec = row
                 .decoration()
                 .expect("review rows always have a decoration");
@@ -1292,20 +1293,33 @@ mod tests {
 
     /// Both review sections render as two-line entries (spec §16): line 1 is
     /// the decoration badge + title (+ a right-aligned `machine:port` URL for
-    /// a Ready item), line 2 is the branch, dim. Ready uses ✓; Queued uses ·.
+    /// a serving Ready item), line 2 is the branch, dim. A serving Ready item
+    /// uses ✓; a still-loading Ready item uses ▶ (no ✓); Queued uses ·.
     #[test]
     fn review_sections_render_two_line_entries_with_badge_url_and_branch() {
         let backend = TestBackend::new(44, 24);
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new_sidebar("demo");
-        app.ready_review = vec![crate::app::ReviewEntry {
-            task_id: "palette".into(),
-            title: "Palette fuzzy-match fix".into(),
-            branch: "shelbi/palette-fuzzy-match-fix".into(),
-            location: Some("hub:3000".into()),
-            workspace: Some("review-1".into()),
-            state: crate::app::ReviewState::Serving,
-        }];
+        app.ready_review = vec![
+            crate::app::ReviewEntry {
+                task_id: "palette".into(),
+                title: "Palette fuzzy-match fix".into(),
+                branch: "shelbi/palette-fuzzy-match-fix".into(),
+                location: Some("hub:3000".into()),
+                workspace: Some("review-1".into()),
+                state: crate::app::ReviewState::Serving,
+            },
+            // A task still loading onto its slot sits under Ready too, but
+            // renders WITHOUT the ✓ (a ▶ instead) and with no location.
+            crate::app::ReviewEntry {
+                task_id: "nav".into(),
+                title: "Homepage nav fix".into(),
+                branch: "shelbi/homepage-nav-fix".into(),
+                location: None,
+                workspace: Some("review-2".into()),
+                state: crate::app::ReviewState::Loading,
+            },
+        ];
         app.queued_review = vec![crate::app::ReviewEntry {
             task_id: "onboarding".into(),
             title: "Rework onboarding copy".into(),
@@ -1344,6 +1358,29 @@ mod tests {
             rows[ready_y + 1].contains("shelbi/palette-fuzzy-match-fix"),
             "branch renders on the line directly below the title, got: {:?}",
             rows[ready_y + 1]
+        );
+
+        // Loading item under Ready: a ▶ badge, NO ✓, and no location URL.
+        let loading_y = row_y(&rows, "Homepage nav fix");
+        assert!(
+            row_y(&rows, "Ready for Review") < loading_y
+                && loading_y < row_y(&rows, "Queued for Review"),
+            "the loading row renders under Ready, above Queued, got:\n{joined}"
+        );
+        assert!(
+            rows[loading_y].contains('▶'),
+            "loading row carries ▶, got: {:?}",
+            rows[loading_y]
+        );
+        assert!(
+            !rows[loading_y].contains('✓'),
+            "a loading row must NOT carry the ✓ (that's serving-only), got: {:?}",
+            rows[loading_y]
+        );
+        assert!(
+            !rows[loading_y].contains(':'),
+            "a loading row has no location badge, got: {:?}",
+            rows[loading_y]
         );
 
         // Queued item: · badge, no URL; branch on the next line.
