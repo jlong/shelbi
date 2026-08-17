@@ -3322,6 +3322,18 @@ pub const WORKTREE_STARTUP_PROMPT_REL: &str = ".shelbi/startup-prompt.md";
 /// `.claude/skills/` entries on launch.
 pub const WORKTREE_AGENT_SKILLS_REL: &str = ".claude/skills";
 
+/// Per-worktree manifest recording which `.claude/skills/` entry names Shelbi
+/// mounted on the last dispatch (one name per line). It lets a refresh remove
+/// exactly Shelbi's own mounts before re-mounting the current agent's skills,
+/// so user-authored skills Shelbi never placed are left untouched. Lives under
+/// the worktree's gitignored `.shelbi/` scratch, not inside `.claude/skills/`
+/// (which must contain only real skill entries).
+const WORKTREE_OWNED_SKILLS_REL: &str = ".shelbi/mounted-claude-skills";
+
+/// Header comment written once above Shelbi's block in a worktree's
+/// `info/exclude`, so a human inspecting the file sees who put the lines there.
+const SHELBI_EXCLUDE_HEADER: &str = "# shelbi-mounted, never-committed agent context (skills/hooks)";
+
 const MESSAGE_TAIL_START_SH: &str = r#"#!/bin/sh
 mkdir -p .shelbi/messages
 if [ -z "${TASK_ID:-}" ]; then
@@ -3527,15 +3539,17 @@ fn set_executable(_path: &Path) -> Result<()> {
 }
 
 /// Deploy the dispatched agent's `instructions.md` to the worktree and
-/// refresh `.claude/skills/` from the agent's `skills/` directory. One
+/// mount the agent's `skills/` directory into `.claude/skills/`. One
 /// orchestration helper so the spawn path doesn't have to manage the
 /// individual primitives; the caller just hands us a (host, worktree,
 /// project, agent) tuple and we do the rest.
 ///
-/// Idempotent and overwrite-safe: every call rewrites the instructions
-/// file and clears `.claude/skills/` before mounting, so the worktree's
-/// agent context reflects the *current* agent — not a leftover from a
-/// prior task on the same workspace.
+/// Idempotent and non-destructive: every call rewrites the instructions
+/// file and refreshes *only Shelbi's own* mounted skills (tracked via a
+/// manifest — see [`refresh_agent_skills`]), so the worktree's agent
+/// context reflects the *current* agent while any user-authored
+/// `.claude/skills/` content is left untouched — the same
+/// own-only-what-you-own discipline [`wire_settings_local`] uses.
 pub fn deploy_agent_context(
     host: &Host,
     worktree: &Path,
@@ -3643,27 +3657,61 @@ fn deploy_orchestrator_system_skill(
     // Keep the reserved discovery copies installed last as a compatibility
     // layer for runner versions predating session injection. The isolated
     // bundle above remains the authoritative source used by built-in sessions.
-    for rel in [
-        PathBuf::from(".claude")
-            .join("skills")
-            .join(reserved)
-            .join("SKILL.md"),
-        PathBuf::from(".agents")
-            .join("skills")
-            .join(reserved)
-            .join("SKILL.md"),
+    //
+    // Non-destructive discipline: the reserved name (`update-shelbi-configuration`)
+    // is Shelbi's own, so warn-then-overwrite is acceptable here — but ONLY when
+    // the collision isn't a git-tracked user file. If a user has committed a
+    // skill of the reserved name, we never rewrite it on disk (that would dirty
+    // the tree / destroy tracked content); Shelbi's version still takes effect
+    // through the `--plugin-dir` bundle staged above. When we do mount, we first
+    // remove any pre-existing entry (e.g. a symlink `refresh_agent_skills` mounted
+    // from the orchestrator's own `skills/` source) so we never write *through* a
+    // symlink into the source tree.
+    let mut owned_reserved: Vec<String> = Vec::new();
+    for dir_rel in [
+        format!(".claude/skills/{reserved}"),
+        format!(".agents/skills/{reserved}"),
     ] {
-        let destination = worktree.join(&rel);
-        if read_worktree_text(host, &destination)?
-            .is_some_and(|existing| existing != plugin.skill)
-        {
+        let dir_dest = worktree.join(&dir_rel);
+        let skill_dest = dir_dest.join("SKILL.md");
+        if git_tracks_path(host, worktree, &dir_rel) {
+            eprintln!(
+                "shelbi: warning: reserved skill `{reserved}` collides with a git-tracked user skill at {}; leaving it in place (Shelbi's version is served via --plugin-dir)",
+                dir_dest.display()
+            );
+            tracing::warn!(
+                skill = reserved,
+                path = %dir_dest.display(),
+                "reserved system skill collides with git-tracked user skill; not overwriting on disk",
+            );
+            continue;
+        }
+        if read_worktree_text(host, &skill_dest)?.is_some_and(|existing| existing != plugin.skill) {
             eprintln!(
                 "shelbi: warning: suppressing colliding skill `{reserved}` at {}; Shelbi's system skill takes precedence",
-                destination.display()
+                skill_dest.display()
             );
         }
-        write_worktree_text(host, &destination, &plugin.skill, "system-skill")?;
+        // Remove any existing entry (real dir or symlink) before writing our
+        // real copy, so a symlink mounted by `refresh_agent_skills` doesn't
+        // relay the write into its source.
+        remove_worktree_entry(host, &dir_dest)?;
+        write_worktree_text(host, &skill_dest, &plugin.skill, "system-skill")?;
+        owned_reserved.push(dir_rel);
     }
+
+    // Record the `.claude/skills/` copy as Shelbi-owned so a later dispatch
+    // under a different agent clears it via the manifest, and keep every
+    // Shelbi-mounted path out of the worktree's `git status`.
+    if owned_reserved
+        .iter()
+        .any(|r| r == &format!(".claude/skills/{reserved}"))
+    {
+        add_owned_skill(host, worktree, reserved)?;
+    }
+    let mut ignore_rels = owned_reserved;
+    ignore_rels.push(".claude/shelbi-system-plugins/".to_string());
+    let _ = gitignore_worktree_paths(host, worktree, &ignore_rels);
     Ok(())
 }
 
@@ -3759,65 +3807,293 @@ fn deploy_startup_prompt(host: &Host, worktree: &Path, prompt: &str) -> Result<(
     }
 }
 
-/// Clear `<worktree>/.claude/skills/` and recursively mirror
-/// `skills_src` into it. A non-existent or empty `skills_src` just
-/// produces an empty destination — the v1 default agents ship with no
-/// skills, so this is the normal happy path.
+/// Mount the entries of `skills_src` into `<worktree>/.claude/skills/`,
+/// refreshing *only Shelbi's own* mounts and never touching user-authored
+/// content that Shelbi didn't place.
+///
+/// Ownership is tracked in a per-worktree manifest
+/// ([`WORKTREE_OWNED_SKILLS_REL`]): each call removes the entries it
+/// mounted last time, then mounts the current agent's `skills/` entries and
+/// records the new set. The `.claude/skills/` directory itself is never
+/// `rm -rf`'d — a user's `.claude/skills/my-skill/` survives across any
+/// number of dispatches, mirroring the own-only-what-you-own discipline of
+/// [`wire_settings_local`].
+///
+/// Mount mechanism: local hosts symlink each entry to its source under the
+/// Shelbi-managed agent `skills/` dir (never committed, single source of
+/// truth); remote hosts copy (the source lives on the hub, so a symlink
+/// would dangle). Either way the mounted names are added to the worktree's
+/// git exclude so they never show as changes in `git status`.
+///
+/// Collision: if a pre-existing entry occupies a name Shelbi wants to mount,
+/// Shelbi's version wins for that name UNLESS the existing entry is
+/// git-tracked — in which case we never overwrite it on disk (that would
+/// dirty the tree / destroy tracked content); we log a warning and skip.
+///
+/// A non-existent or empty `skills_src` just produces no Shelbi mounts — the
+/// v1 default agents ship with no skills, so this is the normal happy path.
 pub fn refresh_agent_skills(host: &Host, worktree: &Path, skills_src: &Path) -> Result<()> {
-    let dest = worktree.join(".claude").join("skills");
-    let dest_str = dest.to_string_lossy().into_owned();
+    let skills_dir = worktree.join(".claude").join("skills");
 
-    // Clear first. `rm -rf` is idempotent — succeeds whether the path
-    // exists or not, which keeps the first-dispatch (nothing there yet)
-    // and Nth-dispatch (carry-over from a different agent) cases on the
-    // same code path.
-    let rm = shelbi_ssh::run(host, ["rm", "-rf", &dest_str]).map_err(Error::Io)?;
-    if !rm.status.success() {
-        return Err(Error::Command {
-            cmd: format!("rm -rf {dest_str}"),
-            status: rm.status.to_string(),
-            stderr: String::from_utf8_lossy(&rm.stderr).into_owned(),
-        });
+    // Remove ONLY the entries Shelbi mounted on a previous dispatch (a
+    // carry-over from a different agent on the same workspace). We never touch
+    // entries Shelbi didn't place, and never remove the dir itself.
+    let prev_owned = read_owned_skills(host, worktree)?;
+    for name in &prev_owned {
+        remove_worktree_entry(host, &skills_dir.join(name))?;
     }
 
-    // Always (re)create the destination — even when skills_src is empty
-    // we want `.claude/skills/` to exist so the runner's skill loader
-    // doesn't trip on a missing path.
-    let mkdir = shelbi_ssh::run(host, ["mkdir", "-p", &dest_str]).map_err(Error::Io)?;
+    // Always ensure the destination exists — even with no skills we want
+    // `.claude/skills/` present so the runner's skill loader doesn't trip on a
+    // missing path.
+    let skills_str = skills_dir.to_string_lossy().into_owned();
+    let mkdir = shelbi_ssh::run(host, ["mkdir", "-p", &skills_str]).map_err(Error::Io)?;
     if !mkdir.status.success() {
         return Err(Error::Command {
-            cmd: format!("mkdir -p {dest_str}"),
+            cmd: format!("mkdir -p {skills_str}"),
             status: mkdir.status.to_string(),
             stderr: String::from_utf8_lossy(&mkdir.stderr).into_owned(),
         });
     }
 
-    if !skills_src.is_dir() {
-        // Agent's skills/ dir not on disk (legacy materialize, user nuked
-        // it, etc.). The hub side's self-heal will recreate it on next
-        // `shelbi reload`; for now an empty deploy is correct.
-        return Ok(());
+    let mut owned: Vec<String> = Vec::new();
+    if skills_src.is_dir() {
+        for entry in std::fs::read_dir(skills_src).map_err(Error::Io)? {
+            let entry = entry.map_err(Error::Io)?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let dest = skills_dir.join(&name);
+            // After removing prev-owned entries above, anything still present at
+            // this name is user content Shelbi didn't place — a collision.
+            if worktree_entry_exists(host, &dest) {
+                let rel = format!(".claude/skills/{name}");
+                if git_tracks_path(host, worktree, &rel) {
+                    eprintln!(
+                        "shelbi: warning: skill `{name}` collides with a git-tracked user skill at {}; leaving the user's version in place (Shelbi's skill is not mounted for this name)",
+                        dest.display()
+                    );
+                    tracing::warn!(
+                        skill = %name,
+                        path = %dest.display(),
+                        "skipping Shelbi skill mount over a git-tracked user skill",
+                    );
+                    continue;
+                }
+                eprintln!(
+                    "shelbi: warning: mounting Shelbi skill `{name}` over a pre-existing untracked entry at {}",
+                    dest.display()
+                );
+                tracing::warn!(
+                    skill = %name,
+                    path = %dest.display(),
+                    "overwriting an untracked entry with a Shelbi skill mount",
+                );
+                remove_worktree_entry(host, &dest)?;
+            }
+            mount_skill_entry(host, &entry.path(), &dest)?;
+            owned.push(name);
+        }
     }
 
-    let entries: Vec<_> = std::fs::read_dir(skills_src)
-        .map_err(Error::Io)?
-        .collect::<std::result::Result<_, _>>()
-        .map_err(Error::Io)?;
-    if entries.is_empty() {
-        return Ok(());
-    }
+    write_owned_skills(host, worktree, &owned)?;
 
+    // Keep every Shelbi-mounted path — plus the worktree's `.shelbi/` scratch
+    // (which holds the manifest) — out of `git status` in the user's repo.
+    let mut ignore_rels: Vec<String> = owned
+        .iter()
+        .map(|n| format!(".claude/skills/{n}"))
+        .collect();
+    ignore_rels.push(".shelbi/".to_string());
+    let _ = gitignore_worktree_paths(host, worktree, &ignore_rels);
+    Ok(())
+}
+
+/// Mount a single skill source entry at `dest`. Local hosts symlink (an
+/// absolute link to the Shelbi-managed source — never committed, single
+/// source of truth); remote hosts copy, since the source lives on the hub and
+/// a symlink would dangle. `dest` must not already exist (callers clear stale
+/// or colliding entries first).
+fn mount_skill_entry(host: &Host, src: &Path, dest: &Path) -> Result<()> {
     match host {
-        Host::Local => copy_dir_contents_local(skills_src, &dest)?,
-        Host::Ssh { host: ssh_host } => copy_dir_contents_to_remote(ssh_host, skills_src, &dest)?,
+        Host::Local => {
+            // Defensive: a stale entry here would make symlink() fail with
+            // EEXIST. Callers already clear owned/colliding entries; clear any
+            // straggler too so the mount is idempotent.
+            if dest.symlink_metadata().is_ok() {
+                remove_worktree_entry(host, dest)?;
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(src, dest).map_err(Error::Io)?;
+            #[cfg(not(unix))]
+            {
+                if src.is_dir() {
+                    std::fs::create_dir_all(dest).map_err(Error::Io)?;
+                    copy_dir_contents_local(src, dest)?;
+                } else {
+                    std::fs::copy(src, dest).map_err(Error::Io)?;
+                }
+            }
+            Ok(())
+        }
+        Host::Ssh { host: ssh_host } => {
+            if src.is_dir() {
+                let dest_str = dest.to_string_lossy().into_owned();
+                let mkdir = shelbi_ssh::run(host, ["mkdir", "-p", &dest_str]).map_err(Error::Io)?;
+                if !mkdir.status.success() {
+                    return Err(Error::Command {
+                        cmd: format!("ssh {ssh_host} mkdir -p {dest_str}"),
+                        status: mkdir.status.to_string(),
+                        stderr: String::from_utf8_lossy(&mkdir.stderr).into_owned(),
+                    });
+                }
+                copy_dir_contents_to_remote(ssh_host, src, dest)?;
+            } else {
+                let dest_str = dest.to_string_lossy().into_owned();
+                let dest_uri = scp_remote_target(ssh_host, &dest_str);
+                let mut cmd = std::process::Command::new("scp");
+                cmd.arg("-q").arg("-B").arg(src).arg(&dest_uri);
+                let out = cmd.output().map_err(Error::Io)?;
+                if !out.status.success() {
+                    return Err(Error::Command {
+                        cmd: format!("scp {} {dest_uri}", src.display()),
+                        status: out.status.to_string(),
+                        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                    });
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `rm -rf` a single worktree entry (a skill mount or manifest-listed name).
+/// Idempotent — succeeds whether the path exists or not. Never called on the
+/// `.claude/skills/` directory itself, only on individual entries.
+fn remove_worktree_entry(host: &Host, path: &Path) -> Result<()> {
+    let p = path.to_string_lossy().into_owned();
+    let rm = shelbi_ssh::run(host, ["rm", "-rf", &p]).map_err(Error::Io)?;
+    if !rm.status.success() {
+        return Err(Error::Command {
+            cmd: format!("rm -rf {p}"),
+            status: rm.status.to_string(),
+            stderr: String::from_utf8_lossy(&rm.stderr).into_owned(),
+        });
     }
     Ok(())
 }
 
+/// True iff a filesystem entry (including a broken symlink) exists at `path`
+/// on `host`. Local hosts stat without following; remote hosts probe with
+/// `test -e || test -L` so a dangling link still reads as present.
+fn worktree_entry_exists(host: &Host, path: &Path) -> bool {
+    match host {
+        Host::Local => path.symlink_metadata().is_ok(),
+        Host::Ssh { .. } => {
+            let q = shelbi_core::shell_escape(&path.to_string_lossy());
+            shelbi_ssh::run(host, ["sh", "-c", &format!("test -e {q} || test -L {q}")])
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+    }
+}
+
+/// Read the per-worktree manifest of Shelbi-owned `.claude/skills/` entry
+/// names (one per line). Absent manifest → empty set.
+fn read_owned_skills(host: &Host, worktree: &Path) -> Result<Vec<String>> {
+    let manifest = worktree.join(WORKTREE_OWNED_SKILLS_REL);
+    Ok(read_worktree_text(host, &manifest)?
+        .map(|s| {
+            s.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Overwrite the per-worktree owned-skills manifest with `names`.
+fn write_owned_skills(host: &Host, worktree: &Path, names: &[String]) -> Result<()> {
+    let manifest = worktree.join(WORKTREE_OWNED_SKILLS_REL);
+    let mut body = String::new();
+    for n in names {
+        body.push_str(n);
+        body.push('\n');
+    }
+    write_worktree_text(host, &manifest, &body, "owned-skills")
+}
+
+/// Append `name` to the owned-skills manifest if not already present.
+fn add_owned_skill(host: &Host, worktree: &Path, name: &str) -> Result<()> {
+    let mut owned = read_owned_skills(host, worktree)?;
+    if !owned.iter().any(|n| n == name) {
+        owned.push(name.to_owned());
+        write_owned_skills(host, worktree, &owned)?;
+    }
+    Ok(())
+}
+
+/// Add `rels` (worktree-relative paths) to the worktree's git exclude file so
+/// Shelbi's never-committed mounts don't show as untracked changes in
+/// `git status`. Uses `info/exclude` (git's personal, never-committed,
+/// never-shared-via-push ignore file) resolved against the worktree — unlike
+/// appending to the repo's `.gitignore`, which is a tracked working file whose
+/// uncommitted edits don't even propagate into a linked worktree.
+///
+/// Fully best-effort: a non-git worktree or any git/IO failure is swallowed
+/// (callers invoke via `let _ =`), because a dirty `git status` is a cosmetic
+/// nuisance, not a reason to fail a dispatch.
+fn gitignore_worktree_paths(host: &Host, worktree: &Path, rels: &[String]) -> Result<()> {
+    if rels.is_empty() {
+        return Ok(());
+    }
+    let wt = worktree.to_string_lossy().into_owned();
+    let out = match shelbi_ssh::run(
+        host,
+        ["git", "-C", &wt, "rev-parse", "--git-path", "info/exclude"],
+    ) {
+        Ok(out) if out.status.success() => out,
+        // Not a git repo, or git is unavailable — nothing to exclude.
+        _ => return Ok(()),
+    };
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.is_empty() {
+        return Ok(());
+    }
+    // `--git-path` returns a path relative to the worktree (we passed `-C`) or
+    // an absolute path (common when the git dir lives outside a linked
+    // worktree). Resolve against the worktree in the relative case.
+    let exclude_path = if Path::new(&raw).is_absolute() {
+        PathBuf::from(&raw)
+    } else {
+        worktree.join(&raw)
+    };
+    let existing = read_worktree_text(host, &exclude_path)?.unwrap_or_default();
+    let already: std::collections::HashSet<&str> =
+        existing.lines().map(str::trim).collect();
+    let to_add: Vec<&String> = rels.iter().filter(|r| !already.contains(r.as_str())).collect();
+    if to_add.is_empty() {
+        return Ok(());
+    }
+    let mut body = existing;
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    if !body.contains(SHELBI_EXCLUDE_HEADER) {
+        body.push_str(SHELBI_EXCLUDE_HEADER);
+        body.push('\n');
+    }
+    for rel in to_add {
+        body.push_str(rel);
+        body.push('\n');
+    }
+    write_worktree_text(host, &exclude_path, &body, "git-exclude")
+}
+
 /// Recursively copy the contents of `src` (a directory) into `dest`. The
-/// destination must already exist. Used to mirror the agent's `skills/`
-/// directory into the worktree on local hosts; remote hosts go through
-/// [`copy_dir_contents_to_remote`].
+/// destination must already exist. Local hosts mount skills via symlink
+/// ([`mount_skill_entry`]), so this copy fallback is only reached on non-unix
+/// targets where symlinks aren't available.
+#[cfg(not(unix))]
 fn copy_dir_contents_local(src: &Path, dest: &Path) -> Result<()> {
     for entry in std::fs::read_dir(src).map_err(Error::Io)? {
         let entry = entry.map_err(Error::Io)?;
@@ -7460,6 +7736,187 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    fn git_on_path() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn git_in(repo: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git run")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    fn git_status_porcelain(repo: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn init_git_repo(repo: &Path) {
+        std::fs::create_dir_all(repo).unwrap();
+        git_in(repo, &["init", "-q"]);
+        git_in(repo, &["config", "user.email", "t@t.co"]);
+        git_in(repo, &["config", "user.name", "t"]);
+    }
+
+    /// Core acceptance: a user's pre-existing `.claude/skills/<user-skill>/`
+    /// and other `.claude/` content survive one-or-more dispatches untouched,
+    /// while Shelbi's own skill is mounted (as a symlink), functions, and never
+    /// dirties `git status`.
+    #[test]
+    fn refresh_agent_skills_preserves_user_content_and_hides_shelbi_mounts() {
+        if !git_on_path() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = agent_test_tmpdir("skills-preserve");
+        let repo = tmp.join("repo");
+        init_git_repo(&repo);
+        // User-authored, git-tracked skill + an unrelated user file under
+        // `.claude/` that Shelbi doesn't own.
+        std::fs::create_dir_all(repo.join(".claude/skills/my-skill")).unwrap();
+        std::fs::write(repo.join(".claude/skills/my-skill/SKILL.md"), "user skill\n").unwrap();
+        std::fs::create_dir_all(repo.join(".claude/hooks")).unwrap();
+        std::fs::write(repo.join(".claude/hooks/user-hook.sh"), "echo hi\n").unwrap();
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "-qm", "user content"]);
+
+        // Shelbi source skill.
+        let src = tmp.join("agent/skills");
+        std::fs::create_dir_all(src.join("update-shelbi-configuration")).unwrap();
+        std::fs::write(
+            src.join("update-shelbi-configuration/SKILL.md"),
+            "shelbi skill\n",
+        )
+        .unwrap();
+
+        // Two back-to-back dispatches — idempotent, non-destructive.
+        refresh_agent_skills(&Host::Local, &repo, &src).unwrap();
+        refresh_agent_skills(&Host::Local, &repo, &src).unwrap();
+
+        // User content survives byte-for-byte.
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".claude/skills/my-skill/SKILL.md")).unwrap(),
+            "user skill\n",
+            "user skill must survive dispatch untouched",
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".claude/hooks/user-hook.sh")).unwrap(),
+            "echo hi\n",
+            "unrelated user .claude content must survive",
+        );
+        // Shelbi's skill is mounted, readable, and a symlink into the source.
+        let mounted = repo.join(".claude/skills/update-shelbi-configuration");
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("SKILL.md")).unwrap(),
+            "shelbi skill\n",
+        );
+        assert!(
+            mounted.symlink_metadata().unwrap().file_type().is_symlink(),
+            "Shelbi's mount must be a symlink",
+        );
+        // Nothing Shelbi placed shows up in `git status`.
+        let status = git_status_porcelain(&repo);
+        assert!(
+            status.trim().is_empty(),
+            "worktree must be clean after dispatch; got:\n{status}",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Collision with a git-tracked user skill of the same name: Shelbi never
+    /// overwrites the tracked copy on disk (that would destroy/dirty it); the
+    /// user's version stays, and the tree stays clean.
+    #[test]
+    fn refresh_agent_skills_never_clobbers_git_tracked_collision() {
+        if !git_on_path() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = agent_test_tmpdir("skills-collide-tracked");
+        let repo = tmp.join("repo");
+        init_git_repo(&repo);
+        std::fs::create_dir_all(repo.join(".claude/skills/shared")).unwrap();
+        std::fs::write(repo.join(".claude/skills/shared/SKILL.md"), "USER\n").unwrap();
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "-qm", "user shared skill"]);
+
+        let src = tmp.join("agent/skills");
+        std::fs::create_dir_all(src.join("shared")).unwrap();
+        std::fs::write(src.join("shared/SKILL.md"), "SHELBI\n").unwrap();
+
+        refresh_agent_skills(&Host::Local, &repo, &src).unwrap();
+
+        let target = repo.join(".claude/skills/shared/SKILL.md");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "USER\n",
+            "Shelbi must not overwrite a git-tracked user skill",
+        );
+        assert!(
+            !repo
+                .join(".claude/skills/shared")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the tracked user dir must remain a real dir, not a Shelbi symlink",
+        );
+        assert!(
+            git_status_porcelain(&repo).trim().is_empty(),
+            "tracked-collision path must not dirty the tree",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Collision with an *untracked* pre-existing entry: Shelbi wins for that
+    /// name (mounts its symlink), since nothing git-tracked is at risk.
+    #[test]
+    fn refresh_agent_skills_wins_over_untracked_collision() {
+        let tmp = agent_test_tmpdir("skills-collide-untracked");
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(worktree.join(".claude/skills/shared")).unwrap();
+        std::fs::write(
+            worktree.join(".claude/skills/shared/SKILL.md"),
+            "stray\n",
+        )
+        .unwrap();
+
+        let src = tmp.join("agent/skills");
+        std::fs::create_dir_all(src.join("shared")).unwrap();
+        std::fs::write(src.join("shared/SKILL.md"), "SHELBI\n").unwrap();
+
+        refresh_agent_skills(&Host::Local, &worktree, &src).unwrap();
+
+        let mounted = worktree.join(".claude/skills/shared");
+        assert!(
+            mounted.symlink_metadata().unwrap().file_type().is_symlink(),
+            "Shelbi wins over an untracked collision via its symlink mount",
+        );
+        assert_eq!(
+            std::fs::read_to_string(mounted.join("SKILL.md")).unwrap(),
+            "SHELBI\n",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// Phase 5 acceptance criterion: the line we send into a remote
     /// pane sets `SHELBI_HUB_SOCK` so the agent can write
     /// worker→hub events through the SSH-reverse-forwarded socket.
@@ -9119,12 +9576,13 @@ mod rebase_git_tests {
         );
     }
 
-    /// Acceptance: `refresh_agent_skills` runs `rm -rf <worktree>/.claude/skills`
-    /// over SSH. With a spaced `work_dir` the old (unescaped) wire word-split
-    /// into `rm -rf <first> <rest>` and recursively deleted the wrong
-    /// directory. Replay the exact wire `shelbi_ssh` now emits through a local
-    /// `sh -c` (the stand-in remote shell) against real temp dirs and prove
-    /// the sibling that used to be destroyed survives.
+    /// Acceptance: the `rm -rf <path>` that Shelbi runs to clear a single
+    /// owned skill entry (`remove_worktree_entry`) over SSH must not word-split
+    /// on a spaced `work_dir` — the old (unescaped) wire split into
+    /// `rm -rf <first> <rest>` and recursively deleted the wrong directory.
+    /// Replay the exact wire `shelbi_ssh` now emits through a local `sh -c`
+    /// (the stand-in remote shell) against real temp dirs and prove the sibling
+    /// that used to be destroyed survives.
     #[test]
     fn refresh_skills_rm_cannot_escape_spaced_worktree() {
         let root = std::env::temp_dir().join(format!("shelbi-rm-test-{}", std::process::id()));
