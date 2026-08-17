@@ -168,15 +168,17 @@ pub struct App {
     /// each refresh by [`App::refresh`]; carries the same actionable message
     /// [`shelbi_state::load_project`] hands the `shelbi workspace list` CLI.
     pub config_error: Option<String>,
-    /// Tasks in the Review column whose review server is **confirmed serving**
-    /// — the "Ready for Review" section (✓). Built each refresh by
-    /// [`split_review_sections`]; each entry carries the `machine:port` URL
-    /// the human can open.
+    /// Tasks in the Review column that are **already on a review slot** — the
+    /// "Ready for Review" section. Two kinds live here: a **serving** task
+    /// ([`ReviewState::Serving`], ✓, with the `machine:port` URL the human can
+    /// open) and a task **loading** onto its slot ([`ReviewState::Loading`], ▶,
+    /// no ✓ and no location yet) — surfaced the moment the load starts so the
+    /// row doesn't vanish until the build finishes. Built each refresh by
+    /// [`split_review_sections`].
     pub ready_review: Vec<ReviewEntry>,
-    /// Tasks in the Review column **not yet serving** — the "Queued for Review"
-    /// section: assigned but still booting ([`ReviewState::Loading`], ▶) or
-    /// waiting for a free review slot ([`ReviewState::Pending`], ·). No
-    /// location yet (nothing serving).
+    /// Tasks in the Review column **not yet on any review slot** — the "Queued
+    /// for Review" section: waiting for a free review slot
+    /// ([`ReviewState::Pending`], ·). No location yet (nothing serving).
     pub queued_review: Vec<ReviewEntry>,
     pub sidebar_index: usize,
     pub last_refresh: Instant,
@@ -501,8 +503,9 @@ impl App {
                 }
             }
         }
-        // Ready for Review — tasks whose review server is confirmed serving
-        // (✓). Line 1 carries the `machine:port` URL badge; line 2 the branch.
+        // Ready for Review — tasks already on a review slot: serving (✓, with
+        // the `machine:port` URL badge on line 1) or still loading onto the slot
+        // (▶, no ✓, no location). Line 2 carries the branch.
         if !self.ready_review.is_empty() {
             rows.push(Row::Blank);
             rows.push(Row::Section {
@@ -518,10 +521,9 @@ impl App {
                 });
             }
         }
-        // Queued for Review — Review-status tasks not yet serving: assigned but
-        // still booting (▶) or waiting for a free review slot (·). No location
-        // yet (nothing serving); branch on line 2. The per-entry `state` picks
-        // the glyph.
+        // Queued for Review — Review-status tasks not yet on any review slot:
+        // waiting for a free review slot (·). No location yet (nothing serving);
+        // branch on line 2. The per-entry `state` picks the glyph.
         if !self.queued_review.is_empty() {
             rows.push(Row::Blank);
             rows.push(Row::Section {
@@ -705,19 +707,42 @@ impl App {
                 }
             }
             View::ReviewTask(id) => {
-                // A Queued row isn't loaded on a review slot yet: ask before
-                // loading (and load onto a *review* workspace, never the dev
-                // pane that built it). A Ready row is already assigned to a
-                // review slot, so open its review interface straight away —
-                // unless that slot's window was never launched, in which case
-                // `open_ready_review` lazily launches it first.
-                if self.queued_review.iter().any(|e| e.task_id == *id) {
-                    self.open_review_load_prompt(id);
-                } else {
-                    self.open_ready_review(id);
+                // Branch on the task's review sub-state, not merely which
+                // section it renders in. A *pending-load* row isn't on a review
+                // slot yet: ask before loading (and load onto a *review*
+                // workspace, never the dev pane that built it). A *loading* or
+                // *serving* row is already assigned to a slot — loading one is
+                // mid-build, serving one is up — so open its review interface
+                // straight away rather than re-prompting to load; if the slot's
+                // window was never launched `open_ready_review` lazily launches
+                // it first.
+                match self.review_substate(id) {
+                    ReviewState::Pending => self.open_review_load_prompt(id),
+                    ReviewState::Loading | ReviewState::Serving => self.open_ready_review(id),
                 }
             }
         }
+    }
+
+    /// Resolve a review task's lifecycle sub-state for the click handler,
+    /// sourced from the in-flight load job and the workspace-derived section
+    /// entries rather than section membership alone. An in-flight load started
+    /// by *this* sidebar is authoritative Loading even before the next refresh
+    /// records the slot assignment — so a second click during that window opens
+    /// the (booting) window instead of re-prompting. Otherwise the entry's own
+    /// `state` drives it: Serving/Loading live in Ready, Pending in Queued. An
+    /// unknown id (already moved off the board) falls back to Pending so a stale
+    /// click re-prompts rather than opening a nonexistent window.
+    fn review_substate(&self, id: &str) -> ReviewState {
+        if self.review_job.as_ref().is_some_and(|j| j.task_id == id) {
+            return ReviewState::Loading;
+        }
+        self.ready_review
+            .iter()
+            .chain(self.queued_review.iter())
+            .find(|e| e.task_id == id)
+            .map(|e| e.state)
+            .unwrap_or(ReviewState::Pending)
     }
 
     /// Raise the "Load for review" dialog for a Queued row as a centered tmux
@@ -1128,10 +1153,10 @@ pub enum Row {
     /// A task sitting in the Review column, rendered as a two-line entry:
     /// line 1 = title (+ a right-aligned `machine:port` URL badge when
     /// serving); line 2 = branch, dim. Its [`ReviewState`] picks the section
-    /// and glyph: **Ready for Review** (`Serving`, ✓ — the review server is
-    /// confirmed up) or **Queued for Review** (`Loading`, ▶ — assigned but the
-    /// server is still coming up; or `Pending`, · — waiting for a free review
-    /// slot). See spec §16.
+    /// and glyph: **Ready for Review** holds a `Serving` row (✓ — the review
+    /// server is confirmed up) and a `Loading` row (▶ — assigned to a slot but
+    /// the server is still coming up, no ✓ yet); **Queued for Review** holds a
+    /// `Pending` row (· — waiting for a free review slot). See spec §16.
     Review {
         title: String,
         /// Branch name shown dim on line 2.
@@ -1220,8 +1245,9 @@ impl Row {
 }
 
 /// Which of the three review lifecycle states a [`ReviewEntry`] / [`Row::Review`]
-/// is in. Serving is the only one that reads "Ready for Review"; the other two
-/// share the "Queued for Review" section but paint distinct glyphs.
+/// is in. Serving and Loading both read "Ready for Review" (the slot is already
+/// assigned — serving shows a ✓, loading a ▶ with no ✓ yet); Pending reads
+/// "Queued for Review" (no slot yet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewState {
     /// The review slot's dev server is confirmed up (its `ready:` health check
@@ -1229,8 +1255,8 @@ pub enum ReviewState {
     /// with the `machine:port` location.
     Serving,
     /// Assigned to a review slot but the server isn't confirmed serving yet —
-    /// checkout / install / build / boot still in progress. **Queued for
-    /// Review**, ▶, no clickable location.
+    /// checkout / install / build / boot still in progress. **Ready for
+    /// Review** (already on a slot), ▶, no ✓ and no clickable location yet.
     Loading,
     /// In Review but not yet assigned to any review slot (waiting for a free
     /// one). **Queued for Review**, ·.
@@ -1440,8 +1466,10 @@ fn split_review_sections(
                 ));
             }
             // Assigned to a review slot but the server hasn't confirmed serving
-            // yet — loading, not ready. No location until it's actually up.
-            Some(ws) => queued.push(entry(
+            // yet — loading. It's already on a slot being built, so it belongs
+            // under Ready for Review (surfaced the moment the load starts), just
+            // without the ✓ and with no clickable location until it's up.
+            Some(ws) => ready.push(entry(
                 &tf.task,
                 None,
                 Some(ws.name.clone()),
@@ -2341,12 +2369,13 @@ mod tests {
 
     #[test]
     fn review_tasks_split_by_serving_state() {
-        // The Ready/Queued split is gated on the review server actually
-        // serving, not merely on assignment (spec §16). Three states:
+        // The Ready/Queued split is gated on being *on a review slot* (spec
+        // §16). Three states, and the ✓ is gated on serving specifically:
         //   - Serving: assigned to a review slot whose review-loaded marker
         //     names this task → "Ready for Review" (✓) with `machine:workspace`.
         //   - Loading: assigned to a review slot but no serving marker yet →
-        //     "Queued for Review" (▶), no location.
+        //     "Ready for Review" too (already on a slot, surfaced immediately),
+        //     but ▶ with no ✓ and no location.
         //   - Pending: not on a review slot at all → "Queued for Review" (·).
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
@@ -2372,7 +2401,8 @@ mod tests {
         write_review_loaded_marker(&work_dir, "review-1", "serving");
 
         // Loading: on review-2 but the server hasn't confirmed serving (no
-        // marker), so it must NOT read as Ready.
+        // marker). It's already on a slot, so it reads as Ready — but without
+        // the ✓ (▶) and with no location.
         shelbi_state::save_task(
             "demo",
             &review_task(
@@ -2396,36 +2426,42 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
 
-        // Only the serving task is Ready, and it carries its location.
-        assert_eq!(app.ready_review.len(), 1, "only the serving task is Ready");
-        let ready = &app.ready_review[0];
-        assert_eq!(ready.task_id, "serving");
+        // The serving and loading tasks are both Ready (both on a slot); only
+        // the serving one carries a location.
+        assert_eq!(
+            app.ready_review.len(),
+            2,
+            "serving + loading are both Ready (on a slot)"
+        );
+        let ready = app
+            .ready_review
+            .iter()
+            .find(|e| e.task_id == "serving")
+            .expect("serving task is Ready");
         assert_eq!(ready.state, ReviewState::Serving);
         assert_eq!(ready.branch, "shelbi/palette-fix");
         assert_eq!(ready.location.as_deref(), Some("hub:review-1"));
 
-        // Both the loading and pending tasks sit under Queued, distinguished by
-        // state; neither has a clickable location yet.
-        assert_eq!(app.queued_review.len(), 2, "loading + pending are queued");
+        // The loading task is Ready too, but without a checkmark/location.
         let loading = app
-            .queued_review
+            .ready_review
             .iter()
             .find(|e| e.task_id == "loading")
-            .expect("loading task is queued");
+            .expect("loading task is Ready (already on a slot)");
         assert_eq!(
             loading.state,
             ReviewState::Loading,
-            "assigned but not yet serving → Loading"
+            "assigned but not yet serving → Loading (Ready, no ✓)"
         );
         assert!(
             loading.location.is_none(),
             "a loading task has no clickable location"
         );
-        let pending = app
-            .queued_review
-            .iter()
-            .find(|e| e.task_id == "pending")
-            .expect("pending task is queued");
+
+        // Only the pending task sits under Queued (not on a slot yet).
+        assert_eq!(app.queued_review.len(), 1, "only pending is queued");
+        let pending = &app.queued_review[0];
+        assert_eq!(pending.task_id, "pending");
         assert_eq!(
             pending.state,
             ReviewState::Pending,
@@ -2433,8 +2469,8 @@ mod tests {
         );
         assert!(pending.location.is_none());
 
-        // Row layout + glyphs: a Ready section (✓) precedes a Queued section
-        // holding a ▶ loading row and a · pending row.
+        // Row layout + glyphs: a Ready section holding a ✓ serving row and a ▶
+        // loading row (no ✓) precedes a Queued section holding a · pending row.
         let rows = app.rows();
         let ready_hdr = rows
             .iter()
@@ -2445,26 +2481,48 @@ mod tests {
             .position(|r| matches!(r, Row::Section { label } if label == "Queued for Review"))
             .expect("Queued section renders");
         assert!(ready_hdr < queued_hdr, "Ready section sits above Queued");
+        // Both the serving and loading rows render under the Ready header, above
+        // the Queued header. Find each by id (order within a section isn't the
+        // subject here).
+        let serving_row = rows
+            .iter()
+            .find(|r| matches!(r, Row::Review { view: View::ReviewTask(id), .. } if id == "serving"))
+            .expect("serving row renders");
         assert!(matches!(
-            &rows[ready_hdr + 1],
+            serving_row,
             Row::Review { state: ReviewState::Serving, location: Some(loc), branch, .. }
                 if loc == "hub:review-1" && branch == "shelbi/palette-fix"
         ));
-        // The serving row paints a cyan ✓; the loading row a yellow ▶; the
-        // pending row a dim ·.
-        let serving_dec = rows[ready_hdr + 1].decoration().unwrap();
+        // Serving and loading both sit between the two section headers (Ready).
+        let serving_y = rows
+            .iter()
+            .position(|r| matches!(r, Row::Review { view: View::ReviewTask(id), .. } if id == "serving"))
+            .unwrap();
+        let loading_y = rows
+            .iter()
+            .position(|r| matches!(r, Row::Review { view: View::ReviewTask(id), .. } if id == "loading"))
+            .unwrap();
+        assert!(
+            ready_hdr < serving_y && serving_y < queued_hdr,
+            "serving row is under the Ready header"
+        );
+        assert!(
+            ready_hdr < loading_y && loading_y < queued_hdr,
+            "loading row is under the Ready header, not Queued"
+        );
+        // The serving row paints a cyan ✓; the loading row a yellow ▶ (no ✓);
+        // the pending row a dim ·.
+        let serving_dec = serving_row.decoration().unwrap();
         assert_eq!(serving_dec.glyph, "✓");
         assert_eq!(serving_dec.color, shelbi_palette::DecorationColor::Cyan);
 
-        let loading_row = rows
-            .iter()
-            .find(|r| matches!(r, Row::Review { view: View::ReviewTask(id), .. } if id == "loading"))
-            .expect("loading row renders");
+        let loading_row = &rows[loading_y];
         assert!(matches!(
             loading_row,
             Row::Review { state: ReviewState::Loading, location: None, .. }
         ));
         let loading_dec = loading_row.decoration().unwrap();
+        assert_ne!(loading_dec.glyph, "✓", "a loading row never shows the ✓");
         assert_eq!(loading_dec.glyph, "▶", "loading row uses the play triangle");
         assert_eq!(loading_dec.color, shelbi_palette::DecorationColor::Yellow);
 
@@ -2482,10 +2540,11 @@ mod tests {
     }
 
     #[test]
-    fn review_task_leaves_ready_when_its_slot_marker_names_another_task() {
+    fn review_task_stays_loading_when_its_slot_marker_names_another_task() {
         // A review slot reused between tasks keeps the *previous* task's
         // review-loaded marker until the new server comes up. The new task must
-        // read as Loading (its id doesn't match the marker), never inherit the
+        // read as Loading (its id doesn't match the marker) — surfaced under
+        // Ready (it's already on a slot) but WITHOUT the ✓, never inheriting the
         // stale "serving" from the slot it landed on.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
@@ -2507,15 +2566,86 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
 
-        assert!(
-            app.ready_review.is_empty(),
-            "a stale marker for another task must not make this one Ready"
+        // The task is on a slot, so it's under Ready — but as Loading, not
+        // Serving: the stale marker for another task must not lend it the ✓.
+        assert_eq!(app.ready_review.len(), 1);
+        assert_eq!(app.ready_review[0].task_id, "fresh");
+        assert_eq!(
+            app.ready_review[0].state,
+            ReviewState::Loading,
+            "a stale marker for another task must not make this one Serving"
         );
-        assert_eq!(app.queued_review.len(), 1);
-        assert_eq!(app.queued_review[0].task_id, "fresh");
-        assert_eq!(app.queued_review[0].state, ReviewState::Loading);
+        assert!(
+            app.queued_review.is_empty(),
+            "an assigned task is never Queued/Pending"
+        );
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn review_substate_drives_the_click_branch() {
+        // The click handler routes on `review_substate`, not section
+        // membership: a Pending row opens the load prompt; a Loading or Serving
+        // row opens the review interface directly (no prompt). This exercises
+        // that resolver in isolation — no tmux — so the loading-click-opens-
+        // window (no-prompt) branch is covered deterministically.
+        let mut app = App::new_sidebar("demo");
+        app.ready_review = vec![
+            ReviewEntry {
+                task_id: "serving".into(),
+                title: "Serving".into(),
+                branch: "shelbi/serving".into(),
+                location: Some("hub:3000".into()),
+                workspace: Some("review-1".into()),
+                state: ReviewState::Serving,
+            },
+            ReviewEntry {
+                task_id: "loading".into(),
+                title: "Loading".into(),
+                branch: "shelbi/loading".into(),
+                location: None,
+                workspace: Some("review-2".into()),
+                state: ReviewState::Loading,
+            },
+        ];
+        app.queued_review = vec![ReviewEntry {
+            task_id: "pending".into(),
+            title: "Pending".into(),
+            branch: "shelbi/pending".into(),
+            location: None,
+            workspace: None,
+            state: ReviewState::Pending,
+        }];
+
+        // Serving/Loading (already on a slot) → open the interface, never the
+        // load prompt; Pending (no slot yet) → prompt.
+        assert_eq!(app.review_substate("serving"), ReviewState::Serving);
+        assert_eq!(
+            app.review_substate("loading"),
+            ReviewState::Loading,
+            "a loading row routes to the interface, not the load prompt"
+        );
+        assert_eq!(app.review_substate("pending"), ReviewState::Pending);
+        // An id that's already left the board falls back to Pending (a stale
+        // click re-prompts rather than opening a nonexistent window).
+        assert_eq!(app.review_substate("gone"), ReviewState::Pending);
+
+        // An in-flight load started by this sidebar is authoritative Loading
+        // even before the next refresh records the slot — so a second click
+        // during that window opens the (booting) window instead of re-prompting.
+        let (_tx, rx) = channel::<std::result::Result<String, String>>();
+        app.review_job = Some(ReviewLoadJob {
+            task_id: "pending".into(),
+            workspace: "review-1".into(),
+            rx,
+            started: Instant::now(),
+        });
+        assert_eq!(
+            app.review_substate("pending"),
+            ReviewState::Loading,
+            "an in-flight load overrides the still-Pending section entry"
+        );
     }
 
     #[test]
