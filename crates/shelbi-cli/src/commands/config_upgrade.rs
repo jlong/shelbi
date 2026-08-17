@@ -420,6 +420,8 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         && (id.ends_with(".instructions") || id.contains(".skill."))
     {
         sniff_review_instructions(entry, &text, out);
+    } else if id.ends_with(".agent.orchestrator.instructions") {
+        sniff_orchestrator_instructions(entry, &text, out);
     }
 }
 
@@ -878,6 +880,101 @@ fn sniff_workflow_status(
         }
         _ => {}
     }
+}
+
+// ---------------------------------------------------------------------------
+// orchestrator instructions.md (Markdown)
+
+/// The section heading whose body must exclude review-tagged slots from the
+/// dev-dispatch pool. Shared with the drift-guard test so the sniff and the
+/// shipped default can never disagree about the heading it keys on.
+pub(crate) const FREE_WORKSPACE_SECTION_HEADING: &str = "## Free-workspace selection";
+
+/// Sniff an orchestrator `instructions.md` for the review-slot exclusion clause
+/// in its "Free-workspace selection" section.
+///
+/// A default change (excluding `review`-tagged workspaces from the dev
+/// auto-dispatch pool) only reaches NEW projects via the shipped template;
+/// existing projects carry their own copy of the instructions, so this sniffer
+/// hands the orchestrator a boot finding to refresh it (per the AGENTS.md
+/// "Changing shipped defaults" guardrail — a default change needs a sniffer to
+/// reach existing installs).
+///
+/// This is an **absence** sniff: it fires only when the section header is
+/// present but its body never mentions review slots. A prompt without the
+/// section at all is too heavily customized to reason about — we don't
+/// synthesize a section, we only flag one that predates the exclusion clause.
+/// Routed to [`Classification::NeedsJudgment`] because the correct rewrite of a
+/// user-customized prompt is a judgment call, not a mechanical patch.
+fn sniff_orchestrator_instructions(
+    entry: &InventoryEntry,
+    text: &str,
+    out: &mut Vec<UpgradeFinding>,
+) {
+    let Some(section) = markdown_section(text, FREE_WORKSPACE_SECTION_HEADING) else {
+        return;
+    };
+    // The exclusion clause necessarily names review slots; if the section body
+    // never mentions "review" it predates the exclusion and needs refreshing.
+    if !section.to_ascii_lowercase().contains("review") {
+        out.push(finding(
+            entry,
+            Classification::NeedsJudgment,
+            "ORCH_FREE_WORKSPACE_REVIEW_EXCLUSION_MISSING",
+            "orchestrator `Free-workspace selection` section doesn't exclude review-tagged \
+             slots from the dev-dispatch pool",
+            "Refresh the section to exclude `review`-tagged workspaces from auto-dispatch (an \
+             idle review slot is not dev capacity) — mirror the shipped default template.",
+            locate_line(text, FREE_WORKSPACE_SECTION_HEADING),
+        ));
+    }
+}
+
+/// The body of the markdown section headed by the full heading line `heading`
+/// (e.g. `## Free-workspace selection`): everything from just after that line to
+/// just before the next `#`-prefixed header (any level) or end of file. `None`
+/// when the heading line isn't present. Used by the absence sniff so it inspects
+/// only the target section, not the whole document.
+fn markdown_section<'a>(text: &'a str, heading: &str) -> Option<&'a str> {
+    // Byte offset just past the heading line (including its newline).
+    let mut offset = 0usize;
+    let mut body_start = None;
+    for line in text.split_inclusive('\n') {
+        if line.trim_end() == heading {
+            body_start = Some(offset + line.len());
+            break;
+        }
+        offset += line.len();
+    }
+    let start = body_start?;
+    let rest = &text[start..];
+    // The section ends at the next markdown header (any `#` level) or EOF.
+    let mut rel = 0usize;
+    let mut end = rest.len();
+    for line in rest.split_inclusive('\n') {
+        if line.trim_start().starts_with('#') {
+            end = rel;
+            break;
+        }
+        rel += line.len();
+    }
+    Some(&rest[..end])
+}
+
+/// Location of the first line equal (trimmed of trailing whitespace) to
+/// `needle`, for anchoring a markdown finding. Falls back to `1:1`. Distinct
+/// from [`locate_key`], which anchors a YAML `key:` line.
+fn locate_line(text: &str, needle: &str) -> Location {
+    for (i, line) in text.lines().enumerate() {
+        if line.trim_end() == needle {
+            let column = line.len() - line.trim_start().len() + 1;
+            return Location {
+                line: i + 1,
+                column,
+            };
+        }
+    }
+    Location { line: 1, column: 1 }
 }
 
 // ---------------------------------------------------------------------------
@@ -1355,6 +1452,12 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              gate-then-transition policy can't be applied by a mechanical rewrite without \
              risking loss of local edits — the orchestrator repairs its own copy with judgment, \
              preserving customizations."
+        }
+        "ORCH_FREE_WORKSPACE_REVIEW_EXCLUSION_MISSING" => {
+            "Your orchestrator instructions are customized, so the review-slot \
+             exclusion can't be patched in mechanically without risking your edits — \
+             refresh the `Free-workspace selection` section by hand to match the \
+             shipped default."
         }
         _ => "This form is ambiguous or potentially lossy, so a human should confirm the fix.",
     }
@@ -1838,6 +1941,86 @@ mod tests {
             out.is_empty(),
             "shipped review defaults tripped the sniffer: {:?}",
             codes(&out)
+        );
+    }
+
+    // ---- orchestrator instructions.md -----------------------------------
+
+    fn orch_entry() -> InventoryEntry {
+        entry(
+            "project.demo.agent.orchestrator.instructions",
+            "project:demo",
+            SurfaceFormat::Markdown,
+        )
+    }
+
+    #[test]
+    fn free_workspace_section_without_review_exclusion_is_needs_judgment() {
+        let text = "# Orchestrator\n\n## Free-workspace selection\n\nA workspace is free \
+                    when no active task is assigned to it. Pick them in declared order.\n\n\
+                    ## Next section\n\nmentions review here but too late\n";
+        let mut out = Vec::new();
+        sniff_orchestrator_instructions(&orch_entry(), text, &mut out);
+        assert_eq!(
+            find(&out, "ORCH_FREE_WORKSPACE_REVIEW_EXCLUSION_MISSING")
+                .expect("finding")
+                .classification,
+            Classification::NeedsJudgment,
+        );
+    }
+
+    #[test]
+    fn free_workspace_section_with_review_exclusion_is_clean() {
+        let text = "## Free-workspace selection\n\nExclude `review`-tagged workspaces from \
+                    the dev-dispatch pool — an idle review slot is not dev capacity.\n\n\
+                    ## Next\n";
+        let mut out = Vec::new();
+        sniff_orchestrator_instructions(&orch_entry(), text, &mut out);
+        assert!(
+            find(&out, "ORCH_FREE_WORKSPACE_REVIEW_EXCLUSION_MISSING").is_none(),
+            "a section that excludes review slots should not be flagged: {:?}",
+            codes(&out),
+        );
+    }
+
+    #[test]
+    fn instructions_without_the_section_are_not_flagged() {
+        // A heavily-customized prompt with no such section: the absence sniff
+        // fires only when the header is present but silent on review slots.
+        let text = "# Custom orchestrator\n\n## My own scheduling notes\n\nno mention here\n";
+        let mut out = Vec::new();
+        sniff_orchestrator_instructions(&orch_entry(), text, &mut out);
+        assert!(find(&out, "ORCH_FREE_WORKSPACE_REVIEW_EXCLUSION_MISSING").is_none());
+    }
+
+    /// Drift guard: the shipped default orchestrator template must carry the
+    /// review-slot exclusion clause, so a freshly-materialized project never
+    /// trips this sniffer. If this fails, the template's `Free-workspace
+    /// selection` section lost (or never had) the exclusion wording.
+    #[test]
+    fn shipped_default_template_does_not_trip_the_review_exclusion_sniffer() {
+        let mut out = Vec::new();
+        sniff_orchestrator_instructions(
+            &orch_entry(),
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+            &mut out,
+        );
+        assert!(
+            find(&out, "ORCH_FREE_WORKSPACE_REVIEW_EXCLUSION_MISSING").is_none(),
+            "shipped default template trips the review-slot exclusion sniffer: {:?}",
+            codes(&out),
+        );
+        // Guard the sniffer's own precondition too: if the heading ever gets
+        // renamed in the template, the sniff silently stops firing. Assert the
+        // section it keys on is actually present in the shipped default.
+        assert!(
+            markdown_section(
+                shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+                FREE_WORKSPACE_SECTION_HEADING,
+            )
+            .is_some(),
+            "shipped default template no longer has a `{FREE_WORKSPACE_SECTION_HEADING}` \
+             section — the sniffer's absence check is now dead",
         );
     }
 

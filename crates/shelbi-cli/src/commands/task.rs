@@ -78,6 +78,13 @@ pub enum TaskCmd {
         id: String,
         #[arg(long, value_name = "WORKSPACE")]
         to: String,
+        /// Override the review-slot guard. `task assign` refuses a
+        /// `review`-tagged workspace by default (review slots load handed-off
+        /// branches via the review queue, not direct dispatch); pass `--force`
+        /// to route a normal task onto one anyway. The override is recorded on
+        /// `~/.shelbi/events.log` for auditability.
+        #[arg(long)]
+        force: bool,
     },
     /// Clear a task's workspace assignment.
     Unassign { id: String },
@@ -98,6 +105,13 @@ pub enum TaskCmd {
         /// Defaults to `user:cli:start`.
         #[arg(long, value_name = "REASON")]
         reason: Option<String>,
+        /// Override the review-slot guard. `task start` refuses a
+        /// `review`-tagged workspace by default (review slots load handed-off
+        /// branches via the review queue, not direct dispatch); pass `--force`
+        /// to launch a normal task on one anyway. The override is recorded on
+        /// `~/.shelbi/events.log` for auditability.
+        #[arg(long)]
+        force: bool,
     },
     /// Relaunch the assigned workspace on the task it is ALREADY working,
     /// WITHOUT discarding progress. For a stalled or killed worker: recreates
@@ -319,19 +333,21 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
             reason.as_deref(),
             skip_transition_actions,
         ),
-        TaskCmd::Assign { id, to } => assign(&project, &id, &to),
+        TaskCmd::Assign { id, to, force } => assign(&project, &id, &to, force),
         TaskCmd::Unassign { id } => unassign(&project, &id),
         TaskCmd::Start {
             id,
             workspace,
             branch,
             reason,
+            force,
         } => start(
             &project,
             &id,
             workspace.as_deref(),
             branch.as_deref(),
             reason.as_deref(),
+            force,
         ),
         TaskCmd::Resume {
             id,
@@ -931,10 +947,48 @@ fn resolve_active_agent_for_dispatch(project: &str, task: &Task) -> Result<Strin
     }
 }
 
-fn assign(project: &str, id: &str, workspace: &str) -> Result<()> {
-    let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    if project_yaml.workspace(workspace).is_none() {
+/// Guard against routing a normal dev task onto a review slot. A review slot is
+/// a workspace whose [effective tags](shelbi_core::Project::effective_tags)
+/// (its own ∪ its machine's) include `review` — the canonical marker
+/// (`config_upgrade_apply` migrates the legacy `role: review` onto it, and the
+/// poller gates review handling on it). Such slots exist only to load a
+/// handed-off branch and serve it for a human; they're filled by the poller's
+/// `autoload_review_queue`, which does NOT go through these CLI handlers, so the
+/// legitimate review-load path is unaffected by this guard.
+///
+/// Without `--force` a review-slot target is rejected with a message naming the
+/// tag and pointing at the review queue. With `--force` the override is allowed
+/// but recorded on `~/.shelbi/events.log` (best-effort — a logging failure
+/// warns rather than blocking the deliberate human action).
+fn guard_review_slot(
+    project_yaml: &shelbi_core::Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    workspace_name: &str,
+    task_id: &str,
+    force: bool,
+) -> Result<()> {
+    if !project_yaml.effective_tags(workspace).contains("review") {
+        return Ok(());
+    }
+    if !force {
         bail!(
+            "workspace `{workspace_name}` is a review slot (tagged `review`) — review tasks \
+             load via the review queue, not direct dispatch; pick a non-review workspace \
+             (or pass --force to override)"
+        );
+    }
+    if let Err(e) =
+        shelbi_state::append_review_slot_override_event(task_id, workspace_name, "user:force")
+    {
+        eprintln!("warning: append_review_slot_override_event failed: {e}");
+    }
+    Ok(())
+}
+
+fn assign(project: &str, id: &str, workspace: &str, force: bool) -> Result<()> {
+    let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
+    let ws = project_yaml.workspace(workspace).ok_or_else(|| {
+        anyhow!(
             "workspace `{workspace}` not declared in project `{project}` (known: {})",
             project_yaml
                 .workspaces
@@ -942,8 +996,11 @@ fn assign(project: &str, id: &str, workspace: &str) -> Result<()> {
                 .map(|w| w.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
-    }
+        )
+    })?;
+    // Refuse a review slot unless explicitly forced (logged). Review slots are
+    // filled by the review autoloader, never by direct assignment.
+    guard_review_slot(&project_yaml, ws, workspace, id, force)?;
     let mut tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
     tf.task.assigned_to = Some(workspace.to_string());
     tf.task.updated_at = Utc::now();
@@ -1008,6 +1065,7 @@ fn start(
     workspace_arg: Option<&str>,
     branch_arg: Option<&str>,
     reason: Option<&str>,
+    force: bool,
 ) -> Result<()> {
     let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
     let mut tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
@@ -1033,6 +1091,14 @@ fn start(
                 .join(", ")
         )
     })?;
+
+    // Refuse to dispatch a normal dev task onto a review slot (a `review`-tagged
+    // workspace) unless explicitly forced (logged). Review slots serve
+    // handed-off branches for a human via the review autoloader — dispatching
+    // dev work onto one is almost always a routing mistake. This is the hard CLI
+    // backstop for the soft orchestrator instruction that excludes review slots
+    // from auto-dispatch.
+    guard_review_slot(&project_yaml, workspace, &workspace_name, id, force)?;
 
     // Tag routing (Plans/generic-review-via-workflow-primitives): if the
     // active status the task is entering requires workspace tags, the chosen
@@ -2615,6 +2681,131 @@ workspaces:
             ),
         )
         .unwrap();
+    }
+
+    /// Project YAML with one plain dev workspace (`dev`) and one `review`-tagged
+    /// slot (`review`) — the fixture for the review-slot dispatch guard.
+    fn write_project_yaml_with_review(home: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::write(
+            home.join(format!("projects/{name}.yaml")),
+            format!(
+                r#"name: {name}
+repo: /tmp/{name}
+default_branch: main
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+machines:
+  - name: local
+    kind: local
+    work_dir: /tmp/{name}
+workspaces:
+  - {{ name: dev, machine: local, runner: claude }}
+  - {{ name: review, machine: local, runner: claude, tags: [review] }}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn assign_rejects_a_review_slot_without_force() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_project_yaml_with_review(&home, "p");
+        shelbi_state::save_task("p", &task_in(Column::todo(), "t"), "").unwrap();
+
+        let err = assign("p", "t", "review", false).unwrap_err().to_string();
+        assert!(err.contains("review slot"), "err: {err}");
+        assert!(err.contains("--force"), "err should point to --force: {err}");
+        // The task was NOT assigned.
+        let after = shelbi_state::load_task("p", "t").unwrap();
+        assert_eq!(after.task.assigned_to, None);
+        // No override event was logged (the guard rejected before logging).
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default();
+        assert!(!log.contains("review-slot-override"), "unexpected: {log}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn assign_with_force_routes_to_review_slot_and_logs_the_override() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_project_yaml_with_review(&home, "p");
+        shelbi_state::save_task("p", &task_in(Column::todo(), "t"), "").unwrap();
+
+        assign("p", "t", "review", true).unwrap();
+        // The forced assignment landed.
+        let after = shelbi_state::load_task("p", "t").unwrap();
+        assert_eq!(after.task.assigned_to.as_deref(), Some("review"));
+        // …and an auditable override line was written.
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.contains("review-slot-override")
+                && log.contains(" task=t ")
+                && log.contains(" workspace=review ")
+                && log.contains("reason=user:force"),
+            "override not logged: {log}",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn assign_to_a_non_review_workspace_is_unchanged() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_project_yaml_with_review(&home, "p");
+        shelbi_state::save_task("p", &task_in(Column::todo(), "t"), "").unwrap();
+
+        // A plain dev slot: assigned with no force and no override event.
+        assign("p", "t", "dev", false).unwrap();
+        let after = shelbi_state::load_task("p", "t").unwrap();
+        assert_eq!(after.task.assigned_to.as_deref(), Some("dev"));
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default();
+        assert!(!log.contains("review-slot-override"), "unexpected: {log}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn start_rejects_a_review_slot_without_force() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_project_yaml_with_review(&home, "p");
+        shelbi_state::save_task("p", &task_in(Column::todo(), "t"), "").unwrap();
+
+        // The guard fires right after workspace resolution, before any pane
+        // spawn / git work — so this returns the rejection without needing tmux.
+        let err = start("p", "t", Some("review"), None, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("review slot"), "err: {err}");
+        assert!(err.contains("--force"), "err: {err}");
+        // The card never moved out of todo.
+        let after = shelbi_state::load_task("p", "t").unwrap();
+        assert_eq!(after.task.column, Column::todo());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

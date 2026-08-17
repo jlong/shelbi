@@ -1598,6 +1598,37 @@ pub fn append_dispatch_event(
     ))
 }
 
+/// Append `<rfc3339> review-slot-override task=<id> workspace=<ws> reason=<reason>`
+/// to `~/.shelbi/events.log`. Emitted when a human overrides the review-slot
+/// dispatch guard with `--force` on `shelbi task start` / `task assign`,
+/// deliberately routing a normal dev task onto a `review`-tagged workspace.
+///
+/// Review slots exist only to load a handed-off branch and serve it for a human
+/// (they're filled by the poller's review autoloader, never by direct
+/// dispatch), so `task start`/`task assign` refuse them by default. The
+/// `--force` escape hatch is legitimate but rare, and it puts a dev agent on a
+/// slot the review path assumes is free — this line is the audit trail so
+/// `/activity` and the orchestrator can see the deliberate override rather than
+/// silently discovering a review slot occupied by dev work.
+///
+/// Same task-scoped shape (no leading `project=`) as [`append_dispatch_event`];
+/// identifier fields (`task`, `workspace`) are pinned to the strict
+/// [`sanitize_field`] allowlist and `reason` folds whitespace to underscores so
+/// the record stays a single parseable line.
+pub fn append_review_slot_override_event(
+    task_id: &str,
+    workspace: &str,
+    reason: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let task_id = sanitize_field(task_id);
+    let workspace = sanitize_field(workspace);
+    let reason = sanitize_reason(reason);
+    append_event_line(&format!(
+        "{ts} review-slot-override task={task_id} workspace={workspace} reason={reason}"
+    ))
+}
+
 /// The structured fields of a `review-ready` signal — the one event that tells
 /// the orchestrator WHAT is in review and WHERE, emitted once a review
 /// workspace's server is confirmed up for a loaded task. See
