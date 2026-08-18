@@ -307,7 +307,7 @@ pub fn open_pr(
         .map_err(|e| Error::Other(format!("resolve task path for `{}`: {e}", task.id)))?
         .to_string_lossy()
         .into_owned();
-    let body = compose_pr_body(task_body, &task_path);
+    let body = compose_pr_body(&host, &wt, task_body, &task_path);
 
     let out = run_in_dir(
         &host,

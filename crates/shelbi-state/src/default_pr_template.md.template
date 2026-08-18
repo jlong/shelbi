@@ -1,0 +1,87 @@
+# PR description template
+
+This file tells the worker agent how to write the pull-request body for a
+finished task. It is **instructions to the author**, not a
+variable-substitution template — you (the worker) read it and write the
+description yourself, because only an agent that understands the change can
+produce a Mermaid diagram, an ASCII wireframe, or a real QA checklist.
+
+Write the body **for the human reviewer**: someone who wants to know what
+changed and why, not a copy of the task requirements. Ground every section in
+what you actually built and the real problem it solves.
+
+When you finish a task, write the PR body — following the sections below — to
+`.shelbi/pr-body.md` in your worktree, then emit the ready marker as usual. If
+you genuinely can't produce a useful description, don't write the file: Shelbi
+falls back to a task-body-based PR so the handoff never breaks.
+
+Emit these sections, in order, top to bottom. Omit a conditional section
+entirely when it doesn't apply — don't leave an empty heading.
+
+## 1. Summary
+
+A few sentences on the feature or fix, grounded in the real problem it solves.
+Pull the problem from the task's problem statement and pair it with what you
+actually built. The reviewer should understand the *why* before the *how*.
+
+## 2. Technical details
+
+The things a reviewer should be aware of before reading the diff: key design
+decisions and the alternatives you rejected, tradeoffs, risky or subtle areas,
+and any migration or rollout notes. Call out anything that isn't obvious from
+the code.
+
+## 3. Data model changes (only if the change touches a database or schema)
+
+If — and only if — the change adds, removes, or alters a database table,
+column, index, or other persisted schema, include a Mermaid ER or class
+diagram of the changed model. GitHub renders it natively:
+
+````
+```mermaid
+erDiagram
+    ORDER ||--o{ LINE_ITEM : contains
+    ORDER {
+        int id PK
+        string status
+    }
+```
+````
+
+Show the changed entities and their relationships. Skip this section entirely
+for a change with no schema/DB touch.
+
+## 4. UI changes (only if the change alters the interface)
+
+If the change alters a screen or component, show it:
+
+- **Screenshots when you already have a shareable image** — a URL GitHub can
+  reach, or an image committed on the branch you can reference by its raw URL.
+- **Otherwise an ASCII wireframe** of the changed screen or component, so the
+  reviewer can see the layout without running it. For example:
+
+  ```
+  +------------------------------------------+
+  |  Settings                          [x]   |
+  +------------------------------------------+
+  |  [ ] Enable notifications                |
+  |  [x] Dark mode                           |
+  |                          [ Cancel ][ Save ]
+  +------------------------------------------+
+  ```
+
+Automated screenshot upload is out of scope — use a wireframe when you have no
+shareable image. Skip this section entirely for a non-UI change.
+
+## 5. QA checklist
+
+End every PR body with a QA checklist: concrete, checkable items a reviewer or
+tester can run through to verify the change. Prefer specific, runnable steps
+over generic ones. Use GitHub task-list syntax:
+
+```
+## QA checklist
+- [ ] `cargo test --workspace` passes
+- [ ] Open the settings dialog and confirm dark mode persists across restart
+- [ ] Migration runs cleanly on an existing database
+```

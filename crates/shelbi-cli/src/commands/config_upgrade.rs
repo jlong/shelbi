@@ -219,6 +219,9 @@ pub fn detect(projects: &[String]) -> Result<UpgradeReport> {
     // prose surface with the project's workflow transitions), so it also runs
     // over the whole entry set rather than one surface at a time.
     sniff_zen_finalize(&entries, &mut findings);
+    // Missing lifecycle-owned shipped defaults added in a newer release —
+    // materialize them into projects that predate the addition.
+    sniff_missing_lifecycle_defaults(&entries, &mut findings);
 
     findings.sort_by(|a, b| {
         (&a.file, a.location.line, a.location.column, &a.code).cmp(&(
@@ -1098,6 +1101,33 @@ fn sniff_renamed_siblings(entries: &[InventoryEntry], out: &mut Vec<UpgradeFindi
                     }
                 }
             }
+        }
+    }
+}
+
+/// The stable code for "a lifecycle-owned shipped default is missing on disk".
+/// The apply layer materializes the shipped default for this code.
+pub(crate) const PR_TEMPLATE_MISSING: &str = "PR_TEMPLATE_MISSING";
+
+/// Flag lifecycle-owned shipped defaults that a project is missing because it
+/// predates their addition — today the per-project `pr-template.md`. Editing
+/// the shipped default alone reaches only *new* projects; this sniffer plus its
+/// apply-side materializer brings existing projects up to date on boot, the
+/// same self-heal shape the renamed-sibling and settings-refresh healers use.
+///
+/// Only a genuinely-absent file is flagged (a present one, custom or not, is
+/// left untouched), so materializing it is a non-lossy auto-heal.
+fn sniff_missing_lifecycle_defaults(entries: &[InventoryEntry], out: &mut Vec<UpgradeFinding>) {
+    for entry in entries {
+        if entry.logical_id.ends_with(".pr-template") && !entry.exists {
+            out.push(finding(
+                entry,
+                Classification::AutoHeal,
+                PR_TEMPLATE_MISSING,
+                "the project has no `pr-template.md` (added in a newer Shelbi release)",
+                "Materialize the shipped default PR-description template.",
+                Location { line: 1, column: 1 },
+            ));
         }
     }
 }
@@ -2091,6 +2121,16 @@ workspaces:
   tags: [review]
 ";
         std::fs::write(home.join("projects/demo.yaml"), clean).unwrap();
+        // A fully-current project also carries the shipped lifecycle-owned
+        // pr-template.md — without it the missing-default sniffer would (rightly)
+        // flag it, which isn't what this "no legacy forms" case is testing.
+        let project_dir = home.join("projects/demo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("pr-template.md"),
+            shelbi_state::DEFAULT_PR_TEMPLATE,
+        )
+        .unwrap();
         let report = detect(&["demo".to_string()]).unwrap();
         assert!(
             report.is_empty(),
@@ -2427,6 +2467,83 @@ Finalize by moving the card: `shelbi task move <task> --to done`.
             deprecated_pr_merge_finalize_line(shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS)
                 .is_none(),
             "shipped default orchestrator instructions.md still trips the double-merge sniffer"
+        );
+    }
+
+    #[test]
+    fn missing_pr_template_is_detected_and_materialized_on_start() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        // A clean registration with no pr-template.md on disk — the shape of a
+        // project that predates the template's addition.
+        std::fs::write(
+            home.join("projects/demo.yaml"),
+            "name: demo\nrepo: /tmp/demo\nmachines:\n- name: hub\n  kind: local\n  work_dir: /tmp/demo\norchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\nworkspaces:\n- name: w1\n  machine: hub\n",
+        )
+        .unwrap();
+
+        // Detection flags the missing default as an auto-heal.
+        let report = detect(&["demo".to_string()]).unwrap();
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.code == PR_TEMPLATE_MISSING)
+            .expect("missing pr-template not detected");
+        assert_eq!(f.classification, Classification::AutoHeal);
+
+        // The on-start pass materializes the shipped default.
+        let outcome = run_for_project("demo");
+        assert!(
+            outcome.applied.iter().any(|c| c.code == PR_TEMPLATE_MISSING),
+            "pr-template not materialized: {:?}",
+            outcome.applied
+        );
+        let path = home.join("projects/demo/pr-template.md");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            shelbi_state::DEFAULT_PR_TEMPLATE
+        );
+
+        // Idempotent: a second pass detects nothing and rewrites nothing.
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report2.findings.iter().any(|f| f.code == PR_TEMPLATE_MISSING),
+            "pr-template still reported missing after materialize"
+        );
+    }
+
+    #[test]
+    fn present_pr_template_is_left_untouched() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        std::fs::write(
+            home.join("projects/demo.yaml"),
+            "name: demo\nrepo: /tmp/demo\nmachines:\n- name: hub\n  kind: local\n  work_dir: /tmp/demo\norchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\nworkspaces:\n- name: w1\n  machine: hub\n",
+        )
+        .unwrap();
+        // A user-customized template must survive byte-for-byte.
+        let dir = home.join("projects/demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let custom = "# Our PR rules\n\nAlways link the incident.\n";
+        std::fs::write(dir.join("pr-template.md"), custom).unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report.findings.iter().any(|f| f.code == PR_TEMPLATE_MISSING),
+            "present template was reported missing"
+        );
+        run_for_project("demo");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pr-template.md")).unwrap(),
+            custom
         );
     }
 }

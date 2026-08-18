@@ -754,6 +754,15 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
         shelbi_state::ZenmodeOutcome::Unchanged => {}
     }
 
+    // The user-editable PR-description template the developer worker follows
+    // when authoring a PR body. Custom edits survive re-runs.
+    if let shelbi_state::PrTemplateOutcome::Created =
+        shelbi_state::scaffold_pr_template(&resolved.name).map_err(|e| anyhow!(e))?
+    {
+        let path = shelbi_state::pr_template_path(&resolved.name).map_err(|e| anyhow!(e))?;
+        println!("✓ wrote PR template: {}", path.display());
+    }
+
     // Disclose and install the context-scoped default-branch commit guard now,
     // with the user's knowledge — this is the consented install. Project open
     // only *refreshes* an already-installed hook, so it's never created
@@ -989,6 +998,12 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
             );
         }
         shelbi_state::ZenmodeOutcome::Unchanged => {}
+    }
+    if let shelbi_state::PrTemplateOutcome::Created =
+        shelbi_state::scaffold_pr_template(&local_alias).map_err(|e| anyhow!(e))?
+    {
+        let path = shelbi_state::pr_template_path(&local_alias).map_err(|e| anyhow!(e))?;
+        println!("✓ wrote PR template: {}", path.display());
     }
 
     println!();

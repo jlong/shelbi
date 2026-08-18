@@ -533,7 +533,7 @@ fn pr_create_impl(
     let task_path = shelbi_state::task_path(project_name, &task.id)?
         .to_string_lossy()
         .into_owned();
-    let body = compose_pr_body(task_body, &task_path);
+    let body = compose_pr_body(&host, &wt, task_body, &task_path);
     verify_task_branch_head(
         &host,
         &worktree,

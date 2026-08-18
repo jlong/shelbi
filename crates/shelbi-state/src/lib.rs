@@ -25,6 +25,7 @@ mod hub_config;
 mod hub_version;
 pub mod keymap;
 mod migrate;
+mod pr_template;
 mod project_paths;
 mod resolve;
 mod root;
@@ -119,6 +120,10 @@ pub use workspace_status::{
     parse_pane_title_marker, parse_pane_title_state, save_workspace_status, supervision_shutdown_key,
     workspace_status_path, workspaces_dir, PaneMarker, WorkspaceState, WorkspaceStatus,
     EXPECTED_TEARDOWN_MAX_AGE,
+};
+pub use pr_template::{
+    pr_template_path, scaffold_pr_template, PrTemplateOutcome, DEFAULT_PR_TEMPLATE,
+    PR_TEMPLATE_FILE,
 };
 pub use zenmode::{
     read_zenmode_summary, scaffold_zenmode, zenmode_path, ZenmodeOutcome, DEFAULT_ZENMODE,

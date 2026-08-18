@@ -107,6 +107,10 @@ fn scaffold_assets(config_root: &Path) {
         config_root.join("zenmode.md"),
         "Zen keeps this project moving.\n\nFree-form policy.\n",
     );
+    write(
+        config_root.join("pr-template.md"),
+        "# PR description template\n\nSummary, technical details, QA checklist.\n",
+    );
     for agent in [
         "orchestrator",
         "developer",

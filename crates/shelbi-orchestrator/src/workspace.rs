@@ -42,9 +42,10 @@ fn current_exe_string() -> Result<String> {
 ///   `shelbi-ready` marker). Normally gitignored, but a repo that
 ///   hasn't ignored it yet still shouldn't wedge on it.
 /// - `.shelbi/` — shelbi's own runtime scratch (`.shelbi/messages/` inter-agent
-///   mail and other daemon state) written into the worktree root. It is
-///   never user work, so an otherwise-idle worktree whose only untracked entry
-///   is `.shelbi/` must read as clean and dispatchable.
+///   mail, the worker-authored `.shelbi/pr-body.md` PR description, and other
+///   daemon state) written into the worktree root. It is never user work, so an
+///   otherwise-idle worktree whose only untracked entry is `.shelbi/` must read
+///   as clean and dispatchable.
 ///
 /// Callers pass `git status --porcelain -z` (NUL-delimited) output. The `-z`
 /// form is load-bearing: plain porcelain quotes paths with unusual bytes

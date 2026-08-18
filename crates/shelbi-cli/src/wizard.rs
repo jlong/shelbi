@@ -543,6 +543,7 @@ fn persist_plan(plan: &DetectedSetupPlan) -> Result<()> {
         shelbi_state::scaffold_project_statuses(&project.name).map_err(|error| anyhow!(error))?;
     }
     let _ = shelbi_state::scaffold_zenmode(&project.name).map_err(|error| anyhow!(error))?;
+    let _ = shelbi_state::scaffold_pr_template(&project.name).map_err(|error| anyhow!(error))?;
     let _ = shelbi_state::scaffold_welcome_task(&project.name).map_err(|error| anyhow!(error))?;
     // The registration is the commit point. Until it exists, a retry
     // re-enters onboarding and the scaffold helpers can finish any missing

@@ -38,6 +38,37 @@ If the task's acceptance criteria explicitly require the full suite to
 pass locally and it won't complete deterministically, that is a task
 worth a clarification request (below) — don't burn hours retrying it.
 
+## Writing the PR description
+
+When the work is finished — before or with emitting the ready marker —
+write the pull-request body a human reviewer will read to
+`.shelbi/pr-body.md` in your worktree. The orchestrator picks that file
+up when it opens the PR; if it's absent, Shelbi falls back to a
+task-body-based PR, so this never blocks the handoff.
+
+Follow the project's PR template — `~/.shelbi/projects/<name>/pr-template.md`
+for a global project, or `<repo>/.shelbi/pr-template.md` for an in-repo
+project. It is the source of truth for how to structure the body, and
+the user edits it to change the guidance. In short, the default template
+asks for, in order:
+
+1. **Summary** of the feature/fix, grounded in the real problem it
+   solves (task's problem statement + what you actually built) — written
+   for the reviewer, not a copy of the requirements.
+2. **Technical details** the reviewer should know: key decisions,
+   tradeoffs, risky areas, migration notes.
+3. **A Mermaid ER/UML diagram** — only if the change touches a
+   database/schema. GitHub renders ```mermaid fences natively.
+4. **UI changes** — only if the change alters the interface: screenshots
+   when you have a shareable image URL, otherwise an ASCII wireframe of
+   the changed screen/component.
+5. **A QA checklist** at the end: concrete, checkable items.
+
+`.shelbi/pr-body.md` is Shelbi's namespace in the worktree (same place
+the runner hooks live) and is covered by the worktree git exclude, so it
+won't dirty `git status` or get committed. If you genuinely can't produce
+a useful description, just don't write the file.
+
 ## Conventions
 
 Follow project conventions in `agents/_shared/preamble.md` (if present)
