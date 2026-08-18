@@ -23,7 +23,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -330,17 +333,32 @@ pub fn run(out: String) -> Result<bool> {
 
     let submitted = loop {
         term.draw(|f| render(f, &prompt))?;
-        if event::poll(Duration::from_millis(150))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match prompt.key(k) {
-                    Outcome::Submit => break true,
-                    Outcome::Cancel => break false,
-                    Outcome::Continue => {}
+        if !event::poll(Duration::from_millis(150))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => match prompt.key(k) {
+                Outcome::Submit => break true,
+                Outcome::Cancel => break false,
+                Outcome::Continue => {}
+            },
+            // A left-click on a button acts exactly like the keyboard path:
+            // `[ Reject ]` submits (a blank reason is still rejected via
+            // `try_submit`), `[ Cancel ]` cancels. Focus follows the click so the
+            // highlight tracks what was pressed.
+            Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
+                match hit_test(term.get_frame().area(), m.column, m.row) {
+                    Some(Hit::Reject) => {
+                        prompt.focus = Focus::Reject;
+                        if prompt.try_submit() == Outcome::Submit {
+                            break true;
+                        }
+                    }
+                    Some(Hit::Cancel) => break false,
+                    None => {}
                 }
             }
+            _ => {}
         }
     };
 
@@ -352,6 +370,76 @@ pub fn run(out: String) -> Result<bool> {
             .with_context(|| format!("writing reject reason to {out}"))?;
     }
     Ok(submitted)
+}
+
+/// A clickable region of the dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hit {
+    Reject,
+    Cancel,
+}
+
+const REJECT_LABEL: &str = "[ Reject ]";
+const CANCEL_LABEL: &str = "[ Cancel ]";
+/// Spaces drawn between the two buttons — must match the group centering below.
+const BUTTON_GAP: u16 = 3;
+
+/// Split the modal's inner area into its five stacked rows: label / text area
+/// (grows to fill) / spacer / buttons / hint. Shared by [`render`] and
+/// [`hit_test`] so a click lands on exactly the button cells that were drawn.
+fn body_rows(inner: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner)
+}
+
+/// Rects of the `[ Reject ]` / `[ Cancel ]` buttons within their row, centered
+/// as a group (`[ Reject ]` + gap + `[ Cancel ]`) so drawing and hit-testing
+/// agree on the exact cells.
+fn button_row(row: Rect) -> (Rect, Rect) {
+    let reject_w = REJECT_LABEL.chars().count() as u16;
+    let cancel_w = CANCEL_LABEL.chars().count() as u16;
+    let total = reject_w + BUTTON_GAP + cancel_w;
+    let start = row.x + row.width.saturating_sub(total) / 2;
+    (
+        Rect {
+            x: start,
+            y: row.y,
+            width: reject_w,
+            height: 1,
+        },
+        Rect {
+            x: start + reject_w + BUTTON_GAP,
+            y: row.y,
+            width: cancel_w,
+            height: 1,
+        },
+    )
+}
+
+/// Map a click at `(col, row)` to the button under it, or `None` for dead
+/// space. `area` is the whole popup area (the border is drawn on it; geometry
+/// is computed against its inner rect).
+fn hit_test(area: Rect, col: u16, row: u16) -> Option<Hit> {
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let rows = body_rows(inner);
+    let (reject, cancel) = button_row(rows[3]);
+    if within(reject, col, row) {
+        return Some(Hit::Reject);
+    }
+    if within(cancel, col, row) {
+        return Some(Hit::Cancel);
+    }
+    None
+}
+
+fn within(rect: Rect, col: u16, row: u16) -> bool {
+    row == rect.y && col >= rect.x && col < rect.x + rect.width
 }
 
 fn render(f: &mut Frame, prompt: &RejectPrompt) {
@@ -368,14 +456,7 @@ fn render(f: &mut Frame, prompt: &RejectPrompt) {
     f.render_widget(block, area);
 
     // label / text area (grows to fill) / spacer / buttons / hint.
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(3),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
+    let rows = body_rows(inner);
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -387,13 +468,23 @@ fn render(f: &mut Frame, prompt: &RejectPrompt) {
 
     render_textarea(f, prompt, rows[1]);
 
-    let buttons = Line::from(vec![
-        button("[ Reject ]", prompt.focus == Focus::Reject),
-        Span::raw("   "),
-        button("[ Cancel ]", prompt.focus == Focus::Cancel),
-    ])
-    .centered();
-    f.render_widget(Paragraph::new(buttons), rows[3]);
+    // Draw each button at its hit-test rect so a click lands on exactly the
+    // cells drawn here (no separate centering math to drift out of sync).
+    let (reject_rect, cancel_rect) = button_row(rows[3]);
+    f.render_widget(
+        Paragraph::new(Line::from(button(
+            REJECT_LABEL,
+            prompt.focus == Focus::Reject,
+        ))),
+        reject_rect,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(button(
+            CANCEL_LABEL,
+            prompt.focus == Focus::Cancel,
+        ))),
+        cancel_rect,
+    );
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -477,7 +568,9 @@ fn button(label: &str, focused: bool) -> Span<'_> {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Mouse capture so the `[ Reject ]` / `[ Cancel ]` buttons are clickable;
+    // tmux forwards mouse events to the popup pane when its `mouse` option is on.
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
@@ -485,21 +578,22 @@ fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
     term: &mut Terminal<B>,
 ) -> Result<()> {
     disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
+    execute!(term.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     term.show_cursor()?;
     Ok(())
 }
 
-/// RAII backstop that leaves raw mode and the alternate screen on drop, so an
-/// error/panic path can't strand the popup pane in full-screen raw mode. The
-/// happy path still calls [`restore_terminal`] explicitly; re-issuing the
-/// escapes after a clean restore is harmless.
+/// RAII backstop that leaves raw mode, mouse capture, and the alternate screen
+/// on drop, so an error/panic path can't strand the popup pane in full-screen
+/// raw mode (or leak the mouse-capture escape sequences). The happy path still
+/// calls [`restore_terminal`] explicitly; re-issuing the escapes after a clean
+/// restore is harmless.
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -741,6 +835,61 @@ mod tests {
             prompt.focus = Focus::Cancel;
             assert_eq!(press(&mut prompt, code), Outcome::Cancel, "{code:?}");
         }
+    }
+
+    #[test]
+    fn hit_test_maps_clicks_to_the_reject_and_cancel_buttons() {
+        // A generous popup area so nothing clips.
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 16,
+        };
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let rows = body_rows(inner);
+        let (reject, cancel) = button_row(rows[3]);
+
+        // Both button cells (start and last column) hit-test to their control.
+        assert_eq!(hit_test(area, reject.x, reject.y), Some(Hit::Reject));
+        assert_eq!(
+            hit_test(area, reject.x + reject.width - 1, reject.y),
+            Some(Hit::Reject)
+        );
+        assert_eq!(hit_test(area, cancel.x, cancel.y), Some(Hit::Cancel));
+        assert_eq!(
+            hit_test(area, cancel.x + cancel.width - 1, cancel.y),
+            Some(Hit::Cancel)
+        );
+        // The gap between the two buttons is dead space.
+        assert_eq!(hit_test(area, reject.x + reject.width, reject.y), None);
+        // The row above the buttons (the spacer) resolves to nothing.
+        assert_eq!(hit_test(area, reject.x, reject.y - 1), None);
+    }
+
+    #[test]
+    fn render_draws_the_buttons_at_their_hit_test_rects() {
+        // The drawn `[ Reject ]` / `[ Cancel ]` glyphs must sit exactly where
+        // `button_row` says they do, so a click at those cells lands on them.
+        let (w, h) = (60u16, 16u16);
+        let prompt = text_prompt("x");
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render(f, &prompt)).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let rows = body_rows(inner);
+        let (reject, _cancel) = button_row(rows[3]);
+        let drawn: String = (0..reject.width)
+            .map(|dx| buf[(reject.x + dx, reject.y)].symbol().to_string())
+            .collect();
+        assert_eq!(drawn, REJECT_LABEL, "reject label sits on its hit rect");
     }
 
     #[test]
