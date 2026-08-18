@@ -8,7 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -107,9 +107,10 @@ pub use event_log::{
     append_worktree_detach_event, append_zen_dryrun_event, append_zen_mode_event, delivery_id,
     claim_event_follower, emit_event_body, event_cursor_path, event_follower_owner,
     event_follower_path, event_log_current_base, event_log_head, events_log_path,
-    message_delivery_status, read_event_log_from, read_or_initialize_event_cursor,
+    message_delivery_status, read_event_log_from, read_event_log_from_deadline,
+    read_or_initialize_event_cursor, read_or_initialize_event_cursor_deadline,
     release_event_follower, task_event_body, write_event_cursor,
-    EventEnvelope, EventKind, EventLogRead, HandoffCause, MessageDelivery, ReviewReadyEvent, ZenHeartbeatCue, ACTIONS_SKIPPED_MARKER, DAEMON_ACK,
+    EventEnvelope, EventKind, EventLogRead, FeedRead, HandoffCause, MessageDelivery, ReviewReadyEvent, ZenHeartbeatCue, ACTIONS_SKIPPED_MARKER, DAEMON_ACK,
     ORCH_EVENT_CALLBACK_SOCK_ENV, READY_MARKER_HANDOFF_ALIASES, READY_MARKER_HANDOFF_CAUSE,
 };
 pub use workspace_status::{
@@ -584,17 +585,25 @@ pub(crate) struct FileLockGuard {
 /// job is to be a stable inode for `flock`. Each caller opens its own
 /// descriptor, so two threads of one process exclude each other just like
 /// two processes do.
-pub(crate) fn acquire_file_lock(lock_path: &Path) -> Result<FileLockGuard> {
+/// Open (creating if missing) the lock file backing a `flock`. The file
+/// carries no data; its only job is to be a stable inode. Each caller opens
+/// its own descriptor, so two threads of one process exclude each other just
+/// like two processes do.
+fn open_lock_file(lock_path: &Path) -> Result<fs::File> {
     if let Some(parent) = lock_path.parent() {
         ensure_dir(parent)?;
     }
-    let file = fs::OpenOptions::new()
+    fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(lock_path)
-        .map_err(|e| shelbi_core::Error::Io(annotate_io_error(lock_path, e)))?;
+        .map_err(|e| shelbi_core::Error::Io(annotate_io_error(lock_path, e)))
+}
+
+pub(crate) fn acquire_file_lock(lock_path: &Path) -> Result<FileLockGuard> {
+    let file = open_lock_file(lock_path)?;
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -610,6 +619,71 @@ pub(crate) fn acquire_file_lock(lock_path: &Path) -> Result<FileLockGuard> {
         }
     }
     Ok(FileLockGuard { _file: file })
+}
+
+/// Poll interval between non-blocking `flock` attempts in
+/// [`acquire_file_lock_deadline`]. Small enough that an elapsed deadline or a
+/// delivered termination signal is honored promptly, large enough not to spin
+/// the CPU while a slow reader holds the lock.
+const FILE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Acquire an exclusive advisory lock, honoring a `deadline` and a
+/// `cancelled` predicate instead of blocking indefinitely like
+/// [`acquire_file_lock`].
+///
+/// Returns `Ok(Some(guard))` on success, or `Ok(None)` if `deadline` passed or
+/// `cancelled()` returned true before the lock could be taken. Unlike the
+/// blocking primitive — whose `flock(LOCK_EX)` can only be broken by SIGKILL,
+/// and whose `EINTR` retry loop swallows a delivered SIGTERM — this loops on
+/// `LOCK_EX | LOCK_NB` and re-checks the deadline and cancel flag between
+/// attempts. That is what lets the consuming event drain meet its
+/// `--max-lifetime` and react to SIGTERM even while the hub-global
+/// `events.log.lock` is held by a slow reader.
+pub(crate) fn acquire_file_lock_deadline(
+    lock_path: &Path,
+    deadline: Option<Instant>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<FileLockGuard>> {
+    let file = open_lock_file(lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            if cancelled() {
+                return Ok(None);
+            }
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+            }
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            match err.kind() {
+                // Held by another descriptor — wait a beat, then re-check.
+                std::io::ErrorKind::WouldBlock => {}
+                // A signal interrupted the syscall. Deliberately do NOT
+                // silently re-issue: fall through to the cancel/deadline
+                // re-check so a delivered SIGTERM ends the wait.
+                std::io::ErrorKind::Interrupted => {}
+                _ => return Err(shelbi_core::Error::Io(err)),
+            }
+            // Never overshoot the deadline by a full interval.
+            let nap = match deadline {
+                Some(deadline) => {
+                    FILE_LOCK_RETRY_INTERVAL.min(deadline.saturating_duration_since(Instant::now()))
+                }
+                None => FILE_LOCK_RETRY_INTERVAL,
+            };
+            if !nap.is_zero() {
+                std::thread::sleep(nap);
+            }
+        }
+    }
+    Ok(Some(FileLockGuard { _file: file }))
 }
 
 /// Public RAII handle for the per-workspace dispatch lock. Wraps a

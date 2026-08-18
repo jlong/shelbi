@@ -30,7 +30,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,10 @@ use serde::{Deserialize, Serialize};
 use shelbi_core::{Column, IntegrationMode, Result, DEFAULT_WORKFLOW_NAME};
 
 use crate::workspace_status::WorkspaceState;
-use crate::{acquire_file_lock, atomic_write, ensure_dir, project_dir, projects_dir, shelbi_home};
+use crate::{
+    acquire_file_lock, acquire_file_lock_deadline, atomic_write, ensure_dir, project_dir,
+    projects_dir, shelbi_home,
+};
 
 /// Harness callback socket for push-capable orchestrator runners.
 ///
@@ -588,6 +591,28 @@ fn append_exact_log_range(
     Ok(())
 }
 
+/// Outcome of a deadline-bounded event-log read for the consuming feed
+/// (`shelbi orchestrator events next --follow`). Unlike [`read_event_log_from`],
+/// which blocks on the hub-global lock and fails closed on an expired cursor,
+/// this reports both conditions as data so the follower can honor its deadline
+/// and self-heal instead of hanging or dying silently.
+pub enum FeedRead {
+    /// Retained bytes from `cursor` forward.
+    Read(EventLogRead),
+    /// The hub-global `events.log.lock` could not be taken before the
+    /// deadline / cancel fired. The caller should re-check its own deadline and
+    /// termination signal, then retry.
+    LockUnavailable,
+    /// `cursor` predates the earliest retained generation: it fell more than one
+    /// rotation behind and its bytes are gone. The follower must fast-forward to
+    /// `earliest` (or beyond) and resynchronize rather than fail closed.
+    CursorExpired {
+        earliest: u64,
+        current_base: u64,
+        head: u64,
+    },
+}
+
 /// Read retained event bytes from a monotonic logical cursor. A cursor in the
 /// prior generation drains the remainder of `.1` and then current in one
 /// contiguous result. Expired or future cursors fail closed instead of being
@@ -595,6 +620,39 @@ fn append_exact_log_range(
 pub fn read_event_log_from(cursor: u64) -> Result<EventLogRead> {
     let path = events_log_path()?;
     let _lock = acquire_file_lock(&event_log_lock_path(&path))?;
+    match read_event_log_locked(cursor)? {
+        FeedRead::Read(read) => Ok(read),
+        FeedRead::CursorExpired { earliest, .. } => Err(shelbi_core::Error::Other(format!(
+            "event cursor {cursor} predates earliest retained cursor {earliest}"
+        ))),
+        // The blocking acquire never returns without the lock held.
+        FeedRead::LockUnavailable => unreachable!("blocking lock never reports unavailable"),
+    }
+}
+
+/// Deadline/cancel-aware sibling of [`read_event_log_from`] for the consuming
+/// feed. Reports a lock timeout and an expired cursor as [`FeedRead`] variants
+/// rather than blocking or failing closed, so the drain can meet its deadline,
+/// react to SIGTERM, and self-heal a poison cursor. Acquires (and releases) the
+/// hub-global lock itself; the caller must not already hold it.
+pub fn read_event_log_from_deadline(
+    cursor: u64,
+    deadline: Option<Instant>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<FeedRead> {
+    let path = events_log_path()?;
+    let Some(_lock) = acquire_file_lock_deadline(&event_log_lock_path(&path), deadline, cancelled)?
+    else {
+        return Ok(FeedRead::LockUnavailable);
+    };
+    read_event_log_locked(cursor)
+}
+
+/// Shared read body for [`read_event_log_from`] and
+/// [`read_event_log_from_deadline`]. The caller must already hold the
+/// hub-global `events.log.lock`.
+fn read_event_log_locked(cursor: u64) -> Result<FeedRead> {
+    let path = events_log_path()?;
     let index = load_event_log_index(&path)?;
     let current_len = match fs::metadata(&path) {
         Ok(metadata) => metadata.len(),
@@ -604,9 +662,11 @@ pub fn read_event_log_from(cursor: u64) -> Result<EventLogRead> {
     let head = index.current_base.saturating_add(current_len);
     let earliest = index.previous_base.unwrap_or(index.current_base);
     if cursor < earliest {
-        return Err(shelbi_core::Error::Other(format!(
-            "event cursor {cursor} predates earliest retained cursor {earliest}"
-        )));
+        return Ok(FeedRead::CursorExpired {
+            earliest,
+            current_base: index.current_base,
+            head,
+        });
     }
     if cursor > head {
         return Err(shelbi_core::Error::Other(format!(
@@ -652,29 +712,65 @@ pub fn read_event_log_from(cursor: u64) -> Result<EventLogRead> {
         shelbi_core::Error::Other("event cursor is outside the current generation".into())
     })?;
     append_exact_log_range(&path, current_offset, current_read_len, &mut bytes)?;
-    Ok(EventLogRead {
+    Ok(FeedRead::Read(EventLogRead {
         start: cursor,
         head,
         bytes,
-    })
+    }))
 }
 
 pub fn event_cursor_path(project: &str) -> Result<PathBuf> {
     Ok(project_dir(project)?.join("event-cursor"))
 }
 
+/// Per-project lock guarding just this project's `event-cursor` file. Distinct
+/// from the hub-global `events.log.lock` so a consuming follower's cursor
+/// read/write never contends with unrelated projects or event writers — the
+/// contention that let a slow hub-global lock starve a follower past its
+/// deadline. Cursor writes are atomic (rename), and rotation reads the cursor
+/// files through the same atomic snapshots, so moving them off the shared lock
+/// stays safe: rotation still sees a committed, monotonic cursor value.
+fn event_cursor_lock_path(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("event-cursor.lock"))
+}
+
+/// True once the logical event-log index has been established on disk. While it
+/// is absent a cursor read must still trigger the one-time legacy-cursor
+/// migration (a side effect of loading the index); once it exists that load is a
+/// no-op, so the cursor read can stay on its own uncontended lock.
+fn event_log_index_established(log_path: &Path) -> Result<bool> {
+    event_log_index_path(log_path)
+        .try_exists()
+        .map_err(shelbi_core::Error::Io)
+}
+
 /// Read a project's applied cursor, registering a missing cursor at the start
 /// of the current generation before any later rotation can discard it.
+///
+/// The cursor file is guarded by the per-project [`event_cursor_lock_path`], not
+/// the hub-global `events.log.lock`: the common path (an existing cursor, index
+/// already established) reads under that low-contention lock alone. The shared
+/// log lock is taken only in the two cases that need the index — establishing it
+/// (which runs the one-time legacy-cursor migration that can rewrite this cursor
+/// file) and initializing a missing cursor from the current generation base — as
+/// an inner lock (cursor lock → log lock, a one-way order no other path inverts).
 pub fn read_or_initialize_event_cursor(project: &str) -> Result<u64> {
     let path = event_cursor_path(project)?;
     let log_path = events_log_path()?;
-    let _lock = acquire_file_lock(&event_log_lock_path(&log_path))?;
-    let index = load_event_log_index(&log_path)?;
+    let _cursor_lock = acquire_file_lock(&event_cursor_lock_path(project)?)?;
+    if !event_log_index_established(&log_path)? {
+        // Pre-establishment: load the index under the shared lock so the legacy
+        // migration runs (and may rewrite this cursor file) before we read it.
+        let _log_lock = acquire_file_lock(&event_log_lock_path(&log_path))?;
+        load_event_log_index(&log_path)?;
+    }
     match fs::read_to_string(&path) {
         Ok(text) => text.trim().parse().map_err(|_| {
             shelbi_core::Error::Other(format!("invalid event cursor in {}", path.display()))
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let _log_lock = acquire_file_lock(&event_log_lock_path(&log_path))?;
+            let index = load_event_log_index(&log_path)?;
             let cursor = index.current_base;
             atomic_write(&path, cursor.to_string().as_bytes())?;
             Ok(cursor)
@@ -683,13 +779,61 @@ pub fn read_or_initialize_event_cursor(project: &str) -> Result<u64> {
     }
 }
 
-pub fn write_event_cursor(project: &str, cursor: u64) -> Result<()> {
+/// Deadline/cancel-aware sibling of [`read_or_initialize_event_cursor`] for the
+/// consuming feed. Returns `Ok(None)` if a lock could not be taken before the
+/// deadline / cancel fired, so a blocked feed still honors its `--max-lifetime`
+/// and SIGTERM. In practice the cursor lock is uncontended and the fast path
+/// returns immediately; the deadline only bites on the one-time init that
+/// reaches for the shared log lock.
+pub fn read_or_initialize_event_cursor_deadline(
+    project: &str,
+    deadline: Option<Instant>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<u64>> {
     let path = event_cursor_path(project)?;
     let log_path = events_log_path()?;
-    let _lock = acquire_file_lock(&event_log_lock_path(&log_path))?;
+    let Some(_cursor_lock) =
+        acquire_file_lock_deadline(&event_cursor_lock_path(project)?, deadline, cancelled)?
+    else {
+        return Ok(None);
+    };
+    if !event_log_index_established(&log_path)? {
+        let Some(_log_lock) =
+            acquire_file_lock_deadline(&event_log_lock_path(&log_path), deadline, cancelled)?
+        else {
+            return Ok(None);
+        };
+        load_event_log_index(&log_path)?;
+    }
+    match fs::read_to_string(&path) {
+        Ok(text) => text
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| shelbi_core::Error::Other(format!("invalid event cursor in {}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let Some(_log_lock) =
+                acquire_file_lock_deadline(&event_log_lock_path(&log_path), deadline, cancelled)?
+            else {
+                return Ok(None);
+            };
+            let index = load_event_log_index(&log_path)?;
+            let cursor = index.current_base;
+            atomic_write(&path, cursor.to_string().as_bytes())?;
+            Ok(Some(cursor))
+        }
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
+pub fn write_event_cursor(project: &str, cursor: u64) -> Result<()> {
+    let path = event_cursor_path(project)?;
+    // Guarded by the per-project cursor lock (not the hub-global lock) so a
+    // consumer's ack never contends with unrelated projects or event writers.
+    let _cursor_lock = acquire_file_lock(&event_cursor_lock_path(project)?)?;
     // Deliberately do not load or create the global index here. Upgrade
     // migration must be able to observe a legacy cursor while the index is
-    // still absent; the next read initializes both under this same lock.
+    // still absent; the next read initializes it.
     //
     // `atomic_write` writes to a per-process temp file (`create` truncates) and
     // `rename`s it over `path`, so a reader never observes a half-written or

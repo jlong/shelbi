@@ -171,6 +171,17 @@ const FEED_POLL: Duration = Duration::from_millis(250);
 /// a stuck follower recovers — and re-blinds no one — within a bounded time.
 const FEED_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// How many times a single unacked batch may be redelivered before the feed
+/// quarantines it: advance the durable cursor past it (without an ack) and move
+/// on. A healthy consumer acks within one redelivery, resetting the count to
+/// zero, so this only ever trips on a genuinely un-ackable batch — one whose
+/// contents crash or hang the consumer every time. Bounding it is the escape
+/// valve for case 3 of the wedge: an un-ackable batch that would otherwise be
+/// re-emitted under a stable delivery id forever, with every later event queued
+/// behind it. At `FEED_VISIBILITY_TIMEOUT` per redelivery this is ~15 min of a
+/// stuck batch before the loud quarantine notice fires.
+const FEED_MAX_REDELIVERIES: u32 = 10;
+
 /// Durable claim/ack event feed — the Claude orchestrator's replacement for a
 /// raw `shelbi events tail --follow` watch.
 ///
@@ -197,18 +208,27 @@ const FEED_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(90);
 /// The loop is a pure filesystem poll of the persisted cursor and
 /// `events.log` — it holds no long-lived hub connection, so nothing on the hub
 /// side can recycle it out from under the consumer. Left alone it runs forever,
-/// emitting a batch only when one is pending. It stops on its own terms only
-/// two ways, both of which emit a terminal [`FeedNotice`] on stdout (and a line
-/// on stderr) and exit 0:
+/// emitting a batch only when one is pending. Every lock it takes on the poll
+/// path is deadline- and signal-aware, so it can never park past its deadline
+/// or ignore a SIGTERM while another holder has the hub-global lock. It stops on
+/// its own terms three ways, each of which emits a terminal [`FeedNotice`] on
+/// stdout (and a line on stderr) so a dead drain is always observable:
 ///
 /// * a catchable termination signal — SIGTERM/SIGHUP/SIGINT, e.g. an
-///   environment reaper or a supervisor recycling the process; and
+///   environment reaper or a supervisor recycling the process (exit 0);
 /// * the optional `max_lifetime` wall-clock cap, a deterministic self-recycle
 ///   a supervisor can set below its reaper's threshold so the exit is always a
-///   clean, message-bearing one rather than a silent kill.
+///   clean, message-bearing one rather than a silent kill (exit 0); and
+/// * a genuine terminal error, which emits a `failed` notice before propagating
+///   non-zero — never a silent Err to `main`.
 ///
-/// Either way the in-flight (unacked) batch is left exactly where it was, so
-/// the next follower re-derives and re-delivers it verbatim (at-least-once).
+/// A poison cursor is NOT a stop: a cursor that has fallen past the retained
+/// window self-heals (fast-forwards to the earliest retained position, emits a
+/// `resynchronized` notice, and continues), so the drain can never wedge on it
+/// and re-die on every relaunch.
+///
+/// On a clean stop the in-flight (unacked) batch is left exactly where it was,
+/// so the next follower re-derives and re-delivers it verbatim (at-least-once).
 /// An uncatchable `SIGKILL` — or the background shell hosting the feed being
 /// reaped when the agent session is recycled — still ends the process without a
 /// notice, but the same redelivery guarantee holds: no event is lost, only a
@@ -243,7 +263,18 @@ fn run_feed(project: &str, max_lifetime: Option<Duration>) -> Result<()> {
     // registry naming its successor. Best-effort: a release failure must not
     // mask the loop's own outcome.
     let _ = shelbi_state::release_event_follower(project, self_pid);
-    emit_feed_notice(project, &outcome?)
+    match outcome {
+        Ok(outcome) => emit_feed_notice(project, &outcome),
+        // Never die silently: surface a terminal notice for a genuine error
+        // before propagating it, so a dead drain is observable on the stream the
+        // supervisor already watches rather than a bare non-zero exit.
+        Err(error) => {
+            let _ = emit_feed_notice(project, &FeedOutcome::Failed {
+                error: error.to_string(),
+            });
+            Err(error)
+        }
+    }
 }
 
 /// The `--follow` poll loop, factored out of [`run_feed`] so it is testable
@@ -251,9 +282,17 @@ fn run_feed(project: &str, max_lifetime: Option<Duration>) -> Result<()> {
 /// `signal` flag and can pre-set it (or pass a zero flag with a short
 /// `max_lifetime`) to drive either exit path deterministically.
 ///
-/// Returns only on a self-determined stop — a non-zero `signal` flag or an
-/// elapsed `max_lifetime`. With `max_lifetime = None` and no signal it loops
+/// Returns on a self-determined stop — a non-zero `signal` flag, an elapsed
+/// `max_lifetime`, or a supersede — as `Ok`, and only propagates `Err` on a
+/// genuine terminal error (which the caller turns into a `failed` notice). A
+/// poison cursor is self-healed inline (fast-forward + `resynchronized` notice)
+/// and does NOT return. With `max_lifetime = None` and no signal it loops
 /// forever, which is the default indefinite feed.
+///
+/// Both lock acquisitions on the poll path (the per-project cursor read and the
+/// hub-global scan) are bounded by the remaining `max_lifetime` and cancelled by
+/// the `signal` flag, so the loop honors its deadline and reacts to SIGTERM even
+/// while another holder has the hub-global lock — never the old unbounded park.
 ///
 /// There is no keepalive line: liveness is carried by the unified stream (the
 /// hub's heartbeat and real events), so a quiet feed simply emits nothing until
@@ -278,8 +317,10 @@ fn feed_loop(
         signal,
         FEED_POLL,
         FEED_VISIBILITY_TIMEOUT,
+        FEED_MAX_REDELIVERIES,
         &|| feed_superseded(project, self_pid),
         &mut |batch| emit_feed_batch(batch),
+        &mut |notice| write_feed_notice(notice),
     )
 }
 
@@ -298,21 +339,30 @@ fn feed_superseded(project: &str, self_pid: u32) -> bool {
 /// injected, so tests can drive the redelivery behaviour deterministically
 /// (short cadences, an in-memory sink) without touching global stdout or real
 /// wall-clock intervals.
+#[allow(clippy::too_many_arguments)]
 fn feed_loop_with(
     project: &str,
     max_lifetime: Option<Duration>,
     signal: &AtomicUsize,
     poll: Duration,
     visibility_timeout: Duration,
+    max_redeliveries: u32,
     superseded: &dyn Fn() -> bool,
     emit: &mut dyn FnMut(&FeedBatch) -> Result<()>,
+    emit_notice: &mut dyn FnMut(&FeedNotice) -> Result<()>,
 ) -> Result<FeedOutcome> {
     let start = Instant::now();
-    // The batch currently in flight: the cursor it was scanned from and when it
-    // was last emitted. `None` means nothing is outstanding, so the next pending
-    // batch emits on the very next tick. While a batch is in flight we hold it
-    // in lock-step (new events wait behind it under a stable delivery id) until
-    // its visibility timeout elapses, at which point it is redelivered.
+    // A delivered termination signal (SIGTERM/SIGHUP/SIGINT) is the cancel
+    // signal threaded into every deadline-aware lock acquire below, so a feed
+    // blocked on lock acquisition ends promptly instead of only on the next
+    // tick — or, with the old `EINTR`-swallowing blocking lock, only on SIGKILL.
+    let cancelled = || signal.load(Ordering::Relaxed) != 0;
+    // The batch currently in flight: the cursor it was scanned from, when it
+    // was last emitted, and how many times it has been redelivered unacked.
+    // `None` means nothing is outstanding, so the next pending batch emits on
+    // the very next tick. While a batch is in flight we hold it in lock-step
+    // (new events wait behind it under a stable delivery id) until its
+    // visibility timeout elapses, at which point it is redelivered.
     let mut inflight: Option<InflightBatch> = None;
     loop {
         let sig = signal.load(Ordering::Relaxed);
@@ -330,20 +380,71 @@ fn feed_loop_with(
                 return Ok(FeedOutcome::Expired { after: limit });
             }
         }
-        let cursor = read_persisted_cursor(project)?;
+        // Bound every lock acquire this tick by the remaining lifetime so the
+        // deadline is honored even while a slow reader holds the hub-global
+        // lock. `None` (no lifetime cap) still leaves the cancel flag as the
+        // interrupt, so SIGTERM ends a blocked acquire regardless.
+        let deadline = max_lifetime.map(|limit| start + limit);
+
+        let cursor =
+            match shelbi_state::read_or_initialize_event_cursor_deadline(project, deadline, &cancelled)
+                .map_err(|e| anyhow!(e))?
+            {
+                Some(cursor) => cursor,
+                // Lock timed out or the signal fired — re-check both at the top.
+                None => continue,
+            };
         if feed_should_scan(inflight.as_ref(), cursor, Instant::now(), visibility_timeout) {
-            match scan_feed_batch(project, cursor)? {
-                Some(batch) => {
-                    emit(&batch)?;
-                    inflight = Some(InflightBatch {
-                        cursor,
-                        emitted: Instant::now(),
-                    });
+            // A rescan at the same cursor with a batch already in flight is a
+            // visibility-timeout redelivery, not a fresh ack-advanced batch.
+            let is_redelivery = matches!(&inflight, Some(b) if b.cursor == cursor);
+            match feed_scan(project, cursor, deadline, &cancelled)? {
+                FeedScan::Batch { batch, through } => {
+                    let redeliveries = if is_redelivery {
+                        inflight.as_ref().map_or(0, |b| b.redeliveries) + 1
+                    } else {
+                        0
+                    };
+                    if max_redeliveries > 0 && redeliveries > max_redeliveries {
+                        // Un-ackable batch: it has been redelivered past the cap
+                        // and still never acked. Advance the durable cursor past
+                        // it (no ack) so it stops wedging the stream, and leave a
+                        // loud notice rather than replay it forever.
+                        write_persisted_cursor(project, through)?;
+                        emit_notice(&quarantine_notice(project, cursor, through, redeliveries))?;
+                        inflight = None;
+                    } else {
+                        emit(&batch)?;
+                        inflight = Some(InflightBatch {
+                            cursor,
+                            emitted: Instant::now(),
+                            redeliveries,
+                        });
+                    }
                 }
                 // Nothing pending: drop any stale in-flight marker so the next
                 // appended event emits immediately instead of waiting out a
                 // visibility window that started before the ack landed.
-                None => inflight = None,
+                FeedScan::Empty => inflight = None,
+                // Lock still held at the deadline — loop back so the top-of-tick
+                // deadline/signal checks decide whether to expire, terminate, or
+                // retry, without a spurious extra poll sleep.
+                FeedScan::LockUnavailable => continue,
+                FeedScan::CursorExpired {
+                    earliest,
+                    current_base,
+                } => {
+                    // Poison cursor: it fell past the retained window (case 2 of
+                    // the wedge). Fast-forward to the earliest still-readable
+                    // position, DURABLY (so a relaunch resumes healed rather than
+                    // re-reading the wedged cursor and re-dying), emit a visible
+                    // resync notice, and continue — never a silent Err to main.
+                    let skipped = earliest.saturating_sub(cursor);
+                    write_persisted_cursor(project, earliest)?;
+                    inflight = None;
+                    emit_notice(&resync_notice(project, cursor, earliest, current_base, skipped))?;
+                    continue;
+                }
             }
         }
         thread::sleep(poll);
@@ -361,6 +462,11 @@ struct InflightBatch {
     /// When the batch was last emitted; the visibility timeout is measured from
     /// here, and reset on each redelivery so redeliveries are spaced out.
     emitted: Instant,
+    /// How many times this same (still-unacked) batch has been redelivered. Reset
+    /// to zero once the cursor advances (an ack); once it exceeds
+    /// [`FEED_MAX_REDELIVERIES`] the batch is quarantined so one un-ackable batch
+    /// cannot wedge the stream forever.
+    redeliveries: u32,
 }
 
 /// Decide whether the feed should scan and (re)emit on this tick. Split out as
@@ -395,9 +501,11 @@ fn feed_should_scan(
     }
 }
 
-/// Why the `--follow` loop returned instead of streaming forever. Both variants
-/// are clean exits (status 0) that print a [`FeedNotice`]; a genuine crash
-/// returns an `Err` up to `main` and prints no notice.
+/// Why the `--follow` loop returned instead of streaming forever. Every variant
+/// prints a [`FeedNotice`] so a dead drain is always observable rather than a
+/// silent stall: the clean stops (`Expired`/`Terminated`/`Superseded`) exit 0,
+/// and `Failed` — a genuine terminal error — still emits its notice before the
+/// error propagates non-zero to `main`.
 #[derive(Debug, PartialEq, Eq)]
 enum FeedOutcome {
     /// The optional `--max-lifetime` wall-clock cap elapsed.
@@ -407,6 +515,10 @@ enum FeedOutcome {
     /// A newer consuming follower took over the project's single-consumer
     /// registry, so this one stood down to keep exactly one follower live.
     Superseded,
+    /// The loop hit a genuine terminal error (I/O, parse, cursor write). Carried
+    /// so the error is surfaced as a notice before propagating, never as a silent
+    /// Err to main. A poison cursor is NOT this — it self-heals and continues.
+    Failed { error: String },
 }
 
 /// The recovery instruction spelled out on every terminal notice so the
@@ -426,8 +538,9 @@ struct FeedNotice {
     note: &'static str,
 }
 
-fn emit_feed_notice(project: &str, outcome: &FeedOutcome) -> Result<()> {
-    let notice = match outcome {
+/// Build the terminal notice for a stopped-on-its-own-terms outcome.
+fn feed_notice_for(project: &str, outcome: &FeedOutcome) -> FeedNotice {
+    match outcome {
         FeedOutcome::Expired { after } => FeedNotice {
             feed: "expired",
             project: project.to_string(),
@@ -446,15 +559,59 @@ fn emit_feed_notice(project: &str, outcome: &FeedOutcome) -> Result<()> {
             reason: "a newer follower for this project took over the consumer slot".to_string(),
             note: FEED_RECOVERY_NOTE,
         },
-    };
-    // A human-readable line on stderr for log scans; the machine notice rides
-    // stdout, the same stream the supervisor already parses for batches.
+        FeedOutcome::Failed { error } => FeedNotice {
+            feed: "failed",
+            project: project.to_string(),
+            reason: format!("event feed drain failed: {error}"),
+            note: FEED_RECOVERY_NOTE,
+        },
+    }
+}
+
+/// Non-terminal notice for a self-healed poison cursor: the cursor fell past the
+/// retained window and was fast-forwarded so the drain keeps making progress.
+fn resync_notice(project: &str, from: u64, to: u64, current_base: u64, skipped: u64) -> FeedNotice {
+    FeedNotice {
+        feed: "resynchronized",
+        project: project.to_string(),
+        reason: format!(
+            "cursor {from} predated the retained event log; fast-forwarded to {to} \
+             (current base {current_base}), skipping {skipped} bytes of expired events"
+        ),
+        note: FEED_RECOVERY_NOTE,
+    }
+}
+
+/// Non-terminal notice for a quarantined un-ackable batch: it was redelivered
+/// past the cap without an ack, so the cursor was advanced past it to unwedge
+/// the stream.
+fn quarantine_notice(project: &str, from: u64, through: u64, redeliveries: u32) -> FeedNotice {
+    FeedNotice {
+        feed: "quarantined",
+        project: project.to_string(),
+        reason: format!(
+            "batch {from}-{through} went unacked across {redeliveries} redeliveries; \
+             advanced the cursor past it to unwedge the stream"
+        ),
+        note: FEED_RECOVERY_NOTE,
+    }
+}
+
+fn emit_feed_notice(project: &str, outcome: &FeedOutcome) -> Result<()> {
+    write_feed_notice(&feed_notice_for(project, outcome))
+}
+
+/// Write a notice to both streams: a human-readable line on stderr for log
+/// scans, and the machine notice on stdout — the same stream the supervisor
+/// already parses for batches. Used for both terminal outcomes and the
+/// non-terminal resync/quarantine notices.
+fn write_feed_notice(notice: &FeedNotice) -> Result<()> {
     eprintln!(
-        "shelbi orchestrator events feed stopped: {} — {}",
-        notice.reason, notice.note
+        "shelbi orchestrator events feed [{}]: {} — {}",
+        notice.feed, notice.reason, notice.note
     );
     let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer_pretty(&mut stdout, &notice)?;
+    serde_json::to_writer_pretty(&mut stdout, notice)?;
     stdout.write_all(b"\n")?;
     stdout.flush()?;
     Ok(())
@@ -480,6 +637,11 @@ fn format_duration(d: Duration) -> String {
 
 /// Scan the next deliverable batch starting at `cursor` WITHOUT advancing the
 /// durable cursor. Returns `None` when no project-scoped events are pending.
+///
+/// Test-only blocking sibling of [`feed_scan`]: the live loop uses the
+/// deadline-aware [`feed_scan`], but the batch-identity/redelivery tests read
+/// more clearly against this simple `Option<FeedBatch>` shape.
+#[cfg(test)]
 fn scan_feed_batch(project: &str, cursor: u64) -> Result<Option<FeedBatch>> {
     let response = drain_once(project, cursor)?;
     if response.events.is_empty() {
@@ -499,6 +661,71 @@ fn scan_feed_batch(project: &str, cursor: u64) -> Result<Option<FeedBatch>> {
         },
         events: response.events,
     }))
+}
+
+/// Outcome of one deadline-aware feed scan. Distinguishes the states the
+/// `--follow` loop must react to differently: a pending batch, an empty stream,
+/// a lock it could not take before its deadline, and a poison cursor that fell
+/// past the retained window and must be resynchronized rather than fatal.
+#[derive(Debug)]
+enum FeedScan {
+    /// A pending batch to emit, plus the logical cursor it advances to on ack.
+    Batch { batch: FeedBatch, through: u64 },
+    /// Nothing project-scoped is pending.
+    Empty,
+    /// The hub-global lock was still held at the deadline; retry after the
+    /// caller re-checks its own deadline and termination signal.
+    LockUnavailable,
+    /// `cursor` predates the earliest retained generation. The caller must
+    /// fast-forward to `earliest` and resynchronize.
+    CursorExpired { earliest: u64, current_base: u64 },
+}
+
+/// Deadline-aware scan for the `--follow` loop: reads the next deliverable
+/// batch from `cursor` WITHOUT advancing the durable cursor, honoring `deadline`
+/// / `cancelled` on the hub-global lock and surfacing a poison cursor as
+/// [`FeedScan::CursorExpired`] instead of a fatal error.
+fn feed_scan(
+    project: &str,
+    cursor: u64,
+    deadline: Option<Instant>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<FeedScan> {
+    let read = match shelbi_state::read_event_log_from_deadline(cursor, deadline, cancelled)
+        .map_err(|e| anyhow!(e))?
+    {
+        shelbi_state::FeedRead::Read(read) => read,
+        shelbi_state::FeedRead::LockUnavailable => return Ok(FeedScan::LockUnavailable),
+        shelbi_state::FeedRead::CursorExpired {
+            earliest,
+            current_base,
+            ..
+        } => {
+            return Ok(FeedScan::CursorExpired {
+                earliest,
+                current_base,
+            })
+        }
+    };
+    let response = parse_drain(project, read)?;
+    if response.events.is_empty() {
+        return Ok(FeedScan::Empty);
+    }
+    let through = response.cursor_offset;
+    let delivery_id = shelbi_state::delivery_id(project, cursor, through);
+    Ok(FeedScan::Batch {
+        batch: FeedBatch {
+            ack: format!("shelbi orchestrator events ack {delivery_id}"),
+            delivery_id,
+            project: project.to_string(),
+            cursor: FeedCursor {
+                from: cursor.to_string(),
+                through: through.to_string(),
+            },
+            events: response.events,
+        },
+        through,
+    })
 }
 
 fn emit_feed_batch(batch: &FeedBatch) -> Result<()> {
@@ -602,8 +829,15 @@ struct AckResponse {
 }
 
 fn drain_once(project: &str, cursor: u64) -> Result<DrainResponse> {
-    let scope = ProjectScope::load(project)?;
     let read = shelbi_state::read_event_log_from(cursor).map_err(|e| anyhow!(e))?;
+    parse_drain(project, read)
+}
+
+/// Parse a raw [`EventLogRead`] into a project-scoped [`DrainResponse`]. Shared
+/// by the blocking [`drain_once`] and the deadline-aware [`feed_scan`], so both
+/// derive the same normalized events, cursor, and delivery range from a read.
+fn parse_drain(project: &str, read: shelbi_state::EventLogRead) -> Result<DrainResponse> {
+    let scope = ProjectScope::load(project)?;
     let start = read.start;
     let buf = read.bytes;
 
@@ -1748,6 +1982,7 @@ mod tests {
         let inflight = InflightBatch {
             cursor: 100,
             emitted: now,
+            redeliveries: 0,
         };
 
         // Same cursor, still inside the visibility window → hold in lock-step
@@ -1790,11 +2025,15 @@ mod tests {
             &signal,
             Duration::from_millis(5),
             Duration::ZERO,
+            // No redelivery cap: this test is about redelivery happening at all,
+            // not the quarantine escape hatch (covered separately).
+            0,
             &|| false,
             &mut |batch| {
                 deliveries.push(batch.delivery_id.clone());
                 Ok(())
             },
+            &mut |_notice| Ok(()),
         )
         .unwrap();
 
@@ -2045,8 +2284,10 @@ mod tests {
             &signal,
             Duration::from_millis(5),
             Duration::ZERO,
+            FEED_MAX_REDELIVERIES,
             &|| true,
             &mut |_batch| Ok(()),
+            &mut |_notice| Ok(()),
         )
         .unwrap();
         assert!(matches!(outcome, FeedOutcome::Superseded));
@@ -2097,5 +2338,244 @@ mod tests {
         // The second follower, holding any other PID, is told to stand down —
         // so it can never claim a batch out from under the primary.
         assert!(feed_superseded("demo", primary.wrapping_add(1)));
+    }
+
+    /// Path to the hub-global `events.log.lock`, the lock a slow reader/writer
+    /// holds while the feed wants to scan.
+    fn events_log_lock_path() -> std::path::PathBuf {
+        shelbi_state::events_log_path()
+            .unwrap()
+            .with_extension("log.lock")
+    }
+
+    /// Holds the hub-global `events.log` lock for as long as the guard lives,
+    /// exactly as a slow reader/writer in another process would. `flock` locks
+    /// are per open-descriptor, so this excludes the feed's own acquire even
+    /// within one process.
+    struct HeldEventsLogLock {
+        _file: std::fs::File,
+    }
+
+    fn hold_events_log_lock() -> HeldEventsLogLock {
+        use std::os::unix::io::AsRawFd;
+        let path = events_log_lock_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        assert_eq!(rc, 0, "test could not grab the events.log lock");
+        HeldEventsLogLock { _file: file }
+    }
+
+    /// Acceptance: `--max-lifetime` must be honored even while another holder has
+    /// the hub-global lock. Before the fix, the feed's blocking `flock(LOCK_EX)`
+    /// parked past the deadline (only SIGKILL could break it); now it returns
+    /// `Expired` within a small multiple of the cap.
+    #[test]
+    fn feed_honors_max_lifetime_while_events_log_lock_is_held() {
+        let (_guard, _tmp) = setup_home();
+        // Establish the index and the cursor file so the cursor read stays on
+        // its own uncontended lock — only the scan contends on the held lock.
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+        let _ = read_cursor("demo");
+
+        let held = hold_events_log_lock();
+        let signal = AtomicUsize::new(0);
+        let lifetime = Duration::from_millis(200);
+        let start = Instant::now();
+        let outcome = feed_loop("demo", Some(lifetime), &signal).unwrap();
+        let elapsed = start.elapsed();
+        drop(held);
+
+        assert!(
+            matches!(outcome, FeedOutcome::Expired { .. }),
+            "expected a timely Expired under lock contention, got {outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "feed hung past its deadline while the lock was held: {elapsed:?}"
+        );
+    }
+
+    /// Acceptance: SIGTERM must end a feed that is blocked on lock acquisition,
+    /// with no reliance on SIGKILL. The signal flag is threaded into the
+    /// deadline-aware acquire as the cancel predicate, so a blocked scan drops
+    /// out within a poll interval of the signal landing.
+    #[test]
+    fn sigterm_ends_a_feed_blocked_on_lock_acquisition() {
+        let (_guard, _tmp) = setup_home();
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+        let _ = read_cursor("demo");
+
+        let held = hold_events_log_lock();
+        let signal = AtomicUsize::new(0);
+        let start = Instant::now();
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // Give the loop time to enter its blocked acquire, then signal.
+                std::thread::sleep(Duration::from_millis(100));
+                signal.store(SIGTERM as usize, Ordering::Relaxed);
+            });
+            feed_loop_with(
+                "demo",
+                None, // no lifetime cap: only the signal can end this loop
+                &signal,
+                Duration::from_millis(5),
+                FEED_VISIBILITY_TIMEOUT,
+                FEED_MAX_REDELIVERIES,
+                &|| false,
+                &mut |_batch| Ok(()),
+                &mut |_notice| Ok(()),
+            )
+            .unwrap()
+        });
+        let elapsed = start.elapsed();
+        drop(held);
+
+        assert_eq!(outcome, FeedOutcome::Terminated { signal: SIGTERM });
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "SIGTERM did not promptly end a lock-blocked feed: {elapsed:?}"
+        );
+    }
+
+    /// Overwrite the index so the current generation begins at `current_base`,
+    /// stranding any smaller cursor past the retained window — the poison-cursor
+    /// state the prbadge drain died on.
+    fn strand_cursor_before_retained_window(current_base: u64) {
+        let path = shelbi_state::events_log_path().unwrap();
+        let index_path = path.with_extension("log.index.json");
+        fs::write(
+            &index_path,
+            format!(r#"{{"version":1,"previous_base":null,"current_base":{current_base}}}"#),
+        )
+        .unwrap();
+    }
+
+    /// Acceptance: a drain whose cursor predates the earliest retained generation
+    /// resynchronizes (fast-forwards to the current base) and keeps making
+    /// progress, emitting a visible "resynchronized" notice — instead of exiting
+    /// with a silent Err and re-dying on every relaunch (the prbadge wedge).
+    #[test]
+    fn poison_cursor_resynchronizes_and_makes_progress_instead_of_dying() {
+        let (_guard, _tmp) = setup_home();
+        // A real event lands in the current generation...
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+        let _ = read_cursor("demo");
+        // ...but the retained window has moved far ahead of the frozen cursor.
+        strand_cursor_before_retained_window(1000);
+        shelbi_state::write_event_cursor("demo", 0).unwrap();
+
+        let signal = AtomicUsize::new(0);
+        let mut delivered_from: Vec<String> = Vec::new();
+        let mut notices: Vec<String> = Vec::new();
+        let outcome = feed_loop_with(
+            "demo",
+            Some(Duration::from_millis(150)),
+            &signal,
+            Duration::from_millis(5),
+            FEED_VISIBILITY_TIMEOUT,
+            FEED_MAX_REDELIVERIES,
+            &|| false,
+            &mut |batch| {
+                delivered_from.push(batch.cursor.from.clone());
+                Ok(())
+            },
+            &mut |notice| {
+                notices.push(notice.feed.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, FeedOutcome::Expired { .. }), "{outcome:?}");
+        assert!(
+            notices.iter().any(|feed| feed == "resynchronized"),
+            "a self-healed poison cursor must emit a visible resync notice: {notices:?}"
+        );
+        assert_eq!(
+            read_cursor("demo"),
+            1000,
+            "poison cursor must fast-forward to the earliest retained position"
+        );
+        assert!(
+            delivered_from.iter().any(|from| from == "1000"),
+            "after resync the feed must deliver from the healed cursor: {delivered_from:?}"
+        );
+
+        // A relaunched drain resumes from the healed cursor and progresses,
+        // rather than re-reading the wedged cursor and re-dying.
+        let relaunch = scan_feed_batch("demo", read_cursor("demo")).unwrap();
+        assert!(
+            relaunch.is_some(),
+            "a relaunch on the healed cursor must make progress, not re-die"
+        );
+    }
+
+    /// A poison cursor surfaces as data (`FeedRead::CursorExpired`) rather than a
+    /// hard error, which is what lets the loop resync instead of dying.
+    #[test]
+    fn expired_cursor_reads_as_data_not_a_fatal_error() {
+        let (_guard, _tmp) = setup_home();
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+        let _ = read_cursor("demo");
+        strand_cursor_before_retained_window(1000);
+
+        match feed_scan("demo", 0, None, &|| false).unwrap() {
+            FeedScan::CursorExpired {
+                earliest,
+                current_base,
+            } => {
+                assert_eq!(earliest, 1000);
+                assert_eq!(current_base, 1000);
+            }
+            other => panic!("expected CursorExpired, got a different scan outcome: {other:?}"),
+        }
+    }
+
+    /// Acceptance (poison-batch escape): a batch redelivered past the cap without
+    /// an ack is quarantined — the cursor advances past it so one un-ackable
+    /// batch cannot wedge the stream forever, and a loud notice records it.
+    #[test]
+    fn unackable_batch_is_quarantined_after_the_redelivery_cap() {
+        let (_guard, _tmp) = setup_home();
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+        let before = read_cursor("demo");
+
+        let signal = AtomicUsize::new(0);
+        let mut notices: Vec<String> = Vec::new();
+        let outcome = feed_loop_with(
+            "demo",
+            Some(Duration::from_millis(150)),
+            &signal,
+            Duration::from_millis(2),
+            // Zero visibility timeout: every tick past the first is a redelivery.
+            Duration::ZERO,
+            2, // small cap so the quarantine trips quickly
+            &|| false,
+            &mut |_batch| Ok(()),
+            &mut |notice| {
+                notices.push(notice.feed.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, FeedOutcome::Expired { .. }), "{outcome:?}");
+        assert!(
+            notices.iter().any(|feed| feed == "quarantined"),
+            "an un-ackable batch must be quarantined past the cap: {notices:?}"
+        );
+        assert!(
+            read_cursor("demo") > before,
+            "quarantine must advance the durable cursor past the wedged batch"
+        );
     }
 }
