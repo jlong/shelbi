@@ -41,6 +41,7 @@ fn test_project() -> Project {
         agent_runners: BTreeMap::new(),
         github_url: None,
         workspace_poll_interval_secs: 5,
+        github_reconcile_interval_secs: 900,
         workspace_permissions_mode: "auto".into(),
         workspace_settings_template: None,
         zen: shelbi_core::ZenConfig::default(),

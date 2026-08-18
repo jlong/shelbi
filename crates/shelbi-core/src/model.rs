@@ -94,6 +94,15 @@ pub struct Project {
     /// How often the orchestrator polls each workspace pane for state changes.
     #[serde(default = "default_workspace_poll_interval_secs")]
     pub workspace_poll_interval_secs: u64,
+    /// How often the hub poller runs its GitHub-merge reconcile pass — the
+    /// sweep that advances a review-category task straight to done when its
+    /// PR was merged on GitHub out-of-band (skipping the local merge, which
+    /// GitHub already did). Default 900s (15 min); this pass shells out to
+    /// `gh` per in-review task, so it runs on its own slow clock, never the
+    /// `workspace_poll_interval_secs` tick. Set to `0` to disable it. See
+    /// [`Project::github_reconcile_interval`].
+    #[serde(default = "default_github_reconcile_interval_secs")]
+    pub github_reconcile_interval_secs: u64,
     /// Permissions posture rendered into the workspace settings template
     /// (see [`Project::workspace_settings_template`]). The default `auto`
     /// is mapped to claude's `acceptEdits` at render time.
@@ -202,6 +211,7 @@ pub const SHARED_PROJECT_FIELDS: &[&str] = &[
     "agent_runners",
     "github_url",
     "workspace_poll_interval_secs",
+    "github_reconcile_interval_secs",
     "workspace_permissions_mode",
     "workspace_settings_template",
     "zen",
@@ -661,6 +671,14 @@ fn default_workspace_poll_interval_secs() -> u64 {
     5
 }
 
+/// Default cadence for the hub poller's GitHub-merge reconcile pass: 15
+/// minutes. Deliberately coarse — the pass shells out to `gh` once per
+/// in-review task, so it runs on its own slow clock (never the 5s
+/// workspace-poll tick). `0` disables the pass entirely.
+fn default_github_reconcile_interval_secs() -> u64 {
+    900
+}
+
 fn default_workspace_permissions_mode() -> String {
     "auto".to_string()
 }
@@ -668,6 +686,16 @@ fn default_workspace_permissions_mode() -> String {
 impl Project {
     pub fn machine(&self, name: &str) -> Option<&Machine> {
         self.machines.iter().find(|m| m.name == name)
+    }
+
+    /// The GitHub-merge reconcile cadence, or `None` when the pass is
+    /// disabled (`github_reconcile_interval_secs: 0`). The hub poller checks
+    /// this each supervisor tick and skips the whole sweep when it is `None`,
+    /// so a project can turn the `gh`-backed reconcile off without affecting
+    /// any other polling.
+    pub fn github_reconcile_interval(&self) -> Option<std::time::Duration> {
+        (self.github_reconcile_interval_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.github_reconcile_interval_secs))
     }
 
     /// The label to show a human for this project. Precedence: the deprecated
@@ -3401,8 +3429,35 @@ agent_runners:
 "#;
         let p: Project = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(p.workspace_poll_interval_secs, 5);
+        // A project YAML that predates the reconcile pass defaults to 15 min.
+        assert_eq!(p.github_reconcile_interval_secs, 900);
+        assert_eq!(
+            p.github_reconcile_interval(),
+            Some(std::time::Duration::from_secs(900))
+        );
         assert_eq!(p.workspace_permissions_mode, "auto");
         assert!(p.workspace_settings_template.is_none());
+    }
+
+    #[test]
+    fn github_reconcile_interval_is_none_when_disabled() {
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+github_reconcile_interval_secs: 0
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.github_reconcile_interval_secs, 0);
+        assert_eq!(
+            p.github_reconcile_interval(),
+            None,
+            "a 0 interval disables the reconcile pass"
+        );
     }
 
     #[test]
@@ -3502,6 +3557,7 @@ workspace_settings_template: /etc/shelbi/p.json
                 slot: None,
             }],
             workspace_poll_interval_secs: default_workspace_poll_interval_secs(),
+            github_reconcile_interval_secs: default_github_reconcile_interval_secs(),
             workspace_permissions_mode: default_workspace_permissions_mode(),
             workspace_settings_template: None,
             zen: ZenConfig::default(),
@@ -3599,6 +3655,7 @@ workspaces:
             github_url: None,
             workspaces,
             workspace_poll_interval_secs: default_workspace_poll_interval_secs(),
+            github_reconcile_interval_secs: default_github_reconcile_interval_secs(),
             workspace_permissions_mode: default_workspace_permissions_mode(),
             workspace_settings_template: None,
             zen: ZenConfig::default(),
@@ -3901,6 +3958,7 @@ workspaces:
             github_url: None,
             workspaces: vec![],
             workspace_poll_interval_secs: default_workspace_poll_interval_secs(),
+            github_reconcile_interval_secs: default_github_reconcile_interval_secs(),
             workspace_permissions_mode: default_workspace_permissions_mode(),
             workspace_settings_template: None,
             zen,
@@ -5225,6 +5283,7 @@ git:
             agent_runners: runners,
             github_url: Some("git@github.com:example/shelbi.git".into()),
             workspace_poll_interval_secs: 7,
+            github_reconcile_interval_secs: 900,
             workspace_permissions_mode: "acceptEdits".into(),
             workspace_settings_template: Some(PathBuf::from("workspace-settings.json.template")),
             zen: ZenConfig {

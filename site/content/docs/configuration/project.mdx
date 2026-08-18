@@ -120,6 +120,7 @@ workspaces:
 | `github_url` | string | no | — | Informational GitHub URL recorded by the setup wizard. |
 | `config_mode` | `global` \| `in-repo` | no | `global` | Which on-disk layout the project uses. Elided from the wire form when `global`. See [config modes](/docs/concepts/config-modes). |
 | `workspace_poll_interval_secs` | integer | no | `5` | How often the hub poller samples each workspace pane for state changes. |
+| `github_reconcile_interval_secs` | integer | no | `900` | How often (seconds) the hub poller reconciles review tasks whose PR was merged on GitHub out-of-band, advancing them to done and skipping the local merge. Runs on its own slow clock, never the workspace poll tick. Set to `0` to disable. |
 | `workspace_permissions_mode` | string | no | `auto` | Permissions posture rendered into the workspace settings template (`auto` → claude's `acceptEdits`). |
 | `heartbeat` | [Heartbeat](#heartbeat) | no | `60s` / `5m` | Adaptive hub heartbeat written to `events.log` so the orchestrator's watch fires on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. |
 | `git` | [Git](#git) | no | all defaults | Base branch, generated task branch prefix, and merge strategy for `shelbi merge` and Zen's auto-merge. |

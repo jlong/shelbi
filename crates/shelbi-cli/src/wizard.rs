@@ -222,6 +222,7 @@ impl DetectedSetupPlan {
             github_url: self.remote_url.as_deref().and_then(remote_url_for_storage),
             workspaces,
             workspace_poll_interval_secs: 5,
+            github_reconcile_interval_secs: 900,
             workspace_permissions_mode: "auto".into(),
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),

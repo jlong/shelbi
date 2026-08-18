@@ -174,6 +174,15 @@ impl EventKind {
 /// (`ready_marker_handoff_contract` pins them together).
 pub const READY_MARKER_HANDOFF_CAUSE: &str = "workspace:ready-marker";
 
+/// The `reason=` token stamped on the review→done move the hub poller makes
+/// when it discovers a task's PR was already merged on GitHub out-of-band and
+/// reconciles the board to match (skipping the local merge, since GitHub has
+/// already integrated the branch). Distinct from every human/accept cause so
+/// the activity feed and the orchestrator's event drain can tell an automated
+/// GitHub-merge reconcile apart from a `user:review` accept. Emitted by
+/// [`append_github_merge_reconcile_event`].
+pub const GITHUB_MERGE_RECONCILE_CAUSE: &str = "poller:github-merge-reconcile";
+
 /// Every historical `reason=` token that has meant the ready-marker handoff.
 /// The canonical spelling changed over time
 /// (`worker:review-marker` → `workspace:review-marker` →
@@ -1322,6 +1331,42 @@ fn write_task_event_line(body: &str) -> Result<()> {
     match append_event_line(&line) {
         Ok(()) => Ok(()),
         Err(e) if is_permission_denied(&e) => emit_event_body(body),
+        Err(e) => Err(e),
+    }
+}
+
+/// Append the review→done transition the hub poller makes when a task's PR was
+/// merged on GitHub out-of-band. The line is a normal task transition — same
+/// `project=/task=/workflow=/from -> to/from_category=/to_category=` shape
+/// [`append_task_event`] emits, so the orchestrator's event drain and the
+/// activity feed classify and follow it like any other move — carrying the
+/// distinct [`GITHUB_MERGE_RECONCILE_CAUSE`] reason plus two provenance tokens:
+///
+/// ```text
+/// <rfc3339> project=<p> task=<id> workflow=<w> review -> done \
+///   reason=poller:github-merge-reconcile from_category=handoff to_category=done pr=<n> sha=<oid>
+/// ```
+///
+/// `pr` and `sha` ride as trailing `key=value` tokens (not folded into the
+/// space-collapsed `reason`) so a reader can pull the merged PR number and merge
+/// commit back out by key. `sha` is `-` when GitHub reported no merge-commit oid.
+pub fn append_github_merge_reconcile_event(
+    project: &str,
+    task_id: &str,
+    workflow: &str,
+    from: Column,
+    to: Column,
+    pr: u64,
+    merge_sha: Option<&str>,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let base = task_event_body(project, task_id, workflow, from, to, GITHUB_MERGE_RECONCILE_CAUSE);
+    let sha = sanitize_field(merge_sha.unwrap_or("-"));
+    let body = format!("{base} pr={pr} sha={sha}");
+    let line = format!("{ts} {body}");
+    match append_event_line(&line) {
+        Ok(()) => Ok(()),
+        Err(e) if is_permission_denied(&e) => emit_event_body(&body),
         Err(e) => Err(e),
     }
 }
@@ -4324,6 +4369,63 @@ mod tests {
         let line = log.lines().next().unwrap();
         assert!(line.contains(" workflow=feature-task "), "line: {line}");
         assert!(line.ends_with(" to_category=handoff"), "line: {line}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn github_merge_reconcile_event_carries_reason_pr_and_sha() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_github_merge_reconcile_event(
+            "demo",
+            "sign-commits",
+            "task",
+            Column::review(),
+            Column::done(),
+            236,
+            Some("abc1234def"),
+        )
+        .unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let line = log.lines().next().unwrap();
+        assert!(line.contains(" task=sign-commits "), "line: {line}");
+        assert!(line.contains(" review -> done "), "line: {line}");
+        assert!(
+            line.contains(&format!("reason={GITHUB_MERGE_RECONCILE_CAUSE}")),
+            "line: {line}"
+        );
+        assert!(line.contains(" to_category=done "), "line: {line}");
+        // `pr` and `sha` ride as trailing key=value tokens (not folded into reason).
+        assert!(line.ends_with(" pr=236 sha=abc1234def"), "line: {line}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn github_merge_reconcile_event_renders_absent_sha_as_dash() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_github_merge_reconcile_event(
+            "demo",
+            "t",
+            "task",
+            Column::review(),
+            Column::done(),
+            7,
+            None,
+        )
+        .unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        assert!(
+            log.lines().next().unwrap().ends_with(" pr=7 sha=-"),
+            "line: {}",
+            log.lines().next().unwrap()
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
