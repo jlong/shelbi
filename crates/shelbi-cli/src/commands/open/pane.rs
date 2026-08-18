@@ -1082,6 +1082,7 @@ mod tests {
             github_url: None,
             workspaces: vec![workspace],
             workspace_poll_interval_secs: 5,
+            github_reconcile_interval_secs: 900,
             workspace_permissions_mode: "default".into(),
             workspace_settings_template: None,
             zen: ZenConfig::default(),

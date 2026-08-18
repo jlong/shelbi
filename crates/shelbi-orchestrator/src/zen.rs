@@ -46,16 +46,17 @@ use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use shelbi_core::{
     checks_for_task_in_workflow, danger_paths_for_workflow, Column, Error, Host, Machine,
-    MergeStrategy, Project, Result, StatusCategory, Task, Workflow, WorkflowStatus, WorkspaceSpec,
+    MergeStrategy, Project, Result, StatusCategory, Task, TransitionAction, Workflow, WorkflowStatus,
+    WorkspaceSpec,
 };
 
 use crate::branch;
 use crate::git::{
     commit_subject, compose_pr_body, gh_pr_merge, locate_hub_workdir, locate_workspace_worktree,
-    login_shell_prefix, lookup_open_pr_in_repository, lookup_origin_repository,
-    lookup_origin_repository_selector,
-    lookup_origin_repository_with_push_target, lookup_pr_identity, parse_pr_number_from_url,
-    run_in_dir, run_login_shell_script_with_deadline, RepositoryIdentity,
+    login_shell_prefix, lookup_merged_pr, lookup_open_pr_in_repository, lookup_origin_repository,
+    lookup_origin_repository_selector, lookup_origin_repository_with_push_target,
+    lookup_pr_identity, parse_pr_number_from_url, run_in_dir,
+    run_login_shell_script_with_deadline, MergedPr, RepositoryIdentity,
 };
 use crate::workspace::{rebase_workspace_branch_onto_default, workspace_worktree, RebaseOutcome};
 
@@ -1049,6 +1050,254 @@ fn in_review_tasks_with_branch(project: &Project) -> Result<Vec<(String, String)
         }
     }
     Ok(out)
+}
+
+/// Upper bound on how many review-category tasks one GitHub-merge reconcile
+/// tick will probe. Each probe is a `gh pr list` round-trip, so a board with a
+/// huge review column can't turn one reconcile tick into a long serial run of
+/// `gh` calls that keeps the (already off-hot-path) sweep busy far past its
+/// interval. The overflow is logged and picked up next tick — the pass is
+/// idempotent, so nothing is lost, just deferred.
+const MAX_GITHUB_RECONCILE_PER_TICK: usize = 25;
+
+/// One task the GitHub-merge reconcile advanced review→done because its PR was
+/// already merged on GitHub. Returned to the hub poller so it can log the move
+/// and free the review slot that was serving the now-done task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubMergeReconcile {
+    pub task_id: String,
+    /// The workspace the task was assigned to at reconcile time (a review slot,
+    /// normally) — `None` if it carried no assignment.
+    pub workspace: Option<String>,
+    pub pr: u64,
+    /// GitHub's recorded merge-commit oid, when it reported one.
+    pub merge_commit: Option<String>,
+}
+
+/// A review-category task eligible for GitHub-merge reconcile: it sits in a
+/// handoff status whose forward edge auto-merges (so a GitHub merge is
+/// equivalent to Shelbi's own accept) and has a resolvable branch to look a PR
+/// up by. Human-review-only umbrella tasks are excluded before a candidate is
+/// built — see [`github_merge_reconcile_candidates`].
+struct GithubReconcileCandidate {
+    task: Task,
+    body: String,
+    workflow: Workflow,
+    branch: String,
+    from_status: String,
+    to_status: String,
+    to_column: Column,
+    workspace: Option<String>,
+}
+
+/// Reconcile review-category tasks whose PR was merged on GitHub out-of-band:
+/// advance each straight to done with the local merge **skipped** (GitHub has
+/// already integrated the branch), running the edge's remaining cleanup, and
+/// emit a `reason=poller:github-merge-reconcile` transition so the orchestrator
+/// and the activity feed see the move like any other.
+///
+/// This is the automated superset of a human clicking Accept on a task whose PR
+/// a teammate already merged on GitHub (the ContextStore `sign-commits` / PR
+/// #236 stuck-in-review incident). It does NOT depend on the "already-integrated
+/// branch is idempotent" merge fix, because it skips the merge action entirely
+/// via [`crate::transition::execute_transition_except`].
+///
+/// Runs off the hub poller's slow reconcile clock (never the 5s workspace tick).
+/// Best-effort throughout: a missing / unauthenticated / offline `gh`, a branch
+/// with no merged PR, or a per-task apply failure is logged and skipped — one
+/// bad task never stalls the sweep or crashes the poller. A branch whose PR is
+/// still open or closed-unmerged produces no merged-PR row and is left in
+/// review, untouched.
+pub fn github_merge_reconcile(project: &Project) -> Result<Vec<GithubMergeReconcile>> {
+    let candidates = github_merge_reconcile_candidates(project)?;
+    if candidates.is_empty() {
+        // No auto-mergeable review task on the board — make no GitHub call at
+        // all, mirroring the scoped CI poll's conditional design.
+        return Ok(Vec::new());
+    }
+    let (host, dir) = locate_hub_workdir(project)?;
+    let wt = dir.to_string_lossy().into_owned();
+    reconcile_candidates_with(project, candidates, |branch| {
+        lookup_merged_pr(&host, &wt, branch)
+    })
+}
+
+/// Drive the reconcile over an already-selected candidate set with the
+/// per-branch merged-PR lookup injected, so a test can exercise the
+/// merged-PR → auto-advance path (and the umbrella / open-PR skips) without a
+/// live `gh` / GitHub. The default caller ([`github_merge_reconcile`]) resolves
+/// the hub host / worktree / origin repository once and injects the real
+/// `gh pr list --state merged` lookup.
+fn reconcile_candidates_with<F>(
+    project: &Project,
+    candidates: Vec<GithubReconcileCandidate>,
+    lookup_merged: F,
+) -> Result<Vec<GithubMergeReconcile>>
+where
+    F: Fn(&str) -> Result<Option<MergedPr>>,
+{
+    let mut reconciled = Vec::new();
+    for (i, cand) in candidates.into_iter().enumerate() {
+        if i >= MAX_GITHUB_RECONCILE_PER_TICK {
+            tracing::debug!(
+                project = %project.name,
+                cap = MAX_GITHUB_RECONCILE_PER_TICK,
+                "github-merge reconcile per-tick cap reached; deferring remaining review tasks to the next tick"
+            );
+            break;
+        }
+        let merged = match lookup_merged(&cand.branch) {
+            Ok(Some(m)) => m,
+            // No merged PR (open / closed-unmerged / none) — leave it in review.
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::debug!(
+                    task = %cand.task.id, branch = %cand.branch, error = %e,
+                    "github-merge reconcile: merged-PR lookup failed (gh missing / offline / unauthenticated?)"
+                );
+                continue;
+            }
+        };
+        match apply_github_merge_reconcile(project, &cand, &merged) {
+            Ok(true) => {
+                tracing::info!(
+                    task = %cand.task.id, pr = merged.pr,
+                    sha = merged.sha.as_deref().unwrap_or("-"),
+                    "github-merge reconcile: advanced review -> done (merge skipped; PR already merged on GitHub)"
+                );
+                reconciled.push(GithubMergeReconcile {
+                    task_id: cand.task.id.clone(),
+                    workspace: cand.workspace.clone(),
+                    pr: merged.pr,
+                    merge_commit: merged.sha.clone(),
+                });
+            }
+            // The task had already left review (a prior tick moved it) — no-op.
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                task = %cand.task.id, error = %e,
+                "github-merge reconcile: advancing the task failed; leaving it in review for the next tick"
+            ),
+        }
+    }
+    Ok(reconciled)
+}
+
+/// Decide the review→done move to auto-make for a task sitting in handoff
+/// status `from`, when its PR is already merged on GitHub.
+///
+/// Returns `Some((to_status, to_column))` only when the forward edge out of
+/// `from` **auto-merges** ([`Workflow::fires_merge_bar`]) and lands on a
+/// terminal (`done`) status — the condition under which a GitHub merge is
+/// equivalent to Shelbi's own Accept, so advancing (with the merge skipped) is
+/// safe. Returns `None` for a human-review-only track — the umbrella
+/// `app-feature` / `site-update` flows, whose handoff status has no outgoing
+/// merge edge (a human does the integration) — and for a handoff status whose
+/// forward status is missing or not terminal.
+fn auto_reconcile_target(workflow: &Workflow, from: &str) -> Option<(String, Column)> {
+    if !workflow.fires_merge_bar(from) {
+        return None;
+    }
+    let forward = workflow.forward_status(from)?;
+    let to_column = Column::from_status_id(&forward.id);
+    (to_column.category() == StatusCategory::Done).then(|| (forward.id.clone(), to_column))
+}
+
+/// Select the review-category tasks eligible for GitHub-merge reconcile: those
+/// in a [`StatusCategory::Handoff`] status whose forward edge auto-merges (see
+/// [`auto_reconcile_target`], which also encodes the human-review-only umbrella
+/// exclusion) and whose branch resolves. A task whose branch can't be resolved
+/// is skipped rather than failing the whole sweep.
+fn github_merge_reconcile_candidates(project: &Project) -> Result<Vec<GithubReconcileCandidate>> {
+    let mut out = Vec::new();
+    for tf in shelbi_state::list_tasks(&project.name)? {
+        // Fall back to the default workflow when the task's workflow can't be
+        // loaded — the same resilience [`crate::review_ui::approve_review_task`]
+        // and the ready-handoff path use, so a transient workflow-YAML issue
+        // doesn't strand an otherwise-reconcilable task.
+        let workflow = load_task_workflow(&project.name, &tf.task)
+            .unwrap_or_else(shelbi_core::default_workflow);
+        let Some(status) = resolve_task_status(&tf.task, &workflow) else {
+            continue;
+        };
+        if status.category != StatusCategory::Handoff {
+            continue;
+        }
+        let from_status = status.id.clone();
+        let Some((to_status, to_column)) = auto_reconcile_target(&workflow, &from_status) else {
+            // Not an auto-mergeable review track — the umbrella /
+            // human-review-only exclusion, or a non-terminal forward status.
+            continue;
+        };
+        let branch = match branch::branch_name_for_task(project, Some(&workflow), &tf.task) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(
+                    task = %tf.task.id, error = %e,
+                    "github-merge reconcile: branch resolve failed"
+                );
+                continue;
+            }
+        };
+        out.push(GithubReconcileCandidate {
+            workspace: tf.task.assigned_to.clone(),
+            from_status,
+            to_status,
+            to_column,
+            branch,
+            workflow,
+            task: tf.task,
+            body: tf.body,
+        });
+    }
+    Ok(out)
+}
+
+/// Advance one candidate review→done because its PR is already merged on
+/// GitHub. Moves the board first (the transition is the source of truth even if
+/// the best-effort cleanup below fails), emits the reconcile event, then fires
+/// the edge's remaining actions with `merge` **skipped** — GitHub already
+/// merged, so re-running the merge would fail "no commits beyond target" and
+/// short-circuit the real cleanup (branch delete, `run:`/`ready:`). Mirrors the
+/// ordering of [`crate::review_ui::approve_review_task`]'s post-merge cleanup.
+///
+/// Returns `Ok(true)` when it made the move, `Ok(false)` when the task had
+/// already left the handoff status (a prior tick handled it).
+fn apply_github_merge_reconcile(
+    project: &Project,
+    cand: &GithubReconcileCandidate,
+    merged: &MergedPr,
+) -> Result<bool> {
+    let Some((from, to, wf)) =
+        shelbi_state::move_task(&project.name, &cand.task.id, cand.to_column.clone())?
+    else {
+        return Ok(false);
+    };
+    shelbi_state::append_github_merge_reconcile_event(
+        &project.name,
+        &cand.task.id,
+        &wf,
+        from,
+        to,
+        merged.pr,
+        merged.sha.as_deref(),
+    )?;
+    if let Err(e) = crate::transition::execute_transition_except(
+        project,
+        &project.name,
+        &cand.task,
+        &cand.body,
+        &cand.workflow,
+        &cand.from_status,
+        &cand.to_status,
+        &[TransitionAction::Merge],
+    ) {
+        tracing::warn!(
+            task = %cand.task.id, error = %e,
+            "github-merge reconcile: post-move cleanup failed (move already landed)"
+        );
+    }
+    Ok(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2666,6 +2915,7 @@ mod pr_create_tests {
                 slot: None,
             }],
             workspace_poll_interval_secs: 5,
+            github_reconcile_interval_secs: 900,
             workspace_permissions_mode: "auto".into(),
             workspace_settings_template: None,
             zen: ZenConfig::default(),
@@ -5110,6 +5360,187 @@ esac
             second.len(),
             1,
             "a settled green must not re-emit on the next sweep (transition dedup): {second:?}"
+        );
+    }
+
+    /// The GitHub-merge-reconcile transition lines currently in the test
+    /// `events.log`. Must be called while the `EnvGuard`'s `SHELBI_HOME` is in
+    /// scope so the path resolves to the hermetic home.
+    fn reconcile_event_lines() -> Vec<String> {
+        let path = shelbi_state::events_log_path().unwrap();
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("reason=poller:github-merge-reconcile"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A merged PR the injected lookup can hand back.
+    fn merged_pr(pr: u64, sha: Option<&str>) -> MergedPr {
+        MergedPr {
+            pr,
+            sha: sha.map(str::to_string),
+            base: "main".into(),
+        }
+    }
+
+    #[test]
+    fn github_merge_reconcile_advances_review_task_when_pr_merged_on_github() {
+        let _lock = crate::test_lock::acquire();
+        let home = tempfile::tempdir().unwrap();
+        let project = project(home.path());
+
+        let (column_after, events, reconciled) = {
+            let _env = EnvGuard::install(home.path());
+            // `task()` sits in the `review` column (Handoff) with an explicit
+            // `branch:` of TASK_BRANCH and no workflow (→ default workflow,
+            // whose review→done fires the merge bar via the legacy convention).
+            shelbi_state::save_task(PROJECT_NAME, &task(), "").unwrap();
+
+            let candidates = github_merge_reconcile_candidates(&project).unwrap();
+            assert_eq!(
+                candidates.len(),
+                1,
+                "the in-review task must be the single reconcile candidate"
+            );
+            // Inject a merged PR — no gh / GitHub touched.
+            let reconciled = reconcile_candidates_with(&project, candidates, |branch| {
+                assert_eq!(branch, TASK_BRANCH, "lookup must key off the task branch");
+                Ok(Some(merged_pr(236, Some("abc1234def"))))
+            })
+            .unwrap();
+
+            let column_after = shelbi_state::load_task(PROJECT_NAME, &task().id)
+                .unwrap()
+                .task
+                .column;
+            (column_after, reconcile_event_lines(), reconciled)
+        };
+
+        assert_eq!(
+            column_after.as_str(),
+            "done",
+            "a merged-on-GitHub review task must land in done"
+        );
+        assert_eq!(reconciled.len(), 1, "one task must be reported reconciled");
+        assert_eq!(reconciled[0].task_id, task().id);
+        assert_eq!(reconciled[0].pr, 236);
+        assert_eq!(reconciled[0].merge_commit.as_deref(), Some("abc1234def"));
+
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one reconcile transition must be emitted: {events:?}"
+        );
+        let line = &events[0];
+        assert!(line.contains("review -> done"), "wrong move: {line}");
+        assert!(
+            line.contains("reason=poller:github-merge-reconcile"),
+            "missing distinct reason: {line}"
+        );
+        assert!(line.contains("to_category=done"), "wrong to_category: {line}");
+        assert!(line.contains(" pr=236 "), "missing pr token: {line}");
+        assert!(line.contains("sha=abc1234def"), "missing sha token: {line}");
+    }
+
+    #[test]
+    fn github_merge_reconcile_leaves_open_or_unmerged_pr_in_review() {
+        let _lock = crate::test_lock::acquire();
+        let home = tempfile::tempdir().unwrap();
+        let project = project(home.path());
+
+        let (column_after, events, reconciled) = {
+            let _env = EnvGuard::install(home.path());
+            shelbi_state::save_task(PROJECT_NAME, &task(), "").unwrap();
+            let candidates = github_merge_reconcile_candidates(&project).unwrap();
+            // No merged PR (open / closed-unmerged / none) → the lookup yields None.
+            let reconciled =
+                reconcile_candidates_with(&project, candidates, |_branch| Ok(None)).unwrap();
+            let column_after = shelbi_state::load_task(PROJECT_NAME, &task().id)
+                .unwrap()
+                .task
+                .column;
+            (column_after, reconcile_event_lines(), reconciled)
+        };
+
+        assert!(reconciled.is_empty(), "nothing should be reconciled");
+        assert_eq!(
+            column_after,
+            Column::review(),
+            "a task with no merged PR must stay in review"
+        );
+        assert!(
+            events.is_empty(),
+            "no reconcile transition may be emitted: {events:?}"
+        );
+    }
+
+    #[test]
+    fn github_merge_reconcile_is_a_noop_when_no_review_task() {
+        let _lock = crate::test_lock::acquire();
+        let (base, _origin, worktree) = setup_repo(false);
+        let stub = tempfile::tempdir().unwrap();
+        // A fully-capable stub: if the pass ever shells out, its log is
+        // non-empty. The empty-log assertion proves the no-candidate early
+        // return runs *before* any gh work (locate_hub_workdir / repo lookup).
+        let log = install_scoped_ci_green_stub(stub.path(), &task_branch_head(&worktree), 236);
+        let project = ci_project(base.path(), &worktree);
+
+        let (reconciled, gh) = {
+            let _env = EnvGuard::install(stub.path());
+            // A task NOT in a handoff status → no reconcile candidate.
+            let mut not_in_review = task();
+            not_in_review.column = Column::in_progress();
+            shelbi_state::save_task(PROJECT_NAME, &not_in_review, "").unwrap();
+
+            let reconciled = github_merge_reconcile(&project).unwrap();
+            (reconciled, gh_calls(&log))
+        };
+
+        assert!(reconciled.is_empty(), "nothing to reconcile: {reconciled:?}");
+        assert!(
+            gh.is_empty(),
+            "the no-candidate early return must precede any gh call: {gh}"
+        );
+    }
+
+    fn umbrella_workflow() -> Workflow {
+        // A human-review-only umbrella: same statuses as the shipped task
+        // workflow, but the review→done edge fires NO merge — a human does the
+        // umbrella integration, so Shelbi must not auto-advance it.
+        let mut wf = shelbi_core::task_workflow();
+        wf.name = "app-feature".into();
+        if let Some(ts) = wf.transitions.as_mut() {
+            for t in ts.iter_mut() {
+                if t.from == "review" && t.to == "done" {
+                    t.actions.clear();
+                }
+            }
+        }
+        wf
+    }
+
+    #[test]
+    fn auto_reconcile_target_gates_on_the_forward_merge_edge() {
+        // Shipped task workflow: review→done fires [PushBranch, Merge] → reconcilable.
+        let task_wf = shelbi_core::task_workflow();
+        assert_eq!(
+            auto_reconcile_target(&task_wf, "review"),
+            Some(("done".into(), Column::from_status_id("done"))),
+            "an auto-merge review track must be reconcilable"
+        );
+        // Legacy default workflow (no transitions block): the handoff-category
+        // convention makes it reconcilable too — the motivating incident's shape.
+        assert!(
+            auto_reconcile_target(&shelbi_core::default_workflow(), "review").is_some(),
+            "a legacy default-workflow review must be reconcilable"
+        );
+        // Human-review-only umbrella: no merge on review→done → excluded.
+        assert_eq!(
+            auto_reconcile_target(&umbrella_workflow(), "review"),
+            None,
+            "a human-review-only umbrella task must never be auto-reconciled"
         );
     }
 }
@@ -9020,6 +9451,7 @@ mod probe_tests {
                 slot: None,
             }],
             workspace_poll_interval_secs: 5,
+            github_reconcile_interval_secs: 900,
             workspace_permissions_mode: "auto".into(),
             workspace_settings_template: None,
             zen: ZenConfig {

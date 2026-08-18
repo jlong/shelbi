@@ -160,6 +160,15 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     let mut ci_poll = shelbi_orchestrator::zen::ScopedCiState::new();
     let mut last_ci_poll: Option<Instant> = None;
 
+    // GitHub-merge reconcile clock. Project-wide (needs the whole review
+    // column), so it lives on the supervisor tick. Its own slow cadence
+    // (`project.github_reconcile_interval_secs`, default 15 min) keeps the `gh`
+    // round-trips gentle and OFF the 5s workspace-poll tick, and the sweep is
+    // conditional: no gh call when the review column has no auto-mergeable task.
+    // A poller restart re-seeds it to `None` (due now), so the first sweep after
+    // a restart reconciles any PR merged on GitHub while the hub was down.
+    let mut last_github_reconcile: Option<Instant> = None;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -253,6 +262,16 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
                 // an in-review terminal verdict whose `ci` event was missed is
                 // recovered here rather than sitting invisible.
                 maybe_poll_ci(&project, &mut ci_poll, &mut last_ci_poll, online_probe);
+
+                // GitHub-merge reconcile: for every review-category task whose
+                // forward edge auto-merges, check whether its PR was already
+                // merged on GitHub out-of-band and, if so, advance it straight
+                // to done with the local merge skipped (GitHub already merged),
+                // running the edge's cleanup. Fully automated — the orchestrator
+                // sees the resulting transition event like any other move. Runs
+                // on its own slow cadence, never the 5s workspace tick, and skips
+                // silently when the pass is disabled or gh is unavailable.
+                maybe_github_reconcile(&project, &mut last_github_reconcile, online_probe);
             }
             Err(e) => tracing::debug!(
                 project = %project.name,
@@ -468,6 +487,67 @@ fn maybe_poll_ci(
     *last_poll = Some(now);
     if let Err(e) = shelbi_orchestrator::zen::scoped_ci_poll(project, state) {
         tracing::warn!(project = %project.name, error = %e, "scoped CI poll failed");
+    }
+}
+
+/// Run one GitHub-merge reconcile sweep for `project` when its cadence is due
+/// and the box is online. Advances any review-category task whose PR was merged
+/// on GitHub out-of-band straight to done (skipping the local merge), then frees
+/// the review slot that was serving it. See
+/// [`shelbi_orchestrator::zen::github_merge_reconcile`].
+///
+/// Cadence is `project.github_reconcile_interval_secs` (default 15 min); a `0`
+/// interval disables the pass entirely (`github_reconcile_interval()` yields
+/// `None`). Kept firmly off the 5s workspace-poll tick — one batched pass per
+/// interval so a slow `gh` can't stall the workspace pollers, matching the
+/// scoped CI poll's independent-clock design.
+///
+/// Connectivity gated: the sweep is a GitHub round-trip, so while the box is
+/// offline it skips WITHOUT consuming the cadence, retrying next tick once
+/// connectivity returns. Best-effort: a sweep or per-task error is logged inside
+/// the orchestrator pass, never fatal to the poller.
+fn maybe_github_reconcile(
+    project: &Project,
+    last_poll: &mut Option<Instant>,
+    is_online: impl Fn() -> bool,
+) {
+    let Some(cadence) = project.github_reconcile_interval() else {
+        // Disabled via `github_reconcile_interval_secs: 0`.
+        return;
+    };
+    let now = Instant::now();
+    if let Some(prev) = last_poll {
+        if now.duration_since(*prev) < cadence {
+            return;
+        }
+    }
+    if !is_online() {
+        // Don't burn the cadence while offline — retry as soon as we're back.
+        return;
+    }
+    *last_poll = Some(now);
+    match shelbi_orchestrator::zen::github_merge_reconcile(project) {
+        Ok(reconciled) => {
+            for r in reconciled {
+                // The task is now done; free the review slot that was serving it
+                // so the auto-loader can hand the slot its next task. Mirrors the
+                // accept flow (approve → close_review_window). Best-effort and
+                // scoped to a review-tagged slot inside the call, so a task on a
+                // non-review workspace (or none) is a clean no-op.
+                if let Err(e) =
+                    shelbi_orchestrator::review_ui::close_review_window(&project.name, &r.task_id)
+                {
+                    tracing::debug!(
+                        project = %project.name, task = %r.task_id, pr = r.pr, error = %e,
+                        "github-merge reconcile: freeing the review slot failed (task already advanced to done)"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!(
+            project = %project.name, error = %e,
+            "github-merge reconcile pass failed"
+        ),
     }
 }
 
@@ -4489,6 +4569,7 @@ Intro prose.
                 slot: None,
             }],
             workspace_poll_interval_secs: 5,
+            github_reconcile_interval_secs: 900,
             workspace_permissions_mode: "auto".into(),
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),

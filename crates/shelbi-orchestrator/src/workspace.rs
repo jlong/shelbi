@@ -5586,6 +5586,7 @@ mod tests {
                 },
             ],
             workspace_poll_interval_secs: 5,
+            github_reconcile_interval_secs: 900,
             workspace_permissions_mode: "auto".into(),
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
@@ -10107,6 +10108,7 @@ mod sync_worktree_git_tests {
                 },
             ],
             workspace_poll_interval_secs: 5,
+            github_reconcile_interval_secs: 900,
             workspace_permissions_mode: "auto".into(),
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
@@ -10786,6 +10788,7 @@ mod sync_worktree_freshcut_tests {
             github_url: None,
             workspaces: vec![],
             workspace_poll_interval_secs: 5,
+            github_reconcile_interval_secs: 900,
             workspace_permissions_mode: "acceptEdits".into(),
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
@@ -11166,6 +11169,7 @@ mod sync_worktree_freshcut_tests {
                 slot: None,
             }],
             workspace_poll_interval_secs: 5,
+            github_reconcile_interval_secs: 900,
             // NOT "auto": keeps `require_auto_mode_supported` from probing
             // the host's claude binary — this test is about the sync step.
             workspace_permissions_mode: "acceptEdits".into(),

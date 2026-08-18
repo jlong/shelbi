@@ -154,6 +154,15 @@ const PROJECT_SECTIONS: &[Section] = &[
     },
     Section {
         prose: &[
+            "How often (seconds) the hub poller reconciles review tasks whose PR",
+            "was merged on GitHub out-of-band, advancing them to done (skipping",
+            "the local merge). Runs on its own slow clock, never the workspace",
+            "poll tick. Default 900 (15 min); 0 disables it.",
+        ],
+        yaml: "github_reconcile_interval_secs: 900\n",
+    },
+    Section {
+        prose: &[
             "Permissions posture rendered into the workspace settings template.",
             "`auto` maps to claude's acceptEdits. Default auto.",
         ],
