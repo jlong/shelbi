@@ -1012,9 +1012,10 @@ fn poll_one(
         }
     }
 
-    // Generic blocking-dialog advisory (trust / permission), deduped via
-    // `last_dialog` so a still-open modal produces one event per incident.
-    maybe_emit_dialog_event(project, workspace, screen.as_deref(), last_dialog);
+    // Generic blocking-dialog advisory (trust / permission / question), deduped
+    // via `last_dialog` so a still-open modal produces one event per incident.
+    // The detected kind is also folded into the persisted state below.
+    let dialog = maybe_emit_dialog_event(project, workspace, screen.as_deref(), last_dialog);
 
     // Resolve this tick's workspace state. For a Claude runner the live pane
     // *content* is the primary signal, not the `shelbi:<state>` pane-title
@@ -1033,6 +1034,16 @@ fn poll_one(
         .flatten();
     let new_state = match live_state {
         Some(state) => state,
+        // A blocking modal (trust / permission / question) parks the pane
+        // awaiting a human: neither the busy footer nor the ready input box is
+        // drawn, and Claude commonly clobbers the `shelbi:` title with the
+        // modal's own chrome. Without this, the title path below finds no marker
+        // and returns early *before* `save_workspace_status`, so `status.yaml`
+        // freezes at the pre-dialog state (a review slot sat frozen at `working`
+        // for hours on a `dialog:question`). Recording Blocked keeps `last_seen`
+        // advancing and reflects the true state; it clears on the next live
+        // busy/ready sample once the human answers.
+        None if dialog.is_some() => WorkspaceState::Blocked,
         None => {
             let title = match shelbi_tmux::pane_title(&host, &addr) {
                 Ok(t) => t,
@@ -1150,31 +1161,35 @@ fn decide_dialog(prev: Option<&str>, detected: Option<&str>) -> (Vec<DialogEvent
 /// Best-effort: an unknown runner or a missing sample (`None`, a transient
 /// `capture-pane` failure) just leaves the stuck-state untouched and retries
 /// next tick — we'd rather miss a beat than fabricate a recovery on a hiccup.
+///
+/// Returns the blocking dialog detected on *this* sample (the kind string, or
+/// `None` when the pane isn't parked on a modal). The caller folds that into the
+/// persisted state: a detected modal means the slot is [`WorkspaceState::Blocked`]
+/// even when the live footer / title path can't see it, so `status.yaml` keeps
+/// advancing instead of freezing at the pre-dialog state for the modal's life.
 fn maybe_emit_dialog_event(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     screen: Option<&str>,
     last_dialog: &mut Option<String>,
-) {
+) -> Option<String> {
     // Best-effort dialog detection against the project's baseline runner — a
     // workspace no longer carries a runner of its own.
-    let Some(runner) = project.default_runner_spec() else {
-        return;
-    };
+    let runner = project.default_runner_spec()?;
     let signatures = runner.effective_dialog_signatures();
     if signatures.is_empty() {
         // Nothing configured for this runner (and no built-in default) —
         // clear any prior stuck-state so a config change that removes the
         // last signature doesn't leave us thinking the pane is still blocked.
         *last_dialog = None;
-        return;
+        return None;
     }
 
     // No sample this tick (capture failed) — leave the stuck-state untouched
-    // rather than fabricating a recovery.
-    let Some(screen) = screen else {
-        return;
-    };
+    // rather than fabricating a recovery, and report no *fresh* detection so the
+    // caller falls back to the title path rather than latching Blocked off a
+    // sample we never actually took.
+    let screen = screen?;
     let detected = shelbi_orchestrator::ready::detect_blocking_dialog(screen, &signatures);
 
     let (events, next) = decide_dialog(last_dialog.as_deref(), detected.as_deref());
@@ -1191,7 +1206,8 @@ fn maybe_emit_dialog_event(
             );
         }
     }
-    *last_dialog = next;
+    *last_dialog = next.clone();
+    next
 }
 
 /// Load the prior [`PriorState`] for a workspace, preferring the in-memory
@@ -3341,19 +3357,29 @@ fn emit_review_ready(
     }
 }
 
-/// Reap a review slot whose task is resolved (no review-column task points at
-/// it) but which still holds a `.claude/shelbi-review-loaded` marker — evidence
-/// it served a now-gone task and its server is orphaned. Clears the stale
-/// marker (so the sidebar drops the phantom **Ready for Review** row) and, on a
-/// live non-user-shell pane, kills it (stopping the server it parented). Returns
-/// `true` when it acted (marker cleared) so the caller skips the rest of the
-/// tick.
+/// Reap a review slot whose task is resolved — no review-column task points at
+/// it, the state a review → done accept (or a bounce / hand move / eviction)
+/// leaves behind. Clears any lingering `.claude/shelbi-review-loaded` marker (so
+/// the sidebar drops the phantom **Ready for Review** row) and, on a live
+/// non-user-shell pane, kills it (stopping the server it parented) and drops the
+/// slot's stale `status.yaml` so it returns to a clean idle. Returns `true` when
+/// it took authoritative action (killed the pane, or cleared a marker) so the
+/// caller skips the rest of the tick.
 ///
-/// Marker presence is the gate: with no marker there's no evidence a server was
-/// started here, so an idle review agent or the sidebar's user shell is left
-/// untouched — the same conservative bias as the dev orphan path
-/// ([`maybe_reconcile_orphaned_pane`]), which this complements (that path
-/// deliberately skips `review` slots).
+/// Marker presence is **not** required to reap: a slot that was dispatched a
+/// review task but never confirmed serving — e.g. the Review agent blocked on a
+/// `dialog:question` before the branch's server came up, so the poller never
+/// wrote the loaded marker — leaves no marker behind, yet its agent pane is just
+/// as orphaned once the task is accepted. The earlier marker gate stranded
+/// exactly that pane as an `orphaned session` (the poller's dev-orphan path,
+/// [`maybe_reconcile_orphaned_pane`], deliberately skips `review` slots, so
+/// nothing else reclaimed it). The liveness/user-shell probe is the real guard:
+/// only a live, non-user-shell agent pane is killed; a user shell (the sidebar's
+/// open-idle pane) or an already-dead/unreachable slot is left alone.
+///
+/// No start-up race with a fresh load: review dispatch persists the task's
+/// review-column assignment *before* spawning the pane, so a booting review slot
+/// already resolves via `assigned_review_task_for` and never reaches this reap.
 fn maybe_reap_orphaned_review_slot(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
@@ -3361,20 +3387,21 @@ fn maybe_reap_orphaned_review_slot(
     addr: &shelbi_core::TmuxAddr,
     marker: &std::path::Path,
 ) -> bool {
-    let has_marker = matches!(
+    // Clear any stale marker first so the Ready row drops even if the reap below
+    // can't run (a probe hiccup, or a pane already gone).
+    let had_marker = matches!(
         shelbi_orchestrator::workspace::read_review_loaded_marker(host, marker),
         Ok(Some(_))
     );
-    if !has_marker {
-        return false;
-    }
-    // Clear the stale marker first so the Ready row drops even if the reap
-    // below can't run (a probe hiccup, or a pane already gone).
-    if let Err(e) = shelbi_orchestrator::workspace::clear_review_loaded_marker(host, marker) {
-        tracing::warn!(workspace = %workspace.name, error = %e, "clear_review_loaded_marker failed");
+    if had_marker {
+        if let Err(e) = shelbi_orchestrator::workspace::clear_review_loaded_marker(host, marker) {
+            tracing::warn!(workspace = %workspace.name, error = %e, "clear_review_loaded_marker failed");
+        }
     }
     // Kill only a live, non-user-shell pane — the same guard the dev orphan
-    // path uses so a user shell opened on the idle slot is never reaped.
+    // path uses so a user shell opened on the idle slot is never reaped. On a
+    // dead / unreachable / user-shell verdict there's nothing to reap: report
+    // whether the marker clear above already made this an authoritative tick.
     match shelbi_orchestrator::workspace::probe_workspace_slot(
         host,
         addr,
@@ -3383,10 +3410,17 @@ fn maybe_reap_orphaned_review_slot(
         shelbi_orchestrator::workspace::SlotProbe::Alive { user_shell: false } => {}
         shelbi_orchestrator::workspace::SlotProbe::Alive { user_shell: true }
         | shelbi_orchestrator::workspace::SlotProbe::Dead
-        | shelbi_orchestrator::workspace::SlotProbe::Unreachable { .. } => return true,
+        | shelbi_orchestrator::workspace::SlotProbe::Unreachable { .. } => return had_marker,
     }
     match shelbi_orchestrator::workspace::kill_workspace_pane(host, addr, &workspace.name) {
         Ok(()) => {
+            // Drop the now-idle slot's stale status.yaml so `shelbi workspace
+            // status` stops reporting the agent's last observed state (a killed
+            // pane emits no further markers, so the poller could never refresh
+            // it — it would stay frozen at `working`/`blocked` for hours).
+            if let Err(e) = shelbi_state::clear_workspace_status(&workspace.name) {
+                tracing::warn!(workspace = %workspace.name, error = %e, "clear_workspace_status failed");
+            }
             if let Err(e) = shelbi_state::append_workspace_pane_event(
                 &project.name,
                 &workspace.name,
@@ -3478,6 +3512,12 @@ fn maybe_reconcile_orphaned_pane(
     // orchestrator (and `shelbi events tail`) sees for the freed slot.
     match shelbi_orchestrator::workspace::kill_workspace_pane(host, addr, &workspace.name) {
         Ok(()) => {
+            // Drop the freed slot's stale status.yaml (a killed pane emits no
+            // further markers, so the poller can't refresh it) so it returns to
+            // a clean idle rather than reporting its last observed state.
+            if let Err(e) = shelbi_state::clear_workspace_status(&workspace.name) {
+                tracing::warn!(workspace = %workspace.name, error = %e, "clear_workspace_status failed");
+            }
             if let Err(e) = shelbi_state::append_workspace_pane_event(
                 &project.name,
                 &workspace.name,
@@ -3814,9 +3854,65 @@ Intro prose.
         assert!(acted, "a lingering marker with no assigned task must be reaped");
         assert!(!marker.exists(), "the stale marker must be cleared");
 
-        // No marker → nothing to reap (an idle agent / user shell is left alone).
+        // No marker AND a dead pane (the bogus addr probes Dead) → nothing to do.
+        // (A *live* non-user-shell pane with no marker is now reaped anyway —
+        // covered by `reaps_markerless_review_pane_and_clears_status`, which
+        // needs a real tmux slot.)
         let again = maybe_reap_orphaned_review_slot(&project, &ws, &host, &addr, &marker);
-        assert!(!again, "with no marker the slot is left untouched");
+        assert!(!again, "no marker + dead pane leaves the slot untouched");
+
+        match prior_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn maybe_emit_dialog_event_reports_detected_kind_for_the_state_fold() {
+        // Fix for the wedged poller: `poll_one` folds this return value into the
+        // persisted state so a pane parked on a `dialog:question` records Blocked
+        // (and keeps `last_seen` advancing) instead of returning early on a
+        // markerless title and freezing status.yaml. A benign screen must report
+        // no dialog so the live/title path keeps owning the state.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = review_serving_home();
+        let prior_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        let ws = project.workspaces[0].clone();
+
+        let question = "\
+╭─── Question ──────────────────────────────────────╮
+│ Which scope should this change target?            │
+│ ❯ 1. Just the poller                              │
+╰───────────────────────────────────────────────────╯
+ Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel";
+
+        let mut last_dialog = None;
+        let detected = maybe_emit_dialog_event(&project, &ws, Some(question), &mut last_dialog);
+        assert_eq!(
+            detected.as_deref(),
+            Some("question"),
+            "a question modal must be reported so poll_one can persist Blocked",
+        );
+        assert_eq!(last_dialog.as_deref(), Some("question"));
+
+        // The modal clears (a plain shell prompt) → no detection; the caller
+        // falls back to its live/title state resolution.
+        let cleared = maybe_emit_dialog_event(&project, &ws, Some("➜  repo $ "), &mut last_dialog);
+        assert_eq!(cleared, None, "a benign screen reports no dialog");
+        assert_eq!(last_dialog, None);
+
+        // A capture failure (no sample) reports no fresh detection either, so the
+        // title path — not a latched Blocked — owns the tick.
+        let mut stuck = Some("question".to_string());
+        let no_sample = maybe_emit_dialog_event(&project, &ws, None, &mut stuck);
+        assert_eq!(no_sample, None, "no sample reports no fresh dialog");
+        assert_eq!(stuck.as_deref(), Some("question"), "no sample leaves the stuck-state untouched");
 
         match prior_home {
             Some(h) => std::env::set_var("SHELBI_HOME", h),
@@ -6610,6 +6706,112 @@ transitions:
         assert!(
             !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr),
             "a dead slot must not be re-reaped",
+        );
+    }
+
+    /// End-to-end reap of a review slot whose task was accepted while the Review
+    /// agent was still on a `dialog:question` — so the poller never confirmed
+    /// serving and never wrote the `shelbi-review-loaded` marker. The pane is
+    /// still a live agent process; the marker-less reap must close it, drop the
+    /// slot's stale `status.yaml`, and log the pane event. This is the exact
+    /// orphaned-session-after-accept case from the bug report.
+    #[test]
+    fn reaps_markerless_review_pane_and_clears_status() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project_name = format!("review-reap-{nonce}");
+        let session = format!("shelbi-{project_name}");
+        let home = std::env::temp_dir().join(&project_name);
+        std::fs::create_dir_all(&home).unwrap();
+        let _cleanup = LimitResumeTmuxCleanup {
+            session: session.clone(),
+            home: home.clone(),
+            prior_home: std::env::var_os("SHELBI_HOME"),
+            prior_hub_sock: std::env::var_os("SHELBI_HUB_SOCK"),
+        };
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.name.clone_from(&project_name);
+        project.workspaces[0].tags = vec!["review".into()];
+        project.workspaces[0].slot = Some(4319);
+        shelbi_state::save_project(&project).unwrap();
+        let ws = project.workspaces[0].clone();
+
+        // The Review agent pane is alive; NO review-loaded marker was ever
+        // written (it blocked on a dialog before serving). Its task has already
+        // left the review column (accepted → done), so nothing points at the
+        // slot — the None branch of `handle_review_slot` reaches this reap.
+        let idle_script = home.join("idle.sh");
+        std::fs::write(&idle_script, "while :; do sleep 60; done\n").unwrap();
+        start_limit_resume_tmux_session(&session, &idle_script, &home.join("unused.receipt"));
+
+        // A stale status.yaml frozen at the pre-accept state, as the poller left
+        // it while the slot sat blocked.
+        let now = Utc::now();
+        shelbi_state::save_workspace_status(&WorkspaceStatus {
+            workspace: ws.name.clone(),
+            current_task: None,
+            state: WorkspaceState::Working,
+            last_transition: now,
+            last_seen: now,
+        })
+        .unwrap();
+
+        let host = Host::Local;
+        let addr = TmuxAddr {
+            session: session.clone(),
+            window: "alpha".into(),
+        };
+        assert!(
+            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            "the orphaned review agent pane must be alive before the reap",
+        );
+
+        let marker =
+            shelbi_orchestrator::workspace::workspace_review_loaded_marker(
+                project.machine(&ws.machine).unwrap(),
+                &ws,
+            );
+        assert!(!marker.exists(), "precondition: no review-loaded marker");
+
+        let acted = maybe_reap_orphaned_review_slot(&project, &ws, &host, &addr, &marker);
+        assert!(acted, "a live markerless review pane must be reaped");
+        assert!(
+            !shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            "the pane must be gone after the reap",
+        );
+        assert!(
+            shelbi_state::load_workspace_status(&ws.name).unwrap().is_none(),
+            "the stale status.yaml must be cleared so the slot reads idle",
+        );
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.lines().any(|l| l.contains(&format!("project={project_name}"))
+                && l.contains(&format!("workspace={}", ws.name))
+                && l.contains("pane_alive=false")
+                && l.contains("reason=orphaned-review-slot-reaped")),
+            "expected an orphaned-review-slot-reaped pane event; log: {log:?}",
+        );
+
+        // Idempotent: with the pane gone, a second pass is a no-op.
+        assert!(
+            !maybe_reap_orphaned_review_slot(&project, &ws, &host, &addr, &marker),
+            "a dead review slot with no marker must not be re-reaped",
         );
     }
 

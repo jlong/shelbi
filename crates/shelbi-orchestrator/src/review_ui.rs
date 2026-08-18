@@ -907,7 +907,12 @@ pub fn close_review_window(project_name: &str, task_id: &str) -> Result<()> {
         .machine(&ws.machine)
         .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
     let addr = crate::workspace::workspace_tmux_addr(&project, &ws)?;
-    crate::workspace::kill_workspace_pane(&machine.host(), &addr, &ws.name)
+    crate::workspace::kill_workspace_pane(&machine.host(), &addr, &ws.name)?;
+    // Drop the freed slot's stale status.yaml so it returns to a clean idle. A
+    // killed pane emits no further markers, so the poller can't refresh the file
+    // — left in place it would report the review agent's last observed state
+    // (frozen) rather than the empty slot it now is.
+    shelbi_state::clear_workspace_status(&ws.name)
 }
 
 /// **Reject**: append the reviewer's `reason` to the task body as a marked

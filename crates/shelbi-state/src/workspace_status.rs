@@ -286,6 +286,24 @@ pub fn load_workspace_status(workspace: &str) -> Result<Option<WorkspaceStatus>>
     Ok(Some(serde_yaml::from_str(&text)?))
 }
 
+/// Remove a workspace's `status.yaml`, if any. Called when a slot's agent pane
+/// is torn down and returned to idle (a review slot reaped after its task was
+/// accepted, a dev slot reaped after a manual board move) so the file doesn't
+/// linger frozen at the agent's last observed state — a killed pane emits no
+/// further markers, so the poller can never refresh it, and a stale
+/// `working`/`blocked` row would misreport an empty slot as busy for hours.
+/// After clearing, `load_workspace_status` reads `None` (the "not polled" state
+/// a genuinely idle slot has) and the board-derived views render it as idle.
+/// Idempotent and best-effort: a missing file is not an error.
+pub fn clear_workspace_status(workspace: &str) -> Result<()> {
+    let path = workspace_status_path(workspace)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
 /// The no-restart key the supervisor consumes to tell a crash from a
 /// deliberate shutdown.
 ///
@@ -467,6 +485,39 @@ mod tests {
         // Missing workspace returns None, not an error — the sidebar uses
         // this to bootstrap fresh on first observation.
         assert!(load_workspace_status("ghost").unwrap().is_none());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn clear_workspace_status_removes_the_file_and_is_idempotent() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // No file yet → clearing is a no-op.
+        clear_workspace_status("alpha").unwrap();
+
+        let now = Utc::now();
+        save_workspace_status(&WorkspaceStatus {
+            workspace: "alpha".into(),
+            current_task: None,
+            state: WorkspaceState::Working,
+            last_transition: now,
+            last_seen: now,
+        })
+        .unwrap();
+        assert!(workspace_status_path("alpha").unwrap().exists());
+
+        clear_workspace_status("alpha").unwrap();
+        assert!(
+            !workspace_status_path("alpha").unwrap().exists(),
+            "clear must remove status.yaml so a reaped slot reads as unpolled/idle"
+        );
+        assert!(load_workspace_status("alpha").unwrap().is_none());
+
+        // Second clear on the now-absent file is also OK.
+        clear_workspace_status("alpha").unwrap();
 
         std::env::remove_var("SHELBI_HOME");
     }
