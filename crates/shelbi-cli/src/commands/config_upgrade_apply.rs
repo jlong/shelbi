@@ -48,7 +48,7 @@ use shelbi_core::StatusCategory;
 use super::config_surfaces::{live_entries, InventoryEntry, SurfaceFormat};
 use super::config_upgrade::{
     get, is_inert, legacy_status_id, scope_label, Classification, UpgradeFinding, UpgradeReport,
-    REMOVED_PROJECT_KEYS,
+    PR_TEMPLATE_MISSING, REMOVED_PROJECT_KEYS,
 };
 
 /// One auto-heal write-back that landed on disk this run. Returned to the
@@ -189,6 +189,12 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
         if matches!(f.code.as_str(), "STATUSES_YML_EXTENSION" | "WORKER_SETTINGS_TEMPLATE_RENAME") {
             heal_rename(entry, f, applied);
         }
+    }
+
+    // Materialize a missing lifecycle-owned shipped default (the per-project
+    // `pr-template.md`). Independent of the content healers below.
+    if codes.contains(PR_TEMPLATE_MISSING) {
+        heal_missing_pr_template(entry, applied);
     }
 
     let id = entry.logical_id.as_str();
@@ -799,6 +805,35 @@ fn heal_rename(entry: &InventoryEntry, finding: &UpgradeFinding, applied: &mut V
         let detail = format!("{}->{}", file_label(legacy), file_label(target));
         record(applied, entry, &finding.code, target, detail);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Missing lifecycle-owned shipped default
+
+/// Materialize the shipped default `pr-template.md` at the entry's canonical
+/// path. Guarded on non-existence so a file created between detection and apply
+/// (or a custom one) is never clobbered — the finding stays reported instead.
+/// The canonical path was resolved config-mode-aware by the inventory, so this
+/// lands in `<repo>/.shelbi/` or `~/.shelbi/projects/<name>/` as appropriate.
+fn heal_missing_pr_template(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
+    let path = &entry.canonical_path;
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!(
+                "shelbi config-upgrade: creating {} failed: {e}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    if let Err(e) = write_atomic(path, shelbi_state::DEFAULT_PR_TEMPLATE) {
+        eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
+        return;
+    }
+    record(applied, entry, PR_TEMPLATE_MISSING, path, "materialize-shipped-default".into());
 }
 
 // ---------------------------------------------------------------------------

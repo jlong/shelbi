@@ -479,6 +479,17 @@ fn collect_project_entries(project: &str, out: &mut Vec<InventoryEntry>) -> Resu
         SurfaceFormat::Markdown,
         false,
     ));
+    // The user-editable PR-description template. Lifecycle-owned: Shelbi ships
+    // and self-heals the default, but the user edits it to change the guidance
+    // the developer worker follows when authoring a PR body.
+    out.push(entry(
+        &format!("project.{project}.pr-template"),
+        &scope,
+        config_root.join("pr-template.md"),
+        candidate_root.join("pr-template.md"),
+        SurfaceFormat::Markdown,
+        true,
+    ));
 
     let workflows = config_root.join("workflows");
     out.push(entry(

@@ -819,17 +819,52 @@ pub(crate) fn head_commit_subject(host: &Host, wt: &str) -> Result<String> {
     commit_subject(host, wt, "HEAD")
 }
 
-/// Lay out the PR body: the task summary (or an empty body when the task
-/// has no body) followed by an auto-opened footer that points the reviewer
-/// back at the task file on disk.
-pub(crate) fn compose_pr_body(task_body: &str, task_path: &str) -> String {
-    let trimmed = task_body.trim();
-    let summary = if trimmed.is_empty() {
-        String::new()
-    } else {
-        format!("{trimmed}\n\n")
+/// Relative path, inside the task's worktree, where the developer worker
+/// writes the PR description it authored for the human reviewer (following
+/// the project's `pr-template.md`). Shelbi's namespace in the worktree — the
+/// same `.shelbi/` tree the runner hooks live under, and covered by the same
+/// git exclude, so it never dirties `git status` or gets committed.
+pub(crate) const PR_BODY_WORKTREE_PATH: &str = ".shelbi/pr-body.md";
+
+/// Lay out the PR body. When the worker authored a description at
+/// `.shelbi/pr-body.md` in the worktree, *that* is the body (with the footer
+/// appended); otherwise fall back to the task body (or an empty body when the
+/// task has none). Either way the auto-opened footer points the reviewer back
+/// at the task file on disk.
+///
+/// `host`/`worktree` locate the worktree (which may be remote), so the read
+/// goes through the same login-shell transport every other primitive uses. A
+/// missing, empty, or unreadable file quietly falls back to the task-body
+/// path — the author step is best-effort and must never break the handoff.
+pub(crate) fn compose_pr_body(
+    host: &Host,
+    worktree: &str,
+    task_body: &str,
+    task_path: &str,
+) -> String {
+    let authored = read_worktree_pr_body(host, worktree);
+    let lead = match authored.as_deref().map(str::trim) {
+        Some(body) if !body.is_empty() => format!("{body}\n\n"),
+        _ => {
+            let trimmed = task_body.trim();
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!("{trimmed}\n\n")
+            }
+        }
     };
-    format!("{summary}---\n\nAuto-opened by Shelbi — review at: {task_path}\n")
+    format!("{lead}---\n\nAuto-opened by Shelbi — review at: {task_path}\n")
+}
+
+/// Read the worker-authored `.shelbi/pr-body.md` from the worktree, returning
+/// `None` when the file is absent or the read fails. Best-effort by design.
+fn read_worktree_pr_body(host: &Host, worktree: &str) -> Option<String> {
+    let out = run_in_dir(host, worktree, &["cat", PR_BODY_WORKTREE_PATH]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// `gh pr create` prints the new PR's URL like
@@ -845,9 +880,36 @@ pub(crate) fn parse_pr_number_from_url(s: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// A worktree path with no `.shelbi/pr-body.md`, so `compose_pr_body`
+    /// exercises the task-body fallback. A missing directory makes the
+    /// worktree `cat` fail fast, which is exactly the "no authored body" case.
+    fn no_authored_body_worktree() -> String {
+        std::env::temp_dir()
+            .join(format!("shelbi-no-prbody-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Create a fresh temp worktree containing `.shelbi/pr-body.md` with
+    /// `contents`. Returns the worktree dir.
+    fn worktree_with_pr_body(contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-prbody-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join(".shelbi")).unwrap();
+        std::fs::write(dir.join(PR_BODY_WORKTREE_PATH), contents).unwrap();
+        dir
+    }
+
     #[test]
     fn pr_body_includes_summary_and_footer() {
-        let body = compose_pr_body("Add foo to bar.", "/tmp/p/tasks/add-foo.md");
+        let wt = no_authored_body_worktree();
+        let body = compose_pr_body(&Host::Local, &wt, "Add foo to bar.", "/tmp/p/tasks/add-foo.md");
         assert!(body.starts_with("Add foo to bar.\n\n---\n"));
         assert!(body.contains("Auto-opened by Shelbi"));
         assert!(body.contains("/tmp/p/tasks/add-foo.md"));
@@ -855,9 +917,44 @@ mod tests {
 
     #[test]
     fn pr_body_handles_empty_task_body() {
-        let body = compose_pr_body("", "/tmp/t.md");
+        let wt = no_authored_body_worktree();
+        let body = compose_pr_body(&Host::Local, &wt, "", "/tmp/t.md");
         assert!(body.starts_with("---\n"));
         assert!(body.contains("Auto-opened by Shelbi"));
+    }
+
+    #[test]
+    fn pr_body_prefers_worker_authored_file_over_task_body() {
+        let authored = "## Summary\n\nFixes the widget.\n\n## QA checklist\n- [ ] click it";
+        let wt = worktree_with_pr_body(authored);
+        let body = compose_pr_body(
+            &Host::Local,
+            &wt.to_string_lossy(),
+            "RAW TASK REQUIREMENTS — should not appear",
+            "/tmp/p/tasks/widget.md",
+        );
+        assert!(body.starts_with("## Summary\n\nFixes the widget."));
+        assert!(body.contains("## QA checklist"));
+        assert!(!body.contains("RAW TASK REQUIREMENTS"));
+        // Footer preserved.
+        assert!(body.contains("Auto-opened by Shelbi — review at: /tmp/p/tasks/widget.md"));
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    #[test]
+    fn pr_body_falls_back_when_authored_file_is_empty() {
+        // A blank/whitespace-only authored file is treated as "no body" so a
+        // worker that touched the file but wrote nothing still gets a real PR.
+        let wt = worktree_with_pr_body("   \n\n");
+        let body = compose_pr_body(
+            &Host::Local,
+            &wt.to_string_lossy(),
+            "Task body fallback.",
+            "/tmp/t.md",
+        );
+        assert!(body.starts_with("Task body fallback.\n\n---\n"));
+        assert!(body.contains("Auto-opened by Shelbi"));
+        std::fs::remove_dir_all(&wt).ok();
     }
 
     #[test]
