@@ -1597,15 +1597,25 @@ fn derive_workspace_badge(workspace_name: &str, current_task: Option<&str>) -> W
         return WorkspaceBadge::Idle;
     };
     match load_workspace_status(workspace_name).ok().flatten() {
-        // Only trust the persisted state when it describes the task currently
-        // assigned to this slot. A `status.yaml` still naming a *prior* task
-        // is stale: a new task was just dispatched here and the poller hasn't
-        // re-observed the fresh pane yet, so its recorded `?`/state would latch
-        // on the row until the next marker lands. Fall through to the
-        // freshly-assigned default rather than render that stale badge.
+        // A Blocked pane is hard-stuck waiting on a human (a dialog/permission
+        // prompt). Surface the red ⚠ badge whether or not `status.yaml` names
+        // the task currently assigned to this slot: the state describes the
+        // *live pane*, and a slot silently stuck for hours is exactly the case
+        // the "freshly-dispatched → green" fall-through was masking. Better to
+        // occasionally show red for a beat after a redispatch (it firms up on
+        // the next poll) than to hide a genuinely blocked slot behind green.
+        Some(s) if s.state == WorkspaceState::Blocked => WorkspaceBadge::AwaitingPermission,
+        // Otherwise only trust the persisted state when it describes the task
+        // currently assigned to this slot. A `status.yaml` still naming a
+        // *prior* task is stale: a new task was just dispatched here and the
+        // poller hasn't re-observed the fresh pane yet, so its recorded
+        // `?`/state would latch on the row until the next marker lands. Fall
+        // through to the freshly-assigned default rather than render that stale
+        // badge.
         Some(s) if s.current_task.as_deref() == Some(task_id) => match s.state {
             WorkspaceState::Working => WorkspaceBadge::Working,
             WorkspaceState::AwaitingInput => WorkspaceBadge::AwaitingInput,
+            // Handled by the Blocked arm above; kept for match exhaustiveness.
             WorkspaceState::Blocked => WorkspaceBadge::AwaitingPermission,
             WorkspaceState::Paused => WorkspaceBadge::Paused,
             // A serving review slot reads as active work (the branch is up).
@@ -3464,6 +3474,25 @@ mod tests {
         .unwrap();
 
         let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        let rows = app.rows();
+        assert_eq!(
+            find_workspace_badge(&rows, "alpha").unwrap(),
+            WorkspaceBadge::AwaitingPermission
+        );
+
+        // A Blocked slot whose `status.yaml` names a *different* (stale/absent)
+        // task must still render red: the fresh-dispatch fall-through to green
+        // must not mask a live Blocked pane. This is the live case that hid a
+        // 10h-stuck slot behind a green triangle.
+        shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
+            workspace: "alpha".into(),
+            current_task: Some("t-other".into()),
+            state: WorkspaceState::Blocked,
+            last_transition: now,
+            last_seen: now,
+        })
+        .unwrap();
         app.refresh().unwrap();
         let rows = app.rows();
         assert_eq!(
