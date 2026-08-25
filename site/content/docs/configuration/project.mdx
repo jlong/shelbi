@@ -399,10 +399,75 @@ frontmatter wins; otherwise Shelbi renders `git.branch`; when neither is set it
 names the branch after your authenticated GitHub username, falling back to
 `user`. The shipped `task` workflow sets `branch: '{{github_user}}/{{id}}'`.
 
+## The PR-body template (`pr-template.md`)
+
+Alongside the project's YAML, `workflows/`, `agents/`, and `zenmode.md`, each
+project carries a `pr-template.md`. It is the guidance a developer worker
+follows when it authors the pull-request body for a finished task. Shelbi
+materializes it from a shipped default on `shelbi init`, self-heals it on
+`shelbi reload`, and the boot-time
+[config-upgrade pass](/docs/concepts/config-upgrade) materializes it for
+projects that predate the file. Like `zenmode.md` and the agent instructions,
+it is user-editable and self-heal-preserving: your edits survive a reload
+byte-for-byte, and editing the file changes the guidance workers follow for
+subsequent PRs.
+
+### Not a substitution template
+
+Unlike the [`git.branch`](#git) template above, `pr-template.md` has **no**
+`{{var}}` placeholders and does no variable substitution. It is instructions to
+the worker, not a fill-in-the-blanks form. Only an agent that understands the
+change can write a real summary, produce a Mermaid diagram, sketch an ASCII
+wireframe, or list a concrete QA checklist, so the worker reads the template and
+writes the body itself.
+
+### Where it lives
+
+The path is [config-mode](/docs/concepts/config-modes)-aware, resolving next to
+the rest of the project's config half:
+
+| Mode | Where `pr-template.md` lives |
+| --- | --- |
+| Global (default) | `~/.shelbi/projects/<id>/pr-template.md` |
+| In-repo | `<repo>/.shelbi/pr-template.md` |
+
+### What the shipped default asks for
+
+The default template tells the worker to write the body **for the human
+reviewer**, grounded in the real problem the change solves rather than a copy of
+the task requirements, in these sections, top to bottom:
+
+1. **Summary**: a few sentences on the feature or fix and the problem it
+   solves, so the reviewer understands the *why* before the *how*.
+2. **Technical details**: key design decisions and rejected alternatives,
+   tradeoffs, risky or subtle areas, and any migration or rollout notes.
+3. **Data model changes**: a conditional section, included only when the change
+   touches a database or schema, with a Mermaid ER or class diagram GitHub
+   renders natively.
+4. **UI changes**: a conditional section, included only when the change alters
+   the interface, with a shareable screenshot when one exists or an ASCII
+   wireframe otherwise.
+5. **QA checklist**: concrete, checkable items a reviewer or tester can run
+   through, using GitHub task-list syntax.
+
+Conditional sections are omitted entirely when they do not apply, so a
+non-schema, non-UI change carries only sections 1, 2, and 5.
+
+### How a worker uses it at handoff
+
+When a worker finishes a task it reads `pr-template.md`, writes the finished
+body to `.shelbi/pr-body.md` in its worktree, then emits its ready marker as
+usual. The orchestrator picks up `.shelbi/pr-body.md` when it opens the pull
+request. If the file is absent (a worker that genuinely could not produce a
+useful description just does not write it), Shelbi falls back to a
+task-body-based PR, so a missing description never blocks the handoff.
+
 ## See also
 
 - [Config modes](/docs/concepts/config-modes) — global vs. in-repo layout
   and the shared/user-local field split.
+- [Config upgrade](/docs/concepts/config-upgrade): the boot-time pass that
+  materializes `pr-template.md` for older projects and heals drifted config.
 - [Workspaces](/docs/concepts/workspaces) and
   [the orchestrator](/docs/concepts/orchestrator) — the concepts behind
   `workspaces:` and `orchestrator:`.

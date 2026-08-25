@@ -8,12 +8,13 @@ summary: "Inspect and validate Shelbi configuration: take a versioned inventory 
 shelbi config <COMMAND> [OPTIONS]
 ```
 
-`shelbi config` inspects and validates the configuration Shelbi owns. Two
+`shelbi config` inspects and validates the configuration Shelbi owns. Three
 commands cover every configuration surface: `inventory` discovers the canonical
-files and materializes an isolated candidate snapshot you can edit safely, and
-`lint` validates those surfaces through the same parsers Shelbi uses at runtime.
-Three older commands (`list-actions`, `dump-keybindings`, `check`) stay focused
-on the TUI keybindings in `~/.shelbi/keys.yaml`.
+files and materializes an isolated candidate snapshot you can edit safely,
+`lint` validates those surfaces through the same parsers Shelbi uses at runtime,
+and `upgrade` detects legacy or drifted forms and heals the safe ones. Three
+older commands (`list-actions`, `dump-keybindings`, `check`) stay focused on the
+TUI keybindings in `~/.shelbi/keys.yaml`.
 
 These commands are what the built-in configuration workflow runs. When you ask a
 built-in orchestrator to change Shelbi configuration, it drives `inventory` and
@@ -32,6 +33,7 @@ project whose `work_dir` contains the current directory) flags.
 | --- | --- |
 | `inventory` | Discover every Shelbi-owned configuration file and materialize an isolated candidate snapshot for safe editing. |
 | `lint` | Validate the selected configuration surfaces (live or staged) through Shelbi's production parsers. |
+| `upgrade` | Detect deprecated/legacy configuration forms, classify each as auto-heal or needs-judgment, and (with `--apply`) heal the safe ones. |
 | `list-actions` | Print every action with its mode, name, description, and the chord(s) bound to it after the `keys.yaml` merge. |
 | `dump-keybindings` | Dump the full default keymap as YAML (a starting point for `~/.shelbi/keys.yaml`). |
 | `check` | Validate `~/.shelbi/keys.yaml` and print any errors or warnings. |
@@ -104,6 +106,36 @@ Diagnostics come back with a stable `code` (for example `CONFIG_UNKNOWN_FIELD`,
 Configuration is either valid or it is not, so a warning is not something to
 apply and move past; it slots the command cleanly into a pre-flight check.
 
+## upgrade
+
+```text
+shelbi config upgrade [--project <PROJECT> | --all] [--apply | --needs-judgment | --apply-finding <ID>] [--format human|json]
+```
+
+Detect deprecated or legacy configuration forms and classify each as an
+**auto-heal** (a deterministic, non-lossy rewrite exists) or **needs-judgment**
+(ambiguous or potentially lossy, so a human decides). Detection is
+version-agnostic: it sniffs each file's content, not a schema version, so it
+works for a config authored by any past release. This is the same pass the hub
+runs on start and on [`shelbi reload`](/docs/cli/reload); see
+[Config upgrade](/docs/concepts/config-upgrade) for the full boot-time flow.
+
+Read-only by default: it reports the findings the on-start pass would act on
+without touching a file.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--all` | flag | off | Include every locally registered project instead of just the resolved one. |
+| `--apply` | flag | off | Perform every auto-heal write-back (as hub start and `shelbi reload` do), disclosing each on `events.log`, then print the residual. Needs-judgment findings are still left for you. Conflicts with `--needs-judgment` and `--apply-finding`. |
+| `--needs-judgment` | flag | off | Show only the needs-judgment findings, the channel the orchestrator ingests at boot. Each carries a stable `id`, the surface and location, the legacy form, the proposed fix, and why it needs judgment. Read-only. |
+| `--apply-finding <ID>` | string | none | Apply exactly one finding by its stable `id` (from `--needs-judgment`), reusing the auto-heal write-back for a single approved fix and leaving every other finding untouched. |
+| `--format human\|json` | enum | `human` | Diagnostic output format. |
+
+Findings persist to `~/.shelbi/config-upgrade-findings.json` for the orchestrator
+to surface; the pass removes that file once the config set is clean. A finding
+with no mechanical resolution (an unknown key that might be a typo or real data)
+is refused by `--apply-finding` with a pointer to edit the file directly.
+
 ## list-actions
 
 ```text
@@ -173,6 +205,14 @@ Validate a staged candidate directory you have been editing:
 shelbi config lint --project demo --staged /tmp/shelbi-config-1234 --format json
 ```
 
+Preview the config-upgrade findings for one project, then read just the ones
+that need a human decision:
+
+```bash
+shelbi config upgrade --project demo
+shelbi config upgrade --project demo --needs-judgment --format json
+```
+
 See what every action is bound to after your overrides are applied:
 
 ```bash
@@ -188,3 +228,5 @@ shelbi config list-actions
   modes, actions, chord syntax, and the built-in defaults.
 - [Config modes](/docs/concepts/config-modes): flat versus in-repo project
   layouts, which shape the registration surfaces `inventory` reports.
+- [Config upgrade](/docs/concepts/config-upgrade): the boot-time
+  validate-and-upgrade pass `upgrade` shares its detector with.
