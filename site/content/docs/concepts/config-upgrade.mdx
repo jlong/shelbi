@@ -1,0 +1,104 @@
+---
+title: Config upgrade
+order: 18
+summary: A version-agnostic validate-and-upgrade pass runs on boot. It sniffs each live config file for legacy forms, auto-heals what it safely can, and hands ambiguous findings to the orchestrator to resolve with you.
+---
+
+You may be sitting on a Shelbi config authored by any past release, and no
+Shelbi config file carries a schema version. So instead of migrating by version
+number, Shelbi runs a **content-based validate-and-upgrade pass** that inspects
+each live config file for deprecated or legacy forms and either fixes them or
+flags them for a human decision.
+
+## When it runs
+
+The pass runs automatically:
+
+- on **hub start** (across every registered project), and
+- on **`shelbi reload`** (for the reloaded project plus the shared global
+  surfaces).
+
+It is read-only about your intent and best-effort about failures: a detection or
+write error on one project is logged and swallowed so it can never stop the hub
+from serving or a reload from completing.
+
+## Detect, classify, apply
+
+Each run is **detect, classify, apply, re-detect, emit**:
+
+1. **Detect.** Sniffers run over every Shelbi-owned config surface (project
+   registration YAML, `statuses.yaml`, workflows, the global `config.yaml`,
+   per-agent `settings.json`, and the Zen and instructions Markdown), looking for
+   known legacy forms. Detection never uses a version number, only the file's
+   content, so it works for a config written by any past release.
+2. **Classify.** Every finding is sorted into one of two buckets:
+   - **`auto_heal`**: a deterministic, non-lossy, unambiguous rewrite exists.
+     Examples: a renamed key (`workers:` becomes `workspaces:`), a tag shorthand
+     (`tag: x` becomes `tags: [x]`), a moved keybinding, a legacy status-id
+     spelling, or a lifecycle-owned default a project is missing because it
+     predates the file (today the per-project
+     [`pr-template.md`](/docs/configuration/project#the-pr-body-template-pr-templatemd)).
+   - **`needs_judgment`**: ambiguous, potentially lossy, or the correct target
+     is not mechanically determinable. Examples: an unknown top-level key that
+     could be a typo or real data, a `display_name:` that disagrees with `name:`,
+     a `zen.danger_paths` that sets both `extend:` and `override:`, or a prose
+     refresh in instructions a user may have customized. When a sniffer is
+     unsure, a finding lands here rather than risk a lossy auto-heal.
+3. **Apply.** The pass applies every `auto_heal` write-back itself, then
+   re-detects the residual so the emitted report reflects the post-heal state. A
+   form healed this run is not re-surfaced. `needs_judgment` findings are never
+   applied automatically.
+4. **Emit.** The residual is disclosed (see below).
+
+## What you see
+
+**On `events.log`.** Each affected project gets one line:
+
+```
+project=<id> config-upgrade auto_heal=<M> needs_judgment=<N>
+```
+
+`auto_heal=<M>` is informational: those `M` fixes are already applied. Only
+`needs_judgment=<N>` with `N > 0` needs attention.
+
+**The findings file.** The residual is written for the orchestrator to ingest at
+boot, as a single hub-global JSON file:
+
+```
+~/.shelbi/config-upgrade-findings.json
+```
+
+It sits next to `events.log`. The pass **removes** the file when a config set is
+fully clean, so a stale file never lingers after the last deprecation is
+resolved. Each finding in it carries a stable `id`, its `code` (the deprecation
+kind, e.g. `ZEN_DANGER_PATHS_CONFLICT`), the `scope`, `file`, and `location`, a
+one-line `message` describing the legacy form, a `proposed_fix`, and for
+`needs_judgment` findings a `rationale` explaining what cannot be inferred
+mechanically.
+
+## Needs-judgment findings and the orchestrator
+
+The `needs_judgment` half of the findings file is the channel the
+[orchestrator](/docs/concepts/orchestrator) surfaces to you. When it sees a
+`needs_judgment > 0` line, it reads the channel and folds the findings into its
+next reply: the surface, the legacy form, the proposed fix, and the rationale,
+then asks how you want to proceed. It never applies a needs-judgment finding you
+have not approved. Once you approve one, it applies exactly that finding by its
+`id`, reusing the same atomic write-back the auto-heal pass uses.
+
+## Inspecting it yourself
+
+The same detector is exposed through
+[`shelbi config upgrade`](/docs/cli/config#upgrade): run it read-only to preview
+what the boot pass would act on, `--needs-judgment` to read just the human-
+decision channel, `--apply` to perform the auto-heals on demand, or
+`--apply-finding <id>` to resolve a single approved finding.
+
+## See also
+
+- [shelbi config](/docs/cli/config#upgrade): the `upgrade` subcommand and its
+  flags.
+- [The events log](/docs/concepts/events-log): where the `config-upgrade`
+  disclosure line lands.
+- [Project config](/docs/configuration/project): the surfaces the pass sniffs,
+  including the `pr-template.md` it materializes for older projects.
