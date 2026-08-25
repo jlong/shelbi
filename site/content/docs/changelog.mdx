@@ -9,6 +9,79 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### August 25, 2026
+
+**v0.9.0. Multi-runner agents, plus review-slot and orchestrator hardening.**
+
+**LLM configuration moved from the workspace to the agent, so you can mix and
+match Codex and Claude per job.** An agent now carries its own `agent.yaml`
+manifest, and a multi-runner resolution chain picks the runner and model from the
+agent rather than the workspace it happens to land in ([#543](https://github.com/jlong/shelbi/pull/543)). A task or a board status can
+override the launch for one dispatch ([#549](https://github.com/jlong/shelbi/pull/549)), and the reviewer is now
+medium-agnostic so it runs the same whether the work under review came from Codex
+or Claude ([#571](https://github.com/jlong/shelbi/pull/571)). The practical upshot: point a cheap fast runner at the
+mechanical tasks and a stronger one at the hard ones, all on the same board.
+
+**The orchestrator recovers from its own event drain.** The consuming event drain
+is now deadline-aware and self-healing, so a stalled or wedged drain unblocks
+itself instead of quietly starving the feed ([#580](https://github.com/jlong/shelbi/pull/580)). When a pane exits
+unexpectedly, Shelbi captures a crash record (the exit code plus a tail of
+`stderr`) so a worker that dies mid-task leaves evidence instead of a silent gap
+([#560](https://github.com/jlong/shelbi/pull/560)).
+
+**Config drift heals itself on boot.** A version-agnostic validate-and-upgrade
+sniffer runs on start, flags config that has drifted from the current defaults,
+and fixes what it safely can. Changes that need judgment are handed to the
+orchestrator as findings rather than force-written, so your customizations survive
+([#550](https://github.com/jlong/shelbi/pull/550), [#552](https://github.com/jlong/shelbi/pull/552), [#572](https://github.com/jlong/shelbi/pull/572)).
+
+**The review flow stops fighting itself.** A hub-side merge is now idempotent, so
+an already-integrated branch is treated as a success instead of an error
+([#573](https://github.com/jlong/shelbi/pull/573)), and a PR that GitHub already merged counts as a merge success too
+([#566](https://github.com/jlong/shelbi/pull/566)). The gated review-to-done merge fires at the move site so accepting a
+review actually lands it ([#558](https://github.com/jlong/shelbi/pull/558)), loading a queued task onto a busy slot shows a
+picker and evicts cleanly ([#564](https://github.com/jlong/shelbi/pull/564)), and a review window whose pane died
+auto-recovers ([#568](https://github.com/jlong/shelbi/pull/568), [#569](https://github.com/jlong/shelbi/pull/569)). The reject dialog gained mouse support and a
+multi-line reason ([#578](https://github.com/jlong/shelbi/pull/578), [#561](https://github.com/jlong/shelbi/pull/561)), and a dispatch guard now refuses to route
+developer work onto a review slot ([#575](https://github.com/jlong/shelbi/pull/575)).
+
+**Worker-authored PR bodies.** Workers write the pull-request description from an
+editable per-project template, so the PR a reviewer opens reads like a human wrote
+it instead of a task dump ([#581](https://github.com/jlong/shelbi/pull/581)).
+
+**Smaller fixes.** The poller auto-reconciles review tasks whose PR was merged on
+GitHub out of band ([#582](https://github.com/jlong/shelbi/pull/582)) and detects a worker's spinner and
+AskUserQuestion dialog more robustly ([#559](https://github.com/jlong/shelbi/pull/559), [#555](https://github.com/jlong/shelbi/pull/555)); the command
+palette shows a three-state project status indicator with an active pulse
+([#556](https://github.com/jlong/shelbi/pull/556), [#562](https://github.com/jlong/shelbi/pull/562)); and the launchd install path handles a clean boot-out and
+restarts an already-running daemon instead of erroring ([#570](https://github.com/jlong/shelbi/pull/570), [#565](https://github.com/jlong/shelbi/pull/565),
+[#547](https://github.com/jlong/shelbi/pull/547)).
+
+### August 10, 2026
+
+**v0.8.0. A unified event stream and review-slot fixes.**
+
+**One state-change stream drives signalling.** Shelbi used to lean on a 30-second
+keepalive to keep the orchestrator's view alive; now every signal flows through a
+single state-change stream, and the keepalive is retired. CI polling is scoped so
+it watches only what it needs ([#521](https://github.com/jlong/shelbi/pull/521)), and unacknowledged follower
+batches are redelivered after a visibility timeout so a slow or restarted follower
+can't drop events on the floor ([#530](https://github.com/jlong/shelbi/pull/530)).
+
+**Review slots stop churning.** Serving detection is now poller-driven ([#532](https://github.com/jlong/shelbi/pull/532)),
+a review slot is parked so it no longer thrashes between resume and autoload
+([#534](https://github.com/jlong/shelbi/pull/534)), and the review window closes once you accept ([#531](https://github.com/jlong/shelbi/pull/531)).
+
+**Merges land through the PR.** Integration goes through the GitHub pull request on
+a PR-only ruleset instead of a direct push ([#536](https://github.com/jlong/shelbi/pull/536)), and a fresh init cleanly
+splits the committed defaults from your local config, both on first init and on
+pick-up ([#537](https://github.com/jlong/shelbi/pull/537), [#538](https://github.com/jlong/shelbi/pull/538)).
+
+**Smaller fixes.** The workspace badge is re-derived from live state so it can't go
+stale ([#533](https://github.com/jlong/shelbi/pull/533)), the sidebar docks in the dashboard only rather than
+following you everywhere ([#519](https://github.com/jlong/shelbi/pull/519)), and the docs got an accuracy audit
+across the CLI, configuration, guides, and Concepts pages ([#522](https://github.com/jlong/shelbi/pull/522)–[#529](https://github.com/jlong/shelbi/pull/529)).
+
 ### August 5, 2026
 
 **v0.7.2. Honest mid-flight comms and workflow-aware handoffs.**
