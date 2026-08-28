@@ -366,10 +366,21 @@ fn create_worktree(
         args.push(wt_str.clone());
         args.push(branch.into());
     } else {
+        // Cut the fresh branch from an up-to-date base: freshen against
+        // `origin/<base>` when the base tracks a remote (see `resolve_cut_base`),
+        // otherwise fall back to the local ref unchanged.
+        let base = resolve_cut_base(host, &repo_dir, &parent_branch);
+        // When we resolved to `origin/<base>`, suppress the automatic upstream
+        // git would otherwise set (it'd point the task branch at `origin/<base>`
+        // — wrong; the branch pushes to its own `origin/<branch>` later). The
+        // local-ref fallback keeps the pre-existing tracking behavior.
+        if base != parent_branch {
+            args.push("--no-track".into());
+        }
         args.push("-b".into());
         args.push(branch.into());
         args.push(wt_str.clone());
-        args.push(parent_branch.clone());
+        args.push(base);
     }
 
     // Route through the shared transport-loss recovery: a `worktree add` that
@@ -387,4 +398,213 @@ fn create_worktree(
         );
     }
     Ok(())
+}
+
+/// Resolve the ref a brand-new task branch should be cut from, freshening the
+/// base against its remote first when it has one.
+///
+/// The hub's local base ref (e.g. `main`) drifts behind `origin/main` as other
+/// work merges — nothing advances the local ref between dispatches. Cutting a
+/// new branch from that stale local ref silently bases the task on old code,
+/// forcing needless rebases/conflicts at merge time. So when `base` has a
+/// remote-tracking counterpart (`refs/remotes/origin/<base>`), we best-effort
+/// `git fetch origin <base>` and cut from `origin/<base>` — the freshest remote
+/// state — rather than the local ref.
+///
+/// Basing on `origin/<base>` also sidesteps the "base is checked out in the
+/// hub's primary worktree" problem: git refuses to attach two worktrees to the
+/// same local branch, but any number of worktrees can branch off the
+/// remote-tracking ref.
+///
+/// Two deliberate fallbacks to the local `base` ref:
+/// - **No remote counterpart** — the subtask/umbrella workflows
+///   (`app-feature-subtask`, `site-update-subtask`) base on a local-only
+///   integration branch (`task/<id>`) that was never pushed, and local-only
+///   projects / test fixtures have no `origin` at all. Either way there is no
+///   `origin/<base>`, so we branch from the local ref and never touch origin.
+/// - **Best-effort fetch failure** — offline, or the remote branch vanished. We
+///   warn and cut from whatever `origin/<base>` last resolved to (no worse than
+///   the local ref) rather than failing the dispatch.
+fn resolve_cut_base(host: &Host, repo: &str, base: &str) -> String {
+    // A base with no remote-tracking counterpart is a local-only integration
+    // branch (subtask/umbrella) or a repo with no `origin`. No fresher remote
+    // truth exists — cut from the local ref, and don't fetch.
+    let remote_ref = format!("refs/remotes/origin/{base}");
+    let has_remote_counterpart = shelbi_ssh::run(
+        host,
+        ["git", "-C", repo, "rev-parse", "--verify", "--quiet", &remote_ref],
+    )
+    .map(|out| out.status.success())
+    .unwrap_or(false);
+    if !has_remote_counterpart {
+        return base.to_string();
+    }
+
+    // Freshen the remote-tracking ref, best-effort. A failure (offline, deleted
+    // remote branch) warns and proceeds from the last-known `origin/<base>` —
+    // never a hard dispatch failure. `run_resilient` rides out a transient
+    // managed-ControlMaster drop before giving up.
+    match shelbi_ssh::run_resilient(host, ["git", "-C", repo, "fetch", "origin", base]) {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => eprintln!(
+            "shelbi: `git fetch origin {base}` failed in {repo}; cutting the new branch \
+             from the last-known origin/{base}: {}",
+            shelbi_ssh::describe_failure(host, &out)
+        ),
+        Err(e) => eprintln!(
+            "shelbi: `git fetch origin {base}` errored in {repo}; cutting the new branch \
+             from the last-known origin/{base}: {e}"
+        ),
+    }
+    format!("origin/{base}")
+}
+
+#[cfg(test)]
+mod cut_base_tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    /// Run `git <args>` in `dir` with a deterministic identity so commits work
+    /// in a bare CI environment. Panics on spawn failure; returns the output.
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git")
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = git(dir, args);
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// `git rev-parse <rev>` in `dir`, trimmed. Empty string if it doesn't resolve.
+    fn rev(dir: &Path, r: &str) -> String {
+        let out = git(dir, &["rev-parse", r]);
+        if out.status.success() {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Build an `origin` bare repo with a `main` commit and a `hub` clone of it.
+    /// Returns (origin_path, hub_path). The `_root` guard keeps the tempdir alive.
+    fn seed_repo(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let seed = root.join("seed");
+        let origin = root.join("origin.git");
+        let hub = root.join("hub");
+        std::fs::create_dir_all(&seed).unwrap();
+
+        git_ok(root, &["init", "--bare", "-b", "main", origin.to_str().unwrap()]);
+        git_ok(&seed, &["init", "-b", "main"]);
+        std::fs::write(seed.join("README.md"), "seed\n").unwrap();
+        git_ok(&seed, &["add", "."]);
+        git_ok(&seed, &["commit", "-m", "seed"]);
+        git_ok(&seed, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git_ok(&seed, &["push", "origin", "main"]);
+        git_ok(root, &["clone", origin.to_str().unwrap(), hub.to_str().unwrap()]);
+        (origin, hub)
+    }
+
+    #[test]
+    fn cuts_from_freshened_origin_when_base_tracks_a_remote() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (origin, hub) = seed_repo(tmp.path());
+
+        // Advance origin from a second working clone so the hub's local `main`
+        // and `origin/main` both go stale relative to the true remote tip.
+        let other = tmp.path().join("other");
+        git_ok(
+            tmp.path(),
+            &["clone", origin.to_str().unwrap(), other.to_str().unwrap()],
+        );
+        std::fs::write(other.join("f2.txt"), "more\n").unwrap();
+        git_ok(&other, &["add", "."]);
+        git_ok(&other, &["commit", "-m", "advance"]);
+        git_ok(&other, &["push", "origin", "main"]);
+        let remote_tip = rev(&other, "HEAD");
+
+        // Before: the hub's origin/main is behind the true remote tip.
+        assert_ne!(rev(&hub, "refs/remotes/origin/main"), remote_tip);
+
+        let base = resolve_cut_base(&Host::Local, hub.to_str().unwrap(), "main");
+        assert_eq!(base, "origin/main");
+        // The best-effort fetch ran: hub's origin/main now matches the remote tip.
+        assert_eq!(rev(&hub, "refs/remotes/origin/main"), remote_tip);
+    }
+
+    #[test]
+    fn falls_back_to_local_ref_when_base_has_no_remote_counterpart() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (_origin, hub) = seed_repo(tmp.path());
+
+        // A local-only integration branch (the subtask/umbrella case): it exists
+        // locally but has no `origin/<base>`.
+        git_ok(&hub, &["branch", "task/add-auth", "main"]);
+
+        let base = resolve_cut_base(&Host::Local, hub.to_str().unwrap(), "task/add-auth");
+        // Unchanged local ref — and no spurious origin ref was created.
+        assert_eq!(base, "task/add-auth");
+        assert_eq!(rev(&hub, "refs/remotes/origin/task/add-auth"), "");
+    }
+
+    #[test]
+    fn falls_back_to_local_ref_when_repo_has_no_origin() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("solo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_ok(&repo, &["init", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "solo\n").unwrap();
+        git_ok(&repo, &["add", "."]);
+        git_ok(&repo, &["commit", "-m", "init"]);
+
+        let base = resolve_cut_base(&Host::Local, repo.to_str().unwrap(), "main");
+        assert_eq!(base, "main");
+    }
+
+    #[test]
+    fn best_effort_fetch_failure_still_cuts_from_last_known_origin() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (_origin, hub) = seed_repo(tmp.path());
+        // origin/main is present from the clone; break the remote so the fetch
+        // fails (offline / vanished remote).
+        git_ok(
+            &hub,
+            &["remote", "set-url", "origin", "/no/such/path.git"],
+        );
+        let before = rev(&hub, "refs/remotes/origin/main");
+
+        let base = resolve_cut_base(&Host::Local, hub.to_str().unwrap(), "main");
+        // Warned + proceeded from the last-known origin/main rather than erroring.
+        assert_eq!(base, "origin/main");
+        assert_eq!(rev(&hub, "refs/remotes/origin/main"), before);
+    }
 }
