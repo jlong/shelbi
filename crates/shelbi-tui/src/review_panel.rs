@@ -566,7 +566,20 @@ fn render_row_list(
     if app.selected >= offset && app.selected < offset + rows.len() {
         state.select(Some(app.selected - offset));
     }
-    let list = List::new(items).highlight_style(Style::default().bg(crate::theme::SELECTION_BG));
+    // The Approve / Reject rows read as pressed *buttons* when selected: their
+    // own tint becomes the fill via `Modifier::REVERSED` (fg = tint → rendered
+    // as the background, with the terminal's own background showing through as
+    // contrasting text). Every other row keeps the generic gray SELECTION_BG
+    // fill. We branch the whole list's highlight here — not per item — because
+    // the list's row-wide highlight patch would otherwise paint SELECTION_BG
+    // over a per-item `bg = tint` and win. Only the single selected row is ever
+    // highlighted, so keying off `app.selected` styles exactly that row.
+    let highlight = match app.rows().get(app.selected) {
+        Some(PanelRow::Approve) => Style::default().fg(Color::Green).add_modifier(Modifier::REVERSED),
+        Some(PanelRow::Reject) => Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED),
+        _ => Style::default().bg(crate::theme::SELECTION_BG),
+    };
+    let list = List::new(items).highlight_style(highlight);
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -696,8 +709,16 @@ fn render_row(app: &ReviewPanel, row: &PanelRow, selected: bool, width: usize) -
 }
 
 fn button_item(label: &str, tint: Color, selected: bool) -> ListItem<'static> {
+    // Selected: reverse-video the button so its tint becomes the fill and the
+    // terminal's background shows through as contrasting text — a pressed
+    // green / red block. `render_row_list` reinforces this across the full row
+    // width with a matching reversed `highlight_style` (and deliberately skips
+    // the generic SELECTION_BG fill for these rows). Unselected keeps the flat
+    // tinted `[ ✅ Approve ]` bracket look.
     let style = if selected {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(tint)
+            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else {
         Style::default().fg(tint)
     };
@@ -1148,6 +1169,62 @@ mod tests {
         assert!(out.contains("Open Browser"), "browser switch when url set: {out}");
         assert!(out.contains("Approve"), "approve button: {out}");
         assert!(out.contains("Reject"), "reject button: {out}");
+    }
+
+    /// A selected Approve / Reject button reads as a pressed, reverse-video
+    /// block: the row carries the button's own tint (green / red) via
+    /// `Modifier::REVERSED`, not the generic gray SELECTION_BG fill that every
+    /// other selected row gets. Unselected buttons stay flat tinted with no
+    /// reverse and no fill.
+    #[test]
+    fn selected_approve_reject_buttons_render_reverse_video_tint() {
+        for (tint, needle, want) in [
+            (Color::Green, "Approve", PanelRow::Approve),
+            (Color::Red, "Reject", PanelRow::Reject),
+        ] {
+            let width = 30u16;
+            let mut app = panel(true);
+            // Focus the button under test by index — no state mutation.
+            app.selected = app
+                .rows()
+                .iter()
+                .position(|r| std::mem::discriminant(r) == std::mem::discriminant(&want))
+                .unwrap();
+            let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+            let buf = term.backend().buffer().clone();
+            let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
+            let y = row_y(&rows, needle) as u16;
+            // The letter cell of the label carries the reversed tint.
+            let col = rows[y as usize].find(needle).unwrap() as u16;
+            let cell = &buf[(col, y)];
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "{needle}: selected button must be reverse-video, got {:?}",
+                cell.modifier
+            );
+            assert_eq!(cell.fg, tint, "{needle}: reverse fg carries the button tint");
+            assert_ne!(
+                cell.bg,
+                crate::theme::SELECTION_BG,
+                "{needle}: the gray SELECTION_BG fill must not compete with the tint"
+            );
+
+            // The *unselected* sibling stays flat tinted: no reverse, no fill.
+            let other = if needle == "Approve" { "Reject" } else { "Approve" };
+            let oy = row_y(&rows, other) as u16;
+            let ocol = rows[oy as usize].find(other).unwrap() as u16;
+            let ocell = &buf[(ocol, oy)];
+            assert!(
+                !ocell.modifier.contains(Modifier::REVERSED),
+                "{other}: unselected button keeps the flat tinted look"
+            );
+            assert_ne!(
+                ocell.bg,
+                crate::theme::SELECTION_BG,
+                "{other}: unselected button carries no selection fill"
+            );
+        }
     }
 
     /// The back button leads the panel: a square block (bleed row above, arrow
