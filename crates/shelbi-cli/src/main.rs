@@ -182,6 +182,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::task::TaskCmd,
     },
+    /// Backend-agnostic operations on the project's issues (e.g. `comment`).
+    Issue {
+        #[command(subcommand)]
+        cmd: commands::issue::IssueCmd,
+    },
     /// Inspect and control the project's declared workspace pool.
     Workspace {
         #[command(subcommand)]
@@ -475,6 +480,7 @@ fn main() -> Result<()> {
             resume,
         }) => commands::open::run(cli.project, name, as_pane, resume),
         Some(Cmd::Task { cmd }) => commands::task::run(cli.project, cmd),
+        Some(Cmd::Issue { cmd }) => commands::issue::run(cli.project, cmd),
         Some(Cmd::Workspace { cmd }) => commands::workspace::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => {
             eprintln!("shelbi: 'worker' is deprecated; use 'workspace' instead.");
@@ -964,6 +970,27 @@ mod cli_tests {
 
         // `--sub` requires exactly two values.
         assert!(Cli::try_parse_from(["shelbi", "task", "edit", "t3", "--sub", "only"]).is_err());
+    }
+
+    /// `shelbi issue comment <id> "<text>"` parses into the id + text the store
+    /// posts (plan Decision D4).
+    #[test]
+    fn issue_comment_parses_id_and_text() {
+        use commands::issue::IssueCmd;
+
+        let cli = Cli::parse_from(["shelbi", "issue", "comment", "fix-login", "looks good"]);
+        match cli.cmd {
+            Some(Cmd::Issue {
+                cmd: IssueCmd::Comment { id, text },
+            }) => {
+                assert_eq!(id, "fix-login");
+                assert_eq!(text, "looks good");
+            }
+            other => panic!("expected Issue::Comment, got {other:?}"),
+        }
+
+        // Both the id and the text are required positionals.
+        assert!(Cli::try_parse_from(["shelbi", "issue", "comment", "fix-login"]).is_err());
     }
 
     /// `shelbi workspace list` is the canonical form and parses into

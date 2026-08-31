@@ -145,6 +145,19 @@ pub fn resolve_github_token(project: &Project) -> Result<SecretToken> {
     resolve_github_token_with(|k| std::env::var(k).ok(), gh_auth_token, &token_file)
 }
 
+/// Resolve a GitHub auth token from a project *name* rather than a loaded
+/// [`Project`]. The out-of-repo `tokens.yml` lives at
+/// `~/.shelbi/projects/<name>/tokens.yml` — [`ProjectPaths::state_root`] is just
+/// [`crate::project_dir`] of the name — so the [`GitHubStore`] can resolve its
+/// token per call holding only the project name, never a full `Project` (which
+/// would force a config load on every API call).
+///
+/// [`GitHubStore`]: crate::GitHubStore
+pub fn resolve_github_token_by_name(project: &str) -> Result<SecretToken> {
+    let token_file = crate::project_dir(project)?.join("tokens.yml");
+    resolve_github_token_with(|k| std::env::var(k).ok(), gh_auth_token, &token_file)
+}
+
 /// Testable core of [`resolve_github_token`]: the resolution chain with its
 /// three external inputs injected.
 ///

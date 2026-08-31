@@ -44,7 +44,7 @@ pub use migrate::{
     IN_REPO_CONFIG_FILES, IN_REPO_GITIGNORE_SNIPPET,
 };
 pub use issue_auth::{
-    resolve_github_token, token_file_path, SecretToken, TokenSource,
+    resolve_github_token, resolve_github_token_by_name, token_file_path, SecretToken, TokenSource,
 };
 pub use github_store::GitHubStore;
 pub use issue_store::{
