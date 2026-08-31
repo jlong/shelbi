@@ -93,7 +93,7 @@ impl EventEnvelope {
 #[serde(rename_all = "kebab-case")]
 pub enum EventKind {
     Heartbeat,
-    Issue,
+    Task,
     Workspace,
     WorkspacePane,
     Message,
@@ -132,7 +132,7 @@ impl EventKind {
             // CI verdict would be mislabeled as an ordinary task transition.
             EventKind::Ci
         } else if body.contains(" task=") || body.starts_with("task=") {
-            EventKind::Issue
+            EventKind::Task
         } else if body.contains(" workspace=") || body.starts_with("workspace=") {
             if body.contains(" pane_alive=") {
                 EventKind::WorkspacePane
@@ -1431,7 +1431,7 @@ pub fn append_ci_event(
 /// comma-separated list of the frontmatter/body fields that changed (e.g.
 /// `title,body`); `reason` is the caller's optional annotation, defaulting to
 /// `user:cli` when none is supplied. The line carries `task=<id>` so
-/// [`EventKind::from_body`] classifies it as a [`EventKind::Issue`] event.
+/// [`EventKind::from_body`] classifies it as a [`EventKind::Task`] event.
 /// Shares [`append_task_event`]'s permission-denied socket fallback.
 pub fn append_task_edit_event(
     project: &str,
@@ -2932,7 +2932,7 @@ mod tests {
             .unwrap();
         let envelope: EventEnvelope = serde_json::from_str(line.trim_end()).unwrap();
 
-        assert_eq!(envelope.kind, EventKind::Issue);
+        assert_eq!(envelope.kind, EventKind::Task);
         assert_eq!(envelope.project.as_deref(), Some("demo"));
         assert!(envelope.line.contains(" task=ready-task "));
         assert!(envelope.line.contains("backlog -> todo"));
@@ -4264,7 +4264,7 @@ mod tests {
         let envelope = EventEnvelope::from_log_line(&line);
 
         // `kind`: classified as a task transition, not a workspace/pane event.
-        assert_eq!(envelope.kind, EventKind::Issue, "line: {line}");
+        assert_eq!(envelope.kind, EventKind::Task, "line: {line}");
 
         // The three positional/keyed fields the orchestrator template matches.
         assert_eq!(

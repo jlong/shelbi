@@ -3431,7 +3431,7 @@ statuses:
         let line = log.lines().next().unwrap();
         assert_eq!(
             shelbi_state::EventEnvelope::from_log_line(line).kind,
-            shelbi_state::EventKind::Issue,
+            shelbi_state::EventKind::Task,
         );
 
         std::env::remove_var("SHELBI_HOME");

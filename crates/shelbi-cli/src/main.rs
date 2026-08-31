@@ -178,7 +178,7 @@ enum Cmd {
         resume: bool,
     },
     /// Manage the project's Kanban task board.
-    Issue {
+    Task {
         #[command(subcommand)]
         cmd: commands::task::TaskCmd,
     },
@@ -474,7 +474,7 @@ fn main() -> Result<()> {
             as_pane,
             resume,
         }) => commands::open::run(cli.project, name, as_pane, resume),
-        Some(Cmd::Issue { cmd }) => commands::task::run(cli.project, cmd),
+        Some(Cmd::Task { cmd }) => commands::task::run(cli.project, cmd),
         Some(Cmd::Workspace { cmd }) => commands::workspace::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => {
             eprintln!("shelbi: 'worker' is deprecated; use 'workspace' instead.");
@@ -921,7 +921,7 @@ mod cli_tests {
 
         let bare = Cli::parse_from(["shelbi", "task", "edit", "t1"]);
         match bare.cmd {
-            Some(Cmd::Issue {
+            Some(Cmd::Task {
                 cmd: TaskCmd::Edit(args),
             }) => {
                 assert_eq!(args.id, "t1");
@@ -931,7 +931,7 @@ mod cli_tests {
                 assert!(args.sub.is_empty());
                 assert!(args.sub_regex.is_empty());
             }
-            other => panic!("expected Issue::Edit, got {other:?}"),
+            other => panic!("expected Task::Edit, got {other:?}"),
         }
 
         let flags = Cli::parse_from([
@@ -951,7 +951,7 @@ mod cli_tests {
             "feat/x",
         ]);
         match flags.cmd {
-            Some(Cmd::Issue {
+            Some(Cmd::Task {
                 cmd: TaskCmd::Edit(args),
             }) => {
                 assert_eq!(args.title.as_deref(), Some("New"));
@@ -959,7 +959,7 @@ mod cli_tests {
                 assert_eq!(args.sub, vec!["a", "b"]);
                 assert_eq!(args.sub_regex, vec!["c(\\d)", "d$1"]);
             }
-            other => panic!("expected Issue::Edit, got {other:?}"),
+            other => panic!("expected Task::Edit, got {other:?}"),
         }
 
         // `--sub` requires exactly two values.
