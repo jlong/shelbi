@@ -187,6 +187,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::issue::IssueCmd,
     },
+    /// Operate on the issue-tracker backend itself (e.g. `migrate` between
+    /// `file_system` and `github`).
+    IssueStore {
+        #[command(subcommand)]
+        cmd: commands::issue_store::IssueStoreCmd,
+    },
     /// Inspect and control the project's declared workspace pool.
     Workspace {
         #[command(subcommand)]
@@ -481,6 +487,7 @@ fn main() -> Result<()> {
         }) => commands::open::run(cli.project, name, as_pane, resume),
         Some(Cmd::Task { cmd }) => commands::task::run(cli.project, cmd),
         Some(Cmd::Issue { cmd }) => commands::issue::run(cli.project, cmd),
+        Some(Cmd::IssueStore { cmd }) => commands::issue_store::run(cli.project, cmd),
         Some(Cmd::Workspace { cmd }) => commands::workspace::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => {
             eprintln!("shelbi: 'worker' is deprecated; use 'workspace' instead.");
@@ -991,6 +998,43 @@ mod cli_tests {
 
         // Both the id and the text are required positionals.
         assert!(Cli::try_parse_from(["shelbi", "issue", "comment", "fix-login"]).is_err());
+    }
+
+    /// `shelbi issue-store migrate --to github` parses into the target backend
+    /// and the (default-off) dry-run flag.
+    #[test]
+    fn issue_store_migrate_parses_target_and_dry_run() {
+        use commands::issue_store::{IssueStoreCmd, MigrateTarget};
+
+        let cli = Cli::parse_from(["shelbi", "issue-store", "migrate", "--to", "github"]);
+        match cli.cmd {
+            Some(Cmd::IssueStore {
+                cmd: IssueStoreCmd::Migrate { to, dry_run },
+            }) => {
+                assert_eq!(to, MigrateTarget::Github);
+                assert!(!dry_run, "dry_run defaults off");
+            }
+            other => panic!("expected IssueStore::Migrate, got {other:?}"),
+        }
+
+        // `file_system` is the reverse target; `--dry-run` flips the flag.
+        let cli =
+            Cli::parse_from(["shelbi", "issue-store", "migrate", "--to", "file_system", "--dry-run"]);
+        match cli.cmd {
+            Some(Cmd::IssueStore {
+                cmd: IssueStoreCmd::Migrate { to, dry_run },
+            }) => {
+                assert_eq!(to, MigrateTarget::FileSystem);
+                assert!(dry_run);
+            }
+            other => panic!("expected IssueStore::Migrate, got {other:?}"),
+        }
+
+        // `--to` is required, and only the live backends are accepted.
+        assert!(Cli::try_parse_from(["shelbi", "issue-store", "migrate"]).is_err());
+        assert!(
+            Cli::try_parse_from(["shelbi", "issue-store", "migrate", "--to", "jira"]).is_err()
+        );
     }
 
     /// `shelbi workspace list` is the canonical form and parses into

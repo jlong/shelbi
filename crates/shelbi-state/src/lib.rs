@@ -25,6 +25,7 @@ pub mod github_store;
 mod hub_config;
 mod hub_version;
 pub mod issue_auth;
+pub mod issue_migrate;
 pub mod issue_store;
 pub mod keymap;
 mod migrate;
@@ -47,6 +48,9 @@ pub use issue_auth::{
     resolve_github_token, resolve_github_token_by_name, token_file_path, SecretToken, TokenSource,
 };
 pub use github_store::GitHubStore;
+pub use issue_migrate::{
+    apply_issue_migration, plan_issue_migration, IssueMigrationPlan,
+};
 pub use issue_store::{
     resolve_issue_store, Cursor, FileSystemStore, IssueChange, IssueComment, IssueFields,
     IssueStore, NewIssue, PrioMove, StatusMove,
