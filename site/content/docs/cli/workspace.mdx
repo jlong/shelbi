@@ -14,11 +14,11 @@ provisions it on first boot (asking how many workspaces and which naming scheme)
 adding each slot with `shelbi workspace add <name>`. Beyond that you use these
 commands to observe (what's idle or working, which agent is loaded where), grow
 or shrink the pool (`add` / `rm`), and intervene (stop a pane to release a stuck
-task). A slot no longer selects a runner: runner/model resolution is owned by
+issue). A slot no longer selects a runner: runner/model resolution is owned by
 the [agent](/docs/configuration/agents) that runs there.
 
 A [workspace](/docs/concepts/workspaces) is capacity: a machine, a tmux pane,
-and a worktree; the [agent](/docs/concepts/agents) inside it is chosen per task
+and a worktree; the [agent](/docs/concepts/agents) inside it is chosen per issue
 by the workflow, which is why `list` reports both. The sidebar shows the same
 pool, grouped by machine, with a badge marking each state (`⏵` working, `·`
 idle):
@@ -71,7 +71,7 @@ Print every declared workspace as a row. The columns:
 | ------- | ----------------------------------------------------------------------------- |
 | `NAME`  | The workspace's stable name (`alpha`, `bravo`, …).                            |
 | `HOST`  | The machine it's pinned to — `hub` or a declared remote.                      |
-| `AGENT` | The [agent](/docs/concepts/agents) role the in-flight task loaded (`developer`, `qa`, …), or `-` when idle. |
+| `AGENT` | The [agent](/docs/concepts/agents) role the in-flight issue loaded (`developer`, `qa`, …), or `-` when idle. |
 | `INTEG` | The integration tier of the project's baseline runner: `conventional` when it emits recognized markers (Claude Code, Codex), `degraded` when Shelbi can only poll it. |
 | `STATE` | The live pane state (see below). |
 
@@ -90,7 +90,7 @@ are they running?" An `AGENT` of `-` with `idle` state is a free slot. `STATE`
 is live-probed, not board-derived — `list` runs a real tmux/SSH probe of each
 pane. It renders `idle`, `in_progress: <task-id>`, `review: <task-id>`,
 `occupied (user shell)`, `orphaned session`, or `unreachable (<reason>)`. For
-the poller's finer-grained read of an in-flight task (`working`,
+the poller's finer-grained read of an in-flight issue (`working`,
 `awaiting_input`, `blocked`), use [`status`](#status).
 
 ## stop
@@ -99,11 +99,11 @@ the poller's finer-grained read of an in-flight task (`working`,
 shelbi workspace stop [OPTIONS] <NAME>
 ```
 
-Stop the workspace's tmux pane. By default the in-flight task is released
+Stop the workspace's tmux pane. By default the in-flight issue is released
 back to its `ready` status (`todo` in the default workflow) and its
 `assigned_to` field is cleared. The board never shows an orphaned
 `in_progress` card pointing at a dead pane. Pass `--keep-task` when you're
-about to restart on the same task and don't want the card to move.
+about to restart on the same issue and don't want the card to move.
 
 For a remote workspace, `stop` also kills the remote tmux session so no
 detached agent process lingers on the other machine.
@@ -111,7 +111,7 @@ detached agent process lingers on the other machine.
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<NAME>` | string | — | Workspace name (positional, required). |
-| `--keep-task` | flag | off | Leave the in-flight task in `in_progress` with `assigned_to` pointing at this workspace. Use when you're about to restart on the same task and don't want the card to move. |
+| `--keep-task` | flag | off | Leave the in-flight issue in `in_progress` with `assigned_to` pointing at this workspace. Use when you're about to restart on the same issue and don't want the card to move. |
 
 ## status
 
@@ -145,7 +145,7 @@ Snapshot the pool to find a free workspace:
 shelbi workspace list
 ```
 
-Stop a stuck workspace and let the board release its task:
+Stop a stuck workspace and let the board release its issue:
 
 ```bash
 shelbi workspace stop bravo
@@ -158,11 +158,11 @@ Change which runner an agent uses (edit the project config, not the pool):
 # See /docs/configuration/agents.
 ```
 
-Restart a workspace on the same task without losing the card:
+Restart a workspace on the same issue without losing the card:
 
 ```bash
 shelbi workspace stop charlie --keep-task
-shelbi task start docs-write-cli-reference-pages
+shelbi issue start docs-write-cli-reference-pages
 ```
 
 Inspect a single workspace's raw status without spawning a tmux probe:
@@ -180,4 +180,4 @@ shelbi workspace status alpha
 - [Agents](/docs/concepts/agents) — the role shown in the `AGENT` column.
 - [`shelbi agent`](/docs/cli/agent) — manage the agents a workspace can run.
 - [Orchestrator](/docs/concepts/orchestrator) — how the scheduler picks a
-  free workspace for the next ready task.
+  free workspace for the next ready issue.

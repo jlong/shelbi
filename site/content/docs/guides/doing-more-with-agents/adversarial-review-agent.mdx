@@ -69,16 +69,16 @@ useful skeptic:
 ```markdown
 # Adversarial Review
 
-You are an adversarial code reviewer. A developer agent has finished a
-task and believes its branch is ready. Your job is **not** to confirm
+You are an adversarial code reviewer. A developer agent has finished an
+issue and believes its branch is ready. Your job is **not** to confirm
 that belief — it is to try to prove the change is wrong before a human
 spends attention on it. Assume there is a bug until you have looked hard
 enough to say otherwise.
 
 ## What to review
 
-Review the diff on the current task's branch against the base branch —
-only what this task changed, plus the code that change touches. You are
+Review the diff on the current issue's branch against the base branch —
+only what this issue changed, plus the code that change touches. You are
 looking for defects the developer and the tests missed, not for style
 nits the preamble's checks already cover.
 
@@ -86,7 +86,7 @@ nits the preamble's checks already cover.
 
 Work through every changed hunk and actively try to falsify it:
 
-- **Correctness** — Does it do what the task asked? Trace the non-obvious
+- **Correctness** — Does it do what the issue asked? Trace the non-obvious
   paths by hand. Off-by-one, wrong operator, inverted condition, a branch
   that silently does nothing.
 - **Security** — Untrusted input reaching a query, a shell, a path, or a
@@ -128,14 +128,14 @@ you checked) so the human reviewer can trust the pass, then hand off
 forward the normal way, by writing the review-ready marker.
 
 **Blocking findings, bounce it back.** If any finding is a `blocker`, the
-change is not ready for a human. Write up your findings, then send the task
+change is not ready for a human. Write up your findings, then send the issue
 back to the developer by writing the transition marker:
 
     printf '%s\n%s\n' "$TASK_ID" bounce \
       > .claude/shelbi-transition.tmp && mv .claude/shelbi-transition.tmp .claude/shelbi-transition
 
-The first line is your task id (`$TASK_ID` in your environment); the second
-is `bounce`, which sends the task back to the active status the developer
+The first line is your issue id (`$TASK_ID` in your environment); the second
+is `bounce`, which sends the issue back to the active status the developer
 works. Do not sign off and bounce in the same run. Bouncing is the signal
 that blockers exist.
 ```
@@ -150,7 +150,7 @@ first and earns its sign-off.
 
 ## How send-back works
 
-A gate agent bounces a task by writing one file: the **transition marker**
+A gate agent bounces an issue by writing one file: the **transition marker**
 at `<worktree>/.claude/shelbi-transition`. It's the same kind of plain-file
 signal as the review-ready marker a finishing agent writes. Workspaces have
 no `shelbi` binary, so the agent just writes the file and the hub poller
@@ -163,7 +163,7 @@ The format is two lines of UTF-8:
 <target-status>
 ```
 
-- **Line 1** is the agent's own task id. It has to match the task the
+- **Line 1** is the agent's own issue id. It has to match the issue the
   workspace is currently assigned, or the poller treats the marker as
   stale and clears it without moving anything.
 - **Line 2** is either a status `id` the workflow declares (the primitive,
@@ -181,14 +181,14 @@ printf '%s\n%s\n' "$TASK_ID" bounce \
 
 It lives under `.claude/` because that directory is Shelbi's gitignored
 deploy footprint, so the marker never dirties the worktree or trips a
-clean-branch check between tasks.
+clean-branch check between issues.
 
 <Callout type="note" title="The workflow has the final say">
 
 Writing the marker is a *request*, not a guaranteed move. The poller
 applies it only if the workflow permits that edge. A backward bounce needs
 the `adversarial-review → in-progress` edge declared in the workflow's
-`transitions`, or the poller rejects the marker and the task stays put.
+`transitions`, or the poller rejects the marker and the issue stays put.
 Wiring that edge is the next part.
 
 </Callout>
@@ -209,13 +209,13 @@ composed in at launch time).
 ## Next
 
 You have a skeptic on disk with nothing to review. Wire it into a workflow
-so tasks actually flow through it:
+so issues actually flow through it:
 
 **[Add it to a workflow →](/docs/guides/doing-more-with-agents/add-to-workflow)**
 
 ## See also
 
-- [Agents](/docs/concepts/agents) — the role/task/workspace model and the
+- [Agents](/docs/concepts/agents) — the role/issue/workspace model and the
   on-disk agent layout.
 - [`shelbi agent`](/docs/cli/agent) — the full command set: `list`, `show`,
   `new`, `edit`.

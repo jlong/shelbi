@@ -498,7 +498,7 @@ fn print_status(project: &str, state: &State) -> Result<()> {
         println!("last crash record: {record}");
     }
     let in_flight = count_in_flight_zen(project, state.zen_mode).unwrap_or(0);
-    println!("in-flight zen tasks: {in_flight}");
+    println!("in-flight zen issues: {in_flight}");
     Ok(())
 }
 
@@ -682,7 +682,7 @@ fn dry_run(project: &str, duration: Option<Duration>, interval: Duration) -> Res
             new_this_tick += 1;
         }
         if first_tick && new_this_tick == 0 {
-            eprintln!("zen dry-run: nothing to preview right now (no backlog candidates, no tasks in review).");
+            eprintln!("zen dry-run: nothing to preview right now (no backlog candidates, no issues in review).");
         }
         first_tick = false;
 

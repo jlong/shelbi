@@ -1,17 +1,17 @@
 ---
 title: Review workspaces
 order: 13
-summary: "Review routing is ordinary tag primitives: a status requires a tag, a workspace carries it, and the task loads onto a matching slot. On top of that, Shelbi ships a dedicated `review:` serve recipe that boots the branch, a review sidebar that lists tasks Ready and Queued for review, and a review interface for clicking through the running app and accepting or rejecting it."
+summary: "Review routing is ordinary tag primitives: a status requires a tag, a workspace carries it, and the issue loads onto a matching slot. On top of that, Shelbi ships a dedicated `review:` serve recipe that boots the branch, a review sidebar that lists issues Ready and Queued for review, and a review interface for clicking through the running app and accepting or rejecting it."
 ---
 
 Most real review of an app or a site means **running it**: booting the dev
 server, hitting a URL, clicking through the change, not just reading a diff.
-The *routing* that gets a task to a review slot is ordinary
+The *routing* that gets an issue to a review slot is ordinary
 [tag routing](/docs/concepts/workspaces#tags-capability-labels): a **status
-requires tags**, a **workspace carries tags**, and the task loads onto a free
+requires tags**, a **workspace carries tags**, and the issue loads onto a free
 slot whose effective tags match. On top of that generic routing, Shelbi ships
 three pieces of review-specific machinery: a workflow `review:` **serve recipe**
-that boots the branch, a **review sidebar** listing tasks Ready and Queued for
+that boots the branch, a **review sidebar** listing issues Ready and Queued for
 review, and a **review interface** for running the change and accepting or
 rejecting it.
 
@@ -41,7 +41,7 @@ machines:
     tags: [review]              # every slot on hub inherits `review`
 ```
 
-When a task enters the review status, the orchestrator routes it to a free
+When an issue enters the review status, the orchestrator routes it to a free
 workspace whose effective tags are a superset of `{review}` — the same
 [superset routing](/docs/concepts/workspaces#status-tag-routing) every tag uses.
 Nothing branches on the literal word "review"; it is just the tag this workflow
@@ -50,7 +50,7 @@ rather than running review work on a general slot.
 
 ## Serving the branch: the `review:` block
 
-Routing gets a task onto a review slot. **Serving** the branch — booting the
+Routing gets an issue onto a review slot. **Serving** the branch — booting the
 dev server so a human can click through it — is best expressed with the
 workflow's dedicated [`review:`](/docs/configuration/workflow#review) block.
 This is the recommended way to stand up a review server. Shelbi resolves the
@@ -111,7 +111,7 @@ status's **transitions** can also run arbitrary commands, and that's the right
 tool for hub-side side-effects that aren't the review server itself. A
 [transition](/docs/configuration/workflow#run-ready-and-teardown) can carry:
 
-- **`run`** — shell commands executed in order, in the task's worktree, on the
+- **`run`** — shell commands executed in order, in the issue's worktree, on the
   assigned workspace's machine. They run after the edge's git `actions` and
   share the same short-circuit contract.
 - **`ready`** — a command polled until it exits 0 (bounded by `ready_timeout`,
@@ -175,7 +175,7 @@ the slot.
 
 <Callout type="note" title="The status's agent runs the recipe">
 
-Routing does two things when a task enters the status: it loads the task onto
+Routing does two things when an issue enters the status: it loads the issue onto
 the matching workspace running the status's [`agent`](/docs/configuration/workflow#statuses),
 **and** it hands that agent the resolved `review:` recipe. Shelbi ships a
 built-in `review` agent whose charter is "make the change runnable for a human,
@@ -186,8 +186,8 @@ See [agents](/docs/concepts/agents).
 
 ## The review sidebar
 
-Review-status tasks surface in the sidebar under two dedicated sections, split
-by whether a task is loaded on a review slot yet:
+Review-status issues surface in the sidebar under two dedicated sections, split
+by whether an issue is loaded on a review slot yet:
 
 ```text
  — Ready for Review —
@@ -199,12 +199,12 @@ by whether a task is loaded on a review slot yet:
    jlong/fix-cookie-domain-bug
 ```
 
-- **Ready for Review** (`✓`, cyan) — the task's `assigned_to` names a
+- **Ready for Review** (`✓`, cyan) — the issue's `assigned_to` names a
   `review`-tagged workspace, so the branch is loaded on a review slot and
-  serving. Each entry is a two-line row: line 1 is the task title with a
+  serving. Each entry is a two-line row: line 1 is the issue title with a
   right-aligned **location badge** (the `machine:workspace` it's loaded on,
   e.g. `hub:review-0`); line 2 is the branch, dim.
-- **Queued for Review** (`·`, dim) — every other Review-status task
+- **Queued for Review** (`·`, dim) — every other Review-status issue
   (unassigned, or still pinned to the dev workspace that produced it), waiting
   for a free review slot. No location badge, because nothing is serving yet.
 
@@ -212,13 +212,13 @@ A `review`-tagged slot **never appears under the `— Workspaces —` section**;
 its capacity surfaces exclusively through these two review sections. Dev
 workspaces list under `— Workspaces —` as usual.
 
-The daemon auto-loads queued review-column tasks onto idle `review`-tagged
+The daemon auto-loads queued review-column issues onto idle `review`-tagged
 slots each poller tick (`autoload_review_queue`), so a queued branch normally
 lands on a free slot without any human action. The confirm popup is the
 manual path: selecting a **Queued** row raises a "Load onto a review
 workspace?" prompt and, on confirm, loads the branch onto a free
 `review`-tagged slot (never the dev pane that built it) — useful for loading
-a queued task while the slots are otherwise busy. Selecting a **Ready** row
+a queued issue while the slots are otherwise busy. Selecting a **Ready** row
 opens its review interface directly.
 
 <Callout type="note" title="Sidebar collapse persists">
@@ -235,7 +235,7 @@ state.
 
 ## The review interface
 
-Opening a Ready task launches the **review interface** — a two-column tmux
+Opening a Ready issue launches the **review interface** — a two-column tmux
 layout: the **review panel** on the left and the swappable review content on
 the right. The panel is the review window's own navigation, so the global nav
 sidebar stays docked in the dashboard. The panel is where you drive the review:
@@ -259,11 +259,11 @@ sidebar stays docked in the dashboard. The panel is where you drive the review:
     browser. This entry renders **only** when the workflow declares a review
     URL.
 - An **Actions** group:
-  - **✅ Approve** — move the task one column forward along the normal accept
+  - **✅ Approve** — move the issue one column forward along the normal accept
     edge (`review → done` in the default workflow), firing that edge's
     `actions` (e.g. `merge`, `delete_branch`), then tear the interface down.
   - **❌ Reject** — open a type-the-reason dialog; on submit, the reason is
-    appended to the task body and the task is bounced back to the workflow's
+    appended to the issue body and the issue is bounced back to the workflow's
     ready status for another pass. An empty reason can't submit.
 
 ### The review editor
@@ -283,36 +283,36 @@ upper-cased — `hx` shows as **Edit in Hx**, `code --wait` as **Edit in Code**.
 
 ## The load → serve → inspect flow
 
-End to end, a finished task reaches a human like this:
+End to end, a finished issue reaches a human like this:
 
 1. **A dev workspace finishes.** It writes its review-ready marker; the hub
-   poller rebases the branch onto the base branch and moves the task into the
+   poller rebases the branch onto the base branch and moves the issue into the
    review status. The finishing workspace closes its own session and returns
    to idle (see [Workspaces](/docs/concepts/workspaces#how-a-task-completes)).
 2. **The orchestrator routes it.** The review status requires `tags: [review]`,
-   so the task loads onto a free `review`-tagged workspace and the Review
+   so the issue loads onto a free `review`-tagged workspace and the Review
    agent boots the branch from the resolved `review:` recipe. Queued review
-   tasks are paired with idle review slots in **declaration order** — the dev
+   issues are paired with idle review slots in **declaration order** — the dev
    workspace that built the branch is *not* preferred (it is typically not
-   review-tagged); the only reuse is resuming a slot the task is already
-   serving on. If every matching slot is busy, the task sits in **Queued for
+   review-tagged); the only reuse is resuming a slot the issue is already
+   serving on. If every matching slot is busy, the issue sits in **Queued for
    Review** until one frees — nothing is preempted.
-3. **A human inspects.** You open the task's review interface from the sidebar,
+3. **A human inspects.** You open the issue's review interface from the sidebar,
    click through the running app at the served URL, and decide: **Approve**
    (move to Done) or **Reject** (bounce back with a reason). Each move fires
    that edge's `actions` and `run`.
 
-The board's category vocabulary is unchanged: the task sits in the
+The board's category vocabulary is unchanged: the issue sits in the
 `handoff`-category review status throughout.
 
 ## Review and Zen Mode
 
-Routing a task to a review workspace is the *human* path — the whole point is
-human eyes on the running app. Whether such a task is eligible for
+Routing an issue to a review workspace is the *human* path — the whole point is
+human eyes on the running app. Whether such an issue is eligible for
 [Zen Mode](/docs/concepts/zen-mode)'s auto-merge is governed by the ordinary
 action-based rule: Zen's high-confidence bar fires on any transition whose
 `actions` include `merge`. Keep `merge` off the *enter*-review edge and on the
-*accept* edge (as above) so the orchestrator holds the task for you rather than
+*accept* edge (as above) so the orchestrator holds the issue for you rather than
 crossing the accept boundary on its own.
 
 ## See also

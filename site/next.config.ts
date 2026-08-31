@@ -38,6 +38,13 @@ const nextConfig: NextConfig = {
     ];
     return [
       {
+        // `shelbi task` was renamed to `shelbi issue`; keep the old CLI
+        // reference URL (and its `.md` variant) resolving for bookmarks.
+        source: "/docs/cli/task",
+        destination: "/docs/cli/issue",
+        permanent: true,
+      },
+      {
         source: "/docs/concepts/columns",
         destination: "/docs/guides/getting-started/workflows",
         permanent: true,

@@ -9,7 +9,7 @@ Shelbi splits everything it writes to disk into two categories:
 - **Config** covers the declarative decisions about the project: its name, the
   default branch, workflows, agent prompts, runner settings. These are
   the same for every teammate.
-- **State** covers the per-user, per-machine, mutable data: task cards, the
+- **State** covers the per-user, per-machine, mutable data: issue cards, the
   events log, workspace status files, the orchestrator's dashboard
   worktree. Two teammates on the same project have different state.
 
@@ -339,7 +339,7 @@ Error: found /Users/you/work/shelbi/.shelbi/project.yaml (committed) but no loca
 
 ## `shelbi reload` semantics
 
-`shelbi reload` respawns the Shelbi-owned panes (sidebar, tasks, review,
+`shelbi reload` respawns the Shelbi-owned panes (sidebar, issues, review,
 machines) and self-heals default agent workspaces and the workspace
 settings template. As part of that, it re-reads the project's YAML, so
 edits to `<repo>/.shelbi/project.yaml` or `local.yaml` (in-repo mode) or
@@ -347,13 +347,13 @@ edits to `<repo>/.shelbi/project.yaml` or `local.yaml` (in-repo mode) or
 reload.
 
 The one important nuance: **a running workspace keeps its current prompt
-until it hands off.** A reload never swaps the prompt mid-task; changes
+until it hands off.** A reload never swaps the prompt mid-issue; changes
 reach a workspace on its *next* dispatch, once it picks up a fresh card.
 This is deliberate. A mid-turn prompt swap would surprise the agent and
 make debugging much harder.
 
 If you need a running workspace to pick up new instructions immediately,
-kill its task, reload, then re-dispatch.
+kill its issue, reload, then re-dispatch.
 
 ## See also
 

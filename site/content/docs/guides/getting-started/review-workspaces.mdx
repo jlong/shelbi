@@ -9,7 +9,7 @@ finished branches back to you. But reading a diff isn't the same as *running*
 the change. Most real review of an app or a site means booting the dev server,
 opening a URL, and clicking through it.
 
-The *routing* that gets a task to a review slot is assembled from generic
+The *routing* that gets an issue to a review slot is assembled from generic
 primitives: a **workspace carries a tag** and a **status requires that tag**.
 On top of that, the workflow's **`review:` block** tells the Review agent how
 to boot the branch, and Shelbi's **review interface** lets you run the change
@@ -20,7 +20,7 @@ underneath, see the reference:
 <Callout type="note" title="You need a working pool first">
 
 This page assumes you already have a project with a workspace pool and can
-promote a task through the board. The [first task](/docs/guides/getting-started/first-task)
+promote an issue through the board. The [first task](/docs/guides/getting-started/first-task)
 and [multi-workspace](/docs/guides/getting-started/multi-workspace) pages get
 you there. A review workspace is an ordinary slot with a tag, not a new kind of
 thing.
@@ -62,7 +62,7 @@ enough for a first pass.
 <Step title="Require the tag and add a review: serve recipe">
 
 In your [workflow file](/docs/configuration/workflow), require the `review` tag
-on the review status so tasks route to the tagged slot, then add a
+on the review status so issues route to the tagged slot, then add a
 [`review:`](/docs/configuration/workflow#review) block telling the Review agent
 how to boot the branch:
 
@@ -102,21 +102,21 @@ shelbi reload
 ```
 
 The tagged slot does **not** show up under **Workspaces** — a review slot's
-capacity surfaces through the review sections instead, and only once a task is
+capacity surfaces through the review sections instead, and only once an issue is
 routed to it.
 
 </Step>
-<Step title="Get a task to the review status">
+<Step title="Get an issue to the review status">
 
-Run a task the way you normally would: promote a card and let a dev workspace
+Run an issue the way you normally would: promote a card and let a dev workspace
 pick it up, or dispatch one through the orchestrator. When the dev workspace
 finishes it writes its review-ready marker; the hub poller rebases the branch
-onto the base branch and moves the task into the **Review** status.
+onto the base branch and moves the issue into the **Review** status.
 
-Because that status requires `tags: [review]`, the orchestrator routes the task
+Because that status requires `tags: [review]`, the orchestrator routes the issue
 onto a free `review`-tagged slot (preferring the one it ran on) and the Review
 agent boots the server from the `review:` recipe. If every matching slot is
-busy the task waits under **Queued for Review** until one frees — nothing is
+busy the issue waits under **Queued for Review** until one frees — nothing is
 preempted.
 
 The finishing dev workspace closes its own session and returns to `idle`. Its
@@ -125,7 +125,7 @@ work is now waiting to be *run*, not edited.
 </Step>
 <Step title="Open the review interface and click through">
 
-The task appears in the sidebar under **Ready for Review** (`✓`) with a
+The issue appears in the sidebar under **Ready for Review** (`✓`) with a
 `machine:workspace` badge showing the slot it's loaded on. Select it (or press
 `Enter` on its row) to open the **review interface**: a two-column layout with
 the **review panel** on the left (its own navigation, with a back button at the
@@ -197,10 +197,10 @@ You own the decision, and you make it from the review panel's **Actions**:
   that edge's `actions`: per the workflow above, it merges the branch and
   deletes it. The interface tears down and focus returns to the dashboard.
 - **❌ Reject** — opens a type-the-reason dialog. On submit, the reason is
-  appended to the task body and the card bounces back to the ready status for
+  appended to the issue body and the card bounces back to the ready status for
   another pass. An empty reason can't submit.
 
-Either decision frees the review slot for the next task routed for review, if
+Either decision frees the review slot for the next issue routed for review, if
 any.
 
 </Step>
@@ -208,9 +208,9 @@ any.
 
 ## Next
 
-Routing a task to a review workspace is the *human* path: the whole point is
+Routing an issue to a review workspace is the *human* path: the whole point is
 human eyes on the running app. Keeping `merge` on the *accept* edge and off the
-*enter*-review edge means the orchestrator holds a review task for you rather
+*enter*-review edge means the orchestrator holds a review issue for you rather
 than auto-merging it. When you're ready to hand the orchestrator the cases it
 *can* judge on its own,
 [enable Zen Mode](/docs/guides/getting-started/enable-zen-mode) to auto-promote

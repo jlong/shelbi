@@ -69,7 +69,7 @@ A handful of pieces are the contract between the orchestrator and the
 rest of the system. Edit them carefully, but don't delete:
 
 - **The bootstrap flow.** The first reply of every session runs
-  `shelbi task list`, `shelbi workspace list`, starts
+  `shelbi issue list`, `shelbi workspace list`, starts
   `shelbi events tail --follow`, and reads `shelbi zen status`.
   Drop any of these and the orchestrator boots without state.
 - **The reaction rules tied to specific reason strings.** The
@@ -97,7 +97,7 @@ patterns worth stealing.
 
 The default scheduler picks the first free workspace in YAML
 declaration order, honoring `prefers_machine` hints. If your project
-has natural routing (infra tasks always to a beefy box, UI tasks
+has natural routing (infra issues always to a beefy box, UI issues
 always somewhere with the design system pre-cached), bake it into
 the workflow:
 
@@ -108,13 +108,13 @@ In addition to the project YAML's `prefers_machine` hints, apply
 these project-specific rules when picking a workspace for a `todo`
 card:
 
-- **Infra tasks** — titles containing `infra:`, `terraform`,
+- **Infra issues** — titles containing `infra:`, `terraform`,
   `helm`, `kubectl`, or paths under `infra/`. Always route to
   `devbox` (the beefier remote). If no `devbox` workspace is free,
   leave the card in `todo` rather than routing to the hub.
 - **Docs and content** — titles containing `docs:` or paths under
   `site/content/**`. Route to the first free hub workspace; these
-  are short, IO-light tasks that don't need the remote.
+  are short, IO-light issues that don't need the remote.
 - **Migration touch-ups** — anything matching `db/migrate/**` or
   `crates/shelbi-state/src/migrations/**` always goes to
   `charlie` (so the same agent context accumulates across the
@@ -148,16 +148,16 @@ true:
    these are bot-filed PR-bumps and lint sweeps we have years of
    acceptance history on.
 2. **Touches only `docs/**` or `site/content/**`.** Content
-   edits are reversible and never reach prod. If the task body
+   edits are reversible and never reach prod. If the issue body
    names a file outside those globs, fall through.
-3. **The user has accepted ≥3 tasks of the same shape (same
+3. **The user has accepted ≥3 issues of the same shape (same
    verb-prefix, same target directory) without changes in the
    last week.** Track this against the `done` status via
-   `shelbi task list --status done`.
+   `shelbi issue list --status done`.
 
 If none of the above, leave the card in `backlog`, emit
 `reason=orchestrator:zen-decline reason-text=<short>`, and surface
-it in the next reply ("I considered promoting `<task>` but wasn't
+it in the next reply ("I considered promoting `<issue>` but wasn't
 sure — want me to?").
 
 ### Merge conditions
@@ -181,7 +181,7 @@ get a richer rundown (or a quieter one), say so:
 When dispatching, reply with:
 
 - The card id and chosen workspace (always).
-- The full first line of the task body (so the user sees what
+- The full first line of the issue body (so the user sees what
   you're about to make the workspace work on).
 - An estimated complexity tag (`xs` / `s` / `m` / `l`) based on
   the body and any `depends_on`. Don't overthink it — a one-token
@@ -239,7 +239,7 @@ The composed prompt (preamble + instructions) is written to
 `~/.shelbi/projects/<name>/CLAUDE.md` on every `shelbi reload`. Read
 that file to see exactly what the runner loads.
 
-`shelbi reload` respawns the sidebar, Tasks, and Activity panes against the
+`shelbi reload` respawns the sidebar, Issues, and Activity panes against the
 new config without restarting workspaces or losing chat history. It does
 recycle the orchestrator pane, so its conversation context resets: the
 cost of changing the system prompt mid-session. Heads up before the next

@@ -478,7 +478,7 @@ mod tests {
     }
 
     /// Regression for the startup-warnings-interleave bug. The sidebar
-    /// must render its three nav labels (`💬 Chat`, `📋 Tasks`,
+    /// must render its three nav labels (`💬 Chat`, `📋 Issues`,
     /// `⚡ Activity`) uninterrupted even when a keys.yaml load produced
     /// warnings. The pre-fix code `eprintln!`'d after the alt-screen
     /// swap and the diagnostic text landed mid-label; the new path
@@ -516,7 +516,7 @@ mod tests {
         // emoji glyph, so the buffer dump shows two spaces between the
         // icon and the label text — that's the layout the user sees on
         // a real terminal too, just collapsed to one cell.
-        for (emoji, text) in [("💬", "Chat"), ("📋", "Tasks"), ("⚡", "Activity")] {
+        for (emoji, text) in [("💬", "Chat"), ("📋", "Issues"), ("⚡", "Activity")] {
             let label = format!("{emoji}  {text}");
             assert!(
                 joined.matches(&label).count() == 1,
@@ -617,7 +617,7 @@ workspace_permissions_mode: auto
             .collect::<Vec<_>>()
             .join("\n");
 
-        for (emoji, text) in [("💬", "Chat"), ("📋", "Tasks"), ("⚡", "Activity")] {
+        for (emoji, text) in [("💬", "Chat"), ("📋", "Issues"), ("⚡", "Activity")] {
             let label = format!("{emoji}  {text}");
             assert!(
                 joined.matches(&label).count() == 1,

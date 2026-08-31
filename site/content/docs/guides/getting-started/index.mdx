@@ -1,10 +1,10 @@
 ---
 title: Getting Started
 order: 10
-summary: Install Shelbi, confirm its detected setup plan once, run a task, then scale to a pool of workspaces and hand the loop to the orchestrator.
+summary: Install Shelbi, confirm its detected setup plan once, run an issue, then scale to a pool of workspaces and hand the loop to the orchestrator.
 ---
 
-Shelbi is an agent orchestrator for the terminal: a board of tasks, a
+Shelbi is an agent orchestrator for the terminal: a board of issues, a
 pool of git workspaces, and an orchestrator that keeps the workspaces
 loaded with work and shepherds each result back for review. This guide is
 the shortest path from an empty machine to that loop running on one of
@@ -27,7 +27,7 @@ before you start.
 You'll start by **installing** the binary and **setting up a project**.
 Shelbi checks the repo, runner, tmux, and machine, then shows one detected
 plan. Press Enter once to write it and open the dashboard, or press `c` to
-customize the detected values. Then you'll **run your first task** end to end,
+customize the detected values. Then you'll **run your first issue** end to end,
 watch a single card cross the board, and review the branch it produces.
 
 From there the guide opens up: a **multi-workspace dispatch loop** fills
@@ -39,7 +39,7 @@ your own conventions.
 
 The last page steps back to the model underneath all of it:
 [**Workflows**](/docs/guides/getting-started/workflows), the per-project
-YAML that declares the statuses a task moves through and the git
+YAML that declares the statuses an issue moves through and the git
 side-effects that fire on each transition. Read it once here and the rest
 of the docs (every concept page and every branching-model deep-dive)
 clicks into place.
