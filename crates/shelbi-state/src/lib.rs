@@ -21,6 +21,7 @@ use shelbi_core::{
 
 mod agent_workspaces;
 mod event_log;
+pub mod github_store;
 mod hub_config;
 mod hub_version;
 pub mod issue_auth;
@@ -45,6 +46,7 @@ pub use migrate::{
 pub use issue_auth::{
     resolve_github_token, token_file_path, SecretToken, TokenSource,
 };
+pub use github_store::GitHubStore;
 pub use issue_store::{
     resolve_issue_store, Cursor, FileSystemStore, IssueChange, IssueComment, IssueFields,
     IssueStore, NewIssue, PrioMove, StatusMove,
