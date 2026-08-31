@@ -177,13 +177,16 @@ enum Cmd {
         #[arg(long, hide = true)]
         resume: bool,
     },
-    /// Manage the project's Kanban task board.
-    Task {
-        #[command(subcommand)]
-        cmd: commands::task::TaskCmd,
-    },
-    /// Backend-agnostic operations on the project's issues (e.g. `comment`).
+    /// Manage the project's Kanban issue board.
     Issue {
+        #[command(subcommand)]
+        cmd: commands::issue::IssueCmd,
+    },
+    /// Deprecated alias for `issue`. Prints a deprecation notice and forwards
+    /// to `shelbi issue`. Kept so existing scripts and muscle memory keep
+    /// working through one release; prefer `shelbi issue`.
+    #[command(hide = true)]
+    Task {
         #[command(subcommand)]
         cmd: commands::issue::IssueCmd,
     },
@@ -485,8 +488,14 @@ fn main() -> Result<()> {
             as_pane,
             resume,
         }) => commands::open::run(cli.project, name, as_pane, resume),
-        Some(Cmd::Task { cmd }) => commands::task::run(cli.project, cmd),
         Some(Cmd::Issue { cmd }) => commands::issue::run(cli.project, cmd),
+        Some(Cmd::Task { cmd }) => {
+            eprintln!(
+                "warning: `shelbi task` is deprecated and will be removed in a future \
+                 release — use `shelbi issue` instead."
+            );
+            commands::issue::run(cli.project, cmd)
+        }
         Some(Cmd::IssueStore { cmd }) => commands::issue_store::run(cli.project, cmd),
         Some(Cmd::Workspace { cmd }) => commands::workspace::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => {
@@ -924,18 +933,18 @@ mod cli_tests {
         }
     }
 
-    /// `shelbi task edit <id>` with no field flags parses into an `EditArgs`
+    /// `shelbi issue edit <id>` with no field flags parses into an `EditArgs`
     /// whose optional fields are all unset — the signal `edit` uses to fall
     /// back to `$EDITOR`. With field flags, the two-value `--sub`/`--sub-regex`
     /// options parse their pairs and the frontmatter flags populate.
     #[test]
-    fn task_edit_parses_bare_and_with_field_flags() {
-        use commands::task::TaskCmd;
+    fn issue_edit_parses_bare_and_with_field_flags() {
+        use commands::issue::IssueCmd;
 
-        let bare = Cli::parse_from(["shelbi", "task", "edit", "t1"]);
+        let bare = Cli::parse_from(["shelbi", "issue", "edit", "t1"]);
         match bare.cmd {
-            Some(Cmd::Task {
-                cmd: TaskCmd::Edit(args),
+            Some(Cmd::Issue {
+                cmd: IssueCmd::Edit(args),
             }) => {
                 assert_eq!(args.id, "t1");
                 assert!(args.title.is_none());
@@ -944,12 +953,12 @@ mod cli_tests {
                 assert!(args.sub.is_empty());
                 assert!(args.sub_regex.is_empty());
             }
-            other => panic!("expected Task::Edit, got {other:?}"),
+            other => panic!("expected Issue::Edit, got {other:?}"),
         }
 
         let flags = Cli::parse_from([
             "shelbi",
-            "task",
+            "issue",
             "edit",
             "t2",
             "--title",
@@ -964,19 +973,35 @@ mod cli_tests {
             "feat/x",
         ]);
         match flags.cmd {
-            Some(Cmd::Task {
-                cmd: TaskCmd::Edit(args),
+            Some(Cmd::Issue {
+                cmd: IssueCmd::Edit(args),
             }) => {
                 assert_eq!(args.title.as_deref(), Some("New"));
                 assert_eq!(args.branch.as_deref(), Some("feat/x"));
                 assert_eq!(args.sub, vec!["a", "b"]);
                 assert_eq!(args.sub_regex, vec!["c(\\d)", "d$1"]);
             }
-            other => panic!("expected Task::Edit, got {other:?}"),
+            other => panic!("expected Issue::Edit, got {other:?}"),
         }
 
         // `--sub` requires exactly two values.
-        assert!(Cli::try_parse_from(["shelbi", "task", "edit", "t3", "--sub", "only"]).is_err());
+        assert!(Cli::try_parse_from(["shelbi", "issue", "edit", "t3", "--sub", "only"]).is_err());
+    }
+
+    /// The deprecated `shelbi task` alias still parses into the same `IssueCmd`
+    /// tree as `shelbi issue`, so existing scripts keep working through the
+    /// deprecation window. The runtime notice is emitted in `run`.
+    #[test]
+    fn task_alias_still_parses_into_issue_cmd() {
+        use commands::issue::IssueCmd;
+
+        let aliased = Cli::parse_from(["shelbi", "task", "edit", "t1"]);
+        match aliased.cmd {
+            Some(Cmd::Task {
+                cmd: IssueCmd::Edit(args),
+            }) => assert_eq!(args.id, "t1"),
+            other => panic!("expected Task::Edit (deprecated alias), got {other:?}"),
+        }
     }
 
     /// `shelbi issue comment <id> "<text>"` parses into the id + text the store

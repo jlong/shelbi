@@ -165,7 +165,7 @@ fn print_summary(project: &str) -> Result<()> {
 fn print_full(project: &str) -> Result<()> {
     println!("## Board");
     println!();
-    super::task::print_board(project)?;
+    super::issue::print_board(project)?;
 
     println!();
     println!("## Workspaces");
