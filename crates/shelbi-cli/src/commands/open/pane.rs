@@ -1090,6 +1090,7 @@ mod tests {
             git: GitConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         }
     }

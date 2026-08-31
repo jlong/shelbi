@@ -228,6 +228,9 @@ impl DetectedSetupPlan {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            // New projects default to the file_system board; a user opts into a
+            // remote tracker by adding an `issue_tracker:` block to project.yaml.
+            issue_tracker: Default::default(),
             runners: Default::default(),
             agents: Default::default(),
             detected_shapes: Vec::new(),

@@ -1996,6 +1996,7 @@ mod tests {
             },
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
