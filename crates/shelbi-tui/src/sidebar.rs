@@ -139,7 +139,7 @@ pub fn nav_lines(nav_n: usize) -> usize {
 pub(crate) const BLEED_ABOVE: &str = "▄"; // U+2584 LOWER HALF BLOCK — sits above the row
 pub(crate) const BLEED_BELOW: &str = "▀"; // U+2580 UPPER HALF BLOCK — sits below the row
 
-/// Render the Chat / Tasks / Activity nav as a full-width block: a separator
+/// Render the Chat / Issues / Activity nav as a full-width block: a separator
 /// line between (and bracketing) each item, with the selected item's fill
 /// spanning edge to edge and its adjacent separators carrying the half-block
 /// bleed. Text keeps the same 1-col indent as the rest of the list.
@@ -696,7 +696,7 @@ mod tests {
         activity.sidebar_index = 2; // Activity
         let activity_rows = sidebar_rows(&mut activity, 24, 20);
 
-        for label in ["Chat", "Tasks", "Activity"] {
+        for label in ["Chat", "Issues", "Activity"] {
             assert_eq!(
                 row_y(&chat_rows, label),
                 row_y(&activity_rows, label),
@@ -705,7 +705,7 @@ mod tests {
         }
         // The three items are one blank/bleed row apart in both states.
         assert_eq!(
-            row_y(&chat_rows, "Tasks") - row_y(&chat_rows, "Chat"),
+            row_y(&chat_rows, "Issues") - row_y(&chat_rows, "Chat"),
             2,
             "one separator line always sits between adjacent nav items"
         );
@@ -718,10 +718,10 @@ mod tests {
     fn selected_nav_item_renders_full_width_half_block_bleed() {
         let width = 24u16;
         let mut app = App::new_sidebar("demo");
-        app.sidebar_index = 1; // Tasks
+        app.sidebar_index = 1; // Issues
         let rows = sidebar_rows(&mut app, width, 20);
 
-        let tasks_y = row_y(&rows, "Tasks");
+        let tasks_y = row_y(&rows, "Issues");
         let above = &rows[tasks_y - 1];
         let below = &rows[tasks_y + 1];
         assert_eq!(
@@ -753,12 +753,12 @@ mod tests {
         let backend = TestBackend::new(width, 20);
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new_sidebar("demo");
-        app.sidebar_index = 1; // Tasks
+        app.sidebar_index = 1; // Issues
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
 
         let buf = term.backend().buffer().clone();
         let rows = dump(&term);
-        let tasks_y = row_y(&rows, "Tasks") as u16;
+        let tasks_y = row_y(&rows, "Issues") as u16;
 
         // Selection background paints edge to edge: the left gutter (column 0,
         // left of the label) and the trailing padding out to the last column.

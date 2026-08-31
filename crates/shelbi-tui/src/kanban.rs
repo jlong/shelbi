@@ -1496,7 +1496,7 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     };
 
     let left = Line::from(vec![
-        Span::styled("Tasks · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Issues · ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             app.display_label().to_string(),
             Style::default()
@@ -2586,8 +2586,8 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         ),
         None => (
             Vec::new(),
-            "(task no longer exists — press esc to close)".to_string(),
-            "Missing task".to_string(),
+            "(issue no longer exists — press esc to close)".to_string(),
+            "Missing issue".to_string(),
         ),
     };
 

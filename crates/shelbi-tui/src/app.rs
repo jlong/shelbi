@@ -404,7 +404,7 @@ impl App {
             },
             Row::Nav {
                 icon: "📋",
-                label: "Tasks",
+                label: "Issues",
                 view: View::Builtin("tasks"),
             },
             Row::Nav {
