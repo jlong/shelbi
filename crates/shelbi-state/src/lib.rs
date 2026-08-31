@@ -23,6 +23,7 @@ mod agent_workspaces;
 mod event_log;
 mod hub_config;
 mod hub_version;
+pub mod issue_store;
 pub mod keymap;
 mod migrate;
 mod pr_template;
@@ -39,6 +40,10 @@ pub use migrate::{
     append_gitignore_snippet, apply_migration_plan, gitignore_already_has_snippet,
     plan_in_repo_migration, MigrationAction, MigrationPlan, IN_REPO_CONFIG_DIRS,
     IN_REPO_CONFIG_FILES, IN_REPO_GITIGNORE_SNIPPET,
+};
+pub use issue_store::{
+    Cursor, FileSystemStore, IssueChange, IssueComment, IssueFields, IssueStore, NewIssue,
+    PrioMove, StatusMove,
 };
 pub use project_paths::ProjectPaths;
 pub use root::{
@@ -2283,6 +2288,7 @@ pub fn task_path(project: &str, id: &str) -> Result<PathBuf> {
     Ok(tasks_dir(project)?.join(format!("{id}.md")))
 }
 
+#[derive(Debug, Clone)]
 pub struct IssueFile {
     pub task: Issue,
     pub body: String,
