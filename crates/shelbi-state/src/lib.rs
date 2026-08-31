@@ -108,7 +108,8 @@ pub use workflows::{
 };
 pub use event_log::{
     append_ci_event, append_clarification_event, append_dispatch_event, append_external_event,
-    append_handoff_event, append_heartbeat_event, append_integration_event, append_limit_resume_event,
+    append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
+    append_limit_resume_event,
     append_github_merge_reconcile_event, append_merge_event, append_message_ack_event,
     append_message_event, append_project_event,
     append_push_event,
@@ -124,6 +125,7 @@ pub use event_log::{
     read_or_initialize_event_cursor, read_or_initialize_event_cursor_deadline,
     release_event_follower, task_event_body, write_event_cursor,
     EventEnvelope, EventKind, EventLogRead, FeedRead, HandoffCause, MessageDelivery, ReviewReadyEvent, ZenHeartbeatCue, ACTIONS_SKIPPED_MARKER, DAEMON_ACK,
+    EXTERNAL_ISSUE_COMMENT_CAUSE, EXTERNAL_ISSUE_RECONCILE_CAUSE,
     GITHUB_MERGE_RECONCILE_CAUSE, ORCH_EVENT_CALLBACK_SOCK_ENV, READY_MARKER_HANDOFF_ALIASES,
     READY_MARKER_HANDOFF_CAUSE,
 };

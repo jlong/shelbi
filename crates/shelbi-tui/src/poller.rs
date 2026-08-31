@@ -68,17 +68,21 @@ use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
 
-use shelbi_core::{default_workflow, Column, Project, StatusCategory, Workflow};
+use shelbi_core::{
+    default_workflow, Column, IssueTrackerBackend, Project, StatusCategory, Workflow,
+    DEFAULT_WORKFLOW_NAME,
+};
 use shelbi_orchestrator::supervision::{
     SupervisionAction, SupervisionInputs, SupervisionState, BASE_BACKOFF, CRASH_LOOP_WINDOW,
     MAX_RESTARTS_IN_WINDOW, STABLE_RECOVERY,
 };
 use shelbi_state::{
-    append_heartbeat_event, append_limit_resume_event, append_push_event, append_rebase_event,
-    append_workspace_dialog_event, append_workspace_event, append_workspace_pause_event,
-    append_worktree_detach_event, events_log_path, load_workspace_status, parse_pane_title_marker,
-    read_state, read_zenmode_summary, save_workspace_status, WorkspaceState, WorkspaceStatus,
-    ZenHeartbeatCue, ZenModeState,
+    append_heartbeat_event, append_issue_comment_event, append_limit_resume_event,
+    append_push_event, append_rebase_event, append_task_event, append_workspace_dialog_event,
+    append_workspace_event, append_workspace_pause_event, append_worktree_detach_event,
+    events_log_path, load_workspace_status, parse_pane_title_marker, read_state,
+    read_zenmode_summary, save_workspace_status, Cursor, IssueChange, IssueStore, WorkspaceState,
+    WorkspaceStatus, ZenHeartbeatCue, ZenModeState, EXTERNAL_ISSUE_RECONCILE_CAUSE,
 };
 
 /// How often each per-workspace thread re-verifies its host's reverse
@@ -168,6 +172,15 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     // A poller restart re-seeds it to `None` (due now), so the first sweep after
     // a restart reconciles any PR merged on GitHub while the hub was down.
     let mut last_github_reconcile: Option<Instant> = None;
+
+    // External-issue reconcile state. Project-wide (one tracker per project), so
+    // it lives on the supervisor tick. Holds the poll watermark + last-seen
+    // column per issue (ephemeral in-memory sync state — NOT a disk content
+    // cache, plan D3) and the heartbeat-derived cadence with quiescent back-off.
+    // A poller restart re-seeds it: the first sweep snapshots the board as the
+    // baseline (emitting nothing), so external edits made while the hub was down
+    // are not retroactively reconciled — the accepted watermark tradeoff.
+    let mut issue_reconcile = IssueReconcileSchedule::default();
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -272,6 +285,17 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
                 // on its own slow cadence, never the 5s workspace tick, and skips
                 // silently when the pass is disabled or gh is unavailable.
                 maybe_github_reconcile(&project, &mut last_github_reconcile, online_probe);
+
+                // External-issue reconcile: for a remote issue tracker (github),
+                // poll the store for edits made on the tracker itself — a human
+                // closing / reopening / relabeling an issue, or adding a comment
+                // — and reconcile each into the event log so the orchestrator
+                // reacts to it like any shelbi-driven move (plan §3 / D4). Driven
+                // off the heartbeat cadence (backing off on a quiescent board),
+                // conditional (no-op for the file_system backend), and gated on
+                // connectivity + its own watermark so a quiet board pays almost
+                // nothing.
+                maybe_reconcile_issues(&project, &mut issue_reconcile, online_probe);
             }
             Err(e) => tracing::debug!(
                 project = %project.name,
@@ -549,6 +573,283 @@ fn maybe_github_reconcile(
             "github-merge reconcile pass failed"
         ),
     }
+}
+
+/// Per-project state for the external-issue reconcile pass: the poll watermark,
+/// the last-seen column per issue (to compute a `from -> to` delta), a seeded
+/// flag, and the heartbeat-derived cadence (current interval + when the next
+/// poll is due). `Default` is the un-seeded, never-polled state a poller
+/// (re)start begins from.
+#[derive(Default)]
+struct IssueReconcileSchedule {
+    /// Live poll watermark threaded through successive `poll_changes` calls.
+    cursor: Cursor,
+    /// Last-seen shelbi column per issue id — the baseline a later external
+    /// move is diffed against. Ephemeral in-memory sync state (plan D3: not a
+    /// disk content cache), re-seeded from the board on the first sweep.
+    seen_status: HashMap<String, Column>,
+    /// False until the first sweep snapshots the board as the baseline.
+    seeded: bool,
+    /// Current back-off interval (base heartbeat interval, doubling toward the
+    /// heartbeat max while the board is quiescent). `None` until the first sweep.
+    interval: Option<Duration>,
+    /// When the next poll is due. `None` means "due now" (first tick / restart).
+    next_attempt: Option<Instant>,
+}
+
+/// One event the reconcile pass will append to `events.log` for a change
+/// `poll_changes` surfaced. Split from the append so [`plan_issue_reconcile`]'s
+/// decision (what a change *means*) is unit-testable without disk or `gh`.
+#[derive(Debug, PartialEq, Eq)]
+enum IssueReconcileEvent {
+    /// A human moved the issue on the tracker: a `from -> to` status transition
+    /// (close → done, reopen/relabel → the matching status).
+    Transition {
+        id: String,
+        workflow: String,
+        from: Column,
+        to: Column,
+    },
+    /// A new comment landed on the tracker.
+    Comment {
+        id: String,
+        comment_id: String,
+        author: Option<String>,
+    },
+}
+
+/// Pure core: fold a batch of `poll_changes` results against the last-seen
+/// column per issue, producing the reconcile events to emit and advancing
+/// `seen` to the new baseline. The decision rules:
+///
+/// - **Upsert whose column changed** (`from != to`) → a `Transition` event: the
+///   external close/reopen/relabel, reconciled as the matching board move.
+/// - **Upsert we have no prior column for** → record the baseline, emit nothing.
+///   This is the post-restart / newly-appeared-issue case; inventing a `from`
+///   would be a lie, and the issue's *next* genuine move reconciles normally.
+/// - **Upsert whose column is unchanged** (a body / priority edit) → record the
+///   baseline, emit nothing.
+/// - **New comment** → a `Comment` event, always (plan D4).
+///
+/// Split out so tests drive it with in-memory fixtures, mirroring
+/// [`tasks_are_quiescent`] / the orchestrator's `reconcile_candidates_with`.
+fn plan_issue_reconcile(
+    changes: Vec<IssueChange>,
+    seen: &mut HashMap<String, Column>,
+) -> Vec<IssueReconcileEvent> {
+    let mut out = Vec::new();
+    for change in changes {
+        match change {
+            IssueChange::Upserted(issue) => {
+                let task = issue.task;
+                let to = task.column.clone();
+                if let Some(from) = seen.get(&task.id) {
+                    if *from != to {
+                        out.push(IssueReconcileEvent::Transition {
+                            id: task.id.clone(),
+                            workflow: task
+                                .workflow
+                                .clone()
+                                .unwrap_or_else(|| DEFAULT_WORKFLOW_NAME.to_string()),
+                            from: from.clone(),
+                            to: to.clone(),
+                        });
+                    }
+                }
+                seen.insert(task.id, to);
+            }
+            IssueChange::CommentAdded { issue_id, comment } => {
+                out.push(IssueReconcileEvent::Comment {
+                    id: issue_id,
+                    comment_id: comment.id,
+                    author: comment.author,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Snapshot the board's current columns + high-water `updated_at` as the
+/// reconcile baseline, without emitting anything. One `list()` call at seed
+/// time; the watermark it derives means the first steady-state `poll_changes`
+/// only surfaces edits made strictly after the snapshot.
+fn seed_issue_reconcile(store: &dyn IssueStore) -> shelbi_core::Result<(Cursor, HashMap<String, Column>)> {
+    let board = store.list()?;
+    let high = board.iter().map(|tf| tf.task.updated_at).max();
+    let seen = board
+        .into_iter()
+        .map(|tf| (tf.task.id, tf.task.column))
+        .collect();
+    Ok((high.map(Cursor::at).unwrap_or_else(Cursor::start), seen))
+}
+
+/// Choose the reconcile pass's next interval, mirroring the heartbeat's
+/// adaptive back-off exactly (plan §6 — "back off on the quiescent heartbeat
+/// like the orchestrator already does"): hold at `standard` while the board has
+/// supervisable work in flight, otherwise double the current interval, capped at
+/// `max` and floored at `standard`.
+fn next_reconcile_interval(
+    project: &Project,
+    current: Duration,
+    standard: Duration,
+    max: Duration,
+) -> Duration {
+    backoff_interval(board_is_quiescent(project), current, standard, max)
+}
+
+/// Pure back-off arithmetic shared by the reconcile cadence: hold at `standard`
+/// while busy, else double `current` capped at `max` and floored at `standard`.
+/// The same "double, capped at max" step [`maybe_emit_heartbeat`] applies.
+fn backoff_interval(quiescent: bool, current: Duration, standard: Duration, max: Duration) -> Duration {
+    if quiescent {
+        current.saturating_mul(2).min(max).max(standard)
+    } else {
+        standard
+    }
+}
+
+/// Append one reconcile event to `events.log`. Best-effort: a write failure is
+/// logged, never fatal to the poller (the watermark still advanced, so the pass
+/// won't loop on the same change).
+fn emit_issue_reconcile_event(project: &str, ev: IssueReconcileEvent) {
+    match ev {
+        IssueReconcileEvent::Transition {
+            id,
+            workflow,
+            from,
+            to,
+        } => {
+            if let Err(e) = append_task_event(
+                project,
+                &id,
+                &workflow,
+                from.clone(),
+                to.clone(),
+                EXTERNAL_ISSUE_RECONCILE_CAUSE,
+            ) {
+                tracing::warn!(project = %project, task = %id, error = %e, "issue-reconcile: append transition failed");
+            } else {
+                tracing::info!(
+                    project = %project, task = %id, from = %from.as_str(), to = %to.as_str(),
+                    "issue-reconcile: external move reconciled into the event log"
+                );
+            }
+        }
+        IssueReconcileEvent::Comment {
+            id,
+            comment_id,
+            author,
+        } => {
+            if let Err(e) = append_issue_comment_event(project, &id, &comment_id, author.as_deref())
+            {
+                tracing::warn!(project = %project, task = %id, error = %e, "issue-reconcile: append comment failed");
+            } else {
+                tracing::info!(project = %project, task = %id, comment = %comment_id, "issue-reconcile: new comment surfaced into the event log");
+            }
+        }
+    }
+}
+
+/// Run one external-issue reconcile sweep for `project` when its heartbeat-driven
+/// cadence is due and the box is online. Pulls edits made on the tracker itself
+/// via [`IssueStore::poll_changes`] and reconciles each into `events.log`: an
+/// external close/reopen/relabel becomes the matching `from -> to` transition, a
+/// new comment becomes an issue-comment notice (plan §3 / D4).
+///
+/// Only remote backends need this — the `file_system` board is read directly and
+/// every mutation already writes its own event at the mutation site, so this is a
+/// clean no-op there. `github` is the only remote backend today.
+///
+/// Cadence is derived from the project heartbeat (base interval, backing off to
+/// the heartbeat max while the board is quiescent, exactly like
+/// [`maybe_emit_heartbeat`]); `heartbeat: off` disables the pass, since the
+/// heartbeat is the cadence source. Connectivity gated: while offline the sweep
+/// skips WITHOUT consuming the cadence, retrying next tick. Best-effort
+/// throughout — a store-resolve, seed, or poll failure is logged and retried,
+/// never fatal to the poller.
+fn maybe_reconcile_issues(
+    project: &Project,
+    schedule: &mut IssueReconcileSchedule,
+    is_online: impl Fn() -> bool,
+) {
+    // File-system board: nothing to reconcile from a remote tracker. Clear the
+    // schedule so flipping a project back to `file_system` at runtime stops the
+    // pass immediately (mirrors the heartbeat's off-path reset).
+    if project.issue_tracker.backend == IssueTrackerBackend::FileSystem {
+        *schedule = IssueReconcileSchedule::default();
+        return;
+    }
+
+    // Heartbeat off ⇒ no cadence source ⇒ pass disabled. Clear so re-enabling
+    // the heartbeat re-seeds from the next tick.
+    let (Some(standard), Some(max)) = (project.heartbeat.interval(), project.heartbeat.max())
+    else {
+        *schedule = IssueReconcileSchedule::default();
+        return;
+    };
+
+    let now = Instant::now();
+    let current_interval = schedule.interval.unwrap_or(standard);
+    if let Some(next) = schedule.next_attempt {
+        if now < next {
+            return;
+        }
+    }
+    if !is_online() {
+        // Don't burn the cadence while offline — retry as soon as we're back.
+        return;
+    }
+
+    let store = match shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(project = %project.name, error = %e, "issue-reconcile: store resolve failed");
+            schedule.interval = Some(standard);
+            schedule.next_attempt = Some(now + standard);
+            return;
+        }
+    };
+
+    // First sweep after (re)start: snapshot the board as the baseline and seed
+    // the watermark, emitting nothing. External edits made while the hub was
+    // down aren't retroactively reconciled — the accepted watermark tradeoff.
+    if !schedule.seeded {
+        match seed_issue_reconcile(store.as_ref()) {
+            Ok((cursor, seen)) => {
+                schedule.cursor = cursor;
+                schedule.seen_status = seen;
+                schedule.seeded = true;
+            }
+            Err(e) => {
+                tracing::debug!(project = %project.name, error = %e, "issue-reconcile: seed failed (tracker unreachable?)");
+                schedule.interval = Some(standard);
+                schedule.next_attempt = Some(now + standard);
+                return;
+            }
+        }
+        let next_interval = next_reconcile_interval(project, current_interval, standard, max);
+        schedule.interval = Some(next_interval);
+        schedule.next_attempt = Some(now + next_interval);
+        return;
+    }
+
+    // Steady state: pull the delta since the watermark and reconcile it.
+    match store.poll_changes(&schedule.cursor) {
+        Ok((changes, next_cursor)) => {
+            for ev in plan_issue_reconcile(changes, &mut schedule.seen_status) {
+                emit_issue_reconcile_event(&project.name, ev);
+            }
+            schedule.cursor = next_cursor;
+        }
+        Err(e) => {
+            tracing::debug!(project = %project.name, error = %e, "issue-reconcile: poll_changes failed")
+        }
+    }
+
+    let next_interval = next_reconcile_interval(project, current_interval, standard, max);
+    schedule.interval = Some(next_interval);
+    schedule.next_attempt = Some(now + next_interval);
 }
 
 /// Consider emitting one heartbeat for `project`. Called once per poller
@@ -6644,6 +6945,141 @@ transitions:
             }),
             tf(review_task("v")),
         ]));
+    }
+
+    fn done_task(id: &str) -> Issue {
+        let mut t = todo_task(id);
+        t.column = Column::done();
+        t
+    }
+
+    fn upsert(task: Issue) -> IssueChange {
+        IssueChange::Upserted(Box::new(tf(task)))
+    }
+
+    #[test]
+    fn plan_issue_reconcile_maps_external_moves_reopens_and_relabels() {
+        // Baseline: `a` in-progress, `b` in todo. Both then move on the tracker
+        // itself — `a` is closed (→ done), `b` is relabeled to review.
+        let mut seen = HashMap::from([
+            ("a".to_string(), Column::in_progress()),
+            ("b".to_string(), Column::todo()),
+        ]);
+        let events = plan_issue_reconcile(
+            vec![upsert(done_task("a")), upsert(review_task("b"))],
+            &mut seen,
+        );
+        assert_eq!(
+            events,
+            vec![
+                IssueReconcileEvent::Transition {
+                    id: "a".into(),
+                    workflow: DEFAULT_WORKFLOW_NAME.into(),
+                    from: Column::in_progress(),
+                    to: Column::done(),
+                },
+                IssueReconcileEvent::Transition {
+                    id: "b".into(),
+                    workflow: DEFAULT_WORKFLOW_NAME.into(),
+                    from: Column::todo(),
+                    to: Column::review(),
+                },
+            ]
+        );
+        // The baseline advanced to the new columns, so a repeat poll of the same
+        // state emits nothing (no duplicate transition).
+        assert_eq!(seen.get("a"), Some(&Column::done()));
+        let repeat = plan_issue_reconcile(vec![upsert(done_task("a"))], &mut seen);
+        assert!(repeat.is_empty());
+
+        // A reopen (done → in-progress) reconciles as the reverse transition.
+        let reopened = plan_issue_reconcile(vec![upsert(in_progress_task("a", "alpha"))], &mut seen);
+        assert_eq!(
+            reopened,
+            vec![IssueReconcileEvent::Transition {
+                id: "a".into(),
+                workflow: DEFAULT_WORKFLOW_NAME.into(),
+                from: Column::done(),
+                to: Column::in_progress(),
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_issue_reconcile_records_baseline_without_a_spurious_transition() {
+        // An issue we have no prior column for (post-restart / newly appeared)
+        // is only recorded — no `from` to honestly report, so no event — and its
+        // next genuine move reconciles normally.
+        let mut seen = HashMap::new();
+        let first = plan_issue_reconcile(vec![upsert(review_task("c"))], &mut seen);
+        assert!(first.is_empty());
+        assert_eq!(seen.get("c"), Some(&Column::review()));
+
+        // A same-column edit (body / priority bump, column unchanged) is likewise
+        // a no-op transition.
+        let noop = plan_issue_reconcile(vec![upsert(review_task("c"))], &mut seen);
+        assert!(noop.is_empty());
+
+        // Now `c` actually moves → the transition surfaces.
+        let moved = plan_issue_reconcile(vec![upsert(done_task("c"))], &mut seen);
+        assert_eq!(
+            moved,
+            vec![IssueReconcileEvent::Transition {
+                id: "c".into(),
+                workflow: DEFAULT_WORKFLOW_NAME.into(),
+                from: Column::review(),
+                to: Column::done(),
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_issue_reconcile_surfaces_new_comments() {
+        let mut seen = HashMap::new();
+        let comment = shelbi_state::IssueComment {
+            id: "555".into(),
+            author: Some("alice".into()),
+            created_at: Utc::now(),
+            body: "please rebase".into(),
+        };
+        let events = plan_issue_reconcile(
+            vec![IssueChange::CommentAdded {
+                issue_id: "a".into(),
+                comment,
+            }],
+            &mut seen,
+        );
+        assert_eq!(
+            events,
+            vec![IssueReconcileEvent::Comment {
+                id: "a".into(),
+                comment_id: "555".into(),
+                author: Some("alice".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn backoff_interval_doubles_when_quiescent_holds_at_standard_when_busy() {
+        let standard = Duration::from_secs(60);
+        let max = Duration::from_secs(300);
+
+        // Busy board: pinned at standard regardless of the current interval.
+        assert_eq!(backoff_interval(false, max, standard, max), standard);
+        assert_eq!(backoff_interval(false, standard, standard, max), standard);
+
+        // Quiescent board: double the current interval, floored at standard...
+        assert_eq!(
+            backoff_interval(true, standard, standard, max),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            backoff_interval(true, Duration::from_secs(120), standard, max),
+            Duration::from_secs(240)
+        );
+        // ...and capped at max (240 doubled would be 480 > 300).
+        assert_eq!(backoff_interval(true, Duration::from_secs(240), standard, max), max);
+        assert_eq!(backoff_interval(true, max, standard, max), max);
     }
 
     /// A `local_project` variant whose sole workspace carries `tags`, so a
