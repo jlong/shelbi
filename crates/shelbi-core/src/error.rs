@@ -171,6 +171,34 @@ pub enum Error {
     )]
     IssueTrackerUnimplemented(String),
 
+    /// No auth token could be resolved for a remote issue-tracker backend.
+    /// The resolver walked its whole chain — `GH_TOKEN`/`GITHUB_TOKEN` env,
+    /// the `gh` CLI keychain, then the out-of-repo `tokens.yml` — and found
+    /// nothing, so the message names every place it looked *and* the one-line
+    /// fix. Shelbi never holds a long-lived secret on disk, so the default
+    /// remedy is to reuse `gh`'s own auth. See `Plans/pluggable-task-stores.md`
+    /// §4 + D2.
+    #[error(
+        "no auth token found for the `{backend}` issue-tracker backend: \
+         checked $GH_TOKEN, $GITHUB_TOKEN, `gh auth token`, and {token_file}; \
+         run `gh auth login` or set GH_TOKEN"
+    )]
+    MissingIssueTrackerAuth {
+        backend: &'static str,
+        token_file: String,
+    },
+
+    /// An out-of-repo `tokens.yml` exists but its filesystem permissions are
+    /// looser than `0600`, so a secret is readable by group/other. Refusing to
+    /// read it (rather than silently trusting a world-readable secret) mirrors
+    /// the plan's "belt and suspenders" stance on token files. The message
+    /// names the file and the exact `chmod` fix.
+    #[error(
+        "token file {path} is readable by group/other (mode {mode:04o}); \
+         a token must stay private — run `chmod 600 {path}`"
+    )]
+    InsecureTokenFile { path: String, mode: u32 },
+
     #[error("{0}")]
     Other(String),
 }
