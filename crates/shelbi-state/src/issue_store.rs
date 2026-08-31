@@ -31,9 +31,32 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use shelbi_core::{Column, Error, Issue, IssueLaunchConfig, IssueZenConfig, Result};
+use shelbi_core::{
+    Column, Error, Issue, IssueLaunchConfig, IssueTrackerBackend, IssueTrackerConfig, IssueZenConfig,
+    Result,
+};
 
 use crate::IssueFile;
+
+/// Resolve a project's `issue_tracker` config into a live [`IssueStore`].
+///
+/// The config is validated first, so a `github` backend with a missing or
+/// malformed `repo` surfaces a field-named [`Error::InvalidIssueTracker`]
+/// before we ever try to build a store. Only `file_system` has a live backend
+/// today; `github` / `jira` / `linear` validate but resolve to a typed
+/// [`Error::IssueTrackerUnimplemented`] so a caller can tell "not built yet"
+/// apart from "you configured it wrong". See
+/// `Plans/pluggable-task-stores.md` §2 + D1.
+pub fn resolve_issue_store(
+    project: &str,
+    cfg: &IssueTrackerConfig,
+) -> Result<Box<dyn IssueStore>> {
+    cfg.validate()?;
+    match cfg.backend {
+        IssueTrackerBackend::FileSystem => Ok(Box::new(FileSystemStore::new(project))),
+        other => Err(Error::IssueTrackerUnimplemented(other.to_string())),
+    }
+}
 
 /// Creation spec handed to [`IssueStore::add`]. Carries the durable issue
 /// definition without the fields a store assigns itself (priority within a
@@ -812,6 +835,69 @@ mod tests {
         assert!(store.add_comment("missing", "x").is_err());
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn resolve_file_system_returns_a_working_store() {
+        use shelbi_core::{GithubConnection, IssueTrackerConfig};
+
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Default (and explicit file_system) resolves to a live store.
+        let store = resolve_issue_store("p", &IssueTrackerConfig::default()).unwrap();
+        store.add(spec("a", Column::todo())).unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        // A staged github block alongside file_system does not block resolution.
+        let cfg = IssueTrackerConfig {
+            backend: IssueTrackerBackend::FileSystem,
+            github: Some(GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(resolve_issue_store("p", &cfg).is_ok());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn resolve_github_is_unimplemented_but_valid_config_is_typed() {
+        use shelbi_core::{GithubConnection, IssueTrackerConfig};
+
+        let cfg = IssueTrackerConfig {
+            backend: IssueTrackerBackend::Github,
+            github: Some(GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            ..Default::default()
+        };
+        match resolve_issue_store("p", &cfg) {
+            Err(Error::IssueTrackerUnimplemented(b)) => assert_eq!(b, "github"),
+            Err(other) => panic!("expected IssueTrackerUnimplemented, got {other:?}"),
+            Ok(_) => panic!("expected an error, got a live store"),
+        }
+    }
+
+    #[test]
+    fn resolve_github_missing_repo_is_a_config_error_not_unimplemented() {
+        use shelbi_core::IssueTrackerConfig;
+
+        // Validation runs before the unimplemented check, so a malformed
+        // github backend surfaces the field-named config error.
+        let cfg = IssueTrackerConfig {
+            backend: IssueTrackerBackend::Github,
+            ..Default::default()
+        };
+        match resolve_issue_store("p", &cfg) {
+            Err(Error::InvalidIssueTracker(msg)) => {
+                assert!(msg.contains("issue_tracker.github.repo"), "msg: {msg}")
+            }
+            Err(other) => panic!("expected InvalidIssueTracker, got {other:?}"),
+            Ok(_) => panic!("expected an error, got a live store"),
+        }
     }
 
     #[test]

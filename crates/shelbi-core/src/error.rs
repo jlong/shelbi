@@ -153,6 +153,24 @@ pub enum Error {
     )]
     GitBranchConflict { scope: String },
 
+    /// A project's `issue_tracker` block selects a backend whose required
+    /// connection facts are missing or malformed. The message names the
+    /// offending field (e.g. `issue_tracker.github.repo`) so the fix is
+    /// unambiguous. See `Plans/pluggable-task-stores.md` §2 + D1.
+    #[error("{0}")]
+    InvalidIssueTracker(String),
+
+    /// A project's `issue_tracker` block selects a valid remote backend
+    /// (`github` / `jira` / `linear`) that parses and validates but has no live
+    /// store implementation yet. Distinct from [`Error::InvalidIssueTracker`]
+    /// (a config error the user must fix) so a caller can tell "not built yet"
+    /// apart from "you configured it wrong". Only `file_system` resolves today.
+    #[error(
+        "issue_tracker backend `{0}` is not yet implemented \
+         (only `file_system` is available today)"
+    )]
+    IssueTrackerUnimplemented(String),
+
     #[error("{0}")]
     Other(String),
 }

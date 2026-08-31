@@ -53,6 +53,7 @@ fn test_project() -> Project {
         workspaces: Vec::new(),
         runners: Default::default(),
         agents: Default::default(),
+        issue_tracker: Default::default(),
         detected_shapes: Vec::new(),
     }
 }

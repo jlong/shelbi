@@ -402,6 +402,7 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig {
                 base_branch: base_branch.map(String::from),

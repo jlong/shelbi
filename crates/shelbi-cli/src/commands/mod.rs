@@ -332,6 +332,7 @@ pub(crate) mod test_support {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
         };

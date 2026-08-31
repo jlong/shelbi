@@ -133,6 +133,16 @@ pub struct Project {
     /// [`Project::merge_strategy`].
     #[serde(default)]
     pub git: GitConfig,
+    /// Which board backend this project's issues live in. Absent ⇒
+    /// [`IssueTrackerBackend::FileSystem`] (today's markdown-on-disk board),
+    /// so every existing project keeps working untouched. Only
+    /// `file_system` resolves to a live store today; the remote backends
+    /// (`github` / `jira` / `linear`) parse and validate but resolve to a
+    /// typed "not yet implemented". Elided from the wire form when it is the
+    /// default so existing project YAMLs don't grow a key on round-trip. See
+    /// [`IssueTrackerConfig`] and `Plans/pluggable-task-stores.md` §2 + D1.
+    #[serde(default, skip_serializing_if = "IssueTrackerConfig::is_default")]
+    pub issue_tracker: IssueTrackerConfig,
     /// The project's runner **fleet**, keyed by canonical [`RunnerKind`]: one
     /// entry per kind is the concrete launcher (the evolution of
     /// [`agent_runners`](Self::agent_runners)), optionally carrying a house
@@ -217,6 +227,7 @@ pub const SHARED_PROJECT_FIELDS: &[&str] = &[
     "zen",
     "heartbeat",
     "git",
+    "issue_tracker",
     "runners",
     "agents",
 ];
@@ -665,6 +676,189 @@ impl std::fmt::Display for MergeStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Which board backend a project's issues live in. The wire form is the
+/// snake-case variant name (`file_system` | `github` | `jira` | `linear`).
+/// The `file_system` backend (`shelbi_state::FileSystemStore`) is the only one
+/// that resolves to a live store today; the remote backends parse and validate
+/// but resolve to a typed "not yet implemented".
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueTrackerBackend {
+    /// Today's markdown-on-disk board under
+    /// `~/.shelbi/projects/<name>/tasks/`. The default: an absent
+    /// `issue_tracker` block resolves here, so existing projects keep working.
+    #[default]
+    FileSystem,
+    /// GitHub issues in a single repo. Selector: [`GithubConnection::repo`].
+    Github,
+    /// Jira issues in a project. Stub: parses and validates, not yet resolvable.
+    Jira,
+    /// Linear issues for a team. Stub: parses and validates, not yet resolvable.
+    Linear,
+}
+
+impl IssueTrackerBackend {
+    /// The snake-case wire token for this backend — matches the YAML form and
+    /// the string interpolated into validation / resolution errors.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IssueTrackerBackend::FileSystem => "file_system",
+            IssueTrackerBackend::Github => "github",
+            IssueTrackerBackend::Jira => "jira",
+            IssueTrackerBackend::Linear => "linear",
+        }
+    }
+}
+
+impl std::fmt::Display for IssueTrackerBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// GitHub backend connection facts. Carries only the **non-secret** repo
+/// selector — the auth token is resolved out-of-band (`gh` keychain / env),
+/// never a field in any committed file. See `Plans/pluggable-task-stores.md`
+/// §4 + D2.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubConnection {
+    /// `owner/repo` — which repo the issues live in. Required whenever the
+    /// GitHub backend is selected; validated by
+    /// [`IssueTrackerConfig::validate`].
+    #[serde(default)]
+    pub repo: String,
+}
+
+/// Jira backend connection facts (stub). No secret ever.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JiraConnection {
+    /// Jira project key (e.g. `PROJ`) — which project the issues live in.
+    #[serde(default)]
+    pub project: String,
+}
+
+/// Linear backend connection facts (stub). No secret ever.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinearConnection {
+    /// Linear team key (e.g. `ENG`) — which team's issues to sync.
+    #[serde(default)]
+    pub team: String,
+}
+
+/// A project's `issue_tracker` block: which board backend is live plus its
+/// per-backend, non-secret connection facts. An absent block deserializes to
+/// the default (`file_system`, no connections), so existing projects keep
+/// working; that default is elided from the wire form via
+/// [`IssueTrackerConfig::is_default`].
+///
+/// The per-backend connection structs are independent options rather than an
+/// enum-tagged union so that a user can keep a `github:` block staged while the
+/// backend is still `file_system`, and so a `parse → serialize` round-trip
+/// never drops a connection block the user wrote. [`IssueTrackerConfig::validate`]
+/// checks only the *selected* backend's requirements.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueTrackerConfig {
+    /// The live backend. Absent ⇒ [`IssueTrackerBackend::FileSystem`].
+    #[serde(default)]
+    pub backend: IssueTrackerBackend,
+    /// GitHub connection facts — required when `backend: github`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GithubConnection>,
+    /// Jira connection facts — required when `backend: jira`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jira: Option<JiraConnection>,
+    /// Linear connection facts — required when `backend: linear`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear: Option<LinearConnection>,
+}
+
+impl IssueTrackerConfig {
+    /// True when this is the untouched default (`file_system`, no connection
+    /// blocks). Drives `skip_serializing_if` on [`Project::issue_tracker`] so an
+    /// absent block stays absent across a load → save round-trip.
+    pub fn is_default(&self) -> bool {
+        *self == IssueTrackerConfig::default()
+    }
+
+    /// Validate the **selected** backend's connection facts, naming the bad
+    /// field in the error. A no-op for `file_system`. GitHub requires a
+    /// well-formed `owner/repo`; Jira/Linear (stubs) require their selector be
+    /// present. Staged connection blocks for a *non-selected* backend are not
+    /// validated, so a `github:` block can sit alongside `backend: file_system`.
+    pub fn validate(&self) -> crate::Result<()> {
+        match self.backend {
+            IssueTrackerBackend::FileSystem => Ok(()),
+            IssueTrackerBackend::Github => {
+                let repo = self
+                    .github
+                    .as_ref()
+                    .map(|g| g.repo.trim())
+                    .filter(|r| !r.is_empty())
+                    .ok_or_else(|| {
+                        crate::Error::InvalidIssueTracker(
+                            "issue_tracker.github.repo is required for the `github` \
+                             backend (expected `owner/repo`)"
+                                .to_string(),
+                        )
+                    })?;
+                if !is_valid_owner_repo(repo) {
+                    return Err(crate::Error::InvalidIssueTracker(format!(
+                        "issue_tracker.github.repo `{repo}` is malformed \
+                         (expected `owner/repo`)"
+                    )));
+                }
+                Ok(())
+            }
+            IssueTrackerBackend::Jira => {
+                require_selector(
+                    self.jira.as_ref().map(|j| j.project.as_str()),
+                    "issue_tracker.jira.project",
+                    "jira",
+                )
+            }
+            IssueTrackerBackend::Linear => require_selector(
+                self.linear.as_ref().map(|l| l.team.as_str()),
+                "issue_tracker.linear.team",
+                "linear",
+            ),
+        }
+    }
+}
+
+/// Shared helper for the stub backends: require a non-empty selector, naming
+/// the field and backend in the error.
+fn require_selector(
+    value: Option<&str>,
+    field: &str,
+    backend: &str,
+) -> crate::Result<()> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(_) => Ok(()),
+        None => Err(crate::Error::InvalidIssueTracker(format!(
+            "{field} is required for the `{backend}` backend"
+        ))),
+    }
+}
+
+/// A GitHub `owner/repo` slug: exactly one `/`, both halves non-empty and drawn
+/// from the characters GitHub allows in owner and repo names
+/// (`[A-Za-z0-9._-]`). Deliberately lenient on length so this never rejects a
+/// valid repo; it exists to catch the obvious mistakes (missing slug, a bare
+/// name, an embedded URL/space).
+fn is_valid_owner_repo(s: &str) -> bool {
+    let mut parts = s.split('/');
+    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let ok = |seg: &str| {
+        !seg.is_empty()
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    ok(owner) && ok(repo)
 }
 
 fn default_workspace_poll_interval_secs() -> u64 {
@@ -3565,6 +3759,7 @@ workspace_settings_template: /etc/shelbi/p.json
             git: GitConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         };
         assert!(project.validate_workspaces().is_ok());
@@ -3663,6 +3858,7 @@ workspaces:
             git: GitConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -3966,6 +4162,7 @@ workspaces:
             git: GitConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -5299,6 +5496,13 @@ git:
                 merge_strategy: MergeStrategy::Rebase,
                 ..Default::default()
             },
+            issue_tracker: IssueTrackerConfig {
+                backend: IssueTrackerBackend::Github,
+                github: Some(GithubConnection {
+                    repo: "example/shelbi".into(),
+                }),
+                ..Default::default()
+            },
             repo: "/home/dev/shelbi".into(),
             machines: vec![Machine {
                 name: "hub".into(),
@@ -5660,5 +5864,151 @@ machines:
             .expect_err("`orchestrator` is required — merge must fail");
         let msg = err.to_string();
         assert!(msg.contains("orchestrator"), "err was: {msg}");
+    }
+
+    // -- issue_tracker config -------------------------------------------------
+
+    fn project_with_issue_tracker_yaml(block: &str) -> Project {
+        let yaml = format!(
+            r#"
+name: p
+repo: r
+machines:
+  - {{ name: hub, kind: local, work_dir: /tmp }}
+orchestrator: {{ runner: claude }}
+agent_runners:
+  claude: {{ command: claude, flags: [] }}
+{block}"#
+        );
+        Project::from_yaml_str(&yaml).unwrap()
+    }
+
+    #[test]
+    fn issue_tracker_absent_defaults_to_file_system_and_omits_key() {
+        // An old project YAML with no `issue_tracker:` block parses to the
+        // file_system default and must not grow the key on re-serialization.
+        let p = project_with_issue_tracker_yaml("");
+        assert_eq!(p.issue_tracker.backend, IssueTrackerBackend::FileSystem);
+        assert!(p.issue_tracker.is_default());
+        p.issue_tracker.validate().unwrap();
+
+        let back = serde_yaml::to_string(&p).unwrap();
+        assert!(!back.contains("issue_tracker"), "got: {back}");
+    }
+
+    #[test]
+    fn issue_tracker_parses_github_backend() {
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n",
+        );
+        assert_eq!(p.issue_tracker.backend, IssueTrackerBackend::Github);
+        assert_eq!(
+            p.issue_tracker.github.as_ref().unwrap().repo,
+            "owner/repo"
+        );
+        p.issue_tracker.validate().unwrap();
+    }
+
+    #[test]
+    fn issue_tracker_github_requires_repo() {
+        // Backend selected but no github block at all.
+        let p = project_with_issue_tracker_yaml("issue_tracker:\n  backend: github\n");
+        let err = p.issue_tracker.validate().expect_err("repo missing");
+        let msg = err.to_string();
+        assert!(msg.contains("issue_tracker.github.repo"), "err was: {msg}");
+
+        // Empty repo string is treated the same as missing.
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: github\n  github:\n    repo: ''\n",
+        );
+        let err = p.issue_tracker.validate().expect_err("repo empty");
+        assert!(
+            err.to_string().contains("issue_tracker.github.repo"),
+            "err was: {err}"
+        );
+    }
+
+    #[test]
+    fn issue_tracker_github_malformed_repo_errors_name_the_field() {
+        for bad in ["not-a-slug", "owner/repo/extra", "owner/", "/repo", "a b/c"] {
+            let p = project_with_issue_tracker_yaml(&format!(
+                "issue_tracker:\n  backend: github\n  github:\n    repo: '{bad}'\n"
+            ));
+            let err = p
+                .issue_tracker
+                .validate()
+                .expect_err(&format!("`{bad}` should be rejected"));
+            assert!(
+                err.to_string().contains("issue_tracker.github.repo"),
+                "`{bad}` err was: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_tracker_jira_and_linear_stubs_validate_selectors() {
+        // Selector present → validate ok (resolution unimplemented is a
+        // separate, store-layer concern).
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: jira\n  jira:\n    project: PROJ\n",
+        );
+        p.issue_tracker.validate().unwrap();
+
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n",
+        );
+        p.issue_tracker.validate().unwrap();
+
+        // Missing selector names the field.
+        let p = project_with_issue_tracker_yaml("issue_tracker:\n  backend: jira\n");
+        assert!(p
+            .issue_tracker
+            .validate()
+            .expect_err("jira selector required")
+            .to_string()
+            .contains("issue_tracker.jira.project"));
+
+        let p = project_with_issue_tracker_yaml("issue_tracker:\n  backend: linear\n");
+        assert!(p
+            .issue_tracker
+            .validate()
+            .expect_err("linear selector required")
+            .to_string()
+            .contains("issue_tracker.linear.team"));
+    }
+
+    #[test]
+    fn issue_tracker_file_system_ignores_staged_connection_blocks() {
+        // A `github:` block staged alongside `backend: file_system` is not
+        // validated and does not block resolution — and it round-trips.
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: file_system\n  github:\n    repo: owner/repo\n",
+        );
+        p.issue_tracker.validate().unwrap();
+        assert_eq!(
+            p.issue_tracker.github.as_ref().unwrap().repo,
+            "owner/repo"
+        );
+    }
+
+    #[test]
+    fn issue_tracker_round_trips_without_dropping_fields() {
+        // parse → serialize → parse must preserve backend + every connection
+        // block, including one staged for a non-selected backend.
+        let src = IssueTrackerConfig {
+            backend: IssueTrackerBackend::Github,
+            github: Some(GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            jira: Some(JiraConnection {
+                project: "PROJ".into(),
+            }),
+            linear: Some(LinearConnection {
+                team: "ENG".into(),
+            }),
+        };
+        let yaml = serde_yaml::to_string(&src).unwrap();
+        let back: IssueTrackerConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(src, back);
     }
 }

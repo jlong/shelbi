@@ -3669,6 +3669,7 @@ mod reload_target_tmux_tests {
             workspaces: Vec::new(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -4464,6 +4465,7 @@ mod reload_workspace_tmux_tests {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
         };

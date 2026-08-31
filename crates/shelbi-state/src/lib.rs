@@ -42,8 +42,8 @@ pub use migrate::{
     IN_REPO_CONFIG_FILES, IN_REPO_GITIGNORE_SNIPPET,
 };
 pub use issue_store::{
-    Cursor, FileSystemStore, IssueChange, IssueComment, IssueFields, IssueStore, NewIssue,
-    PrioMove, StatusMove,
+    resolve_issue_store, Cursor, FileSystemStore, IssueChange, IssueComment, IssueFields,
+    IssueStore, NewIssue, PrioMove, StatusMove,
 };
 pub use project_paths::ProjectPaths;
 pub use root::{
@@ -3196,6 +3196,7 @@ mod tests {
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            issue_tracker: Default::default(),
             runners: Default::default(),
             agents: Default::default(),
             detected_shapes: Vec::new(),
