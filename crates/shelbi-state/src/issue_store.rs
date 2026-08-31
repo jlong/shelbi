@@ -313,6 +313,13 @@ impl IssueStore for FileSystemStore {
             updated_at: now,
             params: spec.params,
         };
+        // Reject self-references, unknown dep ids, and cycles before the card
+        // lands — the same guard `shelbi task add` ran, now the store's job so
+        // every `add` caller (and every backend) enforces it.
+        if !issue.depends_on.is_empty() {
+            let existing = crate::list_tasks(&self.project)?;
+            crate::validate_depends_on(&issue, &existing)?;
+        }
         crate::create_task(&self.project, &issue, &spec.body)?;
         Ok(issue)
     }
@@ -603,6 +610,28 @@ mod tests {
 
         store.add(spec("a", Column::todo())).unwrap();
         assert!(store.add(spec("a", Column::todo())).is_err());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn add_validates_depends_on() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let store = FileSystemStore::new("p");
+
+        let with_ghost_dep = || {
+            let mut s = spec("a", Column::todo());
+            s.depends_on = vec!["ghost".into()];
+            s
+        };
+        // A dependency on an id that doesn't exist is rejected.
+        assert!(store.add(with_ghost_dep()).is_err());
+
+        // With the dependency present, the add succeeds.
+        store.add(spec("ghost", Column::todo())).unwrap();
+        assert!(store.add(with_ghost_dep()).is_ok());
 
         std::env::remove_var("SHELBI_HOME");
     }

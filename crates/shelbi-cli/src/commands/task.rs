@@ -14,6 +14,7 @@ use std::str::FromStr;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use clap::{Args as ClapArgs, Subcommand};
+use shelbi_state::IssueStore;
 use shelbi_core::{
     default_workflow, validate_branch, validate_task_id, validate_workflow_name, Column,
     StatusCategory, Issue, Workflow, MAX_TASK_ID_LEN,
@@ -428,30 +429,6 @@ fn add_with_stdin(project: &str, args: AddArgs, stdin_body: Option<String>) -> R
     if let Some(name) = args.workflow.as_deref() {
         validate_workflow_name(name).map_err(|e| anyhow!(e))?;
     }
-    let priority = shelbi_state::list_column(project, column.clone())
-        .map_err(|e| anyhow!(e))?
-        .len() as u32;
-    let now = Utc::now();
-    let task = Issue {
-        id: id.clone(),
-        title: args.title.clone(),
-        column: column.clone(),
-        priority,
-        assigned_to: None,
-        workflow: args.workflow.clone(),
-        branch: args.branch.clone(),
-        depends_on: dedup_preserving_order(args.depends_on.clone()),
-        prefers_machine: args.prefers_machine.clone(),
-        zen: None,
-        launch: None,
-        created_at: now,
-        updated_at: now,
-        params: std::collections::BTreeMap::new(),
-    };
-    if !task.depends_on.is_empty() {
-        let existing = shelbi_state::list_tasks(project).map_err(|e| anyhow!(e))?;
-        shelbi_state::validate_depends_on(&task, &existing).map_err(|e| anyhow!(e))?;
-    }
     // Body precedence: `-d` and piped stdin are two spellings of the same
     // input, so supplying both is ambiguous — refuse rather than silently
     // discard either one. With neither, the body defaults to the title.
@@ -464,11 +441,30 @@ fn add_with_stdin(project: &str, args: AddArgs, stdin_body: Option<String>) -> R
         (None, Some(s)) => format!("# Task\n\n{}\n", s.trim_end()),
         (None, None) => format!("# Task\n\n{}\n", args.title),
     };
-    // Create-exclusive: the up-front existence checks above are advisory
-    // (they race against concurrent creators); this is the authoritative
-    // no-overwrite guarantee.
-    shelbi_state::create_task(project, &task, &body).map_err(|e| anyhow!(e))?;
-    println!("✓ {} created in {column} (priority {priority})", task.id);
+    // Route creation through the board seam. `add` appends to the column
+    // (priority = current length), validates deps (self-ref / unknown id /
+    // cycle), and is create-exclusive — the authoritative no-overwrite
+    // guarantee. The up-front existence checks above stay as advisory races.
+    let store = shelbi_state::FileSystemStore::new(project);
+    let spec = shelbi_state::NewIssue {
+        id: id.clone(),
+        title: args.title.clone(),
+        column: column.clone(),
+        body,
+        workflow: args.workflow.clone(),
+        branch: args.branch.clone(),
+        depends_on: dedup_preserving_order(args.depends_on.clone()),
+        prefers_machine: args.prefers_machine.clone(),
+        zen: None,
+        launch: None,
+        params: std::collections::BTreeMap::new(),
+        priority: None,
+    };
+    let created = store.add(spec).map_err(|e| anyhow!(e))?;
+    println!(
+        "✓ {} created in {column} (priority {})",
+        created.id, created.priority
+    );
     Ok(())
 }
 
@@ -538,7 +534,9 @@ fn list(
     // `in-progress`.
     let filter = status_filter.map(Column::from_status_id);
 
-    let all = shelbi_state::list_tasks(project).map_err(|e| anyhow!(e))?;
+    let all = shelbi_state::FileSystemStore::new(project)
+        .list()
+        .map_err(|e| anyhow!(e))?;
     if all.is_empty() {
         println!("(no tasks yet)");
         return Ok(());
@@ -751,7 +749,14 @@ fn move_to(
         None
     };
 
-    let moved = shelbi_state::move_task(project, id, column.clone()).map_err(|e| anyhow!(e))?;
+    // Route the status change through the board seam. `move_status` returns a
+    // `StatusMove`; unpack it back into the `(from, to, workflow)` tuple the
+    // event-append + rollback logic below already speaks.
+    let store = shelbi_state::FileSystemStore::new(project);
+    let moved = store
+        .move_status(id, &column, reason.unwrap_or("user:cli"))
+        .map_err(|e| anyhow!(e))?
+        .map(|m| (m.from, m.to, m.workflow));
     if let Some((from, to_col, moved_wf)) = &moved {
         let reason = reason.unwrap_or("user:cli");
         // Stamp `actions=skipped` on the line when the escape hatch bypassed
@@ -763,7 +768,7 @@ fn move_to(
             shelbi_state::append_task_event
         };
         if let Err(e) = append(project, id, moved_wf, from.clone(), to_col.clone(), reason) {
-            match shelbi_state::move_task(project, id, from.clone()) {
+            match store.move_status(id, from, "rollback:event-append-failed") {
                 Ok(_) => {
                     return Err(anyhow!(
                         "moved {id} to {to_col}, but failed to append task event ({e}); \
@@ -1054,7 +1059,10 @@ fn prio(project: &str, args: PrioArgs) -> Result<()> {
         bail!("specify one of --up, --down, --top, --bottom, --set N");
     };
 
-    shelbi_state::set_task_priority(project, &args.id, new_pos as u32).map_err(|e| anyhow!(e))?;
+    let store = shelbi_state::FileSystemStore::new(project);
+    store
+        .set_priority(&args.id, shelbi_state::PrioMove::Set(new_pos as u32))
+        .map_err(|e| anyhow!(e))?;
     println!("✓ {} now at slot {new_pos} in {}", args.id, tf.task.column);
     Ok(())
 }
