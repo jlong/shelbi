@@ -581,7 +581,7 @@ pub fn workspace_transition_marker(machine: &Machine, workspace: &WorkspaceSpec)
 /// `decide_transition`, since it needs the loaded workflow).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionRequest {
-    /// Task id from line 1 — validated against [`validate_task_id`].
+    /// Issue id from line 1 — validated against [`validate_task_id`].
     pub task_id: String,
     /// Raw target token from line 2 — a status id or a verb (`reject`/`bounce`).
     /// Validated only for shape here (a conservative id charset); its meaning
@@ -1693,7 +1693,7 @@ pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -
     Ok(())
 }
 
-/// Spec for `start_workspace_on_task`. We don't take a `&Task` because the
+/// Spec for `start_workspace_on_task`. We don't take a `&Issue` because the
 /// caller may have a fresh task id without a frontmatter file yet.
 pub struct StartSpec<'a> {
     pub project: &'a Project,
@@ -1718,7 +1718,7 @@ pub struct StartSpec<'a> {
     /// Threaded here rather than re-loaded from the task because the caller
     /// already holds the parsed task (a bare `task_id` without a frontmatter
     /// file yet carries no override).
-    pub launch_override: Option<&'a shelbi_core::TaskLaunchConfig>,
+    pub launch_override: Option<&'a shelbi_core::IssueLaunchConfig>,
 }
 
 /// The runner spec + permission mode a dispatch should launch with, after the
@@ -1756,7 +1756,7 @@ pub fn resolve_workspace_launch(
     project: &shelbi_core::Project,
     _workspace: &WorkspaceSpec,
     agent: Option<&str>,
-    task_override: Option<&shelbi_core::TaskLaunchConfig>,
+    task_override: Option<&shelbi_core::IssueLaunchConfig>,
 ) -> Result<ResolvedWorkspaceLaunch> {
     // No agent (bare pane) → no role manifest to resolve, and a bare pane
     // carries no dispatched task, so `task_override` is always `None` here in
@@ -5789,8 +5789,8 @@ mod tests {
             resolve_workspace_launch(&project, &project.workspaces[0], Some("review"), None).unwrap();
         assert_eq!(plain.runner.command, "codex");
 
-        // Task override forces claude + opus + high effort — top of the chain.
-        let over = shelbi_core::TaskLaunchConfig {
+        // Issue override forces claude + opus + high effort — top of the chain.
+        let over = shelbi_core::IssueLaunchConfig {
             runner: Some(shelbi_core::RunnerKind::Claude),
             model: Some("claude-opus-4-8".into()),
             effort: Some(shelbi_core::ReasoningEffort::High),
@@ -6151,7 +6151,7 @@ mod tests {
         )
         .unwrap();
 
-        let task = shelbi_core::Task {
+        let task = shelbi_core::Issue {
             id: "rust-ui-app-name".into(),
             title: "rust-ui-app-name".into(),
             column: shelbi_core::Column::in_progress(),

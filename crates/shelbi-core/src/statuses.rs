@@ -58,7 +58,7 @@ impl ProjectStatuses {
     ///
     /// The terminal check is a hard error: a status set with no `done` or
     /// `archived` category is degenerate — a task could never leave the
-    /// board, and every terminal-assuming consumer ([`Task::is_blocked`],
+    /// board, and every terminal-assuming consumer ([`Issue::is_blocked`],
     /// the `Done`-column mapping) would silently have nothing to key off.
     /// Softer coherence issues (a missing `handoff`, a duplicated
     /// single-instance category) surface as non-fatal warnings via

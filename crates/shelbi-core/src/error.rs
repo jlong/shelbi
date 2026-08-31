@@ -61,13 +61,13 @@ pub enum Error {
         "task file `{requested}.md` declares mismatched frontmatter id \
          `{found}`; rename the file or fix the `id:` field so they match"
     )]
-    TaskIdMismatch { requested: String, found: String },
+    IssueIdMismatch { requested: String, found: String },
 
     #[error(
         "task id `{id}` is too long: {len} bytes (max {max}); git ref names \
          must leave room for a generated branch prefix under GitHub's 255-byte ref limit"
     )]
-    TaskIdTooLong { id: String, len: usize, max: usize },
+    IssueIdTooLong { id: String, len: usize, max: usize },
 
     /// A task's `branch:` override carries characters outside the safe set
     /// (task-id charset plus `/`). Left unchecked the value reaches

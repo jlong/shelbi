@@ -35,7 +35,7 @@ use chrono::Utc;
 use clap::{Args, Subcommand};
 
 use shelbi_core::{
-    ci_timeout_for_workflow, danger_paths_for_project, Column, Project, Task, Workflow,
+    ci_timeout_for_workflow, danger_paths_for_project, Column, Project, Issue, Workflow,
     ZenDangerPaths,
 };
 use shelbi_orchestrator::zen::{self, CiVerdict, DryRunDecision};
@@ -585,9 +585,9 @@ fn print_danger_paths(p: &Project) {
 /// when the workflow YAML is absent or malformed — call sites should
 /// treat that as "fall back to project-level config" rather than
 /// erroring out. Resolves the workflow name through
-/// [`Task::workflow_or_default`] so a task without an explicit
+/// [`Issue::workflow_or_default`] so a task without an explicit
 /// `workflow:` field routes to the project's default workflow.
-fn load_workflow_for_task(project: &str, task: &Task) -> Option<Workflow> {
+fn load_workflow_for_task(project: &str, task: &Issue) -> Option<Workflow> {
     let project_yaml = shelbi_state::load_project(project).ok()?;
     shelbi_state::load_task_workflow(project, &project_yaml, task).ok()
 }
@@ -600,7 +600,7 @@ fn count_in_flight_zen(project: &str, mode: ZenModeState) -> Result<usize> {
         .count())
 }
 
-fn zen_applies(task: &Task, mode: ZenModeState) -> bool {
+fn zen_applies(task: &Issue, mode: ZenModeState) -> bool {
     let explicit = task.zen.as_ref().and_then(|z| z.enabled);
     match (explicit, mode) {
         (Some(b), _) => b,
@@ -779,11 +779,11 @@ fn format_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shelbi_core::TaskZenConfig;
+    use shelbi_core::IssueZenConfig;
 
-    fn make_task(id: &str, col: Column, zen_enabled: Option<bool>) -> Task {
+    fn make_task(id: &str, col: Column, zen_enabled: Option<bool>) -> Issue {
         let now = chrono::Utc::now();
-        Task {
+        Issue {
             id: id.into(),
             title: id.into(),
             column: col,
@@ -793,7 +793,7 @@ mod tests {
             branch: None,
             depends_on: Vec::new(),
             prefers_machine: None,
-            zen: zen_enabled.map(|b| TaskZenConfig {
+            zen: zen_enabled.map(|b| IssueZenConfig {
                 enabled: Some(b),
                 checks_additional: Vec::new(),
                 checks_only: Vec::new(),

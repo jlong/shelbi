@@ -9,7 +9,7 @@ use shelbi_palette::{Decoration, DecorationColor};
 use shelbi_state::{
     keymap::{DisplayStyle, Keymaps},
     load_workspace_status, read_state, sidebar_collapsed_machines,
-    toggle_sidebar_machine_collapsed, TaskFile, WorkspaceState, ZenModeState, ZenToggleChord,
+    toggle_sidebar_machine_collapsed, IssueFile, WorkspaceState, ZenModeState, ZenToggleChord,
 };
 
 /// Sidebar render area floor. Below two columns / two rows the pane can't
@@ -1397,10 +1397,10 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 /// *previous* task) correctly reads as Loading for the new one.
 fn split_review_sections(
     project_name: &str,
-    queue: Vec<TaskFile>,
+    queue: Vec<IssueFile>,
 ) -> (Vec<ReviewEntry>, Vec<ReviewEntry>) {
     let fallback_entry =
-        |task: &shelbi_core::Task, location: Option<String>, state: ReviewState| ReviewEntry {
+        |task: &shelbi_core::Issue, location: Option<String>, state: ReviewState| ReviewEntry {
             task_id: task.id.clone(),
             title: task.title.clone(),
             branch: task
@@ -1424,7 +1424,7 @@ fn split_review_sections(
             return (Vec::new(), queued);
         }
     };
-    let entry = |task: &shelbi_core::Task,
+    let entry = |task: &shelbi_core::Issue,
                  location: Option<String>,
                  workspace: Option<String>,
                  state: ReviewState| {
@@ -1621,7 +1621,7 @@ fn derive_workspace_badge(workspace_name: &str, current_task: Option<&str>) -> W
             // A serving review slot reads as active work (the branch is up).
             WorkspaceState::Serving => WorkspaceBadge::Working,
         },
-        // Task assigned but the poller hasn't recorded a matching marker yet
+        // Issue assigned but the poller hasn't recorded a matching marker yet
         // (never observed, or the status still names a prior task). Show
         // working as the best guess — it firms up within one poll tick.
         _ => WorkspaceBadge::Working,
@@ -1779,7 +1779,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use shelbi_core::{
-        AgentRunnerSpec, Column, Machine, MachineKind, OrchestratorSpec, Project, Task,
+        AgentRunnerSpec, Column, Machine, MachineKind, OrchestratorSpec, Project, Issue,
         WorkspaceSpec,
     };
     use std::collections::BTreeMap;
@@ -2010,7 +2010,7 @@ mod tests {
         shelbi_state::save_project(&project).unwrap();
 
         let now = Utc::now();
-        let assigned = Task {
+        let assigned = Issue {
             id: "fix-thing".into(),
             title: "Fix the thing".into(),
             column: Column::in_progress(),
@@ -2233,7 +2233,7 @@ mod tests {
         let now = Utc::now();
         shelbi_state::save_task(
             "demo",
-            &Task {
+            &Issue {
                 id: "wip".into(),
                 title: "wip".into(),
                 column: Column::in_progress(),
@@ -2358,9 +2358,9 @@ mod tests {
         .unwrap();
     }
 
-    fn review_task(id: &str, title: &str, assigned_to: Option<&str>, branch: Option<&str>) -> Task {
+    fn review_task(id: &str, title: &str, assigned_to: Option<&str>, branch: Option<&str>) -> Issue {
         let now = Utc::now();
-        Task {
+        Issue {
             id: id.into(),
             title: title.into(),
             column: Column::review(),
@@ -2676,7 +2676,7 @@ mod tests {
         let now = Utc::now();
         shelbi_state::save_task(
             "demo",
-            &Task {
+            &Issue {
                 id: "loaded".into(),
                 title: "loaded".into(),
                 column: Column::review(),
@@ -2852,7 +2852,7 @@ mod tests {
         let now = Utc::now();
         shelbi_state::save_task(
             "demo",
-            &Task {
+            &Issue {
                 id: "wip".into(),
                 title: "wip".into(),
                 column: Column::in_progress(),
@@ -3018,7 +3018,7 @@ mod tests {
         for (id, ws) in [("t-a", "alpha"), ("t-b", "bravo")] {
             shelbi_state::save_task(
                 "demo",
-                &Task {
+                &Issue {
                     id: id.into(),
                     title: id.into(),
                     column: Column::in_progress(),
@@ -3203,7 +3203,7 @@ mod tests {
         params.insert("agent".into(), "qa".into());
         shelbi_state::save_task(
             "demo",
-            &Task {
+            &Issue {
                 id: "explicit".into(),
                 title: "explicit".into(),
                 column: Column::in_progress(),
@@ -3225,7 +3225,7 @@ mod tests {
         // delta → no `agent:` in frontmatter, so the default applies
         shelbi_state::save_task(
             "demo",
-            &Task {
+            &Issue {
                 id: "default".into(),
                 title: "default".into(),
                 column: Column::in_progress(),
@@ -3270,7 +3270,7 @@ mod tests {
         let now = Utc::now();
         shelbi_state::save_task(
             "demo",
-            &Task {
+            &Issue {
                 id: "active".into(),
                 title: "active".into(),
                 column: Column::in_progress(),
@@ -3331,7 +3331,7 @@ mod tests {
         ] {
             shelbi_state::save_task(
                 "demo",
-                &Task {
+                &Issue {
                     id: id.into(),
                     title: id.into(),
                     column: Column::in_progress(),
@@ -3393,7 +3393,7 @@ mod tests {
         let now = Utc::now();
         shelbi_state::save_task(
             "demo",
-            &Task {
+            &Issue {
                 id: "t-new".into(),
                 title: "t-new".into(),
                 column: Column::in_progress(),
@@ -3445,7 +3445,7 @@ mod tests {
         let now = Utc::now();
         shelbi_state::save_task(
             "demo",
-            &Task {
+            &Issue {
                 id: "t".into(),
                 title: "t".into(),
                 column: Column::in_progress(),
@@ -3518,7 +3518,7 @@ mod tests {
         let now = Utc::now();
         shelbi_state::save_task(
             "demo",
-            &Task {
+            &Issue {
                 id: "t".into(),
                 title: "t".into(),
                 column: Column::in_progress(),
@@ -3573,7 +3573,7 @@ mod tests {
         let now = Utc::now();
         shelbi_state::save_task(
             "demo",
-            &Task {
+            &Issue {
                 id: "ready".into(),
                 title: "ready".into(),
                 column: Column::review(),
@@ -3702,7 +3702,7 @@ mod tests {
         let now = Utc::now();
         shelbi_state::save_task(
             "demo",
-            &Task {
+            &Issue {
                 id: "ready".into(),
                 title: "Fix login".into(),
                 column: Column::review(),

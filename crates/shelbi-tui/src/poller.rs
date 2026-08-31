@@ -814,7 +814,7 @@ fn board_is_quiescent(project: &Project) -> bool {
 
 /// Pure core of [`board_is_quiescent`]. Split out so unit tests can drive it
 /// with in-memory fixtures without touching disk or `SHELBI_HOME`.
-fn tasks_are_quiescent(tasks: &[shelbi_state::TaskFile]) -> bool {
+fn tasks_are_quiescent(tasks: &[shelbi_state::IssueFile]) -> bool {
     !tasks.iter().any(|tf| {
         // Quiescent = nothing ready/active/in-handoff. Keyed off the
         // semantic category so a workflow that renames these statuses still
@@ -3250,12 +3250,12 @@ fn assigned_review_task_for(project: &Project, workspace_name: &str) -> Option<S
 /// slot isn't serving yet and isn't orphaned, so the caller should observe its
 /// Review agent pane normally (loading / blocked / paused / dialogs).
 ///
-/// - **Task assigned + `ready:` probe passes** → the branch is serving: write
+/// - **Issue assigned + `ready:` probe passes** → the branch is serving: write
 ///   the `.claude/shelbi-review-loaded` marker (so the sidebar promotes it to
 ///   **Ready for Review**, deterministically) and record the `serving`
 ///   sub-state (so `shelbi workspace status` no longer reads "hasn't been
 ///   polled"). Authoritative.
-/// - **Task assigned + probe not yet passing** (booting, or a diff-only review
+/// - **Issue assigned + probe not yet passing** (booting, or a diff-only review
 ///   with no probe) → not authoritative; fall through to observe the pane.
 /// - **No review task assigned** → the slot's task is resolved; reap any
 ///   orphaned server it left listening (see [`maybe_reap_orphaned_review_slot`]).
@@ -3627,7 +3627,7 @@ fn maybe_reconcile_orphaned_pane(
 fn workspace_orphaned_by_board(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
-    tasks: &[shelbi_state::TaskFile],
+    tasks: &[shelbi_state::IssueFile],
 ) -> bool {
     if project.effective_tags(workspace).contains("review") {
         return false;
@@ -3654,7 +3654,7 @@ fn current_task_for(project: &Project, workspace_name: &str) -> Option<String> {
 /// `coding`, `research`, or anything else. A configured workflow that cannot
 /// be loaded fails closed; only the legacy implicit `default` workflow uses
 /// the built-in fallback.
-fn task_is_active(project: &Project, task: &shelbi_core::Task) -> bool {
+fn task_is_active(project: &Project, task: &shelbi_core::Issue) -> bool {
     let workflow = match shelbi_state::load_task_workflow(&project.name, project, task) {
         Ok(workflow) => workflow,
         Err(_)
@@ -4521,7 +4521,7 @@ Intro prose.
     }
 
     use shelbi_core::{
-        AgentRunnerSpec, Host, Machine, MachineKind, OrchestratorSpec, Task, TmuxAddr,
+        AgentRunnerSpec, Host, Machine, MachineKind, OrchestratorSpec, Issue, TmuxAddr,
         WorkspaceSpec,
     };
     use std::collections::BTreeMap;
@@ -4581,9 +4581,9 @@ Intro prose.
         }
     }
 
-    fn in_progress_task(id: &str, workspace: &str) -> Task {
+    fn in_progress_task(id: &str, workspace: &str) -> Issue {
         let now = Utc::now();
-        Task {
+        Issue {
             id: id.into(),
             title: id.into(),
             column: Column::in_progress(),
@@ -6576,22 +6576,22 @@ transitions:
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    fn todo_task(id: &str) -> Task {
+    fn todo_task(id: &str) -> Issue {
         let mut t = in_progress_task(id, "alpha");
         t.column = Column::todo();
         t.assigned_to = None;
         t
     }
 
-    fn review_task(id: &str) -> Task {
+    fn review_task(id: &str) -> Issue {
         let mut t = in_progress_task(id, "alpha");
         t.column = Column::review();
         t.assigned_to = None;
         t
     }
 
-    fn tf(task: Task) -> shelbi_state::TaskFile {
-        shelbi_state::TaskFile {
+    fn tf(task: Issue) -> shelbi_state::IssueFile {
+        shelbi_state::IssueFile {
             task,
             body: String::new(),
         }
@@ -6638,7 +6638,7 @@ transitions:
         project
     }
 
-    fn assigned(mut task: Task, workspace: &str) -> Task {
+    fn assigned(mut task: Issue, workspace: &str) -> Issue {
         task.assigned_to = Some(workspace.into());
         task
     }

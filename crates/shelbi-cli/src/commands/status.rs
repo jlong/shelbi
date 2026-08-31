@@ -794,9 +794,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    fn make_task(id: &str, column: Column) -> shelbi_core::Task {
+    fn make_task(id: &str, column: Column) -> shelbi_core::Issue {
         let now = Utc::now();
-        shelbi_core::Task {
+        shelbi_core::Issue {
             id: id.to_string(),
             title: id.to_string(),
             column,

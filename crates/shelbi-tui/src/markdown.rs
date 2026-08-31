@@ -1,7 +1,7 @@
 //! Inline-markdown rendering for the note bodies shown in the review and
 //! kanban panes.
 //!
-//! Task and review notes are stored as plain markdown strings. The one
+//! Issue and review notes are stored as plain markdown strings. The one
 //! inline construct we surface visually is backtick `code`, painted with a
 //! subtle background so it reads as code against the surrounding prose.
 //!

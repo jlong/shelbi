@@ -92,7 +92,7 @@ pub enum Event {
     /// back-compat parser — `workflow` defaults to
     /// [`DEFAULT_WORKFLOW_NAME`] and the categories are derived from the
     /// canonical 5-status column-to-category map.
-    Task {
+    Issue {
         ts: DateTime<Utc>,
         id: String,
         workflow: String,
@@ -229,7 +229,7 @@ impl SystemEvent {
 impl Event {
     pub fn ts(&self) -> Option<DateTime<Utc>> {
         match self {
-            Event::Task { ts, .. }
+            Event::Issue { ts, .. }
             | Event::Workspace { ts, .. }
             | Event::ZenDryRun { ts, .. }
             | Event::Heartbeat { ts, .. } => Some(*ts),
@@ -283,7 +283,7 @@ impl ActivityFilter {
             return true;
         }
         if self.zen {
-            if let Event::Task { reason, .. } = ev {
+            if let Event::Issue { reason, .. } = ev {
                 if parse_zen_reason(reason).is_some() {
                     return true;
                 }
@@ -631,7 +631,7 @@ impl ActivityApp {
     /// compute "took Xm" for the review handoff at `idx`.
     fn started_at(&self, idx: usize, task_id: &str) -> Option<DateTime<Utc>> {
         self.events[..idx].iter().rev().find_map(|e| match e {
-            Event::Task { id, to, ts, .. } if id == task_id && *to == Column::in_progress() => {
+            Event::Issue { id, to, ts, .. } if id == task_id && *to == Column::in_progress() => {
                 Some(*ts)
             }
             _ => None,
@@ -756,7 +756,7 @@ pub fn parse_event_line(line: &str) -> Event {
                     .get("to_category")
                     .and_then(|s| s.parse::<StatusCategory>().ok())
                     .unwrap_or_else(|| to.category());
-                return Event::Task {
+                return Event::Issue {
                     ts,
                     id,
                     workflow,
@@ -1322,7 +1322,7 @@ fn build_lines(app: &mut ActivityApp, width: usize, now: DateTime<Utc>) -> Vec<L
         // Review handoff (in_progress → review) is the only event
         // that joins to its prior `* -> in_progress` partner. Compute
         // it now while we still have `idx` in scope.
-        let started_at = if let Event::Task { id, to, .. } = &ev {
+        let started_at = if let Event::Issue { id, to, .. } = &ev {
             if *to == Column::review() {
                 app.started_at(idx, id)
             } else {
@@ -1576,7 +1576,7 @@ struct Row {
     /// Dim verb word (finished / is building / merged / …). Empty means the
     /// message is a bare phrase with no verb column.
     verb: String,
-    /// Verb foreground. Task rows keep the dim [`VERB_FG`]; system rows tint
+    /// Verb foreground. Issue rows keep the dim [`VERB_FG`]; system rows tint
     /// it with the event's status color so `unreachable` reads red.
     verb_color: Color,
     /// The task title (or system phrase) — bright fg, wraps, never truncated.
@@ -1620,7 +1620,7 @@ fn render_event(
     started_at: Option<DateTime<Utc>>,
 ) -> Vec<Line<'static>> {
     match ev {
-        Event::Task {
+        Event::Issue {
             ts,
             id,
             from,
@@ -1854,7 +1854,7 @@ fn render_system_event(
 }
 
 /// The dim second line for a system row, when its detail isn't already the
-/// title. Task-scoped rows (dispatch/rebase/detach) show the status token
+/// title. Issue-scoped rows (dispatch/rebase/detach) show the status token
 /// under the task title; others fold their detail into the title.
 fn detail_secondary(sys: &SystemEvent) -> Option<String> {
     match sys.kind {
@@ -2508,7 +2508,7 @@ mod tests {
         let line =
             "2026-06-23T04:19:33.715717+00:00 task=foo todo -> in_progress reason=user:cli:start";
         match parse_event_line(line) {
-            Event::Task {
+            Event::Issue {
                 id,
                 workflow,
                 from,
@@ -2539,7 +2539,7 @@ mod tests {
                     in_progress -> review reason=workspace:ready-marker \
                     from_category=active to_category=handoff";
         match parse_event_line(line) {
-            Event::Task {
+            Event::Issue {
                 id,
                 workflow,
                 from,
@@ -2568,7 +2568,7 @@ mod tests {
         // back to deriving them from the canonical column map.
         let line = "2026-06-23T04:19:33+00:00 task=foo workflow=default todo -> in_progress reason=user:cli";
         match parse_event_line(line) {
-            Event::Task {
+            Event::Issue {
                 workflow,
                 from_category,
                 to_category,
@@ -2593,7 +2593,7 @@ mod tests {
                     reason=orchestrator:auto-dispatch_workspace=alpha_agent=developer \
                     from_category=ready to_category=active";
         match parse_event_line(line) {
-            Event::Task { agent, reason, .. } => {
+            Event::Issue { agent, reason, .. } => {
                 assert_eq!(agent.as_deref(), Some("developer"));
                 // Reason value is preserved verbatim; the agent field is
                 // a parsed convenience layered on top, not a replacement.
@@ -2612,7 +2612,7 @@ mod tests {
                     backlog -> todo reason=user:cli \
                     from_category=backlog to_category=ready";
         match parse_event_line(line) {
-            Event::Task { agent, .. } => assert!(agent.is_none(), "agent: {agent:?}"),
+            Event::Issue { agent, .. } => assert!(agent.is_none(), "agent: {agent:?}"),
             other => panic!("expected task event, got {other:?}"),
         }
     }
@@ -2728,18 +2728,18 @@ mod tests {
     #[test]
     fn parses_project_scoped_task_transition() {
         // The real on-disk shape carries a leading `project=<name>` scope.
-        // It must route to a first-class Task event (the review handoff the
+        // It must route to a first-class Issue event (the review handoff the
         // feed centers on), not fall into Unknown as raw wire syntax.
         let line = "2026-07-22T14:00:00+00:00 project=shelbi task=foo workflow=app \
                     in_progress -> review reason=workspace:ready-marker \
                     from_category=active to_category=handoff";
         match parse_event_line(line) {
-            Event::Task { id, from, to, .. } => {
+            Event::Issue { id, from, to, .. } => {
                 assert_eq!(id, "foo");
                 assert_eq!(from, Column::in_progress());
                 assert_eq!(to, Column::review());
             }
-            other => panic!("expected Task, got {other:?}"),
+            other => panic!("expected Issue, got {other:?}"),
         }
     }
 
@@ -3105,7 +3105,7 @@ mod tests {
         let mut app = ActivityApp::new("demo");
         let ts = Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap();
         let now = ts + chrono::Duration::minutes(1);
-        let ev = Event::Task {
+        let ev = Event::Issue {
             ts,
             id: "demo-task".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
@@ -3139,7 +3139,7 @@ mod tests {
         let mut app = ActivityApp::new("demo");
         let ts = Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap();
         let now = ts + chrono::Duration::minutes(1);
-        let ev = Event::Task {
+        let ev = Event::Issue {
             ts,
             id: "demo-task".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
@@ -3244,7 +3244,7 @@ mod tests {
         let ts = Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap();
         let now = ts + chrono::Duration::minutes(2);
         let started = ts - chrono::Duration::minutes(34);
-        let ev = Event::Task {
+        let ev = Event::Issue {
             ts,
             id: "demo-task".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
@@ -3288,7 +3288,7 @@ mod tests {
         let mut app = ActivityApp::new("demo");
         let ts = Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap();
         let now = ts + chrono::Duration::minutes(5);
-        let ev = Event::Task {
+        let ev = Event::Issue {
             ts,
             id: "demo-task".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
@@ -3452,7 +3452,7 @@ mod tests {
     }
 
     fn task_event(reason: &str) -> Event {
-        Event::Task {
+        Event::Issue {
             ts: Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap(),
             id: "demo-task".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
@@ -3609,7 +3609,7 @@ mod tests {
         // task. Walk the events list backwards from the review event
         // and return the in_progress event's timestamp.
         let mut app = ActivityApp::new("demo");
-        app.events.push(Event::Task {
+        app.events.push(Event::Issue {
             ts: Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap(),
             id: "foo".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
@@ -3622,7 +3622,7 @@ mod tests {
             raw: String::new(),
         });
         // Unrelated task in between — must not affect the lookup.
-        app.events.push(Event::Task {
+        app.events.push(Event::Issue {
             ts: Utc.with_ymd_and_hms(2026, 1, 1, 10, 5, 0).unwrap(),
             id: "bar".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
@@ -3634,7 +3634,7 @@ mod tests {
             to_category: Column::in_progress().category(),
             raw: String::new(),
         });
-        app.events.push(Event::Task {
+        app.events.push(Event::Issue {
             ts: Utc.with_ymd_and_hms(2026, 1, 1, 10, 18, 0).unwrap(),
             id: "foo".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),

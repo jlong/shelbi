@@ -235,7 +235,7 @@ mod tests {
     use ratatui::layout::Rect;
     use shelbi_core::Column;
     use shelbi_state::keymap::load_keymaps;
-    use shelbi_state::TaskFile;
+    use shelbi_state::IssueFile;
 
     /// Load a default `Keymaps` from a temp `$SHELBI_HOME` so a stray
     /// real `~/.shelbi/keys.yaml` can't pollute the test. Caller holds
@@ -281,12 +281,12 @@ mod tests {
         }
     }
 
-    fn task_file(id: &str, column: Column) -> TaskFile {
+    fn task_file(id: &str, column: Column) -> IssueFile {
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-20T10:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        TaskFile {
-            task: shelbi_core::Task {
+        IssueFile {
+            task: shelbi_core::Issue {
                 id: id.to_string(),
                 title: id.to_string(),
                 column,

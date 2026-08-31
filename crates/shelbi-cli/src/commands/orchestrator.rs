@@ -1118,7 +1118,7 @@ mod tests {
     use std::fs;
     use crate::commands::test_support::ENV_LOCK;
     use chrono::Utc;
-    use shelbi_core::{Column, Task};
+    use shelbi_core::{Column, Issue};
     use shelbi_state::{
         append_external_event, append_heartbeat_event, append_send_event, append_task_event,
         append_workspace_event, list_tasks, save_task, WorkspaceState,
@@ -1149,7 +1149,7 @@ mod tests {
 
     fn save_demo_task_in_column(project: &str, id: &str, column: Column) {
         let now = Utc::now();
-        let task = Task {
+        let task = Issue {
             id: id.into(),
             title: id.into(),
             column,

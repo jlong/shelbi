@@ -25,7 +25,7 @@ use std::sync::{
 };
 
 use anyhow::{anyhow, Result};
-use shelbi_core::{Machine, Project, StatusCategory, Task, WorkspaceSpec};
+use shelbi_core::{Machine, Project, StatusCategory, Issue, WorkspaceSpec};
 use shelbi_orchestrator::workspace as orch_workspace;
 
 /// Env var the agent inherits naming the project the worker belongs to.
@@ -523,7 +523,7 @@ fn signal_name(sig: i32) -> String {
 /// Best-effort: returns `None` on read errors (missing project state,
 /// permissions glitch, transient FS) because a missing task just makes the
 /// hooks no-op and skips the worktree recovery — neither breaks the pane.
-pub(super) fn assigned_task_for_workspace(project: &str, workspace: &str) -> Option<Task> {
+pub(super) fn assigned_task_for_workspace(project: &str, workspace: &str) -> Option<Issue> {
     let tasks = shelbi_state::list_tasks(project).ok()?;
     tasks.into_iter().find_map(|tf| {
         let anchors = matches!(
@@ -548,7 +548,7 @@ pub(super) fn assigned_task_for_workspace(project: &str, workspace: &str) -> Opt
 /// Best-effort: returns `None` (worktree recovery is skipped, and the pane
 /// falls back to `$HOME`) when the branch can't be resolved — losing the
 /// recovery is strictly better than aborting the pane.
-fn resolve_task_branch(project: &Project, task: &Task) -> Option<String> {
+fn resolve_task_branch(project: &Project, task: &Issue) -> Option<String> {
     if let Some(branch) = &task.branch {
         return Some(branch.clone());
     }
@@ -1103,7 +1103,7 @@ mod tests {
         let home = fresh_test_home("current-task-lookup");
         std::env::set_var("SHELBI_HOME", &home);
 
-        // Task in InProgress assigned to alpha → that's what the
+        // Issue in InProgress assigned to alpha → that's what the
         // wrapper should pick up.
         let mut task = make_task("feat-x", shelbi_core::Column::in_progress());
         task.assigned_to = Some("alpha".into());
@@ -1608,13 +1608,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Tiny Task fixture for in-test seeding. Mirrors the larger
+    /// Tiny Issue fixture for in-test seeding. Mirrors the larger
     /// `make_task` in shelbi-state — we don't import it because that
     /// helper lives behind `#[cfg(test)]` and isn't reachable across
     /// crates.
-    fn make_task(id: &str, column: shelbi_core::Column) -> shelbi_core::Task {
+    fn make_task(id: &str, column: shelbi_core::Column) -> shelbi_core::Issue {
         let now = chrono::Utc::now();
-        shelbi_core::Task {
+        shelbi_core::Issue {
             id: id.to_string(),
             title: id.replace('-', " "),
             column,

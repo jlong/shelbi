@@ -1045,9 +1045,9 @@ mod tests {
         }
     }
 
-    fn task_on(id: &str, slot: &str, column: Column) -> shelbi_core::Task {
+    fn task_on(id: &str, slot: &str, column: Column) -> shelbi_core::Issue {
         let now = chrono::Utc::now();
-        shelbi_core::Task {
+        shelbi_core::Issue {
             id: id.into(),
             title: id.into(),
             column,

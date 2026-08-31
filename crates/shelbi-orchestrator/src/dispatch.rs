@@ -12,7 +12,7 @@
 //! values, what do I do?" Splitting it out keeps the rule table unit-
 //! testable without spinning up a SHELBI_HOME fixture.
 
-use shelbi_core::{Owner, StatusCategory, Task, WorkflowStatus};
+use shelbi_core::{Owner, StatusCategory, Issue, WorkflowStatus};
 
 /// The outcome of resolving a status against the current automation
 /// state. Either spawn this agent, or skip with a structured reason.
@@ -102,7 +102,7 @@ pub fn resolve_dispatch_agent(status: &WorkflowStatus, zen_on: bool) -> Dispatch
 /// (no stderr diagnostics — there's no human at a prompt) and reads the
 /// project's live Zen state so an `owner: user` active status only pulls in
 /// its agent when Zen is on, matching the declarative dispatch rules.
-pub fn resolve_active_agent(project_name: &str, task: &Task) -> String {
+pub fn resolve_active_agent(project_name: &str, task: &Issue) -> String {
     let workflow = shelbi_state::load_project(project_name)
         .and_then(|project| shelbi_state::load_task_workflow(project_name, &project, task))
         .unwrap_or_else(|_| shelbi_core::default_workflow());
@@ -267,7 +267,7 @@ statuses:
         let prev_home = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", tmp.path());
 
-        let task = Task {
+        let task = Issue {
             id: "fix-login".into(),
             title: "fix-login".into(),
             column: shelbi_core::Column::in_progress(),

@@ -16,7 +16,7 @@ use chrono::Utc;
 use clap::{Args as ClapArgs, Subcommand};
 use shelbi_core::{
     default_workflow, validate_branch, validate_task_id, validate_workflow_name, Column,
-    StatusCategory, Task, Workflow, MAX_TASK_ID_LEN,
+    StatusCategory, Issue, Workflow, MAX_TASK_ID_LEN,
 };
 
 use super::require_project;
@@ -168,7 +168,7 @@ pub struct AddArgs {
     /// `shelbi task edit` to fill it in).
     #[arg(long, short)]
     pub description: Option<String>,
-    /// Task id this task depends on. Repeat for multiple deps:
+    /// Issue id this task depends on. Repeat for multiple deps:
     /// `--depends-on a --depends-on b`. Repeat-flag chosen over
     /// comma-separated to avoid future escaping issues with ids that may
     /// contain commas or shell metacharacters.
@@ -194,7 +194,7 @@ pub struct AddArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct DependsArgs {
-    /// Task whose dependency list is being edited.
+    /// Issue whose dependency list is being edited.
     pub id: String,
     /// Dependency id to add. Repeat for multiple.
     #[arg(long = "add", value_name = "DEP")]
@@ -226,7 +226,7 @@ pub struct PrioArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct EditArgs {
-    /// Task to edit.
+    /// Issue to edit.
     pub id: String,
     /// New display title. The task's `id` stays stable — it is never
     /// re-slugified from a new title.
@@ -432,7 +432,7 @@ fn add_with_stdin(project: &str, args: AddArgs, stdin_body: Option<String>) -> R
         .map_err(|e| anyhow!(e))?
         .len() as u32;
     let now = Utc::now();
-    let task = Task {
+    let task = Issue {
         id: id.clone(),
         title: args.title.clone(),
         column: column.clone(),
@@ -502,7 +502,7 @@ fn list(
     let project_yaml = shelbi_state::load_project(project).ok();
     // String-compare against the project-aware resolver so a filter of the
     // configured default matches tasks with no `workflow:` field.
-    let matches_workflow = |task: &Task| -> bool {
+    let matches_workflow = |task: &Issue| -> bool {
         match workflow_filter {
             Some(name) => {
                 project_yaml
@@ -825,7 +825,7 @@ fn move_to(
 /// path already swallows this load — kept working. Falling back mirrors
 /// the poller's behavior; the warning keeps a genuinely misconfigured
 /// workflow loud.
-fn resolve_task_workflow(project: &str, task: &Task) -> Result<Workflow> {
+fn resolve_task_workflow(project: &str, task: &Issue) -> Result<Workflow> {
     let project_yaml = shelbi_state::load_project(project).ok();
     let name = project_yaml
         .as_ref()
@@ -890,7 +890,7 @@ fn resolve_move_target(workflow: &Workflow, to: &str) -> Result<Column> {
 /// set a workspace's effective tags must be a superset of to take this task
 /// (see the tag-routing check in [`start`]). Empty when the workflow has no
 /// active status or that status declares no `tags:`.
-fn required_active_tags(project: &str, task: &Task) -> Result<std::collections::BTreeSet<String>> {
+fn required_active_tags(project: &str, task: &Issue) -> Result<std::collections::BTreeSet<String>> {
     use shelbi_core::StatusCategory;
     let workflow = resolve_task_workflow(project, task)?;
     Ok(workflow
@@ -901,7 +901,7 @@ fn required_active_tags(project: &str, task: &Task) -> Result<std::collections::
         .unwrap_or_default())
 }
 
-fn resolve_active_agent_for_dispatch(project: &str, task: &Task) -> Result<String> {
+fn resolve_active_agent_for_dispatch(project: &str, task: &Issue) -> Result<String> {
     use shelbi_core::StatusCategory;
     use shelbi_orchestrator::dispatch::{resolve_dispatch_agent, DispatchDecision};
     use shelbi_state::DEVELOPER_AGENT;
@@ -1384,7 +1384,7 @@ fn start(
 /// spawn itself failed. Re-saves the pre-move frontmatter and renumbers
 /// both the column we bumped the card out of and `in_progress` (where the
 /// aborted card was briefly appended) so priorities stay contiguous.
-fn rollback_start(project: &str, original: &Task, body: &str, prev_column: Column) -> Result<()> {
+fn rollback_start(project: &str, original: &Issue, body: &str, prev_column: Column) -> Result<()> {
     shelbi_state::save_task(project, original, body).map_err(|e| anyhow!(e))?;
     if prev_column != Column::in_progress() {
         shelbi_state::renumber_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
@@ -1813,7 +1813,7 @@ fn resolve_body_edit(
 /// Whether the task's current column is an `active`-category status under its
 /// workflow (e.g. `in_progress`). A body/field edit to such a task won't reach
 /// the already-running worker until it is re-dispatched.
-fn task_column_is_active(project: &str, task: &Task) -> bool {
+fn task_column_is_active(project: &str, task: &Issue) -> bool {
     // Stock status ids carry their category directly, so a routine edit on a
     // project without materialized workflow files doesn't emit a spurious
     // workflow-load warning just to compute this hint.
@@ -2012,9 +2012,9 @@ mod tests {
         p
     }
 
-    fn task_in(column: Column, id: &str) -> Task {
+    fn task_in(column: Column, id: &str) -> Issue {
         let now = Utc::now();
-        Task {
+        Issue {
             id: id.into(),
             title: id.replace('-', " "),
             column,
@@ -2363,7 +2363,7 @@ statuses:
         assert!(valid.contains("done"), "{err}");
         assert!(!valid.contains("review"), "{err}");
 
-        // Task must stay put — no event written.
+        // Issue must stay put — no event written.
         let path = shelbi_state::events_log_path().unwrap();
         assert!(
             !path.exists() || std::fs::read_to_string(&path).unwrap().is_empty(),
@@ -2426,7 +2426,7 @@ statuses:
 
         // A status absent from this workflow (`review`) still errors, and
         // the valid-status list names the declared ids (never the undeclared
-        // target). Task stays put.
+        // target). Issue stays put.
         let err = move_to("p", "t", "review", None, false)
             .unwrap_err()
             .to_string();
@@ -2638,7 +2638,7 @@ transitions:
     #[test]
     fn list_workflow_default_matches_tasks_without_explicit_workflow() {
         // `--workflow default` must match tasks whose frontmatter omits
-        // `workflow:` entirely — that's the contract `Task::workflow_or_default`
+        // `workflow:` entirely — that's the contract `Issue::workflow_or_default`
         // promises and the contract callers (orchestrator, future TUI
         // filter) rely on. Verified by exercising the matcher closure
         // directly through the filter_workflow_name helper-equivalent
@@ -3419,11 +3419,11 @@ statuses:
         assert!(log.contains(" edited "), "log: {log}");
         assert!(log.contains("fields=title"), "log: {log}");
         assert!(log.contains("reason=fixing_typo"), "log: {log}");
-        // Classified as a Task event so the feed/poller observe it.
+        // Classified as a Issue event so the feed/poller observe it.
         let line = log.lines().next().unwrap();
         assert_eq!(
             shelbi_state::EventEnvelope::from_log_line(line).kind,
-            shelbi_state::EventKind::Task,
+            shelbi_state::EventKind::Issue,
         );
 
         std::env::remove_var("SHELBI_HOME");

@@ -1,4 +1,4 @@
-//! Task branch-name resolution.
+//! Issue branch-name resolution.
 //!
 //! Explicit task `branch:` wins. Otherwise Shelbi prefers a full `git.branch`
 //! template (rendered against `{{github_user}}`, `{{id}}`, and task params),
@@ -10,7 +10,7 @@
 use std::process::Command;
 use std::sync::OnceLock;
 
-use shelbi_core::{substitute_placeholders, validate_branch, Error, Project, Result, Task, Workflow};
+use shelbi_core::{substitute_placeholders, validate_branch, Error, Project, Result, Issue, Workflow};
 
 const FALLBACK_BRANCH_PREFIX: &str = "user";
 
@@ -19,7 +19,7 @@ static GITHUB_LOGIN: OnceLock<Option<String>> = OnceLock::new();
 pub fn branch_name_for_task(
     project: &Project,
     workflow: Option<&Workflow>,
-    task: &Task,
+    task: &Issue,
 ) -> Result<String> {
     branch_name_for_task_with_login(project, workflow, task, github_login)
 }
@@ -27,7 +27,7 @@ pub fn branch_name_for_task(
 fn branch_name_for_task_with_login<F>(
     project: &Project,
     workflow: Option<&Workflow>,
-    task: &Task,
+    task: &Issue,
     login: F,
 ) -> Result<String>
 where
@@ -197,9 +197,9 @@ mod tests {
         }
     }
 
-    fn task(id: &str, branch: Option<&str>, workflow: Option<&str>) -> Task {
+    fn task(id: &str, branch: Option<&str>, workflow: Option<&str>) -> Issue {
         let now = Utc::now();
-        Task {
+        Issue {
             id: id.into(),
             title: id.into(),
             column: Column::todo(),
