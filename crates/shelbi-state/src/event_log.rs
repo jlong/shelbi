@@ -103,6 +103,7 @@ pub enum EventKind {
     Send,
     Rebase,
     Ci,
+    Comment,
     Zen,
     ZenDryrun,
     Supervision,
@@ -131,6 +132,12 @@ impl EventKind {
             // ` ci ` discriminator before the broad `task=` branch below or a
             // CI verdict would be mislabeled as an ordinary task transition.
             EventKind::Ci
+        } else if body.contains(" comment ") {
+            // An issue-comment line carries `task=` metadata, so match its
+            // ` comment ` discriminator before the broad `task=` branch below or
+            // a new-comment notice would be mislabeled as an ordinary task
+            // transition.
+            EventKind::Comment
         } else if body.contains(" task=") || body.starts_with("task=") {
             EventKind::Task
         } else if body.contains(" workspace=") || body.starts_with("workspace=") {
@@ -182,6 +189,21 @@ pub const READY_MARKER_HANDOFF_CAUSE: &str = "workspace:ready-marker";
 /// GitHub-merge reconcile apart from a `user:review` accept. Emitted by
 /// [`append_github_merge_reconcile_event`].
 pub const GITHUB_MERGE_RECONCILE_CAUSE: &str = "poller:github-merge-reconcile";
+
+/// The `reason=` token stamped on a status transition the hub poller emits when
+/// [`crate::IssueStore::poll_changes`] reports that a human moved an issue on the
+/// tracker itself — closing it on github.com (→ done), reopening or relabeling it
+/// (→ the matching status). Distinct from every worker/human/merge cause so the
+/// activity feed and the orchestrator's drain can tell an *external* reconcile
+/// (someone edited the issue outside shelbi) apart from a shelbi-driven move.
+/// Emitted via [`append_task_event`] from the poller's issue-reconcile pass.
+pub const EXTERNAL_ISSUE_RECONCILE_CAUSE: &str = "poller:issue-reconcile";
+
+/// The `reason=` token stamped on the notice the hub poller emits when
+/// [`crate::IssueStore::poll_changes`] surfaces a new issue comment added on the
+/// tracker (plan D4 — "poll_changes surfaces new comments into the event log so
+/// the orchestrator is aware"). Emitted via [`append_issue_comment_event`].
+pub const EXTERNAL_ISSUE_COMMENT_CAUSE: &str = "poller:issue-comment";
 
 /// Every historical `reason=` token that has meant the ready-marker handoff.
 /// The canonical spelling changed over time
@@ -1409,6 +1431,43 @@ pub fn append_ci_event(
     let head_sha = sanitize_field(head_sha);
     let body = format!(
         "project={project} task={task_id} ci pr={pr} check={check} conclusion={conclusion} head_sha={head_sha}"
+    );
+    let line = format!("{ts} {body}");
+    match append_event_line(&line) {
+        Ok(()) => Ok(()),
+        Err(e) if is_permission_denied(&e) => emit_event_body(&body),
+        Err(e) => Err(e),
+    }
+}
+
+/// Append a new-issue-comment notice to `~/.shelbi/events.log`:
+///
+/// ```text
+/// <rfc3339> project=<p> task=<id> comment id=<comment-id> author=<login> reason=poller:issue-comment
+/// ```
+///
+/// Emitted by the hub poller's issue-reconcile pass when
+/// [`crate::IssueStore::poll_changes`] surfaces a comment added on the tracker
+/// itself (plan D4 — comments are first-class, and a new one must reach the
+/// orchestrator). The leading `project=<name>` scope is load-bearing for the
+/// same reason every other line carries it — `events.log` is hub-global, so each
+/// orchestrator filters to its own project. The ` comment ` keyword sits between
+/// the `task=` scope and the comment detail so [`EventKind::from_body`]
+/// classifies the line as [`EventKind::Comment`] rather than a plain task
+/// transition. `author` folds to `-` when GitHub reported none.
+pub fn append_issue_comment_event(
+    project: &str,
+    task_id: &str,
+    comment_id: &str,
+    author: Option<&str>,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let task_id = sanitize_field(task_id);
+    let comment_id = sanitize_field(comment_id);
+    let author = sanitize_field(author.unwrap_or("-"));
+    let body = format!(
+        "project={project} task={task_id} comment id={comment_id} author={author} reason={EXTERNAL_ISSUE_COMMENT_CAUSE}"
     );
     let line = format!("{ts} {body}");
     match append_event_line(&line) {
@@ -2680,6 +2739,41 @@ mod tests {
             "2026-07-06T12:04:00+00:00 project=demo task=fix-login ci pr=42 check=build conclusion=failure head_sha=deadbeef",
         );
         assert_eq!(red.kind, EventKind::Ci);
+    }
+
+    #[test]
+    fn event_envelope_classifies_issue_comment_not_as_a_task_transition() {
+        // An issue-comment notice carries `task=` metadata; its ` comment `
+        // discriminator must win over the broad `task=` branch so a new comment
+        // classifies as its own kind rather than a task move.
+        let env = EventEnvelope::from_log_line(
+            "2026-08-31T09:00:00+00:00 project=demo task=fix-login comment id=555 author=alice reason=poller:issue-comment",
+        );
+        assert_eq!(env.kind, EventKind::Comment);
+        assert_eq!(env.project.as_deref(), Some("demo"));
+        assert_eq!(
+            serde_json::to_value(&env).unwrap()["kind"],
+            serde_json::json!("comment")
+        );
+    }
+
+    #[test]
+    fn issue_comment_event_writes_a_classifiable_line() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_issue_comment_event("demo", "fix-login", "555", Some("alice")).unwrap();
+        let body = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        assert!(body.contains("project=demo task=fix-login comment id=555 author=alice"));
+        assert!(body.contains(&format!("reason={EXTERNAL_ISSUE_COMMENT_CAUSE}")));
+
+        // A missing author folds to `-`.
+        append_issue_comment_event("demo", "fix-login", "556", None).unwrap();
+        let body = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        assert!(body.contains("comment id=556 author=-"));
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

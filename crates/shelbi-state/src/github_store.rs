@@ -402,7 +402,21 @@ impl IssueStore for GitHubStore {
         // cursor) surface as upserts, and comments on those same freshly-touched
         // issues (created past the cursor) surface as CommentAdded.
         let path = format!("repos/{}/issues", self.repo);
-        let issues = self.api_issues(&path, &["-f", "state=all", "-f", "per_page=100"])?;
+        // On a warm cursor, scope the list to issues touched at/after the
+        // watermark (`since=`, plan D3 — "GitHub supports this cheaply"). On a
+        // quiescent board this transfers next to nothing, so the pass stays well
+        // inside the `gh` rate budget instead of re-listing the whole repo every
+        // tick. The cold first poll has no watermark and lists the board once to
+        // seed the high-water mark. `since=` is *inclusive* (updated_at >= w),
+        // but the strictly-greater filter below drops an issue sitting exactly at
+        // the watermark, so a change is never surfaced twice across polls.
+        let since_param = since.watermark().map(|w| format!("since={}", w.to_rfc3339()));
+        let mut extra: Vec<&str> = vec!["-f", "state=all", "-f", "per_page=100"];
+        if let Some(param) = since_param.as_deref() {
+            extra.push("-f");
+            extra.push(param);
+        }
+        let issues = self.api_issues(&path, &extra)?;
 
         let mut changes = Vec::new();
         let mut high = since.watermark();
@@ -427,7 +441,13 @@ impl IssueStore for GitHubStore {
         // only be on one of those. Only meaningful once past `start`.
         if let Some(w) = since.watermark() {
             for (issue_id, number) in touched {
-                for comment in self.comments_for_number(number)? {
+                // Scope the per-issue comment fetch with the same `since=`
+                // watermark so we only pull comments GitHub touched since the
+                // last poll (plan D3 "comments `since=`"), then keep only the
+                // ones genuinely *created* past the cursor — an edit to a
+                // pre-cursor comment is returned by `since=` but is not a new
+                // comment, so the `created_at > w` filter drops it.
+                for comment in self.comments_for_number_since(number, Some(w))? {
                     if comment.created_at > w {
                         high = Some(high.map_or(comment.created_at, |h| h.max(comment.created_at)));
                         changes.push(IssueChange::CommentAdded {
@@ -479,9 +499,30 @@ impl GitHubStore {
 
     /// Live-read the comments on a GitHub issue by its number, oldest first.
     fn comments_for_number(&self, number: i64) -> Result<Vec<IssueComment>> {
+        self.comments_for_number_since(number, None)
+    }
+
+    /// Like [`GitHubStore::comments_for_number`] but, when `since` is set, scopes
+    /// the fetch to comments GitHub touched at/after that watermark (`since=`).
+    /// The change-detection path passes the poll watermark so a quiescent issue
+    /// transfers no comment bodies; `list_comments` passes `None` for the full
+    /// history. `since=` filters on the comment's `updated_at`, so an edited
+    /// pre-watermark comment can still come back — the caller keeps only those
+    /// whose `created_at` is genuinely past the cursor.
+    fn comments_for_number_since(
+        &self,
+        number: i64,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<IssueComment>> {
         let path = format!("repos/{}/issues/{number}/comments", self.repo);
+        let since_param = since.map(|w| format!("since={}", w.to_rfc3339()));
         let mut args: Vec<&str> = vec!["api", "-X", "GET", &path, "--paginate"];
-        args.extend_from_slice(&["-f", "per_page=100", "--jq", ".[]"]);
+        args.extend_from_slice(&["-f", "per_page=100"]);
+        if let Some(param) = since_param.as_deref() {
+            args.push("-f");
+            args.push(param);
+        }
+        args.extend_from_slice(&["--jq", ".[]"]);
         let out = (self.gh)(&args)?;
         let raw: Vec<GhComment> = parse_jsonl(&out)?;
         let mut comments: Vec<IssueComment> = raw.into_iter().map(GhComment::into_comment).collect();
@@ -1204,6 +1245,65 @@ mod tests {
         assert_eq!(comment_adds.len(), 1);
         assert_eq!(comment_adds[0].0, "t");
         assert_eq!(comment_adds[0].1.body, "new comment");
+    }
+
+    #[test]
+    fn poll_changes_scopes_the_query_with_the_since_watermark() {
+        // A recording runner captures every `gh` call so we can assert the
+        // `since=` watermark is (a) absent on a cold first poll and (b) present
+        // on both the issues query and the per-touched-issue comments query on a
+        // warm poll — the rate-limit-respecting `since=` scoping (plan D3).
+        let issues = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let comments = r#"{"id":100,"body":"new comment","created_at":"2026-08-01T18:00:00Z","user":{"login":"alice"}}"#;
+        let calls: Calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+            Ok(if path.contains("/comments") { comments } else { issues }.to_string())
+        });
+
+        // Cold poll: no watermark, so no `since=` scoping — the whole board is
+        // listed once to seed the high-water mark.
+        let (_changes, cursor) = store.poll_changes(&Cursor::start()).unwrap();
+        {
+            let calls = calls.lock().unwrap();
+            let issues_call = calls
+                .iter()
+                .find(|c| c.contains("repos/owner/repo/issues") && !c.contains("/comments"))
+                .expect("issues list call");
+            assert!(!issues_call.contains("since="), "cold poll must not scope: {issues_call}");
+        }
+
+        // Warm poll against an older cursor: the issue's updated_at (2026-08-02)
+        // is past it, so it surfaces — and both the issues query and the comments
+        // query carry the exact `since=<watermark>` param.
+        calls.lock().unwrap().clear();
+        let older = Cursor::at("2026-08-01T12:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        let (_changes, _next) = store.poll_changes(&older).unwrap();
+        let calls = calls.lock().unwrap();
+        let issues_call = calls
+            .iter()
+            .find(|c| c.contains("repos/owner/repo/issues") && !c.contains("/comments"))
+            .expect("issues list call");
+        assert!(
+            issues_call.contains("since=2026-08-01T12:00:00+00:00"),
+            "warm poll must scope issues: {issues_call}"
+        );
+        let comments_call = calls
+            .iter()
+            .find(|c| c.contains("/comments"))
+            .expect("comments call");
+        assert!(
+            comments_call.contains("since=2026-08-01T12:00:00+00:00"),
+            "warm poll must scope comments: {comments_call}"
+        );
+
+        // The cursor advanced to the issue's updated_at high-water mark.
+        assert_eq!(
+            cursor.watermark(),
+            Some("2026-08-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
+        );
     }
 
     // --- write path ----------------------------------------------------------
