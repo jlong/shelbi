@@ -14,6 +14,7 @@ pub mod guard;
 pub mod hub_version;
 pub mod init;
 pub mod issue;
+pub mod issue_store;
 pub mod list;
 pub mod merge;
 pub mod message;
