@@ -98,12 +98,12 @@ fn busy_workspaces(active: &[ActiveWorkspace]) -> Vec<&ActiveWorkspace> {
 /// the safe default is to leave the running agents alone.
 fn confirm_teardown(project: &str, busy: &[&ActiveWorkspace]) -> Result<bool> {
     eprintln!(
-        "shelbi: {} workspace{} in project '{project}' still hold an active task:",
+        "shelbi: {} workspace{} in project '{project}' still hold an active issue:",
         busy.len(),
         if busy.len() == 1 { "" } else { "s" }
     );
     for w in busy {
-        eprintln!("  · {} ({}) — task {}", w.name, w.state, w.task);
+        eprintln!("  · {} ({}) — issue {}", w.name, w.state, w.task);
     }
     eprintln!(
         "Quitting closes their panes. Worktrees and branches are left intact, so the work \
