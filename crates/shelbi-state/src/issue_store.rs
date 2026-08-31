@@ -42,10 +42,10 @@ use crate::IssueFile;
 ///
 /// The config is validated first, so a `github` backend with a missing or
 /// malformed `repo` surfaces a field-named [`Error::InvalidIssueTracker`]
-/// before we ever try to build a store. Only `file_system` has a live backend
-/// today; `github` / `jira` / `linear` validate but resolve to a typed
-/// [`Error::IssueTrackerUnimplemented`] so a caller can tell "not built yet"
-/// apart from "you configured it wrong". See
+/// before we ever try to build a store. `file_system` (the markdown board) and
+/// `github` (issues in `owner/repo`) both have live backends; `jira` / `linear`
+/// validate but resolve to a typed [`Error::IssueTrackerUnimplemented`] so a
+/// caller can tell "not built yet" apart from "you configured it wrong". See
 /// `Plans/pluggable-task-stores.md` §2 + D1.
 pub fn resolve_issue_store(
     project: &str,
@@ -54,6 +54,18 @@ pub fn resolve_issue_store(
     cfg.validate()?;
     match cfg.backend {
         IssueTrackerBackend::FileSystem => Ok(Box::new(FileSystemStore::new(project))),
+        IssueTrackerBackend::Github => {
+            // `validate()` above guarantees a well-formed `github.repo`, so the
+            // unwrap is unreachable — kept as a typed error rather than a panic.
+            let repo = cfg
+                .github
+                .as_ref()
+                .map(|g| g.repo.clone())
+                .ok_or_else(|| {
+                    Error::InvalidIssueTracker("issue_tracker.github.repo is required".into())
+                })?;
+            Ok(Box::new(crate::GitHubStore::new(project, repo)))
+        }
         other => Err(Error::IssueTrackerUnimplemented(other.to_string())),
     }
 }
@@ -864,9 +876,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_github_is_unimplemented_but_valid_config_is_typed() {
+    fn resolve_github_returns_a_live_store() {
         use shelbi_core::{GithubConnection, IssueTrackerConfig};
 
+        // A valid github config now resolves to a live [`GitHubStore`] (the
+        // write path landed) rather than a typed "unimplemented" error.
         let cfg = IssueTrackerConfig {
             backend: IssueTrackerBackend::Github,
             github: Some(GithubConnection {
@@ -874,8 +888,24 @@ mod tests {
             }),
             ..Default::default()
         };
+        // No network / gh call happens at construction — the store is a cheap
+        // handle that resolves auth lazily per API call.
+        assert!(resolve_issue_store("p", &cfg).is_ok());
+    }
+
+    #[test]
+    fn resolve_jira_is_unimplemented_but_valid_config_is_typed() {
+        use shelbi_core::{IssueTrackerConfig, JiraConnection};
+
+        let cfg = IssueTrackerConfig {
+            backend: IssueTrackerBackend::Jira,
+            jira: Some(JiraConnection {
+                project: "PROJ".into(),
+            }),
+            ..Default::default()
+        };
         match resolve_issue_store("p", &cfg) {
-            Err(Error::IssueTrackerUnimplemented(b)) => assert_eq!(b, "github"),
+            Err(Error::IssueTrackerUnimplemented(b)) => assert_eq!(b, "jira"),
             Err(other) => panic!("expected IssueTrackerUnimplemented, got {other:?}"),
             Ok(_) => panic!("expected an error, got a live store"),
         }

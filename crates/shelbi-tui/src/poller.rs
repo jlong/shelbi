@@ -2091,14 +2091,29 @@ fn maybe_apply_ready_handoff(
                 }
             }
 
-            match shelbi_state::move_task(&project.name, &task_id, to_column) {
-                Ok(Some((from, to, workflow))) => {
+            // Route the status advance through the issue-tracker seam so the
+            // handoff flips the board wherever it lives: for the filesystem
+            // backend this is exactly `move_task` (which `move_status` wraps);
+            // for a `github` board it swaps the issue's `shelbi:status/*` label
+            // to the review status (plan §3 — "the poller flips the issue's
+            // label"). `move_status` returns `Some` only on an actual change,
+            // matching the old `move_task` contract.
+            let advance = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+                .and_then(|store| {
+                    store.move_status(
+                        &task_id,
+                        &to_column,
+                        shelbi_state::READY_MARKER_HANDOFF_CAUSE,
+                    )
+                });
+            match advance {
+                Ok(Some(mv)) => {
                     if let Err(e) = shelbi_state::append_task_event(
                         &project.name,
                         &task_id,
-                        &workflow,
-                        from,
-                        to,
+                        &mv.workflow,
+                        mv.from,
+                        mv.to,
                         shelbi_state::READY_MARKER_HANDOFF_CAUSE,
                     ) {
                         tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_task_event failed");
@@ -2107,7 +2122,7 @@ fn maybe_apply_ready_handoff(
                 Ok(None) => {}
                 Err(e) => {
                     // Leave the marker in place so we retry on the next tick.
-                    tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "move_task on ready handoff failed");
+                    tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "status advance on ready handoff failed");
                     return;
                 }
             }
