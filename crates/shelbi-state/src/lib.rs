@@ -23,6 +23,7 @@ mod agent_workspaces;
 mod event_log;
 mod hub_config;
 mod hub_version;
+pub mod issue_auth;
 pub mod issue_store;
 pub mod keymap;
 mod migrate;
@@ -40,6 +41,9 @@ pub use migrate::{
     append_gitignore_snippet, apply_migration_plan, gitignore_already_has_snippet,
     plan_in_repo_migration, MigrationAction, MigrationPlan, IN_REPO_CONFIG_DIRS,
     IN_REPO_CONFIG_FILES, IN_REPO_GITIGNORE_SNIPPET,
+};
+pub use issue_auth::{
+    resolve_github_token, token_file_path, SecretToken, TokenSource,
 };
 pub use issue_store::{
     resolve_issue_store, Cursor, FileSystemStore, IssueChange, IssueComment, IssueFields,
