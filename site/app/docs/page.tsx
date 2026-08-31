@@ -67,9 +67,9 @@ const concepts = [
 
 const cli = [
   {
-    title: "shelbi task",
-    href: "/docs/cli/task",
-    body: "Add, list, move, assign, and start tasks on the board.",
+    title: "shelbi issue",
+    href: "/docs/cli/issue",
+    body: "Add, list, move, assign, and start issues on the board.",
   },
   {
     title: "shelbi workspace",

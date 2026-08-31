@@ -1,12 +1,12 @@
 ---
 title: Run your first task
 order: 13
-summary: Open the TUI, add a task, watch a workspace pick it up, and review the diff.
+summary: Open the TUI, add an issue, watch a workspace pick it up, and review the diff.
 ---
 
-<CopyPromptBanner prompt="Walk me through running my first Shelbi task. Open the TUI with `shelbi`, add a task to the backlog (through the orchestrator chat or `shelbi task add`), promote it to todo so the orchestrator dispatches it to a free workspace, then review the resulting branch and merge it. Explain the five columns — Backlog → Todo → In Progress → Review → Done — and the workspace badges as we go." />
+<CopyPromptBanner prompt="Walk me through running my first Shelbi issue. Open the TUI with `shelbi`, add an issue to the backlog (through the orchestrator chat or `shelbi issue add`), promote it to todo so the orchestrator dispatches it to a free workspace, then review the resulting branch and merge it. Explain the five columns — Backlog → Todo → In Progress → Review → Done — and the workspace badges as we go." />
 
-A task moves through five columns: **Backlog → Todo → In Progress →
+An issue moves through five columns: **Backlog → Todo → In Progress →
 Review → Done**. You drive the ends: what lands in the backlog and what
 gets accepted out of review. The orchestrator drives the middle: the
 moment a card hits todo, it picks a free workspace and starts it.
@@ -31,17 +31,17 @@ shelbi -p myapp
 ```
 
 The TUI is two panes. A borderless sidebar on the left lists the project
-name, the nav (Chat, Tasks, Activity), your declared workspaces, and any
-tasks waiting on review. The right pane is a real tmux pane: the
+name, the nav (Chat, Issues, Activity), your declared workspaces, and any
+issues waiting on review. The right pane is a real tmux pane: the
 orchestrator agent by default, or one of the built-in views (Chat /
-Tasks / Activity) when you switch.
+Issues / Activity) when you switch.
 
 `Ctrl+P` opens a fuzzy command palette as a tmux popup. Use it to
 switch projects, jump to a workspace pane, or swap the right pane to
 another view. `Enter` on a sidebar row activates it: focus a workspace,
-open a review, switch to the Tasks board.
+open a review, switch to the Issues board.
 
-## Add a task
+## Add an issue
 
 You have two ways in: through the orchestrator (the easy one) or
 directly via the CLI.
@@ -59,7 +59,7 @@ Orchestrator: ✓ added to backlog as `fix-login-bug-on-safari`.
               branch: shelbi/fix-login-bug-on-safari
 ```
 
-The orchestrator creates a markdown task card in the **backlog**
+The orchestrator creates a markdown issue card in the **backlog**
 column. It won't auto-promote. The backlog is *your* triage queue.
 
 ### Via the CLI
@@ -67,13 +67,13 @@ column. It won't auto-promote. The backlog is *your* triage queue.
 Same end result, no chat:
 
 ```bash
-shelbi task add "Fix login bug on Safari"
+shelbi issue add "Fix login bug on Safari"
 ```
 
 Flags you'll reach for occasionally:
 
 ```bash
-shelbi task add "Fix login bug" \
+shelbi issue add "Fix login bug" \
   --id fix-login \
   --status todo \
   --description "Cookie domain mismatch breaks the SSO redirect." \
@@ -83,7 +83,7 @@ shelbi task add "Fix login bug" \
 
 - `--id` — override the auto-slug.
 - `--status` — drop straight into todo (or any other column).
-- `--description` — fill in the task body now instead of editing later.
+- `--description` — fill in the issue body now instead of editing later.
 - `--depends-on` — repeat for multiple dependencies. The orchestrator
   skips a todo card until everything it depends on is in `done`.
 - `--prefers-machine` — soft hint; the orchestrator routes to a free
@@ -91,7 +91,7 @@ shelbi task add "Fix login bug" \
 
 ### Via the kanban view
 
-Press `Ctrl+P` and pick "Tasks", or hit `Enter` on the **Tasks**
+Press `Ctrl+P` and pick "Issues", or hit `Enter` on the **Issues**
 sidebar nav. You land on the 5-column Kanban board. Keys:
 
 | Key | Action |
@@ -104,7 +104,7 @@ sidebar nav. You land on the 5-column Kanban board. Keys:
 | `r` | Refresh |
 | `Esc` / `q` | Close an open card |
 
-Adding a task from the kanban view goes through the orchestrator, so it's
+Adding an issue from the kanban view goes through the orchestrator, so it's
 faster to just talk to it in chat.
 
 ## Promote to todo, watch the auto-dispatch
@@ -127,12 +127,12 @@ free workspace in YAML declaration order (honoring `prefers_machine` if
 set), and runs:
 
 ```bash
-shelbi task start fix-login-bug-on-safari --workspace delta
+shelbi issue start fix-login-bug-on-safari --workspace delta
 ```
 
 That moves the card to **In Progress**, creates the branch
 `shelbi/fix-login-bug-on-safari` in the workspace's worktree, and feeds
-the task prompt into the workspace's agent CLI. The sidebar badge next to
+the issue prompt into the workspace's agent CLI. The sidebar badge next to
 `delta` flips from `·` (idle) to `⏵` (working).
 
 Jump in any time. `Enter` on the workspace's sidebar row drops you straight
@@ -183,7 +183,7 @@ into its pane to watch the run live.
 
 | Badge | Workspace state |
 |---|---|
-| `·` | idle — no task assigned |
+| `·` | idle — no issue assigned |
 | `⏵` | working — agent actively running a turn |
 | `?` | awaiting input — finished a turn, sitting at the prompt |
 | `⚠` | awaiting permission — showing a permission dialog |
@@ -217,7 +217,7 @@ through the app — tag a slot for review and let the review status route the
 branch onto it. See [set up review
 workspaces](/docs/guides/getting-started/review-workspaces).
 
-## Accept the task
+## Accept the issue
 
 Two flavors of accept.
 
@@ -239,7 +239,7 @@ review. You confirm the merge landed and move the card yourself, with `L`
 in the kanban view from **Review**, or:
 
 ```bash
-shelbi task move fix-login-bug-on-safari --to done
+shelbi issue move fix-login-bug-on-safari --to done
 ```
 
 The workspace is already free at that point (the review handoff flipped
@@ -248,7 +248,7 @@ todo card on its own.
 
 <Callout type="note" title="You own the Review → Done move">
 
-The orchestrator squash-merges on request but never marks a task Done for
+The orchestrator squash-merges on request but never marks an issue Done for
 you. Confirming the merge landed and moving the card out of Review is the
 human checkpoint, until you hand that step off to
 [Zen Mode](/docs/guides/getting-started/enable-zen-mode).
@@ -257,10 +257,10 @@ human checkpoint, until you hand that step off to
 
 ## What just happened
 
-You added a task, promoted it, watched a workspace pick it up, reviewed
+You added an issue, promoted it, watched a workspace pick it up, reviewed
 the result, and merged it. The same loop (backlog → todo → in progress
 → review → done) is the whole product surface. Everything else is
-volume: more tasks at once, more workspaces, more machines.
+volume: more issues at once, more workspaces, more machines.
 
 ## Next
 

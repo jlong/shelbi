@@ -11,7 +11,7 @@ what comes in, run it through checks, and merge only what clears sign-off.
 It's the model most open-source projects run.
 
 Shelbi models the **maintainer's side**. Because the branch lives on
-someone else's fork, Shelbi doesn't cut branches or push here. Each task
+someone else's fork, Shelbi doesn't cut branches or push here. Each issue
 carries the fork's PR branch in [`branch:`](/docs/guides/getting-started/workflows#the-branch-task-field),
 and the workflow is mostly about the gate: a `handoff` sign-off status
 that's `owner: user` so nothing reaches `main` without a human (or a
@@ -144,7 +144,7 @@ Two side-effects that the [feature-branch](/docs/guides/understanding-workflows/
 model uses are deliberately *absent* here:
 
 - **No `open_pr`.** The contributor already opened the PR from their fork.
-  The task just tracks it. Pre-fill `branch:` with the PR's head ref so
+  The issue just tracks it. Pre-fill `branch:` with the PR's head ref so
   `merge` and `close_pr` act on the right PR.
 - **No `delete_branch`.** Shelbi can't delete a branch it doesn't own. The
   fork keeps its branch whether the PR merges or is declined.
@@ -188,6 +188,6 @@ the gate for code that arrived from outside.
 - [Agents](/docs/concepts/agents) — how to author the `reviewer` role the
   `InReview` status dispatches to.
 - [Workflows: the `branch:` task field](/docs/guides/getting-started/workflows#the-branch-task-field)
-  — pointing a task at an existing fork PR branch instead of cutting one.
+  — pointing an issue at an existing fork PR branch instead of cutting one.
 - [Trunk-based](/docs/guides/understanding-workflows/trunk-based) — the opposite end of the
   auto-merge spectrum, for work you trust.

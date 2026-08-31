@@ -8,8 +8,8 @@ summary: Merge a workspace's branch into the project's default branch, locally o
 shelbi merge [OPTIONS] <ID>
 ```
 
-`shelbi merge` bridges a task in `review` and a clean default branch. It is
-PR-aware: if an open GitHub PR already exists for the task's branch (the review
+`shelbi merge` bridges an issue in `review` and a clean default branch. It is
+PR-aware: if an open GitHub PR already exists for the issue's branch (the review
 flow's `open_pr` step opens one), it lands the change through that PR with a
 GitHub CLI squash-merge, so a repo whose branch protection requires PRs still
 accepts it. Only when there is no GitHub remote or no open PR does it fall back
@@ -18,11 +18,11 @@ under the generated message `shelbi: merge <id> from <branch>`. Pass `--pr` to
 push the branch and open a fresh GitHub pull request instead, without merging.
 
 A blocked push or a failed PR merge is a hard error: the command stops and does
-not mark the task done, so an unshippable change is never silently left as an
+not mark the issue done, so an unshippable change is never silently left as an
 "accepted" card whose PR stayed open.
 
 The command does not move the card. After a successful merge, the
-orchestrator's "merged → done" sweep (or you, manually) moves the task to
+orchestrator's "merged → done" sweep (or you, manually) moves the issue to
 `done`. After a `--pr` open, the card stays in `review` until the PR
 itself lands.
 
@@ -30,7 +30,7 @@ itself lands.
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
-| `<ID>` | string | — | Task id whose branch to merge (required). |
+| `<ID>` | string | — | Issue id whose branch to merge (required). |
 
 ## Flags
 
@@ -41,7 +41,7 @@ itself lands.
 
 ## Examples
 
-Squash-merge a reviewed task locally:
+Squash-merge a reviewed issue locally:
 
 ```bash
 shelbi merge docs-write-cli-reference-pages

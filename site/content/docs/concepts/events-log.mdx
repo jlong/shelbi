@@ -1,7 +1,7 @@
 ---
 title: The events log
 order: 15
-summary: An append-only file at ~/.shelbi/events.log — every workspace state change and task status move, in one stream the orchestrator tails.
+summary: An append-only file at ~/.shelbi/events.log — every workspace state change and issue status move, in one stream the orchestrator tails.
 ---
 
 Every state change Shelbi observes is appended to one file:
@@ -16,7 +16,7 @@ trail you grep when something looks wrong.
 
 The log is **hub-global**, not per-project: lines for all projects
 running against this hub interleave in the same file. Filtering by
-project (or workspace, or task) is the orchestrator's job. At the
+project (or workspace, or issue) is the orchestrator's job. At the
 filesystem layer, it's one stream.
 
 Defined in `crates/shelbi-state/src/event_log.rs` (`events_log_path`,
@@ -63,10 +63,10 @@ carries:
 
 - The leading `project=<name>` scope is load-bearing, exactly as for
   workspace lines.
-- `workflow=<name>` is the workflow the task runs under (from its
+- `workflow=<name>` is the workflow the issue runs under (from its
   frontmatter); an empty value is treated as the default workflow.
 - `<from-column>` and `<to-column>` are the snake_case status names
-  from the task's workflow (default workflow: `backlog`, `todo`,
+  from the issue's workflow (default workflow: `backlog`, `todo`,
   `in_progress`, `review`, `done`). See
   [workflows](/docs/guides/getting-started/workflows).
 - `from_category=<cat>` and `to_category=<cat>` are the
@@ -86,7 +86,7 @@ carries:
 2026-06-22T14:25:11+00:00 project=myapp heartbeat zen_eligible=5 idle_workspaces=4
 ```
 
-- The line always carries `zen_eligible=` (how many tasks Zen could act
+- The line always carries `zen_eligible=` (how many issues Zen could act
   on) and `idle_workspaces=`. When Zen Mode is On a `zen=on` marker is
   inserted right after `heartbeat`, and a trailing reminder may follow.
 - Emitted by the hub-side poller on the cadence set by the
@@ -97,13 +97,13 @@ carries:
   off exponentially once the board is quiescent, doubling each idle tick
   and capping at `max` (default `5m` / `300s`). A fully idle hub relaxes
   `60s → 2m → 4m → 5m` (capped), so even a long-quiet board still sweeps
-  for a silently-stuck task about every five minutes. Backing off on "no
+  for a silently-stuck issue about every five minutes. Backing off on "no
   supervisable work" rather than "no log line" is deliberate: a stuck
-  `in_progress` task also emits nothing, and the heartbeat sweep is
+  `in_progress` issue also emits nothing, and the heartbeat sweep is
   exactly what catches it.
 - Resets on any real event: the poller compares `events.log`'s mtime
   against a baseline it advances on each seed/emit/reset, so any genuine
-  line (a task move, a workspace transition, a dispatch) both skips
+  line (an issue move, a workspace transition, a dispatch) both skips
   that tick's emission (the event already woke the orchestrator) and
   snaps the cadence back to the standard `interval`. An active board
   never sees padding lines.
@@ -119,7 +119,7 @@ Heartbeats exist for the orchestrator's `events tail --follow` watch.
 When nothing's happening on the board, the watch sits idle for as long
 as it takes for *something* to happen, which can be hours, or never if
 a marker-emitting code path silently regresses. The recurring line is
-the orchestrator's fallback trigger to wake up and check active tasks.
+the orchestrator's fallback trigger to wake up and check active issues.
 
 The TUI activity feed filters heartbeats out by design. They'd
 produce one "nothing happened" row every few minutes. Use
@@ -147,7 +147,7 @@ appends ≤ `PIPE_BUF` (4096 bytes) under `O_APPEND` are atomic relative
 to other appenders, so concurrent writes from the CLI and the poller
 interleave **whole lines** rather than tearing.
 
-This matters because both the CLI (when you run `shelbi task move`) and
+This matters because both the CLI (when you run `shelbi issue move`) and
 the poller (when it observes state changes) write to the same file
 concurrently. The test
 `concurrent_task_and_workspace_appends_dont_tear` in
@@ -183,9 +183,9 @@ content.
 2026-06-22T14:31:52+00:00 project=myapp task=fix-login workflow=task in_progress -> review reason=workspace:ready-marker from_category=active to_category=handoff
 ```
 
-That five-line burst is what one task moving through the system looks
+That five-line burst is what one issue moving through the system looks
 like end-to-end: user triages, orchestrator dispatches, workspace
-starts working, workspace finishes its turn, marker fires, task lands
+starts working, workspace finishes its turn, marker fires, issue lands
 in review.
 
 Implementation: `crates/shelbi-cli/src/commands/events.rs`.
@@ -198,12 +198,12 @@ consistent set:
 
 | Reason                                             | Source                                   | Meaning                                                                            |
 |----------------------------------------------------|------------------------------------------|------------------------------------------------------------------------------------|
-| `user:cli`                                         | `shelbi task move`                       | You moved the card from the CLI with no explicit reason.                           |
-| `user:cli:start`                                   | `shelbi task start`                      | You launched a workspace on a task from the CLI.                                   |
+| `user:cli`                                         | `shelbi issue move`                       | You moved the card from the CLI with no explicit reason.                           |
+| `user:cli:start`                                   | `shelbi issue start`                      | You launched a workspace on an issue from the CLI.                                   |
 | `user:tui:…`                                       | the Kanban TUI                           | You moved the card with `H`/`L` in the TUI.                                        |
 | `user:promote`                                     | a `--reason` you passed                  | Free-form: anything starting with `user:` reads as "the human chose this."         |
-| `orchestrator:auto-dispatch workspace=<name>`         | the orchestrator's `shelbi task start`   | The orchestrator picked a free workspace and dispatched per its routing rules.     |
-| `workspace:ready-marker`                           | the hub poller                           | The workspace wrote its ready marker; the poller promoted the task to review. |
+| `orchestrator:auto-dispatch workspace=<name>`         | the orchestrator's `shelbi issue start`   | The orchestrator picked a free workspace and dispatched per its routing rules.     |
+| `workspace:ready-marker`                           | the hub poller                           | The workspace wrote its ready marker; the poller promoted the issue to review. |
 
 These aren't enforced by code. They're a convention the orchestrator
 parses to decide whether *it* triggered an event (and shouldn't react)
@@ -213,7 +213,7 @@ attention to today:
 - A `user:*` reason on `backlog -> todo` means "newly triaged." Try to
   dispatch.
 - `workspace:ready-marker` on `in_progress -> review` means "the assigned
-  workspace just became free." Find it the next task.
+  workspace just became free." Find it the next issue.
 - `orchestrator:auto-dispatch …` is the orchestrator's own action; it
   doesn't react to it (otherwise it would loop).
 

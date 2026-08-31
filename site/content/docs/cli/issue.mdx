@@ -1,20 +1,29 @@
 ---
-title: shelbi task
+title: shelbi issue
 order: 20
-summary: Manage the project's Kanban task board — add, list, move, assign, start, and resume tasks from the CLI.
+summary: Manage the project's Kanban issue board — add, list, move, assign, start, and resume issues from the CLI.
 ---
 
 ```text
-shelbi task <SUBCOMMAND> [OPTIONS]
+shelbi issue <SUBCOMMAND> [OPTIONS]
 ```
 
-`shelbi task` is the CLI face of the Kanban board. Each card is a file under
+`shelbi issue` is the CLI face of the Kanban board. Each card is a file under
 `~/.shelbi/projects/<project>/tasks/`; each column transition appends a line to
-`~/.shelbi/events.log`. The TUI's tasks pane and this command are two views on
+`~/.shelbi/events.log`. The TUI's issues pane and this command are two views on
 the same files. The orchestrator drives the board through it, and it's where
 scripting, automation, and one-off fixes live.
 
-A board mid-flight, with one task promoted to `TO DO`, one dispatched to a
+<Callout type="note" title="Renamed from `shelbi task`">
+
+This command was called `shelbi task` in earlier releases. `shelbi task` still
+works as a deprecated alias (it prints a notice and forwards to `shelbi issue`)
+so existing scripts keep running, but it will be removed in a future release.
+Prefer `shelbi issue`.
+
+</Callout>
+
+A board mid-flight, with one issue promoted to `TO DO`, one dispatched to a
 workspace, and one already `DONE`:
 
 <AppMockup
@@ -55,10 +64,10 @@ tables below.
 ## add
 
 ```text
-shelbi task add [OPTIONS] <TITLE>
+shelbi issue add [OPTIONS] <TITLE>
 ```
 
-Create a new task. Lands in `backlog` by default, your inbox for triage.
+Create a new issue. Lands in `backlog` by default, your inbox for triage.
 Pass `--status todo` to skip triage when you're already sure.
 
 | Flag | Type | Default | Description |
@@ -66,19 +75,19 @@ Pass `--status todo` to skip triage when you're already sure.
 | `<TITLE>` | string | — | Human-readable title (positional, required). |
 | `--id <ID>` | string | slug of title | Override the auto-generated id. |
 | `--status <STATUS>` | string | `backlog` | Initial status. |
-| `-d, --description <DESCRIPTION>` | string | the title | Task body. When omitted, the body defaults to the title; use `shelbi task edit` to fill it in later. |
-| `--depends-on <ID>` | string (repeatable) | — | Block this task on another. Repeat for multiple deps. |
-| `--prefers-machine <NAME>` | string | — | Hint for the orchestrator to route this task to a workspace on a specific machine. |
-| `--workflow <NAME>` | string | project default | Workflow this task runs under. Names a file in `workflows/<NAME>.yaml`. Omit to inherit the project's default workflow. |
-| `--branch <BRANCH>` | string | generated at dispatch | Pre-fill the task's `branch:` frontmatter field. Omit to let the orchestrator generate `<prefix>/<task-id>` from workflow config, project config, or your GitHub username; supply a value to point the task at an existing branch (the *release task* pattern). |
+| `-d, --description <DESCRIPTION>` | string | the title | Issue body. When omitted, the body defaults to the title; use `shelbi issue edit` to fill it in later. |
+| `--depends-on <ID>` | string (repeatable) | — | Block this issue on another. Repeat for multiple deps. |
+| `--prefers-machine <NAME>` | string | — | Hint for the orchestrator to route this issue to a workspace on a specific machine. |
+| `--workflow <NAME>` | string | project default | Workflow this issue runs under. Names a file in `workflows/<NAME>.yaml`. Omit to inherit the project's default workflow. |
+| `--branch <BRANCH>` | string | generated at dispatch | Pre-fill the issue's `branch:` frontmatter field. Omit to let the orchestrator generate `<prefix>/<task-id>` from workflow config, project config, or your GitHub username; supply a value to point the issue at an existing branch (the *release issue* pattern). |
 
 ## list
 
 ```text
-shelbi task list [OPTIONS]
+shelbi issue list [OPTIONS]
 ```
 
-Print every task grouped by column, in priority order within each column. Use
+Print every issue grouped by column, in priority order within each column. Use
 `--status <NAME>` to scope to one status, or `--ready` to see only unblocked
 `todo` items in dispatch order. That's the orchestrator's view of "what
 should I assign next." `--workflow <NAME>` narrows either view to a single
@@ -88,25 +97,25 @@ workflow.
 | --- | --- | --- | --- |
 | `--status <STATUS>` | string | — | Restrict to a single status. |
 | `--ready` | flag | off | Show only unblocked `todo` items, in priority order. Mutually exclusive with `--status`. |
-| `--workflow <NAME>` | string | — | Restrict to tasks resolved to the named workflow. Tasks with no explicit `workflow:` field inherit the project's `default_workflow`, or `default` when unset. Composes with `--status` and `--ready`. |
+| `--workflow <NAME>` | string | — | Restrict to issues resolved to the named workflow. Issues with no explicit `workflow:` field inherit the project's `default_workflow`, or `default` when unset. Composes with `--status` and `--ready`. |
 
 ## show
 
 ```text
-shelbi task show <ID>
+shelbi issue show <ID>
 ```
 
-Print a task's frontmatter and body, plus the resolved status of each
+Print an issue's frontmatter and body, plus the resolved status of each
 `depends_on` entry. The same view the orchestrator reads before deciding
-whether a task is ready to dispatch.
+whether an issue is ready to dispatch.
 
 ## depends
 
 ```text
-shelbi task depends [OPTIONS] <ID>
+shelbi issue depends [OPTIONS] <ID>
 ```
 
-Edit a task's dependency list without opening the file.
+Edit an issue's dependency list without opening the file.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -116,31 +125,31 @@ Edit a task's dependency list without opening the file.
 ## move
 
 ```text
-shelbi task move --to <STATUS> [OPTIONS] <ID>
+shelbi issue move --to <STATUS> [OPTIONS] <ID>
 ```
 
-Move a task between statuses. Promoting to `todo` is the orchestrator's start
-signal. It picks a free workspace and runs `task start` itself.
+Move an issue between statuses. Promoting to `todo` is the orchestrator's start
+signal. It picks a free workspace and runs `issue start` itself.
 
-The destination is validated against the task's workflow. A status the workflow
+The destination is validated against the issue's workflow. A status the workflow
 doesn't declare (or a custom status with no backing column) errors with the
-list of reachable statuses, and the task stays put. Matching is case- and
-punctuation-insensitive (`InProgress` matches `in_progress`); a task pinned to a
+list of reachable statuses, and the issue stays put. Matching is case- and
+punctuation-insensitive (`InProgress` matches `in_progress`); an issue pinned to a
 workflow with no YAML on disk falls back to the built-in `default`, so
 projects keep moving while the workflows directory is empty.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--to <STATUS>` | string | — | Destination status (required). Must be a status declared by the task's workflow. |
+| `--to <STATUS>` | string | — | Destination status (required). Must be a status declared by the issue's workflow. |
 | `--reason <REASON>` | string | `user:cli` | Reason tag recorded in `~/.shelbi/events.log`. The orchestrator parses this to tell auto-dispatches apart from user actions. |
 
 ## assign
 
 ```text
-shelbi task assign --to <WORKSPACE> <ID>
+shelbi issue assign --to <WORKSPACE> <ID>
 ```
 
-Set the task's `assigned_to` field without launching the workspace. Use
+Set the issue's `assigned_to` field without launching the workspace. Use
 this when you want to pre-allocate before promoting to `todo`. The
 workspace must be declared in the project YAML.
 
@@ -151,44 +160,44 @@ workspace must be declared in the project YAML.
 ## unassign
 
 ```text
-shelbi task unassign <ID>
+shelbi issue unassign <ID>
 ```
 
-Clear a task's `assigned_to` field. The task stays in its current column.
+Clear an issue's `assigned_to` field. The issue stays in its current column.
 
 ## start
 
 ```text
-shelbi task start [OPTIONS] <ID>
+shelbi issue start [OPTIONS] <ID>
 ```
 
-Launch the assigned workspace on this task. Three things happen in one shot:
+Launch the assigned workspace on this issue. Three things happen in one shot:
 
-1. The workspace's worktree is checked out to the task's branch (generated
+1. The workspace's worktree is checked out to the issue's branch (generated
    from workflow config, project config, or your GitHub username when unset).
 2. Any existing pane for that workspace is killed. Context is wiped clean.
-3. The runner relaunches with the task prompt and the column transitions
+3. The runner relaunches with the issue prompt and the column transitions
    into `in_progress`.
 
 Pass `--workspace` to assign and launch in one call. This is the command
-the orchestrator runs when a task hits `todo`.
+the orchestrator runs when an issue hits `todo`.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--workspace <WORKSPACE>` | string | task's `assigned_to` | Assign and launch in one call. |
+| `--workspace <WORKSPACE>` | string | issue's `assigned_to` | Assign and launch in one call. |
 | `--branch <BRANCH>` | string | generated | Override the default branch name. |
 | `--reason <REASON>` | string | `user:cli:start` | Reason tag recorded in `~/.shelbi/events.log` when the column transitions to `in_progress`. |
 
 ## resume
 
 ```text
-shelbi task resume [OPTIONS] <ID>
+shelbi issue resume [OPTIONS] <ID>
 ```
 
-Relaunch the assigned workspace on the task it is **already** working, without
+Relaunch the assigned workspace on the issue it is **already** working, without
 throwing away progress. Use it when a worker stalls or its session dies
-(a killed tmux session, a wedged pane, an agent that stopped mid-task) and you
-want it going again on the same task with its work intact.
+(a killed tmux session, a wedged pane, an agent that stopped mid-issue) and you
+want it going again on the same issue with its work intact.
 
 `resume` is the recovery counterpart to [`start`](#start). `start` wipes
 the agent's context (kills the pane and re-checks-out a clean branch): right
@@ -198,32 +207,32 @@ in-flight state:
 1. The workspace's worktree is left **as-is**: its branch, commits, and
    uncommitted changes stay exactly where the worker left them. The branch is
    never reset or re-checked-out. (If the worktree was torn down entirely, it's
-   recreated on the task's existing branch.)
+   recreated on the issue's existing branch.)
 2. The runner pane is recreated or reclaimed: a killed session is stood back
    up, and a stale or wedged one (the duplicate-session case) is torn down
    before the fresh pane comes up.
 3. For a **claude** runner the pane relaunches with `--continue`, so the worker
    reloads its prior conversation and picks up mid-thought with full context.
-   Other runners fall back to re-injecting the task prompt. The agent continues
+   Other runners fall back to re-injecting the issue prompt. The agent continues
    by reading its own prior work in the worktree. Either way the prompt is
    auto-submitted.
 
-If the card has drifted out of `in_progress` (a killed worker whose task
+If the card has drifted out of `in_progress` (a killed worker whose issue
 someone moved back), `resume` restores it.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--workspace <WORKSPACE>` | string | task's `assigned_to` | Workspace whose worktree holds the in-flight work. |
+| `--workspace <WORKSPACE>` | string | issue's `assigned_to` | Workspace whose worktree holds the in-flight work. |
 | `--reason <REASON>` | string | `user:cli:resume` | Reason tag recorded in `~/.shelbi/events.log` if the resume has to move the card back into `in_progress`. |
 
 ## prio
 
 ```text
-shelbi task prio [OPTIONS] <ID>
+shelbi issue prio [OPTIONS] <ID>
 ```
 
-Re-order a task within its column. The orchestrator picks the top-most ready
-task when dispatching, so `prio` is how you steer "what's next" without
+Re-order an issue within its column. The orchestrator picks the top-most ready
+issue when dispatching, so `prio` is how you steer "what's next" without
 opening the TUI.
 
 | Flag | Type | Default | Description |
@@ -237,12 +246,12 @@ opening the TUI.
 ## edit
 
 ```text
-shelbi task edit <ID> [OPTIONS]
+shelbi issue edit <ID> [OPTIONS]
 ```
 
-With no flags, opens the task's markdown file in `$EDITOR` for free-form
+With no flags, opens the issue's markdown file in `$EDITOR` for free-form
 edits. Any field flag switches to non-interactive mode, the path for the
-orchestrator, CI, or a script to revise a task after creation. A
+orchestrator, CI, or a script to revise an issue after creation. A
 non-interactive edit bumps `updated_at`, validates the touched fields
 before writing, and emits an `edited` event so the change is visible to
 the board and the activity feed. Fields that already have a dedicated
@@ -250,10 +259,10 @@ command (`move`, `prio`, `assign`, `depends`) are out of scope; use those.
 
 | Flag | Type | Description |
 | --- | --- | --- |
-| `--title <TITLE>` | string | Change the display title. The task's `id` stays stable (never re-slugged). |
+| `--title <TITLE>` | string | Change the display title. The issue's `id` stays stable (never re-slugged). |
 | `--body <TEXT>` | string | Replace the body with this text. |
 | `--body-file <PATH>` | path | Replace the body with a file's contents. |
-| (stdin) | pipe | Pipe the body: `shelbi task edit <id> <<EOF … EOF`. |
+| (stdin) | pipe | Pipe the body: `shelbi issue edit <id> <<EOF … EOF`. |
 | `--append` | flag | Append the body source to the existing body instead of replacing it. |
 | `--workflow <NAME>` | string | Set the workflow. Must name an existing `workflows/<NAME>.yaml`. |
 | `--branch <BRANCH>` | string | Set the `branch:` override. |
@@ -268,18 +277,18 @@ The body sources (`--body`, `--body-file`, stdin) are mutually exclusive
 with each other and with the substitution flags. Substitutions replace
 **all** occurrences of each match and report a per-substitution count;
 multiple `--sub`/`--sub-regex` apply in command-line order, each operating
-on the previous one's output. Editing a task whose column is an active
+on the previous one's output. Editing an issue whose column is an active
 status (e.g. `in_progress`) prints a warning: the running worker won't see
-the change until the task is re-dispatched with `shelbi task start`.
+the change until the issue is re-dispatched with `shelbi issue start`.
 
 ```bash
 # Fix a stale path and swap a value in place, before dispatch.
-shelbi task edit fix-login-flow \
+shelbi issue edit fix-login-flow \
     --sub "src/old_auth.rs" "src/auth.rs" \
     --sub-regex "timeout=([0-9]+)" "timeout=30"
 
 # Append a late acceptance criterion without rewriting the body.
-shelbi task edit fix-login-flow --append <<'EOF'
+shelbi issue edit fix-login-flow --append <<'EOF'
 - [ ] Session cookies are cleared on logout.
 EOF
 ```
@@ -287,14 +296,14 @@ EOF
 ## rm
 
 ```text
-shelbi task rm <ID>
+shelbi issue rm <ID>
 ```
 
-Delete a task file.
+Delete an issue file.
 
 <Callout type="warning" title="Irreversible">
 
-`shelbi task rm` deletes the task's markdown file outright. There's no
+`shelbi issue rm` deletes the issue's markdown file outright. There's no
 trash and no undo. To take a card off the board without destroying its
 history, move it back to `backlog` instead.
 
@@ -305,42 +314,42 @@ history, move it back to `backlog` instead.
 Triage a new request into the backlog with a dependency on existing work:
 
 ```bash
-shelbi task add "Wire up changelog page" \
+shelbi issue add "Wire up changelog page" \
     --depends-on docs-write-getting-started-section
 ```
 
-Promote a triaged task to `todo`, and the orchestrator picks it up:
+Promote a triaged issue to `todo`, and the orchestrator picks it up:
 
 ```bash
-shelbi task move docs-write-cli-reference-pages --to todo
+shelbi issue move docs-write-cli-reference-pages --to todo
 ```
 
-Reorder ready work so a specific task is dispatched first:
+Reorder ready work so a specific issue is dispatched first:
 
 ```bash
-shelbi task prio fix-sidebar-clamp --top
+shelbi issue prio fix-sidebar-clamp --top
 ```
 
 Manually dispatch an explicit workspace (overrides the orchestrator's routing):
 
 ```bash
-shelbi task start docs-write-changelog-page --workspace delta
+shelbi issue start docs-write-changelog-page --workspace delta
 ```
 
 Recover a stalled worker without losing its in-flight work, relaunching the pane
-and resuming the conversation on the same task:
+and resuming the conversation on the same issue:
 
 ```bash
-shelbi task resume docs-write-changelog-page
+shelbi issue resume docs-write-changelog-page
 ```
 
 ## See also
 
 - [Workflows](/docs/guides/getting-started/workflows) — the schema behind `--workflow`,
-  what `--to` is validated against on `task move`, and the default
-  workflow's lifecycle (who moves a task between which statuses).
+  what `--to` is validated against on `issue move`, and the default
+  workflow's lifecycle (who moves an issue between which statuses).
 - [`shelbi workflow`](/docs/cli/workflow) — list, show, scaffold, and
-  edit the workflow YAMLs tasks run under.
+  edit the workflow YAMLs issues run under.
 - [Workspaces](/docs/concepts/workspaces) — the pool model that `assign` /
   `start` route into.
 - [Orchestrator](/docs/concepts/orchestrator) — how `--reason` tags get
