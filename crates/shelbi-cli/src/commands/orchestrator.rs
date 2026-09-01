@@ -1136,7 +1136,7 @@ mod tests {
     }
 
     fn setup_home() -> (std::sync::MutexGuard<'static, ()>, TestHome) {
-        let guard = ENV_LOCK.lock().unwrap();
+        let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         std::env::remove_var("SHELBI_HOME");
         std::env::set_var("SHELBI_ROOT", tmp.path());
@@ -2014,14 +2014,24 @@ mod tests {
         .unwrap();
 
         // A follower whose consumer never acks. With a zero visibility timeout
-        // every poll past the first redelivers, so a bounded lifetime captures
-        // several deliveries of the same still-unacked batch — the follower
-        // keeps the orchestrator fed rather than silently stalling.
+        // every poll past the first redelivers, so we capture several deliveries
+        // of the same still-unacked batch — the follower keeps the orchestrator
+        // fed rather than silently stalling.
+        //
+        // Termination is delivery-count driven, NOT wall-clock driven: the emit
+        // callback raises the cancel signal once it has seen enough redeliveries
+        // to prove the point. A prior version bounded the loop with an 80ms
+        // `max_lifetime`, which flaked on a CPU-starved CI box — under load the
+        // lifetime could elapse before the loop scanned even once, yielding zero
+        // deliveries and a false "held silently" failure that then poisoned the
+        // shared test lock and cascaded. Counting deliveries makes the loop stop
+        // exactly when its invariant is satisfied, regardless of scheduling.
         let signal = AtomicUsize::new(0);
         let mut deliveries: Vec<String> = Vec::new();
         let outcome = feed_loop_with(
             "demo",
-            Some(Duration::from_millis(80)),
+            // No wall-clock cap: only the delivery-count signal below ends it.
+            None,
             &signal,
             Duration::from_millis(5),
             Duration::ZERO,
@@ -2031,13 +2041,19 @@ mod tests {
             &|| false,
             &mut |batch| {
                 deliveries.push(batch.delivery_id.clone());
+                // Three deliveries is one more than the invariant needs, so the
+                // redelivery is unambiguous; raise the cancel flag a real signal
+                // handler would set so the loop stops on the next tick.
+                if deliveries.len() >= 3 {
+                    signal.store(SIGTERM as usize, Ordering::Relaxed);
+                }
                 Ok(())
             },
             &mut |_notice| Ok(()),
         )
         .unwrap();
 
-        assert!(matches!(outcome, FeedOutcome::Expired { .. }));
+        assert_eq!(outcome, FeedOutcome::Terminated { signal: SIGTERM });
         assert!(
             deliveries.len() >= 2,
             "an unacked batch must be redelivered, not held silently: {deliveries:?}"

@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn legacy_resolution_retains_runner_and_reports_removed_runner() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let env = EnvGuard::new(&["SHELBI_HOME"]);
         env.set("SHELBI_HOME", tmp.path());

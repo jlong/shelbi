@@ -160,7 +160,7 @@ mod editor_tests {
 
     #[test]
     fn splits_args_and_honors_visual_before_editor() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("EDITOR");
         std::env::remove_var("VISUAL");
         // Nothing set → POSIX `vi`, no args.
@@ -201,6 +201,13 @@ pub(crate) mod test_support {
     /// Tests across the `task` and `workspace` modules race on this env var,
     /// so they must all lock the *same* static — per-module locks would
     /// silently interleave and produce flaky failures.
+    ///
+    /// Acquire it with `.lock().unwrap_or_else(|p| p.into_inner())`, never a
+    /// bare `.unwrap()`: a single panicking test (e.g. a timing-sensitive
+    /// assertion) would otherwise poison this static and cascade into a
+    /// PoisonError failure in every later test that touches it — turning one
+    /// red test into dozens. Recovering the guard from the poison keeps the
+    /// seed failure isolated to the one test that actually failed.
     pub static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Restores process environment variables on drop.

@@ -1056,7 +1056,7 @@ mod cli_tests {
     /// in-repo split project.
     #[test]
     fn project_registration_exists_supports_both_config_modes() {
-        let _g = commands::test_support::ENV_LOCK.lock().unwrap();
+        let _g = commands::test_support::ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = std::env::temp_dir().join(format!(
             "shelbi-stale-marker-test-{}-{}",
             std::process::id(),

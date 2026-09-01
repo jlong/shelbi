@@ -41,5 +41,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # One retry guards against residual timing flakiness under CI load
+      # (several test binaries hammer the machine at once). A genuinely broken
+      # test fails both attempts and still reddens the job; a retried flake is
+      # surfaced as a warning so it stays visible rather than silently masked.
+      # Safe to drop once the suite has proven stable across many runs.
       - name: Test
-        run: cargo test --workspace
+        run: |
+          for attempt in 1 2; do
+            echo "::group::cargo test --workspace (attempt $attempt)"
+            if cargo test --workspace; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::cargo test --workspace failed on attempt $attempt"
+          done
+          echo "::error::cargo test --workspace failed after 2 attempts"
+          exit 1

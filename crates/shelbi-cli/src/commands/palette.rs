@@ -2037,7 +2037,7 @@ mod tests {
         // pinning the inline-actions order. Isolate `SHELBI_HOME` to an empty
         // home so `list_projects()` (now read by `build_entries` for the inline
         // "Switch to X" entries) finds no other projects and can't inject them.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let app = App::new_sidebar("demo");
@@ -2070,7 +2070,7 @@ mod tests {
     fn switch_project_hidden_from_empty_query_but_searchable() {
         // Isolate `SHELBI_HOME` so `list_projects()` finds no other projects
         // and can't inject inline "Switch to X" rows that would also match `sw`.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let app = App::new_sidebar("demo");
@@ -2118,7 +2118,7 @@ mod tests {
         // With `portal` current and three other registered projects, the palette
         // should mint hidden inline "Switch to <display> project" entries for the
         // others (using their display names) and never for the current one.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         write_switch_project(&home, "portal", Some("Portal"));
@@ -2507,7 +2507,7 @@ mod tests {
 
     #[test]
     fn edit_target_path_resolves_each_id_to_its_file() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let cfg = scaffold_edit_project(&home, "editproj", &["developer"]);
@@ -2537,7 +2537,7 @@ mod tests {
 
     #[test]
     fn build_entries_emits_edit_entries_enumerated_from_agents_dir() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         scaffold_edit_project(&home, "editproj", &["orchestrator", "developer", "review"]);
@@ -2574,7 +2574,7 @@ mod tests {
         // Only scaffold project.yaml + one agent — no zenmode.md, no
         // workflows/ dir — and confirm the missing-target openers are
         // dropped rather than offered as dead entries.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let projects = home.join("projects");
@@ -2637,7 +2637,7 @@ mod tests {
         // Acceptance (a): first enable on a fresh `~/.shelbi/state.json` —
         // zen_mode is Off (no `state.json` yet) AND zen_intro_seen is
         // unset, so the popover gate fires.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         seed_project(&home, "demo");
@@ -2655,7 +2655,7 @@ mod tests {
         // Acceptance (f): subsequent enables with the flag set skip the
         // popover entirely — the toggle should fall through to the
         // normal dispatch path.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         seed_project(&home, "demo");
@@ -2675,7 +2675,7 @@ mod tests {
         // never trigger the popover. The user knew about Zen when they
         // paused / turned it on the first time, so re-explaining is
         // noise. We check both non-Off states to pin the gate.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         seed_project(&home, "demo");
@@ -2697,7 +2697,7 @@ mod tests {
     fn apply_cancel_does_not_toggle_zen() {
         // Acceptance (b): Cancel closes the popover without enabling Zen.
         // No `mode=zen` event line should land in the activity log either.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         seed_project(&home, "demo");
@@ -2736,7 +2736,7 @@ mod tests {
         // Acceptance (c): Confirm enables Zen and emits the canonical
         // event line tagged with `user:palette` so the activity feed
         // can attribute the toggle to the palette source.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         seed_project(&home, "demo");
@@ -2765,7 +2765,7 @@ mod tests {
     fn apply_confirm_with_checkbox_persists_the_flag() {
         // Acceptance (d): checkbox-then-Confirm both enables Zen and
         // persists the flag so the popover never re-fires.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         seed_project(&home, "demo");
@@ -2799,7 +2799,7 @@ mod tests {
         // Acceptance (e): checkbox-then-Cancel persists the flag — the
         // user has read the explanation and explicitly opted out of
         // seeing it again, even though they didn't enable Zen this time.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         seed_project(&home, "demo");

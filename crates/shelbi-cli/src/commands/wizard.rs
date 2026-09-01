@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn idempotence_guard_recognizes_flat_and_split_registrations() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
         let env = EnvGuard::new(&["SHELBI_HOME"]);
