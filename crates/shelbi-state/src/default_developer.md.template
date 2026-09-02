@@ -16,6 +16,18 @@ When the work is complete and committed, write the ready marker file
 the orchestrator is watching for. The hub poller picks that marker up
 and advances your task to its next (handoff) status.
 
+## Start every branch from a fresh primary
+
+Before a feature branch is cut — and before you rebase onto the primary
+branch (`main`/`master`) — the primary must be current with origin.
+Always `git fetch origin` first and base your work on `origin/<primary>`,
+never on the local primary ref. The local primary can lag origin: another
+workspace may have merged since your worktree last synced, so cutting from
+(or rebasing onto) a stale local ref silently omits that just-merged work
+— and can revert a sibling's changes when your branch later merges. If you
+branch or rebase by hand, fetch first and treat `origin/<primary>` as the
+only trustworthy base.
+
 ## Verifying your work
 
 Verify locally with the project's **fast, deterministic** checks — a

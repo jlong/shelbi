@@ -2100,6 +2100,11 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
         // Retry-once-then-continue is the spec's loss-handling rule —
         // pin it so a future copy edit can't quietly drop the policy.
         assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("retry once"));
+        // Rule 1: start every branch from a fresh primary — always fetch and
+        // base on `origin/<primary>`, never the stale local ref.
+        assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("Start every branch from a fresh primary"));
+        assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("git fetch origin"));
+        assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("origin/<primary>"));
     }
 
     /// The review charter (§6) must be explicit that the agent loads and
@@ -2115,6 +2120,10 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
         // The human-requested-tweak carve-out must survive edits — it's the
         // sole case the review agent touches code.
         assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("tweak"));
+        // Rule 2: a human-requested tweak must be committed and pushed to the
+        // branch — an uncommitted worktree edit is lost when the branch merges.
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("Commit and push the tweak"));
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("lost when the branch merges"));
         // Load/run mechanics: the workflow's review recipe (injected into the
         // dispatch prompt) is the single source of truth, run verbatim. The
         // section header must match the injected one (`## Review recipe`).

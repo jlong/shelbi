@@ -423,6 +423,10 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         && (id.ends_with(".instructions") || id.contains(".skill."))
     {
         sniff_review_instructions(entry, &text, out);
+    } else if matches!(entry.format, SurfaceFormat::Markdown)
+        && id.ends_with(".agent.developer.instructions")
+    {
+        sniff_developer_instructions(entry, &text, out);
     } else if id.ends_with(".agent.orchestrator.instructions") {
         sniff_orchestrator_instructions(entry, &text, out);
     }
@@ -440,25 +444,100 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
 /// phrases mark the deprecation.
 const LEGACY_REVIEW_WORDING: &[&str] = &["serve recipe", "diff-only", "why no server came up"];
 
-/// Detect the pre-rename server-centric wording in the review agent's
-/// instructions (or its bundled load-run skill). The fix is a prose refresh a
-/// user may have forked and customized — never a mechanical, non-lossy rewrite
-/// — so it routes to [`Classification::NeedsJudgment`] for the orchestrator to
-/// repair its own copy rather than silently clobbering local edits.
+/// The section heading under which the review agent's one code-touching
+/// exception (a human-requested tweak) lives. Shared between the shipped
+/// default and the sniff so the two can never disagree about the heading the
+/// commit-and-push check keys on.
+pub(crate) const REVIEW_TWEAK_SECTION_HEADING: &str =
+    "## The one exception: a human-requested tweak";
+
+/// Detect two deprecations in the review agent's instructions (or, for the
+/// server-centric wording, its bundled load-run skill). Both fixes are a prose
+/// refresh a user may have forked and customized — never a mechanical,
+/// non-lossy rewrite — so each routes to [`Classification::NeedsJudgment`] for
+/// the orchestrator to repair its own copy rather than silently clobbering
+/// local edits.
 fn sniff_review_instructions(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
-    let Some(marker) = LEGACY_REVIEW_WORDING.iter().find(|m| text.contains(**m)) else {
+    if let Some(marker) = LEGACY_REVIEW_WORDING.iter().find(|m| text.contains(**m)) {
+        out.push(finding(
+            entry,
+            Classification::NeedsJudgment,
+            "REVIEW_INSTRUCTIONS_SERVER_CENTRIC",
+            &format!(
+                "review agent prose uses the pre-rename server-centric wording (`{marker}`)"
+            ),
+            "Refresh from the shipped medium-agnostic review defaults: `## Review recipe` \
+             (not `## Review serve recipe`); when no recipe is declared, bring nothing up and \
+             say nothing about it (no `diff-only` / `why no server came up` narration).",
+            Location { line: 1, column: 1 },
+        ));
+    }
+
+    // The human-requested-tweak exception must tell the review agent to commit
+    // and push the tweak — an edit left uncommitted in the worktree is lost when
+    // the branch merges. Fire only when that section is present but its body
+    // never mentions committing/pushing: a copy with no such section at all is
+    // too heavily customized to reason about (mirrors the orchestrator absence
+    // sniff), and the load-run skill carries no exception section, so it is
+    // naturally left alone.
+    if let Some(section) = markdown_section(text, REVIEW_TWEAK_SECTION_HEADING) {
+        let normalized = section.to_ascii_lowercase().replace(['*', '`'], "");
+        let has_push_guidance =
+            normalized.contains("commit and push") || normalized.contains("push it to origin");
+        if !has_push_guidance {
+            out.push(finding(
+                entry,
+                Classification::NeedsJudgment,
+                "REVIEW_INSTRUCTIONS_TWEAK_NO_PUSH",
+                "the review agent's human-requested-tweak exception doesn't say to commit \
+                 and push the tweak — an uncommitted worktree edit is lost when the branch merges",
+                "Refresh the `The one exception: a human-requested tweak` section to require \
+                 committing the tweak to the checked-out branch and `git push`ing it to origin \
+                 before bringing the branch back up — mirror the shipped default template.",
+                locate_line(text, REVIEW_TWEAK_SECTION_HEADING),
+            ));
+        }
+    }
+}
+
+/// Distinctive phrases the post-Rule-1 "Start every branch from a fresh
+/// primary" guidance introduces. A developer `instructions.md` carrying any one
+/// of them already teaches the fresh-primary base discipline; a file with none
+/// predates it. Kept in sync with the shipped default template by the drift
+/// guard in this module's tests.
+const FRESH_PRIMARY_MARKERS: &[&str] =
+    &["git fetch origin", "origin/<primary>", "fresh primary"];
+
+/// Sniff a developer `instructions.md` for the "start every branch from a fresh
+/// primary" base discipline (Rule 1).
+///
+/// A default change (always fetch origin and base work on `origin/<primary>`
+/// before cutting or rebasing a branch) only reaches NEW projects via the
+/// shipped template; existing projects carry their own copy of the
+/// instructions, so this sniffer hands the orchestrator a boot finding to
+/// refresh it (per the AGENTS.md "Changing shipped defaults" guardrail — a
+/// default change needs a sniffer to reach existing installs).
+///
+/// This is an **absence** sniff: it fires when the prose mentions none of the
+/// fresh-primary markers. The fix is a prose refresh of a possibly-forked file,
+/// so it routes to [`Classification::NeedsJudgment`] — the orchestrator merges
+/// the guidance into its own copy rather than a mechanical rewrite clobbering
+/// local edits.
+fn sniff_developer_instructions(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    let lower = text.to_ascii_lowercase();
+    if FRESH_PRIMARY_MARKERS.iter().any(|m| lower.contains(m)) {
         return;
-    };
+    }
     out.push(finding(
         entry,
         Classification::NeedsJudgment,
-        "REVIEW_INSTRUCTIONS_SERVER_CENTRIC",
-        &format!(
-            "review agent prose uses the pre-rename server-centric wording (`{marker}`)"
-        ),
-        "Refresh from the shipped medium-agnostic review defaults: `## Review recipe` \
-         (not `## Review serve recipe`); when no recipe is declared, bring nothing up and \
-         say nothing about it (no `diff-only` / `why no server came up` narration).",
+        "DEV_INSTRUCTIONS_FRESH_PRIMARY_MISSING",
+        "developer agent prose doesn't teach starting every branch from a fresh primary \
+         (`git fetch origin` + base on `origin/<primary>`) — a stale local base silently \
+         omits (and can revert) a just-merged sibling's work",
+        "Add a `Start every branch from a fresh primary` section: always `git fetch origin` \
+         before cutting or rebasing a branch and base work on `origin/<primary>`, never the \
+         local primary ref — mirror the shipped default template.",
         Location { line: 1, column: 1 },
     ));
 }
@@ -1477,6 +1556,16 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              the medium-agnostic wording can't be merged in mechanically without risking \
              local edits — the orchestrator refreshes its own copy instead."
         }
+        "REVIEW_INSTRUCTIONS_TWEAK_NO_PUSH" => {
+            "These are prose instructions a project may have forked and customized, so the \
+             commit-and-push guidance can't be merged in mechanically without risking local \
+             edits — the orchestrator refreshes its own copy instead."
+        }
+        "DEV_INSTRUCTIONS_FRESH_PRIMARY_MISSING" => {
+            "These are prose instructions a project may have forked and customized, so the \
+             fresh-primary base discipline can't be merged in mechanically without risking \
+             local edits — the orchestrator refreshes its own copy instead."
+        }
         "ZEN_PR_MERGE_DOUBLE_MERGE" => {
             "The merge/finalize prose is free-form and user-customizable, so the corrected \
              gate-then-transition policy can't be applied by a mechanical rewrite without \
@@ -1970,6 +2059,141 @@ mod tests {
         assert!(
             out.is_empty(),
             "shipped review defaults tripped the sniffer: {:?}",
+            codes(&out)
+        );
+    }
+
+    // ---- review agent instructions (commit-and-push tweak, Rule 2) ------
+
+    fn review_instr_entry() -> InventoryEntry {
+        entry(
+            "project.demo.agent.review.instructions",
+            "project:demo",
+            SurfaceFormat::Markdown,
+        )
+    }
+
+    #[test]
+    fn tweak_exception_without_commit_and_push_is_needs_judgment() {
+        // The pre-Rule-2 exception: makes the edit and brings it back up, but
+        // never says to commit and push it.
+        let text = format!(
+            "# Review\n\n{REVIEW_TWEAK_SECTION_HEADING}\n\nIf the human asks, make that \
+             specific edit and then **bring it back up** so they can see it. Keep it to \
+             exactly what was asked.\n\n## What you don't do\n\n- Don't modify code.\n"
+        );
+        let mut out = Vec::new();
+        sniff_review_instructions(&review_instr_entry(), &text, &mut out);
+        let f = find(&out, "REVIEW_INSTRUCTIONS_TWEAK_NO_PUSH").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+    }
+
+    #[test]
+    fn tweak_exception_with_commit_and_push_is_clean() {
+        let text = format!(
+            "# Review\n\n{REVIEW_TWEAK_SECTION_HEADING}\n\nMake that specific edit. \
+             **Commit and push the tweak to the task's branch.** Then bring the branch back \
+             up.\n\n## What you don't do\n"
+        );
+        let mut out = Vec::new();
+        sniff_review_instructions(&review_instr_entry(), &text, &mut out);
+        assert!(
+            find(&out, "REVIEW_INSTRUCTIONS_TWEAK_NO_PUSH").is_none(),
+            "a section that commits and pushes should not be flagged: {:?}",
+            codes(&out)
+        );
+    }
+
+    #[test]
+    fn review_instructions_without_the_tweak_section_are_not_flagged() {
+        // No exception section at all: too customized to reason about, so the
+        // absence sniff stays quiet (mirrors the orchestrator absence sniff).
+        let text = "# Review\n\n## My own load notes\n\nno tweak section here\n";
+        let mut out = Vec::new();
+        sniff_review_instructions(&review_instr_entry(), text, &mut out);
+        assert!(find(&out, "REVIEW_INSTRUCTIONS_TWEAK_NO_PUSH").is_none());
+    }
+
+    /// Drift guard: the shipped default review template must carry the
+    /// commit-and-push guidance, so a freshly-materialized project never trips
+    /// this sniffer, and the section it keys on must exist in the default.
+    #[test]
+    fn shipped_default_review_template_carries_commit_and_push_guidance() {
+        let mut out = Vec::new();
+        sniff_review_instructions(
+            &review_instr_entry(),
+            shelbi_state::DEFAULT_REVIEW_INSTRUCTIONS,
+            &mut out,
+        );
+        assert!(
+            find(&out, "REVIEW_INSTRUCTIONS_TWEAK_NO_PUSH").is_none(),
+            "shipped default review template trips the commit-and-push sniffer: {:?}",
+            codes(&out)
+        );
+        assert!(
+            markdown_section(
+                shelbi_state::DEFAULT_REVIEW_INSTRUCTIONS,
+                REVIEW_TWEAK_SECTION_HEADING,
+            )
+            .is_some(),
+            "shipped default review template no longer has a `{REVIEW_TWEAK_SECTION_HEADING}` \
+             section — the sniffer's absence check is now dead",
+        );
+    }
+
+    // ---- developer agent instructions (fresh primary, Rule 1) -----------
+
+    fn dev_instr_entry() -> InventoryEntry {
+        entry(
+            "project.demo.agent.developer.instructions",
+            "project:demo",
+            SurfaceFormat::Markdown,
+        )
+    }
+
+    #[test]
+    fn developer_instructions_without_fresh_primary_are_needs_judgment() {
+        // Pre-Rule-1 prose: mentions branches and rebasing but none of the
+        // fresh-primary markers.
+        let text = "# Developer\n\nCarry out the implementation on the branch you've been \
+                    checked out onto. When done, rebase and write the ready marker.\n";
+        let mut out = Vec::new();
+        sniff_developer_instructions(&dev_instr_entry(), text, &mut out);
+        let f = find(&out, "DEV_INSTRUCTIONS_FRESH_PRIMARY_MISSING").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+    }
+
+    #[test]
+    fn developer_instructions_with_fresh_primary_are_clean() {
+        // Any one marker is enough to mark the discipline present.
+        for marker in ["git fetch origin", "origin/<primary>", "fresh primary"] {
+            let text = format!("# Developer\n\nAlways {marker} before cutting a branch.\n");
+            let mut out = Vec::new();
+            sniff_developer_instructions(&dev_instr_entry(), &text, &mut out);
+            assert!(
+                find(&out, "DEV_INSTRUCTIONS_FRESH_PRIMARY_MISSING").is_none(),
+                "prose carrying `{marker}` was flagged: {:?}",
+                codes(&out)
+            );
+        }
+    }
+
+    /// Drift guard: the shipped default developer template must carry the
+    /// fresh-primary guidance, so a freshly-materialized project never trips
+    /// this sniffer.
+    #[test]
+    fn shipped_default_developer_template_carries_fresh_primary_guidance() {
+        let mut out = Vec::new();
+        sniff_developer_instructions(
+            &dev_instr_entry(),
+            shelbi_state::DEFAULT_DEVELOPER_INSTRUCTIONS,
+            &mut out,
+        );
+        assert!(
+            find(&out, "DEV_INSTRUCTIONS_FRESH_PRIMARY_MISSING").is_none(),
+            "shipped default developer template trips the fresh-primary sniffer: {:?}",
             codes(&out)
         );
     }
