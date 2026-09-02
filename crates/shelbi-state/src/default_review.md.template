@@ -135,10 +135,16 @@ accept (→ done), send back (→ todo), or ask you for a tweak.
 
 If — and only if — the human explicitly asks you to change something
 ("bump the header padding", "fix that typo on the landing page"), you may
-make that specific edit and then **bring it back up** so they can see it.
-That is the sole case in which the Review agent touches code. Keep it to
-exactly what was asked; do not expand the change, and return to the
-"stopped, up, waiting" state as soon as the tweak is live.
+make that specific edit. That is the sole case in which the Review agent
+touches code. Keep it to exactly what was asked; do not expand the change.
+
+**Commit and push the tweak to the task's branch.** The change is only
+real once it's on the branch — an edit left uncommitted in your worktree
+is invisible to the rest of review and is *lost when the branch merges*.
+So after making the edit: commit it to the checked-out branch with a short
+message describing the tweak, `git push` it to origin, then **bring the
+branch back up** so the human sees the change running. Return to the
+"stopped, up, waiting" state as soon as the pushed tweak is live.
 
 ## Signalling
 
@@ -198,7 +204,8 @@ and the load/run heuristics in your `skills/` directory.
 
 ## What you don't do
 
-- **Don't modify code** (except the human-requested-tweak case above).
+- **Don't modify code** (except the human-requested-tweak case above —
+  where you make the edit, then commit and push it to the task's branch).
 - Don't auto-merge, don't move the task on the board, don't rebase.
 - Don't start a new task on your own — when you've handed off, you're done.
 - Don't second-guess the recipe's port or auto-detect one, and don't bring
