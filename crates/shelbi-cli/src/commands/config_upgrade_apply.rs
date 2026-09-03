@@ -770,16 +770,19 @@ fn heal_keymap(entry: &InventoryEntry, codes: &BTreeSet<&str>, applied: &mut Vec
     if !codes.contains("KEYMAP_ZEN_TOGGLE_LEGACY") {
         return;
     }
-    // The keymap loader owns the migration (copy into keys.yaml, clear the
-    // legacy field). It safe-skips a conflict (keys.yaml already sets an
-    // explicit zen_toggle), returning None — leave that reported.
-    if let Some(chord) = shelbi_state::keymap::heal_legacy_zen_toggle() {
+    // The keymap loader owns the move: it copies a non-default binding into
+    // keys.yaml (preserving the bound key) and removes the legacy field from
+    // config.yaml so the detector stops flagging it. `heal_legacy_zen_toggle`
+    // returns an events.log-token-safe `old->new` detail on success, or None
+    // when there's nothing on disk to heal (or a write failed) — leave that
+    // reported for the next run.
+    if let Some(detail) = shelbi_state::keymap::heal_legacy_zen_toggle() {
         record(
             applied,
             entry,
             "KEYMAP_ZEN_TOGGLE_LEGACY",
             &entry.canonical_path,
-            format!("zen_toggle:{chord}->keys.yaml"),
+            detail,
         );
     }
 }
@@ -1272,6 +1275,108 @@ workspaces:
         // Idempotent.
         let report2 = detect(&["demo".to_string()]).unwrap();
         assert_eq!(report2.auto_heal_count(), 0, "residual: {report2:?}");
+    }
+
+    #[test]
+    fn legacy_keymap_zen_toggle_auto_heals_on_start_and_discloses() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        // A global config.yaml still carrying the pre-keys.yaml binding home,
+        // with a non-default chord so the move into keys.yaml is observable.
+        std::fs::write(
+            home.join("config.yaml"),
+            "keymap:\n  zen_toggle: ctrl-g\n",
+        )
+        .unwrap();
+
+        let report = detect(&[]).unwrap();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == "KEYMAP_ZEN_TOGGLE_LEGACY"),
+            "detector should flag the legacy field: {report:?}"
+        );
+
+        let applied = apply_auto_heal(&[], &report);
+        assert!(
+            applied.iter().any(|c| c.code == "KEYMAP_ZEN_TOGGLE_LEGACY"),
+            "the legacy zen_toggle finding was not healed: {applied:?}"
+        );
+
+        // The binding moved into keys.yaml; config.yaml no longer carries it.
+        let keys = std::fs::read_to_string(home.join("keys.yaml")).unwrap();
+        assert!(keys.contains("zen_toggle: ctrl-g"), "keys.yaml: {keys}");
+        let cfg = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(!cfg.contains("zen_toggle"), "config.yaml still has it: {cfg}");
+
+        // Disclosed on events.log.
+        let events = shelbi_state::events_log_path().unwrap();
+        let log = std::fs::read_to_string(&events).unwrap_or_default();
+        assert!(
+            log.contains("config-upgrade") && log.contains("KEYMAP_ZEN_TOGGLE_LEGACY"),
+            "no disclosure line: {log}"
+        );
+
+        // Idempotent: re-detect finds nothing and a second apply writes nothing.
+        let report2 = detect(&[]).unwrap();
+        assert!(
+            !report2
+                .findings
+                .iter()
+                .any(|f| f.code == "KEYMAP_ZEN_TOGGLE_LEGACY"),
+            "residual after heal: {report2:?}"
+        );
+        let applied2 = apply_auto_heal(&[], &report2);
+        assert!(
+            !applied2.iter().any(|c| c.code == "KEYMAP_ZEN_TOGGLE_LEGACY"),
+            "second pass re-healed: {applied2:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_keymap_zen_toggle_stays_reported_when_preservation_fails() {
+        // Failure-safety: if the binding can't be preserved into keys.yaml (here,
+        // an unparseable keys.yaml), the on-start pass must NOT strip the legacy
+        // field — the finding stays reported rather than erasing the binding.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        std::fs::write(home.join("config.yaml"), "keymap:\n  zen_toggle: ctrl-g\n").unwrap();
+        // Unparseable keys.yaml → preservation fails.
+        std::fs::write(home.join("keys.yaml"), "defaults: [unclosed\n").unwrap();
+
+        let report = detect(&[]).unwrap();
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.code == "KEYMAP_ZEN_TOGGLE_LEGACY"));
+
+        let applied = apply_auto_heal(&[], &report);
+        assert!(
+            !applied.iter().any(|c| c.code == "KEYMAP_ZEN_TOGGLE_LEGACY"),
+            "must not heal (and disclose) when the binding couldn't be preserved: {applied:?}"
+        );
+        // config.yaml still carries the binding; keys.yaml left untouched.
+        let cfg = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(cfg.contains("zen_toggle"), "binding erased: {cfg}");
+        assert_eq!(
+            std::fs::read_to_string(home.join("keys.yaml")).unwrap(),
+            "defaults: [unclosed\n"
+        );
+        // Still reported for the next run.
+        let report2 = detect(&[]).unwrap();
+        assert!(report2
+            .findings
+            .iter()
+            .any(|f| f.code == "KEYMAP_ZEN_TOGGLE_LEGACY"));
     }
 
     // ---- slice 3: targeted single-finding apply --------------------------

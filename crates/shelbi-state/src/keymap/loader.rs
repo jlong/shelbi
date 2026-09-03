@@ -32,7 +32,7 @@ use super::actions::{
     SidebarAction, MODE_NAMES,
 };
 use super::chord::KeyChord;
-use crate::user_config::{load_user_config, save_user_config, ZenToggleChord};
+use crate::user_config::{load_user_config, save_user_config, user_config_path, ZenToggleChord};
 use crate::{atomic_write, shelbi_home};
 use crossterm::event::KeyEvent;
 use serde::Deserialize;
@@ -814,20 +814,238 @@ fn legacy_zen_toggle_chord() -> Option<String> {
     Some(chord.to_string())
 }
 
-/// Drive the legacy `config.yaml::keymap.zen_toggle` migration on demand,
-/// outside a full keymap load. The version-agnostic config validate-and-upgrade
-/// pass calls this to write-back-heal a `KEYMAP_ZEN_TOGGLE_LEGACY` finding by
-/// copying the chord into `keys.yaml::defaults.global.zen_toggle` and clearing
-/// the legacy field, exactly as a normal [`load_keymaps`] would.
+/// Write-back-heal a `KEYMAP_ZEN_TOGGLE_LEGACY` config-upgrade finding by
+/// **removing** the legacy `config.yaml::keymap.zen_toggle` field, first
+/// preserving a non-default binding by copying it into
+/// `keys.yaml::defaults.global.zen_toggle`.
 ///
-/// Returns `Some(chord)` when a migration was performed, or `None` when there
-/// was nothing to migrate or the migration had to be safe-skipped (for example
-/// `keys.yaml` already sets an explicit `zen_toggle`, or a file was
-/// unreadable), matching the semantics [`load_keymaps`] uses. Idempotent: a
-/// second call after a successful migration sees the legacy field back at its
-/// default and returns `None`.
+/// This differs from the load-time [`migrate_legacy_zen_toggle`] in one crucial
+/// way: it doesn't just reset the legacy field to its default (which
+/// [`save_user_config`] would re-serialize, leaving `keymap.zen_toggle` on disk
+/// and the detector flagging it forever) — it strips the field out of
+/// `config.yaml` entirely, so the finding stops recurring. The config-upgrade
+/// detector fires on the mere *presence* of the field regardless of value, so a
+/// scaffolded `zen_toggle: alt-z` (the built-in default) must be healed too;
+/// [`migrate_legacy_zen_toggle`] alone can't, since it treats the default value
+/// as a no-op.
+///
+/// Behavior by legacy value:
+/// - a real non-default chord (`ctrl-g`, `ctrl-\`, `ctrl-shift-z`): copied into
+///   `keys.yaml` (unless it already sets `zen_toggle` — then the keys.yaml value
+///   wins and the redundant legacy field is simply dropped) and removed from
+///   `config.yaml`.
+/// - the built-in default (`alt-z`) or `none`: no `keys.yaml` entry is needed
+///   (the built-in `alt-z` binding already applies), so the field is just
+///   removed.
+///
+/// Returns `Some(detail)` (an events.log-token-safe `old->new` description) when
+/// the legacy field was present and removed, or `None` when there was nothing to
+/// heal (no `keymap.zen_toggle` on disk) **or the binding couldn't be preserved
+/// safely** — see [`ChordPreservation`]. Idempotent: a second call sees no legacy
+/// field and returns `None`.
+///
+/// # Preservation before removal (the load-bearing invariant)
+///
+/// The legacy field is the user's only usable copy of a non-default binding until
+/// it lands in keys.yaml. So the field is removed **only after** preservation
+/// succeeds ([`ChordPreservation::Copied`]) or a known non-lossy drop applies
+/// ([`ChordPreservation::SafeNoCopy`]: the built-in default is already `alt-z`, or
+/// keys.yaml already sets a `zen_toggle` that wins). If preservation *fails*
+/// ([`ChordPreservation::Failed`] — an unreadable / unparseable / non-mapping
+/// keys.yaml, or a write error), the legacy field is left untouched and the
+/// finding stays reported for the next run, rather than erasing the binding.
 pub fn heal_legacy_zen_toggle() -> Option<String> {
-    migrate_legacy_zen_toggle()
+    let path = user_config_path().ok()?;
+    let text = fs::read_to_string(&path).ok()?;
+    // Only heal when the legacy field is actually present on disk — this keeps
+    // the healer in lockstep with the detector (which fires on presence).
+    if !config_has_legacy_zen_toggle(&text) {
+        return None;
+    }
+
+    // Preserve the binding the legacy field expresses BEFORE removing it. A
+    // `Failed` outcome means the binding could NOT be carried over safely, so we
+    // must not strip config.yaml — that would erase the only usable copy.
+    let detail = match preserve_legacy_zen_toggle_for_heal() {
+        ChordPreservation::Copied(detail) => detail,
+        ChordPreservation::SafeNoCopy(detail) => detail.to_string(),
+        ChordPreservation::Failed => return None,
+    };
+
+    // Strip the legacy `keymap` block out of config.yaml so the field is gone.
+    // (In the `Copied` case keys.yaml already holds the binding, so even if this
+    // strip is delayed to a later run — a rare IO failure below — nothing is
+    // lost: keys.yaml wins and the next heal reconciles the redundant field.)
+    let cleaned = strip_legacy_keymap(&text)?;
+    let cleaned = if cleaned.trim().is_empty() {
+        "{}\n".to_string()
+    } else {
+        cleaned
+    };
+    atomic_write(&path, cleaned.as_bytes()).ok()?;
+
+    Some(detail)
+}
+
+/// Outcome of trying to preserve a legacy `config.yaml::keymap.zen_toggle`
+/// binding into `keys.yaml` before [`heal_legacy_zen_toggle`] strips the legacy
+/// field. The three-way split is the fix for the failure mode where a single
+/// `Option::None` conflated "nothing to carry over" with "preservation failed",
+/// so the caller stripped the field even when the binding was never saved.
+enum ChordPreservation {
+    /// The binding was written into `keys.yaml::defaults.global.zen_toggle`
+    /// (a real chord, or an explicit unbind for the "no hotkey" choice). Safe to
+    /// remove the legacy field. Carries the events.log-token-safe detail.
+    Copied(String),
+    /// No copy was needed and dropping the legacy field is non-lossy: the legacy
+    /// value is the built-in default (`alt-z`, still bound by the built-in), or
+    /// keys.yaml already sets a `zen_toggle` that wins (the legacy field is a
+    /// redundant, dead duplicate). Safe to remove the legacy field.
+    SafeNoCopy(&'static str),
+    /// Preservation could not be completed safely: keys.yaml is unreadable,
+    /// unparseable, or not a mapping, or the write failed. The caller must leave
+    /// the legacy field in place — the finding stays reported for the next run.
+    Failed,
+}
+
+/// Preserve the binding the legacy `config.yaml::keymap.zen_toggle` field
+/// expresses so [`heal_legacy_zen_toggle`] can safely drop it. Reads the effective
+/// binding from the loaded user config (so the enum→chord mapping matches what the
+/// runtime uses), then:
+///
+/// - `AltZ`: the built-in default already binds `alt-z`; no copy needed →
+///   [`ChordPreservation::SafeNoCopy`].
+/// - `None` (hotkey disabled): copy an explicit unbind (`zen_toggle: []`) into
+///   keys.yaml so dropping the field doesn't silently re-enable the built-in
+///   `alt-z`. Preserves the user's "no hotkey" choice.
+/// - a real non-default chord (`ctrl-\`, `ctrl-g`, `ctrl-shift-z`): copy the chord
+///   into keys.yaml, preserving the bound key.
+///
+/// For the two copy cases, a keys.yaml that already sets `zen_toggle` wins — the
+/// legacy field is redundant, so we report [`ChordPreservation::SafeNoCopy`] and
+/// let the caller drop it. Any read/parse/shape/write failure is
+/// [`ChordPreservation::Failed`], and the field is left in place.
+fn preserve_legacy_zen_toggle_for_heal() -> ChordPreservation {
+    // If config.yaml won't even parse we can't know the binding — refuse to
+    // strip. (The field is present per the caller's raw-text check, but a value
+    // the enum can't represent means the whole config failed to load and the
+    // safe move is to leave it for the user / next run.)
+    let Ok(cfg) = load_user_config() else {
+        return ChordPreservation::Failed;
+    };
+
+    // The chord to splice into keys.yaml, or the safe-drop reason if no copy is
+    // needed. `AltZ` is the only value where dropping restores the identical
+    // effective binding with no keys.yaml entry.
+    let value = match cfg.keymap.zen_toggle {
+        ZenToggleChord::AltZ => return ChordPreservation::SafeNoCopy("drop:zen_toggle"),
+        ZenToggleChord::None => ZenToggleValue::Unbind,
+        ZenToggleChord::CtrlBackslash => ZenToggleValue::Chord("ctrl-\\"),
+        ZenToggleChord::CtrlG => ZenToggleValue::Chord("ctrl-g"),
+        ZenToggleChord::CtrlShiftZ => ZenToggleValue::Chord("ctrl-shift-z"),
+    };
+
+    let (yaml_value, detail) = match value {
+        ZenToggleValue::Chord(c) => {
+            (Value::String(c.to_string()), format!("zen_toggle:{c}->keys.yaml"))
+        }
+        ZenToggleValue::Unbind => (
+            Value::Sequence(Vec::new()),
+            "zen_toggle:none->keys.yaml".to_string(),
+        ),
+    };
+
+    match splice_zen_toggle_into_keys_yaml(yaml_value) {
+        SpliceOutcome::Wrote => ChordPreservation::Copied(detail),
+        // keys.yaml already sets zen_toggle — its value wins, the legacy field is
+        // a dead duplicate that's safe to drop.
+        SpliceOutcome::Conflict => ChordPreservation::SafeNoCopy("drop:zen_toggle"),
+        SpliceOutcome::Failed => ChordPreservation::Failed,
+    }
+}
+
+/// The keys.yaml value a heal preserves for a given legacy binding: either a
+/// concrete chord string or an explicit unbind (empty list) for "no hotkey".
+enum ZenToggleValue {
+    Chord(&'static str),
+    Unbind,
+}
+
+/// Does `text` (a `config.yaml`) carry a `keymap.zen_toggle` entry? Parsed
+/// structurally so flow- and block-style both count. This is the same
+/// presence test the config-upgrade detector applies, so healer and detector
+/// agree on exactly which files need healing.
+fn config_has_legacy_zen_toggle(text: &str) -> bool {
+    serde_yaml::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| {
+            v.as_mapping()?
+                .get(Value::String("keymap".into()))?
+                .as_mapping()?
+                .get(Value::String("zen_toggle".into()))
+                .cloned()
+        })
+        .is_some()
+}
+
+/// Remove the legacy top-level `keymap:` block from a config.yaml text,
+/// preserving every other line and comment. Prefers a comment-preserving line
+/// strip (the scaffolded config.yaml is comment-bearing); falls back to a
+/// structural serde round-trip for shapes the line scanner can't handle
+/// (flow-style mappings) so the field is always removed when present. Returns
+/// `None` only when there is no `keymap.zen_toggle` to remove.
+fn strip_legacy_keymap(text: &str) -> Option<String> {
+    if !config_has_legacy_zen_toggle(text) {
+        return None;
+    }
+    if let Some(stripped) = strip_keymap_block_lines(text) {
+        // Only trust the line strip if it actually removed the field.
+        if !config_has_legacy_zen_toggle(&stripped) {
+            return Some(stripped);
+        }
+    }
+    strip_keymap_via_serde(text)
+}
+
+/// Comment-preserving strip: drop the top-level `keymap:` line and every
+/// following blank or more-indented line up to the next top-level key. Returns
+/// `None` when there's no top-level `keymap:` line to anchor on.
+fn strip_keymap_block_lines(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let km = lines.iter().position(|l| {
+        let indent = l.len() - l.trim_start().len();
+        indent == 0 && l.trim_start().starts_with("keymap:")
+    })?;
+    // The block runs until the next non-blank, indent-0 (top-level) line.
+    let mut end = lines.len();
+    for (i, l) in lines.iter().enumerate().skip(km + 1) {
+        if l.trim().is_empty() {
+            continue;
+        }
+        let indent = l.len() - l.trim_start().len();
+        if indent == 0 {
+            end = i;
+            break;
+        }
+    }
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    out.extend_from_slice(&lines[..km]);
+    out.extend_from_slice(&lines[end..]);
+    let mut joined = out.join("\n");
+    if text.ends_with('\n') && !joined.is_empty() {
+        joined.push('\n');
+    }
+    Some(joined)
+}
+
+/// Structural fallback strip: parse, drop the whole `keymap` key, re-serialize.
+/// Loses comments, so it's only used when the line strip can't cleanly remove
+/// the field (e.g. a hand-authored flow-style `keymap: {zen_toggle: ...}`).
+fn strip_keymap_via_serde(text: &str) -> Option<String> {
+    let mut value: Value = serde_yaml::from_str(text).ok()?;
+    let map = value.as_mapping_mut()?;
+    map.shift_remove(Value::String("keymap".into()))?;
+    serde_yaml::to_string(&value).ok()
 }
 
 /// One-shot migration: copy a non-default `config.yaml::keymap.zen_toggle`
@@ -852,69 +1070,113 @@ pub fn heal_legacy_zen_toggle() -> Option<String> {
 ///   too. Best-effort — a one-time migration warning is preferable to a
 ///   broken Zen toggle.
 fn migrate_legacy_zen_toggle() -> Option<String> {
-    // Step 1: read the legacy field. Bail early on the no-op cases.
-    let chord = legacy_zen_toggle_chord()?;
+    // Copy the non-default legacy chord into keys.yaml (the shared step). Bail
+    // on the no-op / conflict cases where there's nothing to carry over.
+    let chord = copy_legacy_chord_into_keys_yaml()?;
 
-    // Step 2: refuse to migrate when keys.yaml exists but is unreadable
-    // or unparseable. The user's hand-authored content matters more than
-    // a clean reconciliation; the loader's separate parse-error
-    // diagnostic will surface the underlying problem.
-    let path = match shelbi_home() {
-        Ok(h) => h.join(KEYS_FILENAME),
-        Err(_) => return None,
-    };
-    let mut root = match read_keys_yml_value(&path) {
-        ReadKeysYml::Empty => Value::Mapping(Mapping::new()),
-        ReadKeysYml::Parsed(v) => v,
-        ReadKeysYml::Unreadable => return None,
-    };
-
-    // Step 3: if the user has explicitly set defaults.global.zen_toggle,
-    // we don't have a clean place to put the legacy chord — both configs
-    // disagree and the user has to pick. Let the LegacyZenToggleField
-    // warning fire from the caller.
-    if keys_yml_defaults_zen_toggle(&root).is_some() {
-        return None;
-    }
-
-    // Step 4: splice defaults.global.zen_toggle = <chord> into the
-    // existing keys.yaml tree, preserving every other key.
-    let root_map = match root.as_mapping_mut() {
-        Some(m) => m,
-        None => {
-            // The file parsed as a YAML scalar / sequence at the top
-            // level (not a mapping). That's not a shape the loader
-            // expects, so don't overwrite — let the parse error path
-            // surface and the user decide.
-            return None;
-        }
-    };
-    let defaults = upsert_mapping(root_map, "defaults")?;
-    let global = upsert_mapping(defaults, "global")?;
-    global.insert(
-        Value::String("zen_toggle".into()),
-        Value::String(chord.clone()),
-    );
-
-    // Step 5: write keys.yaml. If serialization or IO fails, bail and
-    // leave the legacy field as the runtime source of truth.
-    let yaml = serde_yaml::to_string(&root).ok()?;
-    atomic_write(&path, yaml.as_bytes()).ok()?;
-
-    // Step 6: reset the legacy field so the next startup is silent.
-    // Keep the file on disk — `zen_probe::ensure_zen_keymap` treats a
-    // missing config.yaml as "first run" and would otherwise re-prompt
-    // the user with the fallback chooser they already escaped from.
+    // Reset the legacy field so the next startup is silent. Keep the file on
+    // disk — `zen_probe::ensure_zen_keymap` treats a missing config.yaml as
+    // "first run" and would otherwise re-prompt the user with the fallback
+    // chooser they already escaped from.
     //
-    // If this write fails, keys.yaml already has the chord — the next
-    // load will re-trigger the migration warning (and retry), but the
-    // chord still resolves correctly. Worst case is a repeat notice,
-    // not a broken binding.
+    // If this write fails, keys.yaml already has the chord — the next load will
+    // re-trigger the migration warning (and retry), but the chord still resolves
+    // correctly. Worst case is a repeat notice, not a broken binding.
     let mut cfg = load_user_config().unwrap_or_default();
     cfg.keymap.zen_toggle = ZenToggleChord::default();
     let _ = save_user_config(&cfg);
 
     Some(chord)
+}
+
+/// Copy a non-default `config.yaml::keymap.zen_toggle` chord into
+/// `keys.yaml::defaults.global.zen_toggle`, preserving every other keys.yaml
+/// entry. Returns `Some(chord)` when keys.yaml was (re)written, or `None` on the
+/// no-op / safe-skip cases: the legacy field is at its built-in default (AltZ)
+/// or unbound (None), keys.yaml already sets an explicit `zen_toggle` (its value
+/// wins), keys.yaml is unreadable/non-mapping, or the write failed.
+///
+/// Used by the load-time [`migrate_legacy_zen_toggle`], which only ever migrates
+/// a real non-default chord (never AltZ/None). It does NOT touch config.yaml, so
+/// the caller controls how the legacy field is cleared afterward. The
+/// config-upgrade heal path instead goes through
+/// [`preserve_legacy_zen_toggle_for_heal`], which needs to distinguish the
+/// conflict/failure cases this `Option` flattens together.
+fn copy_legacy_chord_into_keys_yaml() -> Option<String> {
+    // Read the legacy field. Bail early on the no-op cases (AltZ/None).
+    let chord = legacy_zen_toggle_chord()?;
+    match splice_zen_toggle_into_keys_yaml(Value::String(chord.clone())) {
+        SpliceOutcome::Wrote => Some(chord),
+        // Conflict (keys.yaml already set) and failure both mean "don't migrate";
+        // the load-time path leaves the legacy field as the runtime source of
+        // truth and the loader's own diagnostics surface any parse error.
+        SpliceOutcome::Conflict | SpliceOutcome::Failed => None,
+    }
+}
+
+/// Result of splicing (or attempting to splice) a `zen_toggle` value into
+/// `keys.yaml::defaults.global.zen_toggle`.
+enum SpliceOutcome {
+    /// The value was written into keys.yaml (every other entry preserved).
+    Wrote,
+    /// keys.yaml already sets an explicit `zen_toggle` — left untouched (it
+    /// wins). No write happened; this is a *safe* skip, not a failure.
+    Conflict,
+    /// keys.yaml is unreadable / unparseable / not a top-level mapping, or the
+    /// write failed. No usable copy was made — an *unsafe* skip.
+    Failed,
+}
+
+/// Splice `defaults.global.zen_toggle = value` into keys.yaml, preserving every
+/// other entry. Refuses with [`SpliceOutcome::Conflict`] when keys.yaml already
+/// sets `zen_toggle` (its value wins), and with [`SpliceOutcome::Failed`] when
+/// keys.yaml can't be safely read (unreadable/unparseable/non-mapping) or the
+/// write fails. Shared by [`copy_legacy_chord_into_keys_yaml`] (load-time
+/// migration) and [`preserve_legacy_zen_toggle_for_heal`] (config-upgrade heal),
+/// so the two paths can never disagree on what counts as a safe write.
+fn splice_zen_toggle_into_keys_yaml(value: Value) -> SpliceOutcome {
+    let path = match shelbi_home() {
+        Ok(h) => h.join(KEYS_FILENAME),
+        Err(_) => return SpliceOutcome::Failed,
+    };
+    // Refuse to overwrite a keys.yaml we couldn't parse — the user's hand-authored
+    // content matters more than a clean reconciliation; the loader's separate
+    // parse-error diagnostic surfaces the underlying problem.
+    let mut root = match read_keys_yml_value(&path) {
+        ReadKeysYml::Empty => Value::Mapping(Mapping::new()),
+        ReadKeysYml::Parsed(v) => v,
+        ReadKeysYml::Unreadable => return SpliceOutcome::Failed,
+    };
+
+    // If the user has explicitly set defaults.global.zen_toggle, keys.yaml wins —
+    // the legacy field is a dead duplicate. Don't clobber the user's value.
+    if keys_yml_defaults_zen_toggle(&root).is_some() {
+        return SpliceOutcome::Conflict;
+    }
+
+    // Splice into the existing keys.yaml tree, preserving every other key. A
+    // non-mapping top level (scalar/sequence) isn't a shape the loader expects,
+    // so refuse rather than overwrite.
+    let Some(root_map) = root.as_mapping_mut() else {
+        return SpliceOutcome::Failed;
+    };
+    let Some(defaults) = upsert_mapping(root_map, "defaults") else {
+        return SpliceOutcome::Failed;
+    };
+    let Some(global) = upsert_mapping(defaults, "global") else {
+        return SpliceOutcome::Failed;
+    };
+    global.insert(Value::String("zen_toggle".into()), value);
+
+    // Write keys.yaml. If serialization or IO fails, report failure so the caller
+    // leaves the legacy field in place.
+    let Ok(yaml) = serde_yaml::to_string(&root) else {
+        return SpliceOutcome::Failed;
+    };
+    if atomic_write(&path, yaml.as_bytes()).is_err() {
+        return SpliceOutcome::Failed;
+    }
+    SpliceOutcome::Wrote
 }
 
 enum ReadKeysYml {
@@ -2095,5 +2357,232 @@ defaults:
             "default config must not warn on shared ctrl-c, got {diags:?}"
         );
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    // ---- config-upgrade write-back: heal_legacy_zen_toggle ---------------
+
+    #[test]
+    fn heal_removes_default_field_and_is_idempotent() {
+        // The config-upgrade detector fires on the mere presence of
+        // `keymap.zen_toggle`, so even the built-in default `alt-z` must be
+        // healed — by removing the field, not resetting it (a reset would
+        // re-serialize the key and the finding would recur forever). No
+        // keys.yaml entry is needed since the built-in already binds alt-z.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::write(home.join("config.yaml"), "keymap:\n  zen_toggle: alt-z\n").unwrap();
+
+        let detail = heal_legacy_zen_toggle().expect("field present -> heals");
+        assert_eq!(detail, "drop:zen_toggle");
+        // The legacy field is gone from config.yaml.
+        let cfg_text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(
+            !config_has_legacy_zen_toggle(&cfg_text),
+            "field not removed: {cfg_text}"
+        );
+        // No keys.yaml was created (alt-z is the built-in default).
+        assert!(!home.join("keys.yaml").exists());
+        // Idempotent: a second heal finds nothing to do.
+        assert!(heal_legacy_zen_toggle().is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn heal_migrates_non_default_chord_into_keys_yaml() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::write(home.join("config.yaml"), "keymap:\n  zen_toggle: ctrl-g\n").unwrap();
+
+        let detail = heal_legacy_zen_toggle().expect("heals");
+        assert_eq!(detail, "zen_toggle:ctrl-g->keys.yaml");
+
+        // The binding survived the move into keys.yaml and still toggles Zen.
+        let (km, _diags) = load_keymaps(None);
+        assert_eq!(
+            km.global
+                .dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            Some(GlobalAction::ZenToggle)
+        );
+        // config.yaml no longer carries the legacy field.
+        let cfg_text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(!config_has_legacy_zen_toggle(&cfg_text), "{cfg_text}");
+        // Idempotent.
+        assert!(heal_legacy_zen_toggle().is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn heal_preserves_comments_and_unrelated_keys() {
+        // The scaffolded config.yaml is comment-bearing; healing must strip the
+        // legacy `keymap` block surgically and leave every other line intact.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let scaffold = "\
+## Shelbi global config
+## Absent or partial files fall back to built-in defaults.
+
+keymap:
+  ## Chord that toggles Zen Mode. Legacy.
+  zen_toggle: ctrl-g
+
+## Editor comment.
+editor: hx
+";
+        std::fs::write(home.join("config.yaml"), scaffold).unwrap();
+
+        heal_legacy_zen_toggle().expect("heals");
+        let out = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(!out.contains("zen_toggle"), "legacy field remains: {out}");
+        assert!(!out.contains("keymap:"), "keymap block remains: {out}");
+        assert!(out.contains("## Shelbi global config"), "header lost: {out}");
+        assert!(out.contains("## Editor comment."), "editor comment lost: {out}");
+        // The unrelated `editor` key survives the round-trip.
+        let cfg = load_user_config().unwrap();
+        assert_eq!(cfg.editor.as_deref(), Some("hx"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn heal_drops_redundant_field_on_keys_yaml_conflict() {
+        // When keys.yaml already sets an explicit zen_toggle, its value wins and
+        // the config.yaml field is dead. Healing drops the redundant field
+        // (resolving the finding) without clobbering the keys.yaml binding.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::write(home.join("config.yaml"), "keymap:\n  zen_toggle: ctrl-g\n").unwrap();
+        std::fs::write(
+            home.join("keys.yaml"),
+            "defaults:\n  global:\n    zen_toggle: ctrl-\\\n",
+        )
+        .unwrap();
+
+        let detail = heal_legacy_zen_toggle().expect("heals");
+        assert_eq!(detail, "drop:zen_toggle");
+        // keys.yaml value is untouched — it wins.
+        let (km, _diags) = load_keymaps(None);
+        assert_eq!(
+            km.global
+                .dispatch(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL)),
+            Some(GlobalAction::ZenToggle)
+        );
+        let cfg_text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(!config_has_legacy_zen_toggle(&cfg_text), "{cfg_text}");
+        assert!(heal_legacy_zen_toggle().is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn heal_is_noop_when_field_absent() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // No config.yaml at all.
+        assert!(heal_legacy_zen_toggle().is_none());
+        // A config.yaml with no keymap block.
+        std::fs::write(home.join("config.yaml"), "editor: hx\n").unwrap();
+        assert!(heal_legacy_zen_toggle().is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn heal_preserves_disabled_hotkey_as_unbind() {
+        // `zen_toggle: none` is the user's explicit "no hotkey" choice. Healing
+        // must NOT just drop the field (that re-enables the built-in alt-z) — it
+        // preserves the intent as an explicit unbind in keys.yaml, then drops the
+        // legacy field.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::write(home.join("config.yaml"), "keymap:\n  zen_toggle: none\n").unwrap();
+
+        let detail = heal_legacy_zen_toggle().expect("heals");
+        assert_eq!(detail, "zen_toggle:none->keys.yaml");
+
+        // Zen toggle is unbound — the built-in alt-z did NOT sneak back in.
+        let (km, _diags) = load_keymaps(None);
+        assert_eq!(
+            km.global
+                .dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
+            None,
+            "disabled hotkey must stay disabled after heal"
+        );
+        assert!(km.global.first_chord_for(GlobalAction::ZenToggle).is_none());
+        // Legacy field gone; idempotent.
+        let cfg_text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(!config_has_legacy_zen_toggle(&cfg_text), "{cfg_text}");
+        assert!(heal_legacy_zen_toggle().is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn heal_leaves_field_when_keys_yaml_unparseable() {
+        // Regression: a non-default binding must not be erased when its only
+        // usable copy (config.yaml) is dropped while preservation into keys.yaml
+        // failed. An unparseable keys.yaml is a preservation failure — the legacy
+        // field stays put and the finding stays reported.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::write(home.join("config.yaml"), "keymap:\n  zen_toggle: ctrl-g\n").unwrap();
+        // Invalid YAML — read_keys_yml_value returns Unreadable.
+        std::fs::write(home.join("keys.yaml"), "defaults: [unclosed\n").unwrap();
+
+        // Heal is refused (no strip, no disclosure).
+        assert!(
+            heal_legacy_zen_toggle().is_none(),
+            "heal must refuse when keys.yaml can't be preserved into"
+        );
+        // config.yaml still carries the binding — nothing erased.
+        let cfg_text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(
+            config_has_legacy_zen_toggle(&cfg_text),
+            "legacy field must survive a failed preservation: {cfg_text}"
+        );
+        // keys.yaml was left exactly as-is (never clobbered).
+        assert_eq!(
+            std::fs::read_to_string(home.join("keys.yaml")).unwrap(),
+            "defaults: [unclosed\n"
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn heal_leaves_field_when_keys_yaml_non_mapping() {
+        // A keys.yaml whose top level is a sequence (not a mapping) is a shape the
+        // loader doesn't expect — preservation fails, so the legacy field stays.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::write(home.join("config.yaml"), "keymap:\n  zen_toggle: ctrl-g\n").unwrap();
+        std::fs::write(home.join("keys.yaml"), "- a\n- b\n").unwrap();
+
+        assert!(heal_legacy_zen_toggle().is_none());
+        let cfg_text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
+        assert!(config_has_legacy_zen_toggle(&cfg_text), "{cfg_text}");
+        // The non-mapping keys.yaml was left untouched.
+        assert_eq!(
+            std::fs::read_to_string(home.join("keys.yaml")).unwrap(),
+            "- a\n- b\n"
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn strip_flow_style_keymap_falls_back_to_serde() {
+        // A hand-authored flow-style mapping the line scanner can't parse must
+        // still get the field removed via the serde fallback.
+        let text = "keymap: {zen_toggle: ctrl-g}\neditor: hx\n";
+        let out = strip_legacy_keymap(text).expect("removes flow-style keymap");
+        assert!(!config_has_legacy_zen_toggle(&out), "{out}");
+        let parsed: Value = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(
+            parsed.get("editor").and_then(Value::as_str),
+            Some("hx"),
+            "unrelated key lost: {out}"
+        );
     }
 }
