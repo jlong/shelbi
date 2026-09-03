@@ -48,6 +48,8 @@ pub use issue_auth::{
     resolve_github_token, resolve_github_token_by_name, token_file_path, SecretToken, TokenSource,
 };
 pub use github_store::GitHubStore;
+#[cfg(any(test, feature = "test-support"))]
+pub use github_store::{clear_test_gh_runner, set_test_gh_runner};
 pub use issue_migrate::{
     apply_issue_migration, plan_issue_migration, IssueMigrationPlan,
 };
@@ -3081,28 +3083,47 @@ pub fn reject_review_task(
     reason: &str,
     date: &str,
 ) -> Result<Option<(Column, Column, String)>> {
+    // Resolve the ready status the card bounces to from the task's workflow;
+    // fall back to the stock `todo` column if the workflow can't be loaded or
+    // declares no ready status, so a config hiccup still frees the slot. This
+    // read happens outside the write lock — the parametrized helper below takes
+    // it — but a racing workflow-config edit only ever moves the target column,
+    // which the locked helper then applies atomically.
+    let task = load_task(project, id)?.task;
+    let ready_column = load_project(project)
+        .ok()
+        .and_then(|p| load_task_workflow(project, &p, &task).ok())
+        .and_then(|wf| wf.ready_status().map(|s| Column::from_status_id(&s.id)))
+        .unwrap_or_else(Column::todo);
+    reject_review_task_to(project, id, &ready_column, reason, date)
+}
+
+/// The lock-holding core of [`reject_review_task`], with the `ready` column
+/// resolved by the caller rather than re-derived from the workflow. This is the
+/// backend-agnostic shape [`crate::FileSystemStore::reject_review`] delegates to:
+/// the [`IssueStore`] seam resolves `ready` from the issue's workflow (mirroring
+/// how the accept path resolves its forward target) and hands it in, so the
+/// store never has to load the workflow config itself.
+pub fn reject_review_task_to(
+    project: &str,
+    id: &str,
+    ready: &Column,
+    reason: &str,
+    date: &str,
+) -> Result<Option<(Column, Column, String)>> {
     hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
     let IssueFile { mut task, body } = load_task(project, id)?;
     let old_column = task.column.clone();
     let workflow = resolved_task_workflow_name_for_project(project, &task)?;
 
-    // Resolve the ready status the card bounces to from the task's workflow;
-    // fall back to the stock `todo` column if the workflow can't be loaded or
-    // declares no ready status, so a config hiccup still frees the slot.
-    let ready_column = load_project(project)
-        .ok()
-        .and_then(|p| load_task_workflow(project, &p, &task).ok())
-        .and_then(|wf| wf.ready_status().map(|s| Column::from_status_id(&s.id)))
-        .unwrap_or_else(Column::todo);
-
     let new_body = format!("{}{}", body, format_review_feedback_section(reason, date));
 
-    let already_ready = old_column == ready_column;
+    let already_ready = old_column == *ready;
     task.assigned_to = None;
     if !already_ready {
-        task.column = ready_column.clone();
-        task.priority = list_column(project, ready_column.clone())?.len() as u32;
+        task.column = ready.clone();
+        task.priority = list_column(project, ready.clone())?.len() as u32;
     }
     task.updated_at = chrono::Utc::now();
     save_task_unlocked(project, &task, &new_body)?;
@@ -3110,8 +3131,8 @@ pub fn reject_review_task(
         return Ok(None);
     }
     renumber_column_unlocked(project, old_column.clone())?;
-    renumber_column_unlocked(project, ready_column.clone())?;
-    Ok(Some((old_column, ready_column, workflow)))
+    renumber_column_unlocked(project, ready.clone())?;
+    Ok(Some((old_column, ready.clone(), workflow)))
 }
 
 /// Re-position `id` to slot `new_priority` within its current column. Other

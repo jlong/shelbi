@@ -3678,4 +3678,180 @@ statuses:
 
         std::env::remove_var("SHELBI_HOME");
     }
+
+    // --- GitHub-backed command paths -----------------------------------------
+    //
+    // These exercise the real `assign` / `unassign` / `show` / `start` command
+    // functions against a project whose `issue_tracker.backend` is `github`,
+    // with a fake `gh` runner injected via `shelbi_state::set_test_gh_runner`
+    // (the `test-support` feature). They prove the migrated command paths reach
+    // the configured backend — not the local filesystem board — and that a
+    // GitHub-only issue needs no local task markdown file to operate on.
+
+    /// A project YAML selecting the GitHub backend (`owner/repo`) with one plain
+    /// `dev` workspace. No `tasks/` directory is ever created for it.
+    fn write_github_project_yaml(home: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::write(
+            home.join(format!("projects/{name}.yaml")),
+            format!(
+                r#"name: {name}
+repo: /tmp/{name}
+default_branch: main
+issue_tracker:
+  backend: github
+  github:
+    repo: owner/repo
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+machines:
+  - name: local
+    kind: local
+    work_dir: /tmp/{name}
+workspaces:
+  - {{ name: dev, machine: local, runner: claude }}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Install a fake `gh` runner that answers every issue read with `issue_json`
+    /// (a single JSONL object), an empty set for `/labels` and `/comments`, and
+    /// `{}` for any mutating call — enough for the read-only + overlay-only
+    /// command paths under test to run without a network or a real repo.
+    fn install_gh_issue_runner(issue_json: String) {
+        shelbi_state::set_test_gh_runner(move |args: &[&str]| -> shelbi_core::Result<String> {
+            let method = args
+                .iter()
+                .position(|a| *a == "-X")
+                .and_then(|i| args.get(i + 1))
+                .copied()
+                .unwrap_or("GET");
+            if method != "GET" {
+                return Ok("{}".to_string());
+            }
+            let path = args
+                .iter()
+                .find(|a| a.contains("repos/"))
+                .copied()
+                .unwrap_or("");
+            if path.ends_with("/labels") || path.contains("/comments") {
+                return Ok(String::new());
+            }
+            Ok(issue_json.to_string())
+        });
+    }
+
+    /// One GitHub issue object (JSONL) with the given shelbi id + status label.
+    fn gh_issue_json(id: &str, status: &str) -> String {
+        format!(
+            r#"{{"number":7,"title":"{id}","body":"Prose for {id}.","state":"open","labels":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/{status}"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
+        )
+    }
+
+    #[test]
+    fn show_renders_a_github_only_issue_with_no_local_file() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+        install_gh_issue_runner(gh_issue_json("t", "review"));
+
+        // `show` reads through the store; there is no `tasks/t.md` on disk, and
+        // the command must still succeed (the first-pass regression).
+        show("gh", "t").expect("show renders a GitHub-only issue");
+        assert!(
+            !shelbi_state::task_path("gh", "t").unwrap().exists(),
+            "no local task markdown file should be required or created"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn assign_persists_the_owner_through_the_github_store_without_a_local_file() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+        install_gh_issue_runner(gh_issue_json("t", "todo"));
+
+        assign("gh", "t", "dev", false).expect("assign through the github store");
+
+        // The owner is recoverable by re-reading through a freshly resolved
+        // store — the assignment overlay the daemon's ownership scans consult —
+        // even though GitHub itself stores no assignment.
+        let owner = shelbi_state::issue_store_for("gh")
+            .unwrap()
+            .get("t")
+            .unwrap()
+            .unwrap()
+            .task
+            .assigned_to;
+        assert_eq!(owner.as_deref(), Some("dev"));
+        // No phantom local task file was written.
+        assert!(!shelbi_state::task_path("gh", "t").unwrap().exists());
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn unassign_clears_the_owner_through_the_github_store() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+        install_gh_issue_runner(gh_issue_json("t", "todo"));
+
+        assign("gh", "t", "dev", false).unwrap();
+        unassign("gh", "t").expect("unassign through the github store");
+
+        let owner = shelbi_state::issue_store_for("gh")
+            .unwrap()
+            .get("t")
+            .unwrap()
+            .unwrap()
+            .task
+            .assigned_to;
+        assert_eq!(owner, None);
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn start_resolves_the_owner_through_the_github_store() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+        install_gh_issue_runner(gh_issue_json("t", "todo"));
+
+        // With no `--workspace` and no assignment on the (GitHub-backed) issue,
+        // `start` must fail cleanly with the "no assigned workspace" error —
+        // proving it resolved `assigned_to` through the store (which reads the
+        // github backend, not a local task file) before touching any pane.
+        let err = start("gh", "t", None, None, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no assigned workspace"),
+            "start should surface the no-owner error read through the github store: {err}"
+        );
+        assert!(!shelbi_state::task_path("gh", "t").unwrap().exists());
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

@@ -980,7 +980,7 @@ fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect
         // task untouched.
         PanelEffect::RejectPrompt => {
             if let Some(reason) = reject_reason_popup() {
-                match shelbi_orchestrator::review_ui::reject_review_task(
+                match shelbi_orchestrator::review_ui::reject_review(
                     project_name,
                     &app.task_id,
                     &reason,

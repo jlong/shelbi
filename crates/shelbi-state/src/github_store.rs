@@ -112,6 +112,45 @@ const META_END: &str = "<!-- shelbi:end -->";
 /// with resolved auth) and a test runner (canned JSON) are interchangeable.
 type GhRunner = Arc<dyn Fn(&[&str]) -> Result<String> + Send + Sync>;
 
+// --- test-support: injectable `gh` runner ------------------------------------
+//
+// A consumer crate (the CLI) needs to exercise its command paths — which resolve
+// a store from project config via `resolve_issue_store` and can't be handed a
+// store directly — against a GitHub backend without a network. A thread-local
+// override lets a test install a canned `gh` runner that every `GitHubStore::new`
+// on that thread picks up. Thread-local (not global) so parallel tests don't
+// clobber each other; gated to test builds so it never ships.
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static GH_RUNNER_OVERRIDE: std::cell::RefCell<Option<GhRunner>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn test_gh_runner_override() -> Option<GhRunner> {
+    GH_RUNNER_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+/// Install a fake `gh` runner for the current thread: every [`GitHubStore`]
+/// built on this thread (including those resolved from project config through
+/// [`crate::resolve_issue_store`]) routes its `gh api` calls to `runner`, which
+/// returns canned JSON. Test-only. Pair with [`clear_test_gh_runner`] so the
+/// override doesn't leak into a later test reusing the thread.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_test_gh_runner<F>(runner: F)
+where
+    F: Fn(&[&str]) -> Result<String> + Send + Sync + 'static,
+{
+    GH_RUNNER_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(Arc::new(runner)));
+}
+
+/// Remove any thread-local `gh` runner installed by [`set_test_gh_runner`].
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_test_gh_runner() {
+    GH_RUNNER_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+}
+
 /// The GitHub issues backend. A cheap handle: it holds the `owner/repo`
 /// selector and the `gh` runner closure, and resolves everything else per call.
 #[derive(Clone)]
@@ -144,6 +183,15 @@ impl GitHubStore {
     pub fn new(project: impl Into<String>, repo: impl Into<String>) -> Self {
         let project = project.into();
         let repo = repo.into();
+        // Test builds may install a thread-local `gh` runner override so a
+        // consumer crate can drive its command paths through a GitHub-configured
+        // store (resolved via `resolve_issue_store`) against canned JSON instead
+        // of a real repo. Absent an override — always, in a normal build — this
+        // is the real `gh` CLI with resolved auth.
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(runner) = test_gh_runner_override() {
+            return Self { project, repo, gh: runner };
+        }
         let project_for_gh = project.clone();
         let gh: GhRunner = Arc::new(move |args: &[&str]| run_gh(&project_for_gh, args));
         Self { project, repo, gh }
@@ -517,6 +565,43 @@ impl IssueStore for GitHubStore {
 
     fn clear_parked(&self, id: &str) -> Result<()> {
         crate::clear_task_parked(&self.project, id)
+    }
+
+    fn reject_review(
+        &self,
+        id: &str,
+        ready: &Column,
+        reason: &str,
+        date: &str,
+    ) -> Result<Option<StatusMove>> {
+        // The github expression of the atomic reject: append the reviewer's
+        // feedback to the human prose (preserving the fenced metadata block),
+        // then bounce the card back to `ready` and drop the local assignment
+        // overlay. GitHub has no cross-request transaction, so the body edit and
+        // the label swap are two calls; ordering the edit first means a failure
+        // between them leaves the feedback recorded rather than a moved-but-
+        // unedited card the next worker would pick up with no context.
+        let Some(gh) = self.get_raw(id)? else {
+            return Err(Error::Other(format!(
+                "issue `{id}` not found in {}",
+                self.repo
+            )));
+        };
+        let body_raw = gh.body.clone().unwrap_or_default();
+        let (prose, meta) = split_shelbi_meta(&body_raw);
+        let feedback = crate::format_review_feedback_section(reason, date);
+        let new_prose = format!("{}{}", prose, feedback);
+        let body = build_body(&new_prose, &meta);
+        self.api_send(
+            "PATCH",
+            &format!("repos/{}/issues/{}", self.repo, gh.number),
+            &[("body", body)],
+        )?;
+        // Move to `ready` and clear the owner overlay in one step — the same
+        // move-and-unassign the filesystem reject performs. Returns `None` when
+        // the card was already in `ready` (the body edit + unassign still land),
+        // matching the filesystem backend.
+        self.move_status_and_unassign(id, ready, "user:review-reject")
     }
 
     fn poll_changes(&self, since: &Cursor) -> Result<(Vec<IssueChange>, Cursor)> {
@@ -1752,6 +1837,55 @@ mod tests {
         assert_eq!(was.as_deref(), Some("review-1"));
         assert_eq!(crate::get_task_assignment("test-project", "t").unwrap(), None);
         assert!(crate::is_task_parked("test-project", "t").unwrap());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn reject_review_appends_feedback_moves_back_to_ready_and_clears_the_owner() {
+        let _g = crate::test_lock::LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A review-status issue with human prose and a fenced metadata block,
+        // owned by the review slot via the local overlay.
+        let review = r#"{"number":7,"title":"T","body":"Original prose.\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: app\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/review"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(review, review, "", "{}");
+        store
+            .set_fields(
+                "t",
+                IssueFields {
+                    assigned_to: Some(Some("review-1".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let mv = store
+            .reject_review("t", &Column::todo(), "please restore the handler", "2026-09-03")
+            .unwrap()
+            .expect("status changed review -> todo");
+        assert_eq!(mv.from, Column::review());
+        assert_eq!(mv.to, Column::todo());
+        assert_eq!(mv.workflow, "app");
+
+        let calls = calls.lock().unwrap();
+        // The body PATCH appends the dated feedback section while preserving the
+        // original prose and the metadata block.
+        let body_patch = call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/7", "body="])
+            .expect("body PATCH");
+        assert!(body_patch.contains("Review feedback (rejected 2026-09-03)"));
+        assert!(body_patch.contains("please restore the handler"));
+        assert!(body_patch.contains("Original prose."));
+        assert!(body_patch.contains(META_BEGIN));
+        // The status label was swapped to the ready column (todo).
+        assert!(call_containing(
+            &calls,
+            &["-X PUT", "repos/owner/repo/issues/7/labels", "labels[]=shelbi:status/todo"]
+        )
+        .is_some());
+        // The owner overlay is cleared — the freed review slot has no stale owner.
+        assert_eq!(crate::get_task_assignment("test-project", "t").unwrap(), None);
 
         std::env::remove_var("SHELBI_HOME");
     }

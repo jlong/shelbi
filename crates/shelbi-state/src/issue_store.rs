@@ -326,6 +326,25 @@ pub trait IssueStore {
     /// skipped by the auto-loader. See [`crate::clear_task_parked`].
     fn clear_parked(&self, id: &str) -> Result<()>;
 
+    /// **Reject** a review-status issue: append the reviewer's `reason` to the
+    /// issue body as a dated feedback section and bounce the card back to the
+    /// `ready` status, clearing its workspace assignment — all as one atomic
+    /// operation, so a crash can't leave the card edited-but-not-moved or
+    /// unowned-but-still-in-review. `date` is the pre-formatted rejection date
+    /// stamped into the section header (passed in for testability). The caller
+    /// resolves `ready` from the issue's workflow (the same way it resolves the
+    /// accept target for [`IssueStore::move_status`]), keeping the workflow layer
+    /// out of the store. Returns `Some(StatusMove)` when the status changed; the
+    /// body edit and owner-clear still land (returning `None`) when the card was
+    /// already in `ready`. See [`crate::reject_review_task_to`].
+    fn reject_review(
+        &self,
+        id: &str,
+        ready: &Column,
+        reason: &str,
+        date: &str,
+    ) -> Result<Option<StatusMove>>;
+
     /// Everything that changed since `since`, plus the cursor to pass next time.
     fn poll_changes(&self, since: &Cursor) -> Result<(Vec<IssueChange>, Cursor)>;
 
@@ -545,6 +564,16 @@ impl IssueStore for FileSystemStore {
 
     fn clear_parked(&self, id: &str) -> Result<()> {
         crate::clear_task_parked(&self.project, id)
+    }
+
+    fn reject_review(
+        &self,
+        id: &str,
+        ready: &Column,
+        reason: &str,
+        date: &str,
+    ) -> Result<Option<StatusMove>> {
+        Ok(crate::reject_review_task_to(&self.project, id, ready, reason, date)?.map(Into::into))
     }
 
     fn poll_changes(&self, since: &Cursor) -> Result<(Vec<IssueChange>, Cursor)> {
@@ -1053,6 +1082,40 @@ mod tests {
         assert!(!crate::is_task_parked("p", "a").unwrap());
         // Clearing again is idempotent.
         store.clear_parked("a").unwrap();
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn reject_review_appends_feedback_moves_to_ready_and_unassigns() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let store = FileSystemStore::new("p");
+
+        store.add(spec("a", Column::review())).unwrap();
+        store
+            .set_fields(
+                "a",
+                IssueFields {
+                    assigned_to: Some(Some("review-1".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let mv = store
+            .reject_review("a", &Column::todo(), "restore the handler", "2026-09-03")
+            .unwrap()
+            .expect("status changed");
+        assert_eq!(mv.from, Column::review());
+        assert_eq!(mv.to, Column::todo());
+
+        let after = store.get("a").unwrap().unwrap();
+        assert_eq!(after.task.column, Column::todo());
+        assert_eq!(after.task.assigned_to, None);
+        assert!(after.body.contains("Review feedback (rejected 2026-09-03)"));
+        assert!(after.body.contains("restore the handler"));
 
         std::env::remove_var("SHELBI_HOME");
     }

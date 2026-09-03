@@ -14,7 +14,7 @@
 //! On submit it writes the typed reason — newlines preserved verbatim — to
 //! `PATH` and exits 0; on cancel it writes nothing and exits non-zero. The
 //! launcher (the review panel) reads `PATH` back to drive the existing
-//! `reject_review_task` transition — the same plumbing the old inline prompt
+//! `review_ui::reject_review` transition — the same plumbing the old inline prompt
 //! used, only the input surface grew from one line to many. Blank reasons
 //! can't submit, matching the old inline prompt.
 

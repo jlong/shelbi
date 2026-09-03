@@ -50,6 +50,7 @@ const FORBIDDEN: &[&str] = &[
     "clear_task_parked",
     "park_review_task",
     "release_task_to_todo",
+    "reject_review_task",
 ];
 
 struct Finding {

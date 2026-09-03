@@ -8,6 +8,13 @@ repository.workspace = true
 authors.workspace = true
 description = "Markdown + frontmatter state IO for shelbi"
 
+[features]
+# Exposes test-only hooks (e.g. injecting a fake `gh` runner into the GitHub
+# backend so a consumer crate can exercise its command paths against a
+# GitHub-configured store without a network or a real repo). Enabled by the
+# consumer crates' dev-dependencies only — never in a normal build.
+test-support = []
+
 [dependencies]
 shelbi-core = { workspace = true }
 serde = { workspace = true }

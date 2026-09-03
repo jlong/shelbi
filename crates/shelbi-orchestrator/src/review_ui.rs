@@ -941,17 +941,31 @@ pub fn close_review_window(project_name: &str, task_id: &str) -> Result<()> {
 /// task description. Emits the move event on the existing channel — the
 /// structured signal the orchestrator reacts to — with the reason durably in
 /// the task body rather than a transient message.
-pub fn reject_review_task(project_name: &str, task_id: &str, reason: &str) -> Result<()> {
+pub fn reject_review(project_name: &str, task_id: &str, reason: &str) -> Result<()> {
     let date = Utc::now().format("%Y-%m-%d").to_string();
-    if let Some((from, to, wf)) =
-        shelbi_state::reject_review_task(project_name, task_id, reason, &date)?
-    {
+    let project = shelbi_state::load_project(project_name)?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let tf = store
+        .get(task_id)?
+        .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
+
+    // Resolve the ready status the card bounces back to from its workflow — the
+    // reject mirror of the accept path's `forward_status`. Fall back to the
+    // stock `todo` column when the workflow can't be loaded or declares no ready
+    // status, so a config hiccup still frees the review slot. Resolving `ready`
+    // here (not in the store) keeps the workflow layer out of the backend.
+    let ready = shelbi_state::load_task_workflow(project_name, &project, &tf.task)
+        .ok()
+        .and_then(|wf| wf.ready_status().map(|s| Column::from_status_id(&s.id)))
+        .unwrap_or_else(Column::todo);
+
+    if let Some(mv) = store.reject_review(task_id, &ready, reason, &date)? {
         let _ = shelbi_state::append_task_event(
             project_name,
             task_id,
-            &wf,
-            from,
-            to,
+            &mv.workflow,
+            mv.from,
+            mv.to,
             "user:review-reject",
         );
     }

@@ -45,6 +45,10 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# The GitHub-backend command tests resolve a store from project config and need
+# to inject a canned `gh` runner (no network / real repo); this feature exposes
+# `shelbi_state::set_test_gh_runner` for that. Dev-only — never in the shipped bin.
+shelbi-state = { workspace = true, features = ["test-support"] }
 # Used only by `tests/board_seam_gate.rs` to parse the consumer crates' sources
 # and assert no production code calls the low-level board functions directly.
 syn = { version = "2", features = ["full", "visit"] }
