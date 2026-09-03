@@ -2219,7 +2219,11 @@ pub fn save_agent(project: &str, agent: &Agent, body_md: &str) -> Result<()> {
 }
 
 /// Render a `---\n<yaml>\n---\n<body>` file. Caller owns the path/dir.
-fn write_frontmatter_file<T: serde::Serialize>(path: &Path, front: &T, body: &str) -> Result<()> {
+/// Render `front` (serialized as YAML) plus `body` into the frontmatter-file
+/// text — `---\n<yaml>\n---\n<body>\n` — the exact bytes [`write_frontmatter_file`]
+/// persists. Factored out so display paths can produce the on-disk
+/// representation without touching the filesystem (see [`render_task_file`]).
+fn render_frontmatter<T: serde::Serialize>(front: &T, body: &str) -> Result<String> {
     let yaml = serde_yaml::to_string(front)?;
     let mut buf = String::with_capacity(yaml.len() + body.len() + 32);
     buf.push_str("---\n");
@@ -2232,7 +2236,21 @@ fn write_frontmatter_file<T: serde::Serialize>(path: &Path, front: &T, body: &st
     if !body.ends_with('\n') {
         buf.push('\n');
     }
+    Ok(buf)
+}
+
+fn write_frontmatter_file<T: serde::Serialize>(path: &Path, front: &T, body: &str) -> Result<()> {
+    let buf = render_frontmatter(front, body)?;
     atomic_write(path, buf.as_bytes())
+}
+
+/// Render an [`IssueFile`] to its markdown-with-frontmatter representation —
+/// the same bytes [`save_task`] writes to disk. Display paths (e.g.
+/// `shelbi issue show`) use this to render an issue fetched from *any* backend
+/// through the [`crate::IssueStore`] seam, rather than reading the local task
+/// file directly (which a `github` backend never writes).
+pub fn render_task_file(tf: &IssueFile) -> Result<String> {
+    render_frontmatter(&tf.task, &tf.body)
 }
 
 /// Parsed result of an agent file.
@@ -2943,6 +2961,92 @@ pub fn park_review_task(project: &str, id: &str) -> Result<Option<String>> {
     save_task_unlocked(project, &task, &body)?;
     set_task_parked(project, id)?;
     Ok(was)
+}
+
+// ---------------------------------------------------------------------------
+// Local workspace-assignment overlay
+//
+// `assigned_to` is ephemeral local routing — which workspace currently owns an
+// issue — not durable board state. The filesystem backend stores it inline in
+// the task frontmatter, but a remote backend (GitHub) deliberately does NOT
+// push assignment to the tracker (plan §3): it is a shelbi-daemon concern, not
+// something a github.com viewer should see. So a backend that can't (or won't)
+// persist assignment on the remote keeps it here instead — a per-task marker
+// file under `<project_dir>/assignments/<id>` holding the workspace name.
+//
+// This keeps board state on the remote while the active-workspace, conflict,
+// and supervision scans (which all read `assigned_to` off a stored issue) still
+// recover which workspace owns a card. The filesystem backend never touches
+// these — its assignment lives in the frontmatter — so the overlay is exercised
+// only by the GitHub (and future remote) backends.
+
+/// Directory of workspace-assignment markers for `project`
+/// (`<project_dir>/assignments/`). Each file named `<task-id>` holds the name
+/// of the workspace that currently owns the issue.
+fn assignments_dir(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("assignments"))
+}
+
+/// Marker path for a single issue's assignment. Validates the id so a
+/// hostile/synced id can't escape the project's `assignments/` directory.
+fn assignment_marker_path(project: &str, id: &str) -> Result<PathBuf> {
+    validate_task_id(id)?;
+    Ok(assignments_dir(project)?.join(id))
+}
+
+/// Set (or clear) the local workspace assignment for `id`. `Some(ws)` records
+/// the owning workspace; `None` (or an empty name) removes the marker. Used by
+/// backends that don't persist `assigned_to` on the remote (GitHub). Idempotent.
+pub fn set_task_assignment(project: &str, id: &str, workspace: Option<&str>) -> Result<()> {
+    let path = assignment_marker_path(project, id)?;
+    match workspace.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(ws) => {
+            ensure_dir(&assignments_dir(project)?)?;
+            atomic_write(&path, ws.as_bytes())
+        }
+        None => match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(shelbi_core::Error::Io(e)),
+        },
+    }
+}
+
+/// The workspace `id` is assigned to in the local overlay, or `None` when the
+/// marker is absent or empty. The single-issue read backends apply on `get`.
+pub fn get_task_assignment(project: &str, id: &str) -> Result<Option<String>> {
+    let path = assignment_marker_path(project, id)?;
+    match fs::read_to_string(&path) {
+        Ok(s) => {
+            let s = s.trim();
+            Ok((!s.is_empty()).then(|| s.to_string()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
+/// Every local assignment for `project` as an `id -> workspace` map. A missing
+/// directory → empty map. Backends apply this once per board `list` so a
+/// whole-board read doesn't stat a marker file per issue.
+pub fn task_assignments(project: &str) -> Result<BTreeMap<String, String>> {
+    let dir = assignments_dir(project)?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    let mut out = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.map_err(shelbi_core::Error::Io)?;
+        let Some(id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if let Some(ws) = get_task_assignment(project, &id)? {
+            out.insert(id, ws);
+        }
+    }
+    Ok(out)
 }
 
 /// Marked-up header the review interface's **Reject** action appends to a
@@ -3927,6 +4031,58 @@ mod tests {
         clear_task_parked("p", "fix-docs").unwrap();
         assert_eq!(park_review_task("p", "fix-docs").unwrap(), None);
         assert!(is_task_parked("p", "fix-docs").unwrap());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn assignment_overlay_sets_reads_clears_and_lists() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Absent marker reads as unassigned.
+        assert_eq!(get_task_assignment("p", "a").unwrap(), None);
+        assert!(task_assignments("p").unwrap().is_empty());
+
+        // Set two, read them back, and see them in the bulk map.
+        set_task_assignment("p", "a", Some("alpha")).unwrap();
+        set_task_assignment("p", "b", Some("beta")).unwrap();
+        assert_eq!(get_task_assignment("p", "a").unwrap().as_deref(), Some("alpha"));
+        let all = task_assignments("p").unwrap();
+        assert_eq!(all.get("a").map(String::as_str), Some("alpha"));
+        assert_eq!(all.get("b").map(String::as_str), Some("beta"));
+
+        // An empty/whitespace workspace clears the marker rather than storing it.
+        set_task_assignment("p", "a", Some("   ")).unwrap();
+        assert_eq!(get_task_assignment("p", "a").unwrap(), None);
+
+        // Explicit clear is idempotent.
+        set_task_assignment("p", "b", None).unwrap();
+        set_task_assignment("p", "b", None).unwrap();
+        assert_eq!(get_task_assignment("p", "b").unwrap(), None);
+        assert!(task_assignments("p").unwrap().is_empty());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn render_task_file_matches_the_on_disk_representation() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A normally-saved task's `render_task_file` output is byte-identical to
+        // the file `save_task` wrote — so `shelbi issue show` renders the same
+        // text from the store as it used to read from disk, for any backend.
+        let mut task = make_task("do-thing", Column::todo(), 0);
+        task.branch = Some("jlong/do-thing".to_string());
+        let body = "# Do the thing\n\nSome prose.\n";
+        save_task("p", &task, body).unwrap();
+
+        let on_disk = read_to_string_at(&task_path("p", "do-thing").unwrap()).unwrap();
+        let tf = load_task("p", "do-thing").unwrap();
+        assert_eq!(render_task_file(&tf).unwrap(), on_disk);
 
         std::env::remove_var("SHELBI_HOME");
     }

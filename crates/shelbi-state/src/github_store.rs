@@ -27,8 +27,16 @@
 //! * **`add_comment`** posts a native issue comment.
 //!
 //! Workspace assignment (`assigned_to`) is deliberately *not* written to GitHub
-//! (plan §3): it is ephemeral local routing, so [`GitHubStore::set_fields`]
-//! ignores that field and a caller setting only `assigned_to` is a no-op.
+//! (plan §3): it is ephemeral local routing, not board state a github.com viewer
+//! should see. Instead it is persisted to the **local assignment overlay**
+//! (`crate::set_task_assignment` / `crate::get_task_assignment`, marker files
+//! under `<project_dir>/assignments/`). [`GitHubStore::set_fields`] writes the
+//! overlay for that one field; every read ([`GitHubStore::get`] /
+//! [`GitHubStore::list`]) folds the overlay back onto the reconstructed issue,
+//! so the active-workspace, conflict, and supervision scans still recover which
+//! workspace owns a card even though the tracker stores no assignment. The
+//! unassigning transitions ([`GitHubStore::move_status_and_unassign`] /
+//! [`GitHubStore::cancel`] / [`GitHubStore::park_review`]) clear the overlay.
 //!
 //! ## Label hygiene — auto-create on first use (plan §6)
 //!
@@ -64,8 +72,10 @@
 //!   `<!-- shelbi:begin -->` … `<!-- shelbi:end -->` YAML block in the issue
 //!   body. The block is stripped from [`IssueFile::body`] so the human prose and
 //!   the shelbi metadata never clobber each other.
-//! * **assignment** (`assigned_to`) — never read from GitHub. Workspace routing
-//!   is ephemeral local state (plan §3), so it is always `None` here.
+//! * **assignment** (`assigned_to`) — never read from GitHub. The raw mapping
+//!   ([`GhIssue::into_issue_file`]) always yields `None`; the [`IssueStore`]
+//!   read methods then fold in the local assignment overlay (see above), so a
+//!   consumer sees the owning workspace without the tracker storing it.
 //!
 //! ## Testability
 //!
@@ -178,10 +188,17 @@ impl IssueStore for GitHubStore {
     fn list(&self) -> Result<Vec<IssueFile>> {
         let path = format!("repos/{}/issues", self.repo);
         let issues = self.api_issues(&path, &["-f", "state=all", "-f", "per_page=100"])?;
+        // Fold the local assignment overlay onto every issue in one read, rather
+        // than statting a marker file per card.
+        let assignments = crate::task_assignments(&self.project)?;
         let mut out: Vec<IssueFile> = issues
             .into_iter()
             .filter(|gh| !gh.is_pull_request())
-            .map(|gh| gh.into_issue_file())
+            .map(|gh| {
+                let mut tf = gh.into_issue_file();
+                tf.task.assigned_to = assignments.get(&tf.task.id).cloned();
+                tf
+            })
             .collect();
         sort_board(&mut out);
         Ok(out)
@@ -190,7 +207,8 @@ impl IssueStore for GitHubStore {
     fn list_in_status(&self, status: &Column) -> Result<Vec<IssueFile>> {
         // Client-side filter of the full board: the status lives in a label we
         // already parse, and this keeps a single mapping path (no second query
-        // shape to keep in sync).
+        // shape to keep in sync). `list` has already applied the assignment
+        // overlay, so the conflict/active-workspace scans see the owner.
         Ok(self
             .list()?
             .into_iter()
@@ -206,10 +224,14 @@ impl IssueStore for GitHubStore {
             &path,
             &["-f", "state=all", "-f", &label, "-f", "per_page=100"],
         )?;
-        Ok(issues
-            .into_iter()
-            .find(|gh| !gh.is_pull_request())
-            .map(GhIssue::into_issue_file))
+        let Some(gh) = issues.into_iter().find(|gh| !gh.is_pull_request()) else {
+            return Ok(None);
+        };
+        let mut tf = gh.into_issue_file();
+        // Fold in the local assignment overlay so a caller reads the owning
+        // workspace even though the tracker stores no assignment.
+        tf.task.assigned_to = crate::get_task_assignment(&self.project, id)?;
+        Ok(Some(tf))
     }
 
     fn add(&self, spec: NewIssue) -> Result<Issue> {
@@ -350,8 +372,13 @@ impl IssueStore for GitHubStore {
             return Ok(());
         }
         // `assigned_to` is ephemeral local routing (plan §3) — never stored on
-        // GitHub. When it is the *only* field set, the update touches nothing on
-        // the remote and is a clean no-op.
+        // GitHub. It is persisted to the local assignment overlay instead, so an
+        // assign/start/resume through this seam is recoverable by the daemon's
+        // ownership scans. Apply it first so an `assigned_to`-only update still
+        // lands (it just touches nothing on the remote).
+        if let Some(assigned_to) = &fields.assigned_to {
+            crate::set_task_assignment(&self.project, id, assigned_to.as_deref())?;
+        }
         if fields.branch.is_none()
             && fields.depends_on.is_none()
             && fields.prefers_machine.is_none()
@@ -359,6 +386,8 @@ impl IssueStore for GitHubStore {
             && fields.workflow.is_none()
             && fields.body.is_none()
         {
+            // `assigned_to` was the only field — the overlay write above is the
+            // whole operation; nothing to PATCH on the remote.
             return Ok(());
         }
         let Some(gh) = self.get_raw(id)? else {
@@ -421,11 +450,11 @@ impl IssueStore for GitHubStore {
     }
 
     fn cancel(&self, id: &str, reason: &str) -> Result<Option<StatusMove>> {
-        // Cancel = move to the terminal `canceled` status, which closes the
-        // issue as `not_planned`. There is no stored workspace assignment on
-        // GitHub to clear (it lives user-local), so the label swap is the whole
-        // operation.
-        self.move_status(id, &Column::canceled(), reason)
+        // Cancel = move-and-unassign to the terminal `canceled` status (closes
+        // the issue as `not_planned`), clearing the local assignment overlay so a
+        // canceled card isn't relaunched on its old workspace — the same
+        // reasoning as the filesystem backend.
+        self.move_status_and_unassign(id, &Column::canceled(), reason)
     }
 
     fn move_status_and_unassign(
@@ -434,9 +463,12 @@ impl IssueStore for GitHubStore {
         to: &Column,
         reason: &str,
     ) -> Result<Option<StatusMove>> {
-        // No stored workspace assignment on GitHub (it is user-local), so the
-        // "unassign" half is a no-op and this reduces to the status move.
-        self.move_status(id, to, reason)
+        let mv = self.move_status(id, to, reason)?;
+        // Drop the local assignment overlay regardless of whether the status
+        // actually changed (matching the filesystem backend's move-and-unassign,
+        // which clears the owner even on a no-op move).
+        crate::set_task_assignment(&self.project, id, None)?;
+        Ok(mv)
     }
 
     fn delete(&self, id: &str) -> Result<()> {
@@ -446,11 +478,16 @@ impl IssueStore for GitHubStore {
         // no-op. GraphQL `deleteIssue` exists but needs elevated repo scope, so
         // the REST close is the portable choice for the experimental backend.
         let Some(gh) = self.get_raw(id)? else {
+            // Still drop any stale local assignment for a card GitHub no longer
+            // knows about, so the overlay doesn't leak owners.
+            crate::set_task_assignment(&self.project, id, None)?;
             return Ok(());
         };
         if gh.state != "closed" {
             self.set_state(gh.number, "closed", Some("not_planned"))?;
         }
+        // A deleted card has no owner — clear the overlay.
+        crate::set_task_assignment(&self.project, id, None)?;
         Ok(())
     }
 
@@ -468,11 +505,14 @@ impl IssueStore for GitHubStore {
     }
 
     fn park_review(&self, id: &str) -> Result<Option<String>> {
-        // Parked markers are local daemon state for the review-slot auto-loader,
-        // not board state — there is no GitHub-stored assignment to clear, so
-        // this only sets the local marker and reports no prior owner.
+        // Parked markers are local daemon state for the review-slot auto-loader.
+        // The prior owner lives in the local assignment overlay (GitHub stores
+        // none), so report and clear it, then set the parked marker — mirroring
+        // the filesystem backend's park (clear owner + mark parked in one step).
+        let was = crate::get_task_assignment(&self.project, id)?;
+        crate::set_task_assignment(&self.project, id, None)?;
         crate::set_task_parked(&self.project, id)?;
-        Ok(None)
+        Ok(was)
     }
 
     fn clear_parked(&self, id: &str) -> Result<()> {
@@ -1626,9 +1666,14 @@ mod tests {
     }
 
     #[test]
-    fn set_fields_with_only_assigned_to_is_a_noop_on_github() {
-        // Assignment is ephemeral local routing; GitHub never stores it, so this
-        // must not touch the API at all.
+    fn set_fields_with_only_assigned_to_touches_the_overlay_not_the_api() {
+        // Assignment is ephemeral local routing; GitHub never stores it, so an
+        // `assigned_to`-only update must not touch the API at all — it lands in
+        // the local overlay instead, and a subsequent read folds it back on.
+        let _g = crate::test_lock::LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
         let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         let (store, calls) = recording_store(issue, issue, "", "{}");
         store
@@ -1640,7 +1685,90 @@ mod tests {
                 },
             )
             .unwrap();
+        // No gh API call — the only reads/writes were the local overlay.
         assert!(calls.lock().unwrap().is_empty());
+
+        // The overlay is folded onto reads.
+        assert_eq!(
+            store.get("t").unwrap().unwrap().task.assigned_to.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            store.list().unwrap()[0].task.assigned_to.as_deref(),
+            Some("alpha")
+        );
+
+        // Clearing it removes the overlay again.
+        store
+            .set_fields(
+                "t",
+                IssueFields {
+                    assigned_to: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.get("t").unwrap().unwrap().task.assigned_to, None);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn move_and_unassign_and_park_clear_the_assignment_overlay() {
+        let _g = crate::test_lock::LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let review = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/review"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, _calls) = recording_store(review, review, "", "{}");
+
+        // Assign, then move-and-unassign back to todo: the overlay is cleared.
+        store
+            .set_fields(
+                "t",
+                IssueFields {
+                    assigned_to: Some(Some("review-1".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .move_status_and_unassign("t", &Column::todo(), "stop")
+            .unwrap();
+        assert_eq!(crate::get_task_assignment("test-project", "t").unwrap(), None);
+
+        // Re-assign, then park: park reports the prior owner, clears the overlay,
+        // and sets the local parked marker.
+        store
+            .set_fields(
+                "t",
+                IssueFields {
+                    assigned_to: Some(Some("review-1".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let was = store.park_review("t").unwrap();
+        assert_eq!(was.as_deref(), Some("review-1"));
+        assert_eq!(crate::get_task_assignment("test-project", "t").unwrap(), None);
+        assert!(crate::is_task_parked("test-project", "t").unwrap());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A throwaway `SHELBI_HOME` for tests that exercise the local assignment
+    /// overlay (marker files under `<project_dir>/assignments/`).
+    fn fresh_home() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-github-store-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
     }
 
     #[test]

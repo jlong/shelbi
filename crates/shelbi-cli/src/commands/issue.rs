@@ -622,16 +622,29 @@ fn list(
 }
 
 fn show(project: &str, id: &str) -> Result<()> {
-    let path = shelbi_state::task_path(project, id).map_err(|e| anyhow!(e))?;
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    // Render the issue fetched through the store, not the local task file: a
+    // `github` backend never writes that file, so reading it would fail on a
+    // GitHub-only issue. `render_task_file` reconstructs the exact
+    // frontmatter+body representation from any backend's `IssueFile`.
+    let store = resolve_issue_store(project)?;
+    let tf = store
+        .get(id)
+        .map_err(|e| anyhow!(e))?
+        .ok_or_else(|| anyhow!("issue `{id}` not found"))?;
+    let text = shelbi_state::render_task_file(&tf).map_err(|e| anyhow!(e))?;
     print!("{text}");
 
-    // Footer: resolved depends_on. Done lazily after the raw file dump so
+    // Footer: resolved depends_on. Done lazily after the frontmatter dump so
     // scripts grepping for frontmatter still get clean output above the line.
-    let tf = load_issue(project, id)?;
     if !tf.task.depends_on.is_empty() {
-        let columns = shelbi_state::task_columns(project).map_err(|e| anyhow!(e))?;
+        // Build the id→column map from the same board read so the footer works
+        // for every backend (not just the local filesystem).
+        let columns: std::collections::HashMap<String, Column> = store
+            .list()
+            .map_err(|e| anyhow!(e))?
+            .into_iter()
+            .map(|t| (t.task.id, t.task.column))
+            .collect();
         let parts: Vec<String> = tf
             .task
             .depends_on
