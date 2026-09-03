@@ -272,7 +272,7 @@ mod tests {
     /// persisted record + a state pointer + an events.log pointer line.
     #[test]
     fn unexpected_exit_writes_a_crash_record() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (_env, home) = setup_home("unexpected");
 
         set_recent_crash_marker("demo");
@@ -304,7 +304,7 @@ mod tests {
     /// quit / reload path) produces NO record.
     #[test]
     fn graceful_teardown_writes_no_record() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (_env, home) = setup_home("graceful-sighup");
 
         // Marker cleared == graceful teardown already ran zen_clear_crash.
@@ -327,7 +327,7 @@ mod tests {
     /// marker is still set (the exit hook clears it a step later).
     #[test]
     fn clean_exit_writes_no_record_even_with_marker_set() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (_env, home) = setup_home("clean-exit");
 
         set_recent_crash_marker("demo");
@@ -349,7 +349,7 @@ mod tests {
     /// the acceptance criterion.
     #[test]
     fn sigterm_writes_no_record_even_with_marker_set() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (_env, home) = setup_home("sigterm");
 
         set_recent_crash_marker("demo");

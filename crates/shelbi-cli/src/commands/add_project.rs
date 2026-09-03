@@ -623,7 +623,7 @@ mod tests {
     /// scaffolder can slugify it and record the original as `display_name`.
     #[test]
     fn validate_accepts_human_readable_name_and_keeps_it_raw() {
-        let _g = crate::commands::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::commands::test_support::ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = std::env::temp_dir().join(format!(
             "shelbi-add-project-accept-{}-{}",
             std::process::id(),
@@ -650,7 +650,7 @@ mod tests {
     /// that slugify to the same id clash — and the error names the slug.
     #[test]
     fn validate_rejects_slug_collision() {
-        let _g = crate::commands::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::commands::test_support::ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = std::env::temp_dir().join(format!(
             "shelbi-add-project-collide-{}-{}",
             std::process::id(),

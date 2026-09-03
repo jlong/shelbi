@@ -1321,7 +1321,7 @@ mod tests {
     /// no longer short-circuits on a pre-existing YAML.
     #[test]
     fn scaffold_project_is_idempotent_and_completes_half_init() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_dir("half-home");
         let project_root = fresh_dir("half-repo");
         std::env::set_var("SHELBI_HOME", &home);
@@ -1452,7 +1452,7 @@ mod tests {
 
     #[test]
     fn new_registration_is_complete_and_armed_before_it_becomes_discoverable() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_dir("publish-home");
         std::env::set_var("SHELBI_HOME", &home);
         shelbi_state::ensure_root_subdirs().unwrap();
@@ -1502,7 +1502,7 @@ mod tests {
 
     #[test]
     fn split_registration_is_not_shadowed_or_rearmed() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_dir("split-home");
         std::env::set_var("SHELBI_HOME", &home);
         shelbi_state::ensure_root_subdirs().unwrap();
@@ -1520,7 +1520,7 @@ mod tests {
 
     #[test]
     fn scaffold_writes_yaml_but_no_marker_global_mode() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_dir("home");
         let project_root = fresh_dir("repo");
         std::env::set_var("SHELBI_HOME", &home);
@@ -1574,7 +1574,7 @@ mod tests {
 
     #[test]
     fn scaffold_writes_in_repo_config_for_in_repo_mode() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_dir("home");
         let project_root = fresh_dir("repo-in");
         std::env::set_var("SHELBI_HOME", &home);
@@ -1708,7 +1708,7 @@ mod tests {
     /// changes; only the local alias.
     #[test]
     fn next_available_alias_deterministic_ladder() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_dir("alias");
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(home.join("projects")).unwrap();
@@ -1735,7 +1735,7 @@ mod tests {
 
     #[test]
     fn pick_up_arms_the_new_local_alias_only() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_dir("pickup-home");
         let repo_root = fresh_dir("pickup-repo");
         std::env::set_var("SHELBI_HOME", &home);
@@ -1771,7 +1771,7 @@ mod tests {
     /// `<alias>.yaml` is created. The committed file is never touched.
     #[test]
     fn pick_up_writes_split_for_complete_committed_config() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_dir("pickup-split-home");
         let repo_root = fresh_dir("pickup-split-repo");
         std::env::set_var("SHELBI_HOME", &home);
@@ -1830,7 +1830,7 @@ mod tests {
     /// `local.yaml`.
     #[test]
     fn pick_up_falls_back_to_flat_for_legacy_committed_stub() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_dir("pickup-legacy-home");
         let repo_root = fresh_dir("pickup-legacy-repo");
         std::env::set_var("SHELBI_HOME", &home);

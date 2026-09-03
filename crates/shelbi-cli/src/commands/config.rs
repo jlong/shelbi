@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn list_actions_includes_every_required_action() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let (km, _) = load_keymaps(None);
@@ -626,7 +626,7 @@ mod tests {
 
     #[test]
     fn list_actions_uses_lowercase_hyphenated_chord_syntax() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let (km, _) = load_keymaps(None);
@@ -642,7 +642,7 @@ mod tests {
 
     #[test]
     fn list_actions_honors_per_project_override() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(&home).unwrap();
@@ -703,7 +703,7 @@ mod tests {
 
     #[test]
     fn dump_keybindings_round_trips_to_no_config_baseline() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn dump_keybindings_writes_file_when_out_path_given() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         let out = home.join("dump.yml");
         dump_keybindings(Some(out.clone()), false).unwrap();
@@ -739,7 +739,7 @@ mod tests {
 
     #[test]
     fn dump_keybindings_refuses_to_clobber_existing_file_without_force() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         let out = home.join("keys.yaml");
         std::fs::write(&out, "custom: keep-me\n").unwrap();
@@ -761,7 +761,7 @@ mod tests {
 
     #[test]
     fn check_exits_zero_on_missing_keys_file() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let (errors, text) = run_check(None);
@@ -772,7 +772,7 @@ mod tests {
 
     #[test]
     fn check_exits_zero_on_empty_keys_file() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(&home).unwrap();
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn check_exits_zero_on_valid_keys_file() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(&home).unwrap();
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn check_errors_on_malformed_yaml() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(&home).unwrap();
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn check_errors_on_unknown_chord_syntax() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(&home).unwrap();
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn check_errors_on_unknown_action_name() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(&home).unwrap();
@@ -853,7 +853,7 @@ mod tests {
 
     #[test]
     fn check_errors_on_intra_mode_collision() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(&home).unwrap();
@@ -870,7 +870,7 @@ mod tests {
 
     #[test]
     fn check_warns_but_exits_zero_on_reserved_chord_rebind() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(&home).unwrap();
@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn check_warns_but_exits_zero_on_legacy_zen_toggle_field() {
         use shelbi_state::{save_user_config, UserConfig, ZenToggleChord};
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let mut cfg = UserConfig::default();

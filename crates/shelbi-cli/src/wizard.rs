@@ -2104,7 +2104,7 @@ mod tests {
 
     #[test]
     fn non_git_decline_and_q_are_write_free_then_launch_initializes_once() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let root = TempDir::new().unwrap();
         let home = root.path().join("home");
         let env = EnvGuard::new(&["SHELBI_HOME"]);
@@ -2211,7 +2211,7 @@ mod tests {
 
     #[test]
     fn direct_setup_preserves_fresh_clone_pickup_guidance() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
         let repo = temp.path().join("fresh-clone");
@@ -2227,7 +2227,7 @@ mod tests {
 
     #[test]
     fn non_git_enter_initializes_then_persists_after_one_confirmation() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
         let root = temp.path().join("new-repo");
@@ -2503,7 +2503,7 @@ mod tests {
 
     #[test]
     fn launch_persists_complete_scaffold_but_quit_writes_no_state() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("shaft");
         std::fs::create_dir_all(&root).unwrap();
@@ -2614,7 +2614,7 @@ mod tests {
             files
         }
 
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("shaft");
         let interactive_home = temp.path().join("interactive-home");
@@ -2674,7 +2674,7 @@ mod tests {
 
     #[test]
     fn persistence_redacts_remote_credentials_and_repairs_interrupted_scaffolds() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
         let root = temp.path().join("shaft");
@@ -2710,7 +2710,7 @@ mod tests {
 
     #[test]
     fn reopen_and_later_project_do_not_reseed_or_rearm_onboarding() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
         let root = temp.path().join("shaft");
@@ -2745,7 +2745,7 @@ mod tests {
 
     #[test]
     fn customize_receives_detected_defaults_and_persists_its_result() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("shaft");
         std::fs::create_dir_all(&root).unwrap();
@@ -2800,7 +2800,7 @@ mod tests {
 
     #[test]
     fn flat_and_split_collisions_are_rejected_before_any_scaffolding_writes() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
         let root = temp.path().join("shaft");

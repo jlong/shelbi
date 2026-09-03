@@ -2295,7 +2295,7 @@ mod tests {
 
     #[test]
     fn detect_surfaces_legacy_project_and_noop_is_clean() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         let guard = EnvGuard::new(&["SHELBI_HOME"]);
         guard.set("SHELBI_HOME", &home);
@@ -2365,7 +2365,7 @@ workspaces:
 
     #[test]
     fn emit_writes_findings_file_and_clears_it_when_clean() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         let guard = EnvGuard::new(&["SHELBI_HOME"]);
         guard.set("SHELBI_HOME", &home);

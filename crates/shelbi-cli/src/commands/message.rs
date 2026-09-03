@@ -525,7 +525,7 @@ mod tests {
     /// written": a queued-but-unacked message must NOT read as success.
     #[test]
     fn run_status_reflects_delivery_and_gates_exit_code() {
-        let _g = crate::commands::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::commands::test_support::ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = std::env::temp_dir().join(format!(
             "shelbi-msg-status-{}-{}",
             std::process::id(),

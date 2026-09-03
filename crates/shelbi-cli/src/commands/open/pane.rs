@@ -791,7 +791,7 @@ mod tests {
     #[test]
     fn signal_listener_installed_before_spawn_captures_and_forwards() {
         use std::time::Duration;
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
         let received_signal: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
         let signaled_flag = Arc::new(AtomicBool::new(false));
@@ -877,7 +877,7 @@ mod tests {
     /// spawn-wait-emit dance is covered by tests, not just inspection.
     #[test]
     fn run_writes_pane_alive_false_event_when_agent_exits_cleanly() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // A leaked TASK_ID (running tests inside a worker pane) would flip
         // run() into dispatched mode and hard-fail on the missing worktree.
         let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
@@ -931,7 +931,7 @@ mod tests {
     /// and verify the variable lands.
     #[test]
     fn run_passes_shelbi_hub_sock_into_agent_env() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // See run_writes_pane_alive_false_event_when_agent_exits_cleanly —
         // a leaked TASK_ID would make this bare launch dispatched.
         let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
@@ -988,7 +988,7 @@ mod tests {
     /// that's a unit-level test on the same helper.)
     #[test]
     fn run_propagates_nonzero_exit_code_into_reason_field() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // See run_writes_pane_alive_false_event_when_agent_exits_cleanly —
         // a leaked TASK_ID would make this bare launch dispatched.
         let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
@@ -1099,7 +1099,7 @@ mod tests {
     /// seed `$TASK_ID` for the Phase 7 hooks.
     #[test]
     fn assigned_task_for_workspace_returns_in_progress_assignment() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_test_home("current-task-lookup");
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -1130,7 +1130,7 @@ mod tests {
     /// lookup would miss it and leave the review agent in `$HOME`.
     #[test]
     fn assigned_task_for_workspace_returns_review_assignment() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_test_home("review-task-lookup");
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -1347,7 +1347,7 @@ mod tests {
     /// `Command::env(...)` plumbing, not just the lookup helper.
     #[test]
     fn run_exports_phase7_env_vars_to_agent_subprocess() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
         let home = fresh_test_home("pane-env-exports");
         env.set("SHELBI_HOME", &home);
@@ -1413,7 +1413,7 @@ mod tests {
     /// returning an error and emitting a `worktree-missing` event.
     #[test]
     fn dispatched_run_hard_fails_when_worktree_missing() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
         env.remove("PROJECT");
         env.remove("SHELBI_HUB_SOCK");
@@ -1465,7 +1465,7 @@ mod tests {
     /// proceeds normally (and the strict no-fallback `cd` succeeds).
     #[test]
     fn dispatched_run_proceeds_with_valid_worktree() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
         env.remove("PROJECT");
         env.remove("SHELBI_HUB_SOCK");
@@ -1518,7 +1518,7 @@ mod tests {
     /// gone and the lock dir cleaned up.
     #[test]
     fn run_kills_session_tail_on_agent_exit() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // See run_writes_pane_alive_false_event_when_agent_exits_cleanly —
         // a leaked TASK_ID would make this bare launch dispatched (and the
         // stood-up worktree here has no `.git`, so it would hard-fail).
@@ -1642,7 +1642,7 @@ mod tests {
     /// (bug-workspace-pane-alive-false-sighup-fires-spuriously-right-after-dispatch)
     #[test]
     fn run_suppresses_pane_event_when_expected_teardown_marker_is_set() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_test_home("pane-expected-teardown-suppress");
         std::env::set_var("SHELBI_HOME", &home);
         // A caller-set SHELBI_HUB_SOCK would route the wrapper's event
@@ -1714,7 +1714,7 @@ mod tests {
     /// marker either way so it can't leak further forward.
     #[test]
     fn run_ignores_stale_expected_teardown_marker() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_test_home("pane-expected-teardown-stale");
         std::env::set_var("SHELBI_HOME", &home);
         std::env::remove_var("SHELBI_HUB_SOCK");
@@ -1776,7 +1776,7 @@ mod tests {
     /// the `clear_expected_teardown` call at the top of `run()`.
     #[test]
     fn run_clears_expected_teardown_at_startup_before_natural_exit() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_test_home("pane-expected-teardown-startup-clear");
         std::env::set_var("SHELBI_HOME", &home);
         std::env::remove_var("SHELBI_HUB_SOCK");
@@ -1829,7 +1829,7 @@ mod tests {
     /// TASK_ID="" and the SessionStart hook would silently no-op.
     #[test]
     fn run_prefers_inherited_task_id_over_state_lookup() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
         let home = fresh_test_home("pane-inherited-task-id");
         env.set("SHELBI_HOME", &home);

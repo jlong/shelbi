@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn project_name_collides_detects_flat_and_split_registrations() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_tmp_dir();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(home.join("projects")).unwrap();
@@ -564,7 +564,7 @@ mod tests {
     /// successfully and derives the basename as the name.
     #[test]
     fn resolve_root_bypasses_prompt_when_force_root_given() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_tmp_dir();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(home.join("projects")).unwrap();
@@ -583,7 +583,7 @@ mod tests {
     /// touching disk.
     #[test]
     fn resolve_root_rejects_non_existent_root() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_tmp_dir();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(home.join("projects")).unwrap();
@@ -599,7 +599,7 @@ mod tests {
     /// project surfaces the collision instead of silently overwriting.
     #[test]
     fn resolve_root_detects_name_collision_in_scripted_mode() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_tmp_dir();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(home.join("projects")).unwrap();
@@ -620,7 +620,7 @@ mod tests {
     /// Collision is then checked against the override name.
     #[test]
     fn resolve_root_uses_force_name_when_given() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_tmp_dir();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(home.join("projects")).unwrap();
@@ -644,7 +644,7 @@ mod tests {
     /// keeps its original name; only the derived project *name* normalizes.
     #[test]
     fn resolve_root_normalizes_capitalized_or_spaced_basename() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_tmp_dir();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(home.join("projects")).unwrap();
