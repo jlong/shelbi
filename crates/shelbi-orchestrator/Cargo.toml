@@ -18,6 +18,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+signal-hook = "0.3"
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 globset = "0.4"

@@ -1655,9 +1655,9 @@ const ORCH_HEARTBEAT_INTERVAL_SECS: u32 = 60;
 /// step 4, leaving the heartbeat timestamp in place — that's the
 /// signal step 1 reads on the next start.
 ///
-/// Note we deliberately don't `exec` the launch: the wrapper shell
-/// must survive the agent's exit to run step 4 and reap the
-/// background heartbeat.
+/// The launch runs in the background so the wrapper's signal trap can run
+/// while it is waiting. The trap forwards the signal to this pane's process
+/// group, then waits for both child jobs before recording the exit.
 fn orchestrator_pane_cmd(
     shelbi_bin: &str,
     project_name: &str,
@@ -1677,25 +1677,30 @@ fn orchestrator_pane_cmd(
     // Crash-record capture (`__orch-record-exit`) runs on both exit paths:
     // once after the agent returns (`exit:$RC`, catching a claude panic /
     // non-zero exit / a signal that killed only the agent — the wrapper
-    // survives and reports the code), and from a `SIGHUP` trap (the pane /
-    // session being torn down under the wrapper). SIGHUP is what every tmux
-    // teardown delivers — graceful (`quit`, `reload`) and crash alike — but
-    // the graceful paths clear `zen_last_crashed_at` first, so the hook
-    // discriminates and only a real crash writes a record. The `__rec` shell
-    // function keeps the shell-escaped `{bin}`/`{proj}` out of the
-    // single-quoted trap body, dodging nested-quote breakage. The trap
-    // `exit`s so a torn-down pane doesn't fall through to the graceful
-    // `__zen-orch-exit` (which would clear the crash marker we want kept).
+    // survives and reports the code), and from the signal trap (the pane /
+    // session being torn down under the wrapper). The graceful paths clear
+    // `zen_last_crashed_at` first, so the hook discriminates and only a real
+    // crash writes a record. The `__rec` shell function keeps the
+    // shell-escaped `{bin}`/`{proj}` out of the trap body.
     format!(
         "cd {wd} && \
          export SHELBI_PROJECT={proj} SHELBI_TMUX_SESSION={sess} SHELBI_MANAGED_CONTEXT=1 && \
          __rec() {{ {bin} __orch-record-exit {proj} \"$1\" \"$TMUX_PANE\"; }}; \
+         __stop() {{ sig=\"$1\"; rc=\"$2\"; trap '' HUP TERM INT; \
+            kill -s \"$sig\" 0 2>/dev/null; \
+            [ -n \"${{ORCH_PID:-}}\" ] && wait \"$ORCH_PID\" 2>/dev/null; \
+            [ -n \"${{HB:-}}\" ] && wait \"$HB\" 2>/dev/null; \
+            __rec signal:$sig; exit \"$rc\"; }}; \
          {bin} __zen-orch-start {proj}; \
-         trap '__rec signal:SIGHUP; exit 129' HUP; \
+         trap '__stop HUP 129' HUP; \
+         trap '__stop TERM 143' TERM; \
+         trap '__stop INT 130' INT; \
          ({bin} __zen-heartbeat {proj}; \
             while sleep {interval}; do {bin} __zen-heartbeat {proj}; done) & \
          HB=$!; \
-         {launch}; \
+         {launch} </dev/tty & \
+         ORCH_PID=$!; \
+         wait \"$ORCH_PID\"; \
          RC=$?; \
          __rec exit:$RC; \
          kill $HB 2>/dev/null; \
@@ -2505,8 +2510,21 @@ mod pane_cmd_tests {
             "heartbeat must spawn before launch"
         );
         assert!(launch_idx < exit_idx, "exit must run after launch returns");
+        assert!(
+            out.contains("claude --print </dev/tty &"),
+            "background launch must retain the pane terminal on stdin"
+        );
         // Heartbeat loop is spawned in the background and killed afterwards.
         assert!(out.contains("HB=$!"), "must capture heartbeat pid");
+        assert!(out.contains("ORCH_PID=$!"), "must capture orchestrator pid");
+        assert!(
+            out.contains("wait \"$ORCH_PID\""),
+            "must wait on the orchestrator as a background job"
+        );
+        assert!(
+            out.contains("kill -s \"$sig\" 0"),
+            "must forward pane shutdown to the process group"
+        );
         assert!(
             out.contains("kill $HB"),
             "must kill heartbeat after launch exits"
@@ -2516,14 +2534,14 @@ mod pane_cmd_tests {
         // Exit code of the agent is preserved.
         assert!(out.contains("RC=$?") && out.contains("exit $RC"));
         // Crash-record capture runs on both exit paths: the post-agent-return
-        // call (`__rec exit:$RC`) and the SIGHUP teardown trap.
+        // call (`__rec exit:$RC`) and the signal teardown trap.
         assert!(
             out.contains("__orch-record-exit myapp"),
             "missing crash-record hook"
         );
         assert!(out.contains("__rec exit:$RC"), "missing post-return capture");
         let trap_idx = out
-            .find("trap '__rec signal:SIGHUP; exit 129' HUP")
+            .find("trap '__stop HUP 129' HUP")
             .expect("missing SIGHUP crash-capture trap");
         // The trap is armed before the agent launches so a teardown mid-run is
         // caught.
