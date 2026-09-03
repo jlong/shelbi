@@ -1,23 +1,23 @@
 ---
 title: Agents
 order: 11
-summary: An agent is a role, a system prompt plus a skill set, not the task it's handed or the slot it runs in. Shelbi ships six (orchestrator, developer, review, and the qa, security, and adversarial reviewers); each is a directory you can edit, and you can author more.
+summary: An agent is a role, a system prompt plus a skill set, not the issue it's handed or the slot it runs in. Shelbi ships six (orchestrator, developer, review, and the qa, security, and adversarial reviewers); each is a directory you can edit, and you can author more.
 ---
 
 An **agent** is a *role*: a system prompt plus a set of skills. It is the
 "who" of a piece of work: the orchestrator that schedules, the developer
 that writes the code, the reviewer that checks it. An agent is deliberately
-*not* the task it's handed, and *not* the slot it runs in. Those are separate
+*not* the issue it's handed, and *not* the slot it runs in. Those are separate
 things:
 
-- The **task** is the work: a markdown card with a prompt and a branch.
+- The **issue** is the work: a markdown card with a prompt and a branch.
 - The **[workspace](/docs/concepts/workspaces)** is the capacity: a tmux
   pane plus a git worktree on some machine.
 - The **agent** is the role: the prompt and skills that decide *how* the
   work gets done.
 
 Splitting these apart is what lets the same workspace run a developer agent
-on one task and a reviewer agent on the next, and what lets a
+on one issue and a reviewer agent on the next, and what lets a
 [workflow](/docs/guides/getting-started/workflows#owners-and-agents) say "this status is reviewed by
 the security agent" as a line of YAML rather than a paragraph of prompt prose.
 
@@ -28,8 +28,8 @@ are specialized reviewers:
 
 | Agent | Role |
 | --- | --- |
-| `orchestrator` | The agent you talk to. Turns requests into cards, dispatches tasks to free workspaces, tails the events log, reports back. Runs in window 1, never in a workspace. See [Orchestrator](/docs/concepts/orchestrator). |
-| `developer` | The default workspace agent. Implements a task on its branch, runs the project's checks, writes the review-ready marker. This is the agent the runtime dispatcher runs for an `active`-category status when no other is named. |
+| `orchestrator` | The agent you talk to. Turns requests into cards, dispatches issues to free workspaces, tails the events log, reports back. Runs in window 1, never in a workspace. See [Orchestrator](/docs/concepts/orchestrator). |
+| `developer` | The default workspace agent. Implements an issue on its branch, runs the project's checks, writes the review-ready marker. This is the agent the runtime dispatcher runs for an `active`-category status when no other is named. |
 | `review` | The agent named by a review status, run on a [review workspace](/docs/concepts/review-workspaces). Its charter is to make the finished branch runnable for a human. The dev server itself is booted by the status's transition commands, and it hands over a working URL. It doesn't write code (bar an explicitly requested tweak). |
 | `qa` | Exercises a finished change against its acceptance criteria and reports pass or fail with concrete repro steps. It verifies, it doesn't rewrite. |
 | `security` | A defensive-only review of the diff: injection, broken authorization, leaked secrets, unsafe deserialization, path traversal, risky dependencies. Reports findings with severity and location. It does not write exploits. |
@@ -44,7 +44,7 @@ Security, or Adversarial gate a one-line YAML edit rather than a
 `shelbi agent new` first.
 
 Which role is loaded shows up in the sidebar next to each busy workspace. The
-same slot runs `developer` on one task and a reviewer role on the next:
+same slot runs `developer` on one issue and a reviewer role on the next:
 
 <AppMockup
   terminalTitle="jlong@hub — shelbi"
@@ -107,7 +107,7 @@ are prepended to *every* agent's instructions, so project-wide context (the
 repo layout, the house style, the test command) lives in one place instead of
 being copy-pasted into four prompts.
 
-When a task is dispatched, the agent named for that status (or `developer`
+When an issue is dispatched, the agent named for that status (or `developer`
 for an `active`-category status with no `agent:` named) has its rendered
 prompt (`_shared/preamble.md` followed by the
 agent's own `instructions.md`) handed to the runner in the workspace. The
@@ -152,7 +152,7 @@ See the [`shelbi agent`](/docs/cli/agent) reference for the full command set.
 
 ## Assigning an agent to work
 
-You rarely assign an agent to a task directly. Instead, a
+You rarely assign an agent to an issue directly. Instead, a
 [workflow](/docs/guides/getting-started/workflows#owners-and-agents) status declares who owns it:
 
 ```yaml

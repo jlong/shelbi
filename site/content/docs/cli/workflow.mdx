@@ -1,14 +1,14 @@
 ---
 title: shelbi workflow
 order: 23
-summary: Manage the per-project workflow YAML files — list, show, scaffold, and edit the status schemas tasks run under.
+summary: Manage the per-project workflow YAML files — list, show, scaffold, and edit the status schemas issues run under.
 ---
 
 ```text
 shelbi workflow <SUBCOMMAND> [OPTIONS]
 ```
 
-`shelbi workflow` manages the YAML files that declare the statuses a task moves
+`shelbi workflow` manages the YAML files that declare the statuses an issue moves
 through, who owns each one, and which git side-effects fire on each transition.
 Every project has a built-in `default` workflow: the canonical six-status
 flow (`Backlog → Todo → In Progress → Review → Done → Canceled`). These
@@ -69,7 +69,7 @@ scaffolded workflow whose author hasn't written a real description yet.
 
 Errors if a workflow with that name already exists. Names must be
 non-empty, must not start with `.`, and may only contain `a-z`, `0-9`, `-`,
-`_`. The name doubles as a YAML identifier referenced from task
+`_`. The name doubles as a YAML identifier referenced from issue
 frontmatter, so the validator is stricter than POSIX.
 
 | Flag | Type | Default | Description |
@@ -118,5 +118,5 @@ shelbi workflow edit default
 
 - [Workflows](/docs/guides/getting-started/workflows) — the schema, the
   category model, and how transitions wire into the orchestrator.
-- [`shelbi task`](/docs/cli/task) — the `--workflow` flag on
-  `task add` and the workflow-aware `--to` validation on `task move`.
+- [`shelbi issue`](/docs/cli/issue) — the `--workflow` flag on
+  `issue add` and the workflow-aware `--to` validation on `issue move`.

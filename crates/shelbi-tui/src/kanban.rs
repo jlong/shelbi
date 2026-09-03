@@ -28,11 +28,11 @@ use ratatui::{
     Frame,
 };
 use shelbi_core::{
-    default_project_statuses, default_workflow, Column, ProjectStatuses, StatusCategory, Task,
+    default_project_statuses, default_workflow, Column, ProjectStatuses, StatusCategory, Issue,
     Workflow, DEFAULT_WORKFLOW_NAME,
 };
 use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps, PopoverAction};
-use shelbi_state::{KanbanColumnOverride, TaskFile};
+use shelbi_state::{KanbanColumnOverride, IssueFile};
 
 use crate::keymap::format_chord_or_unbound;
 
@@ -44,7 +44,7 @@ pub struct KanbanApp {
     /// each refresh. `None` for legacy projects (and until the first refresh),
     /// which then show the slug. Rendered via [`KanbanApp::display_label`].
     pub display_name: Option<String>,
-    pub tasks: Vec<TaskFile>,
+    pub tasks: Vec<IssueFile>,
     pub selected_column: usize,
     pub selected_row: usize,
     pub last_refresh: Instant,
@@ -524,7 +524,7 @@ impl KanbanApp {
     /// Look up the task currently shown in the popover, if any. Returns
     /// `None` if the popover is closed OR if the task has since vanished
     /// from disk (e.g. deleted by another process between refreshes).
-    pub fn popover_task(&self) -> Option<&TaskFile> {
+    pub fn popover_task(&self) -> Option<&IssueFile> {
         let id = &self.popover.as_ref()?.task_id;
         self.tasks.iter().find(|tf| &tf.task.id == id)
     }
@@ -587,9 +587,9 @@ impl KanbanApp {
         &self.all_columns[idx.min(last)]
     }
 
-    pub fn column_tasks(&self, col_idx: usize) -> Vec<&TaskFile> {
+    pub fn column_tasks(&self, col_idx: usize) -> Vec<&IssueFile> {
         let ac = self.column(col_idx);
-        let mut tasks: Vec<&TaskFile> = self
+        let mut tasks: Vec<&IssueFile> = self
             .tasks
             .iter()
             .filter(|tf| self.task_matches_filter(tf))
@@ -619,7 +619,7 @@ impl KanbanApp {
     /// if their resolved status id matches a visible column. This is
     /// what makes the filter actually narrow the board (otherwise two
     /// workflows that both declare `review` would share that column).
-    fn task_belongs_to(&self, task: &Task, ac: &KanbanColumn) -> bool {
+    fn task_belongs_to(&self, task: &Issue, ac: &KanbanColumn) -> bool {
         if let Some(name) = &self.workflow_filter {
             if self.task_workflow_name(task) != name.as_str() {
                 return false;
@@ -628,7 +628,7 @@ impl KanbanApp {
         self.resolved_status_id(task) == ac.status_id
     }
 
-    fn task_workflow_name<'a>(&'a self, task: &'a Task) -> &'a str {
+    fn task_workflow_name<'a>(&'a self, task: &'a Issue) -> &'a str {
         task.workflow
             .as_deref()
             .unwrap_or(&self.default_workflow_name)
@@ -637,7 +637,7 @@ impl KanbanApp {
     /// Resolve a task to its status id. Prefers the task's own workflow,
     /// then the default workflow, then the legacy column-derived id as
     /// a last-resort fallback.
-    fn resolved_status_id(&self, task: &Task) -> String {
+    fn resolved_status_id(&self, task: &Issue) -> String {
         let wf_name = self.task_workflow_name(task);
         if let Some(wf) = self.workflows.iter().find(|w| w.name == wf_name) {
             return resolve_task_status(task, wf);
@@ -655,7 +655,7 @@ impl KanbanApp {
     /// True when `tf` passes the active workspace filter. With no filter
     /// active everything passes; otherwise the task's `assigned_to`
     /// must match the filter's predicate.
-    fn task_matches_filter(&self, tf: &TaskFile) -> bool {
+    fn task_matches_filter(&self, tf: &IssueFile) -> bool {
         match &self.workspace_filter {
             None => true,
             Some(f) => f.matches(tf.task.assigned_to.as_deref()),
@@ -672,7 +672,7 @@ impl KanbanApp {
             .collect()
     }
 
-    pub fn selected_task(&self) -> Option<&TaskFile> {
+    pub fn selected_task(&self) -> Option<&IssueFile> {
         let col_tasks = self.column_tasks(self.selected_column);
         col_tasks.get(self.selected_row).copied()
     }
@@ -1496,7 +1496,7 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     };
 
     let left = Line::from(vec![
-        Span::styled("Tasks · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Issues · ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             app.display_label().to_string(),
             Style::default()
@@ -2436,7 +2436,7 @@ fn wrap_title_two_lines(title: &str, max: usize) -> (String, Option<String>) {
 /// from this task's params. A fixed `base_branch: main` (no placeholder)
 /// or a half-substituted template resolves to `None` — neither adds
 /// trustworthy per-task info at the card-glance scale.
-fn card_branch(task: &Task, workflows: &[Workflow], workflow_name: &str) -> Option<String> {
+fn card_branch(task: &Issue, workflows: &[Workflow], workflow_name: &str) -> Option<String> {
     if let Some(branch) = task.branch.as_deref().filter(|b| !b.is_empty()) {
         return Some(branch.to_string());
     }
@@ -2466,7 +2466,7 @@ fn card_branch(task: &Task, workflows: &[Workflow], workflow_name: &str) -> Opti
 /// a branch to show, returns `Line::raw("")` — the row is still emitted so
 /// the card keeps its title+meta shape, it just renders blank.
 fn card_meta_line(
-    task: &Task,
+    task: &Issue,
     workflows: &[Workflow],
     workflow_name: &str,
     show_workflow_name: bool,
@@ -2556,7 +2556,7 @@ fn kanban_columns_from(
 /// 3. **Canonical** — if the workflow declares no status that matches by
 ///    id or category, return the stored id unchanged. The task won't
 ///    bucket cleanly, but the renderer never crashes.
-fn resolve_task_status(task: &Task, workflow: &Workflow) -> String {
+fn resolve_task_status(task: &Issue, workflow: &Workflow) -> String {
     let stored = task.column.as_str();
     if workflow.status(stored).is_some() {
         return stored.to_string();
@@ -2569,7 +2569,7 @@ fn resolve_task_status(task: &Task, workflow: &Workflow) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Task detail popover
+// Issue detail popover
 
 fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let popover_area = centered_rect(80, 80, area);
@@ -2586,8 +2586,8 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         ),
         None => (
             Vec::new(),
-            "(task no longer exists — press esc to close)".to_string(),
-            "Missing task".to_string(),
+            "(issue no longer exists — press esc to close)".to_string(),
+            "Missing issue".to_string(),
         ),
     };
 
@@ -2671,7 +2671,7 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     f.render_widget(Paragraph::new(hint), chunks[3]);
 }
 
-fn popover_header(tf: &TaskFile, columns: &HashMap<String, Column>) -> Vec<Line<'static>> {
+fn popover_header(tf: &IssueFile, columns: &HashMap<String, Column>) -> Vec<Line<'static>> {
     let task = &tf.task;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -2851,7 +2851,7 @@ mod tests {
         }
     }
 
-    fn task_file(id: &str, column: Column, priority: u32, updated: &str) -> TaskFile {
+    fn task_file(id: &str, column: Column, priority: u32, updated: &str) -> IssueFile {
         task_file_for(id, column, priority, updated, None)
     }
 
@@ -2861,12 +2861,12 @@ mod tests {
         priority: u32,
         updated: &str,
         assigned_to: Option<&str>,
-    ) -> TaskFile {
+    ) -> IssueFile {
         let updated_at = chrono::DateTime::parse_from_rfc3339(updated)
             .unwrap()
             .with_timezone(&chrono::Utc);
-        TaskFile {
-            task: shelbi_core::Task {
+        IssueFile {
+            task: shelbi_core::Issue {
                 id: id.to_string(),
                 title: id.to_string(),
                 column,
@@ -3113,7 +3113,7 @@ mod tests {
 
         use chrono::Utc;
         let now = Utc::now();
-        let task = shelbi_core::Task {
+        let task = shelbi_core::Issue {
             id: "fix-login".into(),
             title: "fix login".into(),
             column: Column::todo(),
@@ -3189,7 +3189,7 @@ mod tests {
 
         use chrono::Utc;
         let now = Utc::now();
-        let task = shelbi_core::Task {
+        let task = shelbi_core::Issue {
             id: "fix-login".into(),
             title: "fix login".into(),
             column: Column::todo(),
@@ -3253,8 +3253,8 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         app.tasks = vec![{
             let now = chrono::Utc::now();
-            TaskFile {
-                task: shelbi_core::Task {
+            IssueFile {
+                task: shelbi_core::Issue {
                     id: "task-1".into(),
                     title: "task-1".into(),
                     column: Column::backlog(),
@@ -3562,6 +3562,7 @@ mod tests {
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         };
         shelbi_state::save_project(&project).unwrap();
@@ -3604,7 +3605,7 @@ mod tests {
         let now = chrono::Utc::now();
         shelbi_state::save_task(
             "demo",
-            &shelbi_core::Task {
+            &shelbi_core::Issue {
                 id: "orphan".into(),
                 title: "orphan".into(),
                 column: Column::backlog(),
@@ -3983,12 +3984,12 @@ mod tests {
         column: Column,
         workflow: Option<&str>,
         updated: &str,
-    ) -> TaskFile {
+    ) -> IssueFile {
         let updated_at = chrono::DateTime::parse_from_rfc3339(updated)
             .unwrap()
             .with_timezone(&chrono::Utc);
-        TaskFile {
-            task: shelbi_core::Task {
+        IssueFile {
+            task: shelbi_core::Issue {
                 id: id.to_string(),
                 title: id.to_string(),
                 column,
@@ -4150,7 +4151,7 @@ mod tests {
             // A default-workflow task in InProgress shares the column
             // with the design-review InProgress task.
             task_in_workflow("e", Column::in_progress(), None, "2026-06-20T10:00:00Z"),
-            // Task pointing at a workflow that doesn't exist falls
+            // Issue pointing at a workflow that doesn't exist falls
             // back to default — Todo lands in the project-wide Todo column.
             task_in_workflow(
                 "orphan",
@@ -4905,8 +4906,8 @@ mod tests {
         id: &str,
         workflow: Option<&str>,
         params: &[(&str, &str)],
-    ) -> shelbi_core::Task {
-        shelbi_core::Task {
+    ) -> shelbi_core::Issue {
+        shelbi_core::Issue {
             id: id.into(),
             title: id.into(),
             column: Column::todo(),
@@ -5287,6 +5288,7 @@ mod tests {
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         };
         shelbi_state::save_project(&project).unwrap();
@@ -5348,7 +5350,7 @@ mod tests {
         app.toggle_column(0);
         assert_eq!(app.column_expansion(0), ColumnExpansion::Collapsed);
 
-        // Task lands in the column — override stands, count updates.
+        // Issue lands in the column — override stands, count updates.
         app.tasks = vec![task_file("a", Column::backlog(), 0, "2026-06-20T10:00:00Z")];
         assert!(
             app.is_column_collapsed(0),

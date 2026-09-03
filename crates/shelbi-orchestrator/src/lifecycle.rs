@@ -38,8 +38,8 @@
 //! from the freshly-fetched ref (never a possibly-stale local one). A
 //! depends_on chain across machines is out of scope for this pass.
 
-use shelbi_core::{Error, Host, Project, Result, StatusCategory, Task, Workflow};
-use shelbi_state::TaskFile;
+use shelbi_core::{Error, Host, Project, Result, StatusCategory, Issue, Workflow};
+use shelbi_state::IssueFile;
 
 use crate::branch;
 use crate::git::{locate_hub_workdir, run_in_dir};
@@ -75,8 +75,8 @@ use crate::git::{locate_hub_workdir, run_in_dir};
 pub fn resolve_base_branch(
     project: &Project,
     workflow: &Workflow,
-    task: &Task,
-    all_tasks: &[TaskFile],
+    task: &Issue,
+    all_tasks: &[IssueFile],
 ) -> Result<String> {
     let mut active_base: Option<String> = None;
     let mut blocking: Vec<String> = Vec::new();
@@ -88,7 +88,7 @@ pub fn resolve_base_branch(
         // so a workflow that renames its active/handoff status still hands
         // us a branch. A terminal `done` dep is satisfied; an `archived`
         // (e.g. canceled) dep can never complete, so — like a not-yet-done
-        // backlog/ready dep — it blocks (consistent with [`Task::is_blocked`]).
+        // backlog/ready dep — it blocks (consistent with [`Issue::is_blocked`]).
         match dep.task.column.category() {
             StatusCategory::Done => {}
             StatusCategory::Active | StatusCategory::Handoff => {
@@ -229,7 +229,7 @@ fn resolve_hub_cut_base(host: &Host, wt: &str, base: &str) -> Result<Option<Stri
 /// branch name, resolve a base, cut the branch on hub, and persist the
 /// branch onto the task file.
 ///
-/// Returns the updated [`TaskFile`] so callers can read the post-cut
+/// Returns the updated [`IssueFile`] so callers can read the post-cut
 /// state without a second `load_task`. Idempotent: re-running on a task
 /// whose branch already exists is a clean success — the cut step is a
 /// no-op and the save is skipped when nothing changed.
@@ -239,7 +239,7 @@ fn resolve_hub_cut_base(host: &Host, wt: &str, base: &str) -> Result<Option<Stri
 /// must abort the move (so the task file's `branch:` and the on-disk
 /// git refs stay in sync); callers translate the error into their own
 /// surface.
-pub fn ensure_branch_for_in_progress(project: &Project, task_id: &str) -> Result<TaskFile> {
+pub fn ensure_branch_for_in_progress(project: &Project, task_id: &str) -> Result<IssueFile> {
     // This function creates the git ref before persisting `branch:`, so the
     // compatibility gate must precede both side effects. Callers also gate
     // their surrounding transition, while this shared boundary protects any
@@ -257,7 +257,7 @@ pub fn ensure_branch_for_in_progress(project: &Project, task_id: &str) -> Result
         // from a stale read: a concurrent writer that touched another field
         // between our `load_task` and here would otherwise be clobbered
         // (lost update on `updated_at`/column/priority). Reload afterward so
-        // the returned `TaskFile` reflects what actually landed on disk.
+        // the returned `IssueFile` reflects what actually landed on disk.
         shelbi_state::set_task_branch(&project.name, task_id, &branch)?;
         tf = shelbi_state::load_task(&project.name, task_id)?;
     }
@@ -304,9 +304,9 @@ mod tests {
         p
     }
 
-    fn task_with(id: &str, column: Column, branch: Option<&str>, deps: &[&str]) -> Task {
+    fn task_with(id: &str, column: Column, branch: Option<&str>, deps: &[&str]) -> Issue {
         let now = Utc::now();
-        Task {
+        Issue {
             id: id.into(),
             title: id.into(),
             column,
@@ -324,8 +324,8 @@ mod tests {
         }
     }
 
-    fn tf_with(task: Task) -> TaskFile {
-        TaskFile {
+    fn tf_with(task: Issue) -> IssueFile {
+        IssueFile {
             task,
             body: String::new(),
         }
@@ -402,6 +402,7 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig {
                 base_branch: base_branch.map(String::from),
@@ -817,7 +818,7 @@ mod tests {
 
     // ----- ensure_branch_for_in_progress -------------------------------
 
-    fn write_task(home: &std::path::Path, project: &str, task: &Task, body: &str) {
+    fn write_task(home: &std::path::Path, project: &str, task: &Issue, body: &str) {
         std::env::set_var("SHELBI_HOME", home);
         shelbi_state::save_task(project, task, body).unwrap();
     }

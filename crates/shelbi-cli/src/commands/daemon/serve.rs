@@ -681,7 +681,7 @@ struct Message {
     /// every other verb.
     #[serde(default)]
     line: Option<String>,
-    /// Task this message references. Required for `request-clarification`,
+    /// Issue this message references. Required for `request-clarification`,
     /// `message-ack`, and `message-pushed`; ignored for `event`.
     #[serde(default)]
     task_id: Option<String>,

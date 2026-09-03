@@ -133,6 +133,16 @@ pub struct Project {
     /// [`Project::merge_strategy`].
     #[serde(default)]
     pub git: GitConfig,
+    /// Which board backend this project's issues live in. Absent ⇒
+    /// [`IssueTrackerBackend::FileSystem`] (today's markdown-on-disk board),
+    /// so every existing project keeps working untouched. Only
+    /// `file_system` resolves to a live store today; the remote backends
+    /// (`github` / `jira` / `linear`) parse and validate but resolve to a
+    /// typed "not yet implemented". Elided from the wire form when it is the
+    /// default so existing project YAMLs don't grow a key on round-trip. See
+    /// [`IssueTrackerConfig`] and `Plans/pluggable-task-stores.md` §2 + D1.
+    #[serde(default, skip_serializing_if = "IssueTrackerConfig::is_default")]
+    pub issue_tracker: IssueTrackerConfig,
     /// The project's runner **fleet**, keyed by canonical [`RunnerKind`]: one
     /// entry per kind is the concrete launcher (the evolution of
     /// [`agent_runners`](Self::agent_runners)), optionally carrying a house
@@ -217,6 +227,7 @@ pub const SHARED_PROJECT_FIELDS: &[&str] = &[
     "zen",
     "heartbeat",
     "git",
+    "issue_tracker",
     "runners",
     "agents",
 ];
@@ -665,6 +676,189 @@ impl std::fmt::Display for MergeStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Which board backend a project's issues live in. The wire form is the
+/// snake-case variant name (`file_system` | `github` | `jira` | `linear`).
+/// The `file_system` backend (`shelbi_state::FileSystemStore`) is the only one
+/// that resolves to a live store today; the remote backends parse and validate
+/// but resolve to a typed "not yet implemented".
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueTrackerBackend {
+    /// Today's markdown-on-disk board under
+    /// `~/.shelbi/projects/<name>/tasks/`. The default: an absent
+    /// `issue_tracker` block resolves here, so existing projects keep working.
+    #[default]
+    FileSystem,
+    /// GitHub issues in a single repo. Selector: [`GithubConnection::repo`].
+    Github,
+    /// Jira issues in a project. Stub: parses and validates, not yet resolvable.
+    Jira,
+    /// Linear issues for a team. Stub: parses and validates, not yet resolvable.
+    Linear,
+}
+
+impl IssueTrackerBackend {
+    /// The snake-case wire token for this backend — matches the YAML form and
+    /// the string interpolated into validation / resolution errors.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IssueTrackerBackend::FileSystem => "file_system",
+            IssueTrackerBackend::Github => "github",
+            IssueTrackerBackend::Jira => "jira",
+            IssueTrackerBackend::Linear => "linear",
+        }
+    }
+}
+
+impl std::fmt::Display for IssueTrackerBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// GitHub backend connection facts. Carries only the **non-secret** repo
+/// selector — the auth token is resolved out-of-band (`gh` keychain / env),
+/// never a field in any committed file. See `Plans/pluggable-task-stores.md`
+/// §4 + D2.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubConnection {
+    /// `owner/repo` — which repo the issues live in. Required whenever the
+    /// GitHub backend is selected; validated by
+    /// [`IssueTrackerConfig::validate`].
+    #[serde(default)]
+    pub repo: String,
+}
+
+/// Jira backend connection facts (stub). No secret ever.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JiraConnection {
+    /// Jira project key (e.g. `PROJ`) — which project the issues live in.
+    #[serde(default)]
+    pub project: String,
+}
+
+/// Linear backend connection facts (stub). No secret ever.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinearConnection {
+    /// Linear team key (e.g. `ENG`) — which team's issues to sync.
+    #[serde(default)]
+    pub team: String,
+}
+
+/// A project's `issue_tracker` block: which board backend is live plus its
+/// per-backend, non-secret connection facts. An absent block deserializes to
+/// the default (`file_system`, no connections), so existing projects keep
+/// working; that default is elided from the wire form via
+/// [`IssueTrackerConfig::is_default`].
+///
+/// The per-backend connection structs are independent options rather than an
+/// enum-tagged union so that a user can keep a `github:` block staged while the
+/// backend is still `file_system`, and so a `parse → serialize` round-trip
+/// never drops a connection block the user wrote. [`IssueTrackerConfig::validate`]
+/// checks only the *selected* backend's requirements.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueTrackerConfig {
+    /// The live backend. Absent ⇒ [`IssueTrackerBackend::FileSystem`].
+    #[serde(default)]
+    pub backend: IssueTrackerBackend,
+    /// GitHub connection facts — required when `backend: github`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GithubConnection>,
+    /// Jira connection facts — required when `backend: jira`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jira: Option<JiraConnection>,
+    /// Linear connection facts — required when `backend: linear`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear: Option<LinearConnection>,
+}
+
+impl IssueTrackerConfig {
+    /// True when this is the untouched default (`file_system`, no connection
+    /// blocks). Drives `skip_serializing_if` on [`Project::issue_tracker`] so an
+    /// absent block stays absent across a load → save round-trip.
+    pub fn is_default(&self) -> bool {
+        *self == IssueTrackerConfig::default()
+    }
+
+    /// Validate the **selected** backend's connection facts, naming the bad
+    /// field in the error. A no-op for `file_system`. GitHub requires a
+    /// well-formed `owner/repo`; Jira/Linear (stubs) require their selector be
+    /// present. Staged connection blocks for a *non-selected* backend are not
+    /// validated, so a `github:` block can sit alongside `backend: file_system`.
+    pub fn validate(&self) -> crate::Result<()> {
+        match self.backend {
+            IssueTrackerBackend::FileSystem => Ok(()),
+            IssueTrackerBackend::Github => {
+                let repo = self
+                    .github
+                    .as_ref()
+                    .map(|g| g.repo.trim())
+                    .filter(|r| !r.is_empty())
+                    .ok_or_else(|| {
+                        crate::Error::InvalidIssueTracker(
+                            "issue_tracker.github.repo is required for the `github` \
+                             backend (expected `owner/repo`)"
+                                .to_string(),
+                        )
+                    })?;
+                if !is_valid_owner_repo(repo) {
+                    return Err(crate::Error::InvalidIssueTracker(format!(
+                        "issue_tracker.github.repo `{repo}` is malformed \
+                         (expected `owner/repo`)"
+                    )));
+                }
+                Ok(())
+            }
+            IssueTrackerBackend::Jira => {
+                require_selector(
+                    self.jira.as_ref().map(|j| j.project.as_str()),
+                    "issue_tracker.jira.project",
+                    "jira",
+                )
+            }
+            IssueTrackerBackend::Linear => require_selector(
+                self.linear.as_ref().map(|l| l.team.as_str()),
+                "issue_tracker.linear.team",
+                "linear",
+            ),
+        }
+    }
+}
+
+/// Shared helper for the stub backends: require a non-empty selector, naming
+/// the field and backend in the error.
+fn require_selector(
+    value: Option<&str>,
+    field: &str,
+    backend: &str,
+) -> crate::Result<()> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(_) => Ok(()),
+        None => Err(crate::Error::InvalidIssueTracker(format!(
+            "{field} is required for the `{backend}` backend"
+        ))),
+    }
+}
+
+/// A GitHub `owner/repo` slug: exactly one `/`, both halves non-empty and drawn
+/// from the characters GitHub allows in owner and repo names
+/// (`[A-Za-z0-9._-]`). Deliberately lenient on length so this never rejects a
+/// valid repo; it exists to catch the obvious mistakes (missing slug, a bare
+/// name, an embedded URL/space).
+fn is_valid_owner_repo(s: &str) -> bool {
+    let mut parts = s.split('/');
+    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let ok = |seg: &str| {
+        !seg.is_empty()
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    ok(owner) && ok(repo)
 }
 
 fn default_workspace_poll_interval_secs() -> u64 {
@@ -1743,7 +1937,7 @@ impl<'de> serde::Deserialize<'de> for Column {
 /// One Kanban card. Position within a column is given by `priority`
 /// (0 = top); the storage layer keeps these contiguous within each column.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Task {
+pub struct Issue {
     pub id: String,
     pub title: String,
     pub column: Column,
@@ -1753,7 +1947,7 @@ pub struct Task {
     /// Name of the workflow this task runs under, matching the filename
     /// (`workflows/<name>.yaml`) minus the extension. Absent means the
     /// task uses the project's default workflow — see
-    /// [`Task::workflow_or_default`] and [`DEFAULT_WORKFLOW_NAME`].
+    /// [`Issue::workflow_or_default`] and [`DEFAULT_WORKFLOW_NAME`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<String>,
     /// The git branch this task operates on. Two modes (`Plans/workflows.md`
@@ -1764,7 +1958,7 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Other task ids this task depends on. A task is **blocked** (see
-    /// [`Task::is_blocked`]) when any of these are not yet in
+    /// [`Issue::is_blocked`]) when any of these are not yet in
     /// [`Column::done()`]. Stored as a list rather than a reverse `blocks`
     /// field so cycle detection and dep editing only touch one file.
     /// Cycles are rejected at save time by
@@ -1779,16 +1973,16 @@ pub struct Task {
     /// Per-task overrides for Zen Mode: opt-in/out of auto-promote and
     /// adjust the check set against the project default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub zen: Option<TaskZenConfig>,
+    pub zen: Option<IssueZenConfig>,
     /// Per-task launch overrides: the runner kind / model / effort /
     /// permission mode this task should launch with, sitting at the TOP of
     /// the agent-launch resolution chain (above the project config and the
     /// agent's `agent.yaml` manifest). Lives under `launch:` in the task
     /// frontmatter. `None` means "no task-level override — resolve from the
-    /// project/manifest chain as usual." See [`TaskLaunchConfig`] and
+    /// project/manifest chain as usual." See [`IssueLaunchConfig`] and
     /// [`crate::resolve_agent_launch`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch: Option<TaskLaunchConfig>,
+    pub launch: Option<IssueLaunchConfig>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// Free-form parameters carried at the top level of the task's
@@ -1798,7 +1992,7 @@ pub struct Task {
     /// directly alongside the structured fields, which is what the workflow
     /// docs and `feature-task` example assume.
     ///
-    /// Anything that is not a typed Task field lands here — and the value is
+    /// Anything that is not a typed Issue field lands here — and the value is
     /// kept as a raw [`serde_yaml::Value`], not narrowed to `String`. This
     /// is the task half of the forward-compat contract (see the module docs
     /// on `shelbi_state`): when a *newer* binary adds a typed scalar field
@@ -1814,13 +2008,13 @@ pub struct Task {
     /// `{{count}}` backed by `count: 3` reads as *unresolved* rather than
     /// silently coercing the number into a branch name.
     ///
-    /// [`param_str`]: Task::param_str
-    /// [`string_params`]: Task::string_params
+    /// [`param_str`]: Issue::param_str
+    /// [`string_params`]: Issue::string_params
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, serde_yaml::Value>,
 }
 
-impl Task {
+impl Issue {
     /// True iff any id in `depends_on` is not yet `Done` in `columns`.
     /// IDs missing from `columns` are treated as not-done (which matches
     /// the project-wide validation that rejects unknown ids at save time
@@ -1833,7 +2027,7 @@ impl Task {
     }
 
     /// Context-free fallback for legacy paths/tests: the explicit
-    /// [`Task::workflow`] field if set, otherwise [`DEFAULT_WORKFLOW_NAME`].
+    /// [`Issue::workflow`] field if set, otherwise [`DEFAULT_WORKFLOW_NAME`].
     /// Runtime callers with project context should prefer the project-aware
     /// resolver in `shelbi_state` so `default_workflow:` is honored.
     pub fn workflow_or_default(&self) -> &str {
@@ -1849,7 +2043,7 @@ impl Task {
         self.params.get(key).and_then(serde_yaml::Value::as_str)
     }
 
-    /// The string-valued subset of [`Task::params`], for `{{var}}`
+    /// The string-valued subset of [`Issue::params`], for `{{var}}`
     /// substitution. Non-string params (numbers, bools, mappings — which
     /// only arise from a newer binary's typed fields flattening in on an
     /// older binary, or a hand-authored non-string frontmatter value) are
@@ -1862,13 +2056,13 @@ impl Task {
             .collect()
     }
 
-    /// Post-deserialize lint of [`Task::params`] — the flattened catch-all
+    /// Post-deserialize lint of [`Issue::params`] — the flattened catch-all
     /// for extra frontmatter keys. Returns one [`ParamDiagnostic`] per
     /// suspect key (in the map's sorted-key order), or an empty vec when
     /// every param is a plausible free-form string.
     ///
     /// This is a *diagnostic* layered on top of a deliberately tolerant
-    /// parse — it never mutates and never fails. [`Task::params`] holds raw
+    /// parse — it never mutates and never fails. [`Issue::params`] holds raw
     /// [`serde_yaml::Value`]s so a newer binary's typed field survives a
     /// read-modify-write on an older one (see the field docs and the
     /// `non_string_params_round_trip…` test); that tolerance is what lets a
@@ -1906,9 +2100,9 @@ impl Task {
     }
 }
 
-/// The *optional* typed fields on [`Task`] that a hand-authored frontmatter
-/// might misspell into an anonymous [`Task::params`] entry.
-/// [`Task::validate_params`] warns when an extra key is a single edit away
+/// The *optional* typed fields on [`Issue`] that a hand-authored frontmatter
+/// might misspell into an anonymous [`Issue::params`] entry.
+/// [`Issue::validate_params`] warns when an extra key is a single edit away
 /// from one of these — the `asigned_to:`-for-`assigned_to:` slip.
 ///
 /// Only optional fields are listed. Required fields (`id`, `title`,
@@ -1924,8 +2118,8 @@ pub const KNOWN_OPTIONAL_TASK_FIELDS: &[&str] = &[
     "launch",
 ];
 
-/// A post-deserialize problem [`Task::validate_params`] found in a task's
-/// flattened [`Task::params`]. See that method for why the check is a
+/// A post-deserialize problem [`Issue::validate_params`] found in a task's
+/// flattened [`Issue::params`]. See that method for why the check is a
 /// non-fatal diagnostic layered on a tolerant parse rather than a parse
 /// error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2056,7 +2250,7 @@ pub const MAX_TASK_ID_LEN: usize = 233;
 pub fn validate_task_id(s: &str) -> crate::Result<()> {
     validate_agent_id(s)?;
     if s.len() > MAX_TASK_ID_LEN {
-        return Err(crate::Error::TaskIdTooLong {
+        return Err(crate::Error::IssueIdTooLong {
             id: s.to_string(),
             len: s.len(),
             max: MAX_TASK_ID_LEN,
@@ -2425,7 +2619,7 @@ pub fn detect_project_shapes(root: &Path) -> Vec<ProjectShape> {
 /// frontmatter. Every field is optional so a task can adjust just one
 /// dimension.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TaskZenConfig {
+pub struct IssueZenConfig {
     /// Explicit opt-in/out of Zen Mode promotion for this task. `None`
     /// means "follow project default"; `Some(false)` is the canonical
     /// way to keep a sensitive task on the manual-review path even when
@@ -2456,7 +2650,7 @@ pub struct TaskZenConfig {
 /// ceiling by [`crate::resolve_agent_launch`], so a task can only tighten
 /// (or match) the project's permission mode, never loosen it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TaskLaunchConfig {
+pub struct IssueLaunchConfig {
     /// Force this task onto a specific runner kind, overriding the project's
     /// `agents.<name>.runner` and the manifest's `preferred_runner`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2483,7 +2677,7 @@ pub struct TaskLaunchConfig {
 /// prefer [`checks_for_task_in_workflow`], which threads the task's
 /// workflow into the resolution chain so a per-workflow `zen.checks`
 /// override wins over the project-level default.
-pub fn checks_for_task(project: &Project, task: &Task) -> Vec<String> {
+pub fn checks_for_task(project: &Project, task: &Issue) -> Vec<String> {
     checks_for_task_in_workflow(project, None, task)
 }
 
@@ -2497,8 +2691,8 @@ pub fn checks_for_task(project: &Project, task: &Task) -> Vec<String> {
 ///
 /// 1. Project-level `zen.checks.local`.
 /// 2. Per-workflow `WorkflowZenConfig::checks.local` (if set), replacing 1.
-/// 3. Per-task `TaskZenConfig::checks_only` (if set), replacing 2.
-/// 4. Otherwise per-task `TaskZenConfig::checks_additional` extending 2.
+/// 3. Per-task `IssueZenConfig::checks_only` (if set), replacing 2.
+/// 4. Otherwise per-task `IssueZenConfig::checks_additional` extending 2.
 ///
 /// Pass `workflow: None` to skip the workflow layer entirely — the
 /// helper still applies the project + per-task rules and matches the
@@ -2506,7 +2700,7 @@ pub fn checks_for_task(project: &Project, task: &Task) -> Vec<String> {
 pub fn checks_for_task_in_workflow(
     project: &Project,
     workflow: Option<&crate::Workflow>,
-    task: &Task,
+    task: &Issue,
 ) -> Vec<String> {
     let base = workflow
         .and_then(|w| w.zen.as_ref())
@@ -2832,7 +3026,7 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = serde_yaml::from_str(yaml).unwrap();
         assert!(t.depends_on.is_empty());
         let back = serde_yaml::to_string(&t).unwrap();
         assert!(!back.contains("depends_on"));
@@ -2856,7 +3050,7 @@ depends_on:
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(t.workflow.as_deref(), Some("feature-task"));
         assert_eq!(t.branch.as_deref(), Some("feature/auth-rewrite"));
         assert_eq!(t.depends_on, vec!["scaffold-auth".to_string()]);
@@ -2868,7 +3062,7 @@ updated_at: 2026-06-19T00:00:00Z
         assert!(back.contains("- scaffold-auth"));
 
         // Stable second round-trip — no spurious normalization.
-        let t2: Task = serde_yaml::from_str(&back).unwrap();
+        let t2: Issue = serde_yaml::from_str(&back).unwrap();
         assert_eq!(serde_yaml::to_string(&t2).unwrap(), back);
     }
 
@@ -2882,7 +3076,7 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = serde_yaml::from_str(yaml).unwrap();
         assert!(t.workflow.is_none());
         // Absent `workflow:` routes to the canonical default name; no
         // caller has to special-case `Option::None`.
@@ -2893,7 +3087,7 @@ updated_at: 2026-06-19T00:00:00Z
 
     #[test]
     fn task_workflow_or_default_prefers_explicit() {
-        let mut t: Task = serde_yaml::from_str(
+        let mut t: Issue = serde_yaml::from_str(
             r#"
 id: a
 title: A
@@ -2919,7 +3113,7 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = serde_yaml::from_str(yaml).unwrap();
         assert!(t.branch.is_none());
         let back = serde_yaml::to_string(&t).unwrap();
         assert!(!back.contains("branch"));
@@ -3033,7 +3227,7 @@ agent_runners:
     #[test]
     fn task_is_blocked_when_any_dep_not_done() {
         let now = chrono::Utc::now();
-        let task = Task {
+        let task = Issue {
             id: "a".into(),
             title: "A".into(),
             column: Column::todo(),
@@ -3065,7 +3259,7 @@ agent_runners:
     #[test]
     fn task_prefers_machine_round_trips() {
         let now = chrono::Utc::now();
-        let task = Task {
+        let task = Issue {
             id: "linux-probe".into(),
             title: "Tune the readiness probe".into(),
             column: Column::todo(),
@@ -3083,7 +3277,7 @@ agent_runners:
         };
         let y = serde_yaml::to_string(&task).unwrap();
         assert!(y.contains("prefers_machine: devbox"));
-        let back: Task = serde_yaml::from_str(&y).unwrap();
+        let back: Issue = serde_yaml::from_str(&y).unwrap();
         assert_eq!(back.prefers_machine.as_deref(), Some("devbox"));
         // YAML representation is stable across a second round trip.
         let y2 = serde_yaml::to_string(&back).unwrap();
@@ -3100,7 +3294,7 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = serde_yaml::from_str(yaml).unwrap();
         assert!(t.prefers_machine.is_none());
         let back = serde_yaml::to_string(&t).unwrap();
         assert!(!back.contains("prefers_machine"));
@@ -3119,11 +3313,11 @@ updated_at: 2026-06-19T00:00:00Z
 
         let one_over = "a".repeat(MAX_TASK_ID_LEN + 1);
         match validate_task_id(&one_over) {
-            Err(crate::Error::TaskIdTooLong { len, max, .. }) => {
+            Err(crate::Error::IssueIdTooLong { len, max, .. }) => {
                 assert_eq!(len, MAX_TASK_ID_LEN + 1);
                 assert_eq!(max, MAX_TASK_ID_LEN);
             }
-            other => panic!("expected TaskIdTooLong, got {other:?}"),
+            other => panic!("expected IssueIdTooLong, got {other:?}"),
         }
 
         // Agent ids are unaffected — only the task wrapper enforces length.
@@ -3148,7 +3342,7 @@ region: us-east
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(t.param_str("feature"), Some("auth-rewrite"));
         assert_eq!(t.param_str("region"), Some("us-east"));
         // Structured fields aren't double-counted in params.
@@ -3180,7 +3374,7 @@ zen_optional: true
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = serde_yaml::from_str(yaml).unwrap();
         // The unknown non-string fields land in params as raw YAML values.
         assert_eq!(t.params.get("retries"), Some(&serde_yaml::Value::from(2)));
         assert_eq!(
@@ -3198,7 +3392,7 @@ updated_at: 2026-06-19T00:00:00Z
         // The old binary rewrites the file: the newer fields survive with
         // their original YAML types, not stringified.
         let back = serde_yaml::to_string(&t).unwrap();
-        let reparsed: Task = serde_yaml::from_str(&back).unwrap();
+        let reparsed: Issue = serde_yaml::from_str(&back).unwrap();
         assert_eq!(
             reparsed.params.get("retries"),
             Some(&serde_yaml::Value::from(2))
@@ -3209,7 +3403,7 @@ updated_at: 2026-06-19T00:00:00Z
         );
     }
 
-    fn task_with_params(extra_yaml: &str) -> Task {
+    fn task_with_params(extra_yaml: &str) -> Issue {
         let yaml = format!(
             "id: t\ntitle: T\ncolumn: todo\npriority: 0\n\
              created_at: 2026-06-19T00:00:00Z\nupdated_at: 2026-06-19T00:00:00Z\n{extra_yaml}"
@@ -3323,7 +3517,7 @@ updated_at: 2026-06-19T00:00:00Z
         // and round-trip untouched.
         let t = task_with_params("feature: auth-rewrite\nregion: us-east\n");
         assert!(t.validate_params().is_empty());
-        let reparsed: Task = serde_yaml::from_str(&serde_yaml::to_string(&t).unwrap()).unwrap();
+        let reparsed: Issue = serde_yaml::from_str(&serde_yaml::to_string(&t).unwrap()).unwrap();
         assert_eq!(reparsed.param_str("feature"), Some("auth-rewrite"));
         assert_eq!(reparsed.param_str("region"), Some("us-east"));
         assert!(reparsed.validate_params().is_empty());
@@ -3352,13 +3546,13 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = serde_yaml::from_str(yaml).unwrap();
         assert!(t.params.is_empty());
         let back = serde_yaml::to_string(&t).unwrap();
         // There's no good single token to grep for "params:" since it
         // would only appear if we'd nested under that key — instead
         // assert that the round-trip is stable.
-        let t2: Task = serde_yaml::from_str(&back).unwrap();
+        let t2: Issue = serde_yaml::from_str(&back).unwrap();
         assert!(t2.params.is_empty());
     }
 
@@ -3565,6 +3759,7 @@ workspace_settings_template: /etc/shelbi/p.json
             git: GitConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         };
         assert!(project.validate_workspaces().is_ok());
@@ -3663,6 +3858,7 @@ workspaces:
             git: GitConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -3966,13 +4162,14 @@ workspaces:
             git: GitConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
 
-    fn task_with_zen(zen: Option<TaskZenConfig>) -> Task {
+    fn task_with_zen(zen: Option<IssueZenConfig>) -> Issue {
         let now = chrono::Utc::now();
-        Task {
+        Issue {
             id: "t".into(),
             title: "T".into(),
             column: Column::todo(),
@@ -4094,7 +4291,7 @@ zen:
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = serde_yaml::from_str(yaml).unwrap();
         let z = t.zen.expect("zen block present");
         assert_eq!(z.enabled, Some(false));
         assert_eq!(z.checks_only, vec!["cargo test --doc"]);
@@ -4111,7 +4308,7 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = serde_yaml::from_str(yaml).unwrap();
         assert!(t.zen.is_none());
         let back = serde_yaml::to_string(&t).unwrap();
         assert!(!back.contains("zen"));
@@ -4132,7 +4329,7 @@ launch:
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = serde_yaml::from_str(yaml).unwrap();
         let over = t.launch.clone().expect("launch block parsed");
         assert_eq!(over.runner, Some(crate::RunnerKind::Codex));
         assert_eq!(over.model.as_deref(), Some("gpt-5"));
@@ -4144,7 +4341,7 @@ updated_at: 2026-06-19T00:00:00Z
         // The override is a typed field, not a flattened param.
         assert!(!t.params.contains_key("launch"));
         // Round-trips through YAML unchanged.
-        let back: Task = serde_yaml::from_str(&serde_yaml::to_string(&t).unwrap()).unwrap();
+        let back: Issue = serde_yaml::from_str(&serde_yaml::to_string(&t).unwrap()).unwrap();
         assert_eq!(back.launch, t.launch);
     }
 
@@ -4158,20 +4355,20 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = serde_yaml::from_str(yaml).unwrap();
         assert!(t.launch.is_none());
         assert!(!serde_yaml::to_string(&t).unwrap().contains("launch"));
     }
 
     #[test]
     fn task_zen_config_round_trip() {
-        let cfg = TaskZenConfig {
+        let cfg = IssueZenConfig {
             enabled: Some(true),
             checks_additional: vec!["npm test".into()],
             checks_only: vec![],
         };
         let y = serde_yaml::to_string(&cfg).unwrap();
-        let back: TaskZenConfig = serde_yaml::from_str(&y).unwrap();
+        let back: IssueZenConfig = serde_yaml::from_str(&y).unwrap();
         assert_eq!(cfg, back);
         // Empty lists omitted on the wire.
         assert!(!y.contains("checks_only"));
@@ -4197,7 +4394,7 @@ updated_at: 2026-06-19T00:00:00Z
             },
             ..Default::default()
         });
-        let t = task_with_zen(Some(TaskZenConfig {
+        let t = task_with_zen(Some(IssueZenConfig {
             checks_additional: vec!["cargo clippy".into()],
             ..Default::default()
         }));
@@ -4212,7 +4409,7 @@ updated_at: 2026-06-19T00:00:00Z
             },
             ..Default::default()
         });
-        let t = task_with_zen(Some(TaskZenConfig {
+        let t = task_with_zen(Some(IssueZenConfig {
             checks_only: vec!["cargo test --doc".into()],
             // `checks_only` wins even when both are set.
             checks_additional: vec!["never-run".into()],
@@ -5188,7 +5385,7 @@ git:
             }),
             ..Default::default()
         });
-        let task = task_with_zen(Some(TaskZenConfig {
+        let task = task_with_zen(Some(IssueZenConfig {
             enabled: None,
             checks_only: vec!["just this one".into()],
             checks_additional: vec![],
@@ -5213,7 +5410,7 @@ git:
             }),
             ..Default::default()
         });
-        let task = task_with_zen(Some(TaskZenConfig {
+        let task = task_with_zen(Some(IssueZenConfig {
             enabled: None,
             checks_only: vec![],
             checks_additional: vec!["npm test".into()],
@@ -5236,7 +5433,7 @@ git:
             },
             ..Default::default()
         });
-        let task = task_with_zen(Some(TaskZenConfig {
+        let task = task_with_zen(Some(IssueZenConfig {
             enabled: None,
             checks_additional: vec!["npm test".into()],
             checks_only: vec![],
@@ -5297,6 +5494,13 @@ git:
             git: GitConfig {
                 base_branch: Some("trunk".into()),
                 merge_strategy: MergeStrategy::Rebase,
+                ..Default::default()
+            },
+            issue_tracker: IssueTrackerConfig {
+                backend: IssueTrackerBackend::Github,
+                github: Some(GithubConnection {
+                    repo: "example/shelbi".into(),
+                }),
                 ..Default::default()
             },
             repo: "/home/dev/shelbi".into(),
@@ -5660,5 +5864,151 @@ machines:
             .expect_err("`orchestrator` is required — merge must fail");
         let msg = err.to_string();
         assert!(msg.contains("orchestrator"), "err was: {msg}");
+    }
+
+    // -- issue_tracker config -------------------------------------------------
+
+    fn project_with_issue_tracker_yaml(block: &str) -> Project {
+        let yaml = format!(
+            r#"
+name: p
+repo: r
+machines:
+  - {{ name: hub, kind: local, work_dir: /tmp }}
+orchestrator: {{ runner: claude }}
+agent_runners:
+  claude: {{ command: claude, flags: [] }}
+{block}"#
+        );
+        Project::from_yaml_str(&yaml).unwrap()
+    }
+
+    #[test]
+    fn issue_tracker_absent_defaults_to_file_system_and_omits_key() {
+        // An old project YAML with no `issue_tracker:` block parses to the
+        // file_system default and must not grow the key on re-serialization.
+        let p = project_with_issue_tracker_yaml("");
+        assert_eq!(p.issue_tracker.backend, IssueTrackerBackend::FileSystem);
+        assert!(p.issue_tracker.is_default());
+        p.issue_tracker.validate().unwrap();
+
+        let back = serde_yaml::to_string(&p).unwrap();
+        assert!(!back.contains("issue_tracker"), "got: {back}");
+    }
+
+    #[test]
+    fn issue_tracker_parses_github_backend() {
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n",
+        );
+        assert_eq!(p.issue_tracker.backend, IssueTrackerBackend::Github);
+        assert_eq!(
+            p.issue_tracker.github.as_ref().unwrap().repo,
+            "owner/repo"
+        );
+        p.issue_tracker.validate().unwrap();
+    }
+
+    #[test]
+    fn issue_tracker_github_requires_repo() {
+        // Backend selected but no github block at all.
+        let p = project_with_issue_tracker_yaml("issue_tracker:\n  backend: github\n");
+        let err = p.issue_tracker.validate().expect_err("repo missing");
+        let msg = err.to_string();
+        assert!(msg.contains("issue_tracker.github.repo"), "err was: {msg}");
+
+        // Empty repo string is treated the same as missing.
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: github\n  github:\n    repo: ''\n",
+        );
+        let err = p.issue_tracker.validate().expect_err("repo empty");
+        assert!(
+            err.to_string().contains("issue_tracker.github.repo"),
+            "err was: {err}"
+        );
+    }
+
+    #[test]
+    fn issue_tracker_github_malformed_repo_errors_name_the_field() {
+        for bad in ["not-a-slug", "owner/repo/extra", "owner/", "/repo", "a b/c"] {
+            let p = project_with_issue_tracker_yaml(&format!(
+                "issue_tracker:\n  backend: github\n  github:\n    repo: '{bad}'\n"
+            ));
+            let err = p
+                .issue_tracker
+                .validate()
+                .expect_err(&format!("`{bad}` should be rejected"));
+            assert!(
+                err.to_string().contains("issue_tracker.github.repo"),
+                "`{bad}` err was: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_tracker_jira_and_linear_stubs_validate_selectors() {
+        // Selector present → validate ok (resolution unimplemented is a
+        // separate, store-layer concern).
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: jira\n  jira:\n    project: PROJ\n",
+        );
+        p.issue_tracker.validate().unwrap();
+
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n",
+        );
+        p.issue_tracker.validate().unwrap();
+
+        // Missing selector names the field.
+        let p = project_with_issue_tracker_yaml("issue_tracker:\n  backend: jira\n");
+        assert!(p
+            .issue_tracker
+            .validate()
+            .expect_err("jira selector required")
+            .to_string()
+            .contains("issue_tracker.jira.project"));
+
+        let p = project_with_issue_tracker_yaml("issue_tracker:\n  backend: linear\n");
+        assert!(p
+            .issue_tracker
+            .validate()
+            .expect_err("linear selector required")
+            .to_string()
+            .contains("issue_tracker.linear.team"));
+    }
+
+    #[test]
+    fn issue_tracker_file_system_ignores_staged_connection_blocks() {
+        // A `github:` block staged alongside `backend: file_system` is not
+        // validated and does not block resolution — and it round-trips.
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: file_system\n  github:\n    repo: owner/repo\n",
+        );
+        p.issue_tracker.validate().unwrap();
+        assert_eq!(
+            p.issue_tracker.github.as_ref().unwrap().repo,
+            "owner/repo"
+        );
+    }
+
+    #[test]
+    fn issue_tracker_round_trips_without_dropping_fields() {
+        // parse → serialize → parse must preserve backend + every connection
+        // block, including one staged for a non-selected backend.
+        let src = IssueTrackerConfig {
+            backend: IssueTrackerBackend::Github,
+            github: Some(GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            jira: Some(JiraConnection {
+                project: "PROJ".into(),
+            }),
+            linear: Some(LinearConnection {
+                team: "ENG".into(),
+            }),
+        };
+        let yaml = serde_yaml::to_string(&src).unwrap();
+        let back: IssueTrackerConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(src, back);
     }
 }

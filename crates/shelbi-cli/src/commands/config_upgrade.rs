@@ -429,6 +429,9 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_developer_instructions(entry, &text, out);
     } else if id.ends_with(".agent.orchestrator.instructions") {
         sniff_orchestrator_instructions(entry, &text, out);
+        sniff_deprecated_task_command(entry, &text, out);
+    } else if id.ends_with(".zenmode") {
+        sniff_deprecated_task_command(entry, &text, out);
     }
 }
 
@@ -1012,6 +1015,56 @@ fn sniff_orchestrator_instructions(
     }
 }
 
+/// Detect the pre-rename `shelbi task <verb>` board command in an agent's prose
+/// (orchestrator `instructions.md` or `zenmode.md`). The board command was
+/// renamed `shelbi task` -> `shelbi issue` (design D5); `shelbi task` still works
+/// as a deprecated alias, so a forked copy on the old wording is not *broken* —
+/// but it emits a deprecation notice on every invocation and reads inconsistently
+/// with the shipped defaults.
+///
+/// The correct fix is a prose refresh a user may have forked and customized, and
+/// a blind find-replace would wrongly rewrite the still-valid `tasks/` on-disk
+/// path, the `task=` event-log field, and the `task`/`subtask` workflow names —
+/// so it routes to [`Classification::NeedsJudgment`] for the orchestrator to
+/// repair its own copy rather than silently clobbering local edits.
+fn sniff_deprecated_task_command(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    // The marker: an invocation of the renamed board command. Present in the
+    // pre-rename shipped orchestrator + zenmode defaults; absent from the new
+    // ones (which say `shelbi issue`). `tasks/`, `task=`, and `task.yaml` never
+    // match because none is preceded by `shelbi ` + the bare word `task`.
+    const MARKER: &str = "shelbi task ";
+    if !text.contains(MARKER) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        "INSTRUCTIONS_TASK_COMMAND_RENAMED",
+        "agent prose still calls the board command `shelbi task <verb>`, which was renamed to \
+         `shelbi issue <verb>` (the `task` alias still works but is deprecated and warns)",
+        "Rename `shelbi task <verb>` -> `shelbi issue <verb>` throughout (add, list, move, show, \
+         depends, assign, unassign, start, resume, prio, edit, rm). Leave unchanged: the on-disk \
+         `~/.shelbi/projects/<p>/tasks/` path, the `task=<id>` event-log field, and the `task` / \
+         `subtask` workflow names — those are not the renamed command.",
+        locate_line_containing(text, MARKER),
+    ));
+}
+
+/// Location of the first line containing `needle` (substring match), for
+/// anchoring a finding to where the deprecated wording first appears. Falls back
+/// to `1:1`. Unlike [`locate_line`], which needs a whole-line match.
+fn locate_line_containing(text: &str, needle: &str) -> Location {
+    for (i, line) in text.lines().enumerate() {
+        if let Some(col) = line.find(needle) {
+            return Location {
+                line: i + 1,
+                column: col + 1,
+            };
+        }
+    }
+    Location { line: 1, column: 1 }
+}
+
 /// The body of the markdown section headed by the full heading line `heading`
 /// (e.g. `## Free-workspace selection`): everything from just after that line to
 /// just before the next `#`-prefixed header (any level) or end of file. `None`
@@ -1577,6 +1630,13 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              exclusion can't be patched in mechanically without risking your edits — \
              refresh the `Free-workspace selection` section by hand to match the \
              shipped default."
+        }
+        "INSTRUCTIONS_TASK_COMMAND_RENAMED" => {
+            "These are prose instructions a project may have forked and customized, so the \
+             `shelbi task` -> `shelbi issue` command rename can't be applied by a blind \
+             find-replace without risking local edits (and without clobbering the still-valid \
+             `tasks/` path, `task=` event field, and `task`/`subtask` workflow names) — the \
+             orchestrator refreshes its own copy with judgment."
         }
         _ => "This form is ambiguous or potentially lossy, so a human should confirm the fix.",
     }
@@ -2276,6 +2336,72 @@ mod tests {
             "shipped default template no longer has a `{FREE_WORKSPACE_SECTION_HEADING}` \
              section — the sniffer's absence check is now dead",
         );
+    }
+
+    // ---- deprecated `shelbi task` board command -------------------------
+
+    fn zen_entry() -> InventoryEntry {
+        entry("project.demo.zenmode", "project:demo", SurfaceFormat::Markdown)
+    }
+
+    #[test]
+    fn forked_prose_still_calling_shelbi_task_is_needs_judgment() {
+        let text = "# Zen\n\nFor ones you promote, run `shelbi task move <id> --to todo`.\n";
+        let mut out = Vec::new();
+        sniff_deprecated_task_command(&zen_entry(), text, &mut out);
+        let f = find(&out, "INSTRUCTIONS_TASK_COMMAND_RENAMED").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        // Anchored to where the deprecated wording first appears, not 1:1.
+        assert_eq!(f.location.line, 3);
+    }
+
+    #[test]
+    fn prose_using_shelbi_issue_is_clean() {
+        let text = "# Zen\n\nFor ones you promote, run `shelbi issue move <id> --to todo`.\n";
+        let mut out = Vec::new();
+        sniff_deprecated_task_command(&zen_entry(), text, &mut out);
+        assert!(
+            find(&out, "INSTRUCTIONS_TASK_COMMAND_RENAMED").is_none(),
+            "renamed prose should not be flagged: {:?}",
+            codes(&out),
+        );
+    }
+
+    #[test]
+    fn preserved_task_contract_tokens_do_not_trip_the_rename_sniffer() {
+        // The board unit's cross-boundary contracts keep the word "task" and must
+        // NOT look like the deprecated command: the on-disk `tasks/` path, the
+        // `task=` event field, and the `task` workflow name. None is `shelbi task `.
+        let text = "Cards live under `~/.shelbi/projects/<p>/tasks/`; events log \
+                    `task=<id>` lines; the default `task` workflow gates review.\n";
+        let mut out = Vec::new();
+        sniff_deprecated_task_command(&orch_entry(), text, &mut out);
+        assert!(
+            find(&out, "INSTRUCTIONS_TASK_COMMAND_RENAMED").is_none(),
+            "preserved contract tokens (tasks/, task=, `task` workflow) tripped the \
+             command-rename sniffer: {:?}",
+            codes(&out),
+        );
+    }
+
+    /// Drift guard: the shipped orchestrator + zenmode defaults must speak the
+    /// renamed `shelbi issue` command, so a freshly-materialized project never
+    /// trips this sniffer. If this fails, a shipped template regressed to the
+    /// old `shelbi task` spelling.
+    #[test]
+    fn shipped_defaults_do_not_trip_the_task_command_rename_sniffer() {
+        for text in [
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+            shelbi_state::DEFAULT_ZENMODE,
+        ] {
+            let mut out = Vec::new();
+            sniff_deprecated_task_command(&orch_entry(), text, &mut out);
+            assert!(
+                find(&out, "INSTRUCTIONS_TASK_COMMAND_RENAMED").is_none(),
+                "a shipped default still calls `shelbi task`: {:?}",
+                codes(&out),
+            );
+        }
     }
 
     // ---- detect + emit (home-scoped) ------------------------------------

@@ -58,7 +58,7 @@ use std::time::SystemTime;
 
 use shelbi_core::{
     default_project_statuses, default_workflow, validate_workflow_name, Error, Project,
-    ProjectStatuses, Result, Task, Workflow,
+    ProjectStatuses, Result, Issue, Workflow,
 };
 
 use crate::{agents_dir, atomic_write, config_project_dir};
@@ -249,7 +249,7 @@ fn resolve_workflow_alias(project: &str, name: &str) -> Result<String> {
 /// Resolve the workflow name for `task` with project context:
 /// explicit task `workflow:` wins, then project `default_workflow:`,
 /// then the built-in `default` fallback.
-pub fn resolve_task_workflow_name<'a>(project: &'a Project, task: &'a Task) -> &'a str {
+pub fn resolve_task_workflow_name<'a>(project: &'a Project, task: &'a Issue) -> &'a str {
     task.workflow
         .as_deref()
         .unwrap_or_else(|| project.default_workflow_name())
@@ -261,7 +261,7 @@ pub fn resolve_task_workflow_name<'a>(project: &'a Project, task: &'a Task) -> &
 pub fn load_task_workflow(
     project: &str,
     project_config: &Project,
-    task: &Task,
+    task: &Issue,
 ) -> Result<Workflow> {
     load_workflow(project, resolve_task_workflow_name(project_config, task))
 }
@@ -713,9 +713,9 @@ workspaces:
         .unwrap();
     }
 
-    fn task_with_workflow(workflow: Option<&str>) -> Task {
+    fn task_with_workflow(workflow: Option<&str>) -> Issue {
         let now = chrono::Utc::now();
-        Task {
+        Issue {
             id: "t".into(),
             title: "Task".into(),
             column: shelbi_core::Column::todo(),

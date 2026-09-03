@@ -76,7 +76,7 @@ accept step.
   }}
 />
 
-Four columns, no `Review`. A task branch is cut off `main` at
+Four columns, no `Review`. An issue branch is cut off `main` at
 **In Progress** and squash-merged straight back into `main` at **Done**,
 the moment checks pass and Zen clears the bar.
 
@@ -94,7 +94,7 @@ description: Trunk-based — short-lived branches, merge to main on green.
 
 git:
   base_branch: main
-  merge_strategy: squash               # one squashed commit per task on trunk
+  merge_strategy: squash               # one squashed commit per issue on trunk
 
 statuses:
   - { id: backlog,     owner: user,  agent: orchestrator }
@@ -139,13 +139,13 @@ tweaks are worth encoding:
 
 ### Merge conditions
 
-A task on the `InProgress → Done` edge may auto-merge when **all** hold:
+An issue on the `InProgress → Done` edge may auto-merge when **all** hold:
 
 1. The workspace has written its review marker (work is complete).
 2. `shelbi zen probe` reports every local check green.
 3. The diff touches no path in the danger set (migrations, auth, CI).
 
-Otherwise, hold the card in `InProgress` and surface it: "`<task>` is
+Otherwise, hold the card in `InProgress` and surface it: "`<issue>` is
 green but touches `<danger-path>` — merge to main?" Trunk stays
 releasable because nothing lands without a green probe.
 ```
@@ -157,7 +157,7 @@ That's the discipline trunk-based trades the review column for.
 ## See also
 
 - [Feature-branch](/docs/guides/understanding-workflows/feature-branch) — the review-gated
-  version of the same branch-per-task shape.
+  version of the same branch-per-issue shape.
 - [Zen Mode](/docs/concepts/zen-mode) — the confidence bar and the
   `zen.checks` that stand in for a review column here.
 - [Workflows: what fires the high-confidence bar](/docs/guides/getting-started/workflows#what-fires-zen-modes-high-confidence-bar):

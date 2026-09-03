@@ -42,7 +42,7 @@
 //! cleaning up a branch the branch is on origin, so gh / git from any
 //! hub checkout work fine.
 
-use shelbi_core::{validate_branch, Column, Error, Host, MergeStrategy, Project, Result, Task};
+use shelbi_core::{validate_branch, Column, Error, Host, MergeStrategy, Project, Result, Issue};
 
 use crate::git::{
     compose_pr_body, gh_pr_merge, head_commit_subject, locate_hub_workdir,
@@ -239,7 +239,7 @@ impl RestackOutcome {
 /// Errors when the task has no assigned workspace or no `branch` field — both
 /// are caller bugs (the workflow contract guarantees both fields by the
 /// time this fires). Re-pushing an up-to-date branch is a clean success.
-pub fn push_branch(project: &Project, task: &Task) -> Result<()> {
+pub fn push_branch(project: &Project, task: &Issue) -> Result<()> {
     let branch = require_branch(task)?;
     let (host, worktree) = locate_workspace_worktree(project, task)?;
     let wt = worktree.to_string_lossy().into_owned();
@@ -286,7 +286,7 @@ pub fn push_branch(project: &Project, task: &Task) -> Result<()> {
 pub fn open_pr(
     project: &Project,
     project_name: &str,
-    task: &Task,
+    task: &Issue,
     task_body: &str,
     target_override: Option<&str>,
 ) -> Result<u64> {
@@ -338,7 +338,7 @@ pub fn open_pr(
 fn resolve_pr_target(
     project: &Project,
     project_name: &str,
-    task: &Task,
+    task: &Issue,
     target_override: Option<&str>,
 ) -> Result<String> {
     Ok(resolve_pr_target_from(
@@ -358,12 +358,12 @@ fn resolve_pr_target(
 /// without a `SHELBI_HOME`.
 fn resolve_pr_target_from<F>(
     project_base_branch: &str,
-    task: &Task,
+    task: &Issue,
     target_override: Option<&str>,
     parent_lookup: F,
 ) -> String
 where
-    F: Fn(&str) -> Option<Task>,
+    F: Fn(&str) -> Option<Issue>,
 {
     if let Some(t) = target_override {
         return t.to_string();
@@ -452,7 +452,7 @@ where
 pub fn merge(
     project: &Project,
     project_name: &str,
-    task: &Task,
+    task: &Issue,
     target_override: Option<&str>,
 ) -> Result<MergeResult> {
     let branch = require_branch(task)?;
@@ -542,7 +542,7 @@ pub fn merge(
 /// A task whose workflow can't be loaded at all genuinely has no workflow
 /// base, so the project base is its effective base — matching the tolerant
 /// `load_task_workflow` fallback the poller and transition executor use.
-fn resolve_task_base_branch(project: &Project, project_name: &str, task: &Task) -> Result<String> {
+fn resolve_task_base_branch(project: &Project, project_name: &str, task: &Issue) -> Result<String> {
     let params = task.string_params();
     match shelbi_state::load_task_workflow(project_name, project, task) {
         Ok(workflow) => Ok(workflow
@@ -570,7 +570,7 @@ fn resolve_task_base_branch(project: &Project, project_name: &str, task: &Task) 
 fn restack_children(
     project: &Project,
     project_name: &str,
-    parent_task: &Task,
+    parent_task: &Issue,
     parent_branch: &str,
     onto: &str,
 ) -> Vec<RestackOutcome> {
@@ -618,9 +618,9 @@ fn restack_children(
 }
 
 fn restack_base_for_child(
-    child: &Task,
-    tasks: &[shelbi_state::TaskFile],
-    just_merged_parent: &Task,
+    child: &Issue,
+    tasks: &[shelbi_state::IssueFile],
+    just_merged_parent: &Issue,
     just_merged_parent_branch: &str,
 ) -> (String, Option<Vec<String>>) {
     if child.depends_on.len() <= 1 {
@@ -640,8 +640,8 @@ fn restack_base_for_child(
 }
 
 fn unfinished_multi_parent_deps(
-    child: &Task,
-    tasks: &[shelbi_state::TaskFile],
+    child: &Issue,
+    tasks: &[shelbi_state::IssueFile],
     just_merged_parent_id: &str,
 ) -> Vec<String> {
     if child.depends_on.len() <= 1 {
@@ -665,7 +665,7 @@ fn unfinished_multi_parent_deps(
         .collect()
 }
 
-fn multi_parent_restack_cutoff(child: &Task, tasks: &[shelbi_state::TaskFile]) -> Option<String> {
+fn multi_parent_restack_cutoff(child: &Issue, tasks: &[shelbi_state::IssueFile]) -> Option<String> {
     child.depends_on.iter().find_map(|dep_id| {
         tasks
             .iter()
@@ -717,7 +717,7 @@ fn multi_parent_restack_cutoff(child: &Task, tasks: &[shelbi_state::TaskFile]) -
 /// [`Error::Command`] so a misconfiguration surfaces loudly.
 pub fn restack(
     project: &Project,
-    child_task: &Task,
+    child_task: &Issue,
     from_base: &str,
     onto_override: Option<&str>,
 ) -> Result<RestackOutcome> {
@@ -1465,7 +1465,7 @@ fn run_capture_stdout(host: &Host, wt: &str, argv: &[&str]) -> Result<String> {
 ///
 /// Returns `Some(pr_number)` when a PR was closed, `None` when no open PR
 /// existed for the branch (the spec's "no-op if none open" case).
-pub fn close_pr(project: &Project, task: &Task) -> Result<Option<u64>> {
+pub fn close_pr(project: &Project, task: &Issue) -> Result<Option<u64>> {
     let branch = require_branch(task)?;
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
@@ -1505,7 +1505,7 @@ pub fn close_pr(project: &Project, task: &Task) -> Result<Option<u64>> {
 ///   [`DeleteOutcome::RemoteDeletedLocalDeferred`]. Without this, an accepted
 ///   task's branch stayed on origin forever (`gh` warned `cannot delete
 ///   branch … used by worktree` and the whole delete no-op'd).
-pub fn delete_branch(project: &Project, task: &Task) -> Result<DeleteOutcome> {
+pub fn delete_branch(project: &Project, task: &Issue) -> Result<DeleteOutcome> {
     let branch = require_branch(task)?;
 
     let holder = workspace_holding_branch(project, &branch)?;
@@ -1586,7 +1586,7 @@ pub fn delete_branch(project: &Project, task: &Task) -> Result<DeleteOutcome> {
 
 fn deferred_multi_parent_child_needing_branch(
     project: &Project,
-    parent_task: &Task,
+    parent_task: &Issue,
     parent_branch: &str,
 ) -> Option<String> {
     let tasks = shelbi_state::list_tasks(&project.name).ok()?;
@@ -1606,7 +1606,7 @@ fn deferred_multi_parent_child_needing_branch(
 // ---------------------------------------------------------------------------
 // helpers
 
-fn require_branch(task: &Task) -> Result<String> {
+fn require_branch(task: &Issue) -> Result<String> {
     let branch = task.branch.clone().ok_or_else(|| {
         Error::Other(format!(
             "task `{}` has no branch — populate `branch:` in its frontmatter \
@@ -1747,9 +1747,9 @@ mod tests {
 
     // --- require_branch contract ------------------------------------------
 
-    fn bare_task(id: &str) -> Task {
+    fn bare_task(id: &str) -> Issue {
         let now = chrono::Utc::now();
-        Task {
+        Issue {
             id: id.into(),
             title: id.into(),
             column: Column::in_progress(),
@@ -1916,6 +1916,7 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
         }
@@ -1988,6 +1989,7 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
         };
@@ -1996,7 +1998,7 @@ mod tests {
             .is_none());
     }
 
-    fn task_on_branch(id: &str, branch: &str) -> Task {
+    fn task_on_branch(id: &str, branch: &str) -> Issue {
         let mut t = bare_task(id);
         t.branch = Some(branch.into());
         t
@@ -2078,6 +2080,7 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
         }
@@ -2170,6 +2173,7 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
         };
@@ -2250,6 +2254,7 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
         };
@@ -2324,20 +2329,20 @@ mod tests {
     // closure away; tests below build that closure in memory so the rules
     // are pinned without touching SHELBI_HOME or shelling out to gh.
 
-    fn parent(id: &str, column: Column, branch: Option<&str>) -> Task {
+    fn parent(id: &str, column: Column, branch: Option<&str>) -> Issue {
         let mut t = bare_task(id);
         t.column = column;
         t.branch = branch.map(str::to_string);
         t
     }
 
-    fn child(id: &str, deps: &[&str]) -> Task {
+    fn child(id: &str, deps: &[&str]) -> Issue {
         let mut t = bare_task(id);
         t.depends_on = deps.iter().map(|s| s.to_string()).collect();
         t
     }
 
-    fn lookup(parents: Vec<Task>) -> impl Fn(&str) -> Option<Task> {
+    fn lookup(parents: Vec<Issue>) -> impl Fn(&str) -> Option<Issue> {
         move |id: &str| parents.iter().find(|t| t.id == id).cloned()
     }
 
@@ -2583,6 +2588,7 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig {
                 base_branch: None,
@@ -3425,7 +3431,7 @@ mod tests {
         project_at(local, MergeStrategy::Squash)
     }
 
-    fn child_task_on_branch(id: &str, branch: &str, depends_on: &[&str]) -> Task {
+    fn child_task_on_branch(id: &str, branch: &str, depends_on: &[&str]) -> Issue {
         let mut t = bare_task(id);
         t.branch = Some(branch.into());
         t.depends_on = depends_on.iter().map(|s| s.to_string()).collect();
@@ -3691,7 +3697,7 @@ mod tests {
         crate::test_lock::acquire()
     }
 
-    fn write_task_file(project: &str, task: &Task) {
+    fn write_task_file(project: &str, task: &Issue) {
         shelbi_state::save_task(project, task, "").unwrap();
     }
 

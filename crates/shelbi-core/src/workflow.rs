@@ -89,7 +89,7 @@ pub struct Workflow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transitions: Option<Vec<Transition>>,
 
-    /// Task frontmatter fields every task on this workflow must carry.
+    /// Issue frontmatter fields every task on this workflow must carry.
     ///
     /// This is the contract that makes a templated `git.base_branch` safe:
     /// a workflow whose `base_branch` is `task/{{task}}` declares

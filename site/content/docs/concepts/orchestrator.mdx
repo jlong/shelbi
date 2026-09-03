@@ -1,7 +1,7 @@
 ---
 title: Orchestrator
 order: 14
-summary: One agent in window 1 you talk to — it dispatches tasks to workspaces, tails the events log, and reports back. You are the priority-setter; it is the scheduler.
+summary: One agent in window 1 you talk to — it dispatches issues to workspaces, tails the events log, and reports back. You are the priority-setter; it is the scheduler.
 ---
 
 The orchestrator is the agent you talk to. It lives in window 1 of the
@@ -13,7 +13,7 @@ It is a [**named agent**](/docs/concepts/agents) like any other
 (`agents/orchestrator/`), with an editable `instructions.md` for its system
 prompt. What makes it special is only *where* it runs: window 1, talking to
 you, rather than in a [workspace](/docs/concepts/workspaces) picking up
-tasks. The `developer` agent (and any reviewer roles you author) run inside
+issues. The `developer` agent (and any reviewer roles you author) run inside
 workspaces; the orchestrator runs the board.
 
 The mental model is: **you are the priority-setter and reviewer. It is
@@ -30,12 +30,12 @@ the workspaces it dispatches them to:
 ## You-are-the-scheduler
 
 A useful contrast: a generic chatbot waits to be asked. The orchestrator
-does not. As soon as a task lands in the `ready` category (`todo` in the
+does not. As soon as an issue lands in the `ready` category (`todo` in the
 default workflow), that is the start signal. The orchestrator's job is
-to find a free workspace, route the task to it, and tell you it did. When
-a workspace hands off (its task moves into the `handoff` category,
+to find a free workspace, route the issue to it, and tell you it did. When
+a workspace hands off (its issue moves into the `handoff` category,
 `review` in the default workflow), the orchestrator's job is to give that
-workspace the next ready task without waiting to be prompted.
+workspace the next ready issue without waiting to be prompted.
 
 This is what makes the loop feel continuous. You drop work into the
 backlog, triage what's ready, and review what comes back. Everything in
@@ -67,9 +67,9 @@ auto-merge rules because the orchestrator matches on the category, not
 the name. See the [Workflows](/docs/guides/getting-started/workflows#status-categories)
 concept page for the full schema.
 
-The `shelbi task move --to <status>` CLI accepts the literal status name
+The `shelbi issue move --to <status>` CLI accepts the literal status name
 from the active workflow. `<status>` is never a category. The category
-is the semantic layer above; the orchestrator reads it from each task's
+is the semantic layer above; the orchestrator reads it from each issue's
 status definition (and, on the wire, from the `from_category=` /
 `to_category=` tokens on every task event line; see [the events
 log](/docs/concepts/events-log#task-transitions)).
@@ -144,12 +144,12 @@ The prompt instructs the orchestrator to do three things on the first
 reply of a session (or right after `shelbi reload`), before answering
 the user:
 
-1. **Read the board.** `shelbi task list` for the column membership,
+1. **Read the board.** `shelbi issue list` for the column membership,
    priorities, `assigned_to`, and any `prefers_machine` hints on each
    card. Each status belongs to one of the six categories above; the
    orchestrator maps column → category from the active workflow.
 2. **Read the workspace pool.** `shelbi workspace list` to see which
-   workspaces are free (no `active`-category task assigned), which machine
+   workspaces are free (no `active`-category issue assigned), which machine
    each lives on, and which agent each is running.
 3. **Start its live watch.** Launch `shelbi orchestrator events next
    --follow` in the background — the durable claim/ack feed is the
@@ -172,7 +172,7 @@ statuses:
   workspace, dispatch.
 - `task=<id> ... to_category=handoff reason=workspace:ready-marker` →
   the finishing dev workspace has already closed its session, so it's
-  *already free*. Find it the next ready task. If the handoff status
+  *already free*. Find it the next ready issue. If the handoff status
   requires [review tags](/docs/concepts/review-workspaces), also route the
   finished branch onto a matching workspace — firing the status's enter
   transition to boot a server (or leave it queued when they're all busy) so a
@@ -183,7 +183,7 @@ statuses:
   is auto-restarted by the supervisor; the orchestrator at most mentions
   it. Only `supervision=gave-up` (crash-loop) is surfaced for direction.
 - `project=<name> heartbeat` → no state change to react to, but the
-  watch is awake. A good time to re-check `active`-category tasks for
+  watch is awake. A good time to re-check `active`-category issues for
   stuck workspaces or missed markers. See
   [heartbeats](/docs/concepts/events-log#heartbeats) for the cadence
   config and rationale; tune it via the `heartbeat` key in
@@ -191,7 +191,7 @@ statuses:
 
 When dispatching, the orchestrator picks free eligible workspaces in the
 order they're declared in the project YAML, honoring `prefers_machine`
-hints. If a task names a machine and no workspace on that machine is free,
+hints. If an issue names a machine and no workspace on that machine is free,
 it stays in the `ready` category rather than getting routed to the wrong
 host.
 
@@ -244,7 +244,7 @@ it; your changes are overwritten on the next render.
 
 A few things worth keeping when you fork the default prompt:
 
-- The bootstrap flow. The orchestrator needs the initial `task list` /
+- The bootstrap flow. The orchestrator needs the initial `issue list` /
   `workspace list` snapshot and the tail process to do its job.
 - The polling-only event drain. Codex-backed and other polling-only runners
   must drain pending project events before each user-facing reply, using
@@ -266,7 +266,7 @@ A few things worth keeping when you fork the default prompt:
 
 What you might *want* to change per project:
 
-- Routing rules: "always send infra tasks to charlie", "never use the
+- Routing rules: "always send infra issues to charlie", "never use the
   hub for benchmarks".
 - Merge policy: by default the orchestrator stops at the `handoff`
   category (`review` in the default workflow); you can authorize specific
@@ -279,7 +279,7 @@ What you might *want* to change per project:
 
 - **It does not edit code.** The `developer` (and other workspace) agents
   do that.
-- **It does not move tasks into the `done` category.** That's your
+- **It does not move issues into the `done` category.** That's your
   accept signal.
 - **It does not auto-promote `backlog` → `ready`.** Triage belongs to
   the user.
@@ -299,7 +299,7 @@ workflow legible.
 When you're ready to let the orchestrator initiate instead of just
 scheduling, [Zen Mode](/docs/concepts/zen-mode) is the next-level
 autonomy switch. It flips the agent from scheduler to lead: it
-auto-promotes `backlog`-category tasks into `ready` when it judges the
+auto-promotes `backlog`-category issues into `ready` when it judges the
 work in scope, and it lands finished branches past a project-defined
 confidence bar without waiting on a human reviewer. The policy that
 decides "in scope" lives in the orchestrator agent's `instructions.md`
@@ -312,7 +312,7 @@ the [workflow YAML](/docs/guides/getting-started/workflows#owners-and-agents).
 - [Agents](/docs/concepts/agents) — the orchestrator is one; this is how
   its prompt, skills, and customization work.
 - [Workspaces](/docs/concepts/workspaces) — what the orchestrator
-  dispatches tasks to.
+  dispatches issues to.
 - [Review workspaces](/docs/concepts/review-workspaces) — the tag-routed slots
   the orchestrator loads a finished branch onto on handoff, and the queue it
   drains as they free.

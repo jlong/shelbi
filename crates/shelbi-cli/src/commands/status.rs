@@ -165,7 +165,7 @@ fn print_summary(project: &str) -> Result<()> {
 fn print_full(project: &str) -> Result<()> {
     println!("## Board");
     println!();
-    super::task::print_board(project)?;
+    super::issue::print_board(project)?;
 
     println!();
     println!("## Workspaces");
@@ -794,9 +794,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    fn make_task(id: &str, column: Column) -> shelbi_core::Task {
+    fn make_task(id: &str, column: Column) -> shelbi_core::Issue {
         let now = Utc::now();
-        shelbi_core::Task {
+        shelbi_core::Issue {
             id: id.to_string(),
             title: id.to_string(),
             column,

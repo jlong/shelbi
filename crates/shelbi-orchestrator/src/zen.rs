@@ -46,7 +46,7 @@ use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use shelbi_core::{
     checks_for_task_in_workflow, danger_paths_for_workflow, Column, Error, Host, Machine,
-    MergeStrategy, Project, Result, StatusCategory, Task, TransitionAction, Workflow, WorkflowStatus,
+    MergeStrategy, Project, Result, StatusCategory, Issue, TransitionAction, Workflow, WorkflowStatus,
     WorkspaceSpec,
 };
 
@@ -330,7 +330,7 @@ impl Default for PrHeadVerifyRetry {
 pub fn pr_create_at_head(
     project: &Project,
     project_name: &str,
-    task: &Task,
+    task: &Issue,
     task_body: &str,
     expected: &PinnedPrIdentity,
 ) -> Result<u64> {
@@ -347,7 +347,7 @@ pub fn pr_create_at_head(
 fn pr_create_impl(
     project: &Project,
     project_name: &str,
-    task: &Task,
+    task: &Issue,
     task_body: &str,
     expected: &PinnedPrIdentity,
     head_retry: PrHeadVerifyRetry,
@@ -1080,7 +1080,7 @@ pub struct GithubMergeReconcile {
 /// up by. Human-review-only umbrella tasks are excluded before a candidate is
 /// built — see [`github_merge_reconcile_candidates`].
 struct GithubReconcileCandidate {
-    task: Task,
+    task: Issue,
     body: String,
     workflow: Workflow,
     branch: String,
@@ -2922,6 +2922,7 @@ mod pr_create_tests {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
         }
@@ -2943,9 +2944,9 @@ mod pr_create_tests {
         project
     }
 
-    fn task() -> Task {
+    fn task() -> Issue {
         let now = chrono::Utc::now();
-        Task {
+        Issue {
             id: "reviewed-head".into(),
             title: "reviewed head".into(),
             column: Column::review(),
@@ -5720,7 +5721,7 @@ pub enum RebasePolicy {
 /// [`probe_in_workflow`] with `workflow = None`. New callers should
 /// reach for the workflow-aware form so per-workflow `zen:` overrides
 /// (checks, danger_paths) take effect.
-pub fn probe(project: &Project, task: &Task, branch: &str) -> Result<ProbeReport> {
+pub fn probe(project: &Project, task: &Issue, branch: &str) -> Result<ProbeReport> {
     probe_in_workflow(project, None, task, branch, RebasePolicy::AsIs)
 }
 
@@ -5736,7 +5737,7 @@ pub fn probe(project: &Project, task: &Task, branch: &str) -> Result<ProbeReport
 pub fn probe_in_workflow(
     project: &Project,
     workflow: Option<&Workflow>,
-    task: &Task,
+    task: &Issue,
     branch: &str,
     policy: RebasePolicy,
 ) -> Result<ProbeReport> {
@@ -5825,7 +5826,7 @@ pub fn probe_in_workflow(
 fn probe_isolated_task_ref(
     project: &Project,
     workflow: Option<&Workflow>,
-    task: &Task,
+    task: &Issue,
     host: &Host,
     repository_anchor: &std::path::Path,
     shared_cargo_target: &std::path::Path,
@@ -6134,7 +6135,7 @@ fn normalize_probe_branch(branch: &str) -> Result<String> {
 fn unique_probe_worktree_path(repository_anchor: &std::path::Path, task_id: &str) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Task ids can approach GitHub's 255-byte ref limit. Keep the diagnostic
+    // Issue ids can approach GitHub's 255-byte ref limit. Keep the diagnostic
     // fragment short so the generated path component stays below NAME_MAX;
     // pid + process-local sequence provide uniqueness.
     let safe_id: String = task_id
@@ -6570,7 +6571,7 @@ fn fetch_probe_base_after_fetch<F: FnOnce()>(
 fn resolve_probe_base(
     project: &Project,
     workflow: Option<&Workflow>,
-    task: &Task,
+    task: &Issue,
 ) -> Result<String> {
     let fallback;
     let workflow = match workflow {
@@ -6627,7 +6628,7 @@ fn lookup_probe_repository_identity(
 
 fn resolve_workspace<'a>(
     project: &'a Project,
-    task: &Task,
+    task: &Issue,
 ) -> Result<(Machine, &'a WorkspaceSpec)> {
     let workspace_name = task.assigned_to.as_deref().ok_or_else(|| {
         Error::Other(format!(
@@ -6660,7 +6661,7 @@ fn probe_local_checks(
     expected_head: &str,
     project: &Project,
     workflow: Option<&Workflow>,
-    task: &Task,
+    task: &Issue,
 ) -> Result<Vec<LocalCheck>> {
     let commands = checks_for_task_in_workflow(project, workflow, task);
     if commands.is_empty() {
@@ -9463,14 +9464,15 @@ mod probe_tests {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
         }
     }
 
-    fn probe_task(branch: &str) -> Task {
+    fn probe_task(branch: &str) -> Issue {
         let now = chrono::Utc::now();
-        Task {
+        Issue {
             id: "task1".into(),
             title: "task1".into(),
             column: Column::review(),
@@ -9571,7 +9573,7 @@ mod probe_tests {
         // would fail.
         let (base, origin, wt) = setup_origin_and_worktree();
 
-        // Task branch off the seed commit, with its own work.
+        // Issue branch off the seed commit, with its own work.
         run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
         std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
         run_git(&wt, &["add", "-A"]);
@@ -9875,7 +9877,7 @@ mod probe_tests {
         // conflicting file, abort the rebase, and NOT run the local checks.
         let (base, origin, wt) = setup_origin_and_worktree();
 
-        // Task edits seed.txt.
+        // Issue edits seed.txt.
         run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
         std::fs::write(wt.join("seed.txt"), "task side\n").unwrap();
         run_git(&wt, &["commit", "-q", "-am", "task edits seed"]);
@@ -11861,7 +11863,7 @@ pub fn mechanically_eligible(project: &Project) -> Result<Vec<String>> {
 /// tests can drive it with in-memory fixtures without touching disk or
 /// `SHELBI_HOME`.
 pub fn mechanically_eligible_from(
-    tasks: &[shelbi_state::TaskFile],
+    tasks: &[shelbi_state::IssueFile],
     demoted: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     let columns: std::collections::HashMap<String, Column> = tasks
@@ -11875,7 +11877,7 @@ pub fn mechanically_eligible_from(
         .map(|tf| tf.body.as_str())
         .collect();
 
-    let mut candidates: Vec<&Task> = tasks
+    let mut candidates: Vec<&Issue> = tasks
         .iter()
         .filter(|tf| tf.task.column == Column::backlog())
         .filter(|tf| !tf.task.is_blocked(&columns))
@@ -11894,7 +11896,7 @@ pub fn mechanically_eligible_from(
 /// True iff the task's frontmatter explicitly opts out via `zen.enabled:
 /// false`. `None` (no override) and `Some(true)` both count as "follow
 /// project default" — which, for this gate, means "eligible".
-fn zen_disabled(task: &Task) -> bool {
+fn zen_disabled(task: &Issue) -> bool {
     matches!(task.zen.as_ref().and_then(|z| z.enabled), Some(false))
 }
 
@@ -12005,11 +12007,11 @@ mod scan_tests {
     use super::*;
     use chrono::Utc;
     use shelbi_core::Column;
-    use shelbi_state::TaskFile;
+    use shelbi_state::IssueFile;
     use std::collections::HashSet;
 
-    fn task(id: &str, column: Column, priority: u32, deps: &[&str]) -> Task {
-        Task {
+    fn task(id: &str, column: Column, priority: u32, deps: &[&str]) -> Issue {
+        Issue {
             id: id.into(),
             title: id.into(),
             column,
@@ -12027,8 +12029,8 @@ mod scan_tests {
         }
     }
 
-    fn tf(task: Task, body: &str) -> TaskFile {
-        TaskFile {
+    fn tf(task: Issue, body: &str) -> IssueFile {
+        IssueFile {
             task,
             body: body.into(),
         }
@@ -12091,7 +12093,7 @@ mod scan_tests {
     #[test]
     fn excludes_zen_enabled_false() {
         let mut t = task("opt-out", Column::backlog(), 0, &[]);
-        t.zen = Some(shelbi_core::TaskZenConfig {
+        t.zen = Some(shelbi_core::IssueZenConfig {
             enabled: Some(false),
             ..Default::default()
         });
@@ -12103,7 +12105,7 @@ mod scan_tests {
     #[test]
     fn zen_enabled_true_or_unset_is_eligible() {
         let mut opt_in = task("opt-in", Column::backlog(), 0, &[]);
-        opt_in.zen = Some(shelbi_core::TaskZenConfig {
+        opt_in.zen = Some(shelbi_core::IssueZenConfig {
             enabled: Some(true),
             ..Default::default()
         });
@@ -12159,7 +12161,7 @@ mod scan_tests {
     fn does_not_cap_result_count() {
         // Ten eligible tasks; we get all ten back. The orchestrator's
         // judgment layer picks how many to actually promote.
-        let tasks: Vec<TaskFile> = (0..10)
+        let tasks: Vec<IssueFile> = (0..10)
             .map(|i| tf(task(&format!("t-{i}"), Column::backlog(), i, &[]), ""))
             .collect();
         let got = mechanically_eligible_from(&tasks, &HashSet::new());
@@ -12242,7 +12244,7 @@ mod scan_tests {
             "Follow-up to the auth incident we just shipped a hotfix for.",
             "Phase 3 of the kickoff John kicked off yesterday.",
         ];
-        let tasks: Vec<TaskFile> = bodies
+        let tasks: Vec<IssueFile> = bodies
             .iter()
             .enumerate()
             .map(|(i, body)| {
@@ -12347,7 +12349,7 @@ impl DryRunAction {
 }
 
 /// Run one non-publishing Zen pass for `project` and return every decision the
-/// live loop would have made. Task, board, PR, and branch state remain
+/// live loop would have made. Issue, board, PR, and branch state remain
 /// unchanged; probes use transient isolated worktrees for accurate local
 /// checks. Probes are best-effort: an error is surfaced as a `BlockMerge`
 /// decision labelled `probe-failed` so the user still sees the task, rather
@@ -12448,7 +12450,7 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
 ///    renamed `Review` to `QA` still resolve to a handoff status.
 /// 3. **None** — the workflow declares no compatible status. Callers
 ///    fall back to column-level metadata.
-fn resolve_task_status<'w>(task: &Task, workflow: &'w Workflow) -> Option<&'w WorkflowStatus> {
+fn resolve_task_status<'w>(task: &Issue, workflow: &'w Workflow) -> Option<&'w WorkflowStatus> {
     let canonical = task.column.as_str();
     if let Some(s) = workflow.status(canonical) {
         return Some(s);
@@ -12463,7 +12465,7 @@ fn resolve_task_status<'w>(task: &Task, workflow: &'w Workflow) -> Option<&'w Wo
 /// Loading is best-effort because the dry-run loop runs against live
 /// state, and a transient typo in a workflow YAML shouldn't kill the
 /// whole preview pass for unrelated tasks.
-fn load_task_workflow(project: &str, task: &Task) -> Option<Workflow> {
+fn load_task_workflow(project: &str, task: &Issue) -> Option<Workflow> {
     let project_yaml = shelbi_state::load_project(project).ok()?;
     shelbi_state::load_task_workflow(project, &project_yaml, task).ok()
 }
@@ -12794,9 +12796,9 @@ mod dry_run_tests {
         }
     }
 
-    fn task_in_column(id: &str, column: Column) -> Task {
+    fn task_in_column(id: &str, column: Column) -> Issue {
         let now = chrono::Utc::now();
-        Task {
+        Issue {
             id: id.into(),
             title: id.into(),
             column,

@@ -21,7 +21,7 @@ pub struct ActiveWorkspace {
     /// `"blocked"`. Derived from the same on-disk signals the sidebar's
     /// per-workspace badge reads (in-progress task assignment + status.yaml).
     pub state: &'static str,
-    /// Task id the workspace is currently assigned to, or `"idle"` if it has
+    /// Issue id the workspace is currently assigned to, or `"idle"` if it has
     /// no in-progress card. Multiple ids get comma-joined — the workspace
     /// pool should never carry more than one but if it does, the popover
     /// should expose it rather than hide it.

@@ -14,8 +14,8 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use shelbi_core::{Column, Error, Project, Result, Task, WorkspaceSpec, Workflow};
-use shelbi_state::TaskFile;
+use shelbi_core::{Column, Error, Project, Result, Issue, WorkspaceSpec, Workflow};
+use shelbi_state::IssueFile;
 
 use crate::branch;
 use crate::workspace::{start_workspace_on_task, StartSpec};
@@ -151,7 +151,7 @@ pub fn review_slots(project_name: &str) -> Result<Vec<ReviewSlot>> {
 /// workspace (declaration order) to the active task assigned to it. Split out
 /// with no I/O so the free/occupied labeling is unit-testable on in-memory
 /// fixtures.
-fn review_slots_from(project: &Project, active: &[TaskFile]) -> Vec<ReviewSlot> {
+fn review_slots_from(project: &Project, active: &[IssueFile]) -> Vec<ReviewSlot> {
     let review_tag: BTreeSet<String> = std::iter::once("review".to_string()).collect();
     project
         .workspaces_matching(&review_tag)
@@ -348,7 +348,7 @@ fn load_review_task_locked(
 /// one: a task whose `assigned_to` already names `target` is being re-loaded
 /// onto the SAME slot it owns — a resume of a stranded review slot whose pane
 /// died on `quit`/crash — which is allowed, not a double-load.
-fn conflicting_review_slot(project: &Project, task: &Task, target: &str) -> Option<String> {
+fn conflicting_review_slot(project: &Project, task: &Issue, target: &str) -> Option<String> {
     task.assigned_to
         .as_deref()
         .filter(|name| *name != target)
@@ -463,7 +463,7 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
 /// next tick. Split out with no I/O so board order, capacity limiting, and the
 /// parked skip are unit-testable on in-memory fixtures.
 fn plan_review_autoload(
-    review_tasks: &[TaskFile],
+    review_tasks: &[IssueFile],
     project: &Project,
     free: &[WorkspaceSpec],
     parked: &BTreeSet<String>,
@@ -561,7 +561,7 @@ fn dispatch_task_onto(
     project_name: &str,
     project: &Project,
     workflow: &Workflow,
-    mut tf: TaskFile,
+    mut tf: IssueFile,
     ws: &WorkspaceSpec,
     agent: Option<String>,
 ) -> Result<String> {
@@ -631,16 +631,16 @@ mod tests {
     use super::*;
     use shelbi_core::{
         AgentRunnerSpec, GitConfig, Machine, MachineKind, MergeStrategy, OrchestratorSpec, Project,
-        Task, WorkspaceSpec,
+        Issue, WorkspaceSpec,
     };
     use std::collections::BTreeMap;
 
     /// A fresh `todo` task with no branch cut yet — the shape a subtask is in
     /// before dispatch. `params` seeds the frontmatter the workflow templates
     /// resolve against.
-    fn todo_task(id: &str, params: &[(&str, &str)]) -> Task {
+    fn todo_task(id: &str, params: &[(&str, &str)]) -> Issue {
         let now = chrono::Utc::now();
-        Task {
+        Issue {
             id: id.into(),
             title: id.into(),
             column: Column::todo(),
@@ -676,9 +676,9 @@ mod tests {
 
     /// A review-column task assigned to `assigned_to` — the shape a
     /// Queued-for-Review card is in (still pinned to the slot that built it).
-    fn review_task(id: &str, assigned_to: &str) -> Task {
+    fn review_task(id: &str, assigned_to: &str) -> Issue {
         let now = chrono::Utc::now();
-        Task {
+        Issue {
             id: id.into(),
             title: id.into(),
             column: Column::review(),
@@ -762,6 +762,7 @@ mod tests {
             git: shelbi_core::GitConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -941,9 +942,9 @@ mod tests {
 
     /// A review-column task with a chosen priority and optional assignment —
     /// lets a test spell out board order and the queued-vs-serving shape.
-    fn review_task_pri(id: &str, assigned_to: Option<&str>, priority: u32) -> Task {
+    fn review_task_pri(id: &str, assigned_to: Option<&str>, priority: u32) -> Issue {
         let now = chrono::Utc::now();
-        Task {
+        Issue {
             id: id.into(),
             title: id.into(),
             column: Column::review(),
@@ -961,8 +962,8 @@ mod tests {
         }
     }
 
-    fn tf(task: Task) -> TaskFile {
-        TaskFile {
+    fn tf(task: Issue) -> IssueFile {
+        IssueFile {
             task,
             body: "body".into(),
         }

@@ -1041,13 +1041,14 @@ mod tests {
             git: shelbi_core::GitConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
 
-    fn task_on(id: &str, slot: &str, column: Column) -> shelbi_core::Task {
+    fn task_on(id: &str, slot: &str, column: Column) -> shelbi_core::Issue {
         let now = chrono::Utc::now();
-        shelbi_core::Task {
+        shelbi_core::Issue {
             id: id.into(),
             title: id.into(),
             column,

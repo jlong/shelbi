@@ -12,8 +12,8 @@ explicit staging branch where work accumulates before a release.
 
 Git-flow doesn't fit one board, because a feature and a release are
 different lifecycles. Model it as **two Shelbi Workflows**: a `feature`
-workflow whose tasks branch off and merge back into `develop`, and a
-`release` workflow whose task PRs `develop` into `main`. Hotfixes reuse
+workflow whose issues branch off and merge back into `develop`, and a
+`release` workflow whose issue PRs `develop` into `main`. Hotfixes reuse
 the [feature-branch](/docs/guides/understanding-workflows/feature-branch) default with `main` as
 their base.
 
@@ -87,7 +87,7 @@ their base.
 Every card on the `feature` workflow cuts its branch off `develop` and
 squash-merges back into `develop`. The **On Develop** column is "landed
 on the integration branch," not "released." Shipping to `main` is a
-separate `release` task.
+separate `release` issue.
 
 ## The statuses
 
@@ -155,7 +155,7 @@ transition overrides it with a [`target:`](/docs/guides/getting-started/workflow
 
 ## The release workflow
 
-A release task PRs the accumulated `develop` into `main`. Pre-fill its
+A release issue PRs the accumulated `develop` into `main`. Pre-fill its
 `branch:` so the orchestrator operates on `develop`
 [directly instead of cutting a new branch](/docs/guides/getting-started/workflows#the-branch-task-field):
 
@@ -211,7 +211,7 @@ the orchestrator prompt (see
   work goes here; do not route feature work at `main`.
 - **Hotfixes** — titles prefixed `hotfix:` — use the `default` workflow
   (base `main`) so the fix branches off the released line. After a hotfix
-  merges to `main`, open a follow-up task to merge `main` back into
+  merges to `main`, open a follow-up issue to merge `main` back into
   `develop` so the branches don't diverge.
 - **Releases** are created by the user on the `release` workflow with
   `branch: develop` pre-filled. Never auto-promote a release — cutting one
@@ -220,7 +220,7 @@ the orchestrator prompt (see
 
 The develop-back-merge after a hotfix is the one bit of bookkeeping
 git-flow needs that a single workflow can't express. Surface it as a
-follow-up task rather than trying to encode it as a transition.
+follow-up issue rather than trying to encode it as a transition.
 
 ## See also
 
@@ -228,6 +228,6 @@ follow-up task rather than trying to encode it as a transition.
   — `{{var}}` in `base_branch` if you run several concurrent integration
   branches instead of one `develop`.
 - [Workflows: the `branch:` task field](/docs/guides/getting-started/workflows#the-branch-task-field)
-  — how a release task operates on `develop` without cutting a new branch.
+  — how a release issue operates on `develop` without cutting a new branch.
 - [Feature-branch](/docs/guides/understanding-workflows/feature-branch) — the simpler model
   hotfixes fall back to.

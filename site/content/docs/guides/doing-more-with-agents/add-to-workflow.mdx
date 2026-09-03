@@ -31,7 +31,7 @@ statuses:
 `category` comes from the
 [closed vocabulary](/docs/configuration/statuses#categories):
 `backlog`, `ready`, `active`, `handoff`, `done`, `archived`. Because an
-agent is *actively working* the review while a task sits here, it's
+agent is *actively working* the review while an issue sits here, it's
 `active`, not `handoff`: `handoff` means "one owner finished, another's
 input is required next," which is what the human `review` status already
 is. Declaration order here is the left-to-right column order in the TUI.
@@ -53,7 +53,7 @@ statuses:
   - { id: done,                owner: user }
 ```
 
-`owner: agent` makes the status the orchestrator's to act on, so tasks
+`owner: agent` makes the status the orchestrator's to act on, so issues
 that land here are [auto-dispatched](/docs/concepts/orchestrator); the
 `agent: adversarial-review` field names *which* agent runs it. No `name:`
 or `category:` appears here. Those live in `statuses.yaml`, and repeating
@@ -91,14 +91,14 @@ What each edge does:
 - **`adversarial-review → in-progress`** is the bounce-back. When the
   skeptic files blockers and writes the
   [transition marker](/docs/guides/doing-more-with-agents/adversarial-review-agent#how-send-back-works),
-  the task drops to the developer with no git side-effects: same branch,
+  the issue drops to the developer with no git side-effects: same branch,
   same PR, another pass. This edge is what makes that bounce legal; drop it
   and the poller refuses the reviewer's send-back.
 - **`review → done`** is the only edge carrying `merge` (and
   `delete_branch`). That's deliberate.
 
 The [action primitives](/docs/configuration/workflow#actions) in play are
-`push_branch` (push the task branch to origin), `open_pr` (open its PR),
+`push_branch` (push the issue branch to origin), `open_pr` (open its PR),
 `merge` (merge the branch into its target), and `delete_branch` (delete the
 local and remote branch).
 
@@ -114,7 +114,7 @@ still owns the accept.
 ## What you see now
 
 The board grows an **Adversarial Review** column between In Progress and
-Review. Tasks the developer marks ready flow into it, get auto-dispatched
+Review. Issues the developer marks ready flow into it, get auto-dispatched
 to the `adversarial-review` agent, and either bounce back with blockers or
 advance to human review with the skeptic's findings already waiting on the
 PR.

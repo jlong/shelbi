@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::process::Output;
 
-use shelbi_core::{Error, Host, MachineKind, MergeStrategy, Project, Result, Task};
+use shelbi_core::{Error, Host, MachineKind, MergeStrategy, Project, Result, Issue};
 
 use crate::workspace::workspace_worktree;
 
@@ -119,7 +119,7 @@ pub(crate) fn login_shell_prefix(host: &Host) -> (String, &'static str) {
 /// Find the workspace assigned to `task`, then return its host + worktree.
 /// Errors if the task is unassigned or the workspace/machine resolution
 /// fails — those are caller bugs, not policy decisions.
-pub(crate) fn locate_workspace_worktree(project: &Project, task: &Task) -> Result<(Host, PathBuf)> {
+pub(crate) fn locate_workspace_worktree(project: &Project, task: &Issue) -> Result<(Host, PathBuf)> {
     let workspace_name = task.assigned_to.as_deref().ok_or_else(|| {
         Error::Other(format!(
             "task `{}` has no assigned workspace — assign one before running this action",
@@ -949,10 +949,10 @@ mod tests {
         let body = compose_pr_body(
             &Host::Local,
             &wt.to_string_lossy(),
-            "Task body fallback.",
+            "Issue body fallback.",
             "/tmp/t.md",
         );
-        assert!(body.starts_with("Task body fallback.\n\n---\n"));
+        assert!(body.starts_with("Issue body fallback.\n\n---\n"));
         assert!(body.contains("Auto-opened by Shelbi"));
         std::fs::remove_dir_all(&wt).ok();
     }

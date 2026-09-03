@@ -24,7 +24,7 @@
 
 use std::time::{Duration, Instant};
 
-use shelbi_core::{Error, Host, Project, Result, Task, TransitionAction, Workflow};
+use shelbi_core::{Error, Host, Project, Result, Issue, TransitionAction, Workflow};
 
 use crate::actions;
 use crate::workspace::workspace_worktree;
@@ -68,7 +68,7 @@ pub struct ActionOutcome {
 pub fn execute_transition(
     project: &Project,
     project_name: &str,
-    task: &Task,
+    task: &Issue,
     task_body: &str,
     workflow: &Workflow,
     from: &str,
@@ -92,7 +92,7 @@ pub fn execute_transition(
 pub fn execute_merge_action(
     project: &Project,
     project_name: &str,
-    task: &Task,
+    task: &Issue,
     task_body: &str,
     workflow: &Workflow,
     from: &str,
@@ -149,7 +149,7 @@ pub fn execute_merge_action(
 pub fn run_gated_merge(
     project: &Project,
     project_name: &str,
-    task: &Task,
+    task: &Issue,
     task_body: &str,
     workflow: &Workflow,
     from: &str,
@@ -204,7 +204,7 @@ pub fn run_gated_merge(
 pub fn execute_transition_except(
     project: &Project,
     project_name: &str,
-    task: &Task,
+    task: &Issue,
     task_body: &str,
     workflow: &Workflow,
     from: &str,
@@ -250,7 +250,7 @@ pub fn execute_transition_except(
 /// an unresolvable placeholder can't fail an edge that never needed it.
 fn resolve_effective_target(
     workflow: &Workflow,
-    task: &Task,
+    task: &Issue,
     from: &str,
     to: &str,
 ) -> Result<Option<String>> {
@@ -283,7 +283,7 @@ fn resolve_effective_target(
 /// actually serving.
 fn run_shell_commands(
     project: &Project,
-    task: &Task,
+    task: &Issue,
     transition: &shelbi_core::Transition,
 ) -> Result<()> {
     // Resolve the worktree/host/slot from the task's assigned workspace.
@@ -418,7 +418,7 @@ fn wait_ready(host: &Host, env: &TransitionEnv<'_>, probe: &str, timeout: Durati
 fn run_action(
     project: &Project,
     project_name: &str,
-    task: &Task,
+    task: &Issue,
     task_body: &str,
     action: TransitionAction,
     target: Option<&str>,
@@ -514,14 +514,15 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
         }
     }
 
-    fn bare_task(id: &str) -> Task {
+    fn bare_task(id: &str) -> Issue {
         let now = chrono::Utc::now();
-        Task {
+        Issue {
             id: id.into(),
             title: id.into(),
             column: shelbi_core::Column::review(),
@@ -790,7 +791,7 @@ transitions:
         p
     }
 
-    fn task_assigned(id: &str, workspace: &str) -> Task {
+    fn task_assigned(id: &str, workspace: &str) -> Issue {
         let mut t = bare_task(id);
         t.assigned_to = Some(workspace.into());
         t

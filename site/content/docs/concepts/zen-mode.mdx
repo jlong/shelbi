@@ -22,7 +22,7 @@ Three ways to flip the switch:
 - **TUI**: `Alt+Z` toggles between On and Off from any sidebar focus.
 - **Status check**: `shelbi zen status` prints the current mode,
   configured local checks, resolved danger paths, the last crash
-  timestamp (if any), and the count of in-flight Zen tasks.
+  timestamp (if any), and the count of in-flight Zen issues.
 
 When Zen is **on**, the sidebar shows a green **ZEN ON** pill anchored
 to the bottom of the workspaces column. That pill is the at-a-glance
@@ -56,10 +56,10 @@ Three levels of "stop":
   bar on any `merge`-action transition. Anything already mid-flight
   in the conditions flow runs to completion on its current trajectory.
 - **`shelbi zen pause`**: softer. No new auto-promotions, but the
-  merge bar keeps applying to in-flight tasks that reach a
+  merge bar keeps applying to in-flight issues that reach a
   `merge`-action transition. Use this when you want to triage
   incoming work yourself without losing validation already in motion.
-- **Per-task pull-back**: `shelbi task move <id> --to backlog`
+- **Per-issue pull-back**: `shelbi issue move <id> --to backlog`
   from a handoff status pulls a specific card out of Zen's hands
   without changing the global mode.
 
@@ -130,7 +130,7 @@ project:
     crates/shelbi-state/src/default_zenmode.md.template */}
 
 ```markdown
-Zen: auto-promote eligible backlog, review each handoff yourself (diff vs the task's acceptance criteria + scope), and run the exact-provenance merge flow without asking.
+Zen: auto-promote eligible backlog, review each handoff yourself (diff vs the issue's acceptance criteria + scope), and run the exact-provenance merge flow without asking.
 
 # Zen Mode policy
 
@@ -147,40 +147,40 @@ is what gets re-injected as a live reminder.
 When Zen is on the orchestrator acts as lead rather than scheduler. It may:
 
 1. Auto-merge work that passes the merge-conditions flow below.
-2. Auto-promote `backlog`-category tasks into `ready` when they fit at least
+2. Auto-promote `backlog`-category issues into `ready` when they fit at least
    one of the judgment categories below.
 
 When Zen is `paused` it stops starting new auto-promotions but keeps applying
-the merge-conditions flow to in-flight tasks that reach `handoff`. When Zen is
+the merge-conditions flow to in-flight issues that reach `handoff`. When Zen is
 `off` the orchestrator is a plain scheduler: it dispatches what you promote and
 leaves handoffs for you.
 
 ## Auto-promote judgment categories
 
 The mechanical eligibility scan (`shelbi zen scan`) hands the orchestrator
-`backlog`-category task ids that are safe from a state-machine standpoint: not
+`backlog`-category issue ids that are safe from a state-machine standpoint: not
 blocked, not opt-out, no file overlap with anything in flight. From that list,
 **only auto-promote** a candidate if **at least one** of these is true:
 
 1. **It's the kind of work the user generally trusts you with.** Look at the
-   `done`-category column. Does the user routinely accept tasks of this shape
+   `done`-category column. Does the user routinely accept issues of this shape
    without changes? (Examples: docs typo fixes, dependency bumps, content
    sweeps that match a recently-stated convention.) If their done-history shows
    pattern acceptance, this is in scope.
 2. **It's part of fixing an issue the user recently raised.** Did the user
    mention this bug, feature, or concern in conversation in the last few turns?
-   Tasks that respond to something the user explicitly asked for are in scope.
+   Issues that respond to something the user explicitly asked for are in scope.
 3. **It's part of a larger body of work the user explicitly kicked off.** If
-   the user filed a batch of related tasks (e.g. 13 vs-pages, a multi-step
+   the user filed a batch of related issues (e.g. 13 vs-pages, a multi-step
    refactor), the remaining items in that batch are in scope.
 
 If a candidate fits none of these, **leave it in `backlog`** and surface it in
-your next user-facing reply: *"I considered promoting `<task>` but wasn't sure
+your next user-facing reply: *"I considered promoting `<issue>` but wasn't sure
 if it fits your intent, want me to?"* Also emit
-`reason=orchestrator:zen-decline reason-text=<short>` on the task so the
+`reason=orchestrator:zen-decline reason-text=<short>` on the issue so the
 activity feed shows what you considered.
 
-For ones you do promote, run `shelbi task move <id> --to <ready-status>
+For ones you do promote, run `shelbi issue move <id> --to <ready-status>
 --reason "orchestrator:zen-promote category=<n>"` (`<ready-status>` is the
 literal `ready`-category status name from the active workflow, `todo` in the
 default) and then dispatch per the normal auto-dispatch contract.
@@ -188,21 +188,21 @@ default) and then dispatch per the normal auto-dispatch contract.
 ## Merge conditions
 
 **First, the review-workspace gate.** If the project declares review
-workspaces, a task reaching `handoff` is destined for a **human** to inspect on
+workspaces, an issue reaching `handoff` is destined for a **human** to inspect on
 a running server, that's the entire point of the review workspace. So do
 **not** run the merge-conditions flow on it, and do **not** merge it: leave it
 in the review status for the human to load from the sidebar and resolve (there
 is no `shelbi review` command for you to run). The human accepts by moving it
 to `done` (which is when it merges per existing rules) or bounces it back to
-`ready`. Zen never auto-merges a review-routed task out from under the human.
+`ready`. Zen never auto-merges a review-routed issue out from under the human.
 Only when the project has **no** review workspace does `handoff` mean "ready to
 auto-merge", the case the rest of this section covers.
 
-When a task enters `handoff` and Zen is on (and the project has no review
+When an issue enters `handoff` and Zen is on (and the project has no review
 workspaces), run `shelbi zen probe <task-id>` to get a JSON report covering
 local checks, merge conflicts, diff size, and danger-path matches. A passing
 mechanical probe is necessary but not sufficient; your own review of the diff
-(step 5) is what checks the branch against the task's intent. Apply these
+(step 5) is what checks the branch against the issue's intent. Apply these
 conditions to the report:
 
 1. **All `local_checks` must have `exit_code == 0`.** If any failed, leave in
@@ -215,17 +215,17 @@ conditions to the report:
 4. **`danger_paths.matched` must be empty.** Otherwise emit
    `reason=zen:danger-path` with the paths.
 
-If all four pre-PR probe conditions pass, review the diff against the task
+If all four pre-PR probe conditions pass, review the diff against the issue
 yourself before opening a PR; only if your review passes do the
 pr-create/ci-watch/pr-merge steps run:
 
-5. **Review the diff against the task.** A green mechanical probe proves the
+5. **Review the diff against the issue.** A green mechanical probe proves the
    branch builds and does not conflict; it does not prove the branch does what
-   the task asked. Read the task's acceptance criteria and the branch diff
+   the issue asked. Read the issue's acceptance criteria and the branch diff
    (`git diff <base_branch>...<branch>`) yourself and confirm:
-   - the diff satisfies every acceptance criterion the task states;
-   - the diff stays within the task's declared scope, with no unrelated files
-     and, in particular, no large deletions or reverts of code the task never
+   - the diff satisfies every acceptance criterion the issue states;
+   - the diff stays within the issue's declared scope, with no unrelated files
+     and, in particular, no large deletions or reverts of code the issue never
      mentions (the signature of a branch cut from a stale base);
    - the branch carries real new commits ahead of `<base_branch>` and its
      content is not already present in the base under a different commit (a
@@ -234,7 +234,7 @@ pr-create/ci-watch/pr-merge steps run:
    You are the reviewer here, not the builder: a workspace developer agent
    wrote this code, so reviewing it yourself is not grading your own work.
    Read the criteria and diff with fresh eyes and don't wave a branch through
-   just because you dispatched it. If it fails any check, bounce the task to
+   just because you dispatched it. If it fails any check, bounce the issue to
    `ready` with concrete findings and emit `reason=zen:review-reject` with a
    one-line summary. For a project that wants a genuinely independent,
    de-biased reviewer instead of this self-review, wire a `qa`/`adversarial`
@@ -248,7 +248,7 @@ pr-create/ci-watch/pr-merge steps run:
    pr-create replace the tip it reviewed instead of refusing it as a concurrent
    update. Capture the PR number it prints. Exit code 75 means the push landed
    but GitHub's PR view had not caught up yet: re-run the exact same command (it
-   is idempotent). Exit code 1 is a real mismatch: leave the task in `handoff`
+   is idempotent). Exit code 1 is a real mismatch: leave the issue in `handoff`
    and re-probe.
 7. Run `shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --timeout 15m`
    using that same probe identity. Stdout is `green`,
@@ -261,8 +261,8 @@ pr-create/ci-watch/pr-merge steps run:
    `refs/heads/<base_branch>` from `base_sha` to `integration_sha` with Git's
    compare-and-swap lease. If branch protection, rulesets, a merge queue, a
    fork, permissions, or a non-squash strategy prevent that exact-ref path,
-   leave the task in `handoff` and follow the command's human-review action.
-   Only after a candidate SHA result, move the task into `done` and emit
+   leave the issue in `handoff` and follow the command's human-review action.
+   Only after a candidate SHA result, move the issue into `done` and emit
    `reason=orchestrator:zen-merge` with the merge SHA.
 9. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
    or `reason=zen:ci-timeout`.
@@ -278,7 +278,7 @@ top.
   orchestrator's live behavior.
 - **Auto-promote judgment categories** — add ("anything tagged `automation:`
   is always in scope"), tighten ("only auto-promote if the user has accepted
-  >=3 tasks of this shape without changes"), or replace the list entirely.
+  >=3 issues of this shape without changes"), or replace the list entirely.
 - **Merge conditions** — raise/lower the diff-size thresholds, accept partial
   CI red ("if only the integration-test job is red, treat as green"), add new
   pre-merge probes ("before merging anything touching `migrations/`, also
@@ -293,29 +293,29 @@ the sections in place to reshape them.
 
 Where the review-workspace gate above says to "leave it in the review status
 for the human to load from the sidebar," the substantive guarantees still
-hold: Zen never auto-merges a review-routed task, the human still resolves it
+hold: Zen never auto-merges a review-routed issue, the human still resolves it
 (accept → `done`, or bounce → `ready`), and there is genuinely no `shelbi
 review` command. What has changed is *who triggers the load*: the daemon now
-auto-loads queued review-column tasks onto idle
+auto-loads queued review-column issues onto idle
 [review workspaces](/docs/concepts/review-workspaces) each poller tick
 (`autoload_review_queue`), so loading is no longer a human-only sidebar
 action. The sidebar confirm popup is the manual path for loading a queued
-task onto a chosen slot.
+issue onto a chosen slot.
 
 </Callout>
 
 ### Pre-merge review is the orchestrator's own
 
 Step 5 of the merge conditions is a **self-review**: the orchestrator reads
-the task's acceptance criteria and the branch diff itself and confirms the
-branch does what the task asked before opening a PR. It does not spawn a
+the issue's acceptance criteria and the branch diff itself and confirms the
+branch does what the issue asked before opening a PR. It does not spawn a
 separate evaluator subagent for this. The "don't let the builder grade its
 own work" worry does not apply, because the orchestrator is not the builder:
 a workspace [developer agent](/docs/concepts/agents) wrote the code, and the
-orchestrator already owns the review column under Zen and holds the task's
+orchestrator already owns the review column under Zen and holds the issue's
 full context. A green mechanical probe proves the branch builds and does not
-conflict; the self-review is what proves it satisfies the task's intent and
-stays in scope. On failure the orchestrator bounces the task back to `ready`
+conflict; the self-review is what proves it satisfies the issue's intent and
+stays in scope. On failure the orchestrator bounces the issue back to `ready`
 with findings (`reason=zen:review-reject`).
 
 If you want a genuinely **independent, de-biased reviewer** rather than the
@@ -359,7 +359,7 @@ A starter override that tightens Zen's judgment, edited directly in
 `zenmode.md`:
 
 ```markdown
-Zen: auto-merge docs/content and automation-tagged tasks; hold everything else for me.
+Zen: auto-merge docs/content and automation-tagged issues; hold everything else for me.
 
 ## Auto-promote judgment categories
 
@@ -370,7 +370,7 @@ Promote a candidate only if **at least one** is true:
    history on.
 2. **Touches only `docs/**` or `site/content/**`.** Content edits are
    reversible and never reach prod.
-3. **The user has accepted ≥3 tasks of the same shape (same
+3. **The user has accepted ≥3 issues of the same shape (same
    verb-prefix, same target directory) without changes in the last
    week.** Track this against the `done` column.
 
@@ -402,12 +402,12 @@ own. For the CLI that flips Zen on and off, see
 
 Zen Mode does exactly two things the default scheduler doesn't:
 
-1. **Auto-merge**: when a task is queued for a workflow transition
+1. **Auto-merge**: when an issue is queued for a workflow transition
    whose `actions:` include `merge`, Zen runs the high-confidence bar below.
    If everything passes, it lands the reviewed head on the exact probed base
-   and moves the task to the transition's `to` status.
+   and moves the issue to the transition's `to` status.
 2. **Auto-promote**: when a workspace frees up, Zen scans the backlog
-   for tasks that are *mechanically eligible* (see
+   for issues that are *mechanically eligible* (see
    [`shelbi zen scan`](/docs/cli/zen#scan)) and then applies the
    **judgment categories** from the orchestrator's prompt to decide
    which ones to promote into todo.
@@ -421,7 +421,7 @@ per project. That's the most important point on this page.
 The bar fires on **any [workflow](/docs/guides/getting-started/workflows#transitions)
 transition whose `actions:` list includes `merge`**, not on the
 `Review` column per se. The canonical default workflow happens to put
-`merge` on the `Review → Done` edge, so in practice a task that hands off
+`merge` on the `Review → Done` edge, so in practice an issue that hands off
 to `review` trips the bar. But a
 trunk-based workflow that skips `Review` entirely and merges straight
 from `InProgress → Done` runs through the *same* probe. Gating is
@@ -429,10 +429,10 @@ action-based, not status-pair-based. See [What fires Zen Mode's
 high-confidence bar](/docs/guides/getting-started/workflows#what-fires-zen-modes-high-confidence-bar).
 
 When such a transition is queued, the orchestrator runs
-`shelbi zen probe <task-id>` (which threads the task's workflow
+`shelbi zen probe <task-id>` (which threads the issue's workflow
 through `probe_in_workflow` so per-workflow overrides take effect; see
 below) to get a single JSON report covering every dimension below.
-Then it applies the conditions in order. Any failure leaves the task
+Then it applies the conditions in order. Any failure leaves the issue
 where it was, with a tagged reason event so the activity feed shows
 what happened.
 
@@ -459,7 +459,7 @@ The conditions, in order:
 5. **PR opens cleanly** via
    `shelbi zen pr-create <id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`. All six values are copied directly from the probe report. The PR is returned
    only after its remote identity matches the exact repository, resolved
-   workflow base name and commit, task branch, reviewed head, and prebuilt
+   workflow base name and commit, issue branch, reviewed head, and prebuilt
    integration commit. The PR head is the integration commit so CI runs on
    the exact object eligible to land.
 6. **CI is green**:
@@ -470,7 +470,7 @@ The conditions, in order:
    prevents a not-yet-reported required context from being mistaken for no
    check, while an optional failed check does not override passing required
    checks. The
-   `--task` flag resolves the timeout against the task's workflow
+   `--task` flag resolves the timeout against the issue's workflow
    (`zen.ci_timeout` override, then project default of `15m`); plain
    `--timeout <duration>` still overrides explicitly. Anything red or
    a timeout bails. Each poll compares against the frozen probe identity
@@ -547,9 +547,9 @@ on relaxed rules.
 Resolution rules:
 
 - **`checks`**: when set on the workflow, the workflow's list
-  replaces the project's list outright. Per-task `checks_only` /
+  replaces the project's list outright. Per-issue `checks_only` /
   `checks_additional` still apply on top (see
-  [per-task overrides](#per-task-overrides)).
+  [per-issue overrides](#per-issue-overrides)).
 - **`ci_timeout`**: when set on the workflow, the workflow's value
   wins. `shelbi zen ci-watch <pr> <all-probe-match-flags> --task <id>`
   resolves through this
@@ -557,7 +557,7 @@ Resolution rules:
 - **`danger_paths`**: uses the same `extend:` vs `override:` shape as
   the project block. `extend:` adds to the project's resolved list
   (built-ins + detected shapes + project `extend`). `override:`
-  replaces the whole resolved list for tasks in this workflow.
+  replaces the whole resolved list for issues in this workflow.
 
 An empty block (`zen: {}`) parses but overrides nothing, semantically
 identical to omitting the block.
@@ -580,7 +580,7 @@ least one** is true:
 
 1. **It's the kind of work the user generally trusts you with.**
    Pattern from the `done` column: does the user routinely accept
-   tasks of this shape without changes?
+   issues of this shape without changes?
 2. **It's part of fixing an issue the user recently raised.** The
    user mentioned this bug or feature in the last few turns.
 3. **It's part of a larger body of work the user explicitly kicked
@@ -588,7 +588,7 @@ least one** is true:
    remaining items in that batch are in scope.
 
 If nothing fits, the candidate stays in backlog and the orchestrator
-calls it out in its next reply ("I considered promoting `<task>` but
+calls it out in its next reply ("I considered promoting `<issue>` but
 wasn't sure. Want me to?"). It also emits
 `reason=orchestrator:zen-decline reason-text=<short>` so the
 activity feed shows what was considered and why.
@@ -621,12 +621,12 @@ and the confidence bar. See
 [owners and agents](/docs/guides/getting-started/workflows#owners-and-agents) for the
 field semantics and the four validation rules.
 
-## Per-task overrides
+## Per-issue overrides
 
-Sometimes a single task needs different treatment than the project
+Sometimes a single issue needs different treatment than the project
 default: kept on the manual-review path because it's sensitive, or
 given an extra check the rest of the project doesn't need. Put a `zen:`
-block in the task's frontmatter:
+block in the issue's frontmatter:
 
 ```yaml
 ---
@@ -635,7 +635,7 @@ title: Refactor payment processor adapter
 column: backlog
 priority: 0
 zen:
-  enabled: false          # opt this task out of Zen entirely
+  enabled: false          # opt this issue out of Zen entirely
 ---
 ```
 
@@ -646,7 +646,7 @@ title: Rewrite the getting-started tutorial
 column: backlog
 priority: 0
 zen:
-  checks_additional:      # extend the project checks for this task
+  checks_additional:      # extend the project checks for this issue
     - 'cargo test --package shelbi-docs'
 ---
 ```
@@ -658,23 +658,23 @@ title: Restyle the sidebar pill
 column: backlog
 priority: 0
 zen:
-  checks_only:            # replace project checks for this task
+  checks_only:            # replace project checks for this issue
     - 'cd site && npm run lint && npm run build'
 ---
 ```
 
 Resolution rules:
 
-- `enabled: false` keeps the task on the manual-review path even
-  with Zen on; `enabled: true` opts a task in even when Zen is off
+- `enabled: false` keeps the issue on the manual-review path even
+  with Zen on; `enabled: true` opts an issue in even when Zen is off
   (rare but supported).
 - `checks_only` takes precedence over `checks_additional`. If both
   are set, `checks_only` wins and `checks_additional` is ignored.
 - `checks_additional` extends whichever list the workflow layer
   resolved to: workflow `zen.checks.local` if set, else project
   `zen.checks.local`.
-- Absent both, the task inherits that resolved list verbatim. Full
-  precedence: per-task `checks_only` > per-task `checks_additional` >
+- Absent both, the issue inherits that resolved list verbatim. Full
+  precedence: per-issue `checks_only` > per-issue `checks_additional` >
   per-workflow `zen.checks.local` > project `zen.checks.local`.
 
 ## Configuration reference
@@ -751,10 +751,10 @@ specific phrasing; the exception is called out below):
 
 | Reason | Meaning |
 | --- | --- |
-| `orchestrator:zen-promote category=<n>` | Promoted a backlog task to todo under judgment category `<n>`. |
+| `orchestrator:zen-promote category=<n>` | Promoted a backlog issue to todo under judgment category `<n>`. |
 | `orchestrator:zen-decline reason-text=<short>` | Considered a candidate, decided not to promote. Still gets the ZEN badge and tinted row, but has no dedicated phrasing: it renders generically as a move and does not surface `reason-text`. |
-| `orchestrator:zen-merge sha=<short>` | Auto-merged a reviewed task to `main`. |
-| `zen:failed-checks cmd=<…> exit=<…>` | Local check failed; task stays in review. |
+| `orchestrator:zen-merge sha=<short>` | Auto-merged a reviewed issue to `main`. |
+| `zen:failed-checks cmd=<…> exit=<…>` | Local check failed; issue stays in review. |
 | `zen:diff-too-large files=<…> lines=<…>` | Diff exceeded the size threshold. |
 | `zen:danger-path paths=<…>` | One or more danger-path globs matched. |
 | `zen:merge-conflict files=<…>` | Branch wouldn't merge cleanly. |

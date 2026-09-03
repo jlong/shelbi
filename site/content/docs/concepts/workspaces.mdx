@@ -1,13 +1,13 @@
 ---
 title: Workspaces
 order: 12
-summary: A workspace is capacity — a persistent slot pinned to a machine, made of one tmux pane and one git worktree. The orchestrator dispatches tasks to it; whichever agent the task calls for runs inside it.
+summary: A workspace is capacity — a persistent slot pinned to a machine, made of one tmux pane and one git worktree. The orchestrator dispatches issues to it; whichever agent the issue calls for runs inside it.
 ---
 
-A **workspace** is the unit Shelbi dispatches tasks to. It is capacity, not
+A **workspace** is the unit Shelbi dispatches issues to. It is capacity, not
 a role and not a process: a *slot* declared once in the project YAML, alive
 for the lifetime of the project, with an agent process cycled inside it per
-task.
+issue.
 
 Each workspace is two pinned resources on one machine:
 
@@ -17,7 +17,7 @@ Each workspace is two pinned resources on one machine:
   `<machine.work_dir>/.shelbi/wt/<workspace-name>`. The path is fixed; not
   configurable.
 
-A workspace handles one task at a time. It does not spawn, it does not fan
+A workspace handles one issue at a time. It does not spawn, it does not fan
 out, it does not multiplex. If the project declares five workspaces, you have
 five concurrent slots, no more, no less.
 
@@ -32,16 +32,16 @@ The single most important distinction on this page: a workspace is **where**
 work runs; an [agent](/docs/concepts/agents) is **who** does it.
 
 - A **workspace** is a machine + pane + worktree. It's interchangeable
-  capacity. `bravo` is just as good as `alpha` for any task that fits its
+  capacity. `bravo` is just as good as `alpha` for any issue that fits its
   machine.
 - An **agent** is a system prompt + skill set: the `developer`, `qa`, or
-  `security` role. It's loaded *into* a workspace when a task is
+  `security` role. It's loaded *into* a workspace when an issue is
   dispatched.
 
-That split is what lets the same slot run a `developer` agent on one task and
+That split is what lets the same slot run a `developer` agent on one issue and
 a `qa` agent on the next, and it's why a workflow can say "review this status
 with the security agent" without caring which workspace is free to do it.
-The workspace supplies the compute; the task's status supplies the agent.
+The workspace supplies the compute; the issue's status supplies the agent.
 
 ## The pool model
 
@@ -59,10 +59,10 @@ This is deliberate. Workspaces are not allocated on demand. They are *named
 slots* the orchestrator routes work to. That gives you:
 
 - **Stable identities** in the sidebar, the events log, and the kanban
-  card's `assigned_to` field. "bravo is on the palette task" means the same
+  card's `assigned_to` field. "bravo is on the palette issue" means the same
   thing across sessions.
 - **Pre-warmed worktrees**: no `git worktree add` on the hot path. A new
-  task on bravo just switches branches in the worktree bravo already owns.
+  issue on bravo just switches branches in the worktree bravo already owns.
 - **A real ceiling on concurrency**. The number of declared workspaces *is*
   the parallelism cap; the orchestrator can't accidentally outrun your RAM
   by spawning more.
@@ -72,7 +72,7 @@ when spread across machines, clamped to `[1, 16]`). Add or remove workspaces
 later by editing the YAML and running `shelbi reload`.
 
 A slot can also carry `tags` — capability labels a workflow status can
-require, so a task routes to a matching workspace. That routing is generic:
+require, so an issue routes to a matching workspace. That routing is generic:
 [review workspaces](/docs/concepts/review-workspaces) are just the canonical
 use of it (a slot tagged `review` that a review status routes to), but the same
 mechanism pins any capability to any pool.
@@ -102,15 +102,15 @@ on-disk form when empty, so existing project YAMLs round-trip unchanged.
 
 ### Status-tag routing
 
-A workflow [status](/docs/configuration/workflow#statuses) declares the tags a
-task needs while it sits there:
+A workflow [status](/docs/configuration/workflow#statuses) declares the tags an
+issue needs while it sits there:
 
 ```yaml
 statuses:
   - { id: review, owner: user, agent: review, tags: [review] }
 ```
 
-When a task enters that status, the orchestrator routes it to a **free
+When an issue enters that status, the orchestrator routes it to a **free
 workspace whose effective tags are a superset of the status's required set**
 (set-AND). Empty required tags — the default — match any free workspace, so
 any idle slot qualifies. `tags: [review]` on the status plus `tags: [review]`
@@ -142,7 +142,7 @@ Alongside `$SLOT`, every transition command also gets `$SHELBI_TASK`,
 Workspaces render in the sidebar grouped under the machine they're pinned to,
 so the layout mirrors where your compute actually lives. Each row shows the
 workspace's state badge, its name, the agent currently loaded (if any), and
-the task it's on:
+the issue it's on:
 
 ```text
  — hub —
@@ -156,7 +156,7 @@ the task it's on:
  · foxtrot
 ```
 
-Idle slots (`·`) carry no agent or task. They're capacity waiting to be
+Idle slots (`·`) carry no agent or issue. They're capacity waiting to be
 filled. A busy slot shows which [agent](/docs/concepts/agents) role it's
 running, which is how you tell at a glance that `delta` is doing a QA pass,
 not writing code.
@@ -174,18 +174,18 @@ they never render here. Their capacity surfaces under the sidebar's
 
 ## Machine-aware routing
 
-A task can hint where it wants to run with `prefers_machine`:
+An issue can hint where it wants to run with `prefers_machine`:
 
 ```bash
-shelbi task add "Re-encode the marketing video assets" \
+shelbi issue add "Re-encode the marketing video assets" \
   --prefers-machine devbox
 ```
 
 The orchestrator honors the hint when at least one workspace on that machine
-is free. If `devbox` is fully busy when the task becomes ready, the card
+is free. If `devbox` is fully busy when the issue becomes ready, the card
 stays in its `ready`-category status rather than getting routed to the wrong
 host. Shelbi never silently re-routes RAM-heavy or latency-sensitive work to
-the hub. The hint rides along in the task's frontmatter as `prefers_machine`
+the hub. The hint rides along in the issue's frontmatter as `prefers_machine`
 and is surfaced on the kanban card.
 
 ## Workspace states
@@ -200,10 +200,10 @@ The hub polls each workspace's tmux pane title every few seconds (see
 | `💬`  | `awaiting_input`   | agent finished a turn and is sitting at the prompt.                      |
 | `⚠`   | `blocked`          | agent paused on a permission dialog or other interactive gate.           |
 | `⏸`   | `paused`           | the workspace stalled on a usage limit and is waiting to resume.         |
-| `·`   | (no in-flight task) | the slot is idle and ready to be assigned.                              |
+| `·`   | (no in-flight issue) | the slot is idle and ready to be assigned.                              |
 
-A workspace that *finishes* a task doesn't get its own "done" badge. The
-moment it writes the review-ready marker and the poller promotes the task,
+A workspace that *finishes* an issue doesn't get its own "done" badge. The
+moment it writes the review-ready marker and the poller promotes the issue,
 the workspace **closes its session and returns to idle** (see
 [How a task completes](#how-a-task-completes)). Completion shows up in the
 sidebar's *Ready for Review* section, never as a lingering check on the
@@ -211,7 +211,7 @@ workspace row.
 
 `awaiting_input` is the right state for "agent done with this turn, waiting
 for the next prompt." It's what fires when claude's Stop hook runs at end of
-turn. The agent has *not* finished the task; it just finished one round of
+turn. The agent has *not* finished the issue; it just finished one round of
 work. The actual completion signal is the review-ready marker (see below).
 
 State changes are also appended to `~/.shelbi/events.log`:
@@ -224,14 +224,14 @@ State changes are also appended to `~/.shelbi/events.log`:
 That feed is what the orchestrator tails to know when to dispatch more work.
 See [the events log](/docs/concepts/events-log).
 
-## Switching tasks clears context
+## Switching issues clears context
 
-When a workspace picks up a new task its pane is **killed and re-created**
+When a workspace picks up a new issue its pane is **killed and re-created**
 from scratch. The branch switch happens first, while the old pane is still
 intact; the pane is torn down and rebuilt only after the worktree and
 settings are in place:
 
-1. The worktree is switched to the task's branch, creating the branch off
+1. The worktree is switched to the issue's branch, creating the branch off
    the project's `base_branch()` (the `git.base_branch` setting when
    present, otherwise `default_branch`, and a workflow can override it
    further) if it doesn't exist, and refusing to switch if there are
@@ -242,13 +242,13 @@ settings are in place:
 3. The pane (window for hub workspaces, session for remote ones) is torn
    down.
 4. A new pane is created and the agent CLI is launched in it, loaded with
-   the [agent](/docs/concepts/agents) the task's status calls for.
+   the [agent](/docs/concepts/agents) the issue's status calls for.
 5. Once the agent's input box is ready (`shift+tab to cycle` footer
    detected), the initial prompt is typed.
 
-This is *intentional*. The previous task's conversation history, scratchpad
-files, and any agent-local state are gone. Each task starts the agent with a
-clean context, with no leakage between tasks on the same workspace.
+This is *intentional*. The previous issue's conversation history, scratchpad
+files, and any agent-local state are gone. Each issue starts the agent with a
+clean context, with no leakage between issues on the same workspace.
 
 <Callout type="warning" title="Uncommitted work blocks the switch">
 
@@ -259,14 +259,14 @@ tree.
 
 </Callout>
 
-The worktree itself persists. Files committed on the previous task's branch
+The worktree itself persists. Files committed on the previous issue's branch
 are still there on disk; only the branch checkout changes. This keeps the
-on-machine cost of a task switch small (one branch checkout, not a whole
+on-machine cost of an issue switch small (one branch checkout, not a whole
 clone).
 
 ## How a task completes
 
-A workspace reports task completion by writing its task id into a marker file
+A workspace reports issue completion by writing its issue id into a marker file
 in the worktree:
 
 ```text
@@ -276,19 +276,19 @@ in the worktree:
 The hub poller `cat`s this file on each tick (locally or over SSH), and when
 it finds a non-empty value:
 
-1. Confirms the named task is in-progress and assigned to this workspace.
-2. Moves the task to the next `handoff` status (`review` in the default
+1. Confirms the named issue is in-progress and assigned to this workspace.
+2. Moves the issue to the next `handoff` status (`review` in the default
    workflow).
 3. Clears the marker.
-4. Appends the task transition to the events log, e.g.
+4. Appends the issue transition to the events log, e.g.
    `project=<name> task=<id> workflow=<name> in_progress -> review reason=workspace:ready-marker from_category=active to_category=handoff`.
 
 The workspace never runs `shelbi` itself. The marker file is the *entire*
 on-workspace protocol. This is what makes a remote workspace possible with
 nothing installed but `tmux`, `git`, and the agent CLI.
 
-Once the task is safely promoted, the finishing dev workspace **closes its
-own session** and frees its slot for the next task. No lingering "done"
+Once the issue is safely promoted, the finishing dev workspace **closes its
+own session** and frees its slot for the next issue. No lingering "done"
 pane. If the project declares [review workspaces](/docs/concepts/review-workspaces),
 the orchestrator then loads the promoted branch onto one so a human can *run*
 the change, not just read the diff.
@@ -323,9 +323,9 @@ you can `tmux ls` on the remote to inspect.
   workspace, and the role/slot split.
 - [Workflows](/docs/guides/getting-started/workflows#lifecycle-who-moves-a-task-between-the-default-statuses)
   — what the default workflow's statuses mean, and where workspaces fit in
-  the task lifecycle.
+  the issue lifecycle.
 - [The events log](/docs/concepts/events-log) — the shape of every
   workspace transition line.
 - [Orchestrator](/docs/concepts/orchestrator) — how it picks which
-  workspace to dispatch a task to.
+  workspace to dispatch an issue to.
 - [`shelbi workspace`](/docs/cli/workspace) — list and stop workspaces.

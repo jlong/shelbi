@@ -16,13 +16,17 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shelbi_core::{
     validate_agent_id, validate_branch, validate_project_name, validate_task_id, Agent, Column,
-    Project, Result, Session, Task,
+    Project, Result, Session, Issue,
 };
 
 mod agent_workspaces;
 mod event_log;
+pub mod github_store;
 mod hub_config;
 mod hub_version;
+pub mod issue_auth;
+pub mod issue_migrate;
+pub mod issue_store;
 pub mod keymap;
 mod migrate;
 mod pr_template;
@@ -39,6 +43,17 @@ pub use migrate::{
     append_gitignore_snippet, apply_migration_plan, gitignore_already_has_snippet,
     plan_in_repo_migration, MigrationAction, MigrationPlan, IN_REPO_CONFIG_DIRS,
     IN_REPO_CONFIG_FILES, IN_REPO_GITIGNORE_SNIPPET,
+};
+pub use issue_auth::{
+    resolve_github_token, resolve_github_token_by_name, token_file_path, SecretToken, TokenSource,
+};
+pub use github_store::GitHubStore;
+pub use issue_migrate::{
+    apply_issue_migration, plan_issue_migration, IssueMigrationPlan,
+};
+pub use issue_store::{
+    resolve_issue_store, Cursor, FileSystemStore, IssueChange, IssueComment, IssueFields,
+    IssueStore, NewIssue, PrioMove, StatusMove,
 };
 pub use project_paths::ProjectPaths;
 pub use root::{
@@ -97,7 +112,8 @@ pub use workflows::{
 };
 pub use event_log::{
     append_ci_event, append_clarification_event, append_dispatch_event, append_external_event,
-    append_handoff_event, append_heartbeat_event, append_integration_event, append_limit_resume_event,
+    append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
+    append_limit_resume_event,
     append_github_merge_reconcile_event, append_merge_event, append_message_ack_event,
     append_message_event, append_project_event,
     append_push_event,
@@ -113,6 +129,7 @@ pub use event_log::{
     read_or_initialize_event_cursor, read_or_initialize_event_cursor_deadline,
     release_event_follower, task_event_body, write_event_cursor,
     EventEnvelope, EventKind, EventLogRead, FeedRead, HandoffCause, MessageDelivery, ReviewReadyEvent, ZenHeartbeatCue, ACTIONS_SKIPPED_MARKER, DAEMON_ACK,
+    EXTERNAL_ISSUE_COMMENT_CAUSE, EXTERNAL_ISSUE_RECONCILE_CAUSE,
     GITHUB_MERGE_RECONCILE_CAUSE, ORCH_EVENT_CALLBACK_SOCK_ENV, READY_MARKER_HANDOFF_ALIASES,
     READY_MARKER_HANDOFF_CAUSE,
 };
@@ -2257,7 +2274,7 @@ pub fn append_log(project: &str, id: &str, line: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Task markdown files
+// Issue markdown files
 
 /// Stable identity and copy for the self-demonstrating card seeded into a
 /// newly-created project. Creation paths call [`scaffold_welcome_task`]
@@ -2283,8 +2300,9 @@ pub fn task_path(project: &str, id: &str) -> Result<PathBuf> {
     Ok(tasks_dir(project)?.join(format!("{id}.md")))
 }
 
-pub struct TaskFile {
-    pub task: Task,
+#[derive(Debug, Clone)]
+pub struct IssueFile {
+    pub task: Issue,
     pub body: String,
 }
 
@@ -2301,14 +2319,14 @@ fn lock_tasks(project: &str) -> Result<FileLockGuard> {
     acquire_file_lock(&tasks_lock_path(project)?)
 }
 
-pub fn save_task(project: &str, task: &Task, body_md: &str) -> Result<()> {
+pub fn save_task(project: &str, task: &Issue, body_md: &str) -> Result<()> {
     let _lock = lock_tasks(project)?;
     save_task_unlocked(project, task, body_md)
 }
 
 /// [`save_task`] body without the task lock — for callers that already
 /// hold it (nested `flock` acquisition would deadlock).
-fn save_task_unlocked(project: &str, task: &Task, body_md: &str) -> Result<()> {
+fn save_task_unlocked(project: &str, task: &Issue, body_md: &str) -> Result<()> {
     ensure_dir(&tasks_dir(project)?)?;
     let path = task_path(project, &task.id)?;
     // Gate the `branch:` override at the write chokepoint so a value with a
@@ -2335,7 +2353,7 @@ pub fn scaffold_welcome_task(project: &str) -> Result<bool> {
     }
 
     let now = Utc::now();
-    let task = Task {
+    let task = Issue {
         id: WELCOME_TASK_ID.to_string(),
         title: WELCOME_TASK_TITLE.to_string(),
         column: Column::backlog(),
@@ -2359,7 +2377,7 @@ pub fn scaffold_welcome_task(project: &str) -> Result<bool> {
 /// same id already exists instead of silently overwriting it. The
 /// existence check and the write happen under the per-project task lock,
 /// closing the check-then-save TOCTOU in id generation.
-pub fn create_task(project: &str, task: &Task, body_md: &str) -> Result<()> {
+pub fn create_task(project: &str, task: &Issue, body_md: &str) -> Result<()> {
     let _lock = lock_tasks(project)?;
     let path = task_path(project, &task.id)?;
     if path.exists() {
@@ -2371,7 +2389,7 @@ pub fn create_task(project: &str, task: &Task, body_md: &str) -> Result<()> {
     save_task_unlocked(project, task, body_md)
 }
 
-pub fn load_task(project: &str, id: &str) -> Result<TaskFile> {
+pub fn load_task(project: &str, id: &str) -> Result<IssueFile> {
     let path = task_path(project, id)?;
     let text = read_to_string_at(&path)?;
     let tf = parse_task_file(&text)?;
@@ -2381,7 +2399,7 @@ pub fn load_task(project: &str, id: &str) -> Result<TaskFile> {
     // *second* file and fork the card onto the board. Reject the mismatch
     // loudly instead so the task can never split in two.
     if tf.task.id != id {
-        return Err(shelbi_core::Error::TaskIdMismatch {
+        return Err(shelbi_core::Error::IssueIdMismatch {
             requested: id.to_string(),
             found: tf.task.id.clone(),
         });
@@ -2389,11 +2407,11 @@ pub fn load_task(project: &str, id: &str) -> Result<TaskFile> {
     Ok(tf)
 }
 
-pub fn parse_task_file(text: &str) -> Result<TaskFile> {
+pub fn parse_task_file(text: &str) -> Result<IssueFile> {
     let (front, body) = split_frontmatter(text)
         .ok_or_else(|| shelbi_core::Error::Other("missing frontmatter".into()))?;
-    let task: Task = serde_yaml::from_str(front)?;
-    Ok(TaskFile {
+    let task: Issue = serde_yaml::from_str(front)?;
+    Ok(IssueFile {
         task,
         body: body.to_string(),
     })
@@ -2465,7 +2483,7 @@ fn prune_parse_warn(dir: &Path, seen: &HashSet<PathBuf>) {
 /// warning is deduped via [`PARSE_WARN_CACHE`] so a refresh loop that calls
 /// `list_tasks` repeatedly only sees a malformed file's warning once per
 /// unchanged state.
-pub fn list_tasks(project: &str) -> Result<Vec<TaskFile>> {
+pub fn list_tasks(project: &str) -> Result<Vec<IssueFile>> {
     let dir = tasks_dir(project)?;
     if !dir.exists() {
         return Ok(Vec::new());
@@ -2536,7 +2554,7 @@ pub fn list_tasks(project: &str) -> Result<Vec<TaskFile>> {
     // collide — without it, ties resolve by `read_dir` order, which the
     // filesystem is free to flap between scans.
     out.sort_by(|a, b| {
-        let col_idx = |tf: &TaskFile| tf.task.column.board_order();
+        let col_idx = |tf: &IssueFile| tf.task.column.board_order();
         (col_idx(a), a.task.priority, a.task.id.as_str()).cmp(&(
             col_idx(b),
             b.task.priority,
@@ -2547,7 +2565,7 @@ pub fn list_tasks(project: &str) -> Result<Vec<TaskFile>> {
 }
 
 /// Tasks in one column, sorted by priority.
-pub fn list_column(project: &str, column: Column) -> Result<Vec<TaskFile>> {
+pub fn list_column(project: &str, column: Column) -> Result<Vec<IssueFile>> {
     Ok(list_tasks(project)?
         .into_iter()
         .filter(|tf| tf.task.column == column)
@@ -2555,7 +2573,7 @@ pub fn list_column(project: &str, column: Column) -> Result<Vec<TaskFile>> {
 }
 
 /// Map of every task id in `project` to its current column. Used to derive
-/// the [blocked](Task::is_blocked) state without reloading individual files.
+/// the [blocked](Issue::is_blocked) state without reloading individual files.
 pub fn task_columns(project: &str) -> Result<HashMap<String, Column>> {
     Ok(list_tasks(project)?
         .into_iter()
@@ -2567,7 +2585,7 @@ pub fn task_columns(project: &str) -> Result<HashMap<String, Column>> {
 /// dependency. Returned in priority order. Both views — the id→column map
 /// and the Todo subset — derive from a single [`list_tasks`] pass, so a
 /// concurrent task move can't make them disagree mid-call.
-pub fn list_ready(project: &str) -> Result<Vec<TaskFile>> {
+pub fn list_ready(project: &str) -> Result<Vec<IssueFile>> {
     let tasks = list_tasks(project)?;
     let columns: HashMap<String, Column> = tasks
         .iter()
@@ -2593,7 +2611,7 @@ pub fn idle_workspace_count(project: &Project) -> Result<usize> {
 /// with in-memory fixtures without touching disk or `SHELBI_HOME`.
 pub fn idle_workspace_count_from(
     workspaces: &[shelbi_core::WorkspaceSpec],
-    in_progress: &[TaskFile],
+    in_progress: &[IssueFile],
 ) -> usize {
     let busy: HashSet<&str> = in_progress
         .iter()
@@ -2614,7 +2632,7 @@ pub fn idle_workspace_count_from(
 /// `existing_tasks` should be the full task list before the save. The
 /// candidate's own id is taken from `task.id` and excluded from existence
 /// checks (allowing this fn to be used for both add and modification).
-pub fn validate_depends_on(task: &Task, existing_tasks: &[TaskFile]) -> Result<()> {
+pub fn validate_depends_on(task: &Issue, existing_tasks: &[IssueFile]) -> Result<()> {
     if task.depends_on.is_empty() {
         return Ok(());
     }
@@ -2719,7 +2737,7 @@ pub fn move_task(
     // task lock: two concurrent moves into one column would otherwise
     // both read the same `len()` and land on duplicate priorities.
     let _lock = lock_tasks(project)?;
-    let TaskFile { mut task, body } = load_task(project, id)?;
+    let IssueFile { mut task, body } = load_task(project, id)?;
     if task.column == new_column {
         return Ok(None);
     }
@@ -2762,7 +2780,7 @@ pub fn move_task_and_unassign(
 ) -> Result<Option<(Column, Column, String)>> {
     hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
-    let TaskFile { mut task, body } = load_task(project, id)?;
+    let IssueFile { mut task, body } = load_task(project, id)?;
     let old_column = task.column.clone();
     let workflow = resolved_task_workflow_name_for_project(project, &task)?;
     let already_there = old_column == new_column;
@@ -2803,7 +2821,7 @@ pub fn move_task_and_unassign(
 pub fn release_task_to_todo(project: &str, id: &str) -> Result<Option<(Column, Column, String)>> {
     hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
-    let TaskFile { mut task, body } = load_task(project, id)?;
+    let IssueFile { mut task, body } = load_task(project, id)?;
     let old_column = task.column.clone();
     let workflow = resolved_task_workflow_name_for_project(project, &task)?;
     let already_todo = old_column == Column::todo();
@@ -2826,7 +2844,7 @@ pub fn release_task_to_todo(project: &str, id: &str) -> Result<Option<(Column, C
     Ok(Some((old_column, Column::todo(), workflow)))
 }
 
-fn resolved_task_workflow_name_for_project(project: &str, task: &Task) -> Result<String> {
+fn resolved_task_workflow_name_for_project(project: &str, task: &Issue) -> Result<String> {
     Ok(load_project(project)
         .map(|p| resolve_task_workflow_name(&p, task).to_string())
         .unwrap_or_else(|_| task.workflow_or_default().to_string()))
@@ -2919,7 +2937,7 @@ pub fn parked_review_tasks(project: &str) -> Result<BTreeSet<String>> {
 pub fn park_review_task(project: &str, id: &str) -> Result<Option<String>> {
     hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
-    let TaskFile { mut task, body } = load_task(project, id)?;
+    let IssueFile { mut task, body } = load_task(project, id)?;
     let was = task.assigned_to.take();
     task.updated_at = Utc::now();
     save_task_unlocked(project, &task, &body)?;
@@ -2961,7 +2979,7 @@ pub fn reject_review_task(
 ) -> Result<Option<(Column, Column, String)>> {
     hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
-    let TaskFile { mut task, body } = load_task(project, id)?;
+    let IssueFile { mut task, body } = load_task(project, id)?;
     let old_column = task.column.clone();
     let workflow = resolved_task_workflow_name_for_project(project, &task)?;
 
@@ -3038,7 +3056,7 @@ pub fn set_task_branch(project: &str, id: &str, branch: &str) -> Result<()> {
 /// tasks whose priority actually changed. Callers must hold the task
 /// lock — the slice is a snapshot, and an unserialized concurrent writer
 /// would be clobbered by these saves.
-fn write_column_order(project: &str, ordered: &[TaskFile]) -> Result<()> {
+fn write_column_order(project: &str, ordered: &[IssueFile]) -> Result<()> {
     let now = chrono::Utc::now();
     for (i, tf) in ordered.iter().enumerate() {
         let want = i as u32;
@@ -3190,6 +3208,7 @@ mod tests {
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            issue_tracker: Default::default(),
             runners: Default::default(),
             agents: Default::default(),
             detected_shapes: Vec::new(),
@@ -3640,9 +3659,9 @@ mod tests {
         p
     }
 
-    fn make_task(id: &str, column: Column, priority: u32) -> shelbi_core::Task {
+    fn make_task(id: &str, column: Column, priority: u32) -> shelbi_core::Issue {
         let now = chrono::Utc::now();
-        shelbi_core::Task {
+        shelbi_core::Issue {
             id: id.to_string(),
             title: id.replace('-', " "),
             column,
@@ -3669,10 +3688,10 @@ mod tests {
         }
     }
 
-    fn assigned(id: &str, to: &str) -> TaskFile {
+    fn assigned(id: &str, to: &str) -> IssueFile {
         let mut task = make_task(id, Column::in_progress(), 0);
         task.assigned_to = Some(to.to_string());
-        TaskFile {
+        IssueFile {
             task,
             body: String::new(),
         }
@@ -4091,7 +4110,7 @@ mod tests {
         // accepted, so a following save can't write a second `fix-auth.md`.
         assert!(matches!(
             load_task("p", "fix-login"),
-            Err(shelbi_core::Error::TaskIdMismatch { .. })
+            Err(shelbi_core::Error::IssueIdMismatch { .. })
         ));
         assert!(
             move_task("p", "fix-login", Column::in_progress()).is_err(),
@@ -4305,7 +4324,7 @@ mod tests {
         column: Column,
         priority: u32,
         deps: &[&str],
-    ) -> shelbi_core::Task {
+    ) -> shelbi_core::Issue {
         let mut t = make_task(id, column, priority);
         t.depends_on = deps.iter().map(|s| s.to_string()).collect();
         t

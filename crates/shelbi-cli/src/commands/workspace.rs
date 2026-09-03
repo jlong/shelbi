@@ -10,7 +10,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
-use shelbi_core::{Column, ConfigMode, IntegrationMode, Task, WorkspaceSpec};
+use shelbi_core::{Column, ConfigMode, IntegrationMode, Issue, WorkspaceSpec};
 use shelbi_orchestrator::workspace as orch_workspace;
 use shelbi_state::WorkspaceStatus;
 
@@ -310,7 +310,7 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
     // print all of them in the STATE cell so the user sees the mess.
     let in_progress =
         shelbi_state::list_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
-    let assigned: Vec<&Task> = in_progress.iter().map(|tf| &tf.task).collect();
+    let assigned: Vec<&Issue> = in_progress.iter().map(|tf| &tf.task).collect();
 
     // A `review`-tagged slot holds a review-column (handoff) task while it
     // serves the branch for inspection — that task never sits in `in_progress`,
@@ -336,7 +336,7 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
 /// ([`render_list_with_occupied`]) consult this to treat it as busy.
 fn review_assignments(
     project: &shelbi_core::Project,
-    review: &[shelbi_state::TaskFile],
+    review: &[shelbi_state::IssueFile],
 ) -> BTreeMap<String, String> {
     review
         .iter()
@@ -412,7 +412,7 @@ impl OccupiedKind {
 
 fn occupied_idle_workspaces(
     project: &shelbi_core::Project,
-    in_progress: &[&Task],
+    in_progress: &[&Issue],
     review_by_ws: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, OccupiedKind>> {
     // A slot assigned an in-progress task OR serving a review-column task is
@@ -484,7 +484,7 @@ fn occupied_idle_workspaces(
 #[cfg(test)]
 fn render_list(
     workspaces: &[WorkspaceSpec],
-    in_progress: &[&Task],
+    in_progress: &[&Issue],
 ) -> Result<Vec<String>> {
     render_list_with_occupied(
         workspaces,
@@ -497,7 +497,7 @@ fn render_list(
 
 fn render_list_with_occupied(
     workspaces: &[WorkspaceSpec],
-    in_progress: &[&Task],
+    in_progress: &[&Issue],
     review_by_ws: &BTreeMap<String, String>,
     occupied_idle: &BTreeMap<String, OccupiedKind>,
     integration: &BTreeMap<String, IntegrationMode>,
@@ -508,7 +508,7 @@ fn render_list_with_occupied(
         "NAME", "HOST", "AGENT", "INTEG", "STATE"
     ));
     for workspace in workspaces {
-        let mine: Vec<&Task> = in_progress
+        let mine: Vec<&Issue> = in_progress
             .iter()
             .copied()
             .filter(|t| t.assigned_to.as_deref() == Some(workspace.name.as_str()))
@@ -820,9 +820,9 @@ mod tests {
         p
     }
 
-    fn make_task(id: &str, column: Column, priority: u32, assigned_to: Option<&str>) -> Task {
+    fn make_task(id: &str, column: Column, priority: u32, assigned_to: Option<&str>) -> Issue {
         let now = Utc::now();
-        Task {
+        Issue {
             id: id.to_string(),
             title: id.replace('-', " "),
             column,
@@ -856,7 +856,7 @@ mod tests {
             make_workspace("bravo", "hub"),
         ];
         let assigned = make_task("aw-task-1", Column::in_progress(), 0, Some("alpha"));
-        let in_progress: Vec<&Task> = vec![&assigned];
+        let in_progress: Vec<&Issue> = vec![&assigned];
 
         let rows = render_list(&workspaces, &in_progress).unwrap();
         assert_eq!(rows.len(), 3);
@@ -887,7 +887,7 @@ mod tests {
             make_workspace("alpha", "hub"),
             make_workspace("bravo", "hub"),
         ];
-        let in_progress: Vec<&Task> = Vec::new();
+        let in_progress: Vec<&Issue> = Vec::new();
         // alpha runs a hook-capable runner (conventional); bravo's runner is
         // unrecognized, so it can only be polled (degraded).
         let modes = BTreeMap::from([
@@ -929,7 +929,7 @@ mod tests {
     fn render_list_active_workspace_surfaces_default_agent() {
         let workspaces = vec![make_workspace("alpha", "hub")];
         let task = make_task("aw-fix-login", Column::in_progress(), 0, Some("alpha"));
-        let in_progress: Vec<&Task> = vec![&task];
+        let in_progress: Vec<&Issue> = vec![&task];
 
         let rows = render_list(&workspaces, &in_progress).unwrap();
         let row = &rows[1];
@@ -949,7 +949,7 @@ mod tests {
         let workspaces = vec![make_workspace("delta", "devbox")];
         let mut task = make_task("aw-write-tests", Column::in_progress(), 0, Some("delta"));
         task.params.insert("agent".into(), "qa".into());
-        let in_progress: Vec<&Task> = vec![&task];
+        let in_progress: Vec<&Issue> = vec![&task];
 
         let rows = render_list(&workspaces, &in_progress).unwrap();
         let row = &rows[1];
@@ -965,7 +965,7 @@ mod tests {
     fn render_list_idle_workspace_uses_placeholder_agent_and_idle_state() {
         let workspaces = vec![make_workspace("bravo", "hub")];
         // No in-progress tasks at all — bravo is idle.
-        let in_progress: Vec<&Task> = Vec::new();
+        let in_progress: Vec<&Issue> = Vec::new();
 
         let rows = render_list(&workspaces, &in_progress).unwrap();
         let row = &rows[1];
@@ -986,7 +986,7 @@ mod tests {
     #[test]
     fn render_list_marks_unassigned_live_slot_as_orphaned_session() {
         let workspaces = vec![make_workspace("delta", "devbox")];
-        let in_progress: Vec<&Task> = Vec::new();
+        let in_progress: Vec<&Issue> = Vec::new();
         let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::Orphaned)]);
 
         let rows = render_list_with_occupied(
@@ -1013,7 +1013,7 @@ mod tests {
         let mut ws = make_workspace("review-1", "hub");
         ws.tags = vec!["review".to_string()];
         let workspaces = vec![ws];
-        let in_progress: Vec<&Task> = Vec::new();
+        let in_progress: Vec<&Issue> = Vec::new();
         let review_by_ws =
             BTreeMap::from([("review-1".to_string(), "palette-second-column".to_string())]);
         // Even if a probe had (wrongly) flagged it orphaned, the review
@@ -1045,7 +1045,7 @@ mod tests {
     #[test]
     fn render_list_marks_user_shell_slot_as_occupied() {
         let workspaces = vec![make_workspace("delta", "devbox")];
-        let in_progress: Vec<&Task> = Vec::new();
+        let in_progress: Vec<&Issue> = Vec::new();
         let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::UserShell)]);
 
         let rows = render_list_with_occupied(
@@ -1072,7 +1072,7 @@ mod tests {
     #[test]
     fn render_list_marks_unprobeable_machine_workspaces_unreachable() {
         let workspaces = vec![make_workspace("delta", "devbox")];
-        let in_progress: Vec<&Task> = Vec::new();
+        let in_progress: Vec<&Issue> = Vec::new();
         let occupied = BTreeMap::from([(
             "delta".to_string(),
             OccupiedKind::Unreachable(
@@ -1103,7 +1103,7 @@ mod tests {
     fn render_list_prefers_assigned_task_over_orphan_marker() {
         let workspaces = vec![make_workspace("delta", "devbox")];
         let task = make_task("bug-fix", Column::in_progress(), 0, Some("delta"));
-        let in_progress: Vec<&Task> = vec![&task];
+        let in_progress: Vec<&Issue> = vec![&task];
         let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::Orphaned)]);
 
         let rows = render_list_with_occupied(
@@ -1128,7 +1128,7 @@ mod tests {
             make_workspace("bravo", "hub"),
         ];
         let task = make_task("aw-fix-login", Column::in_progress(), 0, Some("alpha"));
-        let in_progress: Vec<&Task> = vec![&task];
+        let in_progress: Vec<&Issue> = vec![&task];
 
         let rows = render_list(&workspaces, &in_progress).unwrap();
         assert!(rows[1].contains("in_progress: aw-fix-login"));
@@ -1148,7 +1148,7 @@ mod tests {
     #[test]
     fn deprecation_alias_prints_the_same_columns() {
         let workspaces = vec![make_workspace("alpha", "hub")];
-        let in_progress: Vec<&Task> = Vec::new();
+        let in_progress: Vec<&Issue> = Vec::new();
         let canonical = render_list(&workspaces, &in_progress).unwrap();
         // The alias arm in main.rs forwards into `commands::workspace::run`,
         // which calls into `list`, which calls `render_list`. Asserting

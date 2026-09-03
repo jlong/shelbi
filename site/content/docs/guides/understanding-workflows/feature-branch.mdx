@@ -1,11 +1,11 @@
 ---
 title: Feature-branch (GitHub-flow)
 order: 33
-summary: Branch per task off main, open a PR, merge back. This is the default Shelbi shape — the workflow every project ships with, written out in full.
+summary: Branch per issue off main, open a PR, merge back. This is the default Shelbi shape — the workflow every project ships with, written out in full.
 ---
 
 **Feature-branch** (a.k.a. GitHub-flow) is the simplest durable model:
-`main` is always deployable, every task cuts a short branch off it, opens
+`main` is always deployable, every issue cuts a short branch off it, opens
 a pull request, and merges back. There are no long-lived integration
 branches. The PR *is* the integration point.
 
@@ -112,7 +112,7 @@ is repeated here (the loader rejects a workflow file that does):
 ```yaml
 # workflows/default.yaml
 name: default
-description: Feature-branch flow — branch per task off main, PR, merge.
+description: Feature-branch flow — branch per issue off main, PR, merge.
 
 # Inherits the project's base_branch: main and merge_strategy from
 # project.yaml. A git: block here would only be needed to override them.
@@ -137,7 +137,7 @@ statuses:
 # initial_status: backlog
 #
 # transitions:
-#   - { from: in-progress, to: review,   actions: [push_branch, open_pr] }   # push the task branch, open a PR into main
+#   - { from: in-progress, to: review,   actions: [push_branch, open_pr] }   # push the issue branch, open a PR into main
 #   - { from: review,      to: done,     actions: [push_branch, merge] }     # push, then squash-merge the PR
 #   - { from: in-progress, to: canceled, actions: [close_pr, delete_branch] }
 #   - { from: review,      to: canceled, actions: [close_pr, delete_branch] }

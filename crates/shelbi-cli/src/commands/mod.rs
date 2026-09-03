@@ -13,6 +13,8 @@ pub mod events;
 pub mod guard;
 pub mod hub_version;
 pub mod init;
+pub mod issue;
+pub mod issue_store;
 pub mod list;
 pub mod merge;
 pub mod message;
@@ -32,7 +34,6 @@ pub mod send;
 pub mod spawn;
 pub mod status;
 pub mod tail;
-pub mod task;
 pub mod teardown;
 pub mod wizard;
 pub mod workflow;
@@ -339,6 +340,7 @@ pub(crate) mod test_support {
             heartbeat: HeartbeatConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
+            issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
         };

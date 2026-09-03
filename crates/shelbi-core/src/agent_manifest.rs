@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Project, RunnerKind, TaskLaunchConfig};
+use crate::model::{Project, RunnerKind, IssueLaunchConfig};
 
 /// A coarse reasoning-effort dial that travels *with* a runner kind inside a
 /// [`RunnerManifestConfig`]. Greenfield: there is no shared ordinal scale on the
@@ -261,7 +261,7 @@ pub fn resolve_agent_launch(
     project: &Project,
     agent_name: &str,
     manifest: Option<&AgentManifest>,
-    task_override: Option<&TaskLaunchConfig>,
+    task_override: Option<&IssueLaunchConfig>,
 ) -> ResolvedAgentLaunch {
     // --- runner kind chain -------------------------------------------------
     // task/status override sits at the top; the rest of the chain is
@@ -526,10 +526,10 @@ workspaces: []
         )
         .unwrap();
 
-        // Task override forces claude + a specific model + effort — it sits at
+        // Issue override forces claude + a specific model + effort — it sits at
         // the very top of every chain, so it beats both the project's codex pin
         // and the manifest's claude block.
-        let over = TaskLaunchConfig {
+        let over = IssueLaunchConfig {
             runner: Some(RunnerKind::Claude),
             model: Some("claude-opus-4-8".into()),
             effort: Some(ReasoningEffort::High),
@@ -566,7 +566,7 @@ workspaces: []
                 },
             );
         }
-        let over = TaskLaunchConfig {
+        let over = IssueLaunchConfig {
             runner: Some(RunnerKind::Codex),
             model: None,
             effort: None,
@@ -596,7 +596,7 @@ workspaces: []
         .unwrap();
         let without = resolve_agent_launch(&project, "review", Some(&m), None);
         let with_empty =
-            resolve_agent_launch(&project, "review", Some(&m), Some(&TaskLaunchConfig::default()));
+            resolve_agent_launch(&project, "review", Some(&m), Some(&IssueLaunchConfig::default()));
         assert_eq!(without, with_empty);
         assert_eq!(without.kind, RunnerKind::Codex);
         assert_eq!(without.model.as_deref(), Some("gpt-5"));
@@ -608,7 +608,7 @@ workspaces: []
         // looser `full-access` is clamped down to the ceiling, never escalated.
         let project = base_project();
         assert_eq!(project.workspace_permissions_mode, "auto");
-        let escalate = TaskLaunchConfig {
+        let escalate = IssueLaunchConfig {
             permission_mode: Some("full-access".into()),
             ..Default::default()
         };
@@ -616,7 +616,7 @@ workspaces: []
         assert_eq!(r.permission_mode, "auto");
 
         // A tighter request (read-only) is honored, mapped to claude's `plan`.
-        let tighten = TaskLaunchConfig {
+        let tighten = IssueLaunchConfig {
             permission_mode: Some("read-only".into()),
             ..Default::default()
         };
@@ -626,7 +626,7 @@ workspaces: []
         // The task request wins over the manifest's: manifest asks read-only but
         // the task asks (and is granted) the equal-to-ceiling `auto`.
         let m = AgentManifest::from_yaml_str("name: r\npermissions_mode: read-only\n").unwrap();
-        let task_auto = TaskLaunchConfig {
+        let task_auto = IssueLaunchConfig {
             permission_mode: Some("auto".into()),
             ..Default::default()
         };

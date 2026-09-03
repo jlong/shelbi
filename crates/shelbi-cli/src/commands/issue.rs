@@ -1,9 +1,9 @@
-//! `shelbi task <subcommand>` — Kanban board management.
+//! `shelbi issue <subcommand>` — Kanban board management.
 //!
-//! Tasks are stored as `<shelbi_home>/projects/<project>/tasks/<id>.md`
+//! Issues are stored as `<shelbi_home>/projects/<project>/tasks/<id>.md`
 //! files (markdown body + YAML frontmatter). The orchestrator creates
-//! tasks (typically into `backlog`); the user curates them through the
-//! columns; workspaces pick up `todo` tasks.
+//! issues (typically into `backlog`); the user curates them through the
+//! columns; workspaces pick up `todo` issues.
 //!
 //! Priorities within a column are contiguous integers 0..N. Any operation
 //! that changes a column's membership renumbers it before returning, so
@@ -14,18 +14,19 @@ use std::str::FromStr;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use clap::{Args as ClapArgs, Subcommand};
+use shelbi_state::IssueStore;
 use shelbi_core::{
     default_workflow, validate_branch, validate_task_id, validate_workflow_name, Column,
-    StatusCategory, Task, Workflow, MAX_TASK_ID_LEN,
+    StatusCategory, Issue, Workflow, MAX_TASK_ID_LEN,
 };
 
 use super::require_project;
 
 #[derive(Debug, Subcommand)]
-pub enum TaskCmd {
-    /// Create a new task. Defaults to the backlog column.
+pub enum IssueCmd {
+    /// Create a new issue. Defaults to the backlog column.
     Add(AddArgs),
-    /// List tasks (all statuses, or one with `--status`).
+    /// List issues (all statuses, or one with `--status`).
     List {
         /// Restrict to a single status. `--column` accepted as a hidden
         /// alias for one release while older scripts catch up.
@@ -36,19 +37,19 @@ pub enum TaskCmd {
         /// exclusive with `--status`.
         #[arg(long, conflicts_with = "status")]
         ready: bool,
-        /// Restrict to tasks pinned to the named workflow. Tasks with no
+        /// Restrict to issues pinned to the named workflow. Issues with no
         /// explicit `workflow:` field are treated as the canonical
         /// `default` workflow. Composes with `--column` and `--ready`.
         #[arg(long, value_name = "NAME")]
         workflow: Option<String>,
     },
-    /// Print a task's frontmatter + body, plus the resolved status of each
+    /// Print an issue's frontmatter + body, plus the resolved status of each
     /// `depends_on` entry.
     Show { id: String },
-    /// Edit a task's dependency list.
+    /// Edit an issue's dependency list.
     Depends(DependsArgs),
-    /// Move a task to another status. A task's position is a status id, so
-    /// the destination may be ANY status the task's workflow declares —
+    /// Move an issue to another status. An issue's position is a status id, so
+    /// the destination may be ANY status the issue's workflow declares —
     /// including `canceled` / archived statuses and any status a user adds.
     /// A status the workflow doesn't declare errors, naming the ids it does.
     Move {
@@ -73,24 +74,24 @@ pub enum TaskCmd {
         #[arg(long)]
         skip_transition_actions: bool,
     },
-    /// Assign a task to a workspace. Workspace must be declared in project YAML.
+    /// Assign an issue to a workspace. Workspace must be declared in project YAML.
     Assign {
         id: String,
         #[arg(long, value_name = "WORKSPACE")]
         to: String,
-        /// Override the review-slot guard. `task assign` refuses a
+        /// Override the review-slot guard. `issue assign` refuses a
         /// `review`-tagged workspace by default (review slots load handed-off
         /// branches via the review queue, not direct dispatch); pass `--force`
-        /// to route a normal task onto one anyway. The override is recorded on
+        /// to route a normal issue onto one anyway. The override is recorded on
         /// `~/.shelbi/events.log` for auditability.
         #[arg(long)]
         force: bool,
     },
-    /// Clear a task's workspace assignment.
+    /// Clear an issue's workspace assignment.
     Unassign { id: String },
-    /// Launch the assigned workspace on this task: ensure the worktree is on
-    /// the task's branch, kill any existing workspace pane (clears context),
-    /// start the runner with the task's prompt. Moves the task into
+    /// Launch the assigned workspace on this issue: ensure the worktree is on
+    /// the issue's branch, kill any existing workspace pane (clears context),
+    /// start the runner with the issue's prompt. Moves the issue into
     /// `in_progress`. Pass `--workspace` to assign at the same time.
     Start {
         id: String,
@@ -105,22 +106,22 @@ pub enum TaskCmd {
         /// Defaults to `user:cli:start`.
         #[arg(long, value_name = "REASON")]
         reason: Option<String>,
-        /// Override the review-slot guard. `task start` refuses a
+        /// Override the review-slot guard. `issue start` refuses a
         /// `review`-tagged workspace by default (review slots load handed-off
         /// branches via the review queue, not direct dispatch); pass `--force`
-        /// to launch a normal task on one anyway. The override is recorded on
+        /// to launch a normal issue on one anyway. The override is recorded on
         /// `~/.shelbi/events.log` for auditability.
         #[arg(long)]
         force: bool,
     },
-    /// Relaunch the assigned workspace on the task it is ALREADY working,
+    /// Relaunch the assigned workspace on the issue it is ALREADY working,
     /// WITHOUT discarding progress. For a stalled or killed worker: recreates
     /// or reclaims the tmux pane and (for a claude runner) resumes the prior
     /// conversation via `--continue`, while preserving the worktree as-is —
     /// its branch, commits, and uncommitted changes stay put. Contrast with
     /// `start`, which wipes context and re-checks-out a clean branch. Restores
-    /// the task to `in_progress` if it drifted. Pass `--workspace` to target a
-    /// specific workspace (defaults to the task's `assigned_to`).
+    /// the issue to `in_progress` if it drifted. Pass `--workspace` to target a
+    /// specific workspace (defaults to the issue's `assigned_to`).
     Resume {
         id: String,
         #[arg(long, value_name = "WORKSPACE")]
@@ -131,9 +132,9 @@ pub enum TaskCmd {
         #[arg(long, value_name = "REASON")]
         reason: Option<String>,
     },
-    /// Re-order a task within its column.
+    /// Re-order an issue within its column.
     Prio(PrioArgs),
-    /// Revise a task's content. With NO flags, opens the task file in
+    /// Revise an issue's content. With NO flags, opens the issue file in
     /// `$EDITOR` (the historical behavior). Any field flag switches to
     /// non-interactive mode: `--title`, a body source
     /// (`--body`/`--body-file`/stdin, optionally `--append`), a frontmatter
@@ -142,8 +143,17 @@ pub enum TaskCmd {
     /// dedicated command — `move`, `prio`, `assign`, `depends` — are out of
     /// scope; use those instead.
     Edit(EditArgs),
-    /// Delete a task.
+    /// Delete an issue.
     Rm { id: String },
+    /// Post a comment on an issue. Works against whichever issue-tracker
+    /// backend the project is configured for (`file_system` by default,
+    /// `github` for issues in a repo).
+    Comment {
+        /// The issue id (the stable shelbi slug).
+        id: String,
+        /// The comment text.
+        text: String,
+    },
 }
 
 #[derive(Debug, ClapArgs)]
@@ -163,30 +173,30 @@ pub struct AddArgs {
     )]
     pub status: String,
     /// Optional description. The body may also be piped on stdin
-    /// (`shelbi task add "Title" <<EOF ... EOF`); passing both is an
+    /// (`shelbi issue add "Title" <<EOF ... EOF`); passing both is an
     /// error. If neither is given, the body defaults to the title (use
-    /// `shelbi task edit` to fill it in).
+    /// `shelbi issue edit` to fill it in).
     #[arg(long, short)]
     pub description: Option<String>,
-    /// Task id this task depends on. Repeat for multiple deps:
+    /// Issue id this issue depends on. Repeat for multiple deps:
     /// `--depends-on a --depends-on b`. Repeat-flag chosen over
     /// comma-separated to avoid future escaping issues with ids that may
     /// contain commas or shell metacharacters.
     #[arg(long = "depends-on", value_name = "ID")]
     pub depends_on: Vec<String>,
-    /// Hint to the orchestrator that this task should be assigned to a
-    /// workspace on this machine. Persisted in the task frontmatter; the
+    /// Hint to the orchestrator that this issue should be assigned to a
+    /// workspace on this machine. Persisted in the issue frontmatter; the
     /// orchestrator decides whether to honor it.
     #[arg(long = "prefers-machine", value_name = "NAME")]
     pub prefers_machine: Option<String>,
-    /// Workflow this task runs under. Names a file in `workflows/<NAME>.yaml`.
+    /// Workflow this issue runs under. Names a file in `workflows/<NAME>.yaml`.
     /// Omit to inherit the project's default workflow.
     #[arg(long = "workflow", value_name = "NAME")]
     pub workflow: Option<String>,
-    /// Pre-fill the task's `branch:` frontmatter field. Omit to let the
+    /// Pre-fill the issue's `branch:` frontmatter field. Omit to let the
     /// orchestrator generate a branch from workflow config, project config,
     /// or the GitHub username at dispatch time; supply a value to point the
-    /// task at an existing branch (the *release task* pattern in
+    /// issue at an existing branch (the *release issue* pattern in
     /// `Plans/workflows.md` §12).
     #[arg(long = "branch", value_name = "BRANCH")]
     pub branch: Option<String>,
@@ -194,7 +204,7 @@ pub struct AddArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct DependsArgs {
-    /// Task whose dependency list is being edited.
+    /// Issue whose dependency list is being edited.
     pub id: String,
     /// Dependency id to add. Repeat for multiple.
     #[arg(long = "add", value_name = "DEP")]
@@ -226,9 +236,9 @@ pub struct PrioArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct EditArgs {
-    /// Task to edit.
+    /// Issue to edit.
     pub id: String,
-    /// New display title. The task's `id` stays stable — it is never
+    /// New display title. The issue's `id` stays stable — it is never
     /// re-slugified from a new title.
     #[arg(long, value_name = "TITLE")]
     pub title: Option<String>,
@@ -245,10 +255,10 @@ pub struct EditArgs {
     /// flags.
     #[arg(long)]
     pub append: bool,
-    /// Set the task's workflow. Must name an existing `workflows/<NAME>.yaml`.
+    /// Set the issue's workflow. Must name an existing `workflows/<NAME>.yaml`.
     #[arg(long = "workflow", value_name = "NAME")]
     pub workflow: Option<String>,
-    /// Set the task's `branch:` override.
+    /// Set the issue's `branch:` override.
     #[arg(long = "branch", value_name = "BRANCH")]
     pub branch: Option<String>,
     /// Set the prefers-machine hint. Mutually exclusive with
@@ -303,25 +313,25 @@ enum SubOp {
     Regex { pattern: String, replacement: String },
 }
 
-pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
+pub fn run(project_opt: Option<String>, cmd: IssueCmd) -> Result<()> {
     let project = require_project(project_opt)?;
     // Version gate: board mutations against a stale daemon (old binary
     // kept running across an upgrade) produce undiagnosable io errors —
     // refuse up front. Read-only views still work, with a warning.
     match &cmd {
-        TaskCmd::List { .. } | TaskCmd::Show { .. } => super::hub_version::warn_on_mismatch(),
+        IssueCmd::List { .. } | IssueCmd::Show { .. } => super::hub_version::warn_on_mismatch(),
         _ => super::hub_version::ensure_daemon_matches_for_mutation()?,
     }
     match cmd {
-        TaskCmd::Add(args) => add(&project, args),
-        TaskCmd::List {
+        IssueCmd::Add(args) => add(&project, args),
+        IssueCmd::List {
             status,
             ready,
             workflow,
         } => list(&project, status.as_deref(), ready, workflow.as_deref()),
-        TaskCmd::Show { id } => show(&project, &id),
-        TaskCmd::Depends(args) => depends(&project, args),
-        TaskCmd::Move {
+        IssueCmd::Show { id } => show(&project, &id),
+        IssueCmd::Depends(args) => depends(&project, args),
+        IssueCmd::Move {
             id,
             to,
             reason,
@@ -333,9 +343,9 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
             reason.as_deref(),
             skip_transition_actions,
         ),
-        TaskCmd::Assign { id, to, force } => assign(&project, &id, &to, force),
-        TaskCmd::Unassign { id } => unassign(&project, &id),
-        TaskCmd::Start {
+        IssueCmd::Assign { id, to, force } => assign(&project, &id, &to, force),
+        IssueCmd::Unassign { id } => unassign(&project, &id),
+        IssueCmd::Start {
             id,
             workspace,
             branch,
@@ -349,22 +359,41 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
             reason.as_deref(),
             force,
         ),
-        TaskCmd::Resume {
+        IssueCmd::Resume {
             id,
             workspace,
             reason,
         } => resume(&project, &id, workspace.as_deref(), reason.as_deref()),
-        TaskCmd::Prio(args) => prio(&project, args),
-        TaskCmd::Edit(args) => edit(&project, args),
-        TaskCmd::Rm { id } => rm(&project, &id),
+        IssueCmd::Prio(args) => prio(&project, args),
+        IssueCmd::Edit(args) => edit(&project, args),
+        IssueCmd::Rm { id } => rm(&project, &id),
+        IssueCmd::Comment { id, text } => comment(&project, &id, &text),
     }
+}
+
+/// Post a comment onto an issue via the project's configured issue-tracker
+/// backend (plan Decision D4 — comments are first-class). Routed through the
+/// [`IssueStore`] seam so it works the same on `file_system` or `github`.
+fn comment(project: &str, id: &str, text: &str) -> Result<()> {
+    let store = resolve_issue_store(project)?;
+    let posted = store.add_comment(id, text).map_err(|e| anyhow!(e))?;
+    println!("✓ commented on {id} (comment {})", posted.id);
+    Ok(())
+}
+
+/// Resolve the project's configured issue-tracker backend into a live store.
+/// The project YAML's `issue_tracker` block selects and validates the backend
+/// (`file_system` by default, `github` for issues in a repo).
+fn resolve_issue_store(project: &str) -> Result<Box<dyn IssueStore>> {
+    let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
+    shelbi_state::resolve_issue_store(project, &project_yaml.issue_tracker).map_err(|e| anyhow!(e))
 }
 
 fn add(project: &str, args: AddArgs) -> Result<()> {
     // Only consult stdin when NO explicit body source was passed. `-d` /
     // `--description` already carries the body, so touching `stdin()` would
     // pointlessly block a non-interactive caller whose stdin never reaches EOF.
-    // Reading stdin is reserved for the `shelbi task add "Title" <<EOF` spelling.
+    // Reading stdin is reserved for the `shelbi issue add "Title" <<EOF` spelling.
     let stdin_body = if add_should_read_stdin(&args) {
         read_piped_stdin()?
     } else {
@@ -418,7 +447,7 @@ fn add_with_stdin(project: &str, args: AddArgs, stdin_body: Option<String>) -> R
                 .map_err(|e| anyhow!(e))?
                 .exists()
             {
-                bail!("task id `{id}` already exists");
+                bail!("issue id `{id}` already exists");
             }
             id
         }
@@ -427,30 +456,6 @@ fn add_with_stdin(project: &str, args: AddArgs, stdin_body: Option<String>) -> R
 
     if let Some(name) = args.workflow.as_deref() {
         validate_workflow_name(name).map_err(|e| anyhow!(e))?;
-    }
-    let priority = shelbi_state::list_column(project, column.clone())
-        .map_err(|e| anyhow!(e))?
-        .len() as u32;
-    let now = Utc::now();
-    let task = Task {
-        id: id.clone(),
-        title: args.title.clone(),
-        column: column.clone(),
-        priority,
-        assigned_to: None,
-        workflow: args.workflow.clone(),
-        branch: args.branch.clone(),
-        depends_on: dedup_preserving_order(args.depends_on.clone()),
-        prefers_machine: args.prefers_machine.clone(),
-        zen: None,
-        launch: None,
-        created_at: now,
-        updated_at: now,
-        params: std::collections::BTreeMap::new(),
-    };
-    if !task.depends_on.is_empty() {
-        let existing = shelbi_state::list_tasks(project).map_err(|e| anyhow!(e))?;
-        shelbi_state::validate_depends_on(&task, &existing).map_err(|e| anyhow!(e))?;
     }
     // Body precedence: `-d` and piped stdin are two spellings of the same
     // input, so supplying both is ambiguous — refuse rather than silently
@@ -464,11 +469,30 @@ fn add_with_stdin(project: &str, args: AddArgs, stdin_body: Option<String>) -> R
         (None, Some(s)) => format!("# Task\n\n{}\n", s.trim_end()),
         (None, None) => format!("# Task\n\n{}\n", args.title),
     };
-    // Create-exclusive: the up-front existence checks above are advisory
-    // (they race against concurrent creators); this is the authoritative
-    // no-overwrite guarantee.
-    shelbi_state::create_task(project, &task, &body).map_err(|e| anyhow!(e))?;
-    println!("✓ {} created in {column} (priority {priority})", task.id);
+    // Route creation through the board seam. `add` appends to the column
+    // (priority = current length), validates deps (self-ref / unknown id /
+    // cycle), and is create-exclusive — the authoritative no-overwrite
+    // guarantee. The up-front existence checks above stay as advisory races.
+    let store = shelbi_state::FileSystemStore::new(project);
+    let spec = shelbi_state::NewIssue {
+        id: id.clone(),
+        title: args.title.clone(),
+        column: column.clone(),
+        body,
+        workflow: args.workflow.clone(),
+        branch: args.branch.clone(),
+        depends_on: dedup_preserving_order(args.depends_on.clone()),
+        prefers_machine: args.prefers_machine.clone(),
+        zen: None,
+        launch: None,
+        params: std::collections::BTreeMap::new(),
+        priority: None,
+    };
+    let created = store.add(spec).map_err(|e| anyhow!(e))?;
+    println!(
+        "✓ {} created in {column} (priority {})",
+        created.id, created.priority
+    );
     Ok(())
 }
 
@@ -485,7 +509,7 @@ fn dedup_preserving_order(items: Vec<String>) -> Vec<String> {
     out
 }
 
-/// The full board rendering used by both `shelbi task list` (no flags)
+/// The full board rendering used by both `shelbi issue list` (no flags)
 /// and the `## Board` section of `shelbi status --full`. Emits every
 /// column with counts and owner badges. Extracted so the bootstrap
 /// snapshot doesn't fork a second copy of the render code.
@@ -501,14 +525,14 @@ fn list(
 ) -> Result<()> {
     let project_yaml = shelbi_state::load_project(project).ok();
     // String-compare against the project-aware resolver so a filter of the
-    // configured default matches tasks with no `workflow:` field.
-    let matches_workflow = |task: &Task| -> bool {
+    // configured default matches issues with no `workflow:` field.
+    let matches_workflow = |issue: &Issue| -> bool {
         match workflow_filter {
             Some(name) => {
                 project_yaml
                     .as_ref()
-                    .map(|p| shelbi_state::resolve_task_workflow_name(p, task))
-                    .unwrap_or_else(|| task.workflow_or_default())
+                    .map(|p| shelbi_state::resolve_task_workflow_name(p, issue))
+                    .unwrap_or_else(|| issue.workflow_or_default())
                     == name
             }
             None => true,
@@ -538,20 +562,22 @@ fn list(
     // `in-progress`.
     let filter = status_filter.map(Column::from_status_id);
 
-    let all = shelbi_state::list_tasks(project).map_err(|e| anyhow!(e))?;
+    let all = shelbi_state::FileSystemStore::new(project)
+        .list()
+        .map_err(|e| anyhow!(e))?;
     if all.is_empty() {
-        println!("(no tasks yet)");
+        println!("(no issues yet)");
         return Ok(());
     }
-    // Blocked-status lookup is computed against the unfiltered task set:
+    // Blocked-status lookup is computed against the unfiltered issue set:
     // a workflow filter can hide a dependency target without changing
-    // whether the visible task is actually blocked.
+    // whether the visible issue is actually blocked.
     let columns: std::collections::HashMap<String, Column> = all
         .iter()
         .map(|tf| (tf.task.id.clone(), tf.task.column.clone()))
         .collect();
     // The stock columns (always shown, even empty) plus any custom /
-    // archived status a task actually occupies, in board order.
+    // archived status an issue actually occupies, in board order.
     let mut cols: Vec<Column> = Column::core();
     for tf in &all {
         if !cols.contains(&tf.task.column) {
@@ -670,7 +696,7 @@ fn move_to(
 ) -> Result<()> {
     let tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
     let workflow = resolve_task_workflow(project, &tf.task)?;
-    // Resolve the destination against the task's workflow. A task's position
+    // Resolve the destination against the issue's workflow. An issue's position
     // is a status id, so ANY status the workflow declares is a valid target
     // — including `canceled` / archived and any status a user adds. A target
     // the workflow doesn't declare errors, naming the declared statuses.
@@ -700,14 +726,14 @@ fn move_to(
             .actions_for_transition(&from_status, &to_status)
             .contains(&shelbi_core::TransitionAction::Merge);
 
-    // Lifecycle hook: a move INTO `in_progress` cuts the task's branch on
+    // Lifecycle hook: a move INTO `in_progress` cuts the issue's branch on
     // the hub (with depends_on awareness — see
     // `shelbi_orchestrator::lifecycle`) and persists `branch:` onto the
-    // task. Skip when the destination matches the current column (the
+    // issue. Skip when the destination matches the current column (the
     // `shelbi_state::move_task` short-circuit would treat it as a no-op
     // anyway) and when no column change is actually happening — that
-    // keeps `task move ... --to in_progress` on an already-in-progress
-    // task from running the cut for no reason. A failure inside the cut
+    // keeps `issue move ... --to in_progress` on an already-in-progress
+    // issue from running the cut for no reason. A failure inside the cut
     // (e.g. depends_on names a branch that hasn't been pushed yet) DOES
     // abort the move — silently dropping the depends_on intent and
     // shipping the card to in_progress without a usable branch would be
@@ -721,7 +747,7 @@ fn move_to(
     // Gated merge for an accept edge. Integrate the branch (via the PR when
     // one is open — the path a protected `main` accepts) BEFORE the card
     // moves. A failed merge emits a `merge … status=failed` event and aborts
-    // the move: the task stays put rather than showing the target status with
+    // the move: the issue stays put rather than showing the target status with
     // nothing merged. Loaded once here and reused for the post-move cleanup.
     let project_yaml_for_actions = if declares_merge {
         let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
@@ -751,7 +777,14 @@ fn move_to(
         None
     };
 
-    let moved = shelbi_state::move_task(project, id, column.clone()).map_err(|e| anyhow!(e))?;
+    // Route the status change through the board seam. `move_status` returns a
+    // `StatusMove`; unpack it back into the `(from, to, workflow)` tuple the
+    // event-append + rollback logic below already speaks.
+    let store = shelbi_state::FileSystemStore::new(project);
+    let moved = store
+        .move_status(id, &column, reason.unwrap_or("user:cli"))
+        .map_err(|e| anyhow!(e))?
+        .map(|m| (m.from, m.to, m.workflow));
     if let Some((from, to_col, moved_wf)) = &moved {
         let reason = reason.unwrap_or("user:cli");
         // Stamp `actions=skipped` on the line when the escape hatch bypassed
@@ -763,19 +796,19 @@ fn move_to(
             shelbi_state::append_task_event
         };
         if let Err(e) = append(project, id, moved_wf, from.clone(), to_col.clone(), reason) {
-            match shelbi_state::move_task(project, id, from.clone()) {
+            match store.move_status(id, from, "rollback:event-append-failed") {
                 Ok(_) => {
                     return Err(anyhow!(
-                        "moved {id} to {to_col}, but failed to append task event ({e}); \
+                        "moved {id} to {to_col}, but failed to append issue event ({e}); \
                          rolled back to {from}. Fix events.log permissions or restart the \
                          Shelbi daemon, then retry the move"
                     ));
                 }
                 Err(re) => {
                     return Err(anyhow!(
-                        "moved {id} to {to_col}, but failed to append task event ({e}); \
+                        "moved {id} to {to_col}, but failed to append issue event ({e}); \
                          rollback to {from} also failed ({re}). Fix events.log permissions, \
-                         then run `shelbi task move {id} --to {from}` or retry the intended move"
+                         then run `shelbi issue move {id} --to {from}` or retry the intended move"
                     ));
                 }
             }
@@ -810,12 +843,12 @@ fn move_to(
     Ok(())
 }
 
-/// Load the workflow assigned to `task`. Project defaults are resolved via
+/// Load the workflow assigned to `issue`. Project defaults are resolved via
 /// project config; a workflow that can't be loaded — whatever the reason —
 /// falls back to the canonical default workflow with a stderr warning.
 ///
 /// The fail-soft is deliberate and load-bearing: this sits on the status
-/// transition path (`task move` / `task start`), and a workflow YAML can be
+/// transition path (`issue move` / `issue start`), and a workflow YAML can be
 /// absent through no fault of the project's config — a stale daemon
 /// managing an older state layout the CLI doesn't expect (the observed
 /// field failure: a 0.1 daemon under a 0.3.2 CLI), or an in-repo
@@ -825,12 +858,12 @@ fn move_to(
 /// path already swallows this load — kept working. Falling back mirrors
 /// the poller's behavior; the warning keeps a genuinely misconfigured
 /// workflow loud.
-fn resolve_task_workflow(project: &str, task: &Task) -> Result<Workflow> {
+fn resolve_task_workflow(project: &str, issue: &Issue) -> Result<Workflow> {
     let project_yaml = shelbi_state::load_project(project).ok();
     let name = project_yaml
         .as_ref()
-        .map(|p| shelbi_state::resolve_task_workflow_name(p, task))
-        .unwrap_or_else(|| task.workflow_or_default());
+        .map(|p| shelbi_state::resolve_task_workflow_name(p, issue))
+        .unwrap_or_else(|| issue.workflow_or_default());
     match shelbi_state::load_workflow(project, name) {
         Ok(wf) => Ok(wf),
         Err(e) => {
@@ -842,10 +875,10 @@ fn resolve_task_workflow(project: &str, task: &Task) -> Result<Workflow> {
     }
 }
 
-/// Resolve a `task move --to <STATUS>` argument against the task's
+/// Resolve a `issue move --to <STATUS>` argument against the issue's
 /// workflow, returning the target position (a status id).
 ///
-/// A task's position is a status id, so any status the workflow declares
+/// An issue's position is a status id, so any status the workflow declares
 /// is a reachable target — including `canceled` / archived statuses and
 /// any status a user adds later. `to` is matched against the declared
 /// status ids, first through the same alias normalization a stored
@@ -879,20 +912,20 @@ fn resolve_move_target(workflow: &Workflow, to: &str) -> Result<Column> {
 }
 
 /// Resolve which agent should drive the workspace once it lands in the
-/// active (in-progress) status. `shelbi task start` is an explicit user
+/// active (in-progress) status. `shelbi issue start` is an explicit user
 /// invocation — we don't gate on Zen here even when the active status
 /// is `owner: user` (the user typed the command, that's the override).
 /// Falls back to the bundled `developer` agent when the workflow can't
 /// be loaded or has no active-category status (legacy workflows without
 /// the two-field design); the worktree's agent context still deploys so
 /// the bundled developer prompt + skills are wired up correctly.
-/// The required workspace tags of the task's workflow active status — the
-/// set a workspace's effective tags must be a superset of to take this task
+/// The required workspace tags of the issue's workflow active status — the
+/// set a workspace's effective tags must be a superset of to take this issue
 /// (see the tag-routing check in [`start`]). Empty when the workflow has no
 /// active status or that status declares no `tags:`.
-fn required_active_tags(project: &str, task: &Task) -> Result<std::collections::BTreeSet<String>> {
+fn required_active_tags(project: &str, issue: &Issue) -> Result<std::collections::BTreeSet<String>> {
     use shelbi_core::StatusCategory;
-    let workflow = resolve_task_workflow(project, task)?;
+    let workflow = resolve_task_workflow(project, issue)?;
     Ok(workflow
         .statuses
         .iter()
@@ -901,13 +934,13 @@ fn required_active_tags(project: &str, task: &Task) -> Result<std::collections::
         .unwrap_or_default())
 }
 
-fn resolve_active_agent_for_dispatch(project: &str, task: &Task) -> Result<String> {
+fn resolve_active_agent_for_dispatch(project: &str, issue: &Issue) -> Result<String> {
     use shelbi_core::StatusCategory;
     use shelbi_orchestrator::dispatch::{resolve_dispatch_agent, DispatchDecision};
     use shelbi_state::DEVELOPER_AGENT;
 
-    let workflow = resolve_task_workflow(project, task)?;
-    // The active-category status is what the task lands in after `task
+    let workflow = resolve_task_workflow(project, issue)?;
+    // The active-category status is what the issue lands in after `issue
     // start` — its `agent:` field is the runner we want spawned.
     let active = workflow
         .statuses
@@ -947,7 +980,7 @@ fn resolve_active_agent_for_dispatch(project: &str, task: &Task) -> Result<Strin
     }
 }
 
-/// Guard against routing a normal dev task onto a review slot. A review slot is
+/// Guard against routing a normal dev issue onto a review slot. A review slot is
 /// a workspace whose [effective tags](shelbi_core::Project::effective_tags)
 /// (its own ∪ its machine's) include `review` — the canonical marker
 /// (`config_upgrade_apply` migrates the legacy `role: review` onto it, and the
@@ -972,7 +1005,7 @@ fn guard_review_slot(
     }
     if !force {
         bail!(
-            "workspace `{workspace_name}` is a review slot (tagged `review`) — review tasks \
+            "workspace `{workspace_name}` is a review slot (tagged `review`) — review issues \
              load via the review queue, not direct dispatch; pick a non-review workspace \
              (or pass --force to override)"
         );
@@ -1005,7 +1038,7 @@ fn assign(project: &str, id: &str, workspace: &str, force: bool) -> Result<()> {
     tf.task.assigned_to = Some(workspace.to_string());
     tf.task.updated_at = Utc::now();
     shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
-    // A fresh assignment un-parks the task, so a previously-parked card can be
+    // A fresh assignment un-parks the issue, so a previously-parked card can be
     // re-served. Best-effort — a stale marker only ever suppresses an auto-load.
     let _ = shelbi_state::clear_task_parked(project, id);
     println!("✓ {id} assigned to {workspace}");
@@ -1014,10 +1047,10 @@ fn assign(project: &str, id: &str, workspace: &str, force: bool) -> Result<()> {
 
 fn unassign(project: &str, id: &str) -> Result<()> {
     let tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
-    // Unassigning a review-column (handoff) task from its slot is a *park*: it
+    // Unassigning a review-column (handoff) issue from its slot is a *park*: it
     // must stay unloaded, not be re-grabbed by the review auto-loader on the
     // next tick. `park_review_task` clears `assigned_to` and sets the parked
-    // marker in one locked write. A non-review task is a plain unassign.
+    // marker in one locked write. A non-review issue is a plain unassign.
     if tf.task.column == Column::review() {
         shelbi_state::park_review_task(project, id).map_err(|e| anyhow!(e))?;
         println!("✓ {id} unassigned (parked — won't auto-reload for review)");
@@ -1037,7 +1070,7 @@ fn prio(project: &str, args: PrioArgs) -> Result<()> {
     let pos = col
         .iter()
         .position(|x| x.task.id == args.id)
-        .ok_or_else(|| anyhow!("task `{}` not found in column listing", args.id))?;
+        .ok_or_else(|| anyhow!("issue `{}` not found in column listing", args.id))?;
     let last = col.len().saturating_sub(1);
 
     let new_pos: usize = if args.up {
@@ -1054,7 +1087,10 @@ fn prio(project: &str, args: PrioArgs) -> Result<()> {
         bail!("specify one of --up, --down, --top, --bottom, --set N");
     };
 
-    shelbi_state::set_task_priority(project, &args.id, new_pos as u32).map_err(|e| anyhow!(e))?;
+    let store = shelbi_state::FileSystemStore::new(project);
+    store
+        .set_priority(&args.id, shelbi_state::PrioMove::Set(new_pos as u32))
+        .map_err(|e| anyhow!(e))?;
     println!("✓ {} now at slot {new_pos} in {}", args.id, tf.task.column);
     Ok(())
 }
@@ -1070,14 +1106,14 @@ fn start(
     let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
     let mut tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
 
-    // Resolve workspace: explicit --workspace wins; otherwise reuse task.assigned_to.
+    // Resolve workspace: explicit --workspace wins; otherwise reuse issue.assigned_to.
     let workspace_name = workspace_arg
         .map(str::to_string)
         .or_else(|| tf.task.assigned_to.clone())
         .ok_or_else(|| {
             anyhow!(
-                "task `{id}` has no assigned workspace — pass `--workspace NAME` or run \
-                 `shelbi task assign {id} --to <workspace>` first"
+                "issue `{id}` has no assigned workspace — pass `--workspace NAME` or run \
+                 `shelbi issue assign {id} --to <workspace>` first"
             )
         })?;
     let workspace = project_yaml.workspace(&workspace_name).ok_or_else(|| {
@@ -1092,7 +1128,7 @@ fn start(
         )
     })?;
 
-    // Refuse to dispatch a normal dev task onto a review slot (a `review`-tagged
+    // Refuse to dispatch a normal dev issue onto a review slot (a `review`-tagged
     // workspace) unless explicitly forced (logged). Review slots serve
     // handed-off branches for a human via the review autoloader — dispatching
     // dev work onto one is almost always a routing mistake. This is the hard CLI
@@ -1101,7 +1137,7 @@ fn start(
     guard_review_slot(&project_yaml, workspace, &workspace_name, id, force)?;
 
     // Tag routing (Plans/generic-review-via-workflow-primitives): if the
-    // active status the task is entering requires workspace tags, the chosen
+    // active status the issue is entering requires workspace tags, the chosen
     // workspace's *effective* tags (its own ∪ its machine's) must be a
     // superset. An empty required set — the default for every stock status —
     // accepts any workspace, so this is a no-op until a workflow opts in.
@@ -1115,7 +1151,7 @@ fn start(
             .collect();
         if !missing.is_empty() {
             bail!(
-                "workspace `{workspace_name}` can't take task `{id}`: its active status \
+                "workspace `{workspace_name}` can't take issue `{id}`: its active status \
                  requires tag(s) {required:?} but the workspace's effective tags are \
                  {effective:?} (missing {missing:?}) — assign a workspace tagged accordingly"
             );
@@ -1148,9 +1184,9 @@ fn start(
         }
     }
 
-    // Refuse to clobber another in-flight task on the same workspace. Pulling
-    // a workspace off mid-task is intentional — make the user do it explicitly
-    // via `task move <other> --to todo` first.
+    // Refuse to clobber another in-flight issue on the same workspace. Pulling
+    // a workspace off mid-issue is intentional — make the user do it explicitly
+    // via `issue move <other> --to todo` first.
     let conflict = shelbi_state::list_column(project, Column::in_progress())
         .map_err(|e| anyhow!(e))?
         .into_iter()
@@ -1159,7 +1195,7 @@ fn start(
         });
     if let Some(other) = conflict {
         bail!(
-            "workspace `{workspace_name}` is already on task `{}` (in_progress) — \
+            "workspace `{workspace_name}` is already on issue `{}` (in_progress) — \
              move it to another column first",
             other.task.id
         );
@@ -1172,7 +1208,7 @@ fn start(
     // they share the repo, so the cut we just made is the same ref the
     // workspace will resolve. An explicit `--branch` override still wins:
     // it bypasses the lifecycle cut and tells `sync_worktree` to use
-    // that ref directly (the *release task* pattern, Plans/workflows.md
+    // that ref directly (the *release issue* pattern, Plans/workflows.md
     // §12).
     if branch_arg.is_none() {
         let updated =
@@ -1195,8 +1231,8 @@ fn start(
             .map_err(|e| anyhow!(e))
         })?;
 
-    // Resolve which agent runs in the spawned pane. `shelbi task start`
-    // is always putting the task into `in_progress`, so we look up the
+    // Resolve which agent runs in the spawned pane. `shelbi issue start`
+    // is always putting the issue into `in_progress`, so we look up the
     // workflow's active status and ask the dispatch resolver which
     // agent answers for it under the project's current Zen state. The
     // CLI is an explicit user invocation, so we don't honor the
@@ -1211,7 +1247,7 @@ fn start(
     // is load-bearing: if we spawned first and the process died before the
     // save, an agent would be running against a card still sitting in
     // `todo`, and auto-dispatch (which selects from `todo`) could hand the
-    // same task to a second workspace — two agents on one branch. The
+    // same issue to a second workspace — two agents on one branch. The
     // conflict guard above only inspects the `in_progress` column, which
     // the un-persisted first start never reached. By moving the card first
     // the board reflects the in-flight work the instant the agent can
@@ -1244,7 +1280,7 @@ fn start(
     // branch cut, and the auto-mode + runner-availability SSH probes — have no
     // ceiling of their own and can each block indefinitely on a wedged network
     // or a lock held by a crashed peer. Left unbounded, a single stuck step
-    // hangs `shelbi task start` forever with the card already moved to
+    // hangs `shelbi issue start` forever with the card already moved to
     // `in_progress` and assigned but no pane and no dispatch event: the
     // phantom-in_progress bug (observed 2026-07-15 on alpha). Run the launch on
     // a worker thread and cap the wait; on timeout we record a
@@ -1262,7 +1298,7 @@ fn start(
         let branch_owned = branch.clone();
         let body_owned = tf.body.clone();
         let agent_owned = agent_name.clone();
-        // The task-level `launch:` override rides into the thread as an owned
+        // The issue-level `launch:` override rides into the thread as an owned
         // clone; `StartSpec` borrows it back below.
         let launch_owned = tf.task.launch.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1294,7 +1330,7 @@ fn start(
                 if let Err(re) = rollback_start(project, &original, &tf.body, prev_column.clone()) {
                     eprintln!(
                         "warning: `{id}` was moved to in_progress but the spawn failed and the \
-                         rollback also failed ({re}); run `shelbi task move {id} --to \
+                         rollback also failed ({re}); run `shelbi issue move {id} --to \
                          {prev_column}` to recover"
                     );
                 }
@@ -1318,12 +1354,12 @@ fn start(
                 if let Err(re) = rollback_start(project, &original, &tf.body, prev_column.clone()) {
                     eprintln!(
                         "warning: `{id}` launch timed out and the rollback also failed ({re}); \
-                         run `shelbi task move {id} --to {prev_column}` to recover"
+                         run `shelbi issue move {id} --to {prev_column}` to recover"
                     );
                 }
                 return Err(anyhow!(
                     "launching workspace `{workspace_name}` on `{id}` timed out after {}s — \
-                     dispatch aborted and the task rolled back to `{prev_column}`. The launch \
+                     dispatch aborted and the issue rolled back to `{prev_column}`. The launch \
                      likely blocked on git/ssh or a stale lock; check the workspace pane, then \
                      re-run the dispatch.",
                     launch_deadline.as_secs(),
@@ -1343,7 +1379,7 @@ fn start(
                 if let Err(re) = rollback_start(project, &original, &tf.body, prev_column.clone()) {
                     eprintln!(
                         "warning: `{id}` launch thread died and the rollback also failed ({re}); \
-                         run `shelbi task move {id} --to {prev_column}` to recover"
+                         run `shelbi issue move {id} --to {prev_column}` to recover"
                     );
                 }
                 return Err(anyhow!(
@@ -1384,7 +1420,7 @@ fn start(
 /// spawn itself failed. Re-saves the pre-move frontmatter and renumbers
 /// both the column we bumped the card out of and `in_progress` (where the
 /// aborted card was briefly appended) so priorities stay contiguous.
-fn rollback_start(project: &str, original: &Task, body: &str, prev_column: Column) -> Result<()> {
+fn rollback_start(project: &str, original: &Issue, body: &str, prev_column: Column) -> Result<()> {
     shelbi_state::save_task(project, original, body).map_err(|e| anyhow!(e))?;
     if prev_column != Column::in_progress() {
         shelbi_state::renumber_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
@@ -1402,7 +1438,7 @@ fn dispatch_reason_with_agent(base: &str, agent: &str) -> String {
     format!("{base} agent={agent}")
 }
 
-/// Default wall-clock ceiling for the whole launch phase of `shelbi task
+/// Default wall-clock ceiling for the whole launch phase of `shelbi issue
 /// start` (worktree sync, SSH probes, pane creation, and the readiness/submit
 /// wait). Generous enough to cover a cold `git fetch` on a fresh cut plus the
 /// two 30s internal readiness probes without tripping on a healthy-but-slow
@@ -1423,12 +1459,12 @@ fn launch_timeout() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
-/// `shelbi task resume` — relaunch the assigned workspace on the task it is
+/// `shelbi issue resume` — relaunch the assigned workspace on the issue it is
 /// already working, WITHOUT discarding the in-flight worktree. The recovery
 /// counterpart to [`start`]: where `start` wipes context (kills the pane,
 /// re-checks-out a clean branch) for a fresh dispatch, `resume` is for a
 /// stalled or killed worker — the tmux session died, the pane wedged, or the
-/// agent stopped mid-task — and gets it going again on the SAME task with its
+/// agent stopped mid-issue — and gets it going again on the SAME issue with its
 /// commits and uncommitted changes intact.
 ///
 /// The worktree is preserved as-is (see
@@ -1446,14 +1482,14 @@ fn resume(
     let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
     let mut tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
 
-    // Resolve workspace: explicit --workspace wins; otherwise reuse the task's
+    // Resolve workspace: explicit --workspace wins; otherwise reuse the issue's
     // existing assignment. A resume without either has nothing to relaunch.
     let workspace_name = workspace_arg
         .map(str::to_string)
         .or_else(|| tf.task.assigned_to.clone())
         .ok_or_else(|| {
             anyhow!(
-                "task `{id}` has no assigned workspace — pass `--workspace NAME` (the \
+                "issue `{id}` has no assigned workspace — pass `--workspace NAME` (the \
                  workspace whose worktree holds the in-flight work)"
             )
         })?;
@@ -1469,8 +1505,8 @@ fn resume(
         )
     })?;
 
-    // Refuse to clobber a DIFFERENT in-flight task on the same workspace —
-    // same guard as `start`. Resuming this task onto a workspace busy with
+    // Refuse to clobber a DIFFERENT in-flight issue on the same workspace —
+    // same guard as `start`. Resuming this issue onto a workspace busy with
     // another would leave two agents racing one worktree.
     let conflict = shelbi_state::list_column(project, Column::in_progress())
         .map_err(|e| anyhow!(e))?
@@ -1481,14 +1517,14 @@ fn resume(
         });
     if let Some(other) = conflict {
         bail!(
-            "workspace `{workspace_name}` is already on task `{}` (in_progress) — \
+            "workspace `{workspace_name}` is already on issue `{}` (in_progress) — \
              move it to another column first",
             other.task.id
         );
     }
 
     // Resolve the branch WITHOUT cutting or resetting it: the branch already
-    // exists (the worker created + committed on it). Prefer the task's recorded
+    // exists (the worker created + committed on it). Prefer the issue's recorded
     // branch, falling back through workflow/project/GitHub prefix resolution.
     let workflow = shelbi_state::load_task_workflow(project, &project_yaml, &tf.task)
         .map_err(|e| anyhow!(e))?;
@@ -1538,13 +1574,13 @@ fn resume(
         Ok(addr) => addr,
         Err(e) => {
             // Roll the card back only if we moved it — a resume of an
-            // already-in-progress task left the board untouched, so there's
+            // already-in-progress issue left the board untouched, so there's
             // nothing to undo.
             if moved_into_progress {
                 if let Err(re) = rollback_start(project, &original, &tf.body, prev_column.clone()) {
                     eprintln!(
                         "warning: `{id}` was restored to in_progress but the resume failed and \
-                         the rollback also failed ({re}); run `shelbi task move {id} --to \
+                         the rollback also failed ({re}); run `shelbi issue move {id} --to \
                          {prev_column}` to recover"
                     );
                 }
@@ -1554,7 +1590,7 @@ fn resume(
     };
 
     // Only a card we actually moved records a dispatch event — a resume of an
-    // already-in-progress task leaves no misleading transition line.
+    // already-in-progress issue leaves no misleading transition line.
     if moved_into_progress {
         let base_reason = reason.unwrap_or("user:cli:resume");
         let dispatched_reason = dispatch_reason_with_agent(base_reason, &agent_name);
@@ -1596,7 +1632,7 @@ fn edit_has_field_flags(args: &EditArgs, stdin_body: &Option<String>) -> bool {
 /// body source (`--body`/`--body-file`) was given — the caller already supplied
 /// the body, so reading stdin would only risk blocking a non-interactive
 /// invocation whose stdin never closes. Reading stdin is reserved for the
-/// `shelbi task edit x <<EOF` spelling, where the body comes from stdin.
+/// `shelbi issue edit x <<EOF` spelling, where the body comes from stdin.
 fn edit_should_read_stdin(args: &EditArgs) -> bool {
     args.body.is_none() && args.body_file.is_none()
 }
@@ -1674,7 +1710,7 @@ fn edit(project: &str, args: EditArgs) -> Result<()> {
     // `--body-file` already carry the body, so touching `stdin()` would
     // pointlessly block a non-interactive caller whose stdin never reaches EOF
     // (backgrounded process, inherited pipe) — the hang this gate exists to
-    // prevent. Reading stdin here is reserved for the `shelbi task edit x <<EOF`
+    // prevent. Reading stdin here is reserved for the `shelbi issue edit x <<EOF`
     // spelling, where the body is *meant* to come from stdin.
     let stdin_body = if edit_should_read_stdin(&args) {
         read_piped_stdin()?
@@ -1687,7 +1723,7 @@ fn edit(project: &str, args: EditArgs) -> Result<()> {
     if !edit_has_field_flags(&args, &stdin_body) {
         let path = shelbi_state::task_path(project, &args.id).map_err(|e| anyhow!(e))?;
         if !path.exists() {
-            bail!("task `{}` not found", args.id);
+            bail!("issue `{}` not found", args.id);
         }
         return super::launch_editor(&path);
     }
@@ -1739,7 +1775,7 @@ fn apply_substitutions(
         };
         if count == 0 && !allow_no_match {
             bail!(
-                "substitution {label} matched zero occurrences — the task body is \
+                "substitution {label} matched zero occurrences — the issue body is \
                  unchanged (pass --allow-no-match to permit a no-op substitution)"
             );
         }
@@ -1810,21 +1846,21 @@ fn resolve_body_edit(
     }
 }
 
-/// Whether the task's current column is an `active`-category status under its
-/// workflow (e.g. `in_progress`). A body/field edit to such a task won't reach
+/// Whether the issue's current column is an `active`-category status under its
+/// workflow (e.g. `in_progress`). A body/field edit to such an issue won't reach
 /// the already-running worker until it is re-dispatched.
-fn task_column_is_active(project: &str, task: &Task) -> bool {
+fn task_column_is_active(project: &str, issue: &Issue) -> bool {
     // Stock status ids carry their category directly, so a routine edit on a
     // project without materialized workflow files doesn't emit a spurious
     // workflow-load warning just to compute this hint.
-    if Column::core().contains(&task.column) {
-        return task.column.category() == StatusCategory::Active;
+    if Column::core().contains(&issue.column) {
+        return issue.column.category() == StatusCategory::Active;
     }
-    // Custom status id: resolve its category through the task's workflow.
-    resolve_task_workflow(project, task)
+    // Custom status id: resolve its category through the issue's workflow.
+    resolve_task_workflow(project, issue)
         .ok()
         .and_then(|wf| {
-            wf.status(task.column.as_str())
+            wf.status(issue.column.as_str())
                 .map(|s| s.category == StatusCategory::Active)
         })
         .unwrap_or(false)
@@ -1852,7 +1888,7 @@ fn edit_non_interactive(
     let mut fields: Vec<&str> = Vec::new();
 
     // --- validate every touched field BEFORE mutating, so an invalid input
-    // leaves the task file untouched. ---
+    // leaves the issue file untouched. ---
     if let Some(name) = args.workflow.as_deref() {
         validate_workflow_name(name).map_err(|e| anyhow!(e))?;
         let path = shelbi_state::workflow_path(project, name).map_err(|e| anyhow!(e))?;
@@ -1922,7 +1958,7 @@ fn edit_non_interactive(
     if task_column_is_active(project, &tf.task) {
         eprintln!(
             "warning: `{}` is in an active status ({}) — this edit will NOT reach the \
-             running worker until the task is re-dispatched (`shelbi task start`)",
+             running worker until the issue is re-dispatched (`shelbi issue start`)",
             args.id, tf.task.column
         );
     }
@@ -1942,16 +1978,16 @@ fn rm(project: &str, id: &str) -> Result<()> {
 // Helpers
 
 /// Slugify a title to a kebab-case id, appending `-2`, `-3`, ... if the
-/// base collides with an existing task file.
+/// base collides with an existing issue file.
 fn generate_unique_id(project: &str, title: &str) -> Result<String> {
     let base = slugify(title);
     if base.is_empty() {
         bail!("could not generate id from title `{title}` — pass --id explicitly");
     }
-    let tasks = shelbi_state::tasks_dir(project).map_err(|e| anyhow!(e))?;
+    let issues = shelbi_state::tasks_dir(project).map_err(|e| anyhow!(e))?;
     let mut candidate = base.clone();
     let mut n: u32 = 2;
-    while tasks.join(format!("{candidate}.md")).exists() {
+    while issues.join(format!("{candidate}.md")).exists() {
         candidate = format!("{base}-{n}");
         n += 1;
     }
@@ -1995,7 +2031,7 @@ mod tests {
 
     fn fresh_home() -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "shelbi-cli-task-test-{}-{}",
+            "shelbi-cli-issue-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2012,9 +2048,9 @@ mod tests {
         p
     }
 
-    fn task_in(column: Column, id: &str) -> Task {
+    fn task_in(column: Column, id: &str) -> Issue {
         let now = Utc::now();
-        Task {
+        Issue {
             id: id.into(),
             title: id.replace('-', " "),
             column,
@@ -2105,7 +2141,7 @@ mod tests {
             err.contains("both --description and piped stdin"),
             "err: {err}"
         );
-        // The refusal must happen before the task file is written.
+        // The refusal must happen before the issue file is written.
         assert!(shelbi_state::load_task("p", "ambiguous").is_err());
 
         std::env::remove_var("SHELBI_HOME");
@@ -2188,7 +2224,7 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         // `move_to` now runs the depends_on-aware branch cut on hub when
-        // a card lands in `in_progress` — see `commands::task::move_to`.
+        // a card lands in `in_progress` — see `commands::issue::move_to`.
         // The hook needs both a loadable project YAML and a real git
         // repo at the hub's `work_dir`, so we provision them up front.
         crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
@@ -2281,7 +2317,7 @@ mod tests {
         .to_string();
         std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        assert!(err.contains("failed to append task event"), "err: {err}");
+        assert!(err.contains("failed to append issue event"), "err: {err}");
         assert!(err.contains("rolled back to backlog"), "err: {err}");
         let tf = shelbi_state::load_task("p", "denied").unwrap();
         assert_eq!(tf.task.column, Column::backlog());
@@ -2342,9 +2378,9 @@ statuses:
         )
         .unwrap();
 
-        let mut task = task_in(Column::todo(), "d");
-        task.workflow = Some("research".into());
-        shelbi_state::save_task("p", &task, "").unwrap();
+        let mut issue = task_in(Column::todo(), "d");
+        issue.workflow = Some("research".into());
+        shelbi_state::save_task("p", &issue, "").unwrap();
 
         let err = move_to("p", "d", "review", None, false)
             .unwrap_err()
@@ -2363,7 +2399,7 @@ statuses:
         assert!(valid.contains("done"), "{err}");
         assert!(!valid.contains("review"), "{err}");
 
-        // Task must stay put — no event written.
+        // Issue must stay put — no event written.
         let path = shelbi_state::events_log_path().unwrap();
         assert!(
             !path.exists() || std::fs::read_to_string(&path).unwrap().is_empty(),
@@ -2376,9 +2412,9 @@ statuses:
 
     #[test]
     fn move_to_custom_status_is_a_valid_target() {
-        // A task's position is a status id, so ANY status the workflow
+        // An issue's position is a status id, so ANY status the workflow
         // declares — including a custom `qa` status with no legacy column
-        // backing — is a reachable `task move` target. A status the
+        // backing — is a reachable `issue move` target. A status the
         // workflow does NOT declare still errors, naming the declared ids.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
@@ -2408,12 +2444,12 @@ statuses:
         )
         .unwrap();
 
-        let mut task = task_in(Column::todo(), "t");
-        task.workflow = Some("qa".into());
-        shelbi_state::save_task("p", &task, "").unwrap();
+        let mut issue = task_in(Column::todo(), "t");
+        issue.workflow = Some("qa".into());
+        shelbi_state::save_task("p", &issue, "").unwrap();
 
         // `--to qa`: a declared custom status is now a real move target and
-        // the task lands there (its stored position id is the custom id).
+        // the issue lands there (its stored position id is the custom id).
         move_to("p", "t", "qa", None, false).unwrap();
         assert_eq!(
             shelbi_state::load_task("p", "t")
@@ -2426,7 +2462,7 @@ statuses:
 
         // A status absent from this workflow (`review`) still errors, and
         // the valid-status list names the declared ids (never the undeclared
-        // target). Task stays put.
+        // target). Issue stays put.
         let err = move_to("p", "t", "review", None, false)
             .unwrap_err()
             .to_string();
@@ -2445,7 +2481,7 @@ statuses:
                 .column
                 .as_str(),
             "qa",
-            "rejected move must not relocate the task",
+            "rejected move must not relocate the issue",
         );
 
         // A core status the workflow declares still moves successfully.
@@ -2488,9 +2524,9 @@ transitions:
         )
         .unwrap();
 
-        let mut task = task_in(Column::review(), "t");
-        task.workflow = Some("mergewf".into());
-        shelbi_state::save_task("p", &task, "").unwrap();
+        let mut issue = task_in(Column::review(), "t");
+        issue.workflow = Some("mergewf".into());
+        shelbi_state::save_task("p", &issue, "").unwrap();
 
         move_to("p", "t", "done", Some("recovery:pr-merged-by-hand"), true).unwrap();
 
@@ -2500,7 +2536,7 @@ transitions:
             Column::done(),
         );
 
-        // Exactly one line — the task move. No `merge … status=…` line, because
+        // Exactly one line — the issue move. No `merge … status=…` line, because
         // the action list never ran. The line carries BOTH the user's
         // `reason=` and a distinct `actions=skipped` marker.
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
@@ -2518,7 +2554,7 @@ transitions:
     #[test]
     fn move_to_without_skip_flag_still_runs_the_merge_action() {
         // The complement: WITHOUT the flag, the same `review -> done` edge fires
-        // its `merge`, which fails here (the task has no branch/PR) and aborts
+        // its `merge`, which fails here (the issue has no branch/PR) and aborts
         // the move — the card stays in `review`. This is the pre-existing
         // behavior the flag deliberately does NOT change, and it proves the
         // action actually runs when the flag is absent.
@@ -2547,9 +2583,9 @@ transitions:
         )
         .unwrap();
 
-        let mut task = task_in(Column::review(), "t");
-        task.workflow = Some("mergewf".into());
-        shelbi_state::save_task("p", &task, "").unwrap();
+        let mut issue = task_in(Column::review(), "t");
+        issue.workflow = Some("mergewf".into());
+        shelbi_state::save_task("p", &issue, "").unwrap();
 
         let err = move_to("p", "t", "done", None, false)
             .unwrap_err()
@@ -2568,14 +2604,14 @@ transitions:
 
     #[test]
     fn move_to_canceled_succeeds_and_round_trips() {
-        // The headline acceptance: a default-workflow task can be moved to
+        // The headline acceptance: a default-workflow issue can be moved to
         // the archived `canceled` status, and it round-trips through disk.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
         shelbi_state::save_project_statuses("p", &shelbi_core::default_project_statuses()).unwrap();
-        // A default-workflow task (no explicit `workflow:` field).
+        // A default-workflow issue (no explicit `workflow:` field).
         shelbi_state::save_task("p", &task_in(Column::todo(), "c"), "").unwrap();
 
         move_to("p", "c", "canceled", None, false).unwrap();
@@ -2598,9 +2634,9 @@ transitions:
 
     #[test]
     fn list_workflow_filter_composes_with_column_and_ready() {
-        // Three tasks across two workflows; verify the filter wiring on
+        // Three issues across two workflows; verify the filter wiring on
         // each list mode (default / --column / --ready) returns Ok and
-        // doesn't panic when the filter matches zero, one, or all tasks.
+        // doesn't panic when the filter matches zero, one, or all issues.
         // Output assertions live behind a refactor (split compute from
         // render); the smoke test catches accidental regressions in the
         // wiring.
@@ -2637,8 +2673,8 @@ transitions:
 
     #[test]
     fn list_workflow_default_matches_tasks_without_explicit_workflow() {
-        // `--workflow default` must match tasks whose frontmatter omits
-        // `workflow:` entirely — that's the contract `Task::workflow_or_default`
+        // `--workflow default` must match issues whose frontmatter omits
+        // `workflow:` entirely — that's the contract `Issue::workflow_or_default`
         // promises and the contract callers (orchestrator, future TUI
         // filter) rely on. Verified by exercising the matcher closure
         // directly through the filter_workflow_name helper-equivalent
@@ -2724,7 +2760,7 @@ workspaces:
         let err = assign("p", "t", "review", false).unwrap_err().to_string();
         assert!(err.contains("review slot"), "err: {err}");
         assert!(err.contains("--force"), "err should point to --force: {err}");
-        // The task was NOT assigned.
+        // The issue was NOT assigned.
         let after = shelbi_state::load_task("p", "t").unwrap();
         assert_eq!(after.task.assigned_to, None);
         // No override event was logged (the guard rejected before logging).
@@ -2811,7 +2847,7 @@ workspaces:
     #[test]
     fn move_to_falls_back_when_project_workflow_file_is_absent() {
         // The CLI-transition ENOENT bug: the project YAML loads fine, the
-        // task has no explicit `workflow:`, and the workflow file the
+        // issue has no explicit `workflow:`, and the workflow file the
         // project default resolves to is not on disk (e.g. a state layout
         // the running daemon version never materialized, or an in-repo
         // `workflows/` blipped by a git checkout). This used to hard-fail
@@ -2850,7 +2886,7 @@ workspaces:
 
     #[test]
     fn dispatch_reason_appends_agent_segment_for_both_default_and_orchestrator_paths() {
-        // Acceptance (a) — every event emitted when `shelbi task start`
+        // Acceptance (a) — every event emitted when `shelbi issue start`
         // spawns a workspace must include `_agent=<name>` in `reason=`.
         // The helper composes the raw reason; `append_task_event` folds
         // the embedded space into the underscore that ends up on disk.
@@ -2947,7 +2983,7 @@ workspaces:
             dispatch_reason_with_agent("orchestrator:auto-dispatch workspace=alpha", "developer");
         shelbi_state::append_task_event(
             "demo",
-            "demo-task",
+            "demo-issue",
             "default",
             Column::todo(),
             Column::in_progress(),
@@ -2967,7 +3003,7 @@ workspaces:
 
     #[test]
     fn resolve_active_agent_dispatches_developer_for_default_workflow() {
-        // Acceptance criterion (a) from the task: a default `shelbi task
+        // Acceptance criterion (a) from the issue: a default `shelbi issue
         // start` resolves the active status's agent and lands on
         // `developer`. The resolver doesn't care about Zen mode for an
         // `owner: agent` status, so this passes regardless of state.
@@ -2989,8 +3025,8 @@ statuses:
 "#,
         );
 
-        let task = task_in(Column::todo(), "t1");
-        let agent = resolve_active_agent_for_dispatch("p", &task).unwrap();
+        let issue = task_in(Column::todo(), "t1");
+        let agent = resolve_active_agent_for_dispatch("p", &issue).unwrap();
         assert_eq!(agent, "developer");
 
         std::env::remove_var("SHELBI_HOME");
@@ -3019,8 +3055,8 @@ statuses:
   - { id: done,    name: Done,    category: done,    owner: user }
 "#,
         );
-        let task = task_in(Column::todo(), "t2");
-        let agent = resolve_active_agent_for_dispatch("p", &task).unwrap();
+        let issue = task_in(Column::todo(), "t2");
+        let agent = resolve_active_agent_for_dispatch("p", &issue).unwrap();
         assert_eq!(agent, shelbi_state::DEVELOPER_AGENT);
 
         std::env::remove_var("SHELBI_HOME");
@@ -3068,16 +3104,16 @@ statuses:
 
     #[test]
     fn move_to_missing_workflow_falls_back_to_default() {
-        // A task pinned to a workflow the project hasn't authored falls
+        // An issue pinned to a workflow the project hasn't authored falls
         // back to the canonical default — same five statuses, so a move
         // to `review` still succeeds.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        let mut task = task_in(Column::todo(), "e");
-        task.workflow = Some("nonexistent".into());
-        shelbi_state::save_task("p", &task, "").unwrap();
+        let mut issue = task_in(Column::todo(), "e");
+        issue.workflow = Some("nonexistent".into());
+        shelbi_state::save_task("p", &issue, "").unwrap();
 
         move_to("p", "e", "review", None, false).unwrap();
 
@@ -3090,7 +3126,7 @@ statuses:
     }
 
     // -------------------------------------------------------------------
-    // task edit (non-interactive)
+    // issue edit (non-interactive)
 
     fn edit_args(id: &str) -> EditArgs {
         EditArgs {
@@ -3110,12 +3146,12 @@ statuses:
         }
     }
 
-    /// Seed a task with a body and an `updated_at` in the past so an edit's
+    /// Seed an issue with a body and an `updated_at` in the past so an edit's
     /// timestamp bump is observable.
     fn seed_task(project: &str, id: &str, column: Column, body: &str) {
-        let mut task = task_in(column, id);
-        task.updated_at = "2000-01-01T00:00:00Z".parse().unwrap();
-        shelbi_state::save_task(project, &task, body).unwrap();
+        let mut issue = task_in(column, id);
+        issue.updated_at = "2000-01-01T00:00:00Z".parse().unwrap();
+        shelbi_state::save_task(project, &issue, body).unwrap();
     }
 
     #[test]
@@ -3124,13 +3160,13 @@ statuses:
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        seed_task("p", "task-one", Column::backlog(), "# Task\n\nbody\n");
-        let mut args = edit_args("task-one");
+        seed_task("p", "issue-one", Column::backlog(), "# Task\n\nbody\n");
+        let mut args = edit_args("issue-one");
         args.title = Some("A brand new title".into());
         edit_non_interactive("p", args, None, Vec::new()).unwrap();
 
-        let tf = shelbi_state::load_task("p", "task-one").unwrap();
-        assert_eq!(tf.task.id, "task-one", "id must never be re-slugged");
+        let tf = shelbi_state::load_task("p", "issue-one").unwrap();
+        assert_eq!(tf.task.id, "issue-one", "id must never be re-slugged");
         assert_eq!(tf.task.title, "A brand new title");
         assert_eq!(tf.body, "# Task\n\nbody\n", "title-only edit leaves body");
         assert!(
@@ -3419,7 +3455,7 @@ statuses:
         assert!(log.contains(" edited "), "log: {log}");
         assert!(log.contains("fields=title"), "log: {log}");
         assert!(log.contains("reason=fixing_typo"), "log: {log}");
-        // Classified as a Task event so the feed/poller observe it.
+        // Classified as a Issue event so the feed/poller observe it.
         let line = log.lines().next().unwrap();
         assert_eq!(
             shelbi_state::EventEnvelope::from_log_line(line).kind,

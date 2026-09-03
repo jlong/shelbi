@@ -89,7 +89,7 @@ fn open(project: &str, name: &str, as_pane: bool, resume: bool) -> Result<()> {
 /// Existing pane → focus and exit. Missing pane → what gets created
 /// depends on whether the workspace is mid-task:
 ///
-/// - **Task assigned** (active or handoff category): relaunch the worker —
+/// - **Issue assigned** (active or handoff category): relaunch the worker —
 ///   the lifecycle wrapper for local hosts, the legacy proxy-window for
 ///   remote hosts.
 /// - **Idle** (nothing assigned): open a plain interactive shell in the

@@ -4,7 +4,7 @@ order: 14
 summary: Fill the backlog, promote a stack of cards, and watch the orchestrator keep every workspace in your pool loaded with work in parallel.
 ---
 
-One task at a time is the on-ramp. The reason Shelbi exists is the
+One issue at a time is the on-ramp. The reason Shelbi exists is the
 other direction: half a dozen workspaces all running in their own
 worktrees, the orchestrator keeping every free slot loaded with the
 next ready card. This page walks the loop end-to-end.
@@ -48,7 +48,7 @@ The fastest way to fill the backlog is to talk to the orchestrator in
 batches:
 
 ```
-you: add three tasks:
+you: add three issues:
      1. add CSV export to the reports page
      2. fix the cookie-domain bug on Safari SSO
      3. tighten the rate-limit error copy
@@ -62,52 +62,52 @@ Orchestrator: ✓ added 3 to backlog:
 The CLI does the same thing in a loop if you'd rather script it:
 
 ```bash
-shelbi task add "Add CSV export to the reports page"
-shelbi task add "Fix cookie-domain bug on Safari SSO"
-shelbi task add "Tighten the rate-limit error copy"
+shelbi issue add "Add CSV export to the reports page"
+shelbi issue add "Fix cookie-domain bug on Safari SSO"
+shelbi issue add "Tighten the rate-limit error copy"
 ```
 
 Each lands in `backlog` as its own markdown card under
 `~/.shelbi/projects/<name>/tasks/`. Nothing dispatches yet. The
 backlog is still your triage queue.
 
-### Route a task to a specific machine
+### Route an issue to a specific machine
 
-When a task is RAM-heavy, latency-sensitive, or you just want to keep
+When an issue is RAM-heavy, latency-sensitive, or you just want to keep
 it off the hub, hint where it should run with `--prefers-machine`:
 
 ```bash
-shelbi task add "Re-encode the marketing video assets" \
+shelbi issue add "Re-encode the marketing video assets" \
   --prefers-machine devbox
 ```
 
 The orchestrator's dispatcher honors the hint when at least one
 workspace on that machine is free. If `devbox` is fully busy when the
-task becomes ready, the card stays in `todo`.
+issue becomes ready, the card stays in `todo`.
 
 <Callout type="note" title="A machine preference is never overridden silently">
 
-Shelbi will not re-route a `--prefers-machine` task to the hub just because
+Shelbi will not re-route a `--prefers-machine` issue to the hub just because
 the preferred machine is busy. It parks the card in `todo` and waits. Free
 a workspace on that machine, or drop the preference, to get it moving.
 
 </Callout>
 
-### Block one task on another
+### Block one issue on another
 
-If task B reads files task A is about to rewrite, declare the order
+If issue B reads files issue A is about to rewrite, declare the order
 explicitly:
 
 ```bash
-shelbi task add "Rename the auth_v1 module to auth" --id auth-rename
-shelbi task add "Update the OpenAPI spec for the new auth module" \
+shelbi issue add "Rename the auth_v1 module to auth" --id auth-rename
+shelbi issue add "Update the OpenAPI spec for the new auth module" \
   --depends-on auth-rename
 ```
 
 The dependent card carries a `🔒` badge in the Kanban view and the
 orchestrator skips it during dispatch until every id in its
 `depends_on` list reaches `done`. See
-[dependent tasks](/docs/guides/getting-started/workflows#dependent-tasks-with-depends_on)
+[dependent issues](/docs/guides/getting-started/workflows#dependent-tasks-with-depends_on)
 for the full state model.
 
 ## Promote everything to todo
@@ -115,7 +115,7 @@ for the full state model.
 Promotion is the start signal. Move all three cards into **todo** in
 the order you want them picked up:
 
-- **From the Kanban view** — `Ctrl+P` → Tasks, then `H`/`L` to walk
+- **From the Kanban view** — `Ctrl+P` → Issues, then `H`/`L` to walk
   cards into the next column. `K`/`J` to reorder within `todo`. The
   orchestrator dispatches from the top.
 - **From the orchestrator** — just ask:
@@ -127,9 +127,9 @@ the order you want them picked up:
 - **From the CLI** — one move per card:
 
   ```bash
-  shelbi task move add-csv-export-to-reports --to todo
-  shelbi task move fix-cookie-domain-bug-on-safari-sso --to todo
-  shelbi task move tighten-rate-limit-error-copy --to todo
+  shelbi issue move add-csv-export-to-reports --to todo
+  shelbi issue move fix-cookie-domain-bug-on-safari-sso --to todo
+  shelbi issue move tighten-rate-limit-error-copy --to todo
   ```
 
 The orchestrator is already tailing `~/.shelbi/events.log`. Each
@@ -225,7 +225,7 @@ to the orchestrator with `Ctrl+P` → Chat when you're done.
 Workspaces finish at their own pace. When the first one writes its
 review-ready marker, three things happen at once:
 
-1. The hub poller moves the task from `in_progress` to `review` and
+1. The hub poller moves the issue from `in_progress` to `review` and
    clears the marker.
 2. The workspace's badge drops from `⏵` back to idle (`·`) and a `✓`
    row appears in the sidebar's **Ready for Review** section.
@@ -234,7 +234,7 @@ review-ready marker, three things happen at once:
    slot (if any).
 
 That last step is the loop. You don't have to ask. The workspace that
-just handed off a finished branch is already on its next task by the
+just handed off a finished branch is already on its next issue by the
 time you've clicked into the review pane.
 
 Open the review:
@@ -244,7 +244,7 @@ Open the review:
 ```
 
 Shelbi checks the branch out into the project's working directory on
-the machine that ran the task and spawns a fresh agent session pointed
+the machine that ran the issue and spawns a fresh agent session pointed
 at the diff. Ask it to walk you through the change, run tests, or
 request edits. The workspace that produced the branch is busy on
 something else, but the review pane is its own conversation in the
@@ -257,7 +257,7 @@ you: merge it.
 ```
 
 Then move the card from `review` to `done` (`L` in the kanban view,
-or `shelbi task move <id> --to done`). The card is yours; the
+or `shelbi issue move <id> --to done`). The card is yours; the
 orchestrator only takes the `review` → `done` step when you've
 explicitly authorized it as part of [Zen
 Mode](/docs/guides/getting-started/enable-zen-mode).
@@ -279,15 +279,15 @@ intent for breakage:
   first.
 - **The card prefers a machine and no workspace on it is free.** The
   orchestrator parks it in `todo` rather than mis-routing. Free a
-  workspace on the target machine (kill another task, or remove the
+  workspace on the target machine (kill another issue, or remove the
   preference).
 - **The workspace's pane died.** The orchestrator surfaces it
   (`workspace=<name> pane_alive=false`) and waits for you. Re-launch with
   `Enter` on the workspace
-  row, or `shelbi workspace stop <name>` to release the in-flight task
+  row, or `shelbi workspace stop <name>` to release the in-flight issue
   back to `todo`.
 - **The mid-conversation guard.** If you're actively chatting with
-  the orchestrator about a specific task, it holds off on
+  the orchestrator about a specific issue, it holds off on
   back-to-back dispatches that would talk over you. The next event
   resumes the loop.
 
