@@ -3044,6 +3044,15 @@ pub fn task_assignments(project: &str) -> Result<BTreeMap<String, String>> {
         let Some(id) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
+        // The directory is enumerated concurrently with `atomic_write`, which
+        // stages each marker under a `<id>.tmp.<pid>.<seq>` sibling before the
+        // rename. A bulk read that hands those transient names (or any other
+        // stray file) to `get_task_assignment` would fail `validate_task_id`
+        // with `InvalidAgentId` mid-write — a spurious, racy error. Only names
+        // that are valid task ids can be real markers, so skip everything else.
+        if validate_task_id(&id).is_err() {
+            continue;
+        }
         if let Some(ws) = get_task_assignment(project, &id)? {
             out.insert(id, ws);
         }
@@ -4083,6 +4092,60 @@ mod tests {
         set_task_assignment("p", "b", None).unwrap();
         assert_eq!(get_task_assignment("p", "b").unwrap(), None);
         assert!(task_assignments("p").unwrap().is_empty());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn task_assignments_skips_atomic_write_temp_markers() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // One real marker plus a stray temp sibling shaped exactly like the one
+        // `atomic_write` stages mid-rename (`<id>.tmp.<pid>.<seq>`). The temp
+        // name is not a valid task id, so a naive bulk read would blow up with
+        // `InvalidAgentId`; the enumeration must skip it instead.
+        set_task_assignment("p", "real-task", Some("alpha")).unwrap();
+        let dir = assignments_dir("p").unwrap();
+        atomic_write(&dir.join("real-task.tmp.12345.0"), b"beta").unwrap();
+        // A leftover temp for an id that has no committed marker at all.
+        atomic_write(&dir.join("ghost.tmp.99999.7"), b"gamma").unwrap();
+
+        let all = task_assignments("p").unwrap();
+        assert_eq!(all.get("real-task").map(String::as_str), Some("alpha"));
+        assert_eq!(all.len(), 1, "only the valid marker is returned: {all:?}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn task_assignments_is_race_safe_against_concurrent_atomic_writes() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Seed a marker so the directory exists and the bulk read has real work.
+        set_task_assignment("p", "seed", Some("alpha")).unwrap();
+        ensure_dir(&assignments_dir("p").unwrap()).unwrap();
+
+        // A writer thread hammers `set_task_assignment`, which stages temp files
+        // under `assignments/` before each rename. `SHELBI_HOME` is already set
+        // process-wide, so the thread inherits it without touching the env.
+        // Concurrently the main thread enumerates the overlay; every read must
+        // succeed regardless of which transient temp files are visible mid-write.
+        let writer = std::thread::spawn(move || {
+            for i in 0..200 {
+                let id = format!("t{}", i % 8);
+                set_task_assignment("p", &id, Some("beta")).unwrap();
+            }
+        });
+
+        for _ in 0..400 {
+            // Must never return Err(InvalidAgentId) even while temps exist.
+            task_assignments("p").expect("bulk read stays valid mid-write");
+        }
+        writer.join().unwrap();
 
         std::env::remove_var("SHELBI_HOME");
     }
