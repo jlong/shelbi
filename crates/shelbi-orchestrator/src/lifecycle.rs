@@ -175,54 +175,133 @@ pub fn cut_branch_on_hub(project: &Project, branch: &str, base: &str) -> Result<
 
 /// Resolve the concrete ref [`cut_branch_on_hub`] should branch from.
 ///
-/// Precedence:
-/// 1. A local head `refs/heads/<base>` — the dependency-stacking case,
-///    where the base is an in-progress sibling's branch that lives only on
-///    the hub (never pushed to origin). Used as-is, no fetch.
-/// 2. Otherwise, when the repo has an `origin` remote, fetch `<base>` from
-///    it and cut from the freshly-updated `origin/<base>`. This is how a
-///    workflow `git.base_branch` like `update/homepage` — a shared branch
-///    that lives on origin but was never checked out as a local head on the
-///    hub — becomes cuttable, and the fetch guarantees the cut sees the
-///    branch's current tip rather than a stale remote-tracking ref.
-/// 3. Otherwise the base genuinely can't be found (no local head, no
-///    origin, or not present on origin): `Ok(None)`, so the caller raises a
-///    clear error naming it instead of silently falling back to `main`.
+/// When the base has an `origin` remote we always fetch it first, then pick
+/// between the local head and the freshly-fetched `origin/<base>`:
+///
+/// 1. **Base on both the hub and origin.** Cut from `origin/<base>` *only
+///    when the local head is strictly behind it* (the local head is an
+///    ancestor of the origin tip). This is the
+///    `dispatch-subtask-stale-local-feature-ref` case: the umbrella's review
+///    worktree checks out `feature/<umbrella>`, pinning the hub's local ref at
+///    the reviewed commit, while sibling merges land on
+///    `origin/feature/<umbrella>`. Git can't fast-forward a checked-out branch,
+///    so the local head lags — cutting a new subtask from it silently omits
+///    every already-merged sibling. Preferring the origin tip freshens past the
+///    stale pin. If the local head is instead **ahead of or diverged from**
+///    origin — an unpushed dependency-stack sibling branch whose worker
+///    committed but hasn't pushed — the local head is authoritative and wins,
+///    or the child would be cut off a base missing the sibling's latest work.
+/// 2. **Base only on origin** (no local head): cut from `origin/<base>`. This
+///    is how a workflow `git.base_branch` like `update/homepage` — a shared
+///    branch present on origin but never checked out as a local head on the hub
+///    — becomes cuttable, always at its current tip.
+/// 3. **Base only on the hub** (no origin remote, or `<base>` absent on
+///    origin): cut from the local head as-is — the in-progress sibling's branch
+///    that lives solely on the hub, never pushed to origin.
+/// 4. **Base nowhere** (no local head, no origin, or not on origin): `Ok(None)`,
+///    so the caller raises a clear error naming it instead of silently falling
+///    back to `main`.
+///
+/// **Fetch failure.** The freshen decision is only trustworthy when the fetch
+/// that would have advanced `origin/<base>` actually succeeded. If origin is
+/// unreachable, a *pre-existing* `refs/remotes/origin/<base>` from an earlier
+/// fetch may still resolve — but it is potentially stale, so it must never be
+/// mistaken for the current shared tip (that would reintroduce the very
+/// sibling-revert this function prevents). Crucially, a cached `origin/<base>`
+/// also *proves the base is shared on origin*: a local head of the same name
+/// may be a stale review-worktree pin sitting behind a sibling's merge, so it
+/// is no safer a fallback than the stale remote ref. On a failed fetch we
+/// therefore refuse the cut whenever a cached `origin/<base>` exists — with or
+/// without a local head — rather than branch from an unverifiable base. We fall
+/// back to the local head only when there is *no* cached `origin/<base>` at all
+/// (the genuinely local-only case: an unpushed dependency-stack sibling, or a
+/// hub with no origin remote), where the local head is authoritative.
 fn resolve_hub_cut_base(host: &Host, wt: &str, base: &str) -> Result<Option<String>> {
-    if local_branch_exists(host, wt, base)? {
-        return Ok(Some(base.to_string()));
-    }
+    let has_local = local_branch_exists(host, wt, base)?;
     let has_origin = run_in_dir(host, wt, &["git", "config", "--get", "remote.origin.url"])?
         .status
         .success();
-    if !has_origin {
-        return Ok(None);
-    }
-    // A fetch that fails because `<base>` isn't on origin (or origin is
-    // unreachable) is treated as "base not found" — the caller surfaces a
-    // clear error naming the base either way, which beats silently cutting
-    // from the project default.
-    if !run_in_dir(host, wt, &["git", "fetch", "origin", base])?
+
+    // When the base lives on origin, fetch it so the comparison below is
+    // against the *current* shared tip, not a stale remote-tracking ref. We
+    // must record whether the fetch SUCCEEDED: a failed fetch (origin
+    // unreachable, or `<base>` deleted upstream) can leave a pre-existing,
+    // potentially stale `origin/<base>` in place. `origin_ref` is the resolved
+    // remote-tracking ref (if any); `fetch_ok` gates whether we may trust it.
+    let (origin_ref, fetch_ok) = if has_origin {
+        let fetched = run_in_dir(host, wt, &["git", "fetch", "origin", base])?
+            .status
+            .success();
+        let remote_ref = format!("origin/{base}");
+        let exists = run_in_dir(
+            host,
+            wt,
+            &[
+                "git",
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/{remote_ref}"),
+            ],
+        )?
         .status
-        .success()
-    {
-        return Ok(None);
+        .success();
+        (exists.then_some(remote_ref), fetched)
+    } else {
+        (None, false)
+    };
+
+    // A resolvable `origin/<base>` whose refreshing fetch failed is stale: its
+    // freshness cannot be established, so it is not a safe cut base.
+    let stale_origin = origin_ref.is_some() && !fetch_ok;
+    let trusted_origin = if stale_origin { None } else { origin_ref };
+
+    match (has_local, trusted_origin, stale_origin) {
+        (true, Some(origin_ref), _) => {
+            // Freshen past a stale local pin only when doing so can't lose
+            // work: the local head must be an ancestor of the origin tip.
+            if local_is_ancestor_of(host, wt, base, &origin_ref)? {
+                Ok(Some(origin_ref))
+            } else {
+                Ok(Some(base.to_string()))
+            }
+        }
+        (false, Some(origin_ref), _) => Ok(Some(origin_ref)),
+        // A cached `origin/<base>` exists but its refreshing fetch failed, so
+        // its current tip cannot be established. The cached ref PROVES the
+        // base is shared on origin — which means a local head of the same name
+        // may be a stale review-worktree pin sitting behind a sibling's merge,
+        // exactly the sibling-revert this function exists to prevent. With the
+        // fetch failed, neither the cached remote tip nor the local head can be
+        // trusted as the shared base's current commit, so refuse the cut
+        // regardless of whether a local head exists — never fall back to a
+        // possibly-stale base.
+        (_, None, true) => Err(Error::Other(format!(
+            "branch-cut: base `{base}` is shared on origin (a cached \
+             `origin/{base}` ref exists) but `git fetch origin {base}` failed, \
+             so its current tip cannot be established. Refusing to cut from a \
+             possibly-stale base — retry once origin is reachable."
+        ))),
+        // No cached `origin/<base>` at all: the base is genuinely local-only —
+        // an unpushed dependency-stack sibling, or a hub with no origin remote.
+        // The local head is authoritative, so fall back to it.
+        (true, None, false) => Ok(Some(base.to_string())),
+        (false, None, false) => Ok(None),
     }
-    let remote_ref = format!("origin/{base}");
-    let exists = run_in_dir(
-        host,
-        wt,
-        &[
-            "git",
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/remotes/{remote_ref}"),
-        ],
-    )?
-    .status
-    .success();
-    Ok(exists.then_some(remote_ref))
+}
+
+/// True when `local` (a local head name) is an ancestor of `other` — i.e.
+/// `other` contains every commit `local` does, so cutting from `other` can
+/// never drop work that exists only on `local`. Equal refs count as ancestors
+/// (`git merge-base --is-ancestor` exits 0). A non-zero/error exit (either ref
+/// unresolvable, or `local` genuinely ahead/diverged) is treated as "not an
+/// ancestor", so the caller conservatively keeps the local head.
+fn local_is_ancestor_of(host: &Host, wt: &str, local: &str, other: &str) -> Result<bool> {
+    Ok(
+        run_in_dir(host, wt, &["git", "merge-base", "--is-ancestor", local, other])?
+            .status
+            .success(),
+    )
 }
 
 /// Prepare a task for the `Todo -> InProgress` transition: pick a
@@ -471,6 +550,124 @@ mod tests {
             &["clone", "-q", origin.to_str().unwrap(), clone.to_str().unwrap()],
         );
         (tmp, clone)
+    }
+
+    /// A hub-repo clone whose `<base>` is checked out locally at a commit
+    /// that origin has since advanced past — the
+    /// `dispatch-subtask-stale-local-feature-ref` shape: the umbrella's review
+    /// worktree pins the hub's local `feature/<umbrella>` at the reviewed
+    /// commit, while a sibling's squash-merge lands on `origin/<base>`.
+    ///
+    /// Returns `(tmpdir, clone_path, origin_tip_sha, stale_local_sha)`.
+    fn fixture_clone_with_stale_local_base(base: &str) -> (tempfile::TempDir, PathBuf, String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let seed = tmp.path().join("seed");
+        let clone = tmp.path().join("clone");
+        run_git(
+            tmp.path(),
+            &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()],
+        );
+        run_git(
+            tmp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), seed.to_str().unwrap()],
+        );
+        run_git(&seed, &["config", "user.email", "test@example.com"]);
+        run_git(&seed, &["config", "user.name", "Test"]);
+        std::fs::write(seed.join("README.md"), "hi\n").unwrap();
+        run_git(&seed, &["add", "README.md"]);
+        run_git(&seed, &["commit", "-q", "-m", "init"]);
+        run_git(&seed, &["push", "-q", "origin", "main"]);
+        // Feature base at its reviewed tip (F0), pushed to origin.
+        run_git(&seed, &["checkout", "-q", "-b", base]);
+        std::fs::write(seed.join("base.txt"), "reviewed\n").unwrap();
+        run_git(&seed, &["add", "base.txt"]);
+        run_git(&seed, &["commit", "-q", "-m", "feature base (reviewed tip)"]);
+        run_git(&seed, &["push", "-q", "origin", base]);
+        // Hub clone checks the base out locally — mirrors the review worktree
+        // pinning the local ref at F0.
+        run_git(
+            tmp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        run_git(&clone, &["checkout", "-q", base]);
+        let stale_local = rev(&clone, base);
+        // A sibling squash-merges into the feature branch on origin (F1). The
+        // hub's local ref stays at F0 — git can't fast-forward a checked-out
+        // branch, and nothing fetched here.
+        std::fs::write(seed.join("sibling.txt"), "merged sibling A\n").unwrap();
+        run_git(&seed, &["add", "sibling.txt"]);
+        run_git(&seed, &["commit", "-q", "-m", "merge sibling A"]);
+        run_git(&seed, &["push", "-q", "origin", base]);
+        let origin_tip = rev(&seed, base);
+        (tmp, clone, origin_tip, stale_local)
+    }
+
+    /// A hub-repo clone carrying a *stale* `origin/<base>` remote-tracking ref
+    /// behind a *broken* origin remote, so every `git fetch origin <base>`
+    /// fails. Mirrors the hazard the Zen review flagged: origin advanced past
+    /// the hub's last fetch, then became unreachable, and a pre-existing
+    /// remote-tracking ref must NOT be mistaken for the current shared tip.
+    ///
+    /// When `checkout_local` is true the clone also checks `<base>` out as a
+    /// local head at the stale tip (F0) — mirroring the review-worktree pin
+    /// sitting behind a sibling merge on origin. Either way a cached
+    /// `origin/<base>` exists, which proves the base is *shared* on origin, so
+    /// the cut must refuse rather than trust the stale local head or the stale
+    /// remote-tracking tip.
+    ///
+    /// Returns `(tmpdir, clone_path, stale_sha, origin_tip_sha)`.
+    fn fixture_clone_stale_origin_broken_remote(
+        base: &str,
+        checkout_local: bool,
+    ) -> (tempfile::TempDir, PathBuf, String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let seed = tmp.path().join("seed");
+        let clone = tmp.path().join("clone");
+        run_git(
+            tmp.path(),
+            &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()],
+        );
+        run_git(
+            tmp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), seed.to_str().unwrap()],
+        );
+        run_git(&seed, &["config", "user.email", "test@example.com"]);
+        run_git(&seed, &["config", "user.name", "Test"]);
+        std::fs::write(seed.join("README.md"), "hi\n").unwrap();
+        run_git(&seed, &["add", "README.md"]);
+        run_git(&seed, &["commit", "-q", "-m", "init"]);
+        run_git(&seed, &["push", "-q", "origin", "main"]);
+        // Base at its first tip (F0), pushed to origin.
+        run_git(&seed, &["checkout", "-q", "-b", base]);
+        std::fs::write(seed.join("base.txt"), "f0\n").unwrap();
+        run_git(&seed, &["add", "base.txt"]);
+        run_git(&seed, &["commit", "-q", "-m", "base F0"]);
+        run_git(&seed, &["push", "-q", "origin", base]);
+        // Hub clone: `origin/<base>` is now cached at F0.
+        run_git(
+            tmp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        let stale = rev(&clone, &format!("origin/{base}"));
+        if checkout_local {
+            run_git(&clone, &["checkout", "-q", base]);
+        }
+        // Origin advances to F1; the hub's remote-tracking ref stays at F0
+        // because nothing re-fetched.
+        std::fs::write(seed.join("base.txt"), "f1\n").unwrap();
+        run_git(&seed, &["add", "base.txt"]);
+        run_git(&seed, &["commit", "-q", "-m", "base F1"]);
+        run_git(&seed, &["push", "-q", "origin", base]);
+        let origin_tip = rev(&seed, base);
+        // Break the remote: origin url now points at a path that doesn't
+        // exist, so any subsequent fetch fails while the stale
+        // `origin/<base>` survives. `remote.origin.url` still resolves, so the
+        // has-origin check stays true — exactly the danger case.
+        let bogus = tmp.path().join("gone.git");
+        run_git(&clone, &["remote", "set-url", "origin", bogus.to_str().unwrap()]);
+        (tmp, clone, stale, origin_tip)
     }
 
     fn rev(repo: &std::path::Path, refname: &str) -> String {
@@ -814,6 +1011,203 @@ mod tests {
         assert!(msg.contains("update/does-not-exist"), "msg: {msg}");
         assert!(msg.contains("origin"), "msg: {msg}");
         assert!(!branch_exists(&repo, "jlong/ghost-task"));
+    }
+
+    #[test]
+    fn cut_branch_freshens_stale_local_base_from_origin() {
+        // Regression for dispatch-subtask-stale-local-feature-ref: sibling A
+        // squash-merged into `feature/x` on origin, then dependent subtask B is
+        // dispatched immediately. The hub's LOCAL `feature/x` head is pinned
+        // stale by the umbrella's review worktree (at the pre-A tip). Cutting
+        // B's branch must land on origin/feature/x (containing A's merge), not
+        // the stale local ref — otherwise merging B could revert A.
+        let (_tmp, repo, origin_tip, stale_local) =
+            fixture_clone_with_stale_local_base("feature/x");
+        let p = project_at(&repo, None);
+        assert!(
+            branch_exists(&repo, "feature/x"),
+            "precondition: base is a (stale) local head, as a review worktree pins it"
+        );
+        assert_ne!(
+            origin_tip, stale_local,
+            "precondition: origin must be ahead of the pinned local ref"
+        );
+
+        cut_branch_on_hub(&p, "jlong/b", "feature/x").unwrap();
+
+        assert!(branch_exists(&repo, "jlong/b"));
+        assert_eq!(
+            rev(&repo, "jlong/b"),
+            origin_tip,
+            "subtask branch must be cut from origin/feature/x's tip (with sibling A's merge)"
+        );
+        assert_ne!(
+            rev(&repo, "jlong/b"),
+            stale_local,
+            "subtask branch must NOT be cut from the stale local feature/x ref"
+        );
+        // The just-merged sibling's file must be present in the cut base.
+        assert!(
+            run_in_dir(
+                &Host::Local,
+                repo.to_str().unwrap(),
+                &["git", "cat-file", "-e", "jlong/b:sibling.txt"],
+            )
+            .unwrap()
+            .status
+            .success(),
+            "the merged sibling's work must be reachable from the subtask base"
+        );
+    }
+
+    #[test]
+    fn cut_branch_keeps_local_base_when_ahead_of_origin() {
+        // The dependency-stacking case must not regress: an in-progress
+        // sibling's branch that has un-pushed local commits (local ahead of
+        // origin) is authoritative. Cutting the child from origin would drop
+        // the sibling's latest work, so the local head must win.
+        let (_tmp, repo, _origin_tip, _stale) =
+            fixture_clone_with_stale_local_base("feature/x");
+        let p = project_at(&repo, None);
+        // Advance the LOCAL feature/x past origin with an un-pushed commit.
+        run_git(&repo, &["checkout", "-q", "feature/x"]);
+        std::fs::write(repo.join("local.txt"), "unpushed\n").unwrap();
+        run_git(&repo, &["add", "local.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "unpushed local work"]);
+        let local_ahead = rev(&repo, "feature/x");
+
+        cut_branch_on_hub(&p, "jlong/c", "feature/x").unwrap();
+
+        assert!(branch_exists(&repo, "jlong/c"));
+        assert_eq!(
+            rev(&repo, "jlong/c"),
+            local_ahead,
+            "when the local base is ahead of origin, the cut must keep the local head"
+        );
+    }
+
+    #[test]
+    fn cut_branch_refuses_stale_origin_when_fetch_fails() {
+        // Zen-review regression: origin advanced past the hub's last fetch,
+        // then origin became unreachable. The stale `origin/<base>` ref must
+        // NOT be used as the cut base — with no local head to fall back to, the
+        // cut must refuse rather than silently branch from a possibly-stale tip
+        // (which could revert a sibling merged on origin after the last fetch).
+        let (_tmp, repo, stale, origin_tip) =
+            fixture_clone_stale_origin_broken_remote("feature/x", false);
+        let p = project_at(&repo, None);
+        assert_ne!(
+            stale, origin_tip,
+            "precondition: origin advanced past the hub's cached remote-tracking ref"
+        );
+        assert!(
+            !branch_exists(&repo, "feature/x"),
+            "precondition: base is not a local head (only a stale origin ref)"
+        );
+        // Sanity-check the fixture: a fetch really does fail here.
+        assert!(
+            !run_in_dir(
+                &Host::Local,
+                repo.to_str().unwrap(),
+                &["git", "fetch", "origin", "feature/x"],
+            )
+            .unwrap()
+            .status
+            .success(),
+            "precondition: the broken remote must make `git fetch` fail"
+        );
+
+        let err = cut_branch_on_hub(&p, "jlong/b", "feature/x").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("feature/x"), "msg: {msg}");
+        assert!(
+            msg.to_lowercase().contains("stale") || msg.to_lowercase().contains("fetch"),
+            "error must explain the fetch-failure/staleness reason: {msg}"
+        );
+        assert!(
+            !branch_exists(&repo, "jlong/b"),
+            "must not cut a branch from a stale, unverifiable remote-tracking tip"
+        );
+    }
+
+    #[test]
+    fn cut_branch_refuses_stale_origin_even_with_local_head_when_fetch_fails() {
+        // Zen re-review regression: fetch fails, a cached `origin/<base>`
+        // exists (F0), AND the base is a local head — but that local head is
+        // *also* stale (F0), a review-worktree pin sitting behind the sibling
+        // merge origin advanced to (F1). Falling back to the local head would
+        // still omit the merged sibling and reintroduce the sibling-revert. A
+        // cached `origin/<base>` proves the base is shared, so neither the
+        // stale remote tip nor the stale local head is trustworthy: the cut
+        // must refuse, not fall back.
+        let (_tmp, repo, stale, origin_tip) =
+            fixture_clone_stale_origin_broken_remote("feature/x", true);
+        let p = project_at(&repo, None);
+        assert!(
+            branch_exists(&repo, "feature/x"),
+            "precondition: base is a local head"
+        );
+        assert_eq!(
+            rev(&repo, "feature/x"),
+            stale,
+            "precondition: the local head sits at the stale pre-advance tip (F0)"
+        );
+        assert_ne!(
+            stale, origin_tip,
+            "precondition: origin advanced past the hub's cached remote-tracking ref"
+        );
+
+        let err = cut_branch_on_hub(&p, "jlong/b", "feature/x").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("feature/x"), "msg: {msg}");
+        assert!(
+            msg.to_lowercase().contains("stale") || msg.to_lowercase().contains("fetch"),
+            "error must explain the fetch-failure/staleness reason: {msg}"
+        );
+        assert!(
+            !branch_exists(&repo, "jlong/b"),
+            "must not cut from a stale local pin when the base is shared on origin"
+        );
+    }
+
+    #[test]
+    fn cut_branch_falls_back_to_local_when_base_is_local_only() {
+        // The genuinely local-only dependency-stack case must still work: the
+        // base is a local head that was NEVER pushed, so there is no cached
+        // `origin/<base>` ref at all. The `git fetch origin <base>` fails
+        // (the branch doesn't exist upstream), but since nothing proves the
+        // base is shared, the local head is authoritative — cut from it rather
+        // than refusing.
+        let (_tmp, repo) = fixture_clone_with_origin_base("update/homepage");
+        let p = project_at(&repo, None);
+        // Create a purely local base branch off main with its own commit,
+        // never pushed to origin, so `origin/local-stack` does not exist.
+        run_git(&repo, &["checkout", "-q", "-b", "local-stack", "main"]);
+        std::fs::write(repo.join("stack.txt"), "unpushed sibling\n").unwrap();
+        run_git(&repo, &["add", "stack.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "local-only sibling work"]);
+        run_git(&repo, &["checkout", "-q", "main"]);
+        let local = rev(&repo, "local-stack");
+        assert!(
+            !run_in_dir(
+                &Host::Local,
+                repo.to_str().unwrap(),
+                &["git", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/local-stack"],
+            )
+            .unwrap()
+            .status
+            .success(),
+            "precondition: base has no cached origin ref (never pushed)"
+        );
+
+        cut_branch_on_hub(&p, "jlong/child", "local-stack").unwrap();
+
+        assert!(branch_exists(&repo, "jlong/child"));
+        assert_eq!(
+            rev(&repo, "jlong/child"),
+            local,
+            "a local-only base (no cached origin ref) must cut from the local head"
+        );
     }
 
     // ----- ensure_branch_for_in_progress -------------------------------
