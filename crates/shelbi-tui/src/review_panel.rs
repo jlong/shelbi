@@ -823,7 +823,10 @@ fn review_context(project_name: &str, task_id: &str) -> (String, bool) {
     let Ok(project) = shelbi_state::load_project(project_name) else {
         return (String::new(), false);
     };
-    let Ok(tf) = shelbi_state::load_task(project_name, task_id) else {
+    let Ok(store) = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker) else {
+        return (String::new(), false);
+    };
+    let Ok(Some(tf)) = store.get(task_id) else {
         return (String::new(), false);
     };
     let worktree = tf
@@ -1055,7 +1058,8 @@ where
 /// `$SLOT` substituted), or `None` when none is configured.
 fn review_url(project_name: &str, task_id: &str) -> Option<String> {
     let project = shelbi_state::load_project(project_name).ok()?;
-    let tf = shelbi_state::load_task(project_name, task_id).ok()?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker).ok()?;
+    let tf = store.get(task_id).ok().flatten()?;
     let workflow = shelbi_state::load_task_workflow(project_name, &project, &tf.task).ok()?;
     let template = workflow.review_url_for_status(tf.task.column.as_str())?;
     let port = tf

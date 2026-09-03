@@ -1029,7 +1029,7 @@ fn ci_should_emit(prev: Option<&(String, String)>, head_sha: &str, conclusion: &
 /// the whole sweep.
 fn in_review_tasks_with_branch(project: &Project) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
-    for tf in shelbi_state::list_tasks(&project.name)? {
+    for tf in shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?.list()? {
         let workflow = load_task_workflow(&project.name, &tf.task);
         let workflow_ref = workflow.as_ref();
         let status = workflow_ref.and_then(|w| resolve_task_status(&tf.task, w));
@@ -1210,7 +1210,7 @@ fn auto_reconcile_target(workflow: &Workflow, from: &str) -> Option<(String, Col
 /// is skipped rather than failing the whole sweep.
 fn github_merge_reconcile_candidates(project: &Project) -> Result<Vec<GithubReconcileCandidate>> {
     let mut out = Vec::new();
-    for tf in shelbi_state::list_tasks(&project.name)? {
+    for tf in shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?.list()? {
         // Fall back to the default workflow when the task's workflow can't be
         // loaded — the same resilience [`crate::review_ui::approve_review_task`]
         // and the ready-handoff path use, so a transient workflow-YAML issue
@@ -1268,8 +1268,9 @@ fn apply_github_merge_reconcile(
     cand: &GithubReconcileCandidate,
     merged: &MergedPr,
 ) -> Result<bool> {
-    let Some((from, to, wf)) =
-        shelbi_state::move_task(&project.name, &cand.task.id, cand.to_column.clone())?
+    let store = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?;
+    let Some(shelbi_state::StatusMove { from, to, workflow: wf }) =
+        store.move_status(&cand.task.id, &cand.to_column, "github-merge-reconcile")?
     else {
         return Ok(false);
     };
@@ -6587,7 +6588,7 @@ fn resolve_probe_base(
     let all_tasks = if task.depends_on.is_empty() {
         Vec::new()
     } else {
-        shelbi_state::list_tasks(&project.name)?
+        shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?.list()?
     };
     crate::lifecycle::resolve_base_branch(project, workflow, task, &all_tasks)
 }
@@ -11854,7 +11855,7 @@ printf 'target:%s\\n' \"$CARGO_TARGET_DIR\"";
 /// I/O: loads every task file in the project plus the events log. Returns an
 /// empty list when the backlog is empty or every backlog task is blocked.
 pub fn mechanically_eligible(project: &Project) -> Result<Vec<String>> {
-    let tasks = shelbi_state::list_tasks(&project.name)?;
+    let tasks = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?.list()?;
     let demoted = read_demoted_task_ids()?;
     Ok(mechanically_eligible_from(&tasks, &demoted))
 }
@@ -12388,7 +12389,7 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
     //    workflow. Filter is on the resolved workflow status's category
     //    rather than `Column::review()` so custom workflows with renamed
     //    handoff statuses still get probed.
-    for tf in shelbi_state::list_tasks(&project.name)? {
+    for tf in shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?.list()? {
         let workflow = load_task_workflow(&project.name, &tf.task);
         let workflow_ref = workflow.as_ref();
         let status = workflow_ref.and_then(|w| resolve_task_status(&tf.task, w));

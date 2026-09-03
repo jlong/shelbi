@@ -606,8 +606,8 @@ impl ActivityApp {
             .map(|m| m.mtime != mtime)
             .unwrap_or(true);
         if stale {
-            match shelbi_state::load_task(&self.project_name, id) {
-                Ok(tf) => {
+            match shelbi_state::issue_store_for(&self.project_name).and_then(|s| s.get(id)) {
+                Ok(Some(tf)) => {
                     self.task_cache.insert(
                         id.to_string(),
                         TaskMeta {
@@ -618,7 +618,7 @@ impl ActivityApp {
                         },
                     );
                 }
-                Err(_) => {
+                Ok(None) | Err(_) => {
                     self.task_cache.remove(id);
                 }
             }

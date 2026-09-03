@@ -106,6 +106,11 @@ type GhRunner = Arc<dyn Fn(&[&str]) -> Result<String> + Send + Sync>;
 /// selector and the `gh` runner closure, and resolves everything else per call.
 #[derive(Clone)]
 pub struct GitHubStore {
+    /// The project *name* (registry alias / on-disk dir). GitHub is the source
+    /// of truth for board state, but the review-slot parked markers are local
+    /// daemon state under `<project_dir>/parked-review/`, so park/clear still
+    /// need the project name to reach them.
+    project: String,
     repo: String,
     gh: GhRunner,
 }
@@ -129,8 +134,9 @@ impl GitHubStore {
     pub fn new(project: impl Into<String>, repo: impl Into<String>) -> Self {
         let project = project.into();
         let repo = repo.into();
-        let gh: GhRunner = Arc::new(move |args: &[&str]| run_gh(&project, args));
-        Self { repo, gh }
+        let project_for_gh = project.clone();
+        let gh: GhRunner = Arc::new(move |args: &[&str]| run_gh(&project_for_gh, args));
+        Self { project, repo, gh }
     }
 
     /// Construct a store over an arbitrary `gh` runner. The production seam for
@@ -141,6 +147,7 @@ impl GitHubStore {
         runner: impl Fn(&[&str]) -> Result<String> + Send + Sync + 'static,
     ) -> Self {
         Self {
+            project: "test-project".to_string(),
             repo: repo.into(),
             gh: Arc::new(runner),
         }
@@ -348,6 +355,9 @@ impl IssueStore for GitHubStore {
         if fields.branch.is_none()
             && fields.depends_on.is_none()
             && fields.prefers_machine.is_none()
+            && fields.title.is_none()
+            && fields.workflow.is_none()
+            && fields.body.is_none()
         {
             return Ok(());
         }
@@ -355,34 +365,57 @@ impl IssueStore for GitHubStore {
             return Err(Error::Other(format!("issue `{id}` not found in {}", self.repo)));
         };
         let body_raw = gh.body.clone().unwrap_or_default();
-        let (prose, mut meta) = split_shelbi_meta(&body_raw);
-        let mut changed = false;
+        let (mut prose, mut meta) = split_shelbi_meta(&body_raw);
+        // The GitHub issue title and the shelbi body prose are stored natively;
+        // branch / depends_on / prefers_machine / workflow live in the meta
+        // block folded into the issue body. Accumulate a single PATCH.
+        let mut params: Vec<(&str, String)> = Vec::new();
+        let mut body_changed = false;
         if let Some(branch) = fields.branch {
             if meta.branch != branch {
                 meta.branch = branch;
-                changed = true;
+                body_changed = true;
             }
         }
         if let Some(depends_on) = fields.depends_on {
             if meta.depends_on != depends_on {
                 meta.depends_on = depends_on;
-                changed = true;
+                body_changed = true;
             }
         }
         if let Some(prefers_machine) = fields.prefers_machine {
             if meta.prefers_machine != prefers_machine {
                 meta.prefers_machine = prefers_machine;
-                changed = true;
+                body_changed = true;
             }
         }
-        if !changed {
+        if let Some(workflow) = fields.workflow {
+            if meta.workflow != workflow {
+                meta.workflow = workflow;
+                body_changed = true;
+            }
+        }
+        if let Some(new_prose) = fields.body {
+            if prose != new_prose {
+                prose = new_prose;
+                body_changed = true;
+            }
+        }
+        if let Some(title) = fields.title {
+            if gh.title != title {
+                params.push(("title", title));
+            }
+        }
+        if body_changed {
+            params.push(("body", build_body(&prose, &meta)));
+        }
+        if params.is_empty() {
             return Ok(());
         }
-        let body = build_body(&prose, &meta);
         self.api_send(
             "PATCH",
             &format!("repos/{}/issues/{}", self.repo, gh.number),
-            &[("body", body)],
+            &params,
         )?;
         Ok(())
     }
@@ -393,6 +426,57 @@ impl IssueStore for GitHubStore {
         // GitHub to clear (it lives user-local), so the label swap is the whole
         // operation.
         self.move_status(id, &Column::canceled(), reason)
+    }
+
+    fn move_status_and_unassign(
+        &self,
+        id: &str,
+        to: &Column,
+        reason: &str,
+    ) -> Result<Option<StatusMove>> {
+        // No stored workspace assignment on GitHub (it is user-local), so the
+        // "unassign" half is a no-op and this reduces to the status move.
+        self.move_status(id, to, reason)
+    }
+
+    fn delete(&self, id: &str) -> Result<()> {
+        // GitHub's REST API cannot hard-delete an issue, so `rm` maps to the
+        // nearest durable effect: close it as `not_planned` (the same terminal
+        // state a cancel reaches). Idempotent — a missing/closed issue is a
+        // no-op. GraphQL `deleteIssue` exists but needs elevated repo scope, so
+        // the REST close is the portable choice for the experimental backend.
+        let Some(gh) = self.get_raw(id)? else {
+            return Ok(());
+        };
+        if gh.state != "closed" {
+            self.set_state(gh.number, "closed", Some("not_planned"))?;
+        }
+        Ok(())
+    }
+
+    fn renumber(&self, status: &Column) -> Result<()> {
+        // Rewrite the column's stored priorities to contiguous 0..N — the same
+        // repair the filesystem backend does, expressed as the client-side
+        // reorder GitHub priorities are maintained by.
+        let column = self.list_in_status(status)?;
+        for (idx, tf) in column.iter().enumerate() {
+            if tf.task.priority != idx as u32 {
+                self.rewrite_priority(&tf.task.id, idx as u32)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn park_review(&self, id: &str) -> Result<Option<String>> {
+        // Parked markers are local daemon state for the review-slot auto-loader,
+        // not board state — there is no GitHub-stored assignment to clear, so
+        // this only sets the local marker and reports no prior owner.
+        crate::set_task_parked(&self.project, id)?;
+        Ok(None)
+    }
+
+    fn clear_parked(&self, id: &str) -> Result<()> {
+        crate::clear_task_parked(&self.project, id)
     }
 
     fn poll_changes(&self, since: &Cursor) -> Result<(Vec<IssueChange>, Cursor)> {
@@ -1504,6 +1588,41 @@ mod tests {
         assert!(patch.contains("branch: jlong/t"));
         // Human prose is preserved around the block.
         assert!(patch.contains("Prose stays."));
+    }
+
+    #[test]
+    fn set_fields_patches_title_and_body_prose() {
+        let issue = r#"{"number":7,"title":"Old","body":"Old prose.\n\n<!-- shelbi:begin -->\n```yaml\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", "{}");
+        store
+            .set_fields(
+                "t",
+                IssueFields {
+                    title: Some("New title".into()),
+                    body: Some("Fresh prose.".into()),
+                    workflow: Some(Some("app".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        let patch = call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/7"])
+            .expect("title/body PATCH");
+        assert!(patch.contains("title=New title"));
+        assert!(patch.contains("Fresh prose."));
+        assert!(patch.contains("workflow: app"));
+    }
+
+    #[test]
+    fn delete_closes_the_issue_as_not_planned() {
+        let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", "{}");
+        store.delete("t").unwrap();
+        assert!(call_containing(
+            &calls.lock().unwrap(),
+            &["-X PATCH", "state=closed", "state_reason=not_planned"]
+        )
+        .is_some());
     }
 
     #[test]

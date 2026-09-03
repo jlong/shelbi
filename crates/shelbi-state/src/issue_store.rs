@@ -70,6 +70,19 @@ pub fn resolve_issue_store(
     }
 }
 
+/// Resolve the live [`IssueStore`] for `project` from its on-disk YAML — the
+/// name-only convenience over [`resolve_issue_store`] for the many call-sites
+/// (CLI subcommands, daemon loops) that hold a project name but not a loaded
+/// [`shelbi_core::Project`]. Loading the project config is the same read those
+/// paths already do elsewhere per operation.
+///
+/// Call-sites that already hold a `&Project` should call [`resolve_issue_store`]
+/// with `&project.issue_tracker` directly instead, to avoid re-reading the YAML.
+pub fn issue_store_for(project: &str) -> Result<Box<dyn IssueStore>> {
+    let cfg = crate::load_project(project)?.issue_tracker;
+    resolve_issue_store(project, &cfg)
+}
+
 /// Creation spec handed to [`IssueStore::add`]. Carries the durable issue
 /// definition without the fields a store assigns itself (priority within a
 /// column, timestamps). For the filesystem backend the `id` is client-chosen;
@@ -129,6 +142,17 @@ pub struct IssueFields {
     pub depends_on: Option<Vec<String>>,
     pub prefers_machine: Option<Option<String>>,
     pub assigned_to: Option<Option<String>>,
+    /// The issue's display title. `Some` replaces it (an empty string is a
+    /// legal, if unusual, title — the store does not police that).
+    pub title: Option<String>,
+    /// The issue's workflow name. Outer `Some` touches it, inner `None` clears
+    /// it back to the project default (the `edit --workflow` surface).
+    pub workflow: Option<Option<String>>,
+    /// The issue's markdown body (the prose under the frontmatter). `Some`
+    /// replaces it wholesale — this is the one non-frontmatter field
+    /// [`IssueStore::set_fields`] touches, so `shelbi issue edit` can rewrite
+    /// the body through the same seam as its frontmatter edits.
+    pub body: Option<String>,
 }
 
 impl IssueFields {
@@ -139,6 +163,9 @@ impl IssueFields {
             && self.depends_on.is_none()
             && self.prefers_machine.is_none()
             && self.assigned_to.is_none()
+            && self.title.is_none()
+            && self.workflow.is_none()
+            && self.body.is_none()
     }
 }
 
@@ -264,6 +291,40 @@ pub trait IssueStore {
     /// Cancel an issue: move it to the terminal `canceled` status and drop any
     /// workspace assignment. Returns the move like [`IssueStore::move_status`].
     fn cancel(&self, id: &str, reason: &str) -> Result<Option<StatusMove>>;
+
+    /// Move an issue to status `to` **and** clear its workspace assignment in a
+    /// single write. The generalization of [`IssueStore::cancel`] (which is this
+    /// with `to = canceled`): an agent-driven transition can land the card in an
+    /// *active* status, where a stale `assigned_to` would make the closed
+    /// workspace's supervisor relaunch it. Returns `Some(StatusMove)` when the
+    /// status changed (the owner is still cleared when it did not).
+    fn move_status_and_unassign(
+        &self,
+        id: &str,
+        to: &Column,
+        reason: &str,
+    ) -> Result<Option<StatusMove>>;
+
+    /// Delete an issue outright. Idempotent — deleting a missing issue is `Ok`.
+    /// Callers that keep a column contiguous follow this with
+    /// [`IssueStore::renumber`].
+    fn delete(&self, id: &str) -> Result<()>;
+
+    /// Renumber a status column so its priorities are the contiguous
+    /// `0..len` again — the repair a delete or an out-of-band edit leaves for.
+    fn renumber(&self, status: &Column) -> Result<()>;
+
+    /// Unload a review-status issue from its slot at the operator's request:
+    /// clear `assigned_to` and set a durable "parked" marker so the review
+    /// auto-loader and the stranded-slot resume both leave it alone until it is
+    /// explicitly loaded again. Returns the workspace it was unassigned from, if
+    /// any. See [`crate::park_review_task`].
+    fn park_review(&self, id: &str) -> Result<Option<String>>;
+
+    /// Clear an issue's parked marker if present (idempotent). Called on any
+    /// fresh dispatch/assignment so a re-served or reworked issue stops being
+    /// skipped by the auto-loader. See [`crate::clear_task_parked`].
+    fn clear_parked(&self, id: &str) -> Result<()>;
 
     /// Everything that changed since `since`, plus the cursor to pass next time.
     fn poll_changes(&self, since: &Cursor) -> Result<(Vec<IssueChange>, Cursor)>;
@@ -427,6 +488,26 @@ impl IssueStore for FileSystemStore {
                 changed = true;
             }
         }
+        if let Some(title) = fields.title {
+            if tf.task.title != title {
+                tf.task.title = title;
+                changed = true;
+            }
+        }
+        if let Some(workflow) = fields.workflow {
+            if tf.task.workflow != workflow {
+                tf.task.workflow = workflow;
+                changed = true;
+            }
+        }
+        // The body is not frontmatter, so it is compared and swapped on `tf`
+        // directly rather than on `tf.task`.
+        if let Some(body) = fields.body {
+            if tf.body != body {
+                tf.body = body;
+                changed = true;
+            }
+        }
         if !changed {
             return Ok(());
         }
@@ -434,11 +515,36 @@ impl IssueStore for FileSystemStore {
         crate::save_task_unlocked(&self.project, &tf.task, &tf.body)
     }
 
-    fn cancel(&self, id: &str, _reason: &str) -> Result<Option<StatusMove>> {
-        // Move to the terminal `canceled` status and drop any owner, so the
-        // pane supervisor doesn't relaunch a canceled card on its old
-        // workspace (same reasoning as the release-to-todo path).
-        Ok(crate::move_task_and_unassign(&self.project, id, Column::canceled())?.map(Into::into))
+    fn cancel(&self, id: &str, reason: &str) -> Result<Option<StatusMove>> {
+        // Cancel is move-and-unassign to the terminal `canceled` status: drop
+        // any owner so the pane supervisor doesn't relaunch a canceled card on
+        // its old workspace (same reasoning as the release-to-todo path).
+        self.move_status_and_unassign(id, &Column::canceled(), reason)
+    }
+
+    fn move_status_and_unassign(
+        &self,
+        id: &str,
+        to: &Column,
+        _reason: &str,
+    ) -> Result<Option<StatusMove>> {
+        Ok(crate::move_task_and_unassign(&self.project, id, to.clone())?.map(Into::into))
+    }
+
+    fn delete(&self, id: &str) -> Result<()> {
+        crate::delete_task(&self.project, id)
+    }
+
+    fn renumber(&self, status: &Column) -> Result<()> {
+        crate::renumber_column(&self.project, status.clone())
+    }
+
+    fn park_review(&self, id: &str) -> Result<Option<String>> {
+        crate::park_review_task(&self.project, id)
+    }
+
+    fn clear_parked(&self, id: &str) -> Result<()> {
+        crate::clear_task_parked(&self.project, id)
     }
 
     fn poll_changes(&self, since: &Cursor) -> Result<(Vec<IssueChange>, Cursor)> {
@@ -754,7 +860,7 @@ mod tests {
                     branch: Some(Some("jlong/a".into())),
                     assigned_to: Some(Some("alpha".into())),
                     depends_on: Some(vec!["b".into()]),
-                    prefers_machine: None,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -819,6 +925,134 @@ mod tests {
         let after = store.get("a").unwrap().unwrap().task;
         assert_eq!(after.column, Column::canceled());
         assert_eq!(after.assigned_to, None);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn set_fields_edits_title_workflow_and_body() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let store = FileSystemStore::new("p");
+
+        store.add(spec("a", Column::todo())).unwrap();
+        store
+            .set_fields(
+                "a",
+                IssueFields {
+                    title: Some("New title".into()),
+                    workflow: Some(Some("app".into())),
+                    body: Some("# Rewritten\n\ncontent\n".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let after = store.get("a").unwrap().unwrap();
+        assert_eq!(after.task.title, "New title");
+        assert_eq!(after.task.workflow.as_deref(), Some("app"));
+        assert_eq!(after.body, "# Rewritten\n\ncontent\n");
+
+        // Clearing the workflow back to the project default.
+        store
+            .set_fields(
+                "a",
+                IssueFields {
+                    workflow: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.get("a").unwrap().unwrap().task.workflow, None);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn delete_then_renumber_keeps_column_contiguous() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let store = FileSystemStore::new("p");
+
+        store.add(spec("a", Column::todo())).unwrap();
+        store.add(spec("b", Column::todo())).unwrap();
+        store.add(spec("c", Column::todo())).unwrap();
+
+        store.delete("b").unwrap();
+        assert!(store.get("b").unwrap().is_none());
+        store.renumber(&Column::todo()).unwrap();
+
+        let col = store.list_in_status(&Column::todo()).unwrap();
+        let ids: Vec<_> = col.iter().map(|tf| tf.task.id.clone()).collect();
+        let prios: Vec<_> = col.iter().map(|tf| tf.task.priority).collect();
+        assert_eq!(ids, vec!["a", "c"]);
+        assert_eq!(prios, vec![0, 1]);
+
+        // Delete is idempotent.
+        store.delete("b").unwrap();
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn move_status_and_unassign_clears_owner() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let store = FileSystemStore::new("p");
+
+        store.add(spec("a", Column::review())).unwrap();
+        store
+            .set_fields(
+                "a",
+                IssueFields {
+                    assigned_to: Some(Some("review-1".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let mv = store
+            .move_status_and_unassign("a", &Column::todo(), "workspace:stop")
+            .unwrap()
+            .expect("moved");
+        assert_eq!(mv.to, Column::todo());
+        let after = store.get("a").unwrap().unwrap().task;
+        assert_eq!(after.column, Column::todo());
+        assert_eq!(after.assigned_to, None);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn park_review_sets_marker_and_clear_parked_removes_it() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let store = FileSystemStore::new("p");
+
+        store.add(spec("a", Column::review())).unwrap();
+        store
+            .set_fields(
+                "a",
+                IssueFields {
+                    assigned_to: Some(Some("review-1".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let was = store.park_review("a").unwrap();
+        assert_eq!(was.as_deref(), Some("review-1"));
+        assert!(crate::is_task_parked("p", "a").unwrap());
+        // Parking clears the assignment.
+        assert_eq!(store.get("a").unwrap().unwrap().task.assigned_to, None);
+
+        store.clear_parked("a").unwrap();
+        assert!(!crate::is_task_parked("p", "a").unwrap());
+        // Clearing again is idempotent.
+        store.clear_parked("a").unwrap();
 
         std::env::remove_var("SHELBI_HOME");
     }

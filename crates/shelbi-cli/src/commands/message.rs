@@ -168,7 +168,12 @@ fn run_send(
     // ack timer — a stale daemon mishandles both.
     super::hub_version::ensure_daemon_matches_for_mutation()?;
     let project = shelbi_state::load_project(&project_name).map_err(|e| anyhow!(e))?;
-    let tf = shelbi_state::load_task(&project_name, &id).map_err(|e| anyhow!(e))?;
+    let store = shelbi_state::resolve_issue_store(&project_name, &project.issue_tracker)
+        .map_err(|e| anyhow!(e))?;
+    let tf = store
+        .get(&id)
+        .map_err(|e| anyhow!(e))?
+        .ok_or_else(|| anyhow!("issue `{id}` not found"))?;
 
     // Resolve the assigned workspace → its worktree + host. The worktree is a
     // per-workspace, per-machine path; without an assignment there is no

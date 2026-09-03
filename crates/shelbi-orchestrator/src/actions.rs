@@ -341,15 +341,12 @@ fn resolve_pr_target(
     task: &Issue,
     target_override: Option<&str>,
 ) -> Result<String> {
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
     Ok(resolve_pr_target_from(
         project.base_branch(),
         task,
         target_override,
-        |parent_id| {
-            shelbi_state::load_task(project_name, parent_id)
-                .ok()
-                .map(|tf| tf.task)
-        },
+        |parent_id| store.get(parent_id).ok().flatten().map(|tf| tf.task),
     ))
 }
 
@@ -516,7 +513,7 @@ pub fn merge(
         }
     };
 
-    let restacks = restack_children(project, project_name, task, &branch, &merged_target);
+    let restacks = restack_children(project, task, &branch, &merged_target);
 
     Ok(MergeResult {
         merge: outcome,
@@ -569,13 +566,14 @@ fn resolve_task_base_branch(project: &Project, project_name: &str, task: &Issue)
 /// shouldn't roll back the merge.
 fn restack_children(
     project: &Project,
-    project_name: &str,
     parent_task: &Issue,
     parent_branch: &str,
     onto: &str,
 ) -> Vec<RestackOutcome> {
     let mut outcomes = Vec::new();
-    let tasks = match shelbi_state::list_tasks(project_name) {
+    let tasks = match shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+        .and_then(|s| s.list())
+    {
         Ok(t) => t,
         Err(e) => {
             // We can't enumerate tasks — surface a single synthetic skip
@@ -1589,7 +1587,9 @@ fn deferred_multi_parent_child_needing_branch(
     parent_task: &Issue,
     parent_branch: &str,
 ) -> Option<String> {
-    let tasks = shelbi_state::list_tasks(&project.name).ok()?;
+    let tasks = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+        .and_then(|s| s.list())
+        .ok()?;
     tasks
         .iter()
         .map(|tf| &tf.task)
@@ -3750,7 +3750,7 @@ mod tests {
         unrelated.branch = Some("solo-branch".into());
         write_task_file("fixture", &unrelated);
 
-        let outcomes = restack_children(&project, "fixture", &parent, "parent", "main");
+        let outcomes = restack_children(&project, &parent, "parent", "main");
 
         // Exactly one outcome — for `ch`.
         assert_eq!(outcomes.len(), 1, "{outcomes:?}");
@@ -3807,7 +3807,7 @@ mod tests {
         child.depends_on = vec!["par".into(), "par2".into()];
         write_task_file("fixture", &child);
 
-        let outcomes = restack_children(&project, "fixture", &parent, "parent", "main");
+        let outcomes = restack_children(&project, &parent, "parent", "main");
         assert_eq!(outcomes.len(), 1, "{outcomes:?}");
         match &outcomes[0] {
             RestackOutcome::Skipped { task_id, reason } => {
@@ -3862,7 +3862,7 @@ mod tests {
         child.depends_on = vec!["par".into(), "par2".into()];
         write_task_file("fixture", &child);
 
-        let outcomes = restack_children(&project, "fixture", &final_parent, "parent2", "main");
+        let outcomes = restack_children(&project, &final_parent, "parent2", "main");
         assert_eq!(outcomes.len(), 1, "{outcomes:?}");
         match &outcomes[0] {
             RestackOutcome::Restacked {
@@ -3916,7 +3916,7 @@ mod tests {
         parent.branch = Some("parent".into());
         write_task_file("fixture", &parent);
 
-        let outcomes = restack_children(&project, "fixture", &parent, "parent", "main");
+        let outcomes = restack_children(&project, &parent, "parent", "main");
         assert!(outcomes.is_empty(), "{outcomes:?}");
 
         std::env::remove_var("SHELBI_HOME");
@@ -4346,7 +4346,7 @@ exit 0
         child.depends_on = vec!["par".into()];
         write_task_file("fixture", &child);
 
-        let outcomes = restack_children(&project, "fixture", &parent, "parent", "main");
+        let outcomes = restack_children(&project, &parent, "parent", "main");
         assert_eq!(outcomes.len(), 1, "{outcomes:?}");
         match &outcomes[0] {
             RestackOutcome::Skipped { task_id, reason } => {

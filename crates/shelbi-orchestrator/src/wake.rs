@@ -2674,7 +2674,10 @@ fn scan_batch(project: &Project, from: u64) -> Result<Option<QueuedBatch>> {
         return Ok(None);
     }
 
-    let board_in_flight = shelbi_state::list_tasks(&project.name)?.iter().any(|task| {
+    let board_in_flight = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?
+        .list()?
+        .iter()
+        .any(|task| {
         matches!(
             task.task.column.category(),
             StatusCategory::Ready | StatusCategory::Active | StatusCategory::Handoff

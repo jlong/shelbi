@@ -105,7 +105,11 @@ pub fn run(
     let launch_override = std::env::var(ENV_TASK_ID)
         .ok()
         .filter(|s| !s.is_empty())
-        .and_then(|tid| shelbi_state::load_task(&project.name, &tid).ok())
+        .and_then(|tid| {
+            let store =
+                shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker).ok()?;
+            store.get(&tid).ok().flatten()
+        })
         .map(|tf| tf.task.launch)
         .unwrap_or_else(|| {
             assigned_task_for_workspace(&project.name, &workspace.name).and_then(|t| t.launch)
@@ -524,7 +528,7 @@ fn signal_name(sig: i32) -> String {
 /// permissions glitch, transient FS) because a missing task just makes the
 /// hooks no-op and skips the worktree recovery — neither breaks the pane.
 pub(super) fn assigned_task_for_workspace(project: &str, workspace: &str) -> Option<Issue> {
-    let tasks = shelbi_state::list_tasks(project).ok()?;
+    let tasks = shelbi_state::issue_store_for(project).and_then(|s| s.list()).ok()?;
     tasks.into_iter().find_map(|tf| {
         let anchors = matches!(
             tf.task.column.category(),
@@ -1035,6 +1039,29 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
+        // Register the `demo` project these tests seed against, so board reads
+        // routed through the store (`assigned_task_for_workspace`, the launch
+        // lookup) can resolve an `IssueStore` for it.
+        let projects = p.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("demo.yaml"),
+            "name: demo\n\
+repo: /tmp/demo\n\
+default_branch: main\n\
+orchestrator:\n\
+\x20 runner: claude\n\
+agent_runners:\n\
+\x20 claude:\n\
+\x20\x20\x20 command: claude\n\
+\x20\x20\x20 flags: []\n\
+machines:\n\
+\x20 - name: local\n\
+\x20\x20\x20 kind: local\n\
+\x20\x20\x20 work_dir: /tmp/demo\n\
+workspaces: []\n",
+        )
+        .unwrap();
         p
     }
 

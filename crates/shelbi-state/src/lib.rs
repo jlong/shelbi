@@ -52,8 +52,8 @@ pub use issue_migrate::{
     apply_issue_migration, plan_issue_migration, IssueMigrationPlan,
 };
 pub use issue_store::{
-    resolve_issue_store, Cursor, FileSystemStore, IssueChange, IssueComment, IssueFields,
-    IssueStore, NewIssue, PrioMove, StatusMove,
+    issue_store_for, resolve_issue_store, Cursor, FileSystemStore, IssueChange, IssueComment,
+    IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
 };
 pub use project_paths::ProjectPaths;
 pub use root::{

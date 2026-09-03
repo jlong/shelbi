@@ -324,21 +324,32 @@ pub fn ensure_branch_for_in_progress(project: &Project, task_id: &str) -> Result
     // their surrounding transition, while this shared boundary protects any
     // future CLI/TUI entry point.
     shelbi_state::ensure_daemon_matches_for_mutation()?;
-    let mut tf = shelbi_state::load_task(&project.name, task_id)?;
-    let all_tasks = shelbi_state::list_tasks(&project.name)?;
+    let store = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?;
+    let mut tf = store
+        .get(task_id)?
+        .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
+    let all_tasks = store.list()?;
     let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
         .unwrap_or_else(|_| shelbi_core::default_workflow());
     let branch = branch::branch_name_for_task(project, Some(&workflow), &tf.task)?;
     let base = resolve_base_branch(project, &workflow, &tf.task, &all_tasks)?;
     cut_branch_on_hub(project, &branch, &base)?;
     if tf.task.branch.as_deref() != Some(branch.as_str()) {
-        // Targeted, locked set-branch instead of writing the whole task back
+        // Targeted, locked set-fields instead of writing the whole task back
         // from a stale read: a concurrent writer that touched another field
-        // between our `load_task` and here would otherwise be clobbered
-        // (lost update on `updated_at`/column/priority). Reload afterward so
-        // the returned `IssueFile` reflects what actually landed on disk.
-        shelbi_state::set_task_branch(&project.name, task_id, &branch)?;
-        tf = shelbi_state::load_task(&project.name, task_id)?;
+        // between our `get` and here would otherwise be clobbered (lost update
+        // on `updated_at`/column/priority). Reload afterward so the returned
+        // `IssueFile` reflects what actually landed on disk.
+        store.set_fields(
+            task_id,
+            shelbi_state::IssueFields {
+                branch: Some(Some(branch.clone())),
+                ..Default::default()
+            },
+        )?;
+        tf = store
+            .get(task_id)?
+            .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
     }
     Ok(tf)
 }

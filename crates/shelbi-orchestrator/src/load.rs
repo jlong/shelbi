@@ -40,7 +40,10 @@ pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
     // this shared boundary rather than relying on every UI surface to remember.
     shelbi_state::ensure_daemon_matches_for_mutation()?;
     let project = shelbi_state::load_project(project_name)?;
-    let tf = shelbi_state::load_task(project_name, task_id)?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let tf = store
+        .get(task_id)?
+        .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
 
     // Resolve the status the task currently sits in and its routing tags +
     // agent. A missing/invalid workflow falls back to the built-in default
@@ -65,8 +68,8 @@ pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
     }
 
     // Busy = holding some *other* active (in-progress / handoff) task.
-    let mut active = shelbi_state::list_column(project_name, Column::in_progress())?;
-    active.extend(shelbi_state::list_column(project_name, Column::review())?);
+    let mut active = store.list_in_status(&Column::in_progress())?;
+    active.extend(store.list_in_status(&Column::review())?);
     let busy: HashSet<&str> = active
         .iter()
         .filter(|t| t.task.id != task_id)
@@ -97,9 +100,10 @@ pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
 /// lives in one place.
 pub fn free_review_workspaces(project_name: &str) -> Result<Vec<WorkspaceSpec>> {
     let project = shelbi_state::load_project(project_name)?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
     let review_tag: BTreeSet<String> = std::iter::once("review".to_string()).collect();
-    let mut active = shelbi_state::list_column(project_name, Column::in_progress())?;
-    active.extend(shelbi_state::list_column(project_name, Column::review())?);
+    let mut active = store.list_in_status(&Column::in_progress())?;
+    active.extend(store.list_in_status(&Column::review())?);
     let busy: HashSet<&str> = active
         .iter()
         .filter_map(|t| t.task.assigned_to.as_deref())
@@ -142,8 +146,9 @@ pub struct ReviewSlotOccupant {
 /// review-column scan the busy check does, so the two never disagree.
 pub fn review_slots(project_name: &str) -> Result<Vec<ReviewSlot>> {
     let project = shelbi_state::load_project(project_name)?;
-    let mut active = shelbi_state::list_column(project_name, Column::in_progress())?;
-    active.extend(shelbi_state::list_column(project_name, Column::review())?);
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let mut active = store.list_in_status(&Column::in_progress())?;
+    active.extend(store.list_in_status(&Column::review())?);
     Ok(review_slots_from(&project, &active))
 }
 
@@ -238,10 +243,11 @@ fn evict_review_slot_locked(
     workspace_name: &str,
     keep: &str,
 ) -> Result<Option<String>> {
+    let store = shelbi_state::issue_store_for(project_name)?;
     // Only review-column tasks are "loaded for review"; an in-progress task on
     // the slot (an odd state) isn't ours to bounce back to the review queue —
     // leave it for `load_review_task_locked`'s busy guard to reject.
-    let review = shelbi_state::list_column(project_name, Column::review())?;
+    let review = store.list_in_status(&Column::review())?;
     let Some(occupant) = review
         .into_iter()
         .find(|tf| tf.task.id != keep && tf.task.assigned_to.as_deref() == Some(workspace_name))
@@ -265,14 +271,17 @@ fn evict_review_slot_locked(
         );
     }
 
-    // Re-load fresh to get the current body (list_column's copy is enough for
-    // the task, but a fresh load keeps the body authoritative) and drop the
-    // review-slot assignment, keeping the task in Review → it re-appears as
-    // Queued/Pending for a later free slot or another manual load.
-    let mut tf = shelbi_state::load_task(project_name, &evicted_id)?;
-    tf.task.assigned_to = None;
-    tf.task.updated_at = chrono::Utc::now();
-    shelbi_state::save_task(project_name, &tf.task, &tf.body)?;
+    // Drop the review-slot assignment, keeping the task in Review → it
+    // re-appears as Queued/Pending for a later free slot or another manual load.
+    // `set_fields` does the locked load→clear→save, so no separate read is
+    // needed to keep the body authoritative.
+    store.set_fields(
+        &evicted_id,
+        shelbi_state::IssueFields {
+            assigned_to: Some(None),
+            ..Default::default()
+        },
+    )?;
 
     let _ = shelbi_state::append_dispatch_event(
         &evicted_id,
@@ -294,6 +303,7 @@ fn load_review_task_locked(
     workspace_name: &str,
 ) -> Result<String> {
     let project = shelbi_state::load_project(project_name)?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
     let ws = project
         .workspace(workspace_name)
         .filter(|w| project.effective_tags(w).contains("review"))
@@ -303,7 +313,9 @@ fn load_review_task_locked(
                 "`{workspace_name}` is not a declared review-tagged workspace"
             ))
         })?;
-    let tf = shelbi_state::load_task(project_name, task_id)?;
+    let tf = store
+        .get(task_id)?
+        .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
 
     // Guard: this task is already assigned to a review slot *other than* the
     // target. A race (the auto-loader placed it between a human opening the
@@ -366,8 +378,9 @@ fn review_slot_busy_with_other(
     workspace_name: &str,
     task_id: &str,
 ) -> Result<bool> {
-    let mut active = shelbi_state::list_column(project_name, Column::in_progress())?;
-    active.extend(shelbi_state::list_column(project_name, Column::review())?);
+    let store = shelbi_state::issue_store_for(project_name)?;
+    let mut active = store.list_in_status(&Column::in_progress())?;
+    active.extend(store.list_in_status(&Column::review())?);
     Ok(active.iter().any(|t| {
         t.task.id != task_id && t.task.assigned_to.as_deref() == Some(workspace_name)
     }))
@@ -397,8 +410,9 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
     let _guard = shelbi_state::lock_review_load(project_name)?;
 
     let project = shelbi_state::load_project(project_name)?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
     // Board order (priority, then id) — the same order the sidebar shows.
-    let review_tasks = shelbi_state::list_column(project_name, Column::review())?;
+    let review_tasks = store.list_in_status(&Column::review())?;
     // Idle review slots in declaration order (never lists a dev slot).
     let free = free_review_workspaces(project_name)?;
     // Tasks an operator deliberately unloaded (`shelbi workspace stop` /
@@ -505,7 +519,10 @@ pub struct AutoLoadedReview {
 /// through [`dispatch_task_onto`] launches the Review agent.
 pub fn load_task_for_review(project_name: &str, task_id: &str) -> Result<String> {
     let project = shelbi_state::load_project(project_name)?;
-    let tf = shelbi_state::load_task(project_name, task_id)?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let tf = store
+        .get(task_id)?
+        .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
     let already = tf
         .task
         .assigned_to
@@ -585,20 +602,29 @@ fn dispatch_task_onto(
     let branch = branch::branch_name_for_task(project, Some(workflow), &tf.task)?;
 
     let agent = dispatch_agent_for(project, ws, agent);
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
 
     // Persist the assignment before dispatch so a concurrent load can't pick
-    // the same slot, and roll it back on a dispatch failure.
+    // the same slot, and roll it back on a dispatch failure. `set_fields` does
+    // the locked read-modify-write, so a concurrent writer touching another
+    // field on the same card can't be clobbered by this assignment.
     let original = tf.task.clone();
     tf.task.assigned_to = Some(ws.name.clone());
     tf.task.branch = Some(branch.clone());
-    tf.task.updated_at = chrono::Utc::now();
-    shelbi_state::save_task(project_name, &tf.task, &tf.body)?;
+    store.set_fields(
+        &tf.task.id,
+        shelbi_state::IssueFields {
+            assigned_to: Some(Some(ws.name.clone())),
+            branch: Some(Some(branch.clone())),
+            ..Default::default()
+        },
+    )?;
 
     // Any fresh dispatch/assignment un-parks the task: an operator-parked task
     // that is now being loaded again (manually, or re-dispatched for rework)
     // must stop being skipped by the auto-loader. Best-effort — a stale marker
     // only ever suppresses an auto-load, never blocks this explicit dispatch.
-    let _ = shelbi_state::clear_task_parked(project_name, &tf.task.id);
+    let _ = store.clear_parked(&tf.task.id);
 
     let addr = match start_workspace_on_task(StartSpec {
         project,
@@ -612,7 +638,16 @@ fn dispatch_task_onto(
         Ok(addr) => addr,
         Err(e) => {
             let task_id = &tf.task.id;
-            if let Err(re) = shelbi_state::save_task(project_name, &original, &tf.body) {
+            // Restore the pre-dispatch assignment/branch so the card isn't left
+            // pinned to a slot whose launch never happened.
+            if let Err(re) = store.set_fields(
+                task_id,
+                shelbi_state::IssueFields {
+                    assigned_to: Some(original.assigned_to.clone()),
+                    branch: Some(original.branch.clone()),
+                    ..Default::default()
+                },
+            ) {
                 eprintln!(
                     "shelbi: load for `{task_id}` failed and the assignment rollback \
                      also failed ({re}); run `shelbi task assign {task_id} --to \

@@ -11,7 +11,7 @@ use anyhow::{anyhow, Result};
 use clap::Subcommand;
 
 use shelbi_orchestrator::{actions, transition};
-use shelbi_state::{load_project, load_task};
+use shelbi_state::load_project;
 
 use crate::commands::require_project;
 
@@ -111,16 +111,24 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
     // Every action primitive changes git/PR or transition state.
     super::hub_version::ensure_daemon_matches_for_mutation()?;
     let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
+    let store = shelbi_state::resolve_issue_store(&project_name, &project.issue_tracker)
+        .map_err(|e| anyhow!(e))?;
 
     match cmd {
         ActionCmd::PushBranch { task_id } => {
-            let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let tf = store
+                .get(&task_id)
+                .map_err(|e| anyhow!(e))?
+                .ok_or_else(|| anyhow!("issue `{task_id}` not found"))?;
             actions::push_branch(&project, &tf.task).map_err(|e| anyhow!(e))?;
             println!("pushed");
             Ok(())
         }
         ActionCmd::OpenPr { task_id, target } => {
-            let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let tf = store
+                .get(&task_id)
+                .map_err(|e| anyhow!(e))?
+                .ok_or_else(|| anyhow!("issue `{task_id}` not found"))?;
             let pr = actions::open_pr(
                 &project,
                 &project_name,
@@ -133,7 +141,10 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
             Ok(())
         }
         ActionCmd::ClosePr { task_id } => {
-            let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let tf = store
+                .get(&task_id)
+                .map_err(|e| anyhow!(e))?
+                .ok_or_else(|| anyhow!("issue `{task_id}` not found"))?;
             match actions::close_pr(&project, &tf.task).map_err(|e| anyhow!(e))? {
                 Some(pr) => println!("{pr}"),
                 None => println!("none"),
@@ -141,7 +152,10 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
             Ok(())
         }
         ActionCmd::Merge { task_id, target } => {
-            let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let tf = store
+                .get(&task_id)
+                .map_err(|e| anyhow!(e))?
+                .ok_or_else(|| anyhow!("issue `{task_id}` not found"))?;
             let result = actions::merge(&project, &project_name, &tf.task, target.as_deref())
                 .map_err(|e| anyhow!(e))?;
             println!("{}", result.merge.as_line());
@@ -151,7 +165,10 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
             Ok(())
         }
         ActionCmd::DeleteBranch { task_id } => {
-            let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let tf = store
+                .get(&task_id)
+                .map_err(|e| anyhow!(e))?
+                .ok_or_else(|| anyhow!("issue `{task_id}` not found"))?;
             let outcome = actions::delete_branch(&project, &tf.task).map_err(|e| anyhow!(e))?;
             println!("{}", outcome.as_line());
             Ok(())
@@ -161,14 +178,20 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
             from,
             onto,
         } => {
-            let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let tf = store
+                .get(&task_id)
+                .map_err(|e| anyhow!(e))?
+                .ok_or_else(|| anyhow!("issue `{task_id}` not found"))?;
             let outcome = actions::restack(&project, &tf.task, &from, onto.as_deref())
                 .map_err(|e| anyhow!(e))?;
             println!("{}", outcome.as_line());
             Ok(())
         }
         ActionCmd::ApplyTransition { task_id, from, to } => {
-            let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let tf = store
+                .get(&task_id)
+                .map_err(|e| anyhow!(e))?
+                .ok_or_else(|| anyhow!("issue `{task_id}` not found"))?;
             let workflow = shelbi_state::load_task_workflow(&project_name, &project, &tf.task)
                 .map_err(|e| anyhow!(e))?;
             let outcomes = transition::execute_transition(

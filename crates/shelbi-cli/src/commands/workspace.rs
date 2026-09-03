@@ -308,8 +308,10 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
     // Surfaces every in-progress task assigned to the workspace. There
     // should normally be at most one, but if shelbi's state diverged we
     // print all of them in the STATE cell so the user sees the mess.
-    let in_progress =
-        shelbi_state::list_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
+    let store = shelbi_state::issue_store_for(project).map_err(|e| anyhow!(e))?;
+    let in_progress = store
+        .list_in_status(&Column::in_progress())
+        .map_err(|e| anyhow!(e))?;
     let assigned: Vec<&Issue> = in_progress.iter().map(|tf| &tf.task).collect();
 
     // A `review`-tagged slot holds a review-column (handoff) task while it
@@ -317,7 +319,9 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
     // so without this it looks like a live pane no active task points at and
     // gets mislabeled `orphaned session`. Map each review slot to the task it's
     // serving so `list` renders it as `review: <id>` (and the probe skips it).
-    let review = shelbi_state::list_column(project, Column::review()).map_err(|e| anyhow!(e))?;
+    let review = store
+        .list_in_status(&Column::review())
+        .map_err(|e| anyhow!(e))?;
     let review_by_ws = review_assignments(&p, &review);
 
     let occupied = occupied_idle_workspaces(&p, &assigned, &review_by_ws)?;
@@ -641,14 +645,17 @@ fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
 /// diverged board is reconciled by parking them all. Used by [`stop`] on a
 /// `review`-tagged slot.
 fn park_review_workspace_tasks(project: &str, workspace_name: &str) -> Result<Vec<String>> {
-    let review = shelbi_state::list_column(project, Column::review()).map_err(|e| anyhow!(e))?;
+    let store = shelbi_state::issue_store_for(project).map_err(|e| anyhow!(e))?;
+    let review = store
+        .list_in_status(&Column::review())
+        .map_err(|e| anyhow!(e))?;
     let mut parked = Vec::new();
     for tf in review {
         if tf.task.assigned_to.as_deref() != Some(workspace_name) {
             continue;
         }
         let id = tf.task.id.clone();
-        shelbi_state::park_review_task(project, &id).map_err(|e| anyhow!(e))?;
+        store.park_review(&id).map_err(|e| anyhow!(e))?;
         parked.push(id);
     }
     Ok(parked)
@@ -659,7 +666,9 @@ fn park_review_workspace_tasks(project: &str, workspace_name: &str) -> Result<Ve
 /// caller doesn't already have `$TASK_ID` in the environment.
 fn active_task_for(project: &str, workspace: &str) -> Option<String> {
     for column in [Column::in_progress(), Column::review()] {
-        if let Ok(tasks) = shelbi_state::list_column(project, column) {
+        if let Ok(tasks) =
+            shelbi_state::issue_store_for(project).and_then(|s| s.list_in_status(&column))
+        {
             if let Some(tf) = tasks
                 .into_iter()
                 .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace))
@@ -775,8 +784,10 @@ fn format_ago(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
 /// release them all so the board doesn't keep dangling cards pointing at
 /// a dead pane.
 fn release_workspace_tasks(project: &str, workspace_name: &str) -> Result<Vec<String>> {
-    let in_progress =
-        shelbi_state::list_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
+    let store = shelbi_state::issue_store_for(project).map_err(|e| anyhow!(e))?;
+    let in_progress = store
+        .list_in_status(&Column::in_progress())
+        .map_err(|e| anyhow!(e))?;
     let mut released = Vec::new();
     for tf in in_progress {
         if tf.task.assigned_to.as_deref() != Some(workspace_name) {
@@ -787,8 +798,10 @@ fn release_workspace_tasks(project: &str, workspace_name: &str) -> Result<Vec<St
         // unassign-then-move split could crash between the two writes and
         // strand the card unowned-but-still-in-progress, where the
         // owner-keyed recovery scan would never see it again (F18).
-        let moved = shelbi_state::release_task_to_todo(project, &id).map_err(|e| anyhow!(e))?;
-        if let Some((from, to, workflow)) = moved {
+        let moved = store
+            .move_status_and_unassign(&id, &Column::todo(), "workspace:stop")
+            .map_err(|e| anyhow!(e))?;
+        if let Some(shelbi_state::StatusMove { from, to, workflow }) = moved {
             if let Err(e) =
                 shelbi_state::append_task_event(project, &id, &workflow, from, to, "workspace:stop")
             {
@@ -818,6 +831,34 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Register a minimal `p` project so board reads/writes routed through the
+    /// `IssueStore` can resolve a (file-system) store. Kept off `fresh_home` so
+    /// the `add`/`rm` layout tests still exercise project creation from scratch.
+    fn register_project(home: &std::path::Path, name: &str) {
+        let projects = home.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join(format!("{name}.yaml")),
+            format!(
+                "name: {name}\n\
+repo: /tmp/{name}\n\
+default_branch: main\n\
+orchestrator:\n\
+\x20 runner: claude\n\
+agent_runners:\n\
+\x20 claude:\n\
+\x20\x20\x20 command: claude\n\
+\x20\x20\x20 flags: []\n\
+machines:\n\
+\x20 - name: local\n\
+\x20\x20\x20 kind: local\n\
+\x20\x20\x20 work_dir: /tmp/{name}\n\
+workspaces: []\n"
+            ),
+        )
+        .unwrap();
     }
 
     fn make_task(id: &str, column: Column, priority: u32, assigned_to: Option<&str>) -> Issue {
@@ -1333,6 +1374,7 @@ workspaces:
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
+        register_project(&home, "p");
 
         // In-progress task on review-1 → found.
         shelbi_state::save_task(
@@ -1364,6 +1406,7 @@ workspaces:
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
+        register_project(&home, "p");
 
         // Bob's task should stay put; alice's should come back to todo.
         shelbi_state::save_task(
@@ -1447,6 +1490,7 @@ workspaces:
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
+        register_project(&home, "p");
         shelbi_state::save_task("p", &make_task("a", Column::todo(), 0, None), "").unwrap();
 
         let released = release_workspace_tasks("p", "alice").unwrap();
