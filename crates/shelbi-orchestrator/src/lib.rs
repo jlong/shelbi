@@ -1682,6 +1682,14 @@ fn orchestrator_pane_cmd(
     // `zen_last_crashed_at` first, so the hook discriminates and only a real
     // crash writes a record. The `__rec` shell function keeps the
     // shell-escaped `{bin}`/`{proj}` out of the trap body.
+    //
+    // The agent gets a DUP of the pane's own stdin (`exec 3<&0` + `<&3`), not a
+    // fresh `</dev/tty` open. Both hand the background job a terminal (job control
+    // is off, so POSIX would otherwise give it `/dev/null`), but a re-opened
+    // `/dev/tty` is a new read-only description that crossterm cannot drive: its
+    // event source fails to initialize, so the TUI renders but never reads a key
+    // and panics with `reader source not set` on the first size query. Claude
+    // tolerated it; Codex's remote TUI does not.
     format!(
         "cd {wd} && \
          export SHELBI_PROJECT={proj} SHELBI_TMUX_SESSION={sess} SHELBI_MANAGED_CONTEXT=1 && \
@@ -1698,7 +1706,8 @@ fn orchestrator_pane_cmd(
          ({bin} __zen-heartbeat {proj}; \
             while sleep {interval}; do {bin} __zen-heartbeat {proj}; done) & \
          HB=$!; \
-         {launch} </dev/tty & \
+         exec 3<&0; \
+         {launch} <&3 & \
          ORCH_PID=$!; \
          wait \"$ORCH_PID\"; \
          RC=$?; \
@@ -2511,8 +2520,9 @@ mod pane_cmd_tests {
         );
         assert!(launch_idx < exit_idx, "exit must run after launch returns");
         assert!(
-            out.contains("claude --print </dev/tty &"),
-            "background launch must retain the pane terminal on stdin"
+            out.contains("claude --print <&3 &"),
+            "background launch must retain the pane terminal on stdin (a dup of fd 0, \
+             not a re-opened /dev/tty)"
         );
         // Heartbeat loop is spawned in the background and killed afterwards.
         assert!(out.contains("HB=$!"), "must capture heartbeat pid");
@@ -2529,8 +2539,18 @@ mod pane_cmd_tests {
             out.contains("kill $HB"),
             "must kill heartbeat after launch exits"
         );
-        // We deliberately don't exec the launch so the wrapper survives.
-        assert!(!out.contains(" exec "), "exec would skip the cleanup hooks");
+        // We deliberately don't exec the launch so the wrapper survives to run
+        // the cleanup hooks. The one `exec` here is a bare redirection
+        // (`exec 3<&0`): it dups a descriptor and leaves the shell in place.
+        assert_eq!(
+            out.matches("exec ").count(),
+            1,
+            "the only exec may be the fd dup; exec-ing the launch would skip cleanup"
+        );
+        assert!(
+            out.contains("exec 3<&0"),
+            "agent stdin must be a dup of the pane's fd 0, not a re-opened /dev/tty"
+        );
         // Exit code of the agent is preserved.
         assert!(out.contains("RC=$?") && out.contains("exit $RC"));
         // Crash-record capture runs on both exit paths: the post-agent-return
