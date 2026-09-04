@@ -1233,6 +1233,7 @@ dependencies = [
  "shelbi-ssh",
  "shelbi-state",
  "shelbi-tmux",
+ "signal-hook",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",

@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shelbi_core::{Error, IntegrationMode, Project, Result, StatusCategory};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use tungstenite::{accept, client, Message, WebSocket};
 
 use crate::codex_rpc::{CodexRpcClient, CodexRpcError, CodexRpcNotification};
@@ -128,6 +129,7 @@ impl FallbackReason {
 struct NativeStartupError {
     error: Error,
     protocol_unsupported: bool,
+    cancelled: bool,
     reason: FallbackReason,
 }
 
@@ -136,6 +138,7 @@ impl NativeStartupError {
         Self {
             error,
             protocol_unsupported: false,
+            cancelled: false,
             // Transient failures retry rather than fall back, so this reason is
             // inert; classify as a socket error since that's the dominant
             // transient cause (connect/timeout).
@@ -151,6 +154,7 @@ impl NativeStartupError {
         Self {
             error,
             protocol_unsupported: false,
+            cancelled: false,
             reason: FallbackReason::SpawnFailure,
         }
     }
@@ -169,6 +173,7 @@ impl NativeStartupError {
         Self {
             error: rpc_error(error),
             protocol_unsupported,
+            cancelled: false,
             reason,
         }
     }
@@ -177,9 +182,19 @@ impl NativeStartupError {
         Self {
             error: Error::Other(message.into()),
             protocol_unsupported: true,
+            cancelled: false,
             // The only production caller is the `resume --remote` capability
             // probe — a version/capability gate, not a live protocol rejection.
             reason: FallbackReason::VersionGate,
+        }
+    }
+
+    fn cancelled() -> Self {
+        Self {
+            error: Error::Other("native Codex bridge shutdown requested".into()),
+            protocol_unsupported: false,
+            cancelled: true,
+            reason: FallbackReason::SocketError,
         }
     }
 }
@@ -225,16 +240,46 @@ fn classify_persisted_resume_rejection(
 }
 
 fn retry_native_start<T>(
+    shutdown: &AtomicBool,
     mut start: impl FnMut() -> NativeStartupResult<T>,
     mut on_transient: impl FnMut(&NativeStartupError),
 ) -> NativeStartupResult<T> {
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Err(NativeStartupError::cancelled());
+        }
         match start() {
             Ok(value) => return Ok(value),
+            Err(_) if shutdown.load(Ordering::Acquire) => {
+                return Err(NativeStartupError::cancelled());
+            }
             Err(error) if !error.protocol_unsupported => on_transient(&error),
             Err(error) => return Err(error),
         }
     }
+}
+
+fn wait_for_reconnect(shutdown: &AtomicBool) {
+    let deadline = Instant::now() + RECONNECT_INTERVAL;
+    while !shutdown.load(Ordering::Acquire) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        thread::sleep(remaining.min(LOOP_SLEEP));
+    }
+}
+
+fn register_shutdown_signals() -> Result<Arc<AtomicBool>> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for signal in [SIGHUP, SIGTERM, SIGINT] {
+        signal_hook::flag::register(signal, Arc::clone(&shutdown)).map_err(|error| {
+            Error::Other(format!(
+                "failed to install shutdown handler for signal {signal}: {error}"
+            ))
+        })?;
+    }
+    Ok(shutdown)
 }
 
 /// Run the project-scoped Codex bridge in the orchestrator pane.
@@ -245,6 +290,15 @@ fn retry_native_start<T>(
 /// the native bridge with its durable queue intact. The compatibility path
 /// deliberately has no autonomous tmux injection.
 pub fn run_codex_bridge(project_name: &str, first_launch: bool) -> Result<()> {
+    let shutdown = register_shutdown_signals()?;
+    run_codex_bridge_until_shutdown(project_name, first_launch, &shutdown)
+}
+
+fn run_codex_bridge_until_shutdown(
+    project_name: &str,
+    first_launch: bool,
+    shutdown: &AtomicBool,
+) -> Result<()> {
     let project = shelbi_state::load_project(project_name)?;
     let runner = project
         .runner(&project.orchestrator.runner)
@@ -273,6 +327,7 @@ pub fn run_codex_bridge(project_name: &str, first_launch: bool) -> Result<()> {
             first_launch_pending,
         );
         let mut bridge = match retry_native_start(
+            shutdown,
             || {
                 NativeBridge::start(
                     project.clone(),
@@ -289,10 +344,11 @@ pub fn run_codex_bridge(project_name: &str, first_launch: bool) -> Result<()> {
                     %error,
                     "Codex native bridge startup deferred; durable events remain queued"
                 );
-                thread::sleep(RECONNECT_INTERVAL);
+                wait_for_reconnect(shutdown);
             },
         ) {
             Ok(bridge) => bridge,
+            Err(error) if error.cancelled => return Ok(()),
             Err(error) => {
                 let reason = error.reason;
                 eprintln!(
@@ -309,7 +365,7 @@ pub fn run_codex_bridge(project_name: &str, first_launch: bool) -> Result<()> {
             }
         };
 
-        let result = bridge.run();
+        let result = bridge.run(shutdown);
         let protocol_unsupported = bridge.protocol_unsupported;
         // A successful or deduplicated bootstrap means the one-shot welcome
         // is present in the exact thread. Any in-process recovery after this
@@ -318,6 +374,9 @@ pub fn run_codex_bridge(project_name: &str, first_launch: bool) -> Result<()> {
             first_launch_pending = false;
         }
         drop(bridge);
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
         match result {
             Ok(()) => return Ok(()),
             Err(error) if protocol_unsupported => {
@@ -347,7 +406,7 @@ pub fn run_codex_bridge(project_name: &str, first_launch: bool) -> Result<()> {
                     %error,
                     "Codex native event bridge interrupted; restarting app-server and exact thread"
                 );
-                thread::sleep(RECONNECT_INTERVAL);
+                wait_for_reconnect(shutdown);
             }
         }
     }
@@ -555,8 +614,11 @@ impl NativeBridge {
         })
     }
 
-    fn run(&mut self) -> Result<()> {
+    fn run(&mut self, shutdown: &AtomicBool) -> Result<()> {
         loop {
+            if shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
             if let Some(status) = self.tui.try_wait().map_err(Error::Io)? {
                 return exit_status(status, "Codex remote TUI");
             }
@@ -4149,7 +4211,9 @@ mod tests {
         .unwrap();
 
         let mut attempts = 0;
+        let shutdown = AtomicBool::new(false);
         let started = retry_native_start(
+            &shutdown,
             || {
                 attempts += 1;
                 if attempts == 1 {
@@ -4171,6 +4235,7 @@ mod tests {
 
         let mut incompatible_attempts = 0;
         let incompatible: NativeStartupResult<()> = retry_native_start(
+            &shutdown,
             || {
                 incompatible_attempts += 1;
                 Err(NativeStartupError::incompatible(
@@ -4181,6 +4246,27 @@ mod tests {
         );
         assert!(incompatible.unwrap_err().protocol_unsupported);
         assert_eq!(incompatible_attempts, 1);
+    }
+
+    #[test]
+    fn native_start_retry_stops_when_shutdown_is_requested() {
+        let shutdown = AtomicBool::new(false);
+        let mut attempts = 0;
+        let result: NativeStartupResult<()> = retry_native_start(
+            &shutdown,
+            || {
+                attempts += 1;
+                shutdown.store(true, Ordering::Release);
+                Err(NativeStartupError::transient(Error::Other(
+                    "app-server socket temporarily unavailable".into(),
+                )))
+            },
+            |_| {},
+        );
+
+        let error = result.expect_err("shutdown should stop startup retries");
+        assert!(error.cancelled);
+        assert_eq!(attempts, 1);
     }
 
     #[test]
