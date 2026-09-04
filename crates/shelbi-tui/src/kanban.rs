@@ -732,7 +732,7 @@ impl KanbanApp {
             }
         };
         self.all_columns = self.compute_all_columns();
-        match shelbi_state::list_tasks(&self.project_name) {
+        match shelbi_state::issue_store_for(&self.project_name).and_then(|s| s.list()) {
             Ok(tasks) => {
                 self.tasks = tasks;
                 self.last_refresh = Instant::now();
@@ -1343,14 +1343,16 @@ impl KanbanApp {
                 }
             }
         }
-        match shelbi_state::move_task(&self.project_name, id, new_col) {
-            Ok(Some((from, to, workflow))) => {
+        match shelbi_state::issue_store_for(&self.project_name)
+            .and_then(|s| s.move_status(id, &new_col, "user:tui"))
+        {
+            Ok(Some(mv)) => {
                 if let Err(e) = shelbi_state::append_task_event(
                     &self.project_name,
                     id,
-                    &workflow,
-                    from,
-                    to,
+                    &mv.workflow,
+                    mv.from,
+                    mv.to,
                     "user:tui",
                 ) {
                     tracing::warn!(task = %id, error = %e, "append_task_event failed");
@@ -1399,7 +1401,9 @@ impl KanbanApp {
             self.status_line = format!("reorder blocked: {e}");
             return;
         }
-        if let Err(e) = shelbi_state::set_task_priority(&self.project_name, &id, new_pos as u32) {
+        if let Err(e) = shelbi_state::issue_store_for(&self.project_name)
+            .and_then(|s| s.set_priority(&id, shelbi_state::PrioMove::Set(new_pos as u32)))
+        {
             self.status_line = format!("reorder failed: {e}");
             return;
         }

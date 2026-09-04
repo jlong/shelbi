@@ -568,8 +568,9 @@ impl App {
             .ok()
             .and_then(|p| p.display_name.or(p.label));
         self.agents = load_agents(&self.project_name).unwrap_or_default();
-        let review =
-            shelbi_state::list_column(&self.project_name, Column::review()).unwrap_or_default();
+        let review = shelbi_state::issue_store_for(&self.project_name)
+            .and_then(|s| s.list_in_status(&Column::review()))
+            .unwrap_or_default();
         let (ready, queued) = split_review_sections(&self.project_name, review);
         self.ready_review = ready;
         self.queued_review = queued;
@@ -1515,7 +1516,9 @@ fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
     // whether an error means "broken config" (file present) or "not set up
     // yet" (file absent) — see [`App::refresh`] / [`project_config_present`].
     let p = shelbi_state::load_project(project)?;
-    let in_progress = shelbi_state::list_column(project, Column::in_progress()).unwrap_or_default();
+    let in_progress = shelbi_state::resolve_issue_store(project, &p.issue_tracker)
+        .and_then(|s| s.list_in_status(&Column::in_progress()))
+        .unwrap_or_default();
     let mut out = Vec::with_capacity(p.workspaces.len());
     for workspace in &p.workspaces {
         // Review-tagged slots never appear under `— Workspaces —`; their

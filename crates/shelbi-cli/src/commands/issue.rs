@@ -12,7 +12,6 @@
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::Utc;
 use clap::{Args as ClapArgs, Subcommand};
 use shelbi_state::IssueStore;
 use shelbi_core::{
@@ -389,6 +388,16 @@ fn resolve_issue_store(project: &str) -> Result<Box<dyn IssueStore>> {
     shelbi_state::resolve_issue_store(project, &project_yaml.issue_tracker).map_err(|e| anyhow!(e))
 }
 
+/// Load one issue through the configured backend, erroring when it doesn't
+/// exist — the `Result<IssueFile>` shape the old `load_task` free function had,
+/// so callers that expect the issue to be present read the same.
+fn load_issue(project: &str, id: &str) -> Result<shelbi_state::IssueFile> {
+    resolve_issue_store(project)?
+        .get(id)
+        .map_err(|e| anyhow!(e))?
+        .ok_or_else(|| anyhow!("issue `{id}` not found"))
+}
+
 fn add(project: &str, args: AddArgs) -> Result<()> {
     // Only consult stdin when NO explicit body source was passed. `-d` /
     // `--description` already carries the body, so touching `stdin()` would
@@ -473,7 +482,7 @@ fn add_with_stdin(project: &str, args: AddArgs, stdin_body: Option<String>) -> R
     // (priority = current length), validates deps (self-ref / unknown id /
     // cycle), and is create-exclusive — the authoritative no-overwrite
     // guarantee. The up-front existence checks above stay as advisory races.
-    let store = shelbi_state::FileSystemStore::new(project);
+    let store = resolve_issue_store(project)?;
     let spec = shelbi_state::NewIssue {
         id: id.clone(),
         title: args.title.clone(),
@@ -562,9 +571,7 @@ fn list(
     // `in-progress`.
     let filter = status_filter.map(Column::from_status_id);
 
-    let all = shelbi_state::FileSystemStore::new(project)
-        .list()
-        .map_err(|e| anyhow!(e))?;
+    let all = resolve_issue_store(project)?.list().map_err(|e| anyhow!(e))?;
     if all.is_empty() {
         println!("(no issues yet)");
         return Ok(());
@@ -615,16 +622,29 @@ fn list(
 }
 
 fn show(project: &str, id: &str) -> Result<()> {
-    let path = shelbi_state::task_path(project, id).map_err(|e| anyhow!(e))?;
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    // Render the issue fetched through the store, not the local task file: a
+    // `github` backend never writes that file, so reading it would fail on a
+    // GitHub-only issue. `render_task_file` reconstructs the exact
+    // frontmatter+body representation from any backend's `IssueFile`.
+    let store = resolve_issue_store(project)?;
+    let tf = store
+        .get(id)
+        .map_err(|e| anyhow!(e))?
+        .ok_or_else(|| anyhow!("issue `{id}` not found"))?;
+    let text = shelbi_state::render_task_file(&tf).map_err(|e| anyhow!(e))?;
     print!("{text}");
 
-    // Footer: resolved depends_on. Done lazily after the raw file dump so
+    // Footer: resolved depends_on. Done lazily after the frontmatter dump so
     // scripts grepping for frontmatter still get clean output above the line.
-    let tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
     if !tf.task.depends_on.is_empty() {
-        let columns = shelbi_state::task_columns(project).map_err(|e| anyhow!(e))?;
+        // Build the id→column map from the same board read so the footer works
+        // for every backend (not just the local filesystem).
+        let columns: std::collections::HashMap<String, Column> = store
+            .list()
+            .map_err(|e| anyhow!(e))?
+            .into_iter()
+            .map(|t| (t.task.id, t.task.column))
+            .collect();
         let parts: Vec<String> = tf
             .task
             .depends_on
@@ -651,7 +671,7 @@ fn depends(project: &str, args: DependsArgs) -> Result<()> {
     if args.add.is_empty() && args.remove.is_empty() {
         bail!("specify at least one --add ID or --remove ID");
     }
-    let mut tf = shelbi_state::load_task(project, &args.id).map_err(|e| anyhow!(e))?;
+    let mut tf = load_issue(project, &args.id)?;
 
     let mut updated: Vec<String> = tf.task.depends_on.clone();
     // Removals first so an --add of an id being removed lands at the end.
@@ -670,11 +690,19 @@ fn depends(project: &str, args: DependsArgs) -> Result<()> {
         return Ok(());
     }
     tf.task.depends_on = updated;
-    tf.task.updated_at = Utc::now();
 
-    let existing = shelbi_state::list_tasks(project).map_err(|e| anyhow!(e))?;
+    let store = resolve_issue_store(project)?;
+    let existing = store.list().map_err(|e| anyhow!(e))?;
     shelbi_state::validate_depends_on(&tf.task, &existing).map_err(|e| anyhow!(e))?;
-    shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
+    store
+        .set_fields(
+            &args.id,
+            shelbi_state::IssueFields {
+                depends_on: Some(tf.task.depends_on.clone()),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| anyhow!(e))?;
     if tf.task.depends_on.is_empty() {
         println!("✓ {} now has no dependencies", args.id);
     } else {
@@ -694,7 +722,7 @@ fn move_to(
     reason: Option<&str>,
     skip_transition_actions: bool,
 ) -> Result<()> {
-    let tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
+    let tf = load_issue(project, id)?;
     let workflow = resolve_task_workflow(project, &tf.task)?;
     // Resolve the destination against the issue's workflow. An issue's position
     // is a status id, so ANY status the workflow declares is a valid target
@@ -780,7 +808,7 @@ fn move_to(
     // Route the status change through the board seam. `move_status` returns a
     // `StatusMove`; unpack it back into the `(from, to, workflow)` tuple the
     // event-append + rollback logic below already speaks.
-    let store = shelbi_state::FileSystemStore::new(project);
+    let store = resolve_issue_store(project)?;
     let moved = store
         .move_status(id, &column, reason.unwrap_or("user:cli"))
         .map_err(|e| anyhow!(e))?
@@ -1034,39 +1062,55 @@ fn assign(project: &str, id: &str, workspace: &str, force: bool) -> Result<()> {
     // Refuse a review slot unless explicitly forced (logged). Review slots are
     // filled by the review autoloader, never by direct assignment.
     guard_review_slot(&project_yaml, ws, workspace, id, force)?;
-    let mut tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
-    tf.task.assigned_to = Some(workspace.to_string());
-    tf.task.updated_at = Utc::now();
-    shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
+    // `id` must exist — surface a clear error before the assignment write.
+    load_issue(project, id)?;
+    let store = resolve_issue_store(project)?;
+    store
+        .set_fields(
+            id,
+            shelbi_state::IssueFields {
+                assigned_to: Some(Some(workspace.to_string())),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| anyhow!(e))?;
     // A fresh assignment un-parks the issue, so a previously-parked card can be
     // re-served. Best-effort — a stale marker only ever suppresses an auto-load.
-    let _ = shelbi_state::clear_task_parked(project, id);
+    let _ = store.clear_parked(id);
     println!("✓ {id} assigned to {workspace}");
     Ok(())
 }
 
 fn unassign(project: &str, id: &str) -> Result<()> {
-    let tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
+    let tf = load_issue(project, id)?;
     // Unassigning a review-column (handoff) issue from its slot is a *park*: it
     // must stay unloaded, not be re-grabbed by the review auto-loader on the
     // next tick. `park_review_task` clears `assigned_to` and sets the parked
     // marker in one locked write. A non-review issue is a plain unassign.
+    let store = resolve_issue_store(project)?;
     if tf.task.column == Column::review() {
-        shelbi_state::park_review_task(project, id).map_err(|e| anyhow!(e))?;
+        store.park_review(id).map_err(|e| anyhow!(e))?;
         println!("✓ {id} unassigned (parked — won't auto-reload for review)");
         return Ok(());
     }
-    let mut tf = tf;
-    tf.task.assigned_to = None;
-    tf.task.updated_at = Utc::now();
-    shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
+    store
+        .set_fields(
+            id,
+            shelbi_state::IssueFields {
+                assigned_to: Some(None),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| anyhow!(e))?;
     println!("✓ {id} unassigned");
     Ok(())
 }
 
 fn prio(project: &str, args: PrioArgs) -> Result<()> {
-    let tf = shelbi_state::load_task(project, &args.id).map_err(|e| anyhow!(e))?;
-    let col = shelbi_state::list_column(project, tf.task.column.clone()).map_err(|e| anyhow!(e))?;
+    let tf = load_issue(project, &args.id)?;
+    let col = resolve_issue_store(project)?
+        .list_in_status(&tf.task.column)
+        .map_err(|e| anyhow!(e))?;
     let pos = col
         .iter()
         .position(|x| x.task.id == args.id)
@@ -1087,7 +1131,7 @@ fn prio(project: &str, args: PrioArgs) -> Result<()> {
         bail!("specify one of --up, --down, --top, --bottom, --set N");
     };
 
-    let store = shelbi_state::FileSystemStore::new(project);
+    let store = resolve_issue_store(project)?;
     store
         .set_priority(&args.id, shelbi_state::PrioMove::Set(new_pos as u32))
         .map_err(|e| anyhow!(e))?;
@@ -1104,7 +1148,7 @@ fn start(
     force: bool,
 ) -> Result<()> {
     let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    let mut tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
+    let mut tf = load_issue(project, id)?;
 
     // Resolve workspace: explicit --workspace wins; otherwise reuse issue.assigned_to.
     let workspace_name = workspace_arg
@@ -1187,7 +1231,8 @@ fn start(
     // Refuse to clobber another in-flight issue on the same workspace. Pulling
     // a workspace off mid-issue is intentional — make the user do it explicitly
     // via `issue move <other> --to todo` first.
-    let conflict = shelbi_state::list_column(project, Column::in_progress())
+    let conflict = resolve_issue_store(project)?
+        .list_in_status(&Column::in_progress())
         .map_err(|e| anyhow!(e))?
         .into_iter()
         .find(|tf| {
@@ -1256,21 +1301,26 @@ fn start(
     // `in_progress` pointing at a pane that never launched.
     let original = tf.task.clone();
     let prev_column = tf.task.column.clone();
-    let now = Utc::now();
-    tf.task.assigned_to = Some(workspace_name.clone());
-    tf.task.branch = Some(branch.clone());
-    tf.task.updated_at = now;
+    let store = resolve_issue_store(project)?;
+    // `move_status` appends the card to `in_progress` and renumbers both the
+    // source and destination columns; the follow-up `set_fields` records the
+    // workspace + branch. Two locked writes through the store replace the old
+    // whole-task save + manual renumber.
     if prev_column != Column::in_progress() {
-        let new_priority = shelbi_state::list_column(project, Column::in_progress())
-            .map_err(|e| anyhow!(e))?
-            .len() as u32;
-        tf.task.column = Column::in_progress();
-        tf.task.priority = new_priority;
+        store
+            .move_status(id, &Column::in_progress(), reason.unwrap_or("user:cli"))
+            .map_err(|e| anyhow!(e))?;
     }
-    shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
-    if prev_column != Column::in_progress() {
-        shelbi_state::renumber_column(project, prev_column.clone()).map_err(|e| anyhow!(e))?;
-    }
+    store
+        .set_fields(
+            id,
+            shelbi_state::IssueFields {
+                assigned_to: Some(Some(workspace_name.clone())),
+                branch: Some(Some(branch.clone())),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| anyhow!(e))?;
 
     println!("→ launching {workspace_name} on {id} (branch: {branch}, agent: {agent_name})");
 
@@ -1420,12 +1470,26 @@ fn start(
 /// spawn itself failed. Re-saves the pre-move frontmatter and renumbers
 /// both the column we bumped the card out of and `in_progress` (where the
 /// aborted card was briefly appended) so priorities stay contiguous.
-fn rollback_start(project: &str, original: &Issue, body: &str, prev_column: Column) -> Result<()> {
-    shelbi_state::save_task(project, original, body).map_err(|e| anyhow!(e))?;
+fn rollback_start(project: &str, original: &Issue, _body: &str, prev_column: Column) -> Result<()> {
+    let store = resolve_issue_store(project)?;
+    // Move the card back out of `in_progress` (where `start` appended it) and
+    // restore its pre-dispatch owner/branch. `move_status` renumbers both the
+    // source and destination columns so priorities stay contiguous.
     if prev_column != Column::in_progress() {
-        shelbi_state::renumber_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
-        shelbi_state::renumber_column(project, prev_column).map_err(|e| anyhow!(e))?;
+        store
+            .move_status(&original.id, &prev_column, "rollback:start-failed")
+            .map_err(|e| anyhow!(e))?;
     }
+    store
+        .set_fields(
+            &original.id,
+            shelbi_state::IssueFields {
+                assigned_to: Some(original.assigned_to.clone()),
+                branch: Some(original.branch.clone()),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| anyhow!(e))?;
     Ok(())
 }
 
@@ -1480,7 +1544,7 @@ fn resume(
     reason: Option<&str>,
 ) -> Result<()> {
     let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    let mut tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
+    let tf = load_issue(project, id)?;
 
     // Resolve workspace: explicit --workspace wins; otherwise reuse the issue's
     // existing assignment. A resume without either has nothing to relaunch.
@@ -1508,7 +1572,8 @@ fn resume(
     // Refuse to clobber a DIFFERENT in-flight issue on the same workspace —
     // same guard as `start`. Resuming this issue onto a workspace busy with
     // another would leave two agents racing one worktree.
-    let conflict = shelbi_state::list_column(project, Column::in_progress())
+    let conflict = resolve_issue_store(project)?
+        .list_in_status(&Column::in_progress())
         .map_err(|e| anyhow!(e))?
         .into_iter()
         .find(|other| {
@@ -1544,20 +1609,22 @@ fn resume(
     let original = tf.task.clone();
     let prev_column = tf.task.column.clone();
     let moved_into_progress = prev_column != Column::in_progress();
-    tf.task.assigned_to = Some(workspace_name.clone());
-    tf.task.branch = Some(branch.clone());
-    tf.task.updated_at = Utc::now();
+    let store = resolve_issue_store(project)?;
     if moved_into_progress {
-        let new_priority = shelbi_state::list_column(project, Column::in_progress())
-            .map_err(|e| anyhow!(e))?
-            .len() as u32;
-        tf.task.column = Column::in_progress();
-        tf.task.priority = new_priority;
+        store
+            .move_status(id, &Column::in_progress(), reason.unwrap_or("user:cli"))
+            .map_err(|e| anyhow!(e))?;
     }
-    shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
-    if moved_into_progress {
-        shelbi_state::renumber_column(project, prev_column.clone()).map_err(|e| anyhow!(e))?;
-    }
+    store
+        .set_fields(
+            id,
+            shelbi_state::IssueFields {
+                assigned_to: Some(Some(workspace_name.clone())),
+                branch: Some(Some(branch.clone())),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| anyhow!(e))?;
 
     println!("→ resuming {workspace_name} on {id} (branch: {branch}, agent: {agent_name})");
     let addr = match shelbi_orchestrator::workspace::resume_workspace_on_task(
@@ -1884,7 +1951,7 @@ fn edit_non_interactive(
         );
     }
 
-    let mut tf = shelbi_state::load_task(project, &args.id).map_err(|e| anyhow!(e))?;
+    let mut tf = load_issue(project, &args.id)?;
     let mut fields: Vec<&str> = Vec::new();
 
     // --- validate every touched field BEFORE mutating, so an invalid input
@@ -1945,8 +2012,28 @@ fn edit_non_interactive(
         return Ok(());
     }
 
-    tf.task.updated_at = Utc::now();
-    shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
+    // Route exactly the touched fields through the store's partial update, so
+    // the edit reaches whichever backend is live (a github title/body edit
+    // PATCHes the issue; the meta block carries workflow/branch/machine).
+    let mut updates = shelbi_state::IssueFields::default();
+    if fields.contains(&"title") {
+        updates.title = Some(tf.task.title.clone());
+    }
+    if fields.contains(&"workflow") {
+        updates.workflow = Some(tf.task.workflow.clone());
+    }
+    if fields.contains(&"branch") {
+        updates.branch = Some(tf.task.branch.clone());
+    }
+    if fields.contains(&"prefers_machine") {
+        updates.prefers_machine = Some(tf.task.prefers_machine.clone());
+    }
+    if fields.contains(&"body") {
+        updates.body = Some(tf.body.clone());
+    }
+    resolve_issue_store(project)?
+        .set_fields(&args.id, updates)
+        .map_err(|e| anyhow!(e))?;
 
     let fields_csv = fields.join(",");
     let reason = args.reason.as_deref().unwrap_or("user:cli");
@@ -1966,10 +2053,11 @@ fn edit_non_interactive(
 }
 
 fn rm(project: &str, id: &str) -> Result<()> {
-    let tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
+    let tf = load_issue(project, id)?;
     let column = tf.task.column;
-    shelbi_state::delete_task(project, id).map_err(|e| anyhow!(e))?;
-    shelbi_state::renumber_column(project, column).map_err(|e| anyhow!(e))?;
+    let store = resolve_issue_store(project)?;
+    store.delete(id).map_err(|e| anyhow!(e))?;
+    store.renumber(&column).map_err(|e| anyhow!(e))?;
     println!("✓ {id} deleted");
     Ok(())
 }
@@ -2025,6 +2113,7 @@ fn slugify(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use crate::commands::test_support::ENV_LOCK as TEST_LOCK;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -2039,6 +2128,12 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
+        // Register the default `p` project so board commands can resolve an
+        // `IssueStore` (the migrated CLI paths route reads/writes through the
+        // project's configured backend, which requires a loadable project YAML).
+        // Tests that need a richer project overwrite this via
+        // `write_project_yaml*` with the same name.
+        write_project_yaml(&p, "p");
         p
     }
 
@@ -3582,5 +3677,181 @@ statuses:
         assert!(!shelbi_state::is_task_parked("p", "wip").unwrap());
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    // --- GitHub-backed command paths -----------------------------------------
+    //
+    // These exercise the real `assign` / `unassign` / `show` / `start` command
+    // functions against a project whose `issue_tracker.backend` is `github`,
+    // with a fake `gh` runner injected via `shelbi_state::set_test_gh_runner`
+    // (the `test-support` feature). They prove the migrated command paths reach
+    // the configured backend — not the local filesystem board — and that a
+    // GitHub-only issue needs no local task markdown file to operate on.
+
+    /// A project YAML selecting the GitHub backend (`owner/repo`) with one plain
+    /// `dev` workspace. No `tasks/` directory is ever created for it.
+    fn write_github_project_yaml(home: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::write(
+            home.join(format!("projects/{name}.yaml")),
+            format!(
+                r#"name: {name}
+repo: /tmp/{name}
+default_branch: main
+issue_tracker:
+  backend: github
+  github:
+    repo: owner/repo
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+machines:
+  - name: local
+    kind: local
+    work_dir: /tmp/{name}
+workspaces:
+  - {{ name: dev, machine: local, runner: claude }}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Install a fake `gh` runner that answers every issue read with `issue_json`
+    /// (a single JSONL object), an empty set for `/labels` and `/comments`, and
+    /// `{}` for any mutating call — enough for the read-only + overlay-only
+    /// command paths under test to run without a network or a real repo.
+    fn install_gh_issue_runner(issue_json: String) {
+        shelbi_state::set_test_gh_runner(move |args: &[&str]| -> shelbi_core::Result<String> {
+            let method = args
+                .iter()
+                .position(|a| *a == "-X")
+                .and_then(|i| args.get(i + 1))
+                .copied()
+                .unwrap_or("GET");
+            if method != "GET" {
+                return Ok("{}".to_string());
+            }
+            let path = args
+                .iter()
+                .find(|a| a.contains("repos/"))
+                .copied()
+                .unwrap_or("");
+            if path.ends_with("/labels") || path.contains("/comments") {
+                return Ok(String::new());
+            }
+            Ok(issue_json.to_string())
+        });
+    }
+
+    /// One GitHub issue object (JSONL) with the given shelbi id + status label.
+    fn gh_issue_json(id: &str, status: &str) -> String {
+        format!(
+            r#"{{"number":7,"title":"{id}","body":"Prose for {id}.","state":"open","labels":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/{status}"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
+        )
+    }
+
+    #[test]
+    fn show_renders_a_github_only_issue_with_no_local_file() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+        install_gh_issue_runner(gh_issue_json("t", "review"));
+
+        // `show` reads through the store; there is no `tasks/t.md` on disk, and
+        // the command must still succeed (the first-pass regression).
+        show("gh", "t").expect("show renders a GitHub-only issue");
+        assert!(
+            !shelbi_state::task_path("gh", "t").unwrap().exists(),
+            "no local task markdown file should be required or created"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn assign_persists_the_owner_through_the_github_store_without_a_local_file() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+        install_gh_issue_runner(gh_issue_json("t", "todo"));
+
+        assign("gh", "t", "dev", false).expect("assign through the github store");
+
+        // The owner is recoverable by re-reading through a freshly resolved
+        // store — the assignment overlay the daemon's ownership scans consult —
+        // even though GitHub itself stores no assignment.
+        let owner = shelbi_state::issue_store_for("gh")
+            .unwrap()
+            .get("t")
+            .unwrap()
+            .unwrap()
+            .task
+            .assigned_to;
+        assert_eq!(owner.as_deref(), Some("dev"));
+        // No phantom local task file was written.
+        assert!(!shelbi_state::task_path("gh", "t").unwrap().exists());
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn unassign_clears_the_owner_through_the_github_store() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+        install_gh_issue_runner(gh_issue_json("t", "todo"));
+
+        assign("gh", "t", "dev", false).unwrap();
+        unassign("gh", "t").expect("unassign through the github store");
+
+        let owner = shelbi_state::issue_store_for("gh")
+            .unwrap()
+            .get("t")
+            .unwrap()
+            .unwrap()
+            .task
+            .assigned_to;
+        assert_eq!(owner, None);
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn start_resolves_the_owner_through_the_github_store() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+        install_gh_issue_runner(gh_issue_json("t", "todo"));
+
+        // With no `--workspace` and no assignment on the (GitHub-backed) issue,
+        // `start` must fail cleanly with the "no assigned workspace" error —
+        // proving it resolved `assigned_to` through the store (which reads the
+        // github backend, not a local task file) before touching any pane.
+        let err = start("gh", "t", None, None, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no assigned workspace"),
+            "start should surface the no-owner error read through the github store: {err}"
+        );
+        assert!(!shelbi_state::task_path("gh", "t").unwrap().exists());
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

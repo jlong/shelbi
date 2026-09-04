@@ -239,16 +239,35 @@ impl Event {
     }
 }
 
-/// Cached subset of a task file frontmatter that the feed renders.
-/// `mtime` lets us re-read the file lazily when it changes (e.g. the
-/// orchestrator renames a task) without reparsing every other task.
+/// Cached subset of an issue's frontmatter that the feed renders.
+///
+/// Invalidation is backend-aware. For the filesystem board, `mtime` lets us
+/// re-read lazily only when the task file changes — exact and free. A remote
+/// backend (e.g. `issue_tracker.backend: github`) has no local task file, so
+/// `mtime` is always `None`; a pure mtime check would then read `None == None`
+/// and never refresh, freezing a remote issue's title / branch / assignment at
+/// whatever the first fetch saw. For those entries we fall back to a short
+/// time-to-live (`REMOTE_META_TTL`): the cache is re-fetched from the
+/// [`shelbi_state::IssueStore`] once it ages past the TTL, so remote edits
+/// surface without re-hitting the API on every render frame.
 #[derive(Debug, Clone)]
 struct TaskMeta {
     title: String,
     branch: Option<String>,
     assigned_to: Option<String>,
+    /// Task-file modification time on the filesystem backend; `None` for a
+    /// backend with no local task file (the TTL path takes over then).
     mtime: Option<SystemTime>,
+    /// When this entry was last fetched from the store — drives the TTL refresh
+    /// for entries that have no `mtime` to compare against.
+    fetched: Instant,
 }
+
+/// How long a task-metadata cache entry with no local file (a remote backend)
+/// is trusted before it is re-fetched from the store. Long enough that a busy
+/// activity view doesn't spam the tracker API per render frame, short enough
+/// that a remote title / branch / assignment edit shows up promptly.
+const REMOTE_META_TTL: Duration = Duration::from_secs(15);
 
 /// Active filter pills above the feed. Both flags off means "All" — the
 /// pill row's `All` chip lights up and every event is rendered. Toggling
@@ -600,14 +619,22 @@ impl ActivityApp {
             Err(_) => return None,
         };
         let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-        let stale = self
-            .task_cache
-            .get(id)
-            .map(|m| m.mtime != mtime)
-            .unwrap_or(true);
+        let stale = match self.task_cache.get(id) {
+            None => true,
+            Some(cached) => {
+                if mtime.is_some() || cached.mtime.is_some() {
+                    // Filesystem backend: exact, free invalidation on file change.
+                    cached.mtime != mtime
+                } else {
+                    // No local file (remote backend): fall back to a TTL so a
+                    // remote edit is picked up without an mtime to compare.
+                    cached.fetched.elapsed() >= REMOTE_META_TTL
+                }
+            }
+        };
         if stale {
-            match shelbi_state::load_task(&self.project_name, id) {
-                Ok(tf) => {
+            match shelbi_state::issue_store_for(&self.project_name).and_then(|s| s.get(id)) {
+                Ok(Some(tf)) => {
                     self.task_cache.insert(
                         id.to_string(),
                         TaskMeta {
@@ -615,10 +642,11 @@ impl ActivityApp {
                             branch: tf.task.branch,
                             assigned_to: tf.task.assigned_to,
                             mtime,
+                            fetched: Instant::now(),
                         },
                     );
                 }
-                Err(_) => {
+                Ok(None) | Err(_) => {
                     self.task_cache.remove(id);
                 }
             }

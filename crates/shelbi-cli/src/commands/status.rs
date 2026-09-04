@@ -336,7 +336,7 @@ struct CategoryCounts {
 }
 
 fn category_counts(project: &str) -> Result<CategoryCounts> {
-    let tasks = shelbi_state::list_tasks(project).map_err(|e| anyhow!(e))?;
+    let tasks = shelbi_state::issue_store_for(project).and_then(|s| s.list()).map_err(|e| anyhow!(e))?;
     let mut c = CategoryCounts::default();
     for tf in &tasks {
         match tf.task.column.category() {
@@ -361,8 +361,9 @@ fn category_counts(project: &str) -> Result<CategoryCounts> {
 /// automatic daemon restart is safe.
 pub(crate) fn workspace_idle_busy(project: &str) -> Result<(usize, usize)> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    let in_progress =
-        shelbi_state::list_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
+    let in_progress = shelbi_state::resolve_issue_store(project, &p.issue_tracker)
+        .and_then(|s| s.list_in_status(&Column::in_progress()))
+        .map_err(|e| anyhow!(e))?;
     let mut idle = 0usize;
     let mut busy = 0usize;
     for w in &p.workspaces {
@@ -504,6 +505,28 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
+        // Register the `p` project these tests seed against, so the board reads
+        // (`category_counts`, `workspace_idle_busy`) can resolve an `IssueStore`.
+        let projects = p.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("p.yaml"),
+            "name: p\n\
+repo: /tmp/p\n\
+default_branch: main\n\
+orchestrator:\n\
+\x20 runner: claude\n\
+agent_runners:\n\
+\x20 claude:\n\
+\x20\x20\x20 command: claude\n\
+\x20\x20\x20 flags: []\n\
+machines:\n\
+\x20 - name: local\n\
+\x20\x20\x20 kind: local\n\
+\x20\x20\x20 work_dir: /tmp/p\n\
+workspaces: []\n",
+        )
+        .unwrap();
         p
     }
 

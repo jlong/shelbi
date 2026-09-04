@@ -1107,10 +1107,25 @@ fn external_event_since(baseline: Option<SystemTime>) -> bool {
 /// quiescent, so a transient failure never accelerates the back-off past the
 /// standard cadence. Derived from the same `list_tasks` pass the payload makes.
 fn board_is_quiescent(project: &Project) -> bool {
-    let Ok(tasks) = shelbi_state::list_tasks(&project.name) else {
+    let Ok(tasks) = list_issues(project) else {
         return false;
     };
     tasks_are_quiescent(&tasks)
+}
+
+/// The whole board for `project`, read through its configured [`IssueStore`]
+/// (so a `github` backend is honored, not the local filesystem).
+fn list_issues(project: &Project) -> shelbi_core::Result<Vec<shelbi_state::IssueFile>> {
+    shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?.list()
+}
+
+/// Read one issue through the project's configured [`IssueStore`], mapping a
+/// missing issue to an error so callers keep the `Result<IssueFile>` shape the
+/// old `load_task` free function had (a missing card was an `Err` there too).
+fn load_issue(project: &Project, id: &str) -> shelbi_core::Result<shelbi_state::IssueFile> {
+    shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?
+        .get(id)?
+        .ok_or_else(|| shelbi_core::Error::Other(format!("issue `{id}` not found")))
 }
 
 /// Pure core of [`board_is_quiescent`]. Split out so unit tests can drive it
@@ -2251,7 +2266,7 @@ fn maybe_apply_ready_handoff(
     // Load the task up front so we can confirm we had a valid task at all.
     // If the load fails or the task isn't ours in-progress, we still fall
     // through to clear the (stale) marker.
-    let task_file = shelbi_state::load_task(&project.name, &task_id);
+    let task_file = load_issue(project, &task_id);
 
     match &task_file {
         Ok(tf)
@@ -2686,7 +2701,7 @@ fn maybe_apply_transition(
         }
     };
 
-    let task_file = shelbi_state::load_task(&project.name, &req.task_id);
+    let task_file = load_issue(project, &req.task_id);
     match &task_file {
         Ok(tf) if tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()) => {
             // Load the task's workflow; fall back to the built-in default
@@ -2710,18 +2725,21 @@ fn maybe_apply_transition(
                     to_status,
                     to_column,
                 } => {
-                    match shelbi_state::move_task_and_unassign(
-                        &project.name,
-                        &req.task_id,
-                        to_column,
-                    ) {
-                        Ok(Some((from, to, wf))) => {
+                    match shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+                        .and_then(|s| {
+                            s.move_status_and_unassign(
+                                &req.task_id,
+                                &to_column,
+                                "workspace:agent-transition",
+                            )
+                        }) {
+                        Ok(Some(mv)) => {
                             if let Err(e) = shelbi_state::append_task_event(
                                 &project.name,
                                 &req.task_id,
-                                &wf,
-                                from,
-                                to,
+                                &mv.workflow,
+                                mv.from,
+                                mv.to,
                                 "workspace:agent-transition",
                             ) {
                                 tracing::warn!(workspace = %workspace.name, task = %req.task_id, error = %e, "append_task_event failed");
@@ -2831,7 +2849,7 @@ fn rebase_workspace_branch_before_handoff(
     host: &shelbi_core::Host,
     task_id: &str,
 ) {
-    let task_file = match shelbi_state::load_task(&project.name, task_id) {
+    let task_file = match load_issue(project, task_id) {
         Ok(tf) => tf,
         Err(e) => {
             tracing::debug!(workspace = %workspace.name, task = %task_id, error = %e, "skip rebase: load_task failed");
@@ -2949,7 +2967,7 @@ fn push_workspace_branch_before_handoff(
     host: &shelbi_core::Host,
     task_id: &str,
 ) -> bool {
-    let task_file = match shelbi_state::load_task(&project.name, task_id) {
+    let task_file = match load_issue(project, task_id) {
         Ok(tf) => tf,
         Err(e) => {
             tracing::debug!(workspace = %workspace.name, task = %task_id, error = %e, "skip push: load_task failed");
@@ -3240,7 +3258,7 @@ fn redispatch_workspace(
     workspace: &shelbi_core::WorkspaceSpec,
     task_id: &str,
 ) -> std::result::Result<(), String> {
-    let tf = shelbi_state::load_task(&project.name, task_id).map_err(|e| e.to_string())?;
+    let tf = load_issue(project, task_id).map_err(|e| e.to_string())?;
     let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
         .map_err(|e| e.to_string())?;
     let branch =
@@ -3553,7 +3571,8 @@ fn maybe_resume_stranded_review_slots(
 /// review slot (its task still pinned to it on disk) from a genuinely idle
 /// one. Mirrors the `list_column(review)` scan the auto-loader uses.
 fn assigned_review_task_for(project: &Project, workspace_name: &str) -> Option<String> {
-    shelbi_state::list_column(&project.name, Column::review())
+    shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+        .and_then(|s| s.list_in_status(&Column::review()))
         .ok()?
         .into_iter()
         .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace_name))
@@ -3727,7 +3746,7 @@ fn emit_review_ready(
 
     // Title + review notes come from the task body; a load failure isn't fatal
     // to the signal (location alone is actionable).
-    let (title, notes) = match shelbi_state::load_task(&project.name, task_id) {
+    let (title, notes) = match load_issue(project, task_id) {
         Ok(tf) => (
             tf.task.title.clone(),
             shelbi_orchestrator::workspace::review_ready_notes(&tf.body),
@@ -3876,7 +3895,7 @@ fn maybe_reconcile_orphaned_pane(
 ) -> bool {
     // Read the board explicitly so a transient failure stays distinguishable
     // from a genuinely empty result — never reap on an unreadable board.
-    let Ok(tasks) = shelbi_state::list_tasks(&project.name) else {
+    let Ok(tasks) = list_issues(project) else {
         return false;
     };
     if !workspace_orphaned_by_board(project, workspace, &tasks) {
@@ -3955,7 +3974,8 @@ fn workspace_orphaned_by_board(
 }
 
 fn current_task_for(project: &Project, workspace_name: &str) -> Option<String> {
-    shelbi_state::list_tasks(&project.name)
+    shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+        .and_then(|s| s.list())
         .ok()?
         .into_iter()
         .find(|tf| {

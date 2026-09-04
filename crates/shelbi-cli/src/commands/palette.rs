@@ -1393,7 +1393,7 @@ fn active_work_projects(projects: &[ProjectSummary]) -> std::collections::HashSe
 /// (so a renamed custom `active` status still counts), falling back to the
 /// column's built-in category when the status isn't declared there.
 fn project_has_active_work(project: &str) -> bool {
-    let tasks = match shelbi_state::list_tasks(project) {
+    let tasks = match shelbi_state::issue_store_for(project).and_then(|s| s.list()) {
         Ok(t) => t,
         Err(_) => return false,
     };

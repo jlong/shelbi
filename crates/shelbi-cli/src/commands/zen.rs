@@ -40,7 +40,7 @@ use shelbi_core::{
 };
 use shelbi_orchestrator::zen::{self, CiVerdict, DryRunDecision};
 use shelbi_state::{
-    append_zen_dryrun_event, list_column, load_project, read_state, set_zen_mode, State,
+    append_zen_dryrun_event, load_project, read_state, set_zen_mode, State,
     ZenModeState,
 };
 
@@ -293,7 +293,11 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
         ZenCmd::Status => status(&project_name),
         ZenCmd::Probe { task_id } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
-            let tf = shelbi_state::load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let tf = shelbi_state::resolve_issue_store(&project_name, &project.issue_tracker)
+                .map_err(|e| anyhow!(e))?
+                .get(&task_id)
+                .map_err(|e| anyhow!(e))?
+                .ok_or_else(|| anyhow!("issue `{task_id}` not found"))?;
             // The workflow is part of the probe's durable provenance. A
             // missing or malformed definition must stop the flow instead of
             // silently substituting project defaults.
@@ -343,7 +347,11 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
         }
         ZenCmd::PrCreate { task_id, identity } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
-            let tf = shelbi_state::load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let tf = shelbi_state::resolve_issue_store(&project_name, &project.issue_tracker)
+                .map_err(|e| anyhow!(e))?
+                .get(&task_id)
+                .map_err(|e| anyhow!(e))?
+                .ok_or_else(|| anyhow!("issue `{task_id}` not found"))?;
             let identity = identity.into_pinned_identity();
             match zen::pr_create_at_head(&project, &project_name, &tf.task, &tf.body, &identity) {
                 Ok(pr) => {
@@ -378,7 +386,11 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
                     // default. Errors (missing task, malformed YAML)
                     // silently fall back to the project default.
                     let workflow = task.as_deref().and_then(|tid| {
-                        let tf = shelbi_state::load_task(&project_name, tid).ok()?;
+                        let tf = shelbi_state::issue_store_for(&project_name)
+                            .ok()?
+                            .get(tid)
+                            .ok()
+                            .flatten()?;
                         load_workflow_for_task(&project_name, &tf.task)
                     });
                     ci_timeout_for_workflow(&project, workflow.as_ref())
@@ -593,7 +605,9 @@ fn load_workflow_for_task(project: &str, task: &Issue) -> Option<Workflow> {
 }
 
 fn count_in_flight_zen(project: &str, mode: ZenModeState) -> Result<usize> {
-    let tasks = list_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
+    let tasks = shelbi_state::issue_store_for(project)
+        .and_then(|s| s.list_in_status(&Column::in_progress()))
+        .map_err(|e| anyhow!(e))?;
     Ok(tasks
         .iter()
         .filter(|tf| zen_applies(&tf.task, mode))

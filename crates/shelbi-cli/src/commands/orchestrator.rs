@@ -921,7 +921,8 @@ struct ProjectScope {
 
 impl ProjectScope {
     fn load(project: &str) -> Result<Self> {
-        let task_ids = shelbi_state::list_tasks(project)
+        let task_ids = shelbi_state::issue_store_for(project)
+            .and_then(|s| s.list())
             .map_err(|e| anyhow!(e))?
             .into_iter()
             .map(|tf| tf.task.id)
@@ -1140,8 +1141,32 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::env::remove_var("SHELBI_HOME");
         std::env::set_var("SHELBI_ROOT", tmp.path());
+        // Register the `demo` project these tests seed against, so the
+        // project-scope board read (`ProjectScope::load`) can resolve an
+        // `IssueStore` for it (the migrated path loads the project config).
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("demo.yaml"), DEMO_PROJECT_YAML).unwrap();
         (guard, TestHome { _tmp: tmp })
     }
+
+    /// Minimal parseable project registration for the `demo` fixture — enough
+    /// for `load_project` + `resolve_issue_store` (defaulting to the
+    /// `file_system` backend) to succeed.
+    const DEMO_PROJECT_YAML: &str = "name: demo\n\
+repo: /tmp/demo\n\
+default_branch: main\n\
+orchestrator:\n\
+\x20 runner: claude\n\
+agent_runners:\n\
+\x20 claude:\n\
+\x20\x20\x20 command: claude\n\
+\x20\x20\x20 flags: []\n\
+machines:\n\
+\x20 - name: local\n\
+\x20\x20\x20 kind: local\n\
+\x20\x20\x20 work_dir: /tmp/demo\n\
+workspaces: []\n";
 
     fn save_demo_task(project: &str, id: &str) {
         save_demo_task_in_column(project, id, Column::todo());

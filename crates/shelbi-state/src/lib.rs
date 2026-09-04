@@ -48,12 +48,14 @@ pub use issue_auth::{
     resolve_github_token, resolve_github_token_by_name, token_file_path, SecretToken, TokenSource,
 };
 pub use github_store::GitHubStore;
+#[cfg(any(test, feature = "test-support"))]
+pub use github_store::{clear_test_gh_runner, set_test_gh_runner};
 pub use issue_migrate::{
     apply_issue_migration, plan_issue_migration, IssueMigrationPlan,
 };
 pub use issue_store::{
-    resolve_issue_store, Cursor, FileSystemStore, IssueChange, IssueComment, IssueFields,
-    IssueStore, NewIssue, PrioMove, StatusMove,
+    issue_store_for, resolve_issue_store, Cursor, FileSystemStore, IssueChange, IssueComment,
+    IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
 };
 pub use project_paths::ProjectPaths;
 pub use root::{
@@ -2219,7 +2221,11 @@ pub fn save_agent(project: &str, agent: &Agent, body_md: &str) -> Result<()> {
 }
 
 /// Render a `---\n<yaml>\n---\n<body>` file. Caller owns the path/dir.
-fn write_frontmatter_file<T: serde::Serialize>(path: &Path, front: &T, body: &str) -> Result<()> {
+/// Render `front` (serialized as YAML) plus `body` into the frontmatter-file
+/// text — `---\n<yaml>\n---\n<body>\n` — the exact bytes [`write_frontmatter_file`]
+/// persists. Factored out so display paths can produce the on-disk
+/// representation without touching the filesystem (see [`render_task_file`]).
+fn render_frontmatter<T: serde::Serialize>(front: &T, body: &str) -> Result<String> {
     let yaml = serde_yaml::to_string(front)?;
     let mut buf = String::with_capacity(yaml.len() + body.len() + 32);
     buf.push_str("---\n");
@@ -2232,7 +2238,21 @@ fn write_frontmatter_file<T: serde::Serialize>(path: &Path, front: &T, body: &st
     if !body.ends_with('\n') {
         buf.push('\n');
     }
+    Ok(buf)
+}
+
+fn write_frontmatter_file<T: serde::Serialize>(path: &Path, front: &T, body: &str) -> Result<()> {
+    let buf = render_frontmatter(front, body)?;
     atomic_write(path, buf.as_bytes())
+}
+
+/// Render an [`IssueFile`] to its markdown-with-frontmatter representation —
+/// the same bytes [`save_task`] writes to disk. Display paths (e.g.
+/// `shelbi issue show`) use this to render an issue fetched from *any* backend
+/// through the [`crate::IssueStore`] seam, rather than reading the local task
+/// file directly (which a `github` backend never writes).
+pub fn render_task_file(tf: &IssueFile) -> Result<String> {
+    render_frontmatter(&tf.task, &tf.body)
 }
 
 /// Parsed result of an agent file.
@@ -2945,6 +2965,101 @@ pub fn park_review_task(project: &str, id: &str) -> Result<Option<String>> {
     Ok(was)
 }
 
+// ---------------------------------------------------------------------------
+// Local workspace-assignment overlay
+//
+// `assigned_to` is ephemeral local routing — which workspace currently owns an
+// issue — not durable board state. The filesystem backend stores it inline in
+// the task frontmatter, but a remote backend (GitHub) deliberately does NOT
+// push assignment to the tracker (plan §3): it is a shelbi-daemon concern, not
+// something a github.com viewer should see. So a backend that can't (or won't)
+// persist assignment on the remote keeps it here instead — a per-task marker
+// file under `<project_dir>/assignments/<id>` holding the workspace name.
+//
+// This keeps board state on the remote while the active-workspace, conflict,
+// and supervision scans (which all read `assigned_to` off a stored issue) still
+// recover which workspace owns a card. The filesystem backend never touches
+// these — its assignment lives in the frontmatter — so the overlay is exercised
+// only by the GitHub (and future remote) backends.
+
+/// Directory of workspace-assignment markers for `project`
+/// (`<project_dir>/assignments/`). Each file named `<task-id>` holds the name
+/// of the workspace that currently owns the issue.
+fn assignments_dir(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("assignments"))
+}
+
+/// Marker path for a single issue's assignment. Validates the id so a
+/// hostile/synced id can't escape the project's `assignments/` directory.
+fn assignment_marker_path(project: &str, id: &str) -> Result<PathBuf> {
+    validate_task_id(id)?;
+    Ok(assignments_dir(project)?.join(id))
+}
+
+/// Set (or clear) the local workspace assignment for `id`. `Some(ws)` records
+/// the owning workspace; `None` (or an empty name) removes the marker. Used by
+/// backends that don't persist `assigned_to` on the remote (GitHub). Idempotent.
+pub fn set_task_assignment(project: &str, id: &str, workspace: Option<&str>) -> Result<()> {
+    let path = assignment_marker_path(project, id)?;
+    match workspace.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(ws) => {
+            ensure_dir(&assignments_dir(project)?)?;
+            atomic_write(&path, ws.as_bytes())
+        }
+        None => match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(shelbi_core::Error::Io(e)),
+        },
+    }
+}
+
+/// The workspace `id` is assigned to in the local overlay, or `None` when the
+/// marker is absent or empty. The single-issue read backends apply on `get`.
+pub fn get_task_assignment(project: &str, id: &str) -> Result<Option<String>> {
+    let path = assignment_marker_path(project, id)?;
+    match fs::read_to_string(&path) {
+        Ok(s) => {
+            let s = s.trim();
+            Ok((!s.is_empty()).then(|| s.to_string()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
+/// Every local assignment for `project` as an `id -> workspace` map. A missing
+/// directory → empty map. Backends apply this once per board `list` so a
+/// whole-board read doesn't stat a marker file per issue.
+pub fn task_assignments(project: &str) -> Result<BTreeMap<String, String>> {
+    let dir = assignments_dir(project)?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    let mut out = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.map_err(shelbi_core::Error::Io)?;
+        let Some(id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        // The directory is enumerated concurrently with `atomic_write`, which
+        // stages each marker under a `<id>.tmp.<pid>.<seq>` sibling before the
+        // rename. A bulk read that hands those transient names (or any other
+        // stray file) to `get_task_assignment` would fail `validate_task_id`
+        // with `InvalidAgentId` mid-write — a spurious, racy error. Only names
+        // that are valid task ids can be real markers, so skip everything else.
+        if validate_task_id(&id).is_err() {
+            continue;
+        }
+        if let Some(ws) = get_task_assignment(project, &id)? {
+            out.insert(id, ws);
+        }
+    }
+    Ok(out)
+}
+
 /// Marked-up header the review interface's **Reject** action appends to a
 /// task body before bouncing it back for rework. Kept as a `##` section so
 /// the next worker reads the feedback as part of the task requirements, not
@@ -2977,28 +3092,47 @@ pub fn reject_review_task(
     reason: &str,
     date: &str,
 ) -> Result<Option<(Column, Column, String)>> {
+    // Resolve the ready status the card bounces to from the task's workflow;
+    // fall back to the stock `todo` column if the workflow can't be loaded or
+    // declares no ready status, so a config hiccup still frees the slot. This
+    // read happens outside the write lock — the parametrized helper below takes
+    // it — but a racing workflow-config edit only ever moves the target column,
+    // which the locked helper then applies atomically.
+    let task = load_task(project, id)?.task;
+    let ready_column = load_project(project)
+        .ok()
+        .and_then(|p| load_task_workflow(project, &p, &task).ok())
+        .and_then(|wf| wf.ready_status().map(|s| Column::from_status_id(&s.id)))
+        .unwrap_or_else(Column::todo);
+    reject_review_task_to(project, id, &ready_column, reason, date)
+}
+
+/// The lock-holding core of [`reject_review_task`], with the `ready` column
+/// resolved by the caller rather than re-derived from the workflow. This is the
+/// backend-agnostic shape [`crate::FileSystemStore::reject_review`] delegates to:
+/// the [`IssueStore`] seam resolves `ready` from the issue's workflow (mirroring
+/// how the accept path resolves its forward target) and hands it in, so the
+/// store never has to load the workflow config itself.
+pub fn reject_review_task_to(
+    project: &str,
+    id: &str,
+    ready: &Column,
+    reason: &str,
+    date: &str,
+) -> Result<Option<(Column, Column, String)>> {
     hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
     let IssueFile { mut task, body } = load_task(project, id)?;
     let old_column = task.column.clone();
     let workflow = resolved_task_workflow_name_for_project(project, &task)?;
 
-    // Resolve the ready status the card bounces to from the task's workflow;
-    // fall back to the stock `todo` column if the workflow can't be loaded or
-    // declares no ready status, so a config hiccup still frees the slot.
-    let ready_column = load_project(project)
-        .ok()
-        .and_then(|p| load_task_workflow(project, &p, &task).ok())
-        .and_then(|wf| wf.ready_status().map(|s| Column::from_status_id(&s.id)))
-        .unwrap_or_else(Column::todo);
-
     let new_body = format!("{}{}", body, format_review_feedback_section(reason, date));
 
-    let already_ready = old_column == ready_column;
+    let already_ready = old_column == *ready;
     task.assigned_to = None;
     if !already_ready {
-        task.column = ready_column.clone();
-        task.priority = list_column(project, ready_column.clone())?.len() as u32;
+        task.column = ready.clone();
+        task.priority = list_column(project, ready.clone())?.len() as u32;
     }
     task.updated_at = chrono::Utc::now();
     save_task_unlocked(project, &task, &new_body)?;
@@ -3006,8 +3140,8 @@ pub fn reject_review_task(
         return Ok(None);
     }
     renumber_column_unlocked(project, old_column.clone())?;
-    renumber_column_unlocked(project, ready_column.clone())?;
-    Ok(Some((old_column, ready_column, workflow)))
+    renumber_column_unlocked(project, ready.clone())?;
+    Ok(Some((old_column, ready.clone(), workflow)))
 }
 
 /// Re-position `id` to slot `new_priority` within its current column. Other
@@ -3927,6 +4061,112 @@ mod tests {
         clear_task_parked("p", "fix-docs").unwrap();
         assert_eq!(park_review_task("p", "fix-docs").unwrap(), None);
         assert!(is_task_parked("p", "fix-docs").unwrap());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn assignment_overlay_sets_reads_clears_and_lists() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Absent marker reads as unassigned.
+        assert_eq!(get_task_assignment("p", "a").unwrap(), None);
+        assert!(task_assignments("p").unwrap().is_empty());
+
+        // Set two, read them back, and see them in the bulk map.
+        set_task_assignment("p", "a", Some("alpha")).unwrap();
+        set_task_assignment("p", "b", Some("beta")).unwrap();
+        assert_eq!(get_task_assignment("p", "a").unwrap().as_deref(), Some("alpha"));
+        let all = task_assignments("p").unwrap();
+        assert_eq!(all.get("a").map(String::as_str), Some("alpha"));
+        assert_eq!(all.get("b").map(String::as_str), Some("beta"));
+
+        // An empty/whitespace workspace clears the marker rather than storing it.
+        set_task_assignment("p", "a", Some("   ")).unwrap();
+        assert_eq!(get_task_assignment("p", "a").unwrap(), None);
+
+        // Explicit clear is idempotent.
+        set_task_assignment("p", "b", None).unwrap();
+        set_task_assignment("p", "b", None).unwrap();
+        assert_eq!(get_task_assignment("p", "b").unwrap(), None);
+        assert!(task_assignments("p").unwrap().is_empty());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn task_assignments_skips_atomic_write_temp_markers() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // One real marker plus a stray temp sibling shaped exactly like the one
+        // `atomic_write` stages mid-rename (`<id>.tmp.<pid>.<seq>`). The temp
+        // name is not a valid task id, so a naive bulk read would blow up with
+        // `InvalidAgentId`; the enumeration must skip it instead.
+        set_task_assignment("p", "real-task", Some("alpha")).unwrap();
+        let dir = assignments_dir("p").unwrap();
+        atomic_write(&dir.join("real-task.tmp.12345.0"), b"beta").unwrap();
+        // A leftover temp for an id that has no committed marker at all.
+        atomic_write(&dir.join("ghost.tmp.99999.7"), b"gamma").unwrap();
+
+        let all = task_assignments("p").unwrap();
+        assert_eq!(all.get("real-task").map(String::as_str), Some("alpha"));
+        assert_eq!(all.len(), 1, "only the valid marker is returned: {all:?}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn task_assignments_is_race_safe_against_concurrent_atomic_writes() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Seed a marker so the directory exists and the bulk read has real work.
+        set_task_assignment("p", "seed", Some("alpha")).unwrap();
+        ensure_dir(&assignments_dir("p").unwrap()).unwrap();
+
+        // A writer thread hammers `set_task_assignment`, which stages temp files
+        // under `assignments/` before each rename. `SHELBI_HOME` is already set
+        // process-wide, so the thread inherits it without touching the env.
+        // Concurrently the main thread enumerates the overlay; every read must
+        // succeed regardless of which transient temp files are visible mid-write.
+        let writer = std::thread::spawn(move || {
+            for i in 0..200 {
+                let id = format!("t{}", i % 8);
+                set_task_assignment("p", &id, Some("beta")).unwrap();
+            }
+        });
+
+        for _ in 0..400 {
+            // Must never return Err(InvalidAgentId) even while temps exist.
+            task_assignments("p").expect("bulk read stays valid mid-write");
+        }
+        writer.join().unwrap();
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn render_task_file_matches_the_on_disk_representation() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A normally-saved task's `render_task_file` output is byte-identical to
+        // the file `save_task` wrote — so `shelbi issue show` renders the same
+        // text from the store as it used to read from disk, for any backend.
+        let mut task = make_task("do-thing", Column::todo(), 0);
+        task.branch = Some("jlong/do-thing".to_string());
+        let body = "# Do the thing\n\nSome prose.\n";
+        save_task("p", &task, body).unwrap();
+
+        let on_disk = read_to_string_at(&task_path("p", "do-thing").unwrap()).unwrap();
+        let tf = load_task("p", "do-thing").unwrap();
+        assert_eq!(render_task_file(&tf).unwrap(), on_disk);
 
         std::env::remove_var("SHELBI_HOME");
     }

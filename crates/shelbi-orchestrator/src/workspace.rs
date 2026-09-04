@@ -283,7 +283,11 @@ pub fn probe_review_slot_serving(
 ) -> Option<ReviewServing> {
     let machine = project.machine(&workspace.machine)?;
     let host = machine.host();
-    let tf = shelbi_state::load_task(&project.name, task_id).ok()?;
+    let tf = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+        .ok()?
+        .get(task_id)
+        .ok()
+        .flatten()?;
     let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task).ok()?;
     let port = workspace.slot.and_then(|s| u16::try_from(s).ok());
     let recipe = workflow.resolved_review_recipe(port)?;
@@ -4556,7 +4560,11 @@ fn resolve_handoff_base_branch(project: &Project, task_id: &str) -> String {
 /// workflow can't be loaded, the workflow has no `git.base_branch`, or a
 /// placeholder in it can't be resolved from the task's params.
 fn resolve_workflow_base_branch(project: &Project, task_id: &str) -> Option<String> {
-    let task_file = shelbi_state::load_task(&project.name, task_id).ok()?;
+    let task_file = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+        .ok()?
+        .get(task_id)
+        .ok()
+        .flatten()?;
     let workflow = shelbi_state::load_task_workflow(&project.name, project, &task_file.task).ok()?;
     workflow
         .resolve_git(&task_file.task.string_params())
@@ -4672,7 +4680,11 @@ fn review_dispatch_extras(
 /// render it as a prompt section — or `None` when there's no recipe (diff-only)
 /// or the task/workflow can't be loaded.
 fn review_recipe_section(project: &Project, task_id: &str, port: Option<u16>) -> Option<String> {
-    let tf = shelbi_state::load_task(&project.name, task_id).ok()?;
+    let tf = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+        .ok()?
+        .get(task_id)
+        .ok()
+        .flatten()?;
     let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task).ok()?;
     let recipe = workflow.resolved_review_recipe(port)?;
     Some(render_review_recipe_section(&recipe))

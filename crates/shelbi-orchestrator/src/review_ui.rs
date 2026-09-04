@@ -239,7 +239,10 @@ fn review_window_active(session: &str, window: &str) -> bool {
 /// window is never reshaped — a review load adds a panel only to its own window.
 pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<ReviewOpenOutcome> {
     let project = shelbi_state::load_project(project_name)?;
-    let tf = shelbi_state::load_task(project_name, task_id)?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let tf = store
+        .get(task_id)?
+        .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
 
     // Is the task loaded on a *review* workspace (Ready), or still queued?
     let review_ws = tf
@@ -391,7 +394,10 @@ pub fn focus_dashboard(project_name: &str) -> Result<()> {
 /// created lazily on the first [`ReviewMidView::Editor`] request.
 pub fn show_review_view(project_name: &str, task_id: &str, view: ReviewMidView) -> Result<()> {
     let project = shelbi_state::load_project(project_name)?;
-    let tf = shelbi_state::load_task(project_name, task_id)?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let tf = store
+        .get(task_id)?
+        .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
     let ws = tf
         .task
         .assigned_to
@@ -445,7 +451,8 @@ pub fn show_review_view(project_name: &str, task_id: &str, view: ReviewMidView) 
 /// "nothing to recover".
 fn review_window_name(project_name: &str, task_id: &str) -> Option<String> {
     let project = shelbi_state::load_project(project_name).ok()?;
-    let tf = shelbi_state::load_task(project_name, task_id).ok()?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker).ok()?;
+    let tf = store.get(task_id).ok().flatten()?;
     let name = tf
         .task
         .assigned_to
@@ -813,7 +820,10 @@ fn review_panel_cmd(shelbi_bin: &str, project_name: &str, task_id: &str) -> Stri
 /// move — the teardown half is [`close_review_window`], called by the caller.
 pub fn approve_review_task(project_name: &str, task_id: &str) -> Result<()> {
     let project = shelbi_state::load_project(project_name)?;
-    let tf = shelbi_state::load_task(project_name, task_id)?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let tf = store
+        .get(task_id)?
+        .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
     let workflow = shelbi_state::load_task_workflow(project_name, &project, &tf.task)
         .unwrap_or_else(|_| shelbi_core::default_workflow());
     let from_status = tf.task.column.as_str().to_string();
@@ -848,8 +858,15 @@ pub fn approve_review_task(project_name: &str, task_id: &str) -> Result<()> {
     )?
     .is_some();
 
-    if let Some((from, to, wf)) = shelbi_state::move_task(project_name, task_id, target)? {
-        let _ = shelbi_state::append_task_event(project_name, task_id, &wf, from, to, "user:review");
+    if let Some(mv) = store.move_status(task_id, &target, "user:review")? {
+        let _ = shelbi_state::append_task_event(
+            project_name,
+            task_id,
+            &mv.workflow,
+            mv.from,
+            mv.to,
+            "user:review",
+        );
     }
 
     // Fire the edge's remaining actions (delete_branch, …) after the move,
@@ -891,7 +908,10 @@ pub fn approve_review_task(project_name: &str, task_id: &str) -> Result<()> {
 /// other review windows and the dashboard sidebar are left alone.
 pub fn close_review_window(project_name: &str, task_id: &str) -> Result<()> {
     let project = shelbi_state::load_project(project_name)?;
-    let tf = shelbi_state::load_task(project_name, task_id)?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let tf = store
+        .get(task_id)?
+        .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
     let Some(ws) = tf
         .task
         .assigned_to
@@ -921,17 +941,31 @@ pub fn close_review_window(project_name: &str, task_id: &str) -> Result<()> {
 /// task description. Emits the move event on the existing channel — the
 /// structured signal the orchestrator reacts to — with the reason durably in
 /// the task body rather than a transient message.
-pub fn reject_review_task(project_name: &str, task_id: &str, reason: &str) -> Result<()> {
+pub fn reject_review(project_name: &str, task_id: &str, reason: &str) -> Result<()> {
     let date = Utc::now().format("%Y-%m-%d").to_string();
-    if let Some((from, to, wf)) =
-        shelbi_state::reject_review_task(project_name, task_id, reason, &date)?
-    {
+    let project = shelbi_state::load_project(project_name)?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let tf = store
+        .get(task_id)?
+        .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
+
+    // Resolve the ready status the card bounces back to from its workflow — the
+    // reject mirror of the accept path's `forward_status`. Fall back to the
+    // stock `todo` column when the workflow can't be loaded or declares no ready
+    // status, so a config hiccup still frees the review slot. Resolving `ready`
+    // here (not in the store) keeps the workflow layer out of the backend.
+    let ready = shelbi_state::load_task_workflow(project_name, &project, &tf.task)
+        .ok()
+        .and_then(|wf| wf.ready_status().map(|s| Column::from_status_id(&s.id)))
+        .unwrap_or_else(Column::todo);
+
+    if let Some(mv) = store.reject_review(task_id, &ready, reason, &date)? {
         let _ = shelbi_state::append_task_event(
             project_name,
             task_id,
-            &wf,
-            from,
-            to,
+            &mv.workflow,
+            mv.from,
+            mv.to,
             "user:review-reject",
         );
     }
