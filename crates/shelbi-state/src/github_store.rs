@@ -60,9 +60,13 @@
 //!
 //! One shelbi issue ⇔ one GitHub issue:
 //!
-//! * **id** — the `shelbi:id/<slug>` label (the round-trip anchor). An issue
-//!   with no such label falls back to its issue number as the id, so a repo
-//!   that has not been migrated still renders.
+//! * **id** — the `shelbi:id/<slug>` label (the round-trip anchor). GitHub
+//!   caps a label at 50 chars, so an id whose label would overflow is anchored
+//!   under a truncated `shelbi:id/<slug>-<hash8>` label and carries its full id
+//!   in the metadata block; the read path prefers that block, falling back to
+//!   the label, then the issue number for an un-migrated issue. Because the
+//!   label stays a deterministic function of the id, `get(id)` still resolves
+//!   with a single server-side `labels=` query.
 //! * **status** — the `shelbi:status/<id>` label. A *closed* issue always maps
 //!   to a terminal status (`done`, or `canceled` when GitHub's `state_reason`
 //!   is `not_planned`), so closing an issue on github.com reads as a terminal
@@ -102,6 +106,12 @@ use shelbi_core::Issue;
 const ID_LABEL_PREFIX: &str = "shelbi:id/";
 /// Label prefix carrying an issue's shelbi status (`shelbi:status/<id>`).
 const STATUS_LABEL_PREFIX: &str = "shelbi:status/";
+/// GitHub's hard cap on a label name (`name is too long (maximum is 50
+/// characters)`, HTTP 422). The id anchor label must fit inside this.
+const GITHUB_LABEL_MAX: usize = 50;
+/// Byte budget for the truncated slug in a long id's anchor label:
+/// `50 - 10 (prefix) - 1 (separator) - 8 (hash) = 31`.
+const ID_SLUG_BUDGET: usize = GITHUB_LABEL_MAX - ID_LABEL_PREFIX.len() - 1 - 8;
 /// Opening marker of the fenced shelbi-metadata block in an issue body.
 const META_BEGIN: &str = "<!-- shelbi:begin -->";
 /// Closing marker of the fenced shelbi-metadata block in an issue body.
@@ -267,7 +277,7 @@ impl IssueStore for GitHubStore {
     fn get(&self, id: &str) -> Result<Option<IssueFile>> {
         shelbi_core::validate_task_id(id)?;
         let path = format!("repos/{}/issues", self.repo);
-        let label = format!("labels={ID_LABEL_PREFIX}{id}");
+        let label = format!("labels={}", id_label(id));
         let issues = self.api_issues(
             &path,
             &["-f", "state=all", "-f", &label, "-f", "per_page=100"],
@@ -301,19 +311,26 @@ impl IssueStore for GitHubStore {
             None => self.list_in_status(&spec.column)?.len() as u32,
         };
 
-        let id_label = format!("{ID_LABEL_PREFIX}{}", spec.id);
+        let id_anchor = id_label(&spec.id);
         let status_label = status_label_name(&spec.column);
         // Auto-create every label this write applies (id + the status set) so a
         // fresh repo bootstraps without a separate provisioning step.
-        self.ensure_labels(&self.bootstrap_labels(&[id_label.clone(), status_label.clone()]))?;
+        self.ensure_labels(&self.bootstrap_labels(&[id_anchor.clone(), status_label.clone()]))?;
 
-        let meta = meta_from_new(&spec, priority);
+        let mut meta = meta_from_new(&spec, priority);
+        // When the anchor label had to be truncated to fit GitHub's 50-char cap
+        // it no longer carries the full id, so stamp the authoritative id into
+        // the body block for a lossless read-back. A short id round-trips
+        // through its verbatim label alone, so its body stays unchanged.
+        if id_is_truncated(&spec.id) {
+            meta.id = Some(spec.id.clone());
+        }
         let body = build_body(&spec.body, &meta);
 
         let fields = vec![
             ("title", spec.title.clone()),
             ("body", body),
-            ("labels[]", id_label),
+            ("labels[]", id_anchor),
             ("labels[]", status_label),
         ];
         let out = self.api_send("POST", &format!("repos/{}/issues", self.repo), &fields)?;
@@ -698,7 +715,7 @@ impl GitHubStore {
     fn get_raw(&self, id: &str) -> Result<Option<GhIssue>> {
         shelbi_core::validate_task_id(id)?;
         let path = format!("repos/{}/issues", self.repo);
-        let label = format!("labels={ID_LABEL_PREFIX}{id}");
+        let label = format!("labels={}", id_label(id));
         let issues = self.api_issues(
             &path,
             &["-f", "state=all", "-f", &label, "-f", "per_page=100"],
@@ -878,13 +895,35 @@ fn run_gh(project: &str, args: &[&str]) -> Result<String> {
             stderr: e.to_string(),
         })?;
     if !output.status.success() {
+        // `gh api` prints the API's JSON error body — the field-level reason,
+        // e.g. `name is too long (maximum is 50 characters)` — to *stdout* and
+        // only a terse one-liner to stderr. Capturing stderr alone drops the
+        // actionable half, so combine both: the response body is what makes an
+        // `external command failed` self-diagnosing.
+        let detail = combine_gh_error_detail(
+            &String::from_utf8_lossy(&output.stderr),
+            &String::from_utf8_lossy(&output.stdout),
+        );
         return Err(Error::Command {
             cmd: format!("gh {}", args.join(" ")),
             status: output.status.to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stderr: detail,
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Merge a failed `gh` invocation's `stderr` and `stdout` into one diagnostic
+/// string for [`Error::Command`]. `gh api` writes the terse status line to
+/// stderr and the rich JSON error body (the field-level reason) to stdout, so
+/// both halves matter; either may be empty. When both carry text they are
+/// joined with a newline, stderr first (the summary), stdout second (the body).
+fn combine_gh_error_detail(stderr: &str, stdout: &str) -> String {
+    match (stderr.trim().is_empty(), stdout.trim().is_empty()) {
+        (false, false) => format!("{}\n{}", stderr.trim_end(), stdout.trim_end()),
+        (true, false) => stdout.trim_end().to_string(),
+        _ => stderr.to_string(),
+    }
 }
 
 /// Parse a `--jq '.[]'` stream (one JSON object per line) into a vec, skipping
@@ -955,9 +994,16 @@ impl GhIssue {
         self.pull_request.is_some()
     }
 
-    /// The stable shelbi id: the `shelbi:id/<slug>` label if present, else the
-    /// issue number as a string (so an un-migrated repo still renders).
-    fn shelbi_id(&self) -> String {
+    /// The stable shelbi id, in resolution order: the authoritative `id` in the
+    /// parsed metadata block (set when the anchor label was truncated) wins;
+    /// else the `shelbi:id/<slug>` label, prefix-stripped (the anchor for a
+    /// short id); else the issue number as a string (so an un-migrated repo
+    /// still renders). Takes the already-parsed `meta` so the body isn't split
+    /// twice.
+    fn resolve_id(&self, meta: &ShelbiMeta) -> String {
+        if let Some(id) = &meta.id {
+            return id.clone();
+        }
         self.labels
             .iter()
             .find_map(|l| l.name.strip_prefix(ID_LABEL_PREFIX))
@@ -1019,7 +1065,7 @@ impl GhIssue {
         let body_raw = self.body.clone().unwrap_or_default();
         let (prose, meta) = split_shelbi_meta(&body_raw);
         let column = self.column();
-        let id = self.shelbi_id();
+        let id = self.resolve_id(&meta);
 
         let task = Issue {
             id,
@@ -1102,6 +1148,63 @@ fn status_label_name(col: &Column) -> String {
     format!("{STATUS_LABEL_PREFIX}{}", col.as_str())
 }
 
+/// The `shelbi:id/<…>` anchor label for a shelbi id, kept within GitHub's
+/// 50-char label cap.
+///
+/// A short id (`prefix + id <= 50`) is used verbatim, so a repo already
+/// migrated under short ids keeps byte-identical anchors — no churn. A long id
+/// is truncated to a [`ID_SLUG_BUDGET`]-byte slug plus a stable 8-hex-char hash
+/// (`shelbi:id/<slug>-<hash8>`). The label stays a pure function of the id
+/// (recomputable for the server-side `labels=` query without fetching), and two
+/// ids sharing their first 31 bytes are disambiguated by the hash. When the
+/// label is truncated the authoritative id no longer lives in the label, so the
+/// caller carries it in the body metadata block (`ShelbiMeta::id`) for a
+/// lossless read-back — see [`id_is_truncated`].
+fn id_label(id: &str) -> String {
+    if ID_LABEL_PREFIX.len() + id.len() <= GITHUB_LABEL_MAX {
+        return format!("{ID_LABEL_PREFIX}{id}");
+    }
+    let slug = truncate_on_char_boundary(id, ID_SLUG_BUDGET);
+    let hash = fnv1a64(id) as u32;
+    format!("{ID_LABEL_PREFIX}{slug}-{hash:08x}")
+}
+
+/// True when [`id_label`] had to truncate — i.e. the anchor label is no longer
+/// the full id and the id must be carried in the body metadata block instead.
+fn id_is_truncated(id: &str) -> bool {
+    ID_LABEL_PREFIX.len() + id.len() > GITHUB_LABEL_MAX
+}
+
+/// The longest prefix of `s` that fits in `max_bytes` without splitting a
+/// multi-byte char. Ids are ASCII slugs today, but a char-boundary walk means a
+/// hand-authored non-ASCII id truncates cleanly rather than panicking.
+fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// FNV-1a 64-bit hash of `id`. Hand-rolled (not
+/// [`std::collections::hash_map::DefaultHasher`], which is explicitly *not*
+/// stable across releases) so the same id yields the same anchor label in this
+/// build and every future one — the property the round-trip depends on. The
+/// caller renders the low 32 bits as 8 hex chars.
+fn fnv1a64(id: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 /// A stable label colour (6 hex digits, no `#`) for a managed shelbi label. The
 /// stock status labels get distinct hues so the GitHub label list reads as a
 /// board; the id anchor and any custom status share a neutral grey. Cosmetic
@@ -1121,6 +1224,8 @@ fn label_color(name: &str) -> &'static str {
 /// Build a [`ShelbiMeta`] from a creation spec, stamping the resolved priority.
 fn meta_from_new(spec: &NewIssue, priority: u32) -> ShelbiMeta {
     ShelbiMeta {
+        // Stamped by the caller (`add`) only when the anchor label is truncated.
+        id: None,
         workflow: spec.workflow.clone(),
         branch: spec.branch.clone(),
         depends_on: spec.depends_on.clone(),
@@ -1170,6 +1275,12 @@ fn parse_json_object<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T> {
 /// [`Issue::params`] so a newer binary's fields survive an older read.
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct ShelbiMeta {
+    /// The authoritative shelbi id, carried here only when the `shelbi:id/*`
+    /// anchor label had to be truncated to fit GitHub's 50-char cap (a short id
+    /// round-trips through the label alone, so it is omitted). The read path
+    /// prefers this over the label — see [`GhIssue::resolve_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workflow: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2045,5 +2156,139 @@ mod tests {
         let plain = build_body("Just prose.", &ShelbiMeta::default());
         assert!(!plain.contains(META_BEGIN));
         assert_eq!(plain.trim(), "Just prose.");
+    }
+
+    // --- id-label truncation (GitHub's 50-char label cap) --------------------
+
+    #[test]
+    fn id_label_short_id_is_verbatim_and_unchanged() {
+        // A short id (prefix + id <= 50) keeps its exact current anchor, so a
+        // repo already migrated under short ids sees no churn.
+        assert_eq!(id_label("do-thing"), "shelbi:id/do-thing");
+        assert!(!id_is_truncated("do-thing"));
+
+        // Exactly at the boundary: a 40-char id → a 50-char label, still verbatim.
+        let id40 = "a".repeat(40);
+        assert_eq!(id40.len(), 40);
+        let label = id_label(&id40);
+        assert_eq!(label, format!("shelbi:id/{id40}"));
+        assert_eq!(label.len(), GITHUB_LABEL_MAX);
+        assert!(!id_is_truncated(&id40));
+    }
+
+    #[test]
+    fn id_label_long_id_truncates_within_the_cap() {
+        // One over the boundary: a 41-char id would make a 51-char label, so it
+        // is truncated to a 31-byte slug plus an 8-hex-char hash.
+        let id41 = "b".repeat(41);
+        assert!(id_is_truncated(&id41));
+        let label = id_label(&id41);
+        assert!(
+            label.len() <= GITHUB_LABEL_MAX,
+            "label exceeds the cap: {label} ({} chars)",
+            label.len()
+        );
+        assert!(label.starts_with(ID_LABEL_PREFIX));
+        // slug is the first 31 bytes of the id.
+        assert!(label.starts_with(&format!("{ID_LABEL_PREFIX}{}-", &id41[..ID_SLUG_BUDGET])));
+        // The tail is 8 lowercase hex digits.
+        let tail = label.rsplit('-').next().unwrap();
+        assert_eq!(tail.len(), 8);
+        assert!(tail.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // The real longest-id class from the migration also fits.
+        let long = "review-load-retry-loop-when-branch-is-checked-out-in-another-worktree";
+        assert!(id_label(long).len() <= GITHUB_LABEL_MAX);
+    }
+
+    #[test]
+    fn ids_sharing_their_first_31_chars_get_distinct_labels() {
+        let a = "review-load-retry-loop-when-branch-checked-out-worktree-a";
+        let b = "review-load-retry-loop-when-branch-checked-out-worktree-b";
+        assert_eq!(&a[..ID_SLUG_BUDGET], &b[..ID_SLUG_BUDGET], "test ids must share the slug");
+        assert_ne!(id_label(a), id_label(b), "same slug must be disambiguated by the hash");
+    }
+
+    #[test]
+    fn id_label_hash_is_stable_across_builds() {
+        // Pin a known id → known label. FNV-1a is chosen precisely so this value
+        // can never drift between releases; a change here would orphan every
+        // already-migrated long-id issue, so it must be a conscious edit.
+        let id = "review-load-retry-loop-when-branch-is-checked-out-in-another-worktree";
+        assert_eq!(fnv1a64(id) as u32, 0x6e57_f8c4);
+        assert_eq!(
+            id_label(id),
+            "shelbi:id/review-load-retry-loop-when-bra-6e57f8c4"
+        );
+    }
+
+    #[test]
+    fn add_a_long_id_uses_a_truncated_label_and_carries_the_full_id_in_the_body() {
+        let created = r#"{"number":10,"title":"T","body":"","state":"open","labels":[],"created_at":"2026-08-03T00:00:00Z","updated_at":"2026-08-03T00:00:00Z"}"#;
+        let (store, calls) = recording_store("", "", "", created);
+
+        let id = "review-load-retry-loop-when-branch-is-checked-out-in-another-worktree";
+        store
+            .add(NewIssue::new(id, "T", Column::todo(), "Prose body"))
+            .unwrap();
+
+        let calls = calls.lock().unwrap();
+        let create = call_containing(&calls, &["-X POST", "repos/owner/repo/issues", "title=T"])
+            .expect("issue create POST");
+        // The anchor label is the truncated form (never the 68-char raw id).
+        assert!(create.contains("labels[]=shelbi:id/review-load-retry-loop-when-bra-6e57f8c4"));
+        assert!(!create.contains(&format!("labels[]=shelbi:id/{id}")));
+        // The authoritative id rides in the body metadata block for read-back.
+        assert!(create.contains(&format!("id: {id}")));
+
+        // The by-id lookup the dup check ran queries the *truncated* label, so a
+        // re-run still resolves the card server-side.
+        assert!(calls
+            .iter()
+            .any(|c| c.contains("labels=shelbi:id/review-load-retry-loop-when-bra-6e57f8c4")));
+    }
+
+    #[test]
+    fn a_long_id_round_trips_losslessly_through_read_back() {
+        // Simulate the issue as `add` would have written it: truncated anchor
+        // label + full id in the metadata block. Reading it back yields the full
+        // id byte-for-byte, and never the number or the truncated slug.
+        let id = "review-load-retry-loop-when-branch-is-checked-out-in-another-worktree";
+        let issue = format!(
+            r#"{{"number":10,"title":"T","body":"Prose.\n\n<!-- shelbi:begin -->\n```yaml\nid: {id}\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{{"name":"shelbi:id/review-load-retry-loop-when-bra-6e57f8c4"}},{{"name":"shelbi:status/todo"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
+        );
+        let leaked: &'static str = Box::leak(issue.into_boxed_str());
+        let store = store_with(leaked, "[]");
+
+        let board = store.list().unwrap();
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0].task.id, id);
+        // The stripped-of-metadata prose survives too.
+        assert_eq!(board[0].body, "Prose.");
+
+        // `get` resolves via the same single server-side label query.
+        let got = store.get(id).unwrap().expect("issue exists");
+        assert_eq!(got.task.id, id);
+    }
+
+    #[test]
+    fn gh_error_detail_includes_the_response_body_where_the_422_lives() {
+        // `gh api` puts the field-level reason in the JSON body on stdout; a
+        // stderr-only capture used to drop it. The combined detail keeps both.
+        let stderr = "gh: Validation Failed (HTTP 422)";
+        let stdout = r#"{"message":"Validation Failed","errors":[{"resource":"Label","field":"name","message":"name is too long (maximum is 50 characters)"}],"status":"422"}"#;
+        let detail = combine_gh_error_detail(stderr, stdout);
+        assert!(detail.contains("Validation Failed (HTTP 422)"));
+        assert!(detail.contains("name is too long (maximum is 50 characters)"));
+
+        // Body-only (gh wrote nothing to stderr) still surfaces the reason.
+        let body_only = combine_gh_error_detail("", stdout);
+        assert!(body_only.contains("name is too long"));
+
+        // Stderr-only (a non-`api` failure) is preserved verbatim.
+        assert_eq!(
+            combine_gh_error_detail("could not resolve host", ""),
+            "could not resolve host"
+        );
     }
 }
