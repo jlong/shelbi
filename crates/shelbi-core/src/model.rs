@@ -700,6 +700,24 @@ pub enum IssueTrackerBackend {
 }
 
 impl IssueTrackerBackend {
+    /// True when this backend lives behind the network rather than on local
+    /// disk.
+    ///
+    /// Callers use this to decide whether a read is cheap. A local board is a
+    /// directory read and can be listed freely on a render or poll cadence; a
+    /// remote board is a paginated API sweep and must be cached and refreshed
+    /// off the caller's thread (see `shelbi_state::issue_cache`). Listed
+    /// explicitly rather than as `!= FileSystem` so a future local backend has
+    /// to make a deliberate choice here.
+    pub fn is_remote(self) -> bool {
+        match self {
+            IssueTrackerBackend::FileSystem => false,
+            IssueTrackerBackend::Github | IssueTrackerBackend::Jira | IssueTrackerBackend::Linear => {
+                true
+            }
+        }
+    }
+
     /// The snake-case wire token for this backend — matches the YAML form and
     /// the string interpolated into validation / resolution errors.
     pub fn as_str(self) -> &'static str {
@@ -5894,6 +5912,17 @@ agent_runners:
 
         let back = serde_yaml::to_string(&p).unwrap();
         assert!(!back.contains("issue_tracker"), "got: {back}");
+    }
+
+    /// Read cost is what `is_remote` gates: a local board can be listed on a
+    /// render cadence, a remote one must be cached. Pin the classification so a
+    /// new backend cannot silently default into "cheap".
+    #[test]
+    fn is_remote_marks_every_network_backend_and_only_those() {
+        assert!(!IssueTrackerBackend::FileSystem.is_remote());
+        assert!(IssueTrackerBackend::Github.is_remote());
+        assert!(IssueTrackerBackend::Jira.is_remote());
+        assert!(IssueTrackerBackend::Linear.is_remote());
     }
 
     #[test]
