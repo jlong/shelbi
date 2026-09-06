@@ -51,6 +51,28 @@ pub fn resolve_issue_store(
     project: &str,
     cfg: &IssueTrackerConfig,
 ) -> Result<Box<dyn IssueStore>> {
+    let store = build_store(project, cfg)?;
+    // A remote board is a network round trip per read, and the TUI reads it on
+    // render/poll cadences that assume a local file board. Wrap remote backends
+    // so reads are served from a process-local snapshot and refreshed off the
+    // caller's thread; `file_system` goes straight to disk, where a cache would
+    // only add staleness. See [`crate::issue_cache`].
+    if cfg.backend.is_remote() {
+        return Ok(Box::new(crate::issue_cache::CachedIssueStore::new(
+            store, project, cfg,
+        )));
+    }
+    Ok(store)
+}
+
+/// Build the raw backend for `cfg`, with no caching layer.
+///
+/// Split from [`resolve_issue_store`] so the cache's background refresh can
+/// construct its own store without recursing back into the cache.
+pub(crate) fn build_store(
+    project: &str,
+    cfg: &IssueTrackerConfig,
+) -> Result<Box<dyn IssueStore>> {
     cfg.validate()?;
     match cfg.backend {
         IssueTrackerBackend::FileSystem => Ok(Box::new(FileSystemStore::new(project))),

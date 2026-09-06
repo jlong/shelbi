@@ -24,6 +24,7 @@ mod event_log;
 pub mod github_store;
 mod hub_config;
 mod hub_version;
+mod issue_cache;
 pub mod issue_auth;
 pub mod issue_migrate;
 pub mod issue_store;
