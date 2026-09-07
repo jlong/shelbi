@@ -223,7 +223,9 @@ impl DetectedSetupPlan {
             workspaces,
             workspace_poll_interval_secs: 5,
             github_reconcile_interval_secs: 900,
-            workspace_permissions_mode: "auto".into(),
+            // Unset by default: a fresh project passes no `--permission-mode`
+            // and each agent runs under the user's own permissions.defaultMode.
+            workspace_permissions_mode: None,
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),

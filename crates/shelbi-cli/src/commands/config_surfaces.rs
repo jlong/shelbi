@@ -264,6 +264,7 @@ fn augment_staged_entries(stage: &Path, entries: &mut Vec<InventoryEntry>) -> Re
                     continue;
                 }
                 for (suffix, filename, format) in [
+                    ("manifest", "agent.yaml", SurfaceFormat::Yaml),
                     ("instructions", "instructions.md", SurfaceFormat::Markdown),
                     ("settings", "settings.json", SurfaceFormat::Json),
                 ] {
@@ -549,6 +550,19 @@ fn collect_project_entries(project: &str, out: &mut Vec<InventoryEntry>) -> Resu
     for agent in agent_names {
         let agent_root = agents.join(&agent);
         let lifecycle_owned = DEFAULT_AGENTS.iter().any(|a| a.name == agent);
+        // The manifest is collected so the config-upgrade pass can sniff a
+        // deprecated `permissions_mode` when the file is present, but it is not
+        // marked lifecycle-owned: a missing agent.yaml is not a lint warning
+        // (dispatch treats an absent manifest as an additive fallback), and the
+        // sniffer fires only when the file exists.
+        out.push(entry(
+            &format!("project.{project}.agent.{agent}.manifest"),
+            &scope,
+            agent_root.join("agent.yaml"),
+            candidate_root.join(format!("agents/{agent}/agent.yaml")),
+            SurfaceFormat::Yaml,
+            false,
+        ));
         out.push(entry(
             &format!("project.{project}.agent.{agent}.instructions"),
             &scope,

@@ -228,7 +228,7 @@ pub fn run(
     // same runner / permission-mode / startup-prompt logic and can't drift.
     let launch_full = orch_workspace::workspace_launch_command_with_startup_prompt(
         &runner,
-        &permission_mode,
+        permission_mode.as_deref(),
         has_agent_instructions,
         resume,
         startup_prompt_rel,
@@ -1110,7 +1110,7 @@ workspaces: []\n",
             workspaces: vec![workspace],
             workspace_poll_interval_secs: 5,
             github_reconcile_interval_secs: 900,
-            workspace_permissions_mode: "default".into(),
+            workspace_permissions_mode: Some("default".into()),
             workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),

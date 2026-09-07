@@ -42,7 +42,7 @@ use shelbi_core::{Error, Result};
 
 use crate::{
     agents_dir, atomic_write, ensure_dir, project_dir, read_state, update_state,
-    DEFAULT_WORKSPACE_SETTINGS_TEMPLATE,
+    DEFAULT_REVIEW_WORKSPACE_SETTINGS_TEMPLATE, DEFAULT_WORKSPACE_SETTINGS_TEMPLATE,
 };
 
 /// Stable identifier of the default orchestrator agent.
@@ -208,7 +208,10 @@ pub const DEFAULT_AGENTS: &[BundledAgent] = &[
         name: REVIEW_AGENT,
         description: "Loads a finished branch for human review and runs it",
         instructions: DEFAULT_REVIEW_INSTRUCTIONS,
-        settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
+        // The review agent must not modify the code under review; its no-edit
+        // posture lives in a `permissions.deny` block (not a launch mode that
+        // disables all tool use — that would block its build/serve steps).
+        settings_template: Some(DEFAULT_REVIEW_WORKSPACE_SETTINGS_TEMPLATE),
         skills: REVIEW_SKILLS,
     },
     BundledAgent {
@@ -265,9 +268,13 @@ pub fn bundled_agent_manifest_yaml(agent: &BundledAgent) -> String {
          #   claude:\n\
          #     model: claude-opus-4-8\n\
          #     reasoning_effort: high\n\
-         ## Permission posture this agent REQUESTS. Clamped DOWN to the project ceiling\n\
-         ## (workspace_permissions_mode), never escalated. read-only maps to Claude's plan mode.\n\
-         # permissions_mode: read-only\n\
+         ## Optional launch permission posture this agent REQUESTS. Clamped DOWN to an\n\
+         ## explicit project ceiling (workspace_permissions_mode), never escalated; omit it\n\
+         ## to defer to the user's own ~/.claude permissions.defaultMode. Values:\n\
+         ## plan | default | acceptEdits | bypassPermissions. This is a launch MODE, not a\n\
+         ## no-edit switch: to forbid edits, add a permissions.deny block on Edit/Write/\n\
+         ## NotebookEdit in this agent's settings.json (which Claude enforces) instead.\n\
+         # permissions_mode: acceptEdits\n\
          ## Compatibility hints (advisory this milestone; enforced at install in a future\n\
          ## marketplace flow). runner_kinds lists the kinds this agent can run on.\n\
          # requires:\n\
@@ -1630,7 +1637,8 @@ mod tests {
             !after.contains(STALE_HOOK_COMMAND_MARKER),
             "stale hook paths must be rewritten: {after}"
         );
-        assert_eq!(after, DEFAULT_WORKSPACE_SETTINGS_TEMPLATE);
+        // The review agent ships the no-edit variant (hooks + permissions.deny).
+        assert_eq!(after, DEFAULT_REVIEW_WORKSPACE_SETTINGS_TEMPLATE);
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -2472,11 +2480,31 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
             default_agent_settings(DEVELOPER_AGENT),
             Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
         );
+        // The review agent ships the no-edit variant (deny block + hooks).
         assert_eq!(
             default_agent_settings(REVIEW_AGENT),
-            Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
+            Some(DEFAULT_REVIEW_WORKSPACE_SETTINGS_TEMPLATE),
         );
         assert_eq!(default_agent_settings("ghost"), None);
+    }
+
+    /// The review agent's no-edit posture must be a `permissions.deny` block on
+    /// the edit tools — the enforcement Claude honors — not a plan/read-only
+    /// launch mode that would block its build/serve steps.
+    #[test]
+    fn review_settings_template_denies_edit_tools() {
+        let v: serde_json::Value =
+            serde_json::from_str(DEFAULT_REVIEW_WORKSPACE_SETTINGS_TEMPLATE).unwrap();
+        let deny = v["permissions"]["deny"].as_array().unwrap();
+        for tool in ["Edit", "Write", "NotebookEdit"] {
+            assert!(
+                deny.iter().any(|d| d == tool),
+                "review settings must deny {tool}: {v}"
+            );
+        }
+        // It still carries the pane-state hooks (it's a working agent, not a
+        // muted one).
+        assert!(v["hooks"]["Stop"].is_array());
     }
 
     #[test]
