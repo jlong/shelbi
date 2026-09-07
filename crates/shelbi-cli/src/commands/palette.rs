@@ -192,6 +192,20 @@ struct State {
     /// Which column Up/Down/Enter act on. Only meaningful while the
     /// projects column is visible; typing forces it back to `Commands`.
     focus: Focus,
+    /// The sidebar `App` backing `all_entries`, kept so a cold palette can
+    /// re-read the board in the background and swap the entries in place once
+    /// the fetch lands (see [`State::poll_board_refresh`]). The palette opens
+    /// as a fresh process, so on a genuine first run this starts loading.
+    app: App,
+    /// Zen toggle chord, retained for rebuilding entries on a background reload.
+    zen_chord: ZenToggleChord,
+    /// True while the backing board hasn't loaded yet (cold process, no
+    /// snapshot). Drives the title's "loading board…" hint and gates the
+    /// background reload poll.
+    board_loading: bool,
+    /// Throttle for [`State::poll_board_refresh`] so the 150ms render loop
+    /// doesn't re-read the board every frame.
+    last_board_poll: Instant,
 }
 
 impl State {
@@ -213,6 +227,7 @@ impl State {
             .unwrap_or(ZenToggleChord::AltZ);
         let chord = keymaps.zen_toggle_chord(legacy);
         let all_entries = build_entries(&app, app.zen_mode, chord);
+        let board_loading = app.board_loading;
         // Other registered projects for the second column — same source and
         // current-project filter the `Switch to project…` sub-picker uses. A
         // failed enumeration degrades to no column rather than failing the
@@ -241,7 +256,30 @@ impl State {
             active_projects,
             project_selected: 0,
             focus: Focus::Commands,
+            app,
+            zen_chord: chord,
+            board_loading,
+            last_board_poll: Instant::now(),
         })
+    }
+
+    /// Re-read the board on a cold palette and swap the entries in place once
+    /// the background fetch lands, preserving the query and selection (the
+    /// renderer re-clamps `selected`). Self-throttled and a no-op once the
+    /// board has loaded, so a warm palette never re-reads and an open popup
+    /// doesn't churn — it exists only to turn the cold first-run "loading"
+    /// state into real rows without the user reopening the palette.
+    fn poll_board_refresh(&mut self) {
+        if !self.board_loading {
+            return;
+        }
+        if self.last_board_poll.elapsed() < Duration::from_millis(300) {
+            return;
+        }
+        self.last_board_poll = Instant::now();
+        self.app.refresh().ok();
+        self.board_loading = self.app.board_loading;
+        self.all_entries = build_entries(&self.app, self.app.zen_mode, self.zen_chord);
     }
 
     fn results(&self) -> Vec<(Entry, u16)> {
@@ -337,6 +375,9 @@ fn picker_loop<B: ratatui::backend::Backend>(
     // project indicator breathes across the 150ms poll-timeout repaints.
     let anim_start = Instant::now();
     loop {
+        // A cold palette re-reads the board off the render loop and swaps the
+        // rows in place when the fetch lands — no-op once loaded.
+        state.poll_board_refresh();
         let results = state.results();
         let phase = pulse_phase(anim_start);
         term.draw(|f| render(f, state, &results, phase))?;
@@ -453,14 +494,24 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)], phase: f32) {
         ])
         .split(area);
 
-    // Title.
-    let title = Paragraph::new(Line::from(Span::styled(
+    // Title. A cold palette (board still loading, no snapshot yet) tacks on a
+    // dim "loading board…" hint so the missing workspace / review rows read as
+    // "still fetching", not "none exist".
+    let mut title_spans = vec![Span::styled(
         format!("shelbi · {}", state.project),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
-    )));
-    f.render_widget(title, layout[0]);
+    )];
+    if state.board_loading {
+        title_spans.push(Span::styled(
+            "  · loading board…",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(title_spans)), layout[0]);
 
     // Search input.
     let prompt = Line::from(vec![
@@ -982,12 +1033,14 @@ fn entry_from_row(row: &Row, workspaces: &[WorkspaceOverview]) -> Option<Entry> 
             decoration,
             hidden_until_query: false,
         }),
-        // Section headers, blanks, machine-group toggles, and the inline
-        // config-error message have no destination to activate in the palette.
+        // Section headers, blanks, machine-group toggles, the inline
+        // config-error message, and the cold-start loading placeholder have no
+        // destination to activate in the palette.
         Row::Section { .. }
         | Row::Blank
         | Row::MachineGroup { .. }
-        | Row::ConfigError { .. } => None,
+        | Row::ConfigError { .. }
+        | Row::Loading => None,
     }
 }
 
@@ -1393,8 +1446,14 @@ fn active_work_projects(projects: &[ProjectSummary]) -> std::collections::HashSe
 /// (so a renamed custom `active` status still counts), falling back to the
 /// column's built-in category when the status isn't declared there.
 fn project_has_active_work(project: &str) -> bool {
-    let tasks = match shelbi_state::issue_store_for(project).and_then(|s| s.list()) {
-        Ok(t) => t,
+    // `list_state`, not `list`: the palette opens as a fresh cold process, and
+    // a blocking `list()` here would pay the full remote sweep for *every*
+    // other remote project before first paint. `list_state` serves the disk
+    // snapshot (or reports Cold without blocking), so a not-yet-loaded remote
+    // project simply doesn't light up the pulse until its snapshot exists —
+    // never at the cost of freezing the palette.
+    let tasks = match shelbi_state::issue_store_for(project).and_then(|s| s.list_state()) {
+        Ok(state) => state.into_issues(),
         Err(_) => return false,
     };
     if tasks.is_empty() {
@@ -2206,6 +2265,10 @@ mod tests {
             active_projects: std::collections::HashSet::new(),
             project_selected,
             focus,
+            app: App::new_sidebar("portal"),
+            zen_chord: ZenToggleChord::AltZ,
+            board_loading: false,
+            last_board_poll: Instant::now(),
         }
     }
 
