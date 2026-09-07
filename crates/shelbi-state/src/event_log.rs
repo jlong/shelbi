@@ -2185,6 +2185,37 @@ pub fn append_worktree_detach_event(
     append_event_line(&line)
 }
 
+/// Append a ready-marker **deferral** line to `~/.shelbi/events.log`. Emitted by
+/// the poller's ready-marker handoff when the task load fails with a *transient*
+/// backend error (network blip, GitHub 403/rate-limit, timeout, malformed
+/// response): rather than clearing the marker (which would strand a finished
+/// task in-progress — the worker wrote its marker exactly once), the poller
+/// leaves the marker in place to retry next tick and records the deferral here
+/// so the signal isn't silently dropped. Written once per outage (deduped on the
+/// `class` token via a sidecar in the worktree), not every tick.
+///
+/// `<rfc3339> marker-deferred task=<id> workspace=<name> reason=marker-deferred:<class>`
+///
+/// Carries the same task-scoped, `project=`-less shape as
+/// [`append_worktree_detach_event`]; the `class` is a short internal token
+/// (`http-403` / `timeout` / `malformed` / `network` / …) so a reader sees *why*
+/// the promotion was deferred without the full error string. Both id fields are
+/// pinned to the identifier allowlist so the line stays a single parseable
+/// record.
+pub fn append_marker_deferred_event(
+    task_id: &str,
+    workspace: &str,
+    class: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let task_id = sanitize_field(task_id);
+    let workspace = sanitize_field(workspace);
+    let class = sanitize_field(class);
+    append_event_line(&format!(
+        "{ts} marker-deferred task={task_id} workspace={workspace} reason=marker-deferred:{class}"
+    ))
+}
+
 /// Append `<rfc3339> <body>` to `~/.shelbi/events.log`. Used by the hub
 /// daemon (`shelbi daemon`) for `event`-verb messages received over the
 /// Unix socket — the worker hands us a pre-formatted body line (e.g.

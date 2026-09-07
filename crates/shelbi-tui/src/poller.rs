@@ -2268,6 +2268,8 @@ fn maybe_apply_ready_handoff(
     addr: &shelbi_core::TmuxAddr,
 ) {
     let marker = shelbi_orchestrator::workspace::workspace_ready_marker(machine, workspace);
+    let deferred_marker =
+        shelbi_orchestrator::workspace::workspace_ready_deferred_marker(machine, workspace);
     let task_id = match shelbi_orchestrator::workspace::read_ready_marker(host, &marker) {
         Ok(Some(id)) => id,
         Ok(None) => return,
@@ -2278,12 +2280,33 @@ fn maybe_apply_ready_handoff(
     };
 
     // Load the task up front so we can confirm we had a valid task at all.
-    // If the load fails or the task isn't ours in-progress, we still fall
-    // through to clear the (stale) marker.
-    let task_file = load_issue(project, &task_id);
+    // Go straight to the store (rather than `load_issue`, which folds a
+    // successful "no such task" read into an `Err`) so we can tell three
+    // outcomes apart:
+    //   Ok(Some(tf)) — task read; promote if it's ours in-progress.
+    //   Ok(None)     — a *successful* read proves the task is gone; clear.
+    //   Err(e)       — the read itself FAILED (network, GitHub 403/rate-limit,
+    //                  timeout, malformed response). This is NOT proof the task
+    //                  is gone, so clearing the marker here strands a finished
+    //                  task in-progress forever (the worker wrote its marker
+    //                  exactly once). Leave the marker in place, defer, and
+    //                  retry next tick.
+    let loaded =
+        shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+            .and_then(|store| store.get(&task_id));
 
-    match &task_file {
-        Ok(tf)
+    // Any successful read ends a prior load-error outage, so drop the deferral
+    // sidecar (best-effort) — the next outage should log afresh.
+    if loaded.is_ok() {
+        if let Err(e) =
+            shelbi_orchestrator::workspace::clear_deferred_marker(host, &deferred_marker)
+        {
+            tracing::debug!(workspace = %workspace.name, error = %e, "clear_deferred_marker failed");
+        }
+    }
+
+    match loaded {
+        Ok(Some(tf))
             if tf.task.column == Column::in_progress()
                 && tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()) =>
         {
@@ -2543,16 +2566,84 @@ fn maybe_apply_ready_handoff(
                 }
             }
         }
-        Ok(_) => {
+        Ok(Some(_)) => {
             tracing::debug!(workspace = %workspace.name, task = %task_id, "stale ready marker (task not in-progress for this workspace); clearing");
         }
+        Ok(None) => {
+            // A *successful* board read shows the task no longer exists — the
+            // marker genuinely names a task that's gone (worktree reused, card
+            // deleted). Safe to clear with the existing warning.
+            tracing::warn!(workspace = %workspace.name, task = %task_id, "ready marker names unloadable task; clearing");
+        }
         Err(e) => {
-            tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "ready marker names unloadable task; clearing");
+            // The read FAILED — a transient backend error, not proof the task
+            // is gone. Leave the marker in place so the next tick retries and
+            // promotes on the first successful read. Log — and record the
+            // deferral on events.log — once per outage, deduped on the error
+            // class via the sidecar, rather than every tick.
+            let class = classify_load_error(&e);
+            let already =
+                shelbi_orchestrator::workspace::read_deferred_marker(host, &deferred_marker)
+                    .ok()
+                    .flatten();
+            if already.as_deref() != Some(class) {
+                tracing::warn!(workspace = %workspace.name, task = %task_id, class = %class, error = %e, "ready marker load failed; deferring promotion and leaving marker in place");
+                if let Err(ev) = shelbi_state::append_marker_deferred_event(
+                    &task_id,
+                    &workspace.name,
+                    class,
+                ) {
+                    tracing::warn!(workspace = %workspace.name, task = %task_id, error = %ev, "append_marker_deferred_event failed");
+                }
+                if let Err(w) = shelbi_orchestrator::workspace::write_deferred_marker(
+                    host,
+                    &deferred_marker,
+                    class,
+                ) {
+                    tracing::debug!(workspace = %workspace.name, task = %task_id, error = %w, "write_deferred_marker failed; may re-log next tick");
+                }
+            } else {
+                tracing::debug!(workspace = %workspace.name, task = %task_id, class = %class, "ready marker load still failing; promotion still deferred");
+            }
+            // Return WITHOUT clearing the marker: the signal must survive the
+            // outage.
+            return;
         }
     }
 
     if let Err(e) = shelbi_orchestrator::workspace::clear_ready_marker(host, &marker) {
         tracing::warn!(workspace = %workspace.name, error = %e, "clear_ready_marker failed");
+    }
+}
+
+/// Classify a task-load failure into a short, stable token for the
+/// `reason=marker-deferred:<class>` events.log line and the once-per-outage
+/// WARN. Groups the transient backend failures the ready-marker handoff must
+/// ride out — a network blip, a GitHub 403 / rate-limit, a timeout, a malformed
+/// response — so a reader can see *why* a promotion is deferred without the full
+/// error string. Best-effort: the load is retried regardless of class, so an
+/// imperfect bucket only affects the log token, never the retry.
+fn classify_load_error(err: &shelbi_core::Error) -> &'static str {
+    use shelbi_core::Error;
+    let msg = err.to_string().to_ascii_lowercase();
+    if msg.contains("403") || msg.contains("rate limit") || msg.contains("rate-limit") {
+        "http-403"
+    } else if msg.contains("timed out") || msg.contains("timeout") {
+        "timeout"
+    } else if matches!(err, Error::Yaml(_))
+        || msg.contains("malformed")
+        || msg.contains("invalid json")
+        || msg.contains("expected value")
+        || msg.contains("mismatched frontmatter")
+    {
+        "malformed"
+    } else if matches!(err, Error::Command { .. }) || matches!(err, Error::Io(_)) {
+        // A shelled-out backend command (`gh api …`) or a raw I/O failure that
+        // isn't one of the more specific buckets above: treat as a network /
+        // connectivity class — the dominant transient cause.
+        "network"
+    } else {
+        "load-error"
     }
 }
 
@@ -5684,6 +5775,145 @@ while :; do sleep 60; done
             "task already in review must not be pulled back out"
         );
         assert!(!marker.exists(), "stale marker should be cleared");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ready_marker_survives_a_transient_load_error_and_promotes_on_recovery() {
+        // The regression under test: when the task load fails with a *transient*
+        // backend error (network / GitHub 403 / timeout / malformed), the ready
+        // marker must NOT be cleared. Clearing it strands a finished task
+        // in-progress forever, because the worker wrote the marker exactly once.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-defer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+
+        // Establish the task file + tasks dir, then corrupt the frontmatter so
+        // the store's `get` returns `Err` (a stand-in for any backend read
+        // failure) rather than `Ok(None)`.
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+        let task_path = shelbi_state::task_path("demo", "fix-login").unwrap();
+        std::fs::write(&task_path, "---\ncolumn: [in_progress\n---\nbody\n").unwrap();
+
+        let marker = write_marker(&project, "fix-login\n");
+        let tick = || {
+            maybe_apply_ready_handoff(
+                &project,
+                &project.workspaces[0],
+                &project.machines[0],
+                &Host::Local,
+                &TmuxAddr {
+                    session: "s".into(),
+                    window: "w".into(),
+                },
+            );
+        };
+
+        tick();
+        assert!(
+            marker.exists(),
+            "marker must survive a transient load error (not be cleared)"
+        );
+
+        // events.log records the deferral once, tagged with the class.
+        let log_path = shelbi_state::events_log_path().unwrap();
+        let deferred_lines = || -> Vec<String> {
+            std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains(" marker-deferred ") && l.contains(" task=fix-login "))
+                .map(str::to_string)
+                .collect()
+        };
+        let after_first = deferred_lines();
+        assert_eq!(after_first.len(), 1, "one deferral line expected: {after_first:?}");
+        assert!(
+            after_first[0].contains(" workspace=alpha ")
+                && after_first[0].contains(" reason=marker-deferred:"),
+            "line: {}",
+            after_first[0]
+        );
+
+        // A second tick during the same outage must not clear the marker and
+        // must not re-log the deferral (once per outage).
+        tick();
+        assert!(marker.exists(), "marker must still survive a repeat outage tick");
+        assert_eq!(
+            deferred_lines().len(),
+            1,
+            "the deferral must be logged once per outage, not every tick"
+        );
+
+        // Backend recovers: a valid read now promotes the task and consumes the
+        // marker on the first successful tick.
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+        tick();
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login")
+                .unwrap()
+                .task
+                .column,
+            Column::review(),
+            "task should be promoted once the read succeeds"
+        );
+        assert!(!marker.exists(), "marker should be consumed after promotion");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ready_marker_naming_a_genuinely_gone_task_is_cleared() {
+        // The complement to the transient-error case: a *successful* read that
+        // shows no such task (Ok(None)) is real proof the task is gone, so the
+        // marker is still cleared (with the existing warning) — a stale marker
+        // must not linger forever.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-gone-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+
+        // No task file at all → the filesystem store reads `Ok(None)`.
+        let marker = write_marker(&project, "ghost-task\n");
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
+        );
+        assert!(
+            !marker.exists(),
+            "a marker a successful read shows is gone must be cleared"
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
