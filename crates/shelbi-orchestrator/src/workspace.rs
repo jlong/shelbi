@@ -252,6 +252,94 @@ pub fn clear_ready_marker(host: &Host, marker: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The ready-handoff **deferral** sidecar for a workspace:
+/// `<worktree>/.claude/shelbi-ready-deferred`.
+///
+/// When the poller reads a [`workspace_ready_marker`] but the task load fails
+/// with a *transient* backend error (network blip, GitHub 403/rate-limit,
+/// timeout, malformed response) it must NOT clear the ready marker — the worker
+/// wrote it exactly once, so clearing on a load error strands a finished task
+/// in-progress forever. Instead it leaves the ready marker in place and retries
+/// next tick. This sidecar records the error class of the current outage so the
+/// deferral is logged (and recorded on `events.log`) once per outage rather than
+/// every tick; a later *successful* read clears it, arming the next outage to
+/// log afresh. Lives under `.claude/` for the same gitignore reason as the
+/// ready marker itself.
+pub fn workspace_ready_deferred_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
+    workspace_worktree(machine, workspace)
+        .join(".claude")
+        .join("shelbi-ready-deferred")
+}
+
+/// Read the deferral sidecar, returning the recorded error-class token (trimmed)
+/// or `None` when it's absent or empty. Host-aware, matching the ready marker: a
+/// local workspace reads straight off disk; a remote one routes `cat` through
+/// `shelbi-ssh`.
+pub fn read_deferred_marker(host: &Host, marker: &Path) -> Result<Option<String>> {
+    let content = if host.is_local() {
+        match std::fs::read_to_string(marker) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::Io(e)),
+        }
+    } else {
+        let path = marker.to_string_lossy().into_owned();
+        let out = shelbi_ssh::run(host, ["cat", path.as_str()]).map_err(Error::Io)?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Write the deferral sidecar with the current outage's error `class`. The
+/// class is a short internal token (see `poller::classify_load_error`), so no
+/// escaping beyond the shell quoting the remote path needs. Best-effort by
+/// contract: a failed write only risks re-logging the deferral next tick.
+pub fn write_deferred_marker(host: &Host, marker: &Path, class: &str) -> Result<()> {
+    let body = format!("{class}\n");
+    if host.is_local() {
+        if let Some(dir) = marker.parent() {
+            std::fs::create_dir_all(dir).map_err(Error::Io)?;
+        }
+        std::fs::write(marker, body.as_bytes()).map_err(Error::Io)?;
+        return Ok(());
+    }
+    let esc = shelbi_core::shell_escape;
+    let marker_path = marker.to_string_lossy().into_owned();
+    let dir_esc = marker
+        .parent()
+        .map(|d| esc(&d.to_string_lossy()))
+        .unwrap_or_else(|| esc("."));
+    let script = format!(
+        "mkdir -p {dir} && printf %s {body} > {marker}",
+        dir = dir_esc,
+        body = esc(&body),
+        marker = esc(&marker_path),
+    );
+    let out = shelbi_ssh::run(host, ["sh", "-c", &script]).map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Other(format!(
+            "writing ready-deferred marker at {marker_path} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Remove the deferral sidecar (idempotent — `rm -f` succeeds if absent).
+/// Called on any *successful* task read so the next outage logs afresh.
+pub fn clear_deferred_marker(host: &Host, marker: &Path) -> Result<()> {
+    let path = marker.to_string_lossy().into_owned();
+    shelbi_ssh::run(host, ["rm", "-f", path.as_str()]).map_err(Error::Io)?;
+    Ok(())
+}
+
 /// A review slot confirmed serving by the poller's own `ready:` probe.
 /// Carries the reviewable URL (if the recipe declared one) so the poller can
 /// write it into the `.claude/shelbi-review-loaded` marker body.
