@@ -38,6 +38,11 @@ pub fn sidebar_loop<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> Result
         // setup a click would — so arriving at a review window either way
         // lands the review sidebar/interface identically.
         app.poll_active_window();
+        // Re-seat the sidebar highlight onto whatever view the dashboard's
+        // right pane now shows, so a nav area swapped in from the Ctrl+P
+        // palette (a separate process) doesn't leave the highlight stranded on
+        // the previously-selected row.
+        app.poll_current_view();
         // Heal a review window whose own panel (left-nav) pane died in place
         // while it's the active window — the panel is run-once and can't rebuild
         // itself, and `poll_active_window` only fires on a window *change*.

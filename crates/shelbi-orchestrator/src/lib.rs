@@ -412,6 +412,16 @@ pub fn show_view(project_name: &str, view: &str) -> Result<()> {
     let _ = std::process::Command::new("tmux")
         .args(["select-pane", "-t", &dashboard])
         .status();
+    // Record which builtin view now occupies the dashboard's right slot. The
+    // sidebar is a separate process that can't observe this pane swap, so it
+    // reads this env back to move its highlight onto the matching nav row.
+    // Every caller that shows a view — the sidebar's own Enter path and the
+    // Ctrl+P palette — funnels through here, so the two can't drift: whoever
+    // swaps the pane records the view, and the sidebar syncs its selection from
+    // it. Best-effort — a failure just leaves the highlight where it was.
+    let _ = std::process::Command::new("tmux")
+        .args(["set-environment", "-t", &session, "SHELBI_CURRENT_VIEW", view])
+        .status();
     Ok(())
 }
 

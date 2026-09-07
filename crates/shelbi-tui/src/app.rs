@@ -255,6 +255,15 @@ pub struct App {
     /// window that's already current (including one we just switched to
     /// ourselves) is a no-op.
     last_active_window: Option<String>,
+    /// Builtin view name last seen occupying the dashboard's right slot,
+    /// tracked by [`App::poll_current_view`] so a view swapped in from the
+    /// Ctrl+P palette (a separate process this one can't observe directly)
+    /// moves the sidebar highlight onto the matching nav row. Read back from
+    /// the `SHELBI_CURRENT_VIEW` session env that [`shelbi_orchestrator::show_view`]
+    /// writes on every swap. `None` until the first poll observes a view. Only a
+    /// *change* re-seats the highlight, so plain cursor-preview navigation
+    /// (which doesn't swap the pane) is never snapped back.
+    last_current_view: Option<String>,
 }
 
 /// A review load running on a worker thread. Holds the channel the thread
@@ -294,6 +303,7 @@ impl App {
             render_panics: 0,
             last_collapse_warn: None,
             last_active_window: None,
+            last_current_view: None,
         }
     }
 
@@ -1050,6 +1060,56 @@ impl App {
             return;
         };
         self.on_active_window(active);
+    }
+
+    /// Move the sidebar highlight onto whichever builtin view now occupies the
+    /// dashboard's right slot, so a view activated from the Ctrl+P palette (a
+    /// separate process that swaps the pane without touching this one's
+    /// selection) doesn't leave the highlight stranded on the previously-shown
+    /// row. Reads the `SHELBI_CURRENT_VIEW` session env that
+    /// [`shelbi_orchestrator::show_view`] writes on every swap — the shared
+    /// point both the palette and the sidebar's own Enter path funnel through,
+    /// so the two selections can't drift. The tmux read is split from the logic
+    /// ([`App::sync_current_view`]) so the routing is unit-testable without a
+    /// live tmux server.
+    pub fn poll_current_view(&mut self) {
+        let view = self.current_view_name();
+        self.sync_current_view(view);
+    }
+
+    /// Change-tracking half of [`App::poll_current_view`]. A no-op when `view`
+    /// matches the last-seen view (the guard that keeps plain cursor-preview
+    /// navigation — which doesn't swap the pane — from being snapped back to the
+    /// shown row every tick); on a change, the highlight re-seats onto the nav
+    /// row whose builtin matches. A view that isn't one of the three nav
+    /// builtins (a workspace / review window, which lives outside the right
+    /// slot) updates the tracker but leaves the highlight alone.
+    fn sync_current_view(&mut self, view: Option<String>) {
+        if self.last_current_view == view {
+            return;
+        }
+        self.last_current_view = view.clone();
+        let Some(view) = view else {
+            return;
+        };
+        let target = view.as_str();
+        if let Some(idx) = self.rows().iter().position(|r| {
+            matches!(r, Row::Nav { view: View::Builtin(n), .. } if *n == target)
+        }) {
+            self.sidebar_index = idx;
+        }
+    }
+
+    /// Name of the builtin view currently swapped into the dashboard's right
+    /// slot, read from the `SHELBI_CURRENT_VIEW` session env, or `None` when the
+    /// env is unset or tmux can't be queried (no server, unit-test env).
+    /// `show-environment KEY` prints `KEY=value` when set and `-KEY` when unset,
+    /// so a line with no `=` (or an empty value) resolves to `None`.
+    fn current_view_name(&self) -> Option<String> {
+        let session = format!("shelbi-{}", self.project_name);
+        let out = capture_tmux(["show-environment", "-t", &session, "SHELBI_CURRENT_VIEW"])?;
+        let (_key, value) = out.trim().split_once('=')?;
+        (!value.is_empty()).then(|| value.to_string())
     }
 
     /// Rebuild a review window's own panel (left-nav) pane if it has died in
@@ -4282,6 +4342,73 @@ mod tests {
             app.status_line.is_empty(),
             "a non-review window must not touch the status line, got: {}",
             app.status_line
+        );
+    }
+
+    /// Activating a nav area (from the Ctrl+P palette, which swaps the pane out
+    /// of process and can't touch this App's selection) re-seats the sidebar
+    /// highlight onto the matching builtin row — the two activation paths funnel
+    /// through the same `SHELBI_CURRENT_VIEW` signal, so they can't drift. The
+    /// three builtins each land on their own row (Chat/orch → 0, Issues/tasks →
+    /// 1, Activity → 2).
+    #[test]
+    fn sync_current_view_moves_highlight_to_the_activated_nav_builtin() {
+        let mut app = App::new_sidebar("demo");
+        // The three nav builtins occupy sidebar rows 0/1/2.
+        assert!(matches!(
+            app.rows().first(),
+            Some(Row::Nav { view: View::Builtin("orch"), .. })
+        ));
+
+        // Chat starts selected; activating Activity moves the highlight to it.
+        app.sidebar_index = 0;
+        app.sync_current_view(Some("activity".into()));
+        assert_eq!(app.sidebar_index, 2, "Activity is the third nav row");
+
+        // Each builtin lands on its own row.
+        app.sync_current_view(Some("tasks".into()));
+        assert_eq!(app.sidebar_index, 1, "Issues/tasks is the second nav row");
+        app.sync_current_view(Some("orch".into()));
+        assert_eq!(app.sidebar_index, 0, "Chat/orch is the first nav row");
+    }
+
+    /// The sync is change-tracked: re-observing the already-shown view is a
+    /// no-op, so plain cursor-preview navigation (moving the highlight without
+    /// swapping the pane) is never snapped back to the shown row on the next
+    /// poll tick.
+    #[test]
+    fn sync_current_view_does_not_fight_preview_navigation() {
+        let mut app = App::new_sidebar("demo");
+        // Right pane currently shows Chat; the tracker has caught up.
+        app.sync_current_view(Some("orch".into()));
+        assert_eq!(app.sidebar_index, 0);
+
+        // User arrows down to preview Activity without activating it. The pane
+        // hasn't swapped, so the view is still "orch" — a repeat poll must leave
+        // the previewed selection where it is.
+        app.sidebar_index = 2;
+        app.sync_current_view(Some("orch".into()));
+        assert_eq!(
+            app.sidebar_index, 2,
+            "an unchanged view must not snap the preview cursor back"
+        );
+    }
+
+    /// A view that isn't one of the nav builtins — a workspace or review window,
+    /// which lives in its own tmux window rather than the dashboard's right slot
+    /// — updates the tracker but leaves the highlight untouched, so activating
+    /// one from the palette keeps the sidebar consistent with the (unchanged)
+    /// right pane.
+    #[test]
+    fn sync_current_view_ignores_non_nav_views() {
+        let mut app = App::new_sidebar("demo");
+        app.sync_current_view(Some("orch".into()));
+        app.sidebar_index = 1;
+
+        app.sync_current_view(Some("review".into()));
+        assert_eq!(
+            app.sidebar_index, 1,
+            "a non-nav view must not move the nav highlight"
         );
     }
 }
