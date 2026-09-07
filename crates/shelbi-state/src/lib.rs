@@ -2967,6 +2967,134 @@ pub fn park_review_task(project: &str, id: &str) -> Result<Option<String>> {
     Ok(was)
 }
 
+// -- review-load failure ledger -----------------------------------------------
+//
+// The review auto-loader ([`shelbi_orchestrator::load::autoload_review_queue`])
+// re-derives its whole plan from disk every poll tick — it holds no in-memory
+// crash-loop bookkeeping the way the pane supervisor does. So a review-load that
+// fails for a durable reason (its branch is checked out in another worktree, say)
+// would be re-planned and re-attempted, identically, on every tick forever.
+//
+// This ledger is the disk-persisted memory that lets the stateless loader back
+// off and eventually give up, exactly as the in-memory
+// [`shelbi_orchestrator::supervision::SupervisionState`] does for panes. It keys
+// per `(task, review-slot)` pair: a per-task JSON file under
+// `<project_dir>/review-load-failures/` holds a `{ workspace -> record }` map, so
+// one file survives `shelbi reload` / `quit`+restart and the loader reads it back
+// on the next fresh tick. The pure backoff/give-up decisions live in
+// `shelbi-orchestrator` (which owns the crash-loop constants); this module only
+// stores the counters. Records are CLEARED wholesale for a task on any successful
+// dispatch/assignment (see [`clear_review_load_failures_for_task`], called beside
+// [`clear_task_parked`] from the dispatch primitive), so a slot that recovers is
+// never permanently poisoned.
+
+/// One `(task, review-slot)` autoload failure record. Plain counters — the
+/// backoff/give-up policy that reads them lives in `shelbi-orchestrator`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewLoadFailure {
+    /// Consecutive failed autoload attempts inside the current crash-loop
+    /// window. Reset to a fresh count once an attempt lands outside the window.
+    pub attempts: u32,
+    /// Unix seconds of the most recent failed attempt — the anchor the backoff
+    /// and window-pruning are measured from.
+    pub last_attempt: i64,
+    /// Latched once the give-up line has been emitted for this pair, so the
+    /// loader neither re-attempts it nor re-emits the event. Cleared only when
+    /// the task loads successfully (which drops the whole per-task file).
+    pub gave_up: bool,
+}
+
+/// Directory of per-task review-load failure files for `project`
+/// (`<project_dir>/review-load-failures/`). Each file is named `<task-id>` and
+/// holds the `{ workspace -> `[`ReviewLoadFailure`]` }` map for that task.
+fn review_load_failures_dir(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("review-load-failures"))
+}
+
+/// The failure file for a single task. Validates the id so a hostile/synced id
+/// can't escape the project's `review-load-failures/` directory.
+fn review_load_failures_file(project: &str, id: &str) -> Result<PathBuf> {
+    validate_task_id(id)?;
+    Ok(review_load_failures_dir(project)?.join(id))
+}
+
+/// Read one task's `{ workspace -> record }` failure map. A missing file (never
+/// failed, or cleared on success) → empty map.
+fn read_review_load_failures_for(
+    project: &str,
+    id: &str,
+) -> Result<BTreeMap<String, ReviewLoadFailure>> {
+    let path = review_load_failures_file(project, id)?;
+    match fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| {
+            shelbi_core::Error::Other(format!("review-load-failures/{id}: {e}"))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
+/// The whole ledger: `task-id -> { workspace -> record }`. A missing directory
+/// (no failures recorded yet) → empty map. The auto-loader reads this once per
+/// batch to suppress pairs still inside their backoff or already given up.
+pub fn review_load_failures(
+    project: &str,
+) -> Result<BTreeMap<String, BTreeMap<String, ReviewLoadFailure>>> {
+    let dir = review_load_failures_dir(project)?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    let mut out = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.map_err(shelbi_core::Error::Io)?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        // Skip any stray non-task-id file rather than failing the whole read.
+        if validate_task_id(&name).is_err() {
+            continue;
+        }
+        let map = read_review_load_failures_for(project, &name)?;
+        if !map.is_empty() {
+            out.insert(name, map);
+        }
+    }
+    Ok(out)
+}
+
+/// Record `rec` for the `(id, workspace)` pair, folding it into the task's
+/// failure file (creating it if absent). Overwrites any prior record for that
+/// workspace; leaves other workspaces' records for the task untouched.
+pub fn record_review_load_failure(
+    project: &str,
+    id: &str,
+    workspace: &str,
+    rec: &ReviewLoadFailure,
+) -> Result<()> {
+    let mut map = read_review_load_failures_for(project, id)?;
+    map.insert(workspace.to_string(), rec.clone());
+    let path = review_load_failures_file(project, id)?;
+    ensure_dir(&review_load_failures_dir(project)?)?;
+    let bytes = serde_json::to_vec_pretty(&map)
+        .map_err(|e| shelbi_core::Error::Other(format!("review-load-failures/{id}: {e}")))?;
+    atomic_write(&path, &bytes)
+}
+
+/// Drop every failure record for `id` (removes the task's file). Idempotent
+/// (no file → `Ok`). Called on any fresh dispatch/assignment of the task, so a
+/// slot that recovers — or a task re-loaded manually — starts from a clean
+/// slate and is never permanently suppressed.
+pub fn clear_review_load_failures_for_task(project: &str, id: &str) -> Result<()> {
+    let path = review_load_failures_file(project, id)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Local workspace-assignment overlay
 //
@@ -3349,6 +3477,50 @@ mod tests {
             agents: Default::default(),
             detected_shapes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn review_load_failures_round_trip_per_pair_and_clear_by_task() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // No failures recorded yet → empty ledger.
+        assert!(review_load_failures("p").unwrap().is_empty());
+
+        // Record two pairs for one task and one for another.
+        let rec = |attempts, last, gave_up| ReviewLoadFailure {
+            attempts,
+            last_attempt: last,
+            gave_up,
+        };
+        record_review_load_failure("p", "t-1", "review-1", &rec(2, 100, false)).unwrap();
+        record_review_load_failure("p", "t-1", "review-2", &rec(3, 200, true)).unwrap();
+        record_review_load_failure("p", "t-2", "review-1", &rec(1, 300, false)).unwrap();
+
+        let all = review_load_failures("p").unwrap();
+        assert_eq!(all.get("t-1").unwrap().len(), 2);
+        assert_eq!(all["t-1"]["review-1"], rec(2, 100, false));
+        assert_eq!(all["t-1"]["review-2"], rec(3, 200, true));
+        assert_eq!(all["t-2"]["review-1"], rec(1, 300, false));
+
+        // Re-recording a pair overwrites just that pair, leaving the task's
+        // other pair intact.
+        record_review_load_failure("p", "t-1", "review-1", &rec(3, 400, true)).unwrap();
+        let all = review_load_failures("p").unwrap();
+        assert_eq!(all["t-1"]["review-1"], rec(3, 400, true));
+        assert_eq!(all["t-1"]["review-2"], rec(3, 200, true));
+
+        // Clearing a task drops all its pairs but leaves other tasks alone.
+        clear_review_load_failures_for_task("p", "t-1").unwrap();
+        let all = review_load_failures("p").unwrap();
+        assert!(!all.contains_key("t-1"));
+        assert_eq!(all["t-2"]["review-1"], rec(1, 300, false));
+
+        // Clearing again is idempotent.
+        clear_review_load_failures_for_task("p", "t-1").unwrap();
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

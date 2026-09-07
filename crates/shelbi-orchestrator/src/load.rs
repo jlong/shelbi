@@ -12,12 +12,13 @@
 //! `run:` / `ready:` commands (Phase 1), fired when the task moves into the
 //! status — not from this loader.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use shelbi_core::{Column, Error, Project, Result, Issue, WorkspaceSpec, Workflow};
-use shelbi_state::IssueFile;
+use shelbi_state::{IssueFile, ReviewLoadFailure};
 
 use crate::branch;
+use crate::supervision::{BASE_BACKOFF, CRASH_LOOP_WINDOW, MAX_RESTARTS_IN_WINDOW};
 use crate::workspace::{start_workspace_on_task, StartSpec};
 
 /// Load `task_id` onto a free workspace whose effective tags satisfy the
@@ -413,13 +414,34 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
     let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
     // Board order (priority, then id) — the same order the sidebar shows.
     let review_tasks = store.list_in_status(&Column::review())?;
+    // Only tasks whose workflow review status is *review-tagged* may be
+    // auto-grabbed onto a scarce review slot. A handoff status that declares no
+    // `review` tag (an orchestrator-owned `review` status, the bare default
+    // workflow) is left in the review column for a human sidebar load — routing
+    // it here would consume a review slot purely for being idle, diverging from
+    // the model where loading onto a review workspace is a deliberate action.
+    let eligible: Vec<IssueFile> = review_tasks
+        .into_iter()
+        .filter(|tf| {
+            let workflow = shelbi_state::load_task_workflow(project_name, &project, &tf.task)
+                .unwrap_or_else(|_| shelbi_core::default_workflow());
+            status_routes_to_review(&workflow, tf.task.column.as_str())
+        })
+        .collect();
     // Idle review slots in declaration order (never lists a dev slot).
     let free = free_review_workspaces(project_name)?;
     // Tasks an operator deliberately unloaded (`shelbi workspace stop` /
     // `task unassign`). Skipped so a parked task stays unloaded instead of
     // being re-grabbed on the next tick.
     let parked = shelbi_state::parked_review_tasks(project_name)?;
-    let plan = plan_review_autoload(&review_tasks, &project, &free, &parked);
+    // Per-`(task, slot)` failure ledger: a load that keeps failing for a
+    // durable reason (its branch checked out in another worktree, say) backs
+    // off and eventually gives up instead of retrying identically forever. Read
+    // once for the whole batch; the planner drops any pair still inside its
+    // backoff or already given up.
+    let failures = shelbi_state::review_load_failures(project_name)?;
+    let now_secs = chrono::Utc::now().timestamp();
+    let plan = plan_review_autoload(&eligible, &project, &free, &parked, &failures, now_secs);
     if plan.is_empty() {
         return Ok(Vec::new());
     }
@@ -461,10 +483,120 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
                     error = %e,
                     "auto review-load failed for one slot",
                 );
+                // Record the failure so a durably-failing pair backs off and
+                // eventually gives up, instead of the planner re-deriving the
+                // same doomed attempt every ~5s tick forever. On the attempt
+                // that trips the crash-loop cap, emit ONE `supervision=gave-up`
+                // line (the same shape the stranded-slot resume path emits) so
+                // the orchestrator gets one actionable signal, then stay quiet.
+                let prior = failures
+                    .get(&task_id)
+                    .and_then(|m| m.get(&workspace))
+                    .cloned()
+                    .unwrap_or_default();
+                let (updated, gave_up_now) = note_autoload_failure(&prior, now_secs);
+                if let Err(re) = shelbi_state::record_review_load_failure(
+                    project_name,
+                    &task_id,
+                    &workspace,
+                    &updated,
+                ) {
+                    tracing::warn!(
+                        project = %project_name,
+                        task = %task_id,
+                        workspace = %workspace,
+                        error = %re,
+                        "recording review-load failure for backoff failed",
+                    );
+                }
+                if gave_up_now {
+                    let _ = shelbi_state::append_supervision_event(
+                        project_name,
+                        Some(&workspace),
+                        "gave-up",
+                        "review-load-crash-loop",
+                    );
+                    tracing::warn!(
+                        project = %project_name,
+                        task = %task_id,
+                        workspace = %workspace,
+                        "gave up auto-loading review slot after the crash-loop cap; left for the user",
+                    );
+                }
             }
         }
     }
     Ok(loaded)
+}
+
+/// True iff `workflow`'s status `status_id` carries the `review` tag — the gate
+/// for whether the auto-loader may consume a review slot for a task sitting in
+/// that status.
+///
+/// The auto-loader's counterpart to the generic superset match in
+/// [`load_task_by_id`]: a review status that declares `tags: [review]` routes
+/// to review slots, so a handed-off task in it is auto-served; one that does not
+/// (an orchestrator-owned `user` handoff status, the bare default workflow) must
+/// NOT be auto-grabbed onto a scarce review slot merely for being idle — it
+/// stays in the review column for a deliberate human sidebar load.
+fn status_routes_to_review(workflow: &Workflow, status_id: &str) -> bool {
+    workflow
+        .status(status_id)
+        .is_some_and(|s| s.tags.iter().any(|t| t == "review"))
+}
+
+/// Whether a retry of a `(task, slot)` auto-load is currently suppressed, given
+/// its failure record and the current wall-clock (`now_secs`, unix seconds).
+///
+/// Suppressed while the pair has given up (latched — leave it for the user), or
+/// while it is still inside the exponential backoff since its last failed
+/// attempt (`BASE_BACKOFF * 2^(attempts-1)`), so no identical attempt is
+/// re-emitted more than once per backoff window. A record whose last attempt is
+/// older than [`CRASH_LOOP_WINDOW`] has aged out and is not suppressed: its
+/// counter restarts on the next failure, so a slow drip never accumulates into
+/// a give-up.
+fn autoload_retry_suppressed(rec: &ReviewLoadFailure, now_secs: i64) -> bool {
+    if rec.gave_up {
+        return true;
+    }
+    if rec.attempts == 0 {
+        return false;
+    }
+    let since = now_secs.saturating_sub(rec.last_attempt);
+    if since >= CRASH_LOOP_WINDOW.as_secs() as i64 {
+        return false;
+    }
+    // `attempts` is capped by the give-up latch above (a given-up record never
+    // reaches here), but clamp the shift regardless so a hand-edited/corrupt
+    // record can't overflow.
+    let shift = (rec.attempts - 1).min(16);
+    let wait = BASE_BACKOFF.as_secs() as i64 * (1i64 << shift);
+    since < wait
+}
+
+/// Fold a fresh failed attempt at `now_secs` into `rec`, returning the updated
+/// record and whether this failure *trips* give-up (so the caller emits the
+/// gave-up event exactly once).
+///
+/// An attempt landing outside [`CRASH_LOOP_WINDOW`] resets the counter first —
+/// only a genuine tight loop trips the cap. Give-up latches once the attempt
+/// count reaches [`MAX_RESTARTS_IN_WINDOW`]; `trips` is true only on the
+/// transition into give-up, never again, so the event fires once.
+fn note_autoload_failure(rec: &ReviewLoadFailure, now_secs: i64) -> (ReviewLoadFailure, bool) {
+    let aged_out = rec.attempts > 0
+        && now_secs.saturating_sub(rec.last_attempt) >= CRASH_LOOP_WINDOW.as_secs() as i64;
+    let base = if aged_out { 0 } else { rec.attempts };
+    let attempts = base.saturating_add(1);
+    let gave_up = attempts >= MAX_RESTARTS_IN_WINDOW as u32;
+    let trips = gave_up && !rec.gave_up;
+    (
+        ReviewLoadFailure {
+            attempts,
+            last_attempt: now_secs,
+            gave_up,
+        },
+        trips,
+    )
 }
 
 /// Pure slot-selection for [`autoload_review_queue`]: pair each queued review
@@ -474,15 +606,25 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
 /// it, or one with no assignment; a task already serving on a review slot is
 /// dropped. A task in `parked` (deliberately unloaded by the operator) is also
 /// dropped, so a parked task stays unloaded instead of being re-grabbed on the
-/// next tick. Split out with no I/O so board order, capacity limiting, and the
-/// parked skip are unit-testable on in-memory fixtures.
+/// next tick.
+///
+/// A `(task, slot)` pair currently suppressed by the failure ledger (`failures`,
+/// evaluated against `now_secs`) is skipped **for that slot only**: a pair in
+/// backoff, or one that has given up, does not consume the slot, and the slot is
+/// offered to the next queued task instead — so one durably-failing task never
+/// blocks a slot other tasks could use, and the loader stops re-attempting the
+/// same doomed pair every tick. Split out with no I/O so board order, capacity
+/// limiting, the parked skip, and failure suppression are unit-testable on
+/// in-memory fixtures.
 fn plan_review_autoload(
     review_tasks: &[IssueFile],
     project: &Project,
     free: &[WorkspaceSpec],
     parked: &BTreeSet<String>,
+    failures: &BTreeMap<String, BTreeMap<String, ReviewLoadFailure>>,
+    now_secs: i64,
 ) -> Vec<(String, String)> {
-    review_tasks
+    let queued: Vec<&IssueFile> = review_tasks
         .iter()
         .filter(|tf| !parked.contains(&tf.task.id))
         .filter(|tf| {
@@ -494,9 +636,33 @@ fn plan_review_autoload(
                 .is_some_and(|w| project.effective_tags(w).contains("review"));
             !on_review_slot
         })
-        .map(|tf| tf.task.id.clone())
-        .zip(free.iter().map(|w| w.name.clone()))
-        .collect()
+        .collect();
+
+    // Greedy pairing: for each free slot (declaration order) take the first
+    // still-unplaced queued task (board order) that isn't suppressed for THIS
+    // slot. A pair suppressed for one slot stays available for a later one, so
+    // suppression is truly per-`(task, slot)` rather than dropping the task
+    // wholesale.
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut placed: HashSet<usize> = HashSet::new();
+    for slot in free {
+        for (i, tf) in queued.iter().enumerate() {
+            if placed.contains(&i) {
+                continue;
+            }
+            let suppressed = failures
+                .get(&tf.task.id)
+                .and_then(|m| m.get(&slot.name))
+                .is_some_and(|rec| autoload_retry_suppressed(rec, now_secs));
+            if suppressed {
+                continue;
+            }
+            out.push((tf.task.id.clone(), slot.name.clone()));
+            placed.insert(i);
+            break;
+        }
+    }
+    out
 }
 
 /// One task auto-loaded onto a review slot by [`autoload_review_queue`].
@@ -657,6 +823,14 @@ fn dispatch_task_onto(
             return Err(e);
         }
     };
+
+    // The load succeeded, so the branch is loadable again: drop any review-load
+    // failure history for the task, so a pair that failed transiently and now
+    // recovers is never left permanently backed-off / given-up by the
+    // auto-loader. Only success clears — a failed attempt keeps its counter so
+    // the backoff/give-up still trips. Best-effort; it only ever gates the
+    // auto-loader.
+    let _ = shelbi_state::clear_review_load_failures_for_task(project_name, &tf.task.id);
 
     Ok(addr.target())
 }
@@ -1019,7 +1193,7 @@ mod tests {
             project.workspace("review-1").unwrap().clone(),
             project.workspace("review-2").unwrap().clone(),
         ];
-        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new());
+        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new(), &BTreeMap::new(), 0);
         assert_eq!(
             plan,
             vec![
@@ -1049,7 +1223,7 @@ mod tests {
             project.workspace("review-1").unwrap().clone(),
             project.workspace("review-2").unwrap().clone(),
         ];
-        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new());
+        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new(), &BTreeMap::new(), 0);
         assert_eq!(
             plan,
             vec![
@@ -1070,7 +1244,7 @@ mod tests {
             tf(review_task_pri("t-queued", Some("alpha"), 1)),
         ];
         let free = vec![project.workspace("review-2").unwrap().clone()];
-        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new());
+        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new(), &BTreeMap::new(), 0);
         assert_eq!(plan, vec![("t-queued".to_string(), "review-2".to_string())]);
     }
 
@@ -1085,14 +1259,14 @@ mod tests {
             tf(review_task_pri("t-3", None, 2)),
         ];
         let free = vec![project.workspace("review-1").unwrap().clone()];
-        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new());
+        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new(), &BTreeMap::new(), 0);
         assert_eq!(plan, vec![("t-1".to_string(), "review-1".to_string())]);
 
         // No free slots → nothing planned even with queued work.
-        assert!(plan_review_autoload(&review, &project, &[], &BTreeSet::new()).is_empty());
+        assert!(plan_review_autoload(&review, &project, &[], &BTreeSet::new(), &BTreeMap::new(), 0).is_empty());
         // No queued work → nothing planned even with free slots.
         let serving = [tf(review_task_pri("t-x", Some("review-1"), 0))];
-        assert!(plan_review_autoload(&serving, &project, &free, &BTreeSet::new()).is_empty());
+        assert!(plan_review_autoload(&serving, &project, &free, &BTreeSet::new(), &BTreeMap::new(), 0).is_empty());
     }
 
     #[test]
@@ -1110,13 +1284,13 @@ mod tests {
             project.workspace("review-2").unwrap().clone(),
         ];
         let parked: BTreeSet<String> = std::iter::once("t-parked".to_string()).collect();
-        let plan = plan_review_autoload(&review, &project, &free, &parked);
+        let plan = plan_review_autoload(&review, &project, &free, &parked, &BTreeMap::new(), 0);
         // The parked card is dropped; the queued one lands on the first slot.
         assert_eq!(plan, vec![("t-queued".to_string(), "review-1".to_string())]);
 
         // With only the parked card queued, nothing loads at all.
         let only_parked = [tf(review_task_pri("t-parked", None, 0))];
-        assert!(plan_review_autoload(&only_parked, &project, &free, &parked).is_empty());
+        assert!(plan_review_autoload(&only_parked, &project, &free, &parked, &BTreeMap::new(), 0).is_empty());
     }
 
     // -- conflicting-slot guard (pure) --------------------------------------
@@ -1382,8 +1556,225 @@ mod tests {
         let project = shelbi_state::load_project("demo").unwrap();
         let review = shelbi_state::list_column("demo", Column::review()).unwrap();
         let free = free_review_workspaces("demo").unwrap();
-        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new());
+        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new(), &BTreeMap::new(), 0);
         assert_eq!(plan, vec![("t-queued".to_string(), "review-1".to_string())]);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- review-status routing gate (pure) ----------------------------------
+
+    #[test]
+    fn status_routes_to_review_gates_on_the_review_tag() {
+        // The shipped `task` workflow tags its `review` status `[review]` → an
+        // auto-load onto a review slot is permitted.
+        assert!(status_routes_to_review(
+            &shelbi_core::task_workflow(),
+            "review"
+        ));
+        // The bare default workflow's `review` status carries no tag → it must
+        // NOT be auto-grabbed onto a scarce review slot; it stays in the review
+        // column for a deliberate human sidebar load.
+        assert!(!status_routes_to_review(
+            &shelbi_core::default_workflow(),
+            "review"
+        ));
+        // An unknown status id is never review-routed.
+        assert!(!status_routes_to_review(
+            &shelbi_core::task_workflow(),
+            "no-such-status"
+        ));
+    }
+
+    // -- failure backoff / give-up (pure) -----------------------------------
+
+    fn failure(attempts: u32, last_attempt: i64, gave_up: bool) -> ReviewLoadFailure {
+        ReviewLoadFailure {
+            attempts,
+            last_attempt,
+            gave_up,
+        }
+    }
+
+    #[test]
+    fn autoload_retry_suppressed_holds_off_within_backoff_then_releases() {
+        let backoff = BASE_BACKOFF.as_secs() as i64;
+        let window = CRASH_LOOP_WINDOW.as_secs() as i64;
+
+        // A given-up pair is suppressed forever (left for the user).
+        assert!(autoload_retry_suppressed(&failure(9, 0, true), 10_000));
+        // A never-failed pair is free to attempt.
+        assert!(!autoload_retry_suppressed(&failure(0, 0, false), 0));
+
+        // One failure: suppressed until BASE_BACKOFF has elapsed since it.
+        assert!(autoload_retry_suppressed(&failure(1, 100, false), 100 + backoff - 1));
+        assert!(!autoload_retry_suppressed(&failure(1, 100, false), 100 + backoff));
+        // Two failures: the window doubles (BASE_BACKOFF * 2).
+        assert!(autoload_retry_suppressed(
+            &failure(2, 100, false),
+            100 + 2 * backoff - 1
+        ));
+        assert!(!autoload_retry_suppressed(
+            &failure(2, 100, false),
+            100 + 2 * backoff
+        ));
+        // A last attempt older than the crash-loop window has aged out: the
+        // counter is stale, so the pair is retryable again (a fresh start).
+        assert!(!autoload_retry_suppressed(&failure(2, 100, false), 100 + window));
+    }
+
+    #[test]
+    fn note_autoload_failure_counts_backs_off_then_trips_giveup_once() {
+        let window = CRASH_LOOP_WINDOW.as_secs() as i64;
+
+        // First failure from a clean slate.
+        let (r1, trips1) = note_autoload_failure(&ReviewLoadFailure::default(), 100);
+        assert_eq!(r1, failure(1, 100, false));
+        assert!(!trips1);
+
+        // Second failure within the window increments, no give-up yet.
+        let (r2, trips2) = note_autoload_failure(&r1, 110);
+        assert_eq!(r2, failure(2, 110, false));
+        assert!(!trips2);
+
+        // Third failure reaches the cap → latches give-up and trips the event
+        // exactly once.
+        let (r3, trips3) = note_autoload_failure(&r2, 120);
+        assert_eq!(r3, failure(3, 120, true));
+        assert!(trips3, "reaching the cap must trip the gave-up event");
+
+        // A further failure while already given up does not re-trip the event.
+        let (r4, trips4) = note_autoload_failure(&r3, 130);
+        assert!(r4.gave_up);
+        assert!(!trips4, "give-up fires once, never again");
+
+        // A failure landing outside the crash-loop window resets the counter,
+        // so a slow drip never accumulates to a give-up.
+        let (drip, trips_drip) = note_autoload_failure(&failure(2, 100, false), 100 + window);
+        assert_eq!(drip, failure(1, 100 + window, false));
+        assert!(!trips_drip);
+    }
+
+    #[test]
+    fn plan_suppresses_a_given_up_pair_but_still_places_it_on_another_slot() {
+        let project = tagged_project();
+        // t-1 has given up on review-1 specifically. t-2 is fresh.
+        let review = [
+            tf(review_task_pri("t-1", None, 0)),
+            tf(review_task_pri("t-2", None, 1)),
+        ];
+        let free = vec![
+            project.workspace("review-1").unwrap().clone(),
+            project.workspace("review-2").unwrap().clone(),
+        ];
+        let mut failures: BTreeMap<String, BTreeMap<String, ReviewLoadFailure>> = BTreeMap::new();
+        failures
+            .entry("t-1".into())
+            .or_default()
+            .insert("review-1".into(), failure(3, 0, true));
+
+        // review-1: t-1 is suppressed there, so the slot goes to t-2 instead.
+        // review-2: t-1 is NOT suppressed there (per-`(task, slot)`), so it
+        // still lands on the other slot rather than being abandoned wholesale.
+        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new(), &failures, 10_000);
+        assert_eq!(
+            plan,
+            vec![
+                ("t-2".to_string(), "review-1".to_string()),
+                ("t-1".to_string(), "review-2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_drops_a_given_up_pair_when_it_is_the_only_slot() {
+        let project = tagged_project();
+        // The bug's resting state: one queued task, one review slot, and the
+        // pair has given up. Nothing is planned — no identical retry is emitted.
+        let review = [tf(review_task_pri("t-doomed", None, 0))];
+        let free = vec![project.workspace("review-1").unwrap().clone()];
+        let mut failures: BTreeMap<String, BTreeMap<String, ReviewLoadFailure>> = BTreeMap::new();
+        failures
+            .entry("t-doomed".into())
+            .or_default()
+            .insert("review-1".into(), failure(3, 0, true));
+
+        let plan = plan_review_autoload(&review, &project, &free, &BTreeSet::new(), &failures, 10_000);
+        assert!(plan.is_empty(), "a given-up pair must not be re-planned");
+    }
+
+    // -- routing gate + failure ledger (on disk, end-to-end) ----------------
+
+    #[test]
+    fn autoload_skips_a_task_whose_review_status_is_not_review_tagged() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+
+        // No workflows scaffolded → the task resolves to the bare default
+        // workflow, whose `review` status carries no `review` tag. A free review
+        // slot is available, but the loader must leave the task in the review
+        // column rather than consuming a slot for an untagged handoff status.
+        shelbi_state::save_task("demo", &review_task("t-untagged", "alpha"), "body").unwrap();
+
+        let loaded = autoload_review_queue("demo").unwrap();
+        assert!(loaded.is_empty(), "an untagged review status must not auto-load");
+        // It was never even attempted, so no failure was recorded.
+        assert!(shelbi_state::review_load_failures("demo").unwrap().is_empty());
+        // Untouched on the dev slot.
+        let after = shelbi_state::load_task("demo", "t-untagged").unwrap();
+        assert_eq!(after.task.assigned_to.as_deref(), Some("alpha"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn autoload_records_a_failure_and_backs_off_a_doomed_load() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+        // Scaffold the shipped `task`/`subtask` workflows + statuses so the task
+        // resolves to the review-tagged `task` workflow and is eligible to load.
+        shelbi_state::scaffold_project_statuses("demo").unwrap();
+        shelbi_state::scaffold_project_workflow("demo").unwrap();
+
+        // Occupy review-2 so review-1 is the *only* free slot — otherwise a
+        // pair backed off on review-1 would (correctly, per-`(task, slot)`)
+        // spill onto review-2, which is a different pairing. Pinning to one slot
+        // isolates the backoff-of-the-same-pair behavior under test.
+        shelbi_state::save_task("demo", &review_task("t-occupied", "review-2"), "body").unwrap();
+
+        // A queued, review-eligible task with the one free slot. Every load
+        // attempt fails at dispatch (no tmux in the test env) — the
+        // durable-failure shape the fix targets.
+        shelbi_state::save_task("demo", &review_task("t-doomed", "alpha"), "body").unwrap();
+
+        // First tick: the pair is attempted and fails, so a failure record is
+        // written. No success is ever reported.
+        let loaded = autoload_review_queue("demo").unwrap();
+        assert!(loaded.is_empty());
+        let after_first = shelbi_state::review_load_failures("demo").unwrap();
+        let rec = after_first
+            .get("t-doomed")
+            .and_then(|m| m.get("review-1"))
+            .expect("the failed pair must be recorded for backoff");
+        assert_eq!(rec.attempts, 1, "one attempt recorded on the first failure");
+        assert!(!rec.gave_up);
+
+        // Second tick within the backoff window: the planner suppresses the
+        // pair, so it is NOT re-attempted and the counter does not climb — the
+        // identical retry the bug emitted every tick is gone.
+        let loaded = autoload_review_queue("demo").unwrap();
+        assert!(loaded.is_empty());
+        let after_second = shelbi_state::review_load_failures("demo").unwrap();
+        assert_eq!(
+            after_second["t-doomed"]["review-1"].attempts, 1,
+            "a within-backoff tick must not re-attempt the same pair"
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
