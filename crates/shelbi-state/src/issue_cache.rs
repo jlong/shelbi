@@ -73,7 +73,17 @@ const BOARD_SNAPSHOT_FILE: &str = "board-snapshot.json";
 /// refresh is not always in flight, short enough that out-of-band board
 /// movement (an agent moving a card) surfaces promptly. Operator-driven writes
 /// do not wait for it — they mark the snapshot stale immediately.
+///
+/// Exposed as [`BOARD_CACHE_TTL`] so out-of-crate consumers that make decisions
+/// off a cached board read (the poller's orphaned-pane reaper) can size their
+/// own staleness-tolerance windows against the same bound instead of
+/// hardcoding a duplicate of this number.
 const TTL: Duration = Duration::from_secs(20);
+
+/// Public alias of the process-local board cache's serve-stale window. See
+/// [`TTL`]. A cached `list()` may lag the backend by up to this long (plus one
+/// background refresh round trip) before the snapshot catches up.
+pub const BOARD_CACHE_TTL: Duration = TTL;
 
 /// One project's cached board.
 struct Entry {

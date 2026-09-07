@@ -25,6 +25,7 @@ pub mod github_store;
 mod hub_config;
 mod hub_version;
 mod issue_cache;
+pub use issue_cache::BOARD_CACHE_TTL;
 pub mod issue_auth;
 pub mod issue_migrate;
 pub mod issue_store;
