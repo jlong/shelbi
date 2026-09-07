@@ -368,6 +368,14 @@ fn run_workspace_poll_loop(
     // reset passed hours while the hub was down.
     let mut limit_resume = LimitResumeState::default();
 
+    // When this slot first read as orphaned-by-board (no active task points at
+    // it). `None` = not currently orphaned. The reaper debounces off this so a
+    // dispatch racing a stale remote-board snapshot is never reaped mid-flight;
+    // see `maybe_reconcile_orphaned_pane`. Per-thread and in-memory like the
+    // rest: a poller restart re-seeds it to `None`, which only re-arms the full
+    // grace window for a slot that was already mid-reap — harmless.
+    let mut orphan_since: Option<Instant> = None;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -412,6 +420,7 @@ fn run_workspace_poll_loop(
             &mut last_dialog,
             &mut supervision,
             &mut limit_resume,
+            &mut orphan_since,
         );
 
         sleep_interruptible(
@@ -1173,6 +1182,7 @@ fn poll_one(
     last_dialog: &mut Option<String>,
     supervision: &mut SupervisionState,
     limit_resume: &mut LimitResumeState,
+    orphan_since: &mut Option<Instant>,
 ) {
     // Gate the whole tick before reading/consuming ready or transition
     // markers. Under a mismatch those durable markers stay in place, and the
@@ -1245,9 +1255,13 @@ fn poll_one(
         // dialog we were tracking can't be "cleared" in a meaningful way —
         // pane death has its own `pane_alive=false` event — so just drop the
         // stuck-state so a respawned pane re-detects from scratch. Same for
-        // a pending limit-resume: there's no pane left to nudge.
+        // a pending limit-resume: there's no pane left to nudge. Drop the
+        // orphan grace clock too: a respawned pane (crash restart or a fresh
+        // dispatch onto this slot) must start its own grace window, not inherit
+        // a stale one from before the pane died.
         *last_dialog = None;
         *limit_resume = LimitResumeState::Idle;
+        *orphan_since = None;
         return;
     }
 
@@ -1262,7 +1276,7 @@ fn poll_one(
     // (we just returned on a dead one) and short-circuits the rest of the tick
     // when it reaps — there's nothing left to observe. (A review slot's teardown
     // lives in `handle_review_slot` above, not here.)
-    if maybe_reconcile_orphaned_pane(project, workspace, &host, &addr) {
+    if maybe_reconcile_orphaned_pane(project, workspace, &host, &addr, orphan_since) {
         *last_dialog = None;
         *limit_resume = LimitResumeState::Idle;
         return;
@@ -3856,6 +3870,23 @@ fn maybe_reap_orphaned_review_slot(
     true
 }
 
+/// How long the orphaned-by-board condition must hold before the reaper acts.
+///
+/// The poller reads a remote board through the process-local cache, which
+/// serves a snapshot up to [`shelbi_state::BOARD_CACHE_TTL`] old plus one
+/// background refresh round trip. A cross-process `shelbi task start` moves the
+/// card to `in_progress` on the backend but not in this poller's snapshot, so a
+/// just-dispatched slot reads as orphaned for that whole window. Reaping inside
+/// it kills the live pane mid-dispatch — the bug this guards against. The grace
+/// is three full TTLs: one covers the serve-stale window before this poller
+/// even kicks its refresh, the rest covers the refresh completing — including a
+/// few 5s-cadence retries if the first background refresh hits a slow or
+/// briefly-unreachable backend before one lands. It is comfortably longer than
+/// the worst-case staleness yet short enough that a genuinely orphaned pane (a
+/// real hand move-away) is still reclaimed on the order of a minute.
+const ORPHAN_REAP_GRACE: Duration =
+    Duration::from_secs(3 * shelbi_state::BOARD_CACHE_TTL.as_secs());
+
 /// Reap a dev workspace pane orphaned by a manual board move. Fires when a
 /// live, non-user-shell pane on a non-`review` workspace has no active
 /// (`active`-category) task assigned to it — the state a hand move out of
@@ -3884,14 +3915,29 @@ fn maybe_reap_orphaned_review_slot(
 ///    carries [`USER_SHELL_OPTION`]; a probe that can't tell is treated as
 ///    "might be one" and skipped.
 ///
-/// No start-up race: dispatch persists a task as `in_progress` + assigned
-/// *before* it spawns the pane, so a freshly launched worker already has an
-/// active task by the time it's alive.
+/// Dispatch persists a task as `in_progress` + assigned *before* it spawns the
+/// pane, so on a `file_system` board (a live directory read) a freshly launched
+/// worker already has an active task the instant it's alive. A **remote**
+/// (`github`) board does not read live: the poller reads it through the
+/// process-local board cache ([`shelbi_state::BOARD_CACHE_TTL`]), and a
+/// `shelbi task start` in a *separate* CLI process writes the `in_progress`
+/// move to the backend without touching this long-lived poller process's
+/// snapshot. So for up to one TTL (plus a refresh round trip) after a dispatch,
+/// this poller's cached board still shows the just-dispatched card in its old
+/// `todo`/unassigned state — the slot *looks* orphaned though its dispatch is in
+/// flight. Reaping then kills the live pane out from under the dispatch (the
+/// confirm-wait then sees no busy signal and aborts). We therefore debounce:
+/// the orphaned-by-board condition must persist past [`ORPHAN_REAP_GRACE`]
+/// (which outlasts the cache's staleness bound) before we act. By then the
+/// snapshot has refreshed from the backend, so a card still absent is genuinely
+/// gone (a real hand move-away), not a stale read. `orphan_since` carries the
+/// grace clock across ticks; it is reset whenever the condition clears.
 fn maybe_reconcile_orphaned_pane(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     host: &shelbi_core::Host,
     addr: &shelbi_core::TmuxAddr,
+    orphan_since: &mut Option<Instant>,
 ) -> bool {
     // Read the board explicitly so a transient failure stays distinguishable
     // from a genuinely empty result — never reap on an unreadable board.
@@ -3899,6 +3945,21 @@ fn maybe_reconcile_orphaned_pane(
         return false;
     };
     if !workspace_orphaned_by_board(project, workspace, &tasks) {
+        // An active task points at the slot (or the snapshot just caught up to
+        // a dispatch): the slot isn't orphaned, so drop any in-flight grace
+        // clock and leave the pane alone.
+        *orphan_since = None;
+        return false;
+    }
+
+    // Orphaned by the (possibly stale) cached board. Start — or continue — the
+    // grace clock and bail until it elapses, so a dispatch racing a stale
+    // remote-board snapshot is never reaped mid-flight. A `file_system` board
+    // reads live, so its grace window is spent against an already-authoritative
+    // read; the cost is a bounded delay before a genuinely orphaned pane is
+    // reclaimed, which teardown tolerates.
+    let first_seen = orphan_since.get_or_insert_with(Instant::now);
+    if first_seen.elapsed() < ORPHAN_REAP_GRACE {
         return false;
     }
 
@@ -3945,6 +4006,10 @@ fn maybe_reconcile_orphaned_pane(
                 workspace = %workspace.name,
                 "reaped orphaned dev pane (no active task assigned); slot returned to idle",
             );
+            // Reaped: the slot is idle now, so clear the grace clock. A later
+            // re-dispatch to this slot starts its own fresh grace window rather
+            // than inheriting this one.
+            *orphan_since = None;
             true
         }
         Err(e) => {
@@ -5255,6 +5320,7 @@ while :; do sleep 60; done
         let mut last_dialog = None;
         let mut supervision = SupervisionState::default();
         let mut limit_resume = LimitResumeState::default();
+        let mut orphan_since: Option<Instant> = None;
 
         // Banner -> scheduled: persist the pause and surface the actual badge,
         // but do not touch the modal before the stated due time.
@@ -5265,6 +5331,7 @@ while :; do sleep 60; done
             &mut last_dialog,
             &mut supervision,
             &mut limit_resume,
+            &mut orphan_since,
         );
         assert_eq!(last_known, Some(WorkspaceState::Paused));
         let paused = load_workspace_status("alpha").unwrap().unwrap();
@@ -5323,6 +5390,7 @@ while :; do sleep 60; done
             &mut last_dialog,
             &mut supervision,
             &mut limit_resume,
+            &mut orphan_since,
         );
         assert_eq!(
             std::fs::read_to_string(&receipt).unwrap(),
@@ -5368,6 +5436,7 @@ while :; do sleep 60; done
             &mut last_dialog,
             &mut supervision,
             &mut limit_resume,
+            &mut orphan_since,
         );
         assert_eq!(last_known, Some(WorkspaceState::Working));
         assert_eq!(
@@ -5481,6 +5550,7 @@ while :; do sleep 60; done
         let mut last_dialog = None;
         let mut supervision = SupervisionState::default();
         let mut limit_resume = LimitResumeState::default();
+        let mut orphan_since: Option<Instant> = None;
         poll_one(
             &project,
             &project.workspaces[0],
@@ -5488,6 +5558,7 @@ while :; do sleep 60; done
             &mut last_dialog,
             &mut supervision,
             &mut limit_resume,
+            &mut orphan_since,
         );
         daemon.join().unwrap();
 
@@ -7182,6 +7253,92 @@ transitions:
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// The orphan reaper debounces off a persistence grace window so a dispatch
+    /// racing a stale remote-board snapshot is never reaped mid-flight. No tmux:
+    /// both cases return at the board/grace gate, before the liveness probe.
+    ///
+    /// This is the regression guard for the dev-dispatch reap bug: a
+    /// just-dispatched slot reads as orphaned only because this poller's cached
+    /// board hasn't caught up to the cross-process `in_progress` move yet.
+    #[test]
+    fn orphan_reaper_debounces_before_reaping() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project_name = format!("orphan-debounce-{nonce}");
+        let home = std::env::temp_dir().join(&project_name);
+        std::fs::create_dir_all(&home).unwrap();
+        let _cleanup = LimitResumeTmuxCleanup {
+            session: format!("unused-{project_name}"),
+            home: home.clone(),
+            prior_home: std::env::var_os("SHELBI_HOME"),
+            prior_hub_sock: std::env::var_os("SHELBI_HUB_SOCK"),
+        };
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.name.clone_from(&project_name);
+        shelbi_state::save_project(&project).unwrap();
+
+        // Assigned to alpha but parked in `review` (non-active) — the board
+        // half reads this slot as orphaned, the same shape a stale snapshot
+        // gives a slot whose in-flight `in_progress` move it hasn't seen yet.
+        let mut task = in_progress_task("t-debounce", "alpha");
+        task.column = Column::review();
+        shelbi_state::save_task(&project.name, &task, "no commits").unwrap();
+
+        let host = Host::Local;
+        let addr = TmuxAddr {
+            session: format!("shelbi-{project_name}"),
+            window: "alpha".into(),
+        };
+
+        // First observation: orphaned-by-board, but the grace clock was unset,
+        // so the reaper arms it and declines to act — the pane (a live,
+        // just-dispatched slot in the real bug) is left alone.
+        let mut orphan_since: Option<Instant> = None;
+        assert!(
+            !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan_since),
+            "a freshly-observed orphan must not be reaped inside the grace window",
+        );
+        let armed = orphan_since.expect("the grace clock must be armed on first observation");
+
+        // Still inside the grace window on the next tick: no reap, and the
+        // clock keeps its original start (not reset forward), so the window
+        // actually elapses instead of restarting every tick.
+        assert!(
+            !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan_since),
+            "an orphan still inside the grace window must not be reaped",
+        );
+        assert_eq!(
+            orphan_since,
+            Some(armed),
+            "the grace clock must not be pushed forward while the condition holds",
+        );
+
+        // The snapshot catches up to the dispatch: the card is now active and
+        // assigned to this slot, so the slot is no longer orphaned and the
+        // grace clock clears — no reap ever fires.
+        task.column = Column::in_progress();
+        shelbi_state::save_task(&project.name, &task, "no commits").unwrap();
+        assert!(
+            !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan_since),
+            "a slot with an active assigned task must never be reaped",
+        );
+        assert!(
+            orphan_since.is_none(),
+            "the grace clock must clear once the orphaned condition lifts",
+        );
+    }
+
     /// End-to-end reap: a real tmux slot for a dev workspace whose task was
     /// hand-moved to `review` is closed by the reconciler, the slot returns to
     /// idle, and a `pane_alive=false reason=orphaned-slot-reaped` line lands.
@@ -7239,8 +7396,23 @@ transitions:
             "the orphaned agent pane must be alive before the reap",
         );
 
-        let reaped = maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr);
+        // The slot has read orphaned-by-board for longer than the grace window
+        // already (a genuine hand move-away, not a fresh dispatch racing a
+        // stale remote-board snapshot), so the reaper acts on this pass rather
+        // than re-arming the debounce. `checked_sub` guards the theoretical
+        // pre-monotonic-origin underflow.
+        let mut orphan_since = Some(
+            Instant::now()
+                .checked_sub(ORPHAN_REAP_GRACE + Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+        );
+        let reaped =
+            maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan_since);
         assert!(reaped, "a live dev pane with no active task must be reaped");
+        assert!(
+            orphan_since.is_none(),
+            "a completed reap must clear the grace clock so a re-dispatch starts fresh",
+        );
         assert!(
             !shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
             "the pane must be gone after the reap",
@@ -7255,9 +7427,22 @@ transitions:
             "expected an orphan-reap pane event; log: {log:?}",
         );
 
-        // Idempotent: with the pane gone, a second pass is a no-op.
+        // Idempotent: with the pane gone, a second pass is a no-op even with
+        // the grace window already satisfied — the liveness probe sees a dead
+        // slot and declines to "reap" it again.
+        let mut elapsed_again = Some(
+            Instant::now()
+                .checked_sub(ORPHAN_REAP_GRACE + Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+        );
         assert!(
-            !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr),
+            !maybe_reconcile_orphaned_pane(
+                &project,
+                &project.workspaces[0],
+                &host,
+                &addr,
+                &mut elapsed_again
+            ),
             "a dead slot must not be re-reaped",
         );
     }
