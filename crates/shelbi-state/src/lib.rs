@@ -55,8 +55,8 @@ pub use issue_migrate::{
     apply_issue_migration, plan_issue_migration, IssueMigrationPlan,
 };
 pub use issue_store::{
-    issue_store_for, resolve_issue_store, Cursor, FileSystemStore, IssueChange, IssueComment,
-    IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
+    issue_store_for, resolve_issue_store, BoardState, Cursor, FileSystemStore, IssueChange,
+    IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
 };
 pub use project_paths::ProjectPaths;
 pub use root::{
@@ -2321,7 +2321,7 @@ pub fn task_path(project: &str, id: &str) -> Result<PathBuf> {
     Ok(tasks_dir(project)?.join(format!("{id}.md")))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueFile {
     pub task: Issue,
     pub body: String,

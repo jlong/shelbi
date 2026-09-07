@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
@@ -45,6 +45,12 @@ pub struct KanbanApp {
     /// which then show the slug. Rendered via [`KanbanApp::display_label`].
     pub display_name: Option<String>,
     pub tasks: Vec<IssueFile>,
+    /// True on a cold process whose board hasn't loaded yet — no persisted
+    /// snapshot to seed from ([`shelbi_state::BoardState::Cold`]). The board
+    /// paints its column chrome plus a centered "Loading board…" overlay
+    /// instead of blocking on the network or showing bare empty columns as if
+    /// they were real. Cleared on the first refresh that returns data.
+    pub board_loading: bool,
     pub selected_column: usize,
     pub selected_row: usize,
     pub last_refresh: Instant,
@@ -360,6 +366,7 @@ impl KanbanApp {
             project_name: project_name.into(),
             display_name: None,
             tasks: Vec::new(),
+            board_loading: false,
             selected_column: 0,
             selected_row: 0,
             last_refresh: Instant::now() - Duration::from_secs(60),
@@ -732,9 +739,22 @@ impl KanbanApp {
             }
         };
         self.all_columns = self.compute_all_columns();
-        match shelbi_state::issue_store_for(&self.project_name).and_then(|s| s.list()) {
-            Ok(tasks) => {
-                self.tasks = tasks;
+        // Board freshness via the three-state API: on a cold process with no
+        // persisted snapshot this returns `Cold` without a blocking sweep, so
+        // the board paints its chrome plus a loading overlay instead of
+        // freezing on the network. A warm/stale (or `file_system`) board seeds
+        // the snapshot and renders normally.
+        match shelbi_state::issue_store_for(&self.project_name).and_then(|s| s.list_state()) {
+            Ok(shelbi_state::BoardState::Cold) => {
+                // No data yet; leave `tasks` as-is (empty on first paint) and
+                // flag loading. The background refresh will fill it and the
+                // next tick renders the real board.
+                self.board_loading = true;
+                self.last_refresh = Instant::now();
+            }
+            Ok(state) => {
+                self.board_loading = false;
+                self.tasks = state.into_issues();
                 self.last_refresh = Instant::now();
                 self.clamp_selection();
             }
@@ -1433,6 +1453,12 @@ pub fn render_full(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     // so the layout has the final area width to work with.
     app.ensure_selected_visible(outer[1].width);
     render_columns(f, app, &mut hits, outer[1]);
+    // Cold process, board not loaded yet: overlay a centered "Loading board…"
+    // banner over the (empty) column chrome so it reads as fetching, not as a
+    // real empty board. Suppressed the instant any tasks are present.
+    if app.board_loading && app.tasks.is_empty() {
+        render_loading_overlay(f, outer[1]);
+    }
     render_footer(f, app, outer[2]);
     app.card_hits = hits;
 
@@ -1456,6 +1482,29 @@ pub fn render_full(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     if app.popover_is_open() {
         render_popover(f, app, area);
     }
+}
+
+/// A centered "Loading board…" banner painted over the column area on a cold
+/// process before the first board read lands. One line, vertically centered,
+/// dim italic so it reads as transient status rather than a card.
+fn render_loading_overlay(f: &mut Frame, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let line = Rect {
+        x: area.x,
+        y: area.y + area.height / 2,
+        width: area.width,
+        height: 1,
+    };
+    let para = Paragraph::new(Line::from(Span::styled(
+        "Loading board…",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )))
+    .alignment(Alignment::Center);
+    f.render_widget(para, line);
 }
 
 fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
@@ -3899,6 +3948,61 @@ mod tests {
                  Shift+k/Shift+j reorder   Tab workflow   f filter   r refresh"
             ),
             "footer mismatch in:\n{joined}"
+        );
+    }
+
+    /// A cold board (loading, no tasks) paints its column chrome plus a
+    /// centered "Loading board…" overlay — not bare empty columns that would
+    /// read as a real empty board.
+    #[test]
+    fn cold_board_renders_loading_overlay() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = KanbanApp::new("demo");
+        app.board_loading = true;
+        assert!(app.tasks.is_empty());
+
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let joined: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("Loading board…"),
+            "cold board must show the loading overlay, got:\n{joined}"
+        );
+    }
+
+    /// Once tasks are present the overlay is gone even if the flag lingered a
+    /// frame — a loaded board (empty or not) never reads as "loading".
+    #[test]
+    fn loading_overlay_suppressed_once_tasks_present() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = KanbanApp::new("demo");
+        app.board_loading = true; // stale flag
+        app.tasks = vec![task_file("task-1", Column::todo(), 0, "2026-06-20T10:00:00Z")];
+
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let joined: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !joined.contains("Loading board…"),
+            "a board with tasks must not show the loading overlay, got:\n{joined}"
         );
     }
 

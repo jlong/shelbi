@@ -246,6 +246,12 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
             ListItem::new(lines)
         }
         Row::Blank => ListItem::new(Line::raw("")),
+        Row::Loading => ListItem::new(Line::from(Span::styled(
+            "  Loading…",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))),
         Row::MachineGroup {
             name,
             collapsed,

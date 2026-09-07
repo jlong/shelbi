@@ -280,12 +280,69 @@ impl Cursor {
     }
 }
 
+/// The three cold-start states a whole-board read can be in, from
+/// [`IssueStore::list_state`]. Lets a render surface tell "the board is empty"
+/// apart from "the board hasn't loaded yet" — the distinction a plain
+/// `Vec<IssueFile>` can't carry, and the reason a cold render used to either
+/// block on the network or lie with a blank board.
+#[derive(Debug, Clone)]
+pub enum BoardState {
+    /// Fresh data: within the cache TTL, or a local `file_system` board (whose
+    /// reads are always authoritative). Render it directly.
+    Warm(Vec<IssueFile>),
+    /// Last-known data served while a background refresh runs. A cold process
+    /// that seeded from the on-disk snapshot reports this: paint the rows now,
+    /// let the refresh replace them in place.
+    Stale(Vec<IssueFile>),
+    /// No data at all — a genuine first run with no snapshot yet. The caller
+    /// should paint its chrome plus a loading indicator, never an empty board.
+    Cold,
+}
+
+impl BoardState {
+    /// The issues to render, empty when [`BoardState::Cold`]. Convenience for
+    /// callers that don't distinguish warm from stale (both are renderable) and
+    /// treat cold as "nothing to show yet".
+    pub fn issues(&self) -> &[IssueFile] {
+        match self {
+            BoardState::Warm(v) | BoardState::Stale(v) => v,
+            BoardState::Cold => &[],
+        }
+    }
+
+    /// Consume into the issue vec — empty when [`BoardState::Cold`].
+    pub fn into_issues(self) -> Vec<IssueFile> {
+        match self {
+            BoardState::Warm(v) | BoardState::Stale(v) => v,
+            BoardState::Cold => Vec::new(),
+        }
+    }
+
+    /// Whether this is the no-data-yet state that should render as "loading".
+    pub fn is_cold(&self) -> bool {
+        matches!(self, BoardState::Cold)
+    }
+}
+
 /// The board seam. Every consumer that reads or mutates a project's issues
 /// does so through this trait; [`FileSystemStore`] is the only implementor
 /// today, with GitHub / Jira / Linear backends to follow behind the same shape.
 pub trait IssueStore {
     /// The whole board, in the canonical column-then-priority order.
     fn list(&self) -> Result<Vec<IssueFile>>;
+
+    /// The whole board tagged with its freshness ([`BoardState`]) so a render
+    /// surface can paint a cold process instantly — from the on-disk snapshot
+    /// when one exists, or a loading indicator when none does — instead of
+    /// blocking on a multi-second remote sweep before first paint.
+    ///
+    /// The default is [`BoardState::Warm`] over [`IssueStore::list`]: correct
+    /// for the local `file_system` backend, whose reads are cheap and always
+    /// authoritative. Only the remote-backed cache overrides it to serve a
+    /// disk snapshot and report `Stale` / `Cold`.
+    fn list_state(&self) -> Result<BoardState> {
+        Ok(BoardState::Warm(self.list()?))
+    }
 
     /// Every issue in a single status column, in priority order.
     fn list_in_status(&self, status: &Column) -> Result<Vec<IssueFile>>;

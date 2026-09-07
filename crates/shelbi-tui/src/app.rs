@@ -180,6 +180,13 @@ pub struct App {
     /// for Review" section: waiting for a free review slot
     /// ([`ReviewState::Pending`], ·). No location yet (nothing serving).
     pub queued_review: Vec<ReviewEntry>,
+    /// True on a cold process whose board hasn't loaded yet — no persisted
+    /// snapshot to seed from ([`shelbi_state::BoardState::Cold`]). Drives the
+    /// dim "Loading…" placeholder in [`App::rows`] so the sidebar paints its
+    /// chrome instantly instead of blocking on the network, and a genuinely
+    /// empty board stays distinguishable from a not-yet-loaded one. Cleared on
+    /// the first refresh that returns real (warm or stale) data.
+    pub board_loading: bool,
     pub sidebar_index: usize,
     pub last_refresh: Instant,
     pub status_line: String,
@@ -270,6 +277,7 @@ impl App {
             config_error: None,
             ready_review: Vec::new(),
             queued_review: Vec::new(),
+            board_loading: false,
             sidebar_index: 0,
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
@@ -413,6 +421,16 @@ impl App {
                 view: View::Builtin("activity"),
             },
         ];
+        // Cold process, board not loaded yet: a dim "Loading…" placeholder
+        // under the nav block. Distinct from an empty board (which shows no
+        // such row) so the user can tell "still fetching" from "nothing here".
+        // The flag is only set when there was genuinely no data to serve, so
+        // the workspace / review sections below are empty and stay omitted.
+        if self.board_loading {
+            rows.push(Row::Blank);
+            rows.push(Row::Loading);
+            return rows;
+        }
         // Every list section header gets exactly one blank line above it,
         // regardless of position, so all section breaks render as the same
         // uniform gap.
@@ -568,26 +586,45 @@ impl App {
             .ok()
             .and_then(|p| p.display_name.or(p.label));
         self.agents = load_agents(&self.project_name).unwrap_or_default();
-        let review = shelbi_state::issue_store_for(&self.project_name)
-            .and_then(|s| s.list_in_status(&Column::review()))
-            .unwrap_or_default();
-        let (ready, queued) = split_review_sections(&self.project_name, review);
-        self.ready_review = ready;
-        self.queued_review = queued;
-        match load_workspaces(&self.project_name) {
-            Ok(ws) => {
-                self.workspaces = ws;
-                self.config_error = None;
-            }
-            Err(e) => {
-                // A load failure with a config file present on disk is a
-                // broken config (invalid id / schema / YAML) — surface the
-                // message inline. A load failure with *no* config file is a
-                // fresh/half-set-up project: keep the section omitted, as
-                // before, rather than crying "config error" during setup.
-                self.workspaces = Vec::new();
-                self.config_error =
-                    project_config_present(&self.project_name).then(|| e.to_string());
+        // Probe board freshness through the three-state API first. On a cold
+        // process with no persisted snapshot this returns `Cold` *without*
+        // blocking on the network — we paint a loading indicator and skip the
+        // downstream `list_in_status` calls, which would otherwise force the
+        // multi-second synchronous sweep. On a warm/stale (or `file_system`)
+        // board this seeds the process-local snapshot, so the reads below are
+        // served from memory rather than the wire.
+        let board_state = shelbi_state::issue_store_for(&self.project_name).map(|s| s.list_state());
+        let cold = matches!(board_state, Ok(Ok(shelbi_state::BoardState::Cold)));
+        self.board_loading = cold;
+        if cold {
+            // Nothing to show yet; the background refresh is in flight. Leave
+            // the sections empty (the loading row stands in) and don't block.
+            self.ready_review = Vec::new();
+            self.queued_review = Vec::new();
+            self.workspaces = Vec::new();
+            self.config_error = None;
+        } else {
+            let review = shelbi_state::issue_store_for(&self.project_name)
+                .and_then(|s| s.list_in_status(&Column::review()))
+                .unwrap_or_default();
+            let (ready, queued) = split_review_sections(&self.project_name, review);
+            self.ready_review = ready;
+            self.queued_review = queued;
+            match load_workspaces(&self.project_name) {
+                Ok(ws) => {
+                    self.workspaces = ws;
+                    self.config_error = None;
+                }
+                Err(e) => {
+                    // A load failure with a config file present on disk is a
+                    // broken config (invalid id / schema / YAML) — surface the
+                    // message inline. A load failure with *no* config file is a
+                    // fresh/half-set-up project: keep the section omitted, as
+                    // before, rather than crying "config error" during setup.
+                    self.workspaces = Vec::new();
+                    self.config_error =
+                        project_config_present(&self.project_name).then(|| e.to_string());
+                }
             }
         }
         // A missing state.json is normal (fresh project): default to Off so
@@ -1114,6 +1151,12 @@ pub enum Row {
     /// Vertical spacing between sections. Renders as an empty line and
     /// can't be selected — purely for visual rhythm.
     Blank,
+    /// The board hasn't loaded yet on a cold process (no snapshot on disk):
+    /// render a dim "Loading…" placeholder rather than an empty sidebar, so a
+    /// genuinely-empty board (no rows) stays distinguishable from a not-yet-
+    /// loaded one. Non-selectable — it's a status, not a destination. Replaced
+    /// in place the moment the background refresh lands.
+    Loading,
     /// Machine group header inside the Workspaces section. Renders as
     /// `▾ <machine>` when expanded and `▸ <machine>   (<total>, <active>
     /// active)` when collapsed. Only emitted when the project declares
@@ -1185,7 +1228,7 @@ impl Row {
         // headers and blank spacers stay inert (no useful action).
         !matches!(
             self,
-            Row::Section { .. } | Row::Blank | Row::ConfigError { .. }
+            Row::Section { .. } | Row::Blank | Row::ConfigError { .. } | Row::Loading
         )
     }
 
@@ -1198,7 +1241,8 @@ impl Row {
             Row::Section { .. }
             | Row::Blank
             | Row::MachineGroup { .. }
-            | Row::ConfigError { .. } => None,
+            | Row::ConfigError { .. }
+            | Row::Loading => None,
         }
     }
 
@@ -1240,7 +1284,8 @@ impl Row {
             Row::Section { .. }
             | Row::Blank
             | Row::MachineGroup { .. }
-            | Row::ConfigError { .. } => None,
+            | Row::ConfigError { .. }
+            | Row::Loading => None,
         }
     }
 }
@@ -2063,6 +2108,44 @@ mod tests {
     /// A `config_error` renders an inline error row under a still-present
     /// `Workspaces` header instead of dropping the whole section — the core
     /// of AC1. Pure `rows()` check, no disk.
+    #[test]
+    fn board_loading_shows_an_inert_loading_row_not_empty_sections() {
+        let mut app = App::new_sidebar("demo");
+        // Cold process, board not loaded yet.
+        app.board_loading = true;
+        let rows = app.rows();
+        let loading = rows
+            .iter()
+            .find(|r| matches!(r, Row::Loading))
+            .expect("a cold board must render a Loading placeholder");
+        // It's a status, not a destination: inert and non-navigable.
+        assert!(!loading.is_selectable());
+        assert!(loading.view().is_none());
+        assert!(loading.decoration().is_none());
+        // No section headers while loading — the placeholder stands alone.
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r, Row::Section { .. })),
+            "loading state must not paint empty Workspaces/Review sections"
+        );
+    }
+
+    #[test]
+    fn a_genuinely_empty_board_shows_no_loading_row() {
+        // board_loading stays false (a warm/stale read returned an empty board):
+        // the sidebar must read as empty, never as loading.
+        let app = App::new_sidebar("demo");
+        assert!(!app.board_loading);
+        let rows = app.rows();
+        assert!(
+            !rows.iter().any(|r| matches!(r, Row::Loading)),
+            "an empty (loaded) board must not render a Loading row"
+        );
+        // Only the three nav rows remain.
+        assert_eq!(rows.iter().filter(|r| r.is_selectable()).count(), 3);
+    }
+
     #[test]
     fn rows_surface_config_error_under_workspaces_header() {
         let mut app = App::new_sidebar("Shelbi");
