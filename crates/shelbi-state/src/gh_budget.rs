@@ -485,6 +485,46 @@ mod tests {
     }
 
     #[test]
+    fn governor_middle_band_boundaries_land_where_the_thresholds_split() {
+        // The exact band edges (defaults high=2,000, medium=500). `tick_plan`
+        // uses `> high` for base and `> medium` for slow, so:
+        //   remaining == high (2,000)  -> slow (not > high, but > medium)
+        //   just inside the band       -> slow
+        //   remaining == medium (500)  -> pause (not > medium; low band)
+        // The `medium` edge pauses only while its reset is in the future, matching
+        // the low-band rule.
+        let th = thresholds();
+        let slow = TickPlan::Refresh(Duration::from_secs(120));
+        assert_eq!(
+            tick_plan(&tier(Some(2_000), None), &th, 1_000),
+            slow,
+            "remaining == high is the top of the slow band, not the base band",
+        );
+        assert_eq!(
+            tick_plan(&tier(Some(1_999), None), &th, 1_000),
+            slow,
+            "just below high is squarely in the slow band",
+        );
+        assert_eq!(
+            tick_plan(&tier(Some(501), None), &th, 1_000),
+            slow,
+            "just above medium is still the slow band",
+        );
+        assert_eq!(
+            tick_plan(&tier(Some(500), Some(5_000)), &th, 1_000),
+            TickPlan::Pause { until: 5_000 },
+            "remaining == medium falls into the low band and pauses until reset",
+        );
+        // And `> high` is the base band, so the slow band's upper edge is exclusive
+        // at the top.
+        assert_eq!(
+            tick_plan(&tier(Some(2_001), None), &th, 1_000),
+            TickPlan::Refresh(Duration::from_secs(30)),
+            "one point above high is the base band, not the slow band",
+        );
+    }
+
+    #[test]
     fn governor_low_band_pauses_until_the_reset() {
         // 300 remaining with a future reset pauses the index refresh.
         assert_eq!(
