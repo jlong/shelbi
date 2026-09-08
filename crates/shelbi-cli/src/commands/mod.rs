@@ -297,6 +297,40 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    #[test]
+    fn issue_list_status_done_serves_a_fresh_page_without_a_backend_request() {
+        // `shelbi issue list --status done` reads the on-demand done-history page
+        // (§4): a page under the 10-minute TTL is served from `done-history.json`
+        // with no `gh` request. A sentinel id that exists on no backend proves
+        // the cached file was the source (any live fetch would fail, `gh` being
+        // unreachable, and never return it).
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "g");
+        shelbi_state::write_done_history(
+            "g",
+            &shelbi_state::DoneHistory::from_page(&shelbi_state::ClosedPage {
+                issues: vec![ifile("sentinel-done-card", "done")],
+                next_cursor: None,
+                remaining: None,
+                reset: None,
+            }),
+        )
+        .unwrap();
+
+        let done = shelbi_state::issue_store_for("g")
+            .unwrap()
+            .list_in_status(&shelbi_core::Column::done())
+            .unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].task.id, "sentinel-done-card");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 #[cfg(test)]

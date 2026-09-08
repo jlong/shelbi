@@ -21,6 +21,7 @@ use shelbi_core::{
 
 mod agent_workspaces;
 pub mod board_index;
+pub mod done_history;
 mod event_log;
 pub mod gh_budget;
 mod gh_retry;
@@ -65,10 +66,14 @@ pub use board_index::{
     board_index_path, patch_board_index_issue, read_board, read_board_index, read_board_with_cfg,
     remove_board_index_issue, write_board_index, BoardIndex, BOARD_INDEX_FILE,
 };
+pub use done_history::{
+    done_history_path, patch_done_history_issue, read_done_history, remove_done_history_issue,
+    write_done_history, DoneHistory, DONE_HISTORY_FILE, DONE_HISTORY_TTL,
+};
 pub use issue_store::{
-    issue_store_for, issue_store_for_project, raw_issue_store_for, resolve_issue_store, BoardRead,
-    BoardState, Cursor, FileSystemStore, IssueChange, IssueComment, IssueFields, IssueStore,
-    NewIssue, PrioMove, StatusMove,
+    is_terminal_column, issue_store_for, issue_store_for_project, raw_issue_store_for,
+    resolve_issue_store, BoardRead, BoardState, ClosedPage, Cursor, FileSystemStore, IssueChange,
+    IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
 };
 pub use project_paths::ProjectPaths;
 pub use root::{

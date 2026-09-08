@@ -588,8 +588,10 @@ fn list(
     // a backend sweep: `read_open_board_for_cli` reads the published file and
     // notes staleness when the daemon is behind. A terminal (`done`/`canceled`)
     // filter is the one exception — that history is loaded on demand and is not
-    // in the open index — so it still reads its column through the store
-    // (`list_in_status` requests `state=closed`).
+    // in the open index — so it reads its column through the store's on-demand
+    // done-history page (§4): the first 50 closed issues, served from the
+    // long-TTL `done-history.json` cache with no request when the page is under
+    // ten minutes old, never a full `state=closed` sweep.
     let all = match &filter {
         Some(col) if is_terminal_status(col) => cached_issue_store(project)?
             .list_in_status(col)

@@ -159,6 +159,17 @@ pub struct KanbanApp {
     /// `workflow_or_default()` so a `review` column shared by two
     /// workflows can carry independent overrides per workflow view.
     pub column_overrides: std::collections::BTreeMap<String, KanbanColumnOverride>,
+    /// Cursor for the next page of terminal `done`/`canceled` history, from the
+    /// on-demand closed page (`Plans/github-issue-caching-and-rate-limits.md`
+    /// §4). `Some` means more history exists and a "load more" row is offered in
+    /// the done column; `None` means the loaded pages are the whole history.
+    /// Refreshed each [`refresh`].
+    pub closed_next_cursor: Option<String>,
+    /// Terminal-history cards fetched by an explicit "load more" (pages *beyond*
+    /// the first). Kept separate from the first page so a periodic [`refresh`] —
+    /// which only re-reads the cached first page — never discards what the user
+    /// paged in. Merged into [`tasks`](Self::tasks) alongside the first page.
+    pub closed_more: Vec<IssueFile>,
 }
 
 /// One rendered column header's screen-space rectangle plus the index
@@ -392,6 +403,8 @@ impl KanbanApp {
             display_style: DisplayStyle::detect(),
             header_hits: Vec::new(),
             column_overrides: std::collections::BTreeMap::new(),
+            closed_next_cursor: None,
+            closed_more: Vec::new(),
         }
     }
 
@@ -779,13 +792,27 @@ impl KanbanApp {
                 let mut tasks = state.into_issues();
                 let mut seen: HashSet<String> =
                     tasks.iter().map(|tf| tf.task.id.clone()).collect();
-                for col in [Column::done(), Column::canceled()] {
-                    if let Ok(closed) = store.list_in_status(&col) {
-                        for tf in closed {
+                // The terminal `done`/`canceled` history is loaded on demand as
+                // one page of 50 (§4) — the first page from the long-TTL closed
+                // cache, never a `state=closed` sweep. The Kanban renders both
+                // terminal lanes from it and offers a "load more" row when the
+                // page reports more history (`closed_next_cursor`). Any pages the
+                // user already paged in (`closed_more`) are merged back so a poll
+                // never drops them. `file_system` boards return the whole board
+                // from `state` already, so the dedupe keeps them unaffected.
+                match store.closed_page(None) {
+                    Ok(page) => {
+                        self.closed_next_cursor = page.next_cursor;
+                        for tf in page.issues.into_iter().chain(self.closed_more.iter().cloned()) {
                             if seen.insert(tf.task.id.clone()) {
                                 tasks.push(tf);
                             }
                         }
+                    }
+                    Err(_) => {
+                        // A failed closed read leaves the terminal lanes empty
+                        // this paint; the open board still renders.
+                        self.closed_next_cursor = None;
                     }
                 }
                 self.tasks = tasks;
@@ -794,6 +821,50 @@ impl KanbanApp {
             }
             Err(e) => {
                 self.status_line = format!("refresh failed: {e}");
+            }
+        }
+    }
+
+    /// Whether a "load more" of the terminal history is available — the on-demand
+    /// closed page reported a next cursor. Drives both the rendered "load more"
+    /// row in the done column and whether [`load_more_done`](Self::load_more_done)
+    /// does anything.
+    pub fn has_more_done(&self) -> bool {
+        self.closed_next_cursor.is_some()
+    }
+
+    /// Fetch the next page of terminal `done`/`canceled` history and append it —
+    /// the "load more" action (§4). A live, uncached fetch (the cached page is
+    /// only ever the first 50), so it is explicit and user-driven. New cards are
+    /// accumulated in [`closed_more`](Self::closed_more) so a later [`refresh`]
+    /// keeps them, then merged into the board immediately. A no-op when no more
+    /// history is available.
+    pub fn load_more_done(&mut self) {
+        let Some(cursor) = self.closed_next_cursor.clone() else {
+            return;
+        };
+        let store = match shelbi_state::issue_store_for(&self.project_name) {
+            Ok(store) => store,
+            Err(e) => {
+                self.status_line = format!("load more failed: {e}");
+                return;
+            }
+        };
+        match store.closed_page(Some(&cursor)) {
+            Ok(page) => {
+                self.closed_next_cursor = page.next_cursor;
+                let mut seen: HashSet<String> =
+                    self.tasks.iter().map(|tf| tf.task.id.clone()).collect();
+                for tf in page.issues {
+                    if seen.insert(tf.task.id.clone()) {
+                        self.closed_more.push(tf.clone());
+                        self.tasks.push(tf);
+                    }
+                }
+                self.clamp_selection();
+            }
+            Err(e) => {
+                self.status_line = format!("load more failed: {e}");
             }
         }
     }
@@ -2077,6 +2148,18 @@ fn render_column(
             Style::default().fg(Color::DarkGray),
         ))));
     }
+    // The done column is history loaded on demand (§4): when the closed page
+    // reports more, offer a "load more" row under the cards. Purely a visual
+    // affordance — it sits outside `column_tasks`, so it never participates in
+    // card selection; the bound action (`m`) fetches the next page.
+    if column.category == StatusCategory::Done && app.has_more_done() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "↓ load more (m)",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))));
+    }
 
     let mut state = ListState::default();
     if focused && !tasks.is_empty() {
@@ -2975,6 +3058,27 @@ mod tests {
 
     const DONE_IDX: usize = 4;
     const BACKLOG_IDX: usize = 0;
+
+    #[test]
+    fn has_more_done_tracks_the_closed_page_cursor() {
+        // The "load more" affordance in the done column is offered exactly when
+        // the on-demand closed page reported a next cursor.
+        let mut app = KanbanApp::new("demo");
+        assert!(!app.has_more_done(), "no cursor ⇒ no load-more row");
+        app.closed_next_cursor = Some("PAGE2".into());
+        assert!(app.has_more_done(), "a cursor ⇒ a load-more row");
+    }
+
+    #[test]
+    fn load_more_done_is_a_noop_without_a_cursor() {
+        // With no next page there is nothing to fetch, so `load_more_done` must
+        // not touch the board or (in this backendless test) try a live read.
+        let mut app = KanbanApp::new("demo");
+        app.tasks = vec![task_file("d", Column::done(), 0, "2026-06-20T10:00:00Z")];
+        app.load_more_done();
+        assert_eq!(app.tasks.len(), 1, "no cursor ⇒ board unchanged");
+        assert!(app.closed_more.is_empty());
+    }
 
     #[test]
     fn done_column_orders_newest_completed_first() {

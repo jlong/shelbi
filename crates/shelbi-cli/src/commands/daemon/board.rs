@@ -327,6 +327,10 @@ mod tests {
     struct FakeStore {
         board: Vec<IssueFile>,
         opens: Arc<AtomicUsize>,
+        /// Count of closed-history reads (`list_closed` / `closed_page`). The
+        /// daemon tick must never touch closed issues (§4), so a test asserts
+        /// this stays zero across refreshes.
+        closeds: Arc<AtomicUsize>,
         /// Every `since` `refresh_board` was called with, in order.
         seen_since: SinceLog,
         /// The `(remaining, reset)` budget the fake reports on each read.
@@ -379,6 +383,22 @@ mod tests {
         fn list_open(&self) -> CoreResult<Vec<IssueFile>> {
             self.opens.fetch_add(1, Ordering::SeqCst);
             Ok(self.board.clone())
+        }
+        fn list_closed(&self) -> CoreResult<Vec<IssueFile>> {
+            self.closeds.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        fn closed_page(
+            &self,
+            _after: Option<&str>,
+        ) -> CoreResult<shelbi_state::ClosedPage> {
+            self.closeds.fetch_add(1, Ordering::SeqCst);
+            Ok(shelbi_state::ClosedPage {
+                issues: Vec::new(),
+                next_cursor: None,
+                remaining: None,
+                reset: None,
+            })
         }
         fn refresh_board(
             &self,
@@ -507,10 +527,27 @@ mod tests {
             FakeStore {
                 board,
                 opens: Arc::clone(&opens),
+                closeds: Arc::new(AtomicUsize::new(0)),
                 seen_since: Arc::new(Mutex::new(Vec::new())),
                 budget: (None, None),
             },
             opens,
+        )
+    }
+
+    /// A fake plus a shared count of its closed-history reads, so a test can
+    /// assert the daemon tick never touches closed issues (§4).
+    fn fake_with_closed_counter(board: Vec<IssueFile>) -> (FakeStore, Arc<AtomicUsize>) {
+        let closeds = Arc::new(AtomicUsize::new(0));
+        (
+            FakeStore {
+                board,
+                opens: Arc::new(AtomicUsize::new(0)),
+                closeds: Arc::clone(&closeds),
+                seen_since: Arc::new(Mutex::new(Vec::new())),
+                budget: (None, None),
+            },
+            closeds,
         )
     }
 
@@ -527,6 +564,7 @@ mod tests {
             FakeStore {
                 board,
                 opens: Arc::new(AtomicUsize::new(0)),
+                closeds: Arc::new(AtomicUsize::new(0)),
                 seen_since: Arc::clone(&seen_since),
                 budget,
             },
@@ -660,6 +698,22 @@ mod tests {
             .collect();
         assert_eq!(refreshed.len(), 1);
         assert!(refreshed[0].contains("remaining=4989"), "{}", refreshed[0]);
+    }
+
+    #[test]
+    fn a_refresh_tick_never_reads_closed_history() {
+        // §4: done/canceled are loaded on demand, never on the daemon cadence.
+        // Several ticks (cold then incremental) must issue zero closed reads.
+        let _iso = IsolatedHome::new("no-closed");
+        let (store, closeds) = fake_with_closed_counter(vec![issue("a", "todo", 0)]);
+        refresh_with_store("proj", &store).unwrap();
+        refresh_with_store("proj", &store).unwrap();
+        refresh_with_store("proj", &store).unwrap();
+        assert_eq!(
+            closeds.load(Ordering::SeqCst),
+            0,
+            "the daemon tick must never request closed issues"
+        );
     }
 
     #[test]
