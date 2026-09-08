@@ -64,10 +64,12 @@ pub use issue_migrate::{
     PartialMigration,
 };
 pub use board_index::{
-    board_index_path, mark_board_index_stale, patch_board_index_issue, read_board,
-    read_board_index, read_board_report, read_board_report_with_cfg, read_board_with_cfg,
-    record_board_index_number, remove_board_index_issue, write_board_index, BoardFreshness,
-    BoardIndex, BoardReport, BoardSource, ReadPath, BOARD_INDEX_FILE,
+    board_index_path, board_refresh_error_path, clear_board_refresh_error, mark_board_index_stale,
+    patch_board_index_issue, read_board, read_board_index, read_board_refresh_error,
+    read_board_report, read_board_report_with_cfg, read_board_with_cfg, record_board_index_number,
+    record_board_refresh_error, remove_board_index_issue, write_board_index, BoardFreshness,
+    BoardIndex, BoardRefreshError, BoardReport, BoardSource, ReadPath, BOARD_INDEX_FILE,
+    BOARD_REFRESH_ERROR_FILE,
 };
 pub use done_history::{
     done_history_path, patch_done_history_issue, read_done_history, remove_done_history_issue,

@@ -147,6 +147,86 @@ pub fn board_index_path(project: &str) -> Result<PathBuf> {
     Ok(crate::project_dir(project)?.join(BOARD_INDEX_FILE))
 }
 
+/// Basename of the sidecar recording the last board-refresh failure for a
+/// project, alongside `board-index.json`. Its presence means the daemon's most
+/// recent refresh tick for this project failed and no fresh index landed; a
+/// successful tick removes it. `shelbi status` / `shelbi doctor` read it to
+/// explain a cold or aging board ("last error: no auth token found …").
+pub const BOARD_REFRESH_ERROR_FILE: &str = "board-refresh-error.json";
+
+/// The last board-refresh failure the daemon recorded for a project: the error
+/// text and when it was recorded. Written on a failing tick, cleared on the next
+/// success, so its mere presence marks an in-progress failure episode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardRefreshError {
+    /// The failure text, single-lined and length-capped for a status line.
+    pub error: String,
+    /// RFC3339 timestamp of when the failure was first recorded this episode.
+    pub at: String,
+}
+
+/// The on-disk path of `project`'s board-refresh error sidecar.
+pub fn board_refresh_error_path(project: &str) -> Result<PathBuf> {
+    Ok(crate::project_dir(project)?.join(BOARD_REFRESH_ERROR_FILE))
+}
+
+/// Collapse a multi-line / oversized error into a single status-safe line: run
+/// whitespace together and cap the length so a status line and an events.log
+/// record stay one tidy line.
+fn sanitize_refresh_error(error: &str) -> String {
+    let one_line = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 240;
+    if one_line.chars().count() > MAX {
+        one_line.chars().take(MAX - 1).collect::<String>() + "…"
+    } else {
+        one_line
+    }
+}
+
+/// Record a failing board refresh for `project`, returning `true` when this
+/// **starts** a new failure episode (no error sidecar was present) and `false`
+/// when one was already recorded (the episode is ongoing). The caller uses the
+/// return to warn / disclose exactly once per episode rather than every tick.
+/// The `at` timestamp is preserved across an ongoing episode so it reflects when
+/// the failures began, not the latest tick.
+pub fn record_board_refresh_error(project: &str, error: &str) -> Result<bool> {
+    let path = board_refresh_error_path(project)?;
+    let existing = read_board_refresh_error(project);
+    let new_episode = existing.is_none();
+    let at = existing.map(|e| e.at).unwrap_or_else(|| Utc::now().to_rfc3339());
+    let record = BoardRefreshError {
+        error: sanitize_refresh_error(error),
+        at,
+    };
+    let bytes = serde_json::to_vec_pretty(&record)
+        .map_err(|e| shelbi_core::Error::Other(format!("serializing board refresh error: {e}")))?;
+    crate::atomic_write(&path, &bytes)?;
+    Ok(new_episode)
+}
+
+/// Read `project`'s last recorded board-refresh error, or `None` when the last
+/// tick succeeded (no sidecar), the file is unreadable, or it is torn/corrupt.
+pub fn read_board_refresh_error(project: &str) -> Option<BoardRefreshError> {
+    let path = board_refresh_error_path(project).ok()?;
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Clear `project`'s board-refresh error sidecar after a successful tick. A
+/// missing file is success (idempotent); any other removal error propagates so a
+/// genuinely stuck sidecar isn't silently ignored.
+pub fn clear_board_refresh_error(project: &str) -> Result<()> {
+    let path = board_refresh_error_path(project)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(shelbi_core::Error::Other(format!(
+            "removing board refresh error {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
 /// Persist `index` to `project`'s board-index file atomically (temp file +
 /// rename via [`crate::atomic_write`]), so a daemon killed mid-write leaves
 /// either the old index or the new one, never a truncated file.
@@ -1132,5 +1212,61 @@ mod tests {
             read_path: ReadPath::Unknown,
         };
         assert_eq!(cache.banner().as_deref(), Some("board cached · no daemon"));
+    }
+
+    #[test]
+    fn refresh_error_records_reads_and_clears() {
+        let _iso = IsolatedHome::new("refresh-error");
+        assert!(
+            read_board_refresh_error("proj").is_none(),
+            "no error before any failure"
+        );
+
+        // First failure starts an episode.
+        assert!(
+            record_board_refresh_error("proj", "no auth token found").unwrap(),
+            "first record starts a new episode"
+        );
+        let first = read_board_refresh_error("proj").expect("error recorded");
+        assert_eq!(first.error, "no auth token found");
+
+        // A second failure in the same episode is not a new episode, and it keeps
+        // the original `at` timestamp (episode start, not latest tick).
+        assert!(
+            !record_board_refresh_error("proj", "still failing").unwrap(),
+            "second record is the same episode"
+        );
+        let second = read_board_refresh_error("proj").expect("still recorded");
+        assert_eq!(second.error, "still failing", "error text updates");
+        assert_eq!(second.at, first.at, "episode-start timestamp is preserved");
+
+        // Clearing removes the sidecar; a later failure is a fresh episode.
+        clear_board_refresh_error("proj").unwrap();
+        assert!(read_board_refresh_error("proj").is_none(), "cleared");
+        clear_board_refresh_error("proj").unwrap(); // idempotent
+        assert!(
+            record_board_refresh_error("proj", "failed again").unwrap(),
+            "a failure after a clear is a new episode"
+        );
+    }
+
+    #[test]
+    fn refresh_error_is_single_lined_and_capped() {
+        let _iso = IsolatedHome::new("refresh-error-sanitize");
+        let messy = format!("line one\n  line two\t\tspaced\n{}", "x".repeat(400));
+        record_board_refresh_error("proj", &messy).unwrap();
+        let rec = read_board_refresh_error("proj").unwrap();
+        assert!(!rec.error.contains('\n'), "no newlines: {:?}", rec.error);
+        assert!(!rec.error.contains('\t'), "no tabs: {:?}", rec.error);
+        assert!(
+            rec.error.starts_with("line one line two spaced"),
+            "whitespace collapsed: {:?}",
+            rec.error
+        );
+        assert!(
+            rec.error.chars().count() <= 240,
+            "length capped: {} chars",
+            rec.error.chars().count()
+        );
     }
 }

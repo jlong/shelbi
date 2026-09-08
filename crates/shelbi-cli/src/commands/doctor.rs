@@ -74,6 +74,15 @@ pub fn run(project: Option<String>) -> Result<()> {
         let remaining = budget.as_ref().and_then(|s| s.tier(kind).remaining);
         report_budget(label, kind, &entries, remaining, now);
     }
+    // The daemon's last board-refresh failure, if the board is not currently
+    // refreshing — the single most useful line when the board is cold and the
+    // budget looks idle only because no request is getting out.
+    if let Some(err) = shelbi_state::read_board_refresh_error(&project) {
+        println!(
+            "  board refresh: FAILING — last error: {} (at {})",
+            err.error, err.at
+        );
+    }
     Ok(())
 }
 

@@ -119,13 +119,52 @@ impl BoardRefresher {
 fn handle_tick_result(project: &str, result: Result<RefreshOutcome>, tier: &BudgetTier) {
     match result {
         Ok(out) if out.changed > 0 => {
+            clear_refresh_error(project);
             tracing::debug!(project, changed = out.changed, "shelbi daemon: board refreshed")
         }
-        Ok(_) => {}
+        Ok(_) => clear_refresh_error(project),
         Err(e) => {
-            tracing::debug!(project, error = %e, "shelbi daemon: board refresh tick failed");
+            report_refresh_failure(project, &e);
             mark_index_stale_from_tier(project, tier);
         }
+    }
+}
+
+/// Record a failing refresh tick and surface it **once per failure episode**
+/// (not once per tick): the first failure after a healthy run warns and drops a
+/// single `board refresh-failed` line on events.log carrying the error text;
+/// subsequent failures in the same episode only refresh the persisted error the
+/// status/doctor GitHub section reads. The per-episode gate lives on disk (the
+/// error sidecar's presence), so it survives a daemon restart and is testable
+/// without loop state. Best-effort: a failed record still logs at debug so the
+/// signal isn't wholly lost.
+fn report_refresh_failure(project: &str, error: &anyhow::Error) {
+    let text = format!("{error:#}");
+    match shelbi_state::record_board_refresh_error(project, &text) {
+        Ok(true) => {
+            tracing::warn!(project, error = %error, "shelbi daemon: board refresh failed; serving last index and marking status");
+            // Single-line the error so it can't tear the events.log record.
+            let line_safe = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let body = format!("project={project} board refresh-failed error={line_safe}");
+            if let Err(e) = shelbi_state::append_external_event(&body) {
+                tracing::debug!(project, error = %e, "shelbi daemon: failed to append board refresh-failed event");
+            }
+        }
+        Ok(false) => {
+            // Same episode continuing — stay quiet, but keep the debug breadcrumb.
+            tracing::debug!(project, error = %error, "shelbi daemon: board refresh tick failed (episode ongoing)");
+        }
+        Err(e) => {
+            tracing::debug!(project, record_error = %e, error = %error, "shelbi daemon: board refresh tick failed; could not persist error");
+        }
+    }
+}
+
+/// Clear a project's persisted refresh error after a successful tick, so a
+/// recovered board stops advertising a stale failure. Best-effort.
+fn clear_refresh_error(project: &str) {
+    if let Err(e) = shelbi_state::clear_board_refresh_error(project) {
+        tracing::debug!(project, error = %e, "shelbi daemon: failed to clear board refresh error");
     }
 }
 
@@ -1030,5 +1069,63 @@ issue_tracker:\n\
             "no reap / orphan / marker-clear / idle line may fire during the outage: {:?}",
             events_lines(),
         );
+    }
+
+    #[test]
+    fn a_failing_tick_warns_and_records_once_per_episode() {
+        // A refresh that keeps failing (a token that won't resolve, a 403) must
+        // surface once per *episode*, not once per tick: exactly one
+        // `board refresh-failed` events line (the observable twin of the `warn`)
+        // and a persisted error the status/doctor section reads. Recovery clears
+        // it; a fresh failure after recovery is a new episode and warns again.
+        let _iso = IsolatedHome::new("fail-episode");
+        register_github_project("proj");
+        let reset = 1_800_000_000i64;
+        let (store, fail) = fake_failable(vec![issue("a", "review", 0)]);
+        let healthy = tier(Some(4_000), Some(reset), None);
+
+        // Prime a good index — a healthy tick records no error.
+        handle_tick_result("proj", refresh_with_store("proj", &store), &healthy);
+        assert!(
+            shelbi_state::read_board_refresh_error("proj").is_none(),
+            "a healthy tick leaves no recorded error"
+        );
+
+        // Three consecutive failing ticks = one episode.
+        fail.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            handle_tick_result("proj", refresh_with_store("proj", &store), &healthy);
+        }
+        let err = shelbi_state::read_board_refresh_error("proj").expect("error recorded");
+        assert!(!err.error.is_empty(), "error text is recorded: {err:?}");
+
+        let failed: Vec<_> = events_lines()
+            .into_iter()
+            .filter(|l| l.contains("board refresh-failed"))
+            .collect();
+        assert_eq!(
+            failed.len(),
+            1,
+            "one refresh-failed line per episode, not per tick: {failed:?}"
+        );
+        assert!(failed[0].contains("project=proj"), "{}", failed[0]);
+        assert!(failed[0].contains("error="), "carries the error text: {}", failed[0]);
+
+        // Recovery clears the recorded error.
+        fail.store(false, Ordering::SeqCst);
+        handle_tick_result("proj", refresh_with_store("proj", &store), &healthy);
+        assert!(
+            shelbi_state::read_board_refresh_error("proj").is_none(),
+            "a successful tick clears the recorded error"
+        );
+
+        // A new failure after recovery is a new episode → warns again.
+        fail.store(true, Ordering::SeqCst);
+        handle_tick_result("proj", refresh_with_store("proj", &store), &healthy);
+        let failed_again = events_lines()
+            .into_iter()
+            .filter(|l| l.contains("board refresh-failed"))
+            .count();
+        assert_eq!(failed_again, 2, "a fresh episode after recovery warns again");
     }
 }

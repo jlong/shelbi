@@ -1198,6 +1198,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width",
+ "which",
 ]
 
 [[package]]

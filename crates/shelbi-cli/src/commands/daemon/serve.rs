@@ -230,6 +230,14 @@ pub(super) fn run_foreground() -> Result<()> {
     // to events.log / the orchestrator handoff file and never blocks serving.
     let _ = crate::commands::config_upgrade::run_startup_pass();
 
+    // launchd/systemd hand a supervised process a minimal PATH that omits the
+    // Homebrew / version-manager bindir `gh` lives in, so every board-refresh
+    // tick's `gh auth token` probe fails and no index is ever published. Fix the
+    // running daemon in-process now, and rewrite an old supervisor unit (one
+    // installed before PATH was baked in) so the next relaunch is correct too.
+    super::supervise::ensure_gh_on_path();
+    super::supervise::heal_daemon_unit_path();
+
     // Tighten the umask around bind() so the socket inode is created
     // 0600 from the very start. Without this there is a window between
     // bind() and the chmod below where the socket carries the umask
