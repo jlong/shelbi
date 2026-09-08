@@ -528,7 +528,9 @@ fn signal_name(sig: i32) -> String {
 /// permissions glitch, transient FS) because a missing task just makes the
 /// hooks no-op and skips the worktree recovery — neither breaks the pane.
 pub(super) fn assigned_task_for_workspace(project: &str, workspace: &str) -> Option<Issue> {
-    let tasks = shelbi_state::issue_store_for(project).and_then(|s| s.list()).ok()?;
+    // Only Active/Handoff cards anchor a workspace, and those are open, so the
+    // cheap open-only read is enough.
+    let tasks = shelbi_state::issue_store_for(project).and_then(|s| s.list_open()).ok()?;
     tasks.into_iter().find_map(|tf| {
         let anchors = matches!(
             tf.task.column.category(),

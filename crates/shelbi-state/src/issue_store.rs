@@ -345,7 +345,45 @@ impl BoardState {
 /// today, with GitHub / Jira / Linear backends to follow behind the same shape.
 pub trait IssueStore {
     /// The whole board, in the canonical column-then-priority order.
+    ///
+    /// Includes the terminal `done`/`canceled` history. On a remote backend
+    /// that is the full, expensive sweep, so only paths that genuinely need
+    /// every issue (migrate, reconcile, dependency resolution) call this; the
+    /// render and poll paths use [`IssueStore::list_open`] instead.
     fn list(&self) -> Result<Vec<IssueFile>>;
+
+    /// Everything on the board except terminal history — the board the render
+    /// and poll paths (pollers, sidebar, `zen scan`, the orchestrator drain,
+    /// unfiltered `issue list`) actually need.
+    ///
+    /// For a remote backend a closed issue is always terminal, so this is the
+    /// cheap "open issues only" read rather than [`IssueStore::list`]'s
+    /// full-history sweep — the `github` backend overrides it to request
+    /// `state=open`. The default is [`IssueStore::list`], correct for the
+    /// `file_system` backend (a directory read is already cheap, and the
+    /// terminal lanes cost nothing) and for the process-local cache (which
+    /// serves its one already-fetched board snapshot); a caller that receives
+    /// the extra terminal cards from those backends filters to the active
+    /// statuses it cares about anyway, so a superset is safe.
+    fn list_open(&self) -> Result<Vec<IssueFile>> {
+        self.list()
+    }
+
+    /// Only the terminal history — the `done`/`canceled` cards the Kanban's
+    /// terminal columns and `issue list --status done|canceled` render.
+    ///
+    /// The counterpart to [`IssueStore::list_open`]: on a remote backend a
+    /// closed issue is always terminal, so the `github` backend overrides this
+    /// to request `state=closed` in a single sweep and the process cache serves
+    /// both terminal columns from it (rather than two per-column sweeps). Kept
+    /// off the render/poll hot path — only the Kanban's terminal columns read
+    /// it, on a slow cadence behind the cache. The default is
+    /// [`IssueStore::list`], correct for the `file_system` backend (its
+    /// per-status read is already a cheap directory scan) and for any caller
+    /// that filters the returned superset to the terminal columns it wants.
+    fn list_closed(&self) -> Result<Vec<IssueFile>> {
+        self.list()
+    }
 
     /// The whole board tagged with its freshness ([`BoardState`]) so a render
     /// surface can paint a cold process instantly — from the on-disk snapshot

@@ -1029,7 +1029,9 @@ fn ci_should_emit(prev: Option<&(String, String)>, head_sha: &str, conclusion: &
 /// the whole sweep.
 fn in_review_tasks_with_branch(project: &Project) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
-    for tf in shelbi_state::issue_store_for_project(project)?.list()? {
+    // Only Handoff-category (review) tasks are kept below, and those are always
+    // open, so the cheap open-only read suffices.
+    for tf in shelbi_state::issue_store_for_project(project)?.list_open()? {
         let workflow = load_task_workflow(&project.name, &tf.task);
         let workflow_ref = workflow.as_ref();
         let status = workflow_ref.and_then(|w| resolve_task_status(&tf.task, w));
@@ -1210,7 +1212,10 @@ fn auto_reconcile_target(workflow: &Workflow, from: &str) -> Option<(String, Col
 /// is skipped rather than failing the whole sweep.
 fn github_merge_reconcile_candidates(project: &Project) -> Result<Vec<GithubReconcileCandidate>> {
     let mut out = Vec::new();
-    for tf in shelbi_state::issue_store_for_project(project)?.list()? {
+    // Reconcile candidates are Handoff-category tasks awaiting an out-of-band
+    // merge — all still open — so the open-only read is the right, cheap scope
+    // here (a task that already reconciled to `done` needs no further action).
+    for tf in shelbi_state::issue_store_for_project(project)?.list_open()? {
         // Fall back to the default workflow when the task's workflow can't be
         // loaded — the same resilience [`crate::review_ui::approve_review_task`]
         // and the ready-handoff path use, so a transient workflow-YAML issue
@@ -6588,7 +6593,11 @@ fn resolve_probe_base(
     let all_tasks = if task.depends_on.is_empty() {
         Vec::new()
     } else {
-        shelbi_state::issue_store_for_project(project)?.list()?
+        // Base resolution needs a dependency's branch, and a dep can be in any
+        // column (including terminal `done`), so it needs the full board — but
+        // this runs per-probe, so take the cheap cached scopes rather than the
+        // live `state=all` sweep.
+        board_from_caches(project)?
     };
     crate::lifecycle::resolve_base_branch(project, workflow, task, &all_tasks)
 }
@@ -11855,9 +11864,38 @@ printf 'target:%s\\n' \"$CARGO_TARGET_DIR\"";
 /// I/O: loads every task file in the project plus the events log. Returns an
 /// empty list when the backlog is empty or every backlog task is blocked.
 pub fn mechanically_eligible(project: &Project) -> Result<Vec<String>> {
-    let tasks = shelbi_state::issue_store_for_project(project)?.list()?;
+    // Runs on the heartbeat cadence, so it must not pay the full `state=all`
+    // sweep `list()` runs on the github backend. It needs the terminal `done`
+    // column visible (a backlog task unblocks once its deps are done — see
+    // `Issue::is_blocked`), so assemble the board from the two *cached* scoped
+    // reads instead of the live full sweep.
+    let tasks = board_from_caches(project)?;
     let demoted = read_demoted_task_ids()?;
     Ok(mechanically_eligible_from(&tasks, &demoted))
+}
+
+/// The whole board — open plus terminal history — assembled from the two
+/// process-cached scoped reads (`list_open` + `list_closed`) rather than the
+/// live full `state=all` sweep [`IssueStore::list`] runs on the github backend.
+///
+/// The dependency checks in [`mechanically_eligible`] / [`resolve_probe_base`]
+/// need the `done` column visible, but both sit on periodic scan/heartbeat
+/// cadences, so paying the six-page history sweep every tick would defeat the
+/// caching. `list_open` (`state=open`) and `list_closed` (`state=closed`) are
+/// each served from their own long-lived process snapshot, so this reconstructs
+/// the full board cheaply. Deduped by id because the `file_system` backend's
+/// `list_open`/`list_closed` both fall back to the whole-board `list`.
+fn board_from_caches(project: &Project) -> Result<Vec<shelbi_state::IssueFile>> {
+    let store = shelbi_state::issue_store_for_project(project)?;
+    let mut tasks = store.list_open()?;
+    let mut seen: std::collections::HashSet<String> =
+        tasks.iter().map(|tf| tf.task.id.clone()).collect();
+    for tf in store.list_closed()? {
+        if seen.insert(tf.task.id.clone()) {
+            tasks.push(tf);
+        }
+    }
+    Ok(tasks)
 }
 
 /// Pure-logic core of [`mechanically_eligible`]. Split out so the unit
@@ -12388,8 +12426,9 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
     // 2. Handoff-category probes — action-based bar gated by the task's
     //    workflow. Filter is on the resolved workflow status's category
     //    rather than `Column::review()` so custom workflows with renamed
-    //    handoff statuses still get probed.
-    for tf in shelbi_state::issue_store_for_project(project)?.list()? {
+    //    handoff statuses still get probed. Handoff tasks are always open, so
+    //    the open-only read is the right, cheap scope.
+    for tf in shelbi_state::issue_store_for_project(project)?.list_open()? {
         let workflow = load_task_workflow(&project.name, &tf.task);
         let workflow_ref = workflow.as_ref();
         let status = workflow_ref.and_then(|w| resolve_task_status(&tf.task, w));
