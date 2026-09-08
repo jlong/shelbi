@@ -4010,6 +4010,11 @@ workspaces:
     /// command paths under test to run without a network or a real repo.
     fn install_gh_issue_runner(issue_json: String) {
         shelbi_state::set_test_gh_runner(move |args: &[&str]| -> shelbi_core::Result<String> {
+            // The reworked `get` reads through GraphQL (search → single-issue),
+            // so answer those queries by reshaping the same REST `issue_json`.
+            if args.contains(&"graphql") {
+                return Ok(gh_issue_to_graphql(args, &issue_json));
+            }
             let method = args
                 .iter()
                 .position(|a| *a == "-X")
@@ -4029,6 +4034,43 @@ workspaces:
             }
             Ok(issue_json.to_string())
         });
+    }
+
+    /// Reshape one REST issue object into the GraphQL response the reworked
+    /// `get`/`fetch`/`search` path expects, dispatching on the query name.
+    fn gh_issue_to_graphql(args: &[&str], issue_json: &str) -> String {
+        let joined = args.join(" ");
+        let v: serde_json::Value =
+            serde_json::from_str(issue_json.trim()).unwrap_or(serde_json::Value::Null);
+        if joined.contains("IdSearch") {
+            return match v.get("number").and_then(serde_json::Value::as_i64) {
+                Some(n) => format!(r#"{{"data":{{"search":{{"nodes":[{{"number":{n}}}]}}}}}}"#),
+                None => r#"{"data":{"search":{"nodes":[]}}}"#.to_string(),
+            };
+        }
+        let label_nodes: Vec<serde_json::Value> = v
+            .get("labels")
+            .and_then(|l| l.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|l| serde_json::json!({ "name": l.get("name").cloned().unwrap_or(serde_json::Value::Null) }))
+            .collect();
+        let node = serde_json::json!({
+            "number": v.get("number").cloned().unwrap_or(serde_json::json!(0)),
+            "title": v.get("title").cloned().unwrap_or(serde_json::json!("")),
+            "state": v.get("state").and_then(|s| s.as_str()).unwrap_or("open").to_uppercase(),
+            "stateReason": v.get("state_reason").cloned().unwrap_or(serde_json::Value::Null),
+            "createdAt": v.get("created_at").cloned().unwrap_or(serde_json::json!("2026-01-01T00:00:00Z")),
+            "updatedAt": v.get("updated_at").cloned().unwrap_or(serde_json::json!("2026-01-01T00:00:00Z")),
+            "body": v.get("body").cloned().unwrap_or(serde_json::json!("")),
+            "labels": { "nodes": label_nodes },
+        })
+        .to_string();
+        if joined.contains("IssuesByNumber") {
+            return format!(r#"{{"data":{{"repository":{{"i0":{node}}}}}}}"#);
+        }
+        format!(r#"{{"data":{{"repository":{{"issue":{node}}}}}}}"#)
     }
 
     /// One GitHub issue object (JSONL) with the given shelbi id + status label.

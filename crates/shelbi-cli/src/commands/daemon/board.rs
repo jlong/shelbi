@@ -137,7 +137,13 @@ fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOu
 
     let changed =
         board_index::board_diff_count(previous.as_ref().map(|p| p.board.as_slice()), &read.board);
-    let index = BoardIndex::fresh_at(read.board, fetched_at, read.remaining, read.reset);
+    // Merge the numbers this read observed onto the prior index's id→number map,
+    // then retain only ids still on the board. An incremental tick only reports
+    // numbers for the issues it touched, so without the merge an untouched
+    // issue's number would drop out of the index every quiet tick and force a
+    // `get` back to the label search.
+    let numbers = merge_index_numbers(previous.as_ref(), &read.numbers, &read.board);
+    let index = BoardIndex::fresh_at(read.board, numbers, fetched_at, read.remaining, read.reset);
     board_index::write_board_index(project, &index).map_err(|e| anyhow!(e))?;
 
     if changed > 0 {
@@ -147,6 +153,32 @@ fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOu
         fetched_at: index.fetched_at,
         changed,
     })
+}
+
+/// Merge the numbers a refresh observed onto the prior index's id→number map,
+/// keeping only ids still on the new board.
+///
+/// A cold read reports every open issue's number, so the merge is a full
+/// replace; an incremental read reports numbers only for the issues it touched,
+/// so folding them onto the previous map preserves the numbers of untouched
+/// issues (which the delta never mentions) while dropping any id that has left
+/// the open board. The result is the complete id→number map for exactly the
+/// issues on `board`.
+fn merge_index_numbers(
+    previous: Option<&BoardIndex>,
+    observed: &[(String, i64)],
+    board: &[shelbi_state::IssueFile],
+) -> Vec<(String, i64)> {
+    let mut numbers: HashMap<String, i64> = previous
+        .map(|p| p.numbers.clone().into_iter().collect())
+        .unwrap_or_default();
+    for (id, number) in observed {
+        numbers.insert(id.clone(), *number);
+    }
+    let on_board: std::collections::HashSet<&str> =
+        board.iter().map(|f| f.task.id.as_str()).collect();
+    numbers.retain(|id, _| on_board.contains(id.as_str()));
+    numbers.into_iter().collect()
 }
 
 /// Append the `board refreshed=<ts> changed=<n> [remaining=<n>]` line for
@@ -313,6 +345,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn merge_index_numbers_keeps_untouched_adds_new_and_drops_off_board() {
+        // Prior index maps a→1, b→2. An incremental read observed only b (moved)
+        // and a new c→3, and the board now holds a, b, c (a untouched, d gone).
+        let mut prev = BoardIndex::fresh(vec![issue("a", "todo", 0), issue("b", "todo", 1)]);
+        prev.numbers = [("a".to_string(), 1), ("b".to_string(), 2), ("d".to_string(), 4)]
+            .into_iter()
+            .collect();
+        let observed = vec![("b".to_string(), 2), ("c".to_string(), 3)];
+        let board = vec![issue("a", "todo", 0), issue("b", "todo", 1), issue("c", "todo", 2)];
+
+        let merged: std::collections::BTreeMap<String, i64> =
+            merge_index_numbers(Some(&prev), &observed, &board).into_iter().collect();
+        assert_eq!(merged.get("a"), Some(&1), "untouched issue keeps its number");
+        assert_eq!(merged.get("b"), Some(&2), "touched issue's number preserved");
+        assert_eq!(merged.get("c"), Some(&3), "new issue's number added");
+        assert_eq!(merged.get("d"), None, "an issue off the board is dropped");
+    }
+
+    #[test]
+    fn merge_index_numbers_is_a_full_replace_with_no_prior_index() {
+        let observed = vec![("a".to_string(), 1)];
+        let board = vec![issue("a", "todo", 0)];
+        let merged: Vec<(String, i64)> = merge_index_numbers(None, &observed, &board);
+        assert_eq!(merged, vec![("a".to_string(), 1)]);
+    }
+
     impl IssueStore for FakeStore {
         fn list(&self) -> CoreResult<Vec<IssueFile>> {
             Ok(self.board.clone())
@@ -329,6 +388,7 @@ mod tests {
             self.seen_since.lock().unwrap().push(since);
             Ok(shelbi_state::BoardRead {
                 board: self.list_open()?,
+                numbers: Vec::new(),
                 remaining: self.budget.0,
                 reset: self.budget.1,
             })

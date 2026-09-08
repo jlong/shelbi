@@ -541,6 +541,15 @@ impl IssueStore for CachedIssueStore {
         self.inner.get(id)
     }
 
+    /// Also deliberately live, straight to the backend — a batch of fresh
+    /// single-issue reads, which the `github` backend collapses into one aliased
+    /// request. Same reasoning as [`CachedIssueStore::get`]: the callers that
+    /// batch-fetch (the drain, `zen scan`) want the latest copy, not the cached
+    /// board.
+    fn fetch_many(&self, ids: &[&str]) -> Result<Vec<IssueFile>> {
+        self.inner.fetch_many(ids)
+    }
+
     fn add(&self, spec: NewIssue) -> Result<Issue> {
         let out = self.inner.add(spec)?;
         self.invalidate();
