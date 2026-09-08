@@ -28,6 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 
 use shelbi_state::board_index::{self, BoardIndex};
 use shelbi_state::IssueStore;
@@ -115,15 +116,32 @@ impl BoardRefresher {
 /// a quiet board produces no log noise. Split from the store construction so it
 /// is unit-testable with a fake [`IssueStore`].
 fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOutcome> {
-    let board = store.list_open().map_err(|e| anyhow!(e))?;
     let previous = board_index::read_board_index(project);
-    let changed = board_index::board_diff_count(previous.as_ref().map(|p| p.board.as_slice()), &board);
+    // The previous index's `fetched_at` is the incremental watermark: read only
+    // issues touched since it. `None` (no prior index, or a torn one) forces a
+    // cold full read. It parses as RFC3339 — a value we can't parse is treated as
+    // "no watermark" so a corrupt timestamp falls back to a safe cold read rather
+    // than an error.
+    let since = previous
+        .as_ref()
+        .and_then(|p| DateTime::parse_from_rfc3339(&p.fetched_at).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    let prev_board: &[shelbi_state::IssueFile] =
+        previous.as_ref().map(|p| p.board.as_slice()).unwrap_or(&[]);
 
-    let index = BoardIndex::fresh(board);
+    // Stamp `fetched_at` *before* the read so the next tick's `since` never skips
+    // an update that lands while this read is in flight (see
+    // `BoardIndex::fresh_at`).
+    let fetched_at = Utc::now().to_rfc3339();
+    let read = store.refresh_board(since, prev_board).map_err(|e| anyhow!(e))?;
+
+    let changed =
+        board_index::board_diff_count(previous.as_ref().map(|p| p.board.as_slice()), &read.board);
+    let index = BoardIndex::fresh_at(read.board, fetched_at, read.remaining, read.reset);
     board_index::write_board_index(project, &index).map_err(|e| anyhow!(e))?;
 
     if changed > 0 {
-        emit_board_refreshed(project, &index.fetched_at, changed);
+        emit_board_refreshed(project, &index.fetched_at, changed, index.remaining);
     }
     Ok(RefreshOutcome {
         fetched_at: index.fetched_at,
@@ -131,11 +149,16 @@ fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOu
     })
 }
 
-/// Append the `board refreshed=<ts> changed=<n>` line for `project`.
-/// Best-effort: a failed events append is logged, never propagated — the index
-/// file is the durable artifact, the event is the orchestrator's nudge.
-fn emit_board_refreshed(project: &str, fetched_at: &str, changed: usize) {
-    let body = format!("project={project} board refreshed={fetched_at} changed={changed}");
+/// Append the `board refreshed=<ts> changed=<n> [remaining=<n>]` line for
+/// `project`. The `remaining` GraphQL points budget is appended when the read
+/// surfaced it (the GraphQL board path), omitted otherwise. Best-effort: a
+/// failed events append is logged, never propagated — the index file is the
+/// durable artifact, the event is the orchestrator's nudge.
+fn emit_board_refreshed(project: &str, fetched_at: &str, changed: usize, remaining: Option<u64>) {
+    let mut body = format!("project={project} board refreshed={fetched_at} changed={changed}");
+    if let Some(remaining) = remaining {
+        body.push_str(&format!(" remaining={remaining}"));
+    }
     if let Err(e) = shelbi_state::append_external_event(&body) {
         tracing::debug!(project, error = %e, "shelbi daemon: failed to append board-refreshed event");
     }
@@ -263,9 +286,19 @@ mod tests {
 
     /// A fake store returning a fixed open board and counting `list_open`
     /// calls, so a test can drive the refresh without a real backend.
+    ///
+    /// It overrides [`IssueStore::refresh_board`] to record each `since`
+    /// watermark it is handed and to surface a configurable budget, so a test
+    /// can assert the daemon threads the previous index's `fetched_at` and lands
+    /// the budget in the new index. The override still calls `list_open`, so the
+    /// `opens` counter (and the existing tests keyed on it) keep working.
     struct FakeStore {
         board: Vec<IssueFile>,
         opens: Arc<AtomicUsize>,
+        /// Every `since` `refresh_board` was called with, in order.
+        seen_since: SinceLog,
+        /// The `(remaining, reset)` budget the fake reports on each read.
+        budget: (Option<u64>, Option<i64>),
     }
 
     fn issue(id: &str, column: &str, priority: u32) -> IssueFile {
@@ -287,6 +320,18 @@ mod tests {
         fn list_open(&self) -> CoreResult<Vec<IssueFile>> {
             self.opens.fetch_add(1, Ordering::SeqCst);
             Ok(self.board.clone())
+        }
+        fn refresh_board(
+            &self,
+            since: Option<DateTime<Utc>>,
+            _previous: &[IssueFile],
+        ) -> CoreResult<shelbi_state::BoardRead> {
+            self.seen_since.lock().unwrap().push(since);
+            Ok(shelbi_state::BoardRead {
+                board: self.list_open()?,
+                remaining: self.budget.0,
+                reset: self.budget.1,
+            })
         }
         fn list_in_status(&self, status: &Column) -> CoreResult<Vec<IssueFile>> {
             Ok(self
@@ -402,8 +447,30 @@ mod tests {
             FakeStore {
                 board,
                 opens: Arc::clone(&opens),
+                seen_since: Arc::new(Mutex::new(Vec::new())),
+                budget: (None, None),
             },
             opens,
+        )
+    }
+
+    /// A shared log of every `since` watermark a fake store was asked to read at.
+    type SinceLog = Arc<Mutex<Vec<Option<DateTime<Utc>>>>>;
+
+    /// A fake plus the shared `since`-recording handle and a configurable budget.
+    fn fake_with_budget(
+        board: Vec<IssueFile>,
+        budget: (Option<u64>, Option<i64>),
+    ) -> (FakeStore, SinceLog) {
+        let seen_since = Arc::new(Mutex::new(Vec::new()));
+        (
+            FakeStore {
+                board,
+                opens: Arc::new(AtomicUsize::new(0)),
+                seen_since: Arc::clone(&seen_since),
+                budget,
+            },
+            seen_since,
         )
     }
 
@@ -487,6 +554,52 @@ mod tests {
             refreshed, 2,
             "the priming tick and the move each emit exactly one line"
         );
+    }
+
+    #[test]
+    fn first_tick_reads_cold_then_subsequent_ticks_read_incrementally() {
+        let _iso = IsolatedHome::new("since");
+        let (store, seen_since) = fake_with_budget(vec![issue("a", "todo", 0)], (None, None));
+
+        // First tick: no prior index ⇒ cold read (`since` is None).
+        let first = refresh_with_store("proj", &store).unwrap();
+        // Second tick: the prior index's `fetched_at` becomes the incremental
+        // watermark.
+        let second = refresh_with_store("proj", &store).unwrap();
+
+        let seen = seen_since.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].is_none(), "first tick is a cold read");
+        let since = seen[1].expect("second tick reads incrementally");
+        // The watermark equals the *first* index's fetched_at (stamped before
+        // that read), to the RFC3339 second.
+        let expected = DateTime::parse_from_rfc3339(&first.fetched_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(since, expected);
+        // The second index advanced its own fetched_at.
+        assert_ne!(second.fetched_at, first.fetched_at);
+    }
+
+    #[test]
+    fn a_surfaced_budget_lands_in_the_index_and_the_events_line() {
+        let _iso = IsolatedHome::new("budget");
+        let (store, _) = fake_with_budget(vec![issue("a", "todo", 0)], (Some(4989), Some(1_800_000_000)));
+
+        refresh_with_store("proj", &store).unwrap();
+
+        // The index carries the GraphQL budget the read reported.
+        let idx = board_index::read_board_index("proj").expect("index written");
+        assert_eq!(idx.remaining, Some(4989));
+        assert_eq!(idx.reset, Some(1_800_000_000));
+
+        // The changed tick's events line carries `remaining=`.
+        let refreshed: Vec<_> = events_lines()
+            .into_iter()
+            .filter(|l| l.contains("board refreshed="))
+            .collect();
+        assert_eq!(refreshed.len(), 1);
+        assert!(refreshed[0].contains("remaining=4989"), "{}", refreshed[0]);
     }
 
     #[test]

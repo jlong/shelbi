@@ -66,9 +66,9 @@ pub use board_index::{
     remove_board_index_issue, write_board_index, BoardIndex, BOARD_INDEX_FILE,
 };
 pub use issue_store::{
-    issue_store_for, issue_store_for_project, raw_issue_store_for, resolve_issue_store, BoardState,
-    Cursor, FileSystemStore, IssueChange, IssueComment, IssueFields, IssueStore, NewIssue,
-    PrioMove, StatusMove,
+    issue_store_for, issue_store_for_project, raw_issue_store_for, resolve_issue_store, BoardRead,
+    BoardState, Cursor, FileSystemStore, IssueChange, IssueComment, IssueFields, IssueStore,
+    NewIssue, PrioMove, StatusMove,
 };
 pub use project_paths::ProjectPaths;
 pub use root::{

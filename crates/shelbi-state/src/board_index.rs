@@ -87,16 +87,35 @@ pub struct BoardIndex {
 
 impl BoardIndex {
     /// Build a fresh index from a board just read from the backend:
-    /// `fetched_at` is now, `stale` is false, and the budget fields are unset
-    /// (the REST path doesn't surface them in Phase 1). This is the shape the
-    /// daemon writes on every successful tick.
+    /// `fetched_at` is now, `stale` is false, and the budget fields are unset.
+    /// The convenience shape for a read that surfaces no budget or timestamp of
+    /// its own; the GraphQL board path uses [`BoardIndex::fresh_at`] to carry the
+    /// budget and a pre-read watermark.
     pub fn fresh(board: Vec<IssueFile>) -> Self {
+        Self::fresh_at(board, Utc::now().to_rfc3339(), None, None)
+    }
+
+    /// Build a fresh (non-stale) index with an explicit `fetched_at` and the
+    /// token budget the read observed.
+    ///
+    /// `fetched_at` is captured by the daemon **before** it issues the read, so
+    /// it is a safe lower bound on the backend state this index reflects: the
+    /// next incremental tick uses it as the `since` watermark, and an update that
+    /// lands while this read is in flight (`updated_at >= fetched_at`) is caught
+    /// on that next tick rather than skipped. `remaining` / `reset` are the
+    /// GraphQL `rateLimit` numbers, `None` when the backend didn't surface them.
+    pub fn fresh_at(
+        board: Vec<IssueFile>,
+        fetched_at: String,
+        remaining: Option<u64>,
+        reset: Option<i64>,
+    ) -> Self {
         Self {
             board,
-            fetched_at: Utc::now().to_rfc3339(),
+            fetched_at,
             stale: false,
-            remaining: None,
-            reset: None,
+            remaining,
+            reset,
         }
     }
 }

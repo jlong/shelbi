@@ -329,6 +329,26 @@ pub enum BoardState {
     Cold,
 }
 
+/// The outcome of a board-index refresh read ([`IssueStore::refresh_board`]):
+/// the open board the daemon publishes, plus the token budget the backend
+/// reported alongside it when known.
+///
+/// The budget rides along for free on the GraphQL board path (`rateLimit {
+/// remaining resetAt }` is part of every response), so the daemon can stamp it
+/// into `board-index.json` without a second call. Backends that don't surface a
+/// budget (the filesystem board, the process cache) leave both `None`.
+#[derive(Debug, Clone)]
+pub struct BoardRead {
+    /// The open board, in canonical column-then-priority order.
+    pub board: Vec<IssueFile>,
+    /// Remaining API budget on the token behind this read, when the backend
+    /// reported it (GraphQL `rateLimit.remaining`).
+    pub remaining: Option<u64>,
+    /// Unix epoch seconds at which that budget resets, when known
+    /// (GraphQL `rateLimit.resetAt`).
+    pub reset: Option<i64>,
+}
+
 impl BoardState {
     /// The issues to render, empty when [`BoardState::Cold`]. Convenience for
     /// callers that don't distinguish warm from stale (both are renderable) and
@@ -410,6 +430,37 @@ pub trait IssueStore {
     /// disk snapshot and report `Stale` / `Cold`.
     fn list_state(&self) -> Result<BoardState> {
         Ok(BoardState::Warm(self.list()?))
+    }
+
+    /// Read the open board for the daemon's board-index refresh, incrementally
+    /// when the backend supports it.
+    ///
+    /// `since` is the previous index's `fetched_at` watermark, or `None` to force
+    /// a cold full read (a first run, or a torn prior index). `previous` is the
+    /// last published open board, which an incremental backend merges its delta
+    /// onto; it is ignored on a cold read. The returned [`BoardRead`] carries the
+    /// new open board plus the token budget the read observed.
+    ///
+    /// The default ignores incrementality and returns a full [`list_open`] with
+    /// no budget — correct for the `file_system` backend (a free local read) and
+    /// the process cache (which serves its one snapshot). The `github` backend
+    /// overrides it with the incremental GraphQL path: a cold read fetches every
+    /// open issue in one query, and a warm tick fetches only issues touched since
+    /// `since` (including ones just closed, so terminal transitions leave the
+    /// open index) — so a quiet board costs a single GraphQL point.
+    ///
+    /// [`list_open`]: IssueStore::list_open
+    fn refresh_board(
+        &self,
+        since: Option<DateTime<Utc>>,
+        previous: &[IssueFile],
+    ) -> Result<BoardRead> {
+        let _ = (since, previous);
+        Ok(BoardRead {
+            board: self.list_open()?,
+            remaining: None,
+            reset: None,
+        })
     }
 
     /// Every issue in a single status column, in priority order.
