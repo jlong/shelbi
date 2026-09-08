@@ -4,6 +4,7 @@ pub mod agent;
 pub mod archive;
 pub mod attach;
 pub mod config;
+pub mod doctor;
 mod config_surfaces;
 mod config_upgrade;
 mod config_upgrade_apply;

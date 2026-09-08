@@ -96,16 +96,47 @@ impl BoardRefresher {
     /// A tick-driven refresh: errors are logged and swallowed, since a single
     /// failed tick must not take the manager loop down — the previous index
     /// stays in place and the next tick tries again.
-    fn tick(&self, project: &str) {
-        match self.refresh(project) {
-            Ok(out) if out.changed > 0 => {
-                tracing::debug!(project, changed = out.changed, "shelbi daemon: board refreshed")
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::debug!(project, error = %e, "shelbi daemon: board refresh tick failed")
-            }
+    ///
+    /// On failure the previous index is rewritten **stale**, keeping its last
+    /// good board but refreshing its budget envelope from the token's GraphQL
+    /// budget (Phase 3, review note 1). Without this a rate-limit park or network
+    /// blip would leave the file silently un-updated — the board would still read
+    /// as stale once its age crossed the threshold, but the `quota resets HH:MM`
+    /// banner would have no reset time to show until then. `tier` is the token's
+    /// last-seen GraphQL budget, resolved once by the manager loop and threaded
+    /// in so the tick doesn't re-shell to the keychain.
+    fn tick(&self, project: &str, tier: &BudgetTier) {
+        handle_tick_result(project, self.refresh(project), tier);
+    }
+}
+
+/// Apply one tick's outcome: log a real change, stay silent on a quiet tick, and
+/// on a failure (a rate-limit park, a network blip) rewrite the published index
+/// stale so it keeps rendering with the reset time (review note 1). Split from
+/// [`BoardRefresher::tick`] — which builds the store under the single-flight lock
+/// — so the failed-tick / stale-marking behavior is unit-testable with a fake
+/// [`IssueStore`].
+fn handle_tick_result(project: &str, result: Result<RefreshOutcome>, tier: &BudgetTier) {
+    match result {
+        Ok(out) if out.changed > 0 => {
+            tracing::debug!(project, changed = out.changed, "shelbi daemon: board refreshed")
         }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!(project, error = %e, "shelbi daemon: board refresh tick failed");
+            mark_index_stale_from_tier(project, tier);
+        }
+    }
+}
+
+/// Rewrite `project`'s published index as stale, carrying the `tier`'s last-seen
+/// `remaining`/`reset` into it so a failed tick or a paused governor still shows
+/// the `quota resets HH:MM` banner with a real reset time. Best-effort: a rewrite
+/// error is logged, never propagated.
+fn mark_index_stale_from_tier(project: &str, tier: &BudgetTier) {
+    let remaining = tier.remaining.and_then(|r| u64::try_from(r).ok());
+    if let Err(e) = shelbi_state::mark_board_index_stale(project, remaining, tier.reset_at) {
+        tracing::debug!(project, error = %e, "shelbi daemon: failed to mark board index stale");
     }
 }
 
@@ -144,7 +175,11 @@ fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOu
     // issue's number would drop out of the index every quiet tick and force a
     // `get` back to the label search.
     let numbers = merge_index_numbers(previous.as_ref(), &read.numbers, &read.board);
-    let index = BoardIndex::fresh_at(read.board, numbers, fetched_at, read.remaining, read.reset);
+    let mut index =
+        BoardIndex::fresh_at(read.board, numbers, fetched_at, read.remaining, read.reset);
+    // Record which read path produced this board so `shelbi status` can report
+    // whether the reader is on GraphQL or the REST fallback (Phase 3 §6).
+    index.rest_fallback = read.rest_fallback;
     board_index::write_board_index(project, &index).map_err(|e| anyhow!(e))?;
 
     if changed > 0 {
@@ -226,20 +261,28 @@ fn refresh_manager_loop(refresher: &BoardRefresher, stop: &AtomicBool) {
                 break;
             }
             let now = chrono::Utc::now().timestamp();
-            match governor_plan(project, &mut token_keys, now) {
+            // Resolve the token's GraphQL budget once, then derive both the tick
+            // plan and (on a failed tick / pause) the stale index's budget envelope
+            // from it — so the reset time the banner shows comes straight from the
+            // budget that governed the decision.
+            let tier = graphql_tier_for(project, &mut token_keys);
+            match governor_plan_from_tier(project, &tier, now) {
                 TickPlan::Refresh(interval) => {
                     if paused.remove(project) {
                         tracing::info!(project, "shelbi daemon: board refresh resumed (budget recovered)");
                     }
                     let due = last.get(project).map_or(true, |t| t.elapsed() >= interval);
                     if due {
-                        refresher.tick(project);
+                        refresher.tick(project, &tier);
                         last.insert(project.clone(), Instant::now());
                     }
                 }
                 TickPlan::Pause { until } => {
-                    // Budget too low (or parked): skip the list read, serve the
-                    // last index (marked stale by its age). Log once per episode.
+                    // Budget too low (or parked): skip the list read and serve the
+                    // last index, now rewritten stale with the reset time so the
+                    // banner shows `quota resets HH:MM` immediately rather than
+                    // waiting for the file's age to cross the stale threshold.
+                    mark_index_stale_from_tier(project, &tier);
                     if paused.insert(project.clone()) {
                         tracing::warn!(
                             project,
@@ -263,11 +306,7 @@ fn refresh_manager_loop(refresher: &BoardRefresher, stop: &AtomicBool) {
 /// The governor's decision for this project's tick (plan Phase 3 §6): scale the
 /// configured cadence, or pause the refresh, from the token's GraphQL budget and
 /// the project's `issue_tracker.budget` thresholds.
-fn governor_plan(
-    project: &str,
-    token_keys: &mut HashMap<String, Option<String>>,
-    now: i64,
-) -> TickPlan {
+fn governor_plan_from_tier(project: &str, tier: &BudgetTier, now: i64) -> TickPlan {
     let cfg = shelbi_state::load_project(project)
         .map(|p| p.issue_tracker)
         .unwrap_or_default();
@@ -278,8 +317,7 @@ fn governor_plan(
         base_secs: cfg.refresh_interval_secs(),
         slow_secs: budget.slow_refresh_secs(),
     };
-    let tier = graphql_tier_for(project, token_keys);
-    gh_budget::tick_plan(&tier, &thresholds, now)
+    gh_budget::tick_plan(tier, &thresholds, now)
 }
 
 /// The GraphQL budget tier the governor scales from: the per-token `budget.json`
@@ -385,7 +423,7 @@ mod tests {
     };
     use shelbi_state::IssueFile;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     /// A fake store returning a fixed open board and counting `list_open`
     /// calls, so a test can drive the refresh without a real backend.
@@ -406,6 +444,10 @@ mod tests {
         seen_since: SinceLog,
         /// The `(remaining, reset)` budget the fake reports on each read.
         budget: (Option<u64>, Option<i64>),
+        /// When set, `refresh_board` returns a rate-limit error instead of a
+        /// board — the integration test's stand-in for a live 403/429 from the
+        /// GraphQL reader, so the daemon's failed-tick path can be driven.
+        fail: Arc<AtomicBool>,
     }
 
     fn issue(id: &str, column: &str, priority: u32) -> IssueFile {
@@ -477,11 +519,22 @@ mod tests {
             _previous: &[IssueFile],
         ) -> CoreResult<shelbi_state::BoardRead> {
             self.seen_since.lock().unwrap().push(since);
+            if self.fail.load(Ordering::SeqCst) {
+                // Stand in for a live GraphQL 403/429: a rate-limit error whose
+                // stderr carries the phrasing + reset the classifier recognizes.
+                return Err(shelbi_core::Error::Command {
+                    cmd: "gh api graphql".to_string(),
+                    status: "exit status: 1".to_string(),
+                    stderr: "HTTP 403: API rate limit exceeded\nx-ratelimit-reset: 1800000000"
+                        .to_string(),
+                });
+            }
             Ok(shelbi_state::BoardRead {
                 board: self.list_open()?,
                 numbers: Vec::new(),
                 remaining: self.budget.0,
                 reset: self.budget.1,
+                rest_fallback: false,
             })
         }
         fn list_in_status(&self, status: &Column) -> CoreResult<Vec<IssueFile>> {
@@ -601,8 +654,26 @@ mod tests {
                 closeds: Arc::new(AtomicUsize::new(0)),
                 seen_since: Arc::new(Mutex::new(Vec::new())),
                 budget: (None, None),
+                fail: Arc::new(AtomicBool::new(false)),
             },
             opens,
+        )
+    }
+
+    /// A fake whose `refresh_board` can be flipped to a rate-limit error via the
+    /// returned flag — the integration test's stand-in for a live 403/429.
+    fn fake_failable(board: Vec<IssueFile>) -> (FakeStore, Arc<AtomicBool>) {
+        let fail = Arc::new(AtomicBool::new(false));
+        (
+            FakeStore {
+                board,
+                opens: Arc::new(AtomicUsize::new(0)),
+                closeds: Arc::new(AtomicUsize::new(0)),
+                seen_since: Arc::new(Mutex::new(Vec::new())),
+                budget: (Some(4_000), Some(1_800_000_000)),
+                fail: Arc::clone(&fail),
+            },
+            fail,
         )
     }
 
@@ -617,6 +688,7 @@ mod tests {
                 closeds: Arc::clone(&closeds),
                 seen_since: Arc::new(Mutex::new(Vec::new())),
                 budget: (None, None),
+                fail: Arc::new(AtomicBool::new(false)),
             },
             closeds,
         )
@@ -638,6 +710,7 @@ mod tests {
                 closeds: Arc::new(AtomicUsize::new(0)),
                 seen_since: Arc::clone(&seen_since),
                 budget,
+                fail: Arc::new(AtomicBool::new(false)),
             },
             seen_since,
         )
@@ -804,5 +877,158 @@ mod tests {
     fn parse_open_project_names_strips_prefix_and_skips_stash() {
         let listing = "shelbi-alpha\n_shelbi-alpha\nplain\nshelbi-\n   shelbi-bravo\n";
         assert_eq!(parse_open_project_names(listing), vec!["alpha", "bravo"]);
+    }
+
+    // --- Phase 3 integration: 403 → 429 → park → recovery ---------------------
+
+    /// Register a `github`-backed project under the isolated home so
+    /// `read_board_report` / `load_project` resolve a remote backend whose board
+    /// the daemon owns (read from `board-index.json`, never a real `gh`).
+    fn register_github_project(name: &str) {
+        let projects = shelbi_state::shelbi_home().unwrap().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join(format!("{name}.yaml")),
+            format!(
+                "name: {name}\n\
+repo: /tmp/{name}\n\
+default_branch: main\n\
+orchestrator:\n\
+\x20 runner: claude\n\
+agent_runners:\n\
+\x20 claude:\n\
+\x20\x20\x20 command: claude\n\
+\x20\x20\x20 flags: []\n\
+machines:\n\
+\x20 - name: local\n\
+\x20\x20\x20 kind: local\n\
+\x20\x20\x20 work_dir: /tmp/{name}\n\
+workspaces: []\n\
+issue_tracker:\n\
+\x20 backend: github\n\
+\x20 refresh_secs: 30\n\
+\x20 github:\n\
+\x20\x20\x20 repo: owner/repo\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn tier(remaining: Option<i64>, reset_at: Option<i64>, parked_until: Option<i64>) -> BudgetTier {
+        BudgetTier {
+            remaining,
+            reset_at,
+            parked_until,
+        }
+    }
+
+    /// Whether any events.log line looks like a destructive poller action — a
+    /// reap, an orphan action, a marker clear, or an idle mark. Phase 3's rule is
+    /// that none of these may fire while the board is stale/failed.
+    fn any_destructive_events() -> bool {
+        events_lines().iter().any(|l| {
+            l.contains("reaped")
+                || l.contains("orphan")
+                || l.contains("marker")
+                || l.contains("mark_idle")
+                || l.contains("idle=")
+        })
+    }
+
+    #[test]
+    fn board_survives_403_429_park_and_recovery_with_no_destructive_action() {
+        // The whole loop through an outage (plan Phase 3 acceptance): a good tick
+        // is warm; a 403 then a 429 leave the board *rendering* (stale, with the
+        // reset time) rather than empty; while parked the governor pauses the read
+        // (no backend hammering); and once the budget recovers a tick goes warm
+        // again. Throughout, the board never reads `Warm` during the outage — the
+        // single condition every destructive poller path (reap / orphan / marker
+        // clear / mark idle) requires — so none of them can fire, and no such line
+        // is ever written.
+        let _iso = IsolatedHome::new("outage");
+        register_github_project("proj");
+        let reset = 1_800_000_000i64; // a fixed future epoch, so the banner has an HH:MM
+        let now = 1_700_000_000i64; // well before the reset → the park is live
+
+        let (store, fail) =
+            fake_failable(vec![issue("a", "review", 0), issue("b", "in-progress", 0)]);
+        let healthy = tier(Some(4_000), Some(reset), None);
+
+        // (1) WARM: a good tick publishes the index; the board reads Warm with a
+        // plain `board …` banner and no stale/quota clause.
+        handle_tick_result("proj", refresh_with_store("proj", &store), &healthy);
+        let report = shelbi_state::read_board_report("proj").unwrap();
+        assert!(
+            matches!(report.state, shelbi_state::BoardState::Warm(_)),
+            "a good tick is warm"
+        );
+        let banner = report.freshness.banner().expect("remote board has a banner");
+        assert!(banner.starts_with("board "), "banner: {banner}");
+        assert!(!banner.contains("stale"), "warm banner is not stale: {banner}");
+
+        // (2) 403: the reader errors; the daemon rewrites the index STALE, carrying
+        // the reset from the (now parked) budget, so the board keeps rendering with
+        // `quota resets HH:MM` instead of collapsing.
+        fail.store(true, Ordering::SeqCst);
+        let parked = tier(Some(50), Some(reset), Some(reset));
+        handle_tick_result("proj", refresh_with_store("proj", &store), &parked);
+        let report = shelbi_state::read_board_report("proj").unwrap();
+        match &report.state {
+            shelbi_state::BoardState::Stale(board) => {
+                assert_eq!(board.len(), 2, "the last good board is carried forward")
+            }
+            other => panic!("expected Stale after a 403, got {other:?}"),
+        }
+        assert_eq!(report.freshness.reset, Some(reset), "reset carried into the index");
+        let banner = report.freshness.banner().unwrap();
+        assert!(banner.contains("stale"), "banner marks stale: {banner}");
+        assert!(banner.contains("quota resets"), "banner names the reset: {banner}");
+        // The thin `read_board` — the one every destructive poller path gates on —
+        // is non-Warm, so a reaper would bail.
+        assert!(
+            !matches!(shelbi_state::read_board("proj").unwrap(), shelbi_state::BoardState::Warm(_)),
+            "a stale board must never read Warm (the reap gate)"
+        );
+
+        // (3) 429 → PARK: with the budget parked, the governor pauses this tick —
+        // the loop skips the backend read entirely (no hammering) and only refreshes
+        // the stale marker.
+        assert!(
+            matches!(
+                governor_plan_from_tier("proj", &parked, now),
+                TickPlan::Pause { until } if until == reset
+            ),
+            "a parked budget pauses the refresh until reset"
+        );
+        mark_index_stale_from_tier("proj", &parked);
+        assert!(
+            !matches!(shelbi_state::read_board("proj").unwrap(), shelbi_state::BoardState::Warm(_)),
+            "still non-Warm while parked"
+        );
+
+        // (4) RECOVERY: the window resets, the budget refills, the reader succeeds
+        // again → the governor refreshes and the index goes warm, banner clears.
+        fail.store(false, Ordering::SeqCst);
+        assert!(
+            matches!(governor_plan_from_tier("proj", &healthy, now), TickPlan::Refresh(_)),
+            "a healthy budget refreshes"
+        );
+        handle_tick_result("proj", refresh_with_store("proj", &store), &healthy);
+        let report = shelbi_state::read_board_report("proj").unwrap();
+        assert!(
+            matches!(report.state, shelbi_state::BoardState::Warm(_)),
+            "recovery goes warm again"
+        );
+        assert!(
+            !report.freshness.banner().unwrap().contains("stale"),
+            "the stale banner clears on recovery"
+        );
+
+        // Across the whole outage, not one destructive poller line was written.
+        assert!(
+            !any_destructive_events(),
+            "no reap / orphan / marker-clear / idle line may fire during the outage: {:?}",
+            events_lines(),
+        );
     }
 }

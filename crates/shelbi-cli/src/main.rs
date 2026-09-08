@@ -230,6 +230,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::config::ConfigCmd,
     },
+    /// Runtime health checks for the project's GitHub API budget: the observed
+    /// request rate, remaining budget, projected time-to-exhaustion, and a
+    /// warning (naming the top callers) when a budget would run out within 30
+    /// minutes at the current rate.
+    Doctor,
     /// Inspect the hub-global workspace-state transition log.
     Events {
         #[command(subcommand)]
@@ -513,6 +518,7 @@ fn main() -> Result<()> {
             let explicit_project = project_flag_was_explicit(std::env::args_os());
             commands::config::run(cli.project, explicit_project, cmd)
         }
+        Some(Cmd::Doctor) => commands::doctor::run(cli.project),
         Some(Cmd::Events { cmd }) => commands::events::run(cmd),
         Some(Cmd::Daemon { cmd }) => commands::daemon::run(cmd),
         Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),

@@ -24,6 +24,7 @@ pub mod board_index;
 pub mod done_history;
 mod event_log;
 pub mod gh_budget;
+pub mod gh_requests;
 mod gh_retry;
 pub mod github_store;
 mod hub_config;
@@ -63,8 +64,10 @@ pub use issue_migrate::{
     PartialMigration,
 };
 pub use board_index::{
-    board_index_path, patch_board_index_issue, read_board, read_board_index, read_board_with_cfg,
-    remove_board_index_issue, write_board_index, BoardIndex, BOARD_INDEX_FILE,
+    board_index_path, mark_board_index_stale, patch_board_index_issue, read_board,
+    read_board_index, read_board_report, read_board_report_with_cfg, read_board_with_cfg,
+    remove_board_index_issue, write_board_index, BoardFreshness, BoardIndex, BoardReport,
+    BoardSource, ReadPath, BOARD_INDEX_FILE,
 };
 pub use done_history::{
     done_history_path, patch_done_history_issue, read_done_history, remove_done_history_issue,

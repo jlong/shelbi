@@ -5691,6 +5691,7 @@ Intro prose.
             stale: true,
             remaining: None,
             reset: None,
+            rest_fallback: false,
         };
         shelbi_state::write_board_index(name, &idx).unwrap();
     }

@@ -521,6 +521,7 @@ impl IssueStore for GitHubStore {
                     numbers: Vec::new(),
                     remaining: None,
                     reset: None,
+                    rest_fallback: true,
                 });
             }
         };
@@ -547,6 +548,7 @@ impl IssueStore for GitHubStore {
                     numbers,
                     remaining: page.remaining,
                     reset: page.reset,
+                    rest_fallback: false,
                 })
             }
             Some(_) => {
@@ -582,6 +584,7 @@ impl IssueStore for GitHubStore {
                     numbers,
                     remaining: page.remaining,
                     reset: page.reset,
+                    rest_fallback: false,
                 })
             }
         }
@@ -1604,6 +1607,14 @@ impl GitHubStore {
             args.push(format!("{k}={v}"));
         }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        // Every mutation spends one REST request: log it hub-wide for the Phase 3
+        // diagnostics before the call, so a write that then fails is still counted.
+        // Gated on `key.is_some()` — the same "governance active" signal the budget
+        // recording uses — so it is inert under test (where `budget_token_key`
+        // returns `None`) and never writes the request log into a test's home.
+        if key.is_some() {
+            crate::gh_requests::record_request(crate::gh_budget::Budget::Rest, "write");
+        }
         let out = (self.gh)(&refs)?;
         Ok(record_and_strip_rest(key.as_deref(), &out))
     }
@@ -1918,6 +1929,10 @@ fn graphql_governed_read(
     {
         return Err(rate_limited_park_error(project, args, reset));
     }
+    // A real GraphQL request is about to be spent: log it to the hub-wide request
+    // log so `shelbi status` / `shelbi doctor` can see the rate and who is driving
+    // it (Phase 3 §6). Best-effort; never fails the read.
+    crate::gh_requests::record_request(crate::gh_budget::Budget::Graphql, graphql_caller(args));
     let result = read_policy.run(|| run_gh_with_token(&token, args));
     match &result {
         Ok(body) => {
@@ -1938,6 +1953,29 @@ fn graphql_governed_read(
         Err(_) => {}
     }
     result
+}
+
+/// The caller label recorded for a GraphQL read, derived from the query name in
+/// `args` (the `-f query=query <Name>(…)` form field). Lets `shelbi doctor` name
+/// which reader is spending the GraphQL budget: the daemon's board-index refresh,
+/// a single-issue fetch, the id→number search, or an on-demand done page. An
+/// unrecognized (or absent) query falls back to a generic `graphql-read`.
+fn graphql_caller(args: &[&str]) -> &'static str {
+    let query = args
+        .iter()
+        .find_map(|a| a.strip_prefix("query="))
+        .unwrap_or("");
+    if query.contains("BoardIndex") {
+        "board-refresh"
+    } else if query.contains("ClosedPage") || query.contains("states: [CLOSED]") {
+        "done-page"
+    } else if query.contains("IdSearch") || query.contains("search(") {
+        "id-search"
+    } else if query.contains("IssuesByNumber") || query.contains("issue(") {
+        "issue-fetch"
+    } else {
+        "graphql-read"
+    }
 }
 
 /// Park the token's **GraphQL** budget until `reset` and, iff this call is the
