@@ -190,6 +190,11 @@ pub struct App {
     pub sidebar_index: usize,
     pub last_refresh: Instant,
     pub status_line: String,
+    /// Board freshness banner for the footer — `board 12s` when warm, `board 4m
+    /// stale · quota resets 16:03` when the daemon index lags or is parked,
+    /// `board 4m cached · no daemon` on a cache fallback. `None` for a local
+    /// board or before the first read. Phase 3 §6.
+    pub board_banner: Option<String>,
     pub should_quit: bool,
     /// Latest Zen Mode state read from `state.json`. Drives the green pill
     /// in the lower-left status block and the Alt+Z toggle direction.
@@ -287,6 +292,7 @@ impl App {
             ready_review: Vec::new(),
             queued_review: Vec::new(),
             board_loading: false,
+            board_banner: None,
             sidebar_index: 0,
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
@@ -613,20 +619,22 @@ impl App {
         // project still classifies below; the board read itself no longer touches
         // the backend.
         match shelbi_state::issue_store_for(&self.project_name) {
-            Ok(_store) => match shelbi_state::read_board(&self.project_name) {
-                Ok(state) if state.is_cold() => {
+            Ok(_store) => match shelbi_state::read_board_report(&self.project_name) {
+                Ok(report) if report.state.is_cold() => {
                     // Nothing to show yet; the background refresh is in flight.
                     // Leave the sections empty (the loading row stands in) and
                     // don't block.
+                    self.board_banner = report.freshness.banner();
                     self.board_loading = true;
                     self.ready_review = Vec::new();
                     self.queued_review = Vec::new();
                     self.workspaces = Vec::new();
                     self.config_error = None;
                 }
-                Ok(state) => {
+                Ok(report) => {
+                    self.board_banner = report.freshness.banner();
                     self.board_loading = false;
-                    let board = state.into_issues();
+                    let board = report.state.into_issues();
                     // Both sections filter the one in-memory board, exactly as
                     // the Issues board filters its columns from
                     // `state.into_issues()` — no second round trip, no separate

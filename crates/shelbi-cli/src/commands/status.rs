@@ -156,6 +156,9 @@ fn print_summary(project: &str) -> Result<()> {
     );
 
     println!("daemon: {}", super::hub_version::status_line());
+    if let Some(line) = github_summary_line(project) {
+        println!("github: {line}");
+    }
     Ok(())
 }
 
@@ -193,7 +196,139 @@ fn print_full(project: &str) -> Result<()> {
     println!("## Daemon");
     println!();
     println!("daemon: {}", super::hub_version::status_line());
+
+    if let Some(section) = github_section(project) {
+        println!();
+        println!("## GitHub");
+        println!();
+        print!("{section}");
+    }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GitHub section (--full) + summary line (Phase 3 §6)
+
+/// The rate-limit / freshness snapshot for a remote (github) project's board:
+/// remaining + reset per budget, requests observed in the last hour, the index
+/// age, and which read path is active. `None` for a `file_system` project, which
+/// has no API budget or read path. All reads are best-effort and side-effect free.
+fn github_section(project: &str) -> Option<String> {
+    let cfg = shelbi_state::load_project(project).ok()?.issue_tracker;
+    if !cfg.backend.is_remote() {
+        return None;
+    }
+    let now = Utc::now();
+    let freshness = shelbi_state::read_board_report_with_cfg(project, &cfg)
+        .ok()
+        .map(|r| r.freshness);
+    let budget = github_budget_snapshot(project);
+    let rates = shelbi_state::gh_requests::rates_in_window(
+        std::time::Duration::from_secs(3600),
+        now,
+    );
+
+    let mut out = String::new();
+    // Read path + index age.
+    if let Some(f) = &freshness {
+        out.push_str(&format!("read path: {}\n", f.read_path.as_str()));
+        let age = f
+            .age_secs
+            .map(|s| format!("{s}s old"))
+            .unwrap_or_else(|| "age unknown".to_string());
+        let freshness_word = match f.source {
+            shelbi_state::BoardSource::CacheFallback => "cache fallback (no daemon)",
+            _ if f.stale => "stale",
+            _ => "warm",
+        };
+        out.push_str(&format!("board index: {age} ({freshness_word})\n"));
+    } else {
+        out.push_str("read path: unknown\nboard index: (no index published)\n");
+    }
+    // Per-budget: remaining, reset, requests in the last hour.
+    for (label, budget_kind) in [
+        ("graphql", shelbi_state::gh_budget::Budget::Graphql),
+        ("rest", shelbi_state::gh_budget::Budget::Rest),
+    ] {
+        let tier = budget.as_ref().map(|s| s.tier(budget_kind));
+        let remaining = tier
+            .and_then(|t| t.remaining)
+            // Fall back to the index's last-seen remaining for the graphql budget.
+            .or_else(|| {
+                if matches!(budget_kind, shelbi_state::gh_budget::Budget::Graphql) {
+                    freshness.as_ref().and_then(|f| f.remaining.map(|r| r as i64))
+                } else {
+                    None
+                }
+            });
+        let reset = tier
+            .and_then(|t| t.reset_at)
+            .or_else(|| {
+                if matches!(budget_kind, shelbi_state::gh_budget::Budget::Graphql) {
+                    freshness.as_ref().and_then(|f| f.reset)
+                } else {
+                    None
+                }
+            });
+        let count = rates
+            .iter()
+            .find(|r| r.budget == budget_kind)
+            .map(|r| r.count)
+            .unwrap_or(0);
+        let remaining_str = remaining
+            .map(|r| format!("{r} remaining"))
+            .unwrap_or_else(|| "remaining unknown".to_string());
+        let reset_str = reset
+            .and_then(format_epoch_local)
+            .map(|hm| format!(", resets {hm}"))
+            .unwrap_or_default();
+        let parked = tier
+            .and_then(|t| t.parked_until)
+            .filter(|until| *until > now.timestamp())
+            .is_some();
+        let parked_str = if parked { " · parked" } else { "" };
+        out.push_str(&format!(
+            "{label} budget: {remaining_str}{reset_str} · {count} request{} in the last hour{parked_str}\n",
+            if count == 1 { "" } else { "s" },
+        ));
+    }
+    Some(out)
+}
+
+/// The concise one-liner for bare `shelbi status`: board age + graphql remaining.
+/// `None` for a non-remote backend.
+fn github_summary_line(project: &str) -> Option<String> {
+    let cfg = shelbi_state::load_project(project).ok()?.issue_tracker;
+    if !cfg.backend.is_remote() {
+        return None;
+    }
+    let freshness = shelbi_state::read_board_report_with_cfg(project, &cfg)
+        .ok()
+        .map(|r| r.freshness)?;
+    let board = freshness.banner().unwrap_or_else(|| "board (no index)".to_string());
+    let budget = github_budget_snapshot(project);
+    let remaining = budget
+        .as_ref()
+        .and_then(|s| s.tier(shelbi_state::gh_budget::Budget::Graphql).remaining)
+        .or_else(|| freshness.remaining.map(|r| r as i64));
+    match remaining {
+        Some(r) => Some(format!("{board} · graphql {r} left")),
+        None => Some(board),
+    }
+}
+
+/// Read the token's persisted rate-limit budget for `project`, or `None` when the
+/// token can't be resolved (then the section falls back to the index's numbers).
+fn github_budget_snapshot(project: &str) -> Option<shelbi_state::gh_budget::RateLimitState> {
+    let token = shelbi_state::resolve_github_token_by_name(project).ok()?;
+    let key = shelbi_state::gh_budget::token_key(token.expose());
+    Some(shelbi_state::gh_budget::read_state(&key))
+}
+
+/// Format an epoch (seconds) as a local `HH:MM`, or `None` when unrepresentable.
+fn format_epoch_local(epoch: i64) -> Option<String> {
+    DateTime::from_timestamp(epoch, 0)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
 }
 
 /// Print the orchestrator's integration-health line for the `## Workspaces`
@@ -616,6 +751,60 @@ issue_tracker:\n\
         assert_eq!(counts.active, 1);
         assert_eq!(counts.handoff, 1);
 
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn github_section_renders_for_a_remote_project_with_live_numbers() {
+        // A github project with a seeded index + a couple of logged requests: the
+        // section reports the read path, index age, and per-budget numbers.
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "g");
+        // Short-circuit token resolution at the env step so the budget snapshot
+        // never shells out to `gh auth token`; the section then falls back to the
+        // index's own remaining/reset, which is what the assertions check.
+        let prev_gh = std::env::var("GH_TOKEN").ok();
+        std::env::set_var("GH_TOKEN", "test-token");
+
+        let mut idx = shelbi_state::BoardIndex::fresh(vec![ifile("a", "review")]);
+        idx.remaining = Some(4_989);
+        idx.reset = Some(1_800_000_000);
+        shelbi_state::write_board_index("g", &idx).unwrap();
+        // A logged GraphQL request so the "requests in the last hour" count is live.
+        shelbi_state::gh_requests::record_request(
+            shelbi_state::gh_budget::Budget::Graphql,
+            "board-refresh",
+        );
+
+        let section = github_section("g").expect("remote project has a GitHub section");
+        assert!(section.contains("read path: graphql"), "{section}");
+        assert!(section.contains("board index:"), "{section}");
+        assert!(section.contains("graphql budget: 4989 remaining"), "{section}");
+        assert!(
+            section.contains("1 request in the last hour"),
+            "the logged request is counted: {section}"
+        );
+
+        match prev_gh {
+            Some(v) => std::env::set_var("GH_TOKEN", v),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn github_section_is_absent_for_a_local_project() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home(); // registers a `file_system`-backed project `p`
+        std::env::set_var("SHELBI_HOME", &home);
+        assert!(
+            github_section("p").is_none(),
+            "a local backend has no API budget section"
+        );
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

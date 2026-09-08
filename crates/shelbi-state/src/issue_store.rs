@@ -354,6 +354,13 @@ pub struct BoardRead {
     /// Unix epoch seconds at which that budget resets, when known
     /// (GraphQL `rateLimit.resetAt`).
     pub reset: Option<i64>,
+    /// True when this board came from the **REST fallback** rather than the
+    /// GraphQL path — a GHES host without `filterBy.since`, a token missing
+    /// GraphQL scope, or a transport blip that dropped the reader off GraphQL.
+    /// The daemon records it into the published index so `shelbi status` can
+    /// report which read path is active (Phase 3 §6). `false` on the GraphQL
+    /// path, and on backends with no notion of a fallback (filesystem, cache).
+    pub rest_fallback: bool,
 }
 
 /// One lazily-fetched page of the terminal `done`/`canceled` history
@@ -534,6 +541,7 @@ pub trait IssueStore {
             numbers: Vec::new(),
             remaining: None,
             reset: None,
+            rest_fallback: false,
         })
     }
 

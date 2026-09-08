@@ -38,7 +38,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 
 use shelbi_core::{IssueTrackerConfig, Result};
@@ -93,6 +93,13 @@ pub struct BoardIndex {
     /// `None`-until-Phase-3 story as [`remaining`](Self::remaining).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset: Option<i64>,
+    /// True when the last refresh that produced this board came from the REST
+    /// fallback rather than the GraphQL path (a GHES host without `filterBy.since`,
+    /// a missing GraphQL scope, or a transport blip). `shelbi status` reports it as
+    /// the active read path (Phase 3 §6). Defaults false — a GraphQL read, or an
+    /// index written by a pre-Phase-3 daemon.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rest_fallback: bool,
 }
 
 impl BoardIndex {
@@ -128,6 +135,7 @@ impl BoardIndex {
             stale: false,
             remaining,
             reset,
+            rest_fallback: false,
         }
     }
 }
@@ -241,6 +249,311 @@ fn fetched_at_is_stale(fetched_at: &str, interval_secs: u64) -> bool {
     let age = Utc::now().signed_duration_since(ts.with_timezone(&Utc));
     age.to_std()
         .is_ok_and(|a| a >= index_stale_threshold(interval_secs))
+}
+
+// --- staleness UI: freshness descriptor + banner (plan Phase 3 §6) -----------
+
+/// Where a board read came from — the provenance a staleness banner needs to
+/// tell "the daemon's index" apart from "this process's own cache fallback".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardSource {
+    /// A local `file_system` board read straight from disk — always
+    /// authoritative, so it carries no freshness banner.
+    Local,
+    /// The daemon-owned `board-index.json`. Its `stale` flag / age drive the
+    /// `board 4m stale · quota resets 16:03` banner.
+    Index,
+    /// The per-process snapshot cache, served because no index file exists **and
+    /// no daemon socket answered** — a machine whose daemon has never run, or a
+    /// bare CLI outside the hub (§5 keeps per-process caching for those). Shown
+    /// distinctly from a daemon-published stale index (review note 2).
+    CacheFallback,
+    /// No board data at all yet: a remote project whose daemon is up (the socket
+    /// answers) but hasn't published a first index. Renders as a loading state.
+    None,
+}
+
+/// Which backend read path last produced the index — surfaced by `shelbi status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadPath {
+    /// The GraphQL board reader (the healthy path).
+    Graphql,
+    /// The REST fallback (GHES without `filterBy.since`, missing scope, a blip).
+    RestFallback,
+    /// Not known — a local board, a cache fallback, or no index yet.
+    Unknown,
+}
+
+impl ReadPath {
+    /// Short human tag for the `shelbi status` GitHub section.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReadPath::Graphql => "graphql",
+            ReadPath::RestFallback => "rest-fallback",
+            ReadPath::Unknown => "unknown",
+        }
+    }
+}
+
+/// The freshness envelope returned alongside a board read by
+/// [`read_board_report`]. Everything a staleness banner or the `shelbi status`
+/// GitHub section needs: where the board came from, whether it is stale, how old
+/// it is, the token budget behind it, and which read path produced it.
+#[derive(Debug, Clone)]
+pub struct BoardFreshness {
+    /// Provenance of the board (index / cache fallback / local / none).
+    pub source: BoardSource,
+    /// Whether the board is known to lag the backend.
+    pub stale: bool,
+    /// Age of the data in seconds (`now - fetched_at`), when a timestamp exists.
+    pub age_secs: Option<u64>,
+    /// Remaining API budget behind the read, when known.
+    pub remaining: Option<u64>,
+    /// Epoch seconds at which the budget resets, when known.
+    pub reset: Option<i64>,
+    /// Which backend read path produced the index.
+    pub read_path: ReadPath,
+}
+
+impl BoardFreshness {
+    /// A local `file_system` board: authoritative, no banner.
+    fn local() -> Self {
+        Self {
+            source: BoardSource::Local,
+            stale: false,
+            age_secs: None,
+            remaining: None,
+            reset: None,
+            read_path: ReadPath::Unknown,
+        }
+    }
+
+    /// A remote project whose daemon is up but has published no index yet.
+    fn none() -> Self {
+        Self {
+            source: BoardSource::None,
+            stale: false,
+            age_secs: None,
+            remaining: None,
+            reset: None,
+            read_path: ReadPath::Unknown,
+        }
+    }
+
+    /// The banner text for the sidebar footer / Issues board header, or `None`
+    /// when nothing should be shown (a local board, or no data yet).
+    ///
+    /// - warm index → `board 12s`
+    /// - stale index → `board 4m stale · quota resets 16:03` (the reset clause
+    ///   only when a reset time is known)
+    /// - cache fallback → `board 4m cached · no daemon` (distinct from a stale
+    ///   index, per review note 2)
+    pub fn banner(&self) -> Option<String> {
+        let age = self.age_secs.map(format_age);
+        match self.source {
+            BoardSource::Local | BoardSource::None => None,
+            BoardSource::CacheFallback => Some(match age {
+                Some(a) => format!("board {a} cached · no daemon"),
+                None => "board cached · no daemon".to_string(),
+            }),
+            BoardSource::Index => {
+                let age = age.unwrap_or_else(|| "?".to_string());
+                if self.stale {
+                    match self.reset.and_then(format_reset) {
+                        Some(reset) => Some(format!("board {age} stale · quota resets {reset}")),
+                        None => Some(format!("board {age} stale")),
+                    }
+                } else {
+                    Some(format!("board {age}"))
+                }
+            }
+        }
+    }
+}
+
+/// A board read plus its freshness envelope — the richer read the staleness UI
+/// and `shelbi status` use, where the plain [`read_board`] returns only the
+/// [`BoardState`].
+#[derive(Debug, Clone)]
+pub struct BoardReport {
+    /// The renderable board state (the same three-state value [`read_board`]
+    /// returns). Destructive gating still keys off `Warm` here.
+    pub state: BoardState,
+    /// The freshness envelope for the banner and diagnostics.
+    pub freshness: BoardFreshness,
+}
+
+/// [`read_board`] with the freshness envelope attached — the read the sidebar,
+/// Issues board and `shelbi status` GitHub section use so they can render a
+/// staleness banner and report the budget.
+///
+/// Unlike [`read_board`], for a **remote** project whose index file is absent
+/// this distinguishes two cases (review note 2): if a daemon socket answers, the
+/// board is [`BoardState::Cold`] (the daemon will publish within a tick or two);
+/// if no daemon answers, it falls back to this process's snapshot cache and
+/// tags it [`BoardSource::CacheFallback`] — a bare CLI or a machine with no hub
+/// still paints its last-known board instead of an empty one. A cache-fallback
+/// board is never reported as `Warm` (only the daemon index authorizes the
+/// destructive poller paths), so a lagging or absent daemon can never drive a
+/// reap off a per-process cache.
+pub fn read_board_report(project: &str) -> Result<BoardReport> {
+    let cfg = crate::load_project(project)?.issue_tracker;
+    read_board_report_with_cfg(project, &cfg)
+}
+
+/// [`read_board_report`] for a caller that already holds the resolved config.
+pub fn read_board_report_with_cfg(project: &str, cfg: &IssueTrackerConfig) -> Result<BoardReport> {
+    if !cfg.backend.is_remote() {
+        let store = crate::issue_store::build_store(project, cfg)?;
+        return Ok(BoardReport {
+            state: BoardState::Warm(store.list_open()?),
+            freshness: BoardFreshness::local(),
+        });
+    }
+    Ok(remote_board_report(project, cfg))
+}
+
+/// Build the [`BoardReport`] for a remote project from its published index, or —
+/// when no index exists — the daemon-probe/cache-fallback logic described on
+/// [`read_board_report_with_cfg`].
+fn remote_board_report(project: &str, cfg: &IssueTrackerConfig) -> BoardReport {
+    let interval_secs = cfg.refresh_interval_secs();
+    if let Some(idx) = read_board_index(project) {
+        let stale = idx.stale || fetched_at_is_stale(&idx.fetched_at, interval_secs);
+        let age_secs = age_secs_of(&idx.fetched_at);
+        let read_path = if idx.rest_fallback {
+            ReadPath::RestFallback
+        } else {
+            ReadPath::Graphql
+        };
+        let freshness = BoardFreshness {
+            source: BoardSource::Index,
+            stale,
+            age_secs,
+            remaining: idx.remaining,
+            reset: idx.reset,
+            read_path,
+        };
+        let state = if stale {
+            BoardState::Stale(idx.board)
+        } else {
+            BoardState::Warm(idx.board)
+        };
+        return BoardReport { state, freshness };
+    }
+    // No index file. Tell "daemon up, not published yet" (Cold) apart from
+    // "no daemon" (per-process cache fallback).
+    if daemon_socket_answers() {
+        return BoardReport {
+            state: BoardState::Cold,
+            freshness: BoardFreshness::none(),
+        };
+    }
+    // No daemon: serve this process's snapshot cache (§5). A warm cache is
+    // downgraded to Stale so a cache fallback never authorizes a destructive
+    // poller action — only the daemon-owned index yields `Warm` for a remote
+    // project. A genuinely empty cache stays Cold so a bare CLI's own
+    // Cold-fallback (a direct backend read) still fires.
+    match crate::issue_store::resolve_issue_store(project, cfg).and_then(|s| s.list_state()) {
+        Ok(BoardState::Warm(board)) | Ok(BoardState::Stale(board)) => BoardReport {
+            state: BoardState::Stale(board),
+            freshness: BoardFreshness {
+                source: BoardSource::CacheFallback,
+                stale: true,
+                age_secs: None,
+                remaining: None,
+                reset: None,
+                read_path: ReadPath::Unknown,
+            },
+        },
+        _ => BoardReport {
+            state: BoardState::Cold,
+            freshness: BoardFreshness {
+                source: BoardSource::CacheFallback,
+                stale: true,
+                age_secs: None,
+                remaining: None,
+                reset: None,
+                read_path: ReadPath::Unknown,
+            },
+        },
+    }
+}
+
+/// Whether a hub daemon is answering its socket right now — the signal that
+/// separates "daemon up, index not published yet" from "no daemon at all".
+/// Any answer (matching or mismatched version) counts as up; only a socket that
+/// doesn't accept is "no daemon".
+fn daemon_socket_answers() -> bool {
+    !matches!(
+        crate::hub_version::daemon_version_status(),
+        crate::hub_version::DaemonVersionStatus::NotRunning
+    )
+}
+
+/// Age in whole seconds of an RFC3339 `fetched_at` relative to now, or `None`
+/// when it doesn't parse or lies in the future.
+fn age_secs_of(fetched_at: &str) -> Option<u64> {
+    let ts = DateTime::parse_from_rfc3339(fetched_at).ok()?;
+    let age = Utc::now().signed_duration_since(ts.with_timezone(&Utc));
+    age.num_seconds().try_into().ok()
+}
+
+/// Format a compact age like `12s`, `4m`, `2h`, `3d` for the staleness banner.
+fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3_600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// Format a budget reset epoch as a local `HH:MM` time for the banner, or `None`
+/// when the epoch is unrepresentable.
+fn format_reset(reset: i64) -> Option<String> {
+    DateTime::from_timestamp(reset, 0).map(|dt| dt.with_timezone(&Local).format("%H:%M").to_string())
+}
+
+/// Rewrite a project's published index as **stale**, keeping the last good board
+/// but refreshing its budget envelope from `remaining`/`reset` — the daemon-side
+/// half of Phase 3 (review note 1). Called when a refresh tick fails (a rate-limit
+/// park, a network blip) or the governor pauses the refresh: the board keeps
+/// rendering, now flagged stale with the reset time, instead of the file sitting
+/// silently un-updated until its age alone crosses the stale threshold.
+///
+/// `fetched_at` is deliberately left untouched — it dates the last *good* read,
+/// so the banner's age reflects how old the served data actually is. A no-op when
+/// no index has been published yet (nothing to mark; the first successful tick
+/// will publish a fresh one).
+pub fn mark_board_index_stale(
+    project: &str,
+    remaining: Option<u64>,
+    reset: Option<i64>,
+) -> Result<()> {
+    let Some(mut idx) = read_board_index(project) else {
+        return Ok(());
+    };
+    // Skip a rewrite when nothing would change — already stale and the budget
+    // numbers match — so a paused project doesn't churn the file every 2s tick.
+    let budget_unchanged = remaining
+        .map(|r| idx.remaining == Some(r))
+        .unwrap_or(true)
+        && reset.map(|r| idx.reset == Some(r)).unwrap_or(true);
+    if idx.stale && budget_unchanged {
+        return Ok(());
+    }
+    idx.stale = true;
+    if remaining.is_some() {
+        idx.remaining = remaining;
+    }
+    if reset.is_some() {
+        idx.reset = reset;
+    }
+    write_board_index(project, &idx)
 }
 
 /// Splice a single freshly-mutated issue into the published index in place — the
@@ -559,6 +872,7 @@ mod tests {
             stale,
             remaining: None,
             reset: None,
+            rest_fallback: false,
         }
     }
 
@@ -704,5 +1018,119 @@ mod tests {
         patch_board_index_issue("proj", &issue("a", "todo", 0)).unwrap();
         remove_board_index_issue("proj", "a").unwrap();
         assert!(read_board_index("proj").is_none());
+    }
+
+    // --- staleness UI: freshness / report / banner (Phase 3 §6) --------------
+
+    #[test]
+    fn mark_stale_flags_the_index_and_carries_the_budget() {
+        // A failed tick rewrites the last good index as stale, keeping the board
+        // and its `fetched_at`, and folds in the token's reset so the banner has
+        // an HH:MM to show.
+        let _iso = IsolatedHome::new("markstale");
+        let original = index_aged(vec![issue("a", "review", 0)], 30, false);
+        write_board_index("proj", &original).unwrap();
+
+        mark_board_index_stale("proj", Some(42), Some(1_800_000_000)).unwrap();
+
+        let back = read_board_index("proj").unwrap();
+        assert!(back.stale, "the index is flagged stale");
+        assert_eq!(back.board.len(), 1, "the last good board is kept");
+        assert_eq!(back.fetched_at, original.fetched_at, "fetched_at (data age) is untouched");
+        assert_eq!(back.remaining, Some(42));
+        assert_eq!(back.reset, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn mark_stale_is_a_noop_with_no_index() {
+        let _iso = IsolatedHome::new("markstale-none");
+        mark_board_index_stale("proj", Some(1), Some(2)).unwrap();
+        assert!(read_board_index("proj").is_none(), "nothing to mark before the first tick");
+    }
+
+    #[test]
+    fn report_carries_index_freshness_and_read_path() {
+        // A warm remote index reports source=Index, path=graphql, and a plain
+        // (non-stale) banner.
+        let _iso = IsolatedHome::new("report-warm");
+        let mut idx = index_aged(vec![issue("a", "todo", 0)], 12, false);
+        idx.remaining = Some(4_989);
+        idx.reset = Some(1_800_000_000);
+        write_board_index("proj", &idx).unwrap();
+
+        let report = read_board_report_with_cfg("proj", &github_cfg()).unwrap();
+        assert!(matches!(report.state, BoardState::Warm(_)));
+        assert_eq!(report.freshness.source, BoardSource::Index);
+        assert_eq!(report.freshness.read_path, ReadPath::Graphql);
+        assert_eq!(report.freshness.remaining, Some(4_989));
+        let banner = report.freshness.banner().unwrap();
+        assert!(banner.starts_with("board "), "{banner}");
+        assert!(!banner.contains("stale"), "{banner}");
+    }
+
+    #[test]
+    fn report_flags_a_stale_index_with_the_reset_in_the_banner() {
+        let _iso = IsolatedHome::new("report-stale");
+        let mut idx = index_aged(vec![issue("a", "review", 0)], 240, true);
+        idx.reset = Some(1_800_000_000);
+        write_board_index("proj", &idx).unwrap();
+
+        let report = read_board_report_with_cfg("proj", &github_cfg()).unwrap();
+        assert!(matches!(report.state, BoardState::Stale(_)));
+        let banner = report.freshness.banner().unwrap();
+        assert!(banner.contains("stale"), "{banner}");
+        assert!(banner.contains("quota resets"), "{banner}");
+    }
+
+    #[test]
+    fn report_reports_the_rest_fallback_read_path() {
+        let _iso = IsolatedHome::new("report-rest");
+        let mut idx = index_aged(vec![issue("a", "todo", 0)], 5, false);
+        idx.rest_fallback = true;
+        write_board_index("proj", &idx).unwrap();
+
+        let report = read_board_report_with_cfg("proj", &github_cfg()).unwrap();
+        assert_eq!(report.freshness.read_path, ReadPath::RestFallback);
+    }
+
+    #[test]
+    fn a_local_board_has_no_banner() {
+        let f = BoardFreshness::local();
+        assert_eq!(f.banner(), None, "a local board is authoritative — no banner");
+    }
+
+    #[test]
+    fn banners_format_each_state() {
+        // warm
+        let warm = BoardFreshness {
+            source: BoardSource::Index,
+            stale: false,
+            age_secs: Some(12),
+            remaining: None,
+            reset: None,
+            read_path: ReadPath::Graphql,
+        };
+        assert_eq!(warm.banner().as_deref(), Some("board 12s"));
+        // stale + reset → the plan's exact shape (time is local, so just check the shape)
+        let stale = BoardFreshness {
+            source: BoardSource::Index,
+            stale: true,
+            age_secs: Some(240),
+            remaining: Some(50),
+            reset: Some(1_800_000_000),
+            read_path: ReadPath::Graphql,
+        };
+        let b = stale.banner().unwrap();
+        assert!(b.starts_with("board 4m stale · quota resets "), "{b}");
+        // cache fallback reads distinctly
+        let cache = BoardFreshness {
+            source: BoardSource::CacheFallback,
+            stale: true,
+            age_secs: None,
+            remaining: None,
+            reset: None,
+            read_path: ReadPath::Unknown,
+        };
+        assert_eq!(cache.banner().as_deref(), Some("board cached · no daemon"));
     }
 }

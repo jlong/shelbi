@@ -539,15 +539,30 @@ fn render_version_row(f: &mut Frame, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let Some(line) = app.daemon_version_line.clone() else {
+    let mut spans: Vec<Span> = Vec::new();
+    if let Some(line) = app.daemon_version_line.clone() {
+        let style = if app.daemon_version_mismatch {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(line, style));
+    }
+    // Board freshness banner (Phase 3 §6) shares the version row: dim `board 12s`
+    // when warm, yellow `board 4m stale · quota resets 16:03` / `board … cached ·
+    // no daemon` when the index lags, is parked, or fell back to the cache — so a
+    // rate-limited or daemon-less hub is visible instead of a silently frozen
+    // board. A leading separator keeps it off the version segment when both show.
+    if let Some(banner) = &app.board_banner {
+        let stale = banner.contains("stale") || banner.contains("no daemon");
+        let color = if stale { Color::Yellow } else { Color::DarkGray };
+        let prefix = if spans.is_empty() { "" } else { "  " };
+        spans.push(Span::styled(format!("{prefix}{banner}"), Style::default().fg(color)));
+    }
+    if spans.is_empty() {
         return;
-    };
-    let style = if app.daemon_version_mismatch {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    f.render_widget(Paragraph::new(Line::from(Span::styled(line, style))), area);
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Single-line zen indicator anchored to the sidebar footer.

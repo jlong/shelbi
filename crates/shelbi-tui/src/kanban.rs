@@ -55,6 +55,11 @@ pub struct KanbanApp {
     pub selected_row: usize,
     pub last_refresh: Instant,
     pub status_line: String,
+    /// Board freshness banner for the title bar — `board 12s` when warm, `board
+    /// 4m stale · quota resets 16:03` when the daemon index lags or is parked,
+    /// `board 4m cached · no daemon` on a per-process cache fallback. `None` for a
+    /// local board (always authoritative) or before the first read. Phase 3 §6.
+    pub board_banner: Option<String>,
     /// When `Some`, a modal task detail popover is open for the given task id.
     /// Selection underneath stays put so closing the popover returns the
     /// cursor to the same card.
@@ -378,6 +383,7 @@ impl KanbanApp {
             display_name: None,
             tasks: Vec::new(),
             board_loading: false,
+            board_banner: None,
             selected_column: 0,
             selected_row: 0,
             last_refresh: Instant::now() - Duration::from_secs(60),
@@ -770,15 +776,37 @@ impl KanbanApp {
                 return;
             }
         };
-        match shelbi_state::read_board(&self.project_name) {
-            Ok(shelbi_state::BoardState::Cold) => {
-                // No data yet; leave `tasks` as-is (empty on first paint) and
-                // flag loading. The daemon's next tick fills the index and the
-                // next refresh renders the real board.
-                self.board_loading = true;
-                self.last_refresh = Instant::now();
+        // Read the board with its freshness envelope so the title bar can show a
+        // staleness banner (Phase 3 §6). `read_board_report` also serves this
+        // process's snapshot cache when no index exists and no daemon answers, so
+        // a bare `__tasks` pane on a hubless machine paints its last-known board
+        // rather than an empty one.
+        match shelbi_state::read_board_report(&self.project_name) {
+            Ok(report) => {
+                self.board_banner = report.freshness.banner();
+                match report.state {
+                    shelbi_state::BoardState::Cold => {
+                        // No data yet; leave `tasks` as-is (empty on first paint)
+                        // and flag loading. The daemon's next tick fills the index
+                        // and the next refresh renders the real board.
+                        self.board_loading = true;
+                        self.last_refresh = Instant::now();
+                    }
+                    state => self.render_board_state(store.as_ref(), state),
+                }
             }
-            Ok(state) => {
+            Err(e) => {
+                self.board_banner = None;
+                self.status_line = format!("refresh failed: {e}");
+            }
+        }
+    }
+
+    /// Fold a warm/stale board read into `self.tasks`, merging the on-demand
+    /// terminal `done`/`canceled` lanes. Split out of [`refresh`](Self::refresh)
+    /// so the freshness-aware read path stays legible.
+    fn render_board_state(&mut self, store: &dyn shelbi_state::IssueStore, state: shelbi_state::BoardState) {
+        {
                 self.board_loading = false;
                 // The index is the **open** board — it deliberately omits the
                 // terminal history so a render never pays a `state=all` sweep.
@@ -818,10 +846,6 @@ impl KanbanApp {
                 self.tasks = tasks;
                 self.last_refresh = Instant::now();
                 self.clamp_selection();
-            }
-            Err(e) => {
-                self.status_line = format!("refresh failed: {e}");
-            }
         }
     }
 
@@ -1653,7 +1677,7 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         (area, None, None)
     };
 
-    let left = Line::from(vec![
+    let mut left_spans = vec![
         Span::styled("Issues · ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             app.display_label().to_string(),
@@ -1665,8 +1689,17 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
             format!("   {total} total"),
             Style::default().fg(Color::DarkGray),
         ),
-    ]);
-    f.render_widget(Paragraph::new(left), left_area);
+    ];
+    // Board freshness banner (Phase 3 §6): a warm board reads plainly dim; a
+    // stale index or a cache fallback reads yellow so a lagging daemon or an
+    // exhausted quota is visible at a glance rather than hidden behind an
+    // unchanging board.
+    if let Some(banner) = &app.board_banner {
+        let stale = banner.contains("stale") || banner.contains("no daemon");
+        let color = if stale { Color::Yellow } else { Color::DarkGray };
+        left_spans.push(Span::styled(format!("   {banner}"), Style::default().fg(color)));
+    }
+    f.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
 
     if let Some(area) = workflow_area {
         let style = if app.workflow_filter.is_some() {
