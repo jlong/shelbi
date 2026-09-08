@@ -596,45 +596,82 @@ impl App {
             .ok()
             .and_then(|p| p.display_name.or(p.label));
         self.agents = load_agents(&self.project_name).unwrap_or_default();
-        // Probe board freshness through the three-state API first. On a cold
-        // process with no persisted snapshot this returns `Cold` *without*
-        // blocking on the network — we paint a loading indicator and skip the
-        // downstream `list_in_status` calls, which would otherwise force the
-        // multi-second synchronous sweep. On a warm/stale (or `file_system`)
-        // board this seeds the process-local snapshot, so the reads below are
-        // served from memory rather than the wire.
-        let board_state = shelbi_state::issue_store_for(&self.project_name).map(|s| s.list_state());
-        let cold = matches!(board_state, Ok(Ok(shelbi_state::BoardState::Cold)));
-        self.board_loading = cold;
-        if cold {
-            // Nothing to show yet; the background refresh is in flight. Leave
-            // the sections empty (the loading row stands in) and don't block.
-            self.ready_review = Vec::new();
-            self.queued_review = Vec::new();
-            self.workspaces = Vec::new();
-            self.config_error = None;
-        } else {
-            let review = shelbi_state::issue_store_for(&self.project_name)
-                .and_then(|s| s.list_in_status(&Column::review()))
-                .unwrap_or_default();
-            let (ready, queued) = split_review_sections(&self.project_name, review);
-            self.ready_review = ready;
-            self.queued_review = queued;
-            match load_workspaces(&self.project_name) {
-                Ok(ws) => {
-                    self.workspaces = ws;
+        // Read the board **once**, through the same three-state cached path the
+        // Issues board (`kanban.rs::refresh`) uses, and derive *both* the review
+        // sections and the workspace list from that single snapshot. This is the
+        // crux of the fix: a failed live refresh (e.g. GitHub returning 403) no
+        // longer collapses the sidebar to "no review tasks, all workspaces idle"
+        // while the Issues board — in the same process, off the same
+        // process-local cache — keeps painting the last-known board. The old
+        // code made two *further* `list_in_status` reads here whose `list()`
+        // hits the backend on a cold process and, on `Err`, `unwrap_or_default`ed
+        // to an empty section; deriving from the one `list_state` we already do
+        // removes those Err-blanking paths entirely.
+        //
+        // On a cold process with no persisted snapshot `list_state` returns
+        // `Cold` *without* blocking on the network, so we paint a loading
+        // indicator; a warm/stale (or `file_system`) board — including one
+        // served from the on-disk snapshot while a live refresh is failing —
+        // serves the last-known board.
+        match shelbi_state::issue_store_for(&self.project_name) {
+            Ok(store) => match store.list_state() {
+                Ok(state) if state.is_cold() => {
+                    // Nothing to show yet; the background refresh is in flight.
+                    // Leave the sections empty (the loading row stands in) and
+                    // don't block.
+                    self.board_loading = true;
+                    self.ready_review = Vec::new();
+                    self.queued_review = Vec::new();
+                    self.workspaces = Vec::new();
                     self.config_error = None;
                 }
-                Err(e) => {
-                    // A load failure with a config file present on disk is a
-                    // broken config (invalid id / schema / YAML) — surface the
-                    // message inline. A load failure with *no* config file is a
-                    // fresh/half-set-up project: keep the section omitted, as
-                    // before, rather than crying "config error" during setup.
-                    self.workspaces = Vec::new();
-                    self.config_error =
-                        project_config_present(&self.project_name).then(|| e.to_string());
+                Ok(state) => {
+                    self.board_loading = false;
+                    let board = state.into_issues();
+                    // Both sections filter the one in-memory board, exactly as
+                    // the Issues board filters its columns from
+                    // `state.into_issues()` — no second round trip, no separate
+                    // store that could `Err` out and blank a section on its own.
+                    // A `github` 403 surfaces here as a served snapshot
+                    // (`Stale`), so the sidebar degrades exactly like the Issues
+                    // board instead of collapsing to empty.
+                    let review: Vec<IssueFile> = board
+                        .iter()
+                        .filter(|f| f.task.column == Column::review())
+                        .cloned()
+                        .collect();
+                    let (ready, queued) = split_review_sections(&self.project_name, review);
+                    self.ready_review = ready;
+                    self.queued_review = queued;
+                    let in_progress: Vec<IssueFile> = board
+                        .iter()
+                        .filter(|f| f.task.column == Column::in_progress())
+                        .cloned()
+                        .collect();
+                    self.apply_workspaces(&in_progress);
                 }
+                Err(_) => {
+                    // The project loaded fine but the board read itself failed (a
+                    // local `file_system` list error; a remote 403 is served from
+                    // the snapshot as `Ok(Stale)` above, never here). Keep the
+                    // last good sections on screen rather than collapsing them —
+                    // the Issues board degrades the same way (`kanban.rs` keeps
+                    // its `tasks` on a failed refresh). `board_loading` is left
+                    // untouched so a transient error never flashes a loading row
+                    // over a board we already painted.
+                }
+            },
+            Err(_) => {
+                // The store couldn't be built at all — the project config failed
+                // to load (broken id / schema / unparseable YAML) or the project
+                // is absent. Empty the sections and let `load_workspaces`
+                // classify the failure: a *present* but broken config surfaces an
+                // inline error, an absent one stays quiet (a fresh/half-set-up
+                // project).
+                self.board_loading = false;
+                self.ready_review = Vec::new();
+                self.queued_review = Vec::new();
+                self.apply_workspaces(&[]);
             }
         }
         // A missing state.json is normal (fresh project): default to Off so
@@ -648,6 +685,25 @@ impl App {
         self.collapsed_machines = sidebar_collapsed_machines().unwrap_or_default();
         self.last_refresh = Instant::now();
         Ok(())
+    }
+
+    /// Build the workspace rows from `in_progress` (a slice of the board
+    /// [`refresh`] already read) and set `config_error` from the outcome: a
+    /// *present* but unloadable config (invalid id / schema / YAML) surfaces an
+    /// inline error, while an absent one stays quiet (a fresh/half-set-up
+    /// project). Shared by the warm-board and broken-config paths of `refresh`.
+    fn apply_workspaces(&mut self, in_progress: &[IssueFile]) {
+        match load_workspaces(&self.project_name, in_progress) {
+            Ok(ws) => {
+                self.workspaces = ws;
+                self.config_error = None;
+            }
+            Err(e) => {
+                self.workspaces = Vec::new();
+                self.config_error =
+                    project_config_present(&self.project_name).then(|| e.to_string());
+            }
+        }
     }
 
     pub fn maybe_refresh(&mut self) -> Result<()> {
@@ -1609,21 +1665,21 @@ fn review_workspace_is_serving(
     )
 }
 
-/// Build the sidebar's view of declared workspaces from the project YAML, the
-/// in-progress task column, and the review column (the latter only so a review
-/// slot serving a loaded task reads active rather than idle — §16). One disk
-/// read per workspace for the `status.yaml` lookup. Errors when the project
-/// config can't be loaded (missing, invalid id, bad schema); the caller keys
-/// off that to distinguish "not set up" from "broken config".
-fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
+/// Build the sidebar's view of declared workspaces from the project YAML and
+/// the `in_progress` task column (a slice pre-filtered from the board snapshot
+/// the caller already read — see [`App::refresh`]). Taking the tasks as an
+/// argument, rather than issuing its own store read, is what keeps the workspace
+/// list on the *same* cached/snapshot board the review sections and the Issues
+/// board use: a failed live refresh can no longer blank this section on its own.
+/// One disk read per workspace for the `status.yaml` lookup. Errors when the
+/// project config can't be loaded (missing, invalid id, bad schema); the caller
+/// keys off that to distinguish "not set up" from "broken config".
+fn load_workspaces(project: &str, in_progress: &[IssueFile]) -> Result<Vec<WorkspaceOverview>> {
     // Propagate a load failure (invalid id, bad schema, unparseable YAML) so
     // the caller can surface it inline in the sidebar. The caller decides
     // whether an error means "broken config" (file present) or "not set up
     // yet" (file absent) — see [`App::refresh`] / [`project_config_present`].
     let p = shelbi_state::load_project(project)?;
-    let in_progress = shelbi_state::resolve_issue_store(project, &p.issue_tracker)
-        .and_then(|s| s.list_in_status(&Column::in_progress()))
-        .unwrap_or_default();
     let mut out = Vec::with_capacity(p.workspaces.len());
     for workspace in &p.workspaces {
         // Review-tagged slots never appear under `— Workspaces —`; their
@@ -1952,6 +2008,16 @@ mod tests {
         p
     }
 
+    /// The in-progress column read from the (file_system) board, the slice
+    /// `App::refresh` now derives and hands to [`load_workspaces`]. The direct
+    /// `load_workspaces` unit tests build it the same way the render path does.
+    fn in_progress_slice(project: &str) -> Vec<IssueFile> {
+        shelbi_state::issue_store_for(project)
+            .unwrap()
+            .list_in_status(&Column::in_progress())
+            .unwrap()
+    }
+
     #[test]
     fn daemon_version_refresh_changes_mismatch_to_match_without_reload() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -2137,7 +2203,7 @@ mod tests {
         };
         shelbi_state::save_task("demo", &assigned, "# task").unwrap();
 
-        let workspaces = load_workspaces("demo").unwrap();
+        let workspaces = load_workspaces("demo", &in_progress_slice("demo")).unwrap();
         assert_eq!(workspaces.len(), 2);
 
         let alpha = &workspaces[0];
@@ -2160,6 +2226,112 @@ mod tests {
         assert!(
             alpha.agent.is_none(),
             "idle workspaces must not carry an agent name"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// AC: with the live board read failing (a remote `github` backend whose
+    /// refresh 403s), a *cold* sidebar process still builds its review sections
+    /// and workspace rows from the persisted board snapshot — the same
+    /// cached/snapshot path the Issues board uses — rather than collapsing to
+    /// "no review tasks, all workspaces idle". This is the crux of the bug:
+    /// one process holding a good snapshot must not paint an empty sidebar.
+    ///
+    /// The snapshot is seeded on disk and the in-memory cache is cold (a unique
+    /// project name), so `list_state` serves the disk snapshot as `Stale`
+    /// *without any live read* — exactly what happens in a fresh pane while
+    /// GitHub is returning 403 to the background refresh.
+    #[test]
+    fn sidebar_sections_built_from_snapshot_when_live_read_fails() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A distinct project name keeps this test's entry isolated in the
+        // process-global board cache (so "cold in memory" actually holds).
+        let name = "sidebar-degrade-gh";
+        let mut project = fixture_project();
+        project.name = name.into();
+        // Remote backend → reads go through the cache, which serves the on-disk
+        // snapshot on a cold process. A bogus repo guarantees any live refresh
+        // fails (the reported 403), proving the snapshot — not the wire — is
+        // what paints the sidebar.
+        project.issue_tracker = shelbi_core::IssueTrackerConfig {
+            backend: shelbi_core::IssueTrackerBackend::Github,
+            github: Some(shelbi_core::GithubConnection {
+                repo: "acme/does-not-exist".into(),
+            }),
+            ..Default::default()
+        };
+        // A review-tagged slot so the review column has somewhere to belong; its
+        // capacity surfaces through the Review sections, never `— Workspaces —`.
+        project.workspaces.push(WorkspaceSpec {
+            name: "rev-1".into(),
+            machine: "hub".into(),
+            tags: vec!["review".into()],
+            slot: None,
+        });
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        let issue = |id: &str, column: Column, assigned_to: Option<&str>| IssueFile {
+            task: Issue {
+                id: id.into(),
+                title: id.into(),
+                column,
+                priority: 0,
+                assigned_to: assigned_to.map(str::to_string),
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                launch: None,
+                created_at: now,
+                updated_at: now,
+                params: BTreeMap::new(),
+            },
+            body: String::new(),
+        };
+        // The handed-off review task (unassigned → Queued for Review) and an
+        // in-progress task pinning the dev slot `alpha` busy.
+        let board = vec![
+            issue("handoff-1", Column::review(), None),
+            issue("work-1", Column::in_progress(), Some("alpha")),
+        ];
+        shelbi_state::seed_board_snapshot_for_test(name, &board);
+
+        let mut app = App::new_sidebar(name);
+        app.refresh().unwrap();
+
+        // Not "loading" — a served snapshot is real data, painted immediately.
+        assert!(
+            !app.board_loading,
+            "a snapshot-served board must render, not show a loading row"
+        );
+        // The review-column task is listed (Queued for Review, since unassigned)
+        // rather than the sections collapsing to empty.
+        assert!(
+            app.queued_review.iter().any(|e| e.task_id == "handoff-1"),
+            "review task must survive a failed live read; queued={:?}",
+            app.queued_review.iter().map(|e| &e.task_id).collect::<Vec<_>>()
+        );
+        // The dev slot reads busy (its in-progress task), not idle; the review
+        // slot never appears under Workspaces.
+        let alpha = app
+            .workspaces
+            .iter()
+            .find(|w| w.name == "alpha")
+            .expect("dev workspace alpha must be listed");
+        assert_eq!(
+            alpha.current_task.as_deref(),
+            Some("work-1"),
+            "assigned workspace must read busy from the snapshot, not idle"
+        );
+        assert!(
+            app.workspaces.iter().all(|w| w.name != "rev-1"),
+            "a review slot never surfaces under Workspaces"
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -2356,7 +2528,7 @@ mod tests {
         });
         shelbi_state::save_project(&project).unwrap();
 
-        let workspaces = load_workspaces("demo").unwrap();
+        let workspaces = load_workspaces("demo", &in_progress_slice("demo")).unwrap();
         let names: Vec<_> = workspaces.iter().map(|w| w.name.as_str()).collect();
         assert!(names.contains(&"alpha"), "dev workspace listed: {names:?}");
         assert!(names.contains(&"delta"), "dev workspace listed: {names:?}");
@@ -2843,7 +3015,7 @@ mod tests {
         )
         .unwrap();
 
-        let workspaces = load_workspaces("demo").unwrap();
+        let workspaces = load_workspaces("demo", &in_progress_slice("demo")).unwrap();
         assert!(
             workspaces.iter().all(|w| w.name != "review-1"),
             "review slot must not surface under Workspaces, got: {:?}",
@@ -3392,7 +3564,7 @@ mod tests {
         )
         .unwrap();
 
-        let workspaces = load_workspaces("demo").unwrap();
+        let workspaces = load_workspaces("demo", &in_progress_slice("demo")).unwrap();
         let alpha = workspaces.iter().find(|w| w.name == "alpha").unwrap();
         let delta = workspaces.iter().find(|w| w.name == "delta").unwrap();
         assert_eq!(alpha.agent.as_deref(), Some("qa"));
