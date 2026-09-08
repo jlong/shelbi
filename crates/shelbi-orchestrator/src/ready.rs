@@ -147,13 +147,22 @@ pub fn has_live_spinner(screen: &str) -> bool {
         return false;
     };
     let line = line.trim();
-    let spinner_glyph = line.chars().next().is_some_and(|glyph| {
-        matches!(
-            glyph,
-            '·' | '✳' | '✻' | '✶' | '✽' | '✺' | '✹' | '✸' | '✷' | '✵'
-        )
-    });
+    let spinner_glyph = line.chars().next().is_some_and(is_spinner_glyph);
     spinner_glyph && line.contains('…') && has_elapsed_timer(line)
+}
+
+/// True when `glyph` can lead Claude Code's animated spinner row.
+///
+/// The animation cycles through the Dingbats asterisk/star run (U+2722–U+2748)
+/// plus the low-activity middot `·` (U+00B7). We accept that whole block rather
+/// than a hand-listed subset: enumerating one glyph at a time silently dropped
+/// frames whose glyph happened to be missing (`✢` U+2722, `✴` U+2734, and `✼`
+/// U+273C each sat outside the old list), and every dropped frame reclassified a
+/// working pane as `AwaitingInput` for that tick — the exact flap this guards.
+/// The finished-turn glyph `⏺` (U+23FA) and every letter/border char fall
+/// outside the block, so a completed or idle row still fails the check.
+fn is_spinner_glyph(glyph: char) -> bool {
+    glyph == '·' || ('\u{2722}'..='\u{2748}').contains(&glyph)
 }
 
 /// True when `line` carries Claude's spinner elapsed-timer parenthetical: an
@@ -726,22 +735,83 @@ mod tests {
         assert!(is_claude_working(no_timer));
     }
 
+    /// Wrap a single spinner row in the live input-box chrome so the positional
+    /// guard in [`has_live_spinner`] finds it directly above the box.
+    fn spinner_screen(row: &str) -> String {
+        format!(
+            "\
+{row}
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"
+        )
+    }
+
+    /// Every glyph in the accepted spinner set: the Dingbats asterisk/star block
+    /// U+2722–U+2748 plus the middot `·`. Claude Code's spinner animation may
+    /// land on any of them from frame to frame.
+    fn accepted_spinner_glyphs() -> Vec<char> {
+        let mut glyphs: Vec<char> = ('\u{2722}'..='\u{2748}').collect();
+        glyphs.push('·');
+        glyphs
+    }
+
+    #[test]
+    fn claude_working_across_every_spinner_glyph() {
+        // Drive the GLYPH axis the animation actually varies — the one axis the
+        // old suite held constant while the flap ran live. The same spinner row
+        // (same gerund, same elapsed timer, same input box) must read Working
+        // whatever frame of the animation the capture lands on, so a future
+        // Claude Code glyph outside the accepted block fails here loudly instead
+        // of flapping `working ↔ awaiting_input` in production.
+        for glyph in accepted_spinner_glyphs() {
+            let screen = spinner_screen(&format!("{glyph} Musing… (4m 21s · ↓ 13.8k tokens)"));
+            assert!(
+                has_live_spinner(&screen),
+                "glyph U+{:04X} must read as a live spinner",
+                glyph as u32
+            );
+            assert!(
+                is_claude_working(&screen),
+                "glyph U+{:04X} must read Working",
+                glyph as u32
+            );
+        }
+        // The specific frame sampled flapping live from workspace `bravo`.
+        let flapping =
+            spinner_screen("✢ Musing… (4m 23s · ↓ 14.4k tokens · thinking with high effort)");
+        assert!(
+            is_claude_working(&flapping),
+            "✢ U+2722 must read Working, not AwaitingInput"
+        );
+    }
+
     #[test]
     fn claude_working_stable_across_a_multi_tick_turn() {
-        // Regression against the flap: within one turn Claude alternates between
-        // streaming tokens and thinking. Every sampled frame must read Working,
-        // so the state never oscillates to AwaitingInput and back.
-        let frames = [
-            BUSY_SPINNER_NO_INTERRUPT, // streaming tokens
-            THINKING_SPINNER_NO_TOKENS, // thinking between tool calls
-            ELAPSED_ONLY_SPINNER,       // spun up a fresh step
-            TOOL_USE_SPINNER,           // running tools
-            BUSY_SPINNER_NO_INTERRUPT,  // streaming again
+        // Regression against the flap: within one turn Claude alternates spinner
+        // tail forms (streaming tokens, thinking, elapsed-only, tool-use) AND
+        // cycles the animated glyph. The old test varied only the tail and held
+        // the glyph on an in-list value, so it stayed green while `✢` U+2722
+        // flapped live. This varies BOTH axes together — every (glyph, tail)
+        // frame must read Working, so the state never oscillates to
+        // AwaitingInput and back.
+        let tails = [
+            "Crunching… (10m 20s · ↓ 39.0k tokens)", // streaming tokens
+            "Julienning… (45s · thought for 1s)",    // thinking between tool calls
+            "Working… (45s)",                        // bare elapsed-only step
+            "Herding… (1m 12s · 3 tool uses)",       // running tools
         ];
-        for (i, frame) in frames.iter().enumerate() {
+        // Rotate through the glyph block so consecutive ticks land on different
+        // frames, `✢` U+2722 among them, paired against every tail form.
+        let glyphs = accepted_spinner_glyphs();
+        for (i, tail) in tails.iter().cycle().take(glyphs.len() * 2).enumerate() {
+            let glyph = glyphs[i % glyphs.len()];
+            let screen = spinner_screen(&format!("{glyph} {tail}"));
             assert!(
-                is_claude_working(frame),
-                "frame {i} must stay Working, not flap to AwaitingInput"
+                is_claude_working(&screen),
+                "frame {i} (glyph U+{:04X}, {tail}) must stay Working, not flap",
+                glyph as u32
             );
         }
     }
