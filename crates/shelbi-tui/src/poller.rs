@@ -4135,6 +4135,23 @@ fn maybe_reconcile_orphaned_pane(
         return false;
     }
 
+    // Never reap a slot whose current agent pane was launched less than the
+    // launch deadline ago. A dispatch that times out and rolls its card back to
+    // `todo` (`shelbi issue start`) briefly leaves a live pane on a non-active
+    // card, and a dispatch racing a stale remote-board snapshot reads the same;
+    // reaping either kills a worker that is fine (the recurring bug). The CLI's
+    // own confirm-or-teardown handles the genuine-failure case, and this
+    // launch-age grace covers the overlap for as long as a launch is entitled to
+    // keep settling. A slot with no stamp (an older shelbi, or a pane not
+    // brought up by the dispatch path) carries no age and falls through to the
+    // normal probe. The grace clock is left armed, so once the pane ages past
+    // the deadline a genuine orphan is still reclaimed on a later tick.
+    if let Some(age) = shelbi_orchestrator::workspace::workspace_launch_age(host, addr) {
+        if age < shelbi_orchestrator::workspace::launch_timeout() {
+            return false;
+        }
+    }
+
     // No active task points at this slot. One bounded probe settles both
     // questions that gate a reap: is the slot genuinely alive (the caller only
     // reaches us on a live pane, but re-probing keeps this self-contained and
@@ -7942,6 +7959,113 @@ transitions:
                 &mut elapsed_again
             ),
             "a dead slot must not be re-reaped",
+        );
+    }
+
+    /// The launch-age grace: a live dev pane on a non-active (`todo`) card whose
+    /// launch epoch is recent is left alone even after the board-observation
+    /// grace has elapsed — this is the exact rollback/stale-snapshot race the
+    /// reaper used to lose (killing a live worker mid-task). Once the same pane's
+    /// launch ages past the deadline it is reaped as today. The card sits in
+    /// `todo` (not `review`) to mirror the CLI rollback that produced the bug.
+    #[test]
+    fn orphan_reaper_holds_a_launch_age_grace_over_a_freshly_launched_pane() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project_name = format!("orphan-launchage-{nonce}");
+        let session = format!("shelbi-{project_name}");
+        let home = std::env::temp_dir().join(&project_name);
+        std::fs::create_dir_all(&home).unwrap();
+        let _cleanup = LimitResumeTmuxCleanup {
+            session: session.clone(),
+            home: home.clone(),
+            prior_home: std::env::var_os("SHELBI_HOME"),
+            prior_hub_sock: std::env::var_os("SHELBI_HUB_SOCK"),
+        };
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.name.clone_from(&project_name);
+        shelbi_state::save_project(&project).unwrap();
+
+        // A card rolled back to `todo` but still assigned to the dev workspace —
+        // the shape a CLI launch timeout leaves behind while the pane it spawned
+        // is still coming up. Orphaned-by-board, but the launch is fresh.
+        let mut task = in_progress_task("launchage-task", "alpha");
+        task.column = Column::todo();
+        shelbi_state::save_task(&project.name, &task, "no commits").unwrap();
+
+        let idle_script = home.join("idle.sh");
+        std::fs::write(&idle_script, "while :; do sleep 60; done\n").unwrap();
+        start_limit_resume_tmux_session(&session, &idle_script, &home.join("unused.receipt"));
+
+        let host = Host::Local;
+        let addr = TmuxAddr {
+            session: session.clone(),
+            window: "alpha".into(),
+        };
+        assert!(
+            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            "the freshly-launched pane must be alive before the checks",
+        );
+
+        // The board-observation grace has already elapsed (a persisted orphan),
+        // so only the launch-age guard stands between the reaper and this pane.
+        let elapsed = || {
+            Some(
+                Instant::now()
+                    .checked_sub(ORPHAN_REAP_GRACE + Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now),
+            )
+        };
+
+        // Stamp the launch as happening now: the pane is inside its launch-age
+        // grace, so it must NOT be reaped, and it stays alive.
+        shelbi_orchestrator::workspace::stamp_launch_epoch(&host, &addr).unwrap();
+        let mut orphan_since = elapsed();
+        assert!(
+            !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan_since),
+            "a pane launched inside the launch-age grace must be left alone",
+        );
+        assert!(
+            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            "the still-settling pane must survive the launch-age grace",
+        );
+
+        // Age the launch past the deadline: the same pane is now a genuine
+        // orphan and is reaped as today.
+        let past = chrono::Utc::now().timestamp()
+            - shelbi_orchestrator::workspace::launch_timeout().as_secs() as i64
+            - 5;
+        let set = std::process::Command::new("tmux")
+            .args(["set-option", "-w", "-t", &shelbi_tmux::command_target(&addr)])
+            .arg(shelbi_orchestrator::workspace::LAUNCH_EPOCH_OPTION)
+            .arg(past.to_string())
+            .status()
+            .unwrap();
+        assert!(set.success(), "re-stamping the launch epoch must succeed");
+
+        let mut orphan_since = elapsed();
+        assert!(
+            maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan_since),
+            "a pane whose launch aged past the deadline must be reaped",
+        );
+        assert!(
+            !shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            "the aged-out orphan pane must be gone after the reap",
         );
     }
 

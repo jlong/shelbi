@@ -1580,6 +1580,100 @@ fn user_shell_mark_set(out: &std::process::Output) -> bool {
     out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "1"
 }
 
+/// tmux user option stamping when a workspace slot's current agent pane was
+/// launched, as unix epoch seconds. Window-scoped for local workspaces (the
+/// window is the slot), session-scoped for remote ones — the same scoping as
+/// [`USER_SHELL_OPTION`], so it dies with the slot and needs no cleanup path.
+/// The poller's orphan reaper reads it to tell a freshly-launched slot — whose
+/// dispatch may still be settling, or racing a stale board snapshot — from a
+/// genuinely long-orphaned one, and holds a launch-age grace over the former.
+pub const LAUNCH_EPOCH_OPTION: &str = "@shelbi-launch-epoch";
+
+/// Stamp [`LAUNCH_EPOCH_OPTION`] with the current time onto a workspace's live
+/// tmux slot. Called right after the agent pane is (re)created on the dispatch
+/// path ([`deploy_and_spawn`]). Best-effort at the call site: a stamp failure
+/// only costs the reaper its launch-age grace for this slot, never the launch.
+pub fn stamp_launch_epoch(host: &Host, addr: &TmuxAddr) -> Result<()> {
+    let now = chrono::Utc::now().timestamp().to_string();
+    let argv: Vec<String> = match host {
+        Host::Local => vec![
+            "tmux".into(),
+            "set-option".into(),
+            "-w".into(),
+            "-t".into(),
+            shelbi_tmux::command_target(addr),
+            LAUNCH_EPOCH_OPTION.into(),
+            now,
+        ],
+        Host::Ssh { .. } => vec![
+            "tmux".into(),
+            "set-option".into(),
+            "-t".into(),
+            format!("={}", addr.session),
+            LAUNCH_EPOCH_OPTION.into(),
+            now,
+        ],
+    };
+    shelbi_ssh::run_capture(host, &argv)?;
+    Ok(())
+}
+
+/// How long ago this workspace slot's current agent pane was launched, per its
+/// [`LAUNCH_EPOCH_OPTION`] stamp, or `None` when the slot carries no readable
+/// stamp — never dispatched through the stamping path, materialized by an older
+/// shelbi, or the option couldn't be read. A clock that has since gone backwards
+/// clamps to zero rather than underflowing.
+pub fn workspace_launch_age(host: &Host, addr: &TmuxAddr) -> Option<std::time::Duration> {
+    let argv: Vec<String> = match host {
+        Host::Local => vec![
+            "tmux".into(),
+            "show-options".into(),
+            "-w".into(),
+            "-v".into(),
+            "-t".into(),
+            shelbi_tmux::command_target(addr),
+            LAUNCH_EPOCH_OPTION.into(),
+        ],
+        Host::Ssh { .. } => vec![
+            "tmux".into(),
+            "show-options".into(),
+            "-v".into(),
+            "-t".into(),
+            format!("={}", addr.session),
+            LAUNCH_EPOCH_OPTION.into(),
+        ],
+    };
+    let out = shelbi_ssh::run(host, argv).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let epoch: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    let now = chrono::Utc::now().timestamp();
+    Some(std::time::Duration::from_secs((now - epoch).max(0) as u64))
+}
+
+/// Default wall-clock ceiling for the launch phase of a dispatch (`shelbi issue
+/// start`: worktree sync, SSH probes, pane creation, and the readiness/submit
+/// wait). Generous enough to cover a cold `git fetch` on a fresh cut plus the
+/// internal readiness probes on a healthy-but-slow machine, while still bounding
+/// the pathological "blocked forever" case that produced the phantom
+/// in_progress. Shared by the CLI's launch wait and the poller's orphan-reaper
+/// launch-age grace so the two agree on how long a launch is allowed to settle.
+pub const DEFAULT_LAUNCH_TIMEOUT_MS: u64 = 180_000;
+
+/// The launch-phase deadline, env-overridable via `SHELBI_LAUNCH_TIMEOUT_MS`
+/// (milliseconds) and clamped to a sane range so a fat-fingered override can't
+/// re-introduce an effectively-unbounded wait or starve a legitimately slow cold
+/// start. Mirrors the `SHELBI_PROBE_TIMEOUT_MS` knob on the slot probe.
+pub fn launch_timeout() -> std::time::Duration {
+    let ms = std::env::var("SHELBI_LAUNCH_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_LAUNCH_TIMEOUT_MS)
+        .clamp(10_000, 1_800_000);
+    std::time::Duration::from_millis(ms)
+}
+
 /// Result of a *bounded* workspace-slot probe — the variant of
 /// [`workspace_slot_alive`] + [`workspace_user_shell_open`] used by
 /// `shelbi workspace list` / `status --full`, where a machine that wedges
@@ -2409,6 +2503,14 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
             })?;
         }
     }
+
+    // Stamp the pane's launch time now that it exists. The poller's orphan
+    // reaper reads it to hold a launch-age grace over a still-settling slot, so
+    // a dispatch whose card is briefly rolled back (a CLI launch timeout) or
+    // racing a stale remote-board snapshot is never reaped out from under a live
+    // worker. Best-effort: a stamp failure only forfeits that grace for this
+    // slot, never the launch itself.
+    let _ = stamp_launch_epoch(a.host, a.addr);
 
     if launch_seed {
         // The pane was just killed + recreated (step 3), so it carries no
@@ -9006,6 +9108,52 @@ mod slot_probe_tests {
             probe_deadline(),
             Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS)
         );
+    }
+
+    #[test]
+    fn launch_timeout_defaults_and_clamps_env_override() {
+        // The launch-phase watchdog must never collapse to 0 (which would fail
+        // every dispatch instantly) nor blow back out to effectively-unbounded,
+        // regardless of what `SHELBI_LAUNCH_TIMEOUT_MS` is set to. Mirrors the
+        // probe-deadline clamp test.
+        let _lock = crate::test_lock::acquire();
+        let prev = std::env::var_os("SHELBI_LAUNCH_TIMEOUT_MS");
+
+        std::env::remove_var("SHELBI_LAUNCH_TIMEOUT_MS");
+        assert_eq!(
+            launch_timeout(),
+            Duration::from_millis(DEFAULT_LAUNCH_TIMEOUT_MS),
+            "default"
+        );
+
+        std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", "100");
+        assert_eq!(launch_timeout(), Duration::from_millis(10_000), "clamps low");
+
+        std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", "99999999");
+        assert_eq!(
+            launch_timeout(),
+            Duration::from_millis(1_800_000),
+            "clamps high"
+        );
+
+        std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", "garbage");
+        assert_eq!(
+            launch_timeout(),
+            Duration::from_millis(DEFAULT_LAUNCH_TIMEOUT_MS),
+            "falls back on unparseable"
+        );
+
+        std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", "45000");
+        assert_eq!(
+            launch_timeout(),
+            Duration::from_millis(45_000),
+            "honors an in-range override"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", v),
+            None => std::env::remove_var("SHELBI_LAUNCH_TIMEOUT_MS"),
+        }
     }
 
     fn tmux_available() -> bool {
