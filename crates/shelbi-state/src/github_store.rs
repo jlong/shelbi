@@ -604,6 +604,47 @@ impl IssueStore for GitHubStore {
             .collect())
     }
 
+    fn closed_page(&self, after: Option<&str>) -> Result<crate::issue_store::ClosedPage> {
+        // The done/canceled history on demand (plan §4): one GraphQL page of 50
+        // closed issues, newest-updated first, never the six-page `state=closed`
+        // REST sweep. Falls back to the REST closed list on any non-rate-limit
+        // failure (a GHES gap, a token scope, a transport blip), matching
+        // `refresh_board`; a rate limit propagates so the caller leaves the
+        // cached page untouched. Which path is active is logged once per repo.
+        match self.graphql_closed_page(after) {
+            Ok(page) => {
+                self.note_graphql_recovered();
+                let assignments = crate::task_assignments(&self.project)?;
+                let issues = page
+                    .issues
+                    .into_iter()
+                    .map(|gh| fold_assignment(gh.into_issue_file(), &assignments))
+                    .collect();
+                Ok(crate::issue_store::ClosedPage {
+                    issues,
+                    next_cursor: page.next_cursor,
+                    remaining: page.remaining,
+                    reset: page.reset,
+                })
+            }
+            Err(e) if crate::gh_retry::is_rate_limit_error(&e) => Err(e),
+            Err(e) => {
+                self.note_graphql_fallback(&e);
+                // REST fallback: the full closed sweep as one page (no cursor),
+                // ordered newest-closed first so the degraded path still reads
+                // like the GraphQL one.
+                let mut issues = self.list_with_state("closed")?;
+                issues.sort_by_key(|f| std::cmp::Reverse(f.task.updated_at));
+                Ok(crate::issue_store::ClosedPage {
+                    issues,
+                    next_cursor: None,
+                    remaining: None,
+                    reset: None,
+                })
+            }
+        }
+    }
+
     fn get(&self, id: &str) -> Result<Option<IssueFile>> {
         shelbi_core::validate_task_id(id)?;
         // The fresh single-issue path (`Plans/github-issue-caching-and-rate-limits.md`
@@ -1188,6 +1229,41 @@ impl GitHubStore {
         }
     }
 
+    /// One `gh api graphql` request for `query` with the optional `after` cursor
+    /// and `since` watermark, parsed into its issues-connection page + budget.
+    /// The single-page primitive both the paginated board read and the one-shot
+    /// closed-page read are built on.
+    fn graphql_request(
+        &self,
+        query: &str,
+        after: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<GraphQlResponsePage> {
+        let (owner, name) = self.owner_and_name()?;
+        let query_arg = format!("query={query}");
+        let owner_arg = format!("owner={owner}");
+        let name_arg = format!("name={name}");
+        // All variables are passed with `-f` (raw string), which is the right
+        // wire form for the `String`/`DateTime` GraphQL scalars these queries
+        // declare and avoids `-F`'s magic coercion of a numeric-looking cursor or
+        // timestamp.
+        let mut args: Vec<&str> = vec![
+            "api", "graphql", "-f", &query_arg, "-f", &owner_arg, "-f", &name_arg,
+        ];
+        let after_arg = after.map(|c| format!("after={c}"));
+        if let Some(arg) = after_arg.as_deref() {
+            args.push("-f");
+            args.push(arg);
+        }
+        let since_arg = since.map(|s| format!("since={s}"));
+        if let Some(arg) = since_arg.as_deref() {
+            args.push("-f");
+            args.push(arg);
+        }
+        let out = (self.graphql)(&args)?;
+        parse_graphql_board_response(&out)
+    }
+
     /// Drive `query` across every page, following `pageInfo.endCursor`, and
     /// collect the issue nodes (mapped onto the REST [`GhIssue`] shape so the one
     /// existing label/metadata mapping serves both backends). The token budget
@@ -1197,7 +1273,6 @@ impl GitHubStore {
         query: &str,
         since: Option<DateTime<Utc>>,
     ) -> Result<GraphQlBoardPage> {
-        let (owner, name) = self.owner_and_name()?;
         let since_str = since.map(|s| s.to_rfc3339());
         let mut after: Option<String> = None;
         let mut issues: Vec<GhIssue> = Vec::new();
@@ -1207,29 +1282,7 @@ impl GitHubStore {
         let mut budget: Option<GhRateLimit>;
 
         loop {
-            let query_arg = format!("query={query}");
-            let owner_arg = format!("owner={owner}");
-            let name_arg = format!("name={name}");
-            // All variables are passed with `-f` (raw string), which is the right
-            // wire form for the `String`/`DateTime` GraphQL scalars this query
-            // declares and avoids `-F`'s magic coercion of a numeric-looking
-            // cursor or timestamp.
-            let mut args: Vec<&str> = vec![
-                "api", "graphql", "-f", &query_arg, "-f", &owner_arg, "-f", &name_arg,
-            ];
-            let after_arg = after.as_ref().map(|c| format!("after={c}"));
-            if let Some(arg) = after_arg.as_deref() {
-                args.push("-f");
-                args.push(arg);
-            }
-            let since_arg = since_str.as_ref().map(|s| format!("since={s}"));
-            if let Some(arg) = since_arg.as_deref() {
-                args.push("-f");
-                args.push(arg);
-            }
-
-            let out = (self.graphql)(&args)?;
-            let page = parse_graphql_board_response(&out)?;
+            let page = self.graphql_request(query, after.as_deref(), since_str.as_deref())?;
             budget = page.rate_limit;
             issues.extend(page.connection.nodes.into_iter().map(GhIssueNode::into_gh_issue));
 
@@ -1455,6 +1508,37 @@ impl GitHubStore {
         let args: Vec<&str> = vec!["api", "graphql", "-f", &query_arg, "-f", &q_arg];
         let out = (self.graphql)(&args)?;
         parse_search_number_response(&out)
+    }
+
+    /// One page (50, newest-updated first) of the terminal `done`/`canceled`
+    /// history via the `BoardClosed` query (`states: [CLOSED]`). `after` is the
+    /// cursor from a prior page, or `None` for the first. Returns the page's
+    /// issues, the cursor for the next page (`None` when this is the last), and
+    /// the token budget — a single GraphQL request, never the six-page history
+    /// sweep. Closed issues always map to a terminal column, so no PR/open filter
+    /// is needed.
+    fn graphql_closed_page(&self, after: Option<&str>) -> Result<GraphQlClosedPage> {
+        let page = self.graphql_request(BOARD_CLOSED_QUERY, after, None)?;
+        let next_cursor = if page.connection.page_info.has_next_page {
+            page.connection.page_info.end_cursor
+        } else {
+            None
+        };
+        let issues: Vec<GhIssue> = page
+            .connection
+            .nodes
+            .into_iter()
+            .map(GhIssueNode::into_gh_issue)
+            .collect();
+        Ok(GraphQlClosedPage {
+            issues,
+            next_cursor,
+            remaining: page.rate_limit.as_ref().and_then(|r| r.remaining),
+            reset: page
+                .rate_limit
+                .and_then(|r| r.reset_at)
+                .map(|dt| dt.timestamp()),
+        })
     }
 
     /// Live-read the comments on a GitHub issue by its number, oldest first.
@@ -1913,6 +1997,26 @@ query BoardIndexDelta($owner: String!, $name: String!, $after: String, $since: D
 }
 "#;
 
+/// The done/canceled history on demand (plan §4): one page of 50 closed issues,
+/// newest-updated first. Same node shape as [`BOARD_INDEX_QUERY`] (so both share
+/// [`GhIssueNode`]); `states: [CLOSED]` means every node maps to a terminal
+/// column, and `pageInfo` carries the cursor a "load more" pages with.
+const BOARD_CLOSED_QUERY: &str = r#"
+query BoardClosed($owner: String!, $name: String!, $after: String) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    issues(states: [CLOSED], first: 50, after: $after,
+           orderBy: { field: UPDATED_AT, direction: DESC }) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number title state stateReason createdAt updatedAt body
+        labels(first: 10) { nodes { name } }
+      }
+    }
+  }
+}
+"#;
+
 /// The collected result of a (possibly paginated) GraphQL board read: every
 /// issue node mapped onto [`GhIssue`], plus the token budget the last page
 /// reported.
@@ -2151,6 +2255,16 @@ pub fn clear_issue_caches_for_test() {
     if let Ok(mut g) = issue_cache().lock() {
         g.clear();
     }
+}
+
+/// One page of closed history from [`GitHubStore::graphql_closed_page`]: the
+/// mapped issue nodes, the cursor for the next page (`None` on the last), and the
+/// token budget the read reported.
+struct GraphQlClosedPage {
+    issues: Vec<GhIssue>,
+    next_cursor: Option<String>,
+    remaining: Option<u64>,
+    reset: Option<i64>,
 }
 
 /// Top-level GraphQL envelope: `{ "data": {...}, "errors": [...] }`.
@@ -4344,6 +4458,111 @@ mod tests {
         assert!(
             call.contains("since=2026-09-01T12:00:00+00:00"),
             "the delta query carries the since watermark: {call}"
+        );
+    }
+
+    #[test]
+    fn closed_page_cold_maps_the_first_page_and_carries_the_next_cursor() {
+        let _iso = IsolatedHome::new("closed-page");
+        // One page of 50-limit closed history: a completed + a canceled issue,
+        // and `hasNextPage` so a "load more" cursor is offered. The node shape is
+        // the same as the board index (labels → id/status/column).
+        let json = r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T07:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":true,"endCursor":"PAGE2"},"nodes":[
+{"number":40,"title":"shipped","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-09-07T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/shipped"},{"name":"shelbi:status/done"}]}},
+{"number":39,"title":"dropped","state":"CLOSED","stateReason":"NOT_PLANNED","createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-09-06T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/dropped"},{"name":"shelbi:status/canceled"}]}}
+]}}}}"#;
+        let store = graphql_store(json);
+
+        let page = store.closed_page(None).unwrap();
+        assert_eq!(page.issues.len(), 2);
+        // Newest-updated first, as the query orders it.
+        assert_eq!(page.issues[0].task.id, "shipped");
+        assert_eq!(page.issues[0].task.column, Column::done());
+        assert_eq!(page.issues[1].task.column, Column::canceled());
+        // A next page is offered.
+        assert_eq!(page.next_cursor.as_deref(), Some("PAGE2"));
+        assert_eq!(page.remaining, Some(4999));
+    }
+
+    #[test]
+    fn closed_page_sends_the_states_closed_query_and_a_load_more_cursor() {
+        let _iso = IsolatedHome::new("closed-args");
+        let json = r#"{"data":{"rateLimit":{"remaining":4998,"resetAt":"2026-09-08T07:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}"#;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let rec = seen.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            Ok(json.to_string())
+        });
+
+        // First page: the CLOSED query, no `after`.
+        let page = store.closed_page(None).unwrap();
+        assert!(page.next_cursor.is_none(), "last page offers no cursor");
+        // Load more: the same query, this time carrying the caller's cursor.
+        store.closed_page(Some("PAGE2")).unwrap();
+
+        let calls = seen.lock().unwrap();
+        assert!(
+            calls[0].contains("BoardClosed") && calls[0].contains("states: [CLOSED]"),
+            "the first page uses the GraphQL BoardClosed query: {}",
+            calls[0]
+        );
+        assert!(
+            !calls[0].contains("after="),
+            "the first page carries no cursor: {}",
+            calls[0]
+        );
+        assert!(
+            calls[1].contains("after=PAGE2"),
+            "a load-more page follows the caller's cursor: {}",
+            calls[1]
+        );
+    }
+
+    #[test]
+    fn closed_page_falls_back_to_the_rest_closed_sweep_off_graphql() {
+        let _iso = IsolatedHome::new("closed-fallback");
+        // A non-rate-limit GraphQL failure falls back to the REST `state=closed`
+        // list (newest-closed first), never failing the read.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let rec = seen.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            if args.contains(&"graphql") {
+                Ok(r#"{"data":null,"errors":[{"message":"Field 'filterBy' doesn't exist"}]}"#
+                    .to_string())
+            } else {
+                Ok(r#"{"number":8,"title":"old","state":"closed","state_reason":"completed","labels":[{"name":"shelbi:id/old"},{"name":"shelbi:status/done"}],"created_at":"2026-07-01T00:00:00Z","updated_at":"2026-07-02T00:00:00Z"}"#.to_string())
+            }
+        });
+
+        let page = store.closed_page(None).unwrap();
+        assert_eq!(page.issues.len(), 1);
+        assert_eq!(page.issues[0].task.id, "old");
+        assert!(page.next_cursor.is_none(), "the REST fallback is one page");
+        let calls = seen.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.contains("state=closed")),
+            "the fallback sweeps state=closed: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn closed_page_propagates_a_graphql_rate_limit_error() {
+        let _iso = IsolatedHome::new("closed-ratelimit");
+        // A rate limit is terminal — it must propagate so the caller leaves the
+        // cached page untouched, never hammering REST as a fallback.
+        let store = GitHubStore::with_runner("owner/repo", |_args| {
+            Err(Error::Command {
+                cmd: "gh api graphql".into(),
+                status: "HTTP 403".into(),
+                stderr: "API rate limit exceeded".into(),
+            })
+        });
+        let err = store.closed_page(None).unwrap_err();
+        assert!(
+            crate::gh_retry::is_rate_limit_error(&err),
+            "a rate limit propagates: {err:?}"
         );
     }
 

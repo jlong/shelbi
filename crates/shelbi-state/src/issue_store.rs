@@ -356,6 +356,43 @@ pub struct BoardRead {
     pub reset: Option<i64>,
 }
 
+/// One lazily-fetched page of the terminal `done`/`canceled` history
+/// ([`IssueStore::closed_page`]): the newest-closed slice of issues, a cursor to
+/// fetch the next page with (`None` when this is the last page), and the token
+/// budget the read observed.
+///
+/// The done column is history — hundreds of closed issues that only the Issues
+/// board ever shows — so it is never on the refresh cadence. It is loaded on
+/// demand a page at a time (`Plans/github-issue-caching-and-rate-limits.md` §4):
+/// the first page (50, newest-updated first) backs the Kanban's terminal
+/// columns, `issue list --status done|canceled`, and the Zen done-history
+/// judgment, cached with a long TTL; a "load more" fetches the next page via
+/// [`next_cursor`](Self::next_cursor).
+#[derive(Debug, Clone)]
+pub struct ClosedPage {
+    /// The closed issues in this page, newest-closed (by `updatedAt`) first.
+    pub issues: Vec<IssueFile>,
+    /// Opaque cursor for the next page, or `None` when this is the last page.
+    /// Passed back to [`IssueStore::closed_page`] as `after`.
+    pub next_cursor: Option<String>,
+    /// Remaining API budget on the token behind this read, when the backend
+    /// reported it (GraphQL `rateLimit.remaining`).
+    pub remaining: Option<u64>,
+    /// Unix epoch seconds at which that budget resets, when known.
+    pub reset: Option<i64>,
+}
+
+/// True for the terminal columns a closed issue maps to (`done`/`canceled`) —
+/// the categories whose history is loaded on demand rather than on the refresh
+/// tick. Shared by the closed-page routing in [`crate::issue_cache`] and the
+/// default [`IssueStore::closed_page`].
+pub fn is_terminal_column(status: &Column) -> bool {
+    matches!(
+        status.category(),
+        shelbi_core::StatusCategory::Done | shelbi_core::StatusCategory::Archived
+    )
+}
+
 impl BoardState {
     /// The issues to render, empty when [`BoardState::Cold`]. Convenience for
     /// callers that don't distinguish warm from stale (both are renderable) and
@@ -424,6 +461,35 @@ pub trait IssueStore {
     /// that filters the returned superset to the terminal columns it wants.
     fn list_closed(&self) -> Result<Vec<IssueFile>> {
         self.list()
+    }
+
+    /// One page of the terminal `done`/`canceled` history, newest-closed first
+    /// — the on-demand done-column read (`Plans/github-issue-caching-and-rate-
+    /// limits.md` §4). `after` is the [`ClosedPage::next_cursor`] from a prior
+    /// page, or `None` for the first page.
+    ///
+    /// The done column is history that only the Issues board renders, so it is
+    /// loaded a page at a time and never on the refresh cadence. The `github`
+    /// backend overrides this with a single GraphQL query (`states: [CLOSED]`,
+    /// first 50, ordered by `updatedAt` desc) that carries the pagination cursor
+    /// and the token budget. The default returns every terminal card from
+    /// [`list_closed`] as one un-paginated page — correct for the `file_system`
+    /// backend (a cheap local read) and for any backend whose `list_closed` is
+    /// already the whole terminal history.
+    ///
+    /// [`list_closed`]: IssueStore::list_closed
+    fn closed_page(&self, _after: Option<&str>) -> Result<ClosedPage> {
+        let issues = self
+            .list_closed()?
+            .into_iter()
+            .filter(|f| is_terminal_column(&f.task.column))
+            .collect();
+        Ok(ClosedPage {
+            issues,
+            next_cursor: None,
+            remaining: None,
+            reset: None,
+        })
     }
 
     /// The whole board tagged with its freshness ([`BoardState`]) so a render

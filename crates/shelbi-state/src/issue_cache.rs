@@ -54,11 +54,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use shelbi_core::{Column, Issue, IssueTrackerConfig, Result, StatusCategory};
+use shelbi_core::{Column, Issue, IssueTrackerConfig, Result};
 
+use crate::done_history::{self, DoneHistory};
 use crate::issue_store::{
-    BoardState, Cursor, IssueChange, IssueComment, IssueFields, IssueStore, NewIssue, PrioMove,
-    StatusMove,
+    is_terminal_column as is_terminal, BoardState, ClosedPage, Cursor, IssueChange, IssueComment,
+    IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
 };
 use crate::IssueFile;
 
@@ -66,14 +67,6 @@ use crate::IssueFile;
 /// state dir (`<shelbi-root>/projects/<project>/`). JSON so a torn write is a
 /// clean parse failure (→ cache miss), not silently-valid garbage.
 const BOARD_SNAPSHOT_FILE: &str = "board-snapshot.json";
-
-/// Basename of the per-project on-disk snapshot for the **closed** (terminal
-/// `done`/`canceled`) board, a sibling of [`BOARD_SNAPSHOT_FILE`]. Kept
-/// separate so a resuming process serves the terminal columns from disk
-/// without a blocking `state=closed` sweep, and so the frequently-rewritten
-/// open snapshot the sidebar / `shelbi status` read stays exactly the open
-/// board (never bloated with history).
-const CLOSED_SNAPSHOT_FILE: &str = "board-snapshot-closed.json";
 
 /// How long a cached board is served before a background refresh is kicked.
 ///
@@ -92,50 +85,6 @@ const TTL: Duration = Duration::from_secs(20);
 /// [`TTL`]. A cached `list()` may lag the backend by up to this long (plus one
 /// background refresh round trip) before the snapshot catches up.
 pub const BOARD_CACHE_TTL: Duration = TTL;
-
-/// How long the **closed** (terminal `done`/`canceled`) board is served before
-/// a background refresh is kicked. Far longer than [`TTL`]: the terminal
-/// history barely changes, only the Kanban's terminal columns read it, and a
-/// `state=closed` sweep is the expensive read on a large board. A terminal
-/// status move *through this cache* invalidates it immediately, so an
-/// operator's own completion still shows promptly; an out-of-band close lands
-/// within this window.
-const CLOSED_TTL: Duration = Duration::from_secs(120);
-
-/// Which slice of a project's board a cache operation addresses. The two are
-/// cached wholly independently — distinct in-memory entry, on-disk snapshot,
-/// staleness window and single-flight refresh flag — because the open board
-/// moves constantly (short TTL, disk-persisted, the render/poll hot path)
-/// while the closed history is nearly static (long TTL, only the Kanban's
-/// terminal columns).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Scope {
-    /// Non-terminal cards — `state=open` on the github backend.
-    Open,
-    /// Terminal `done`/`canceled` history — `state=closed` on the github backend.
-    Closed,
-}
-
-/// The read a background/cold refresh runs for `scope` against a freshly built
-/// store. Split out (rather than inlined in the refresh thread) so it is unit
-/// testable with a recording `gh` runner: `Open` must send `state=open`,
-/// `Closed` must send `state=closed`, neither the full `state=all` sweep.
-fn scoped_read(store: &dyn IssueStore, scope: Scope) -> Result<Vec<IssueFile>> {
-    match scope {
-        Scope::Open => store.list_open(),
-        Scope::Closed => store.list_closed(),
-    }
-}
-
-/// True for the terminal categories a closed GitHub issue maps to
-/// (`done`/`canceled`). A `list_in_status` for one of these is served from the
-/// closed cache; every other status from the open cache.
-fn is_terminal(status: &Column) -> bool {
-    matches!(
-        status.category(),
-        StatusCategory::Done | StatusCategory::Archived
-    )
-}
 
 /// One project's cached board.
 struct Entry {
@@ -179,13 +128,6 @@ fn snapshot(key: &str, ttl: Duration) -> Option<(Arc<Vec<IssueFile>>, bool)> {
     let guard = cache().lock().ok()?;
     let entry = guard.get(key)?;
     Some((Arc::clone(&entry.board), entry.fetched_at.elapsed() >= ttl))
-}
-
-/// The in-memory / refresh-flag / disk key for a project's **closed**-history
-/// cache — the open board keys off the bare project name, so this must not
-/// collide with it. The `\u{1}` separator can't appear in a project name.
-fn closed_key(project: &str) -> String {
-    format!("{project}\u{1}closed")
 }
 
 /// Publish a freshly read board to the in-memory cache and, when a snapshot
@@ -253,14 +195,6 @@ fn snapshot_path(project: &str) -> Option<PathBuf> {
         .map(|dir| dir.join(BOARD_SNAPSHOT_FILE))
 }
 
-/// The on-disk snapshot path for `project`'s **closed** history, a sibling of
-/// [`snapshot_path`]'s open board. `None` on the same conditions.
-fn closed_snapshot_path(project: &str) -> Option<PathBuf> {
-    crate::project_dir(project)
-        .ok()
-        .map(|dir| dir.join(CLOSED_SNAPSHOT_FILE))
-}
-
 /// Read and parse the on-disk snapshot. A missing file, an unreadable file, or
 /// a torn/corrupt one (truncated mid-write, invalid JSON) all resolve to
 /// `None` — a cache miss the caller recovers from with a live read, never an
@@ -308,9 +242,6 @@ pub(crate) struct CachedIssueStore {
     /// then behaves exactly like the old in-memory-only cache (no disk warm, no
     /// disk write).
     snapshot: Option<PathBuf>,
-    /// Where the persisted closed-history snapshot lives (see
-    /// [`closed_snapshot_path`]). `None` on the same conditions as `snapshot`.
-    closed_snapshot: Option<PathBuf>,
 }
 
 impl CachedIssueStore {
@@ -320,49 +251,62 @@ impl CachedIssueStore {
             project: project.to_string(),
             cfg: cfg.clone(),
             snapshot: snapshot_path(project),
-            closed_snapshot: closed_snapshot_path(project),
         }
     }
 
-    /// The scoped cache key, staleness window and on-disk snapshot path for
-    /// `scope` — the one place the open/closed asymmetry is spelled out.
-    fn scope_parts(&self, scope: Scope) -> (String, Duration, Option<PathBuf>) {
-        match scope {
-            Scope::Open => (self.project.clone(), TTL, self.snapshot.clone()),
-            Scope::Closed => (closed_key(&self.project), CLOSED_TTL, self.closed_snapshot.clone()),
-        }
-    }
-
-    /// Serve a scope's board as a plain `Vec` (the `list_open` / `list_closed`
-    /// contract). Non-blocking whenever it can be: the in-memory snapshot when
-    /// present (kicking a background refresh once it is stale), else the
-    /// on-disk snapshot on a warm resume (seeded stale, refreshed in the
-    /// background — no blocking sweep). Only a genuinely cold process with no
-    /// snapshot at all reads live and publishes, so a CLI one-shot never prints
-    /// an empty board.
-    fn serve(&self, scope: Scope) -> Result<Vec<IssueFile>> {
-        let (key, ttl, disk) = self.scope_parts(scope);
-        if let Some((board, stale)) = snapshot(&key, ttl) {
+    /// Serve the **open** board as a plain `Vec` (the `list_open` contract).
+    /// Non-blocking whenever it can be: the in-memory snapshot when present
+    /// (kicking a background refresh once it is stale), else the on-disk
+    /// snapshot on a warm resume (seeded stale, refreshed in the background — no
+    /// blocking sweep). Only a genuinely cold process with no snapshot at all
+    /// reads live and publishes, so a CLI one-shot never prints an empty board.
+    fn serve_open(&self) -> Result<Vec<IssueFile>> {
+        if let Some((board, stale)) = snapshot(&self.project, TTL) {
             if stale {
-                self.kick_refresh(scope);
+                self.kick_refresh();
             }
             return Ok((*board).clone());
         }
-        if let Some(path) = &disk {
+        if let Some(path) = &self.snapshot {
             if let Some(board) = read_snapshot_from_disk(path) {
-                seed_stale_from_disk(&key, board.clone(), ttl);
-                self.kick_refresh(scope);
+                seed_stale_from_disk(&self.project, board.clone(), TTL);
+                self.kick_refresh();
                 return Ok(board);
             }
         }
         // Genuinely cold: read live so a one-shot is correct, and publish to
         // warm the next process (memory + disk).
-        let board = scoped_read(self.inner.as_ref(), scope)?;
-        publish(&key, board.clone(), disk.as_deref());
+        let board = self.inner.list_open()?;
+        publish(&self.project, board.clone(), self.snapshot.as_deref());
         Ok(board)
     }
 
-    /// Refresh the snapshot on a background thread, at most one at a time.
+    /// Serve one page of the terminal `done`/`canceled` history — the on-demand
+    /// done column (`Plans/github-issue-caching-and-rate-limits.md` §4).
+    ///
+    /// The **first** page (`after = None`) is cached on disk in
+    /// `done-history.json` with a ten-minute TTL and its own `fetched_at`
+    /// ([`crate::done_history`]): a page still under the TTL is served straight
+    /// from disk with **no backend request**, so a cold CLI one-shot and every
+    /// Kanban paint read the same file rather than sweeping closed issues. On a
+    /// miss (no page cached, or one past the TTL) the first page is fetched from
+    /// the backend and persisted. A "load more" page (`after = Some`) is always a
+    /// live, uncached fetch — an explicit, interactive request.
+    fn serve_closed_page(&self, after: Option<&str>) -> Result<ClosedPage> {
+        if after.is_some() {
+            return self.inner.closed_page(after);
+        }
+        if let Some(history) = done_history::read_done_history(&self.project) {
+            if history.is_fresh() {
+                return Ok(history.to_page());
+            }
+        }
+        let page = self.inner.closed_page(None)?;
+        let _ = done_history::write_done_history(&self.project, &DoneHistory::from_page(&page));
+        Ok(page)
+    }
+
+    /// Refresh the open snapshot on a background thread, at most one at a time.
     ///
     /// The thread builds its **own** store from the project's config rather
     /// than sharing `self.inner`: the trait carries no `Send + Sync` bound, and
@@ -373,24 +317,23 @@ impl CachedIssueStore {
     /// place and the next read tries again. A board that briefly stops
     /// advancing beats one that renders an error or empties out because GitHub
     /// was slow for a moment.
-    fn kick_refresh(&self, scope: Scope) {
-        let (key, _ttl, disk) = self.scope_parts(scope);
-        let flag = refresh_flag(&key);
+    fn kick_refresh(&self) {
+        let flag = refresh_flag(&self.project);
         if flag.swap(true, Ordering::AcqRel) {
-            return; // already refreshing this scope
+            return; // already refreshing
         }
         let project = self.project.clone();
         let cfg = self.cfg.clone();
+        let disk = self.snapshot.clone();
         let thread_flag = Arc::clone(&flag);
         let spawned = std::thread::Builder::new()
             .name("shelbi-board-refresh".into())
             .spawn(move || {
                 if let Ok(store) = crate::issue_store::build_store(&project, &cfg) {
-                    // Scope-scoped read: `state=open` for the open board,
-                    // `state=closed` for the terminal history — never the full
+                    // `state=open` for the open board — never the full
                     // `state=all` sweep this cache exists to eliminate.
-                    match scoped_read(store.as_ref(), scope) {
-                        Ok(board) => publish(&key, board, disk.as_deref()),
+                    match store.list_open() {
+                        Ok(board) => publish(&project, board, disk.as_deref()),
                         Err(e) => {
                             tracing::debug!(project = %project, error = %e, "board refresh failed")
                         }
@@ -405,55 +348,54 @@ impl CachedIssueStore {
         }
     }
 
-    /// Pass-through for a write that touches only non-terminal state:
-    /// invalidate the **open** board, then kick its refresh so the change lands
-    /// in the snapshot (in memory *and* on disk) without waiting out the TTL.
+    /// Pass-through for a write: invalidate the **open** board, then kick its
+    /// refresh so the change lands in the snapshot (in memory *and* on disk)
+    /// without waiting out the TTL.
     fn invalidate(&self) {
         mark_stale(&self.project, TTL);
-        self.kick_refresh(Scope::Open);
+        self.kick_refresh();
     }
 
-    /// Pass-through for a write that moves a card **to or from a terminal
-    /// column** (a completion / cancellation): invalidate both the open board
-    /// *and* the closed history so the card leaves in-progress and appears in
-    /// done/canceled promptly, rather than the closed side lagging out its long
-    /// TTL after an operator's own action.
-    fn invalidate_with_closed(&self) {
-        self.invalidate();
-        mark_stale(&closed_key(&self.project), CLOSED_TTL);
-        self.kick_refresh(Scope::Closed);
-    }
-
-    /// Write-through the just-mutated issue into the daemon-owned
-    /// `board-index.json` — the write-through half of
-    /// `Plans/github-issue-caching-and-rate-limits.md` §5. Every list consumer
-    /// now reads the board from that file (via [`crate::read_board`]) rather than
-    /// the backend, so after an operator's own write we splice the change into
-    /// the file directly, letting the sidebar and Issues board reflect it on
-    /// their next paint instead of waiting out the next daemon tick.
+    /// Write-through the just-mutated issue into the two on-disk caches every
+    /// list consumer now reads — the daemon-owned `board-index.json` (the open
+    /// board, §5) and `done-history.json` (the terminal history, §4) — so after
+    /// an operator's own write the sidebar, Issues board and terminal columns
+    /// reflect it on their next paint instead of waiting out the next daemon tick
+    /// or the ten-minute done-history TTL.
     ///
-    /// The just-written issue is re-read through the cheap **single-issue** path
-    /// ([`IssueStore::get`] — one label-filtered request, never a board sweep),
-    /// so the patched entry carries every field correctly (including the true
-    /// priority read back from the metadata block). A card that has left the
-    /// open board — deleted, or moved into a terminal `done`/`canceled` column
-    /// the open index omits — is dropped from the file instead.
+    /// The issue is re-read through the cheap **single-issue** path
+    /// ([`IssueStore::get`] — one request, never a board sweep) so the patched
+    /// entry carries every field correctly (including the true priority read back
+    /// from the metadata block). A single read then updates both files by where
+    /// the card now lives:
     ///
-    /// Best-effort by design: if no daemon has published an index yet, or the
-    /// single read fails, this leaves the file alone and the next daemon tick
-    /// reconciles. The freshness envelope (`fetched_at`/`stale`) is never touched
-    /// here — only the daemon advances it — so a hand-patched index still reads
-    /// as exactly as fresh as the daemon last made it.
-    fn write_through_index(&self, id: &str) {
+    /// * **terminal** (`done`/`canceled`) ⇒ dropped from the open index and
+    ///   spliced to the top of the done-history page (the just-merged task shows
+    ///   at the top of the column immediately);
+    /// * **non-terminal** ⇒ patched into the open index and dropped from the
+    ///   done-history page (a reopen leaves the history);
+    /// * **gone** ⇒ removed from both.
+    ///
+    /// Best-effort by design: if no index/page has been published yet, or the
+    /// single read fails, this leaves the files alone and the next daemon tick /
+    /// history fetch reconciles. The caches' freshness envelopes are never
+    /// touched here — only the daemon and the cadence fetch advance those.
+    fn write_through(&self, id: &str) {
         match self.inner.get(id) {
-            Ok(Some(f)) if !is_terminal(&f.task.column) => {
-                let _ = crate::board_index::patch_board_index_issue(&self.project, &f);
-            }
-            // Gone, or now in a terminal column ⇒ off the open board.
-            Ok(_) => {
+            Ok(Some(f)) if is_terminal(&f.task.column) => {
                 let _ = crate::board_index::remove_board_index_issue(&self.project, id);
+                let _ = done_history::patch_done_history_issue(&self.project, &f);
             }
-            // A failed single read leaves the index for the daemon tick to fix.
+            Ok(Some(f)) => {
+                let _ = crate::board_index::patch_board_index_issue(&self.project, &f);
+                let _ = done_history::remove_done_history_issue(&self.project, id);
+            }
+            // Gone from the backend ⇒ off both caches.
+            Ok(None) => {
+                let _ = crate::board_index::remove_board_index_issue(&self.project, id);
+                let _ = done_history::remove_done_history_issue(&self.project, id);
+            }
+            // A failed single read leaves the caches for the next tick to fix.
             Err(_) => {}
         }
     }
@@ -476,13 +418,19 @@ impl IssueStore for CachedIssueStore {
         // drain, unfiltered `issue list`) actually need — served from the
         // process-local open snapshot, refreshed via `inner.list_open()`
         // (`state=open`), never the full sweep.
-        self.serve(Scope::Open)
+        self.serve_open()
     }
 
     fn list_closed(&self) -> Result<Vec<IssueFile>> {
-        // The terminal history, served from the separate long-TTL closed
-        // snapshot (refreshed via `inner.list_closed()` = `state=closed`).
-        self.serve(Scope::Closed)
+        // The terminal history — the first on-demand page (§4), served from the
+        // long-TTL `done-history.json` cache. Never a `state=closed` sweep or the
+        // refresh tick; the Zen done-history judgment (`board_from_caches`) reads
+        // exactly this cached page.
+        Ok(self.serve_closed_page(None)?.issues)
+    }
+
+    fn closed_page(&self, after: Option<&str>) -> Result<ClosedPage> {
+        self.serve_closed_page(after)
     }
 
     fn list_state(&self) -> Result<BoardState> {
@@ -493,7 +441,7 @@ impl IssueStore for CachedIssueStore {
         // its own `list_in_status(done|canceled)` reads.
         if let Some((board, stale)) = snapshot(&self.project, TTL) {
             if stale {
-                self.kick_refresh(Scope::Open);
+                self.kick_refresh();
                 return Ok(BoardState::Stale((*board).clone()));
             }
             return Ok(BoardState::Warm((*board).clone()));
@@ -505,30 +453,32 @@ impl IssueStore for CachedIssueStore {
         if let Some(path) = &self.snapshot {
             if let Some(board) = read_snapshot_from_disk(path) {
                 seed_stale_from_disk(&self.project, board.clone(), TTL);
-                self.kick_refresh(Scope::Open);
+                self.kick_refresh();
                 return Ok(BoardState::Stale(board));
             }
         }
         // Genuinely cold: no memory, no snapshot on disk. Report it so the
         // caller renders a loading indicator (not an empty board) and kick the
         // background fetch that will fill the snapshot.
-        self.kick_refresh(Scope::Open);
+        self.kick_refresh();
         Ok(BoardState::Cold)
     }
 
-    /// Filtered from the scope-appropriate cached board rather than issuing its
-    /// own sweep: the terminal `done`/`canceled` lanes come from the closed
-    /// cache (`state=closed`), every other status from the open cache
-    /// (`state=open`). Both are canonical column-then-priority order and
-    /// filtering preserves relative order, so the result matches a live call.
+    /// Filtered from the scope-appropriate cache rather than issuing its own
+    /// sweep: a terminal `done`/`canceled` lane comes from the on-demand
+    /// done-history page (§4, the long-TTL `done-history.json`), every other
+    /// status from the open snapshot (`state=open`). Filtering preserves relative
+    /// order, so the result matches a live call (newest-closed first for the
+    /// terminal lanes, canonical order for the open ones).
     fn list_in_status(&self, status: &Column) -> Result<Vec<IssueFile>> {
-        let scope = if is_terminal(status) {
-            Scope::Closed
-        } else {
-            Scope::Open
-        };
+        if is_terminal(status) {
+            return Ok(done_history::page_in_status(
+                &self.serve_closed_page(None)?,
+                status,
+            ));
+        }
         Ok(self
-            .serve(scope)?
+            .serve_open()?
             .into_iter()
             .filter(|f| &f.task.column == status)
             .collect())
@@ -554,42 +504,42 @@ impl IssueStore for CachedIssueStore {
         let out = self.inner.add(spec)?;
         self.invalidate();
         // Splice the new card into the published index so the sidebar/board see
-        // it before the next daemon tick (§5 write-through).
-        self.write_through_index(&out.id);
+        // it before the next daemon tick (write-through).
+        self.write_through(&out.id);
         Ok(out)
     }
 
     fn move_status(&self, id: &str, to: &Column, reason: &str) -> Result<Option<StatusMove>> {
         let out = self.inner.move_status(id, to, reason)?;
-        // A move can land in — or leave — a terminal column, so refresh the
-        // closed history too, not just the open board.
-        self.invalidate_with_closed();
-        // Write the move through to the published index (or drop the card from
-        // it when the move was into a terminal column).
-        self.write_through_index(id);
+        self.invalidate();
+        // Write the move through to the open index and the done-history page: a
+        // move into a terminal column drops the card from the index and splices
+        // it to the top of the done column (`write_through` decides by where the
+        // card lands).
+        self.write_through(id);
         Ok(out)
     }
 
     fn set_priority(&self, id: &str, pos: PrioMove) -> Result<()> {
         self.inner.set_priority(id, pos)?;
         self.invalidate();
-        self.write_through_index(id);
+        self.write_through(id);
         Ok(())
     }
 
     fn set_fields(&self, id: &str, fields: IssueFields) -> Result<()> {
         self.inner.set_fields(id, fields)?;
         self.invalidate();
-        self.write_through_index(id);
+        self.write_through(id);
         Ok(())
     }
 
     fn cancel(&self, id: &str, reason: &str) -> Result<Option<StatusMove>> {
         let out = self.inner.cancel(id, reason)?;
-        // Cancel lands the card in the terminal `canceled` column.
-        self.invalidate_with_closed();
-        // The card is now terminal, so this drops it from the open index.
-        self.write_through_index(id);
+        self.invalidate();
+        // Cancel lands the card in the terminal `canceled` column: dropped from
+        // the open index, spliced to the top of the done-history page.
+        self.write_through(id);
         Ok(out)
     }
 
@@ -600,9 +550,8 @@ impl IssueStore for CachedIssueStore {
         reason: &str,
     ) -> Result<Option<StatusMove>> {
         let out = self.inner.move_status_and_unassign(id, to, reason)?;
-        // Like `move_status`, the target may be terminal.
-        self.invalidate_with_closed();
-        self.write_through_index(id);
+        self.invalidate();
+        self.write_through(id);
         Ok(out)
     }
 
@@ -684,11 +633,23 @@ mod tests {
         }
     }
 
-    /// `file_system` so the cache's background refresh builds a harmless local
-    /// store for a project that does not exist: it fails, logs, and leaves the
-    /// snapshot untouched. Keeps the tests offline and deterministic.
+    /// A config whose backend `build_store` **rejects** (`jira`, unimplemented),
+    /// so the cache's background refresh thread — which builds its own store from
+    /// this config — is a guaranteed no-op: it never publishes, never touches
+    /// disk or `gh`, and so can never clobber the in-memory snapshot these tests
+    /// assert on. (A `file_system` config would instead do a real local read,
+    /// which under a concurrent test's `SHELBI_HOME` can race an empty board into
+    /// the snapshot.) The store operations under test go through `self.inner`,
+    /// never this config, so the choice of backend here only gates the refresh.
     fn offline_cfg() -> IssueTrackerConfig {
-        IssueTrackerConfig::default()
+        use shelbi_core::{IssueTrackerBackend, JiraConnection};
+        IssueTrackerConfig {
+            backend: IssueTrackerBackend::Jira,
+            jira: Some(JiraConnection {
+                project: "PROJ".into(),
+            }),
+            ..Default::default()
+        }
     }
 
     impl IssueStore for CountingStore {
@@ -812,7 +773,6 @@ mod tests {
                 project: project.to_string(),
                 cfg: offline_cfg(),
                 snapshot,
-                closed_snapshot: None,
             },
             lists,
             writes,
@@ -889,30 +849,34 @@ mod tests {
     }
 
     #[test]
-    fn terminal_and_open_statuses_use_independent_caches() {
-        // done/canceled are served from the long-TTL closed cache; every other
-        // status from the open cache. Each fills once and serves repeatedly,
-        // and reading one scope never disturbs the other.
+    fn terminal_lanes_come_from_the_done_history_page_open_from_the_snapshot() {
+        // done/canceled are served from the on-demand `done-history.json` page
+        // (§4); every other status from the open snapshot. The first terminal
+        // read fetches and persists the page; later terminal reads are served
+        // from disk (under the 10-minute TTL) with no further backend read, and
+        // the open snapshot is an independent fill.
+        let _home = HomeGuard::new("indep");
         let (store, lists, _) = cached(
             "cache-t2b",
             vec![issue("a", "todo"), issue("b", "done"), issue("c", "canceled")],
         );
-        // First terminal read fills the closed cache (one backend read).
+        // First terminal read fetches the closed page and persists it.
         assert_eq!(store.list_in_status(&Column::done()).unwrap().len(), 1);
         assert_eq!(lists.load(Ordering::SeqCst), 1);
-        // canceled is served from the same closed snapshot — no extra read.
+        // canceled is served from the same persisted page — no extra read.
         assert_eq!(store.list_in_status(&Column::canceled()).unwrap().len(), 1);
         assert_eq!(
             lists.load(Ordering::SeqCst),
             1,
-            "both terminal lanes come from one closed read"
+            "both terminal lanes come from one closed page"
         );
-        // The open cache is a separate fill; it must not carry terminal cards.
+        // The open snapshot is a separate fill; it must not carry terminal cards.
         let open = store.list_open().unwrap();
         assert_eq!(open.len(), 1);
         assert!(open.iter().all(|f| f.task.column == Column::todo()));
         assert_eq!(lists.load(Ordering::SeqCst), 2, "one open + one closed read");
-        // Repeated reads of either scope stay served from cache.
+        // Repeated reads of either lane stay served (page from disk, open from
+        // the in-memory snapshot).
         for _ in 0..5 {
             store.list_in_status(&Column::done()).unwrap();
             store.list_open().unwrap();
@@ -1024,12 +988,12 @@ mod tests {
 
     /// A `CachedIssueStore` wrapping a **real** [`crate::GitHubStore`] whose
     /// `gh` runner records every call, so a test can assert the exact
-    /// `-f state=…` a cached read path sends through to `gh`. `snapshot` /
-    /// `closed_snapshot` are `None` so a single cold read never kicks a
-    /// background refresh (it would build a fresh, non-recording store), and
-    /// `cfg` is left `file_system` so any refresh that *does_ fire is a harmless
-    /// offline read that never touches `gh`. Each test uses a unique `project`
-    /// so the process-global cache starts cold.
+    /// `-f state=…` a cached read path sends through to `gh`. `snapshot` is
+    /// `None` so a single cold read never kicks a background refresh (it would
+    /// build a fresh, non-recording store), and `cfg` is left `file_system` so
+    /// any refresh that *does_ fire is a harmless offline read that never
+    /// touches `gh`. Each test uses a unique `project` so the process-global
+    /// cache starts cold.
     fn cached_github(
         project: &str,
     ) -> (CachedIssueStore, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
@@ -1045,7 +1009,6 @@ mod tests {
                 project: project.to_string(),
                 cfg: offline_cfg(),
                 snapshot: None,
-                closed_snapshot: None,
             },
             calls,
         )
@@ -1084,15 +1047,60 @@ mod tests {
         assert!(!list[0].contains("state=all"), "{}", list[0]);
     }
 
+    /// A valid `gh api graphql` response for the `BoardClosed` query carrying one
+    /// completed (`done`) issue — enough to drive the GraphQL closed-page path.
+    fn closed_graphql_json() -> String {
+        r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T12:00:00Z"},
+        "repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},
+        "nodes":[{"number":7,"title":"done task","state":"CLOSED","stateReason":"COMPLETED",
+        "createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-02T00:00:00Z","body":"",
+        "labels":{"nodes":[{"name":"shelbi:id/dt"},{"name":"shelbi:status/done"}]}}]}}}}"#
+            .to_string()
+    }
+
     #[test]
-    fn cached_list_in_status_terminal_sends_state_closed() {
-        let (store, calls) = cached_github("cache-gh-done");
-        store.list_in_status(&Column::done()).unwrap();
-        let list = recorded_list_calls(&calls);
-        assert_eq!(list.len(), 1);
-        assert!(list[0].contains("state=closed"), "{}", list[0]);
-        assert!(!list[0].contains("state=all"), "{}", list[0]);
-        assert!(!list[0].contains("state=open"), "{}", list[0]);
+    fn cached_list_in_status_terminal_uses_the_graphql_closed_page() {
+        // The terminal history reads through the GraphQL `BoardClosed` page (§4),
+        // not a REST `state=closed` sweep, and persists it to `done-history.json`.
+        let _home = HomeGuard::new("gh-done");
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let gh = crate::GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            if args.contains(&"graphql") {
+                Ok(closed_graphql_json())
+            } else {
+                Ok(String::new())
+            }
+        });
+        let store = CachedIssueStore {
+            inner: Box::new(gh),
+            project: "gh-done".into(),
+            cfg: offline_cfg(),
+            snapshot: None,
+        };
+        let done = store.list_in_status(&Column::done()).unwrap();
+        assert_eq!(done.len(), 1, "the one done card from the closed page");
+
+        let all = calls.lock().unwrap().clone();
+        assert!(
+            all.iter().any(|c| c.contains("graphql") && c.contains("BoardClosed")),
+            "the closed history uses the GraphQL BoardClosed query: {all:?}"
+        );
+        assert!(
+            all.iter().all(|c| !c.contains("state=closed") && !c.contains("state=all")),
+            "no REST closed/all sweep: {all:?}"
+        );
+
+        // The page was persisted; a second read is served from disk with no
+        // further gh call at all.
+        let before = calls.lock().unwrap().len();
+        assert_eq!(store.list_in_status(&Column::done()).unwrap().len(), 1);
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            before,
+            "a fresh done-history page is served from disk, no request"
+        );
     }
 
     #[test]
@@ -1103,26 +1111,6 @@ mod tests {
         let list = recorded_list_calls(&calls);
         assert_eq!(list.len(), 1);
         assert!(list[0].contains("state=all"), "{}", list[0]);
-    }
-
-    #[test]
-    fn scoped_read_maps_open_to_state_open_and_closed_to_state_closed() {
-        // The exact read the background refresh runs for each scope. Asserted
-        // directly against a recording store so the refresh's `state=` is
-        // covered without spawning its thread (which rebuilds a fresh store).
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let rec = calls.clone();
-        let gh = crate::GitHubStore::with_runner("owner/repo", move |args| {
-            rec.lock().unwrap().push(args.join(" "));
-            Ok(String::new())
-        });
-        scoped_read(&gh, Scope::Open).unwrap();
-        scoped_read(&gh, Scope::Closed).unwrap();
-        let list = recorded_list_calls(&calls);
-        assert_eq!(list.len(), 2);
-        assert!(list[0].contains("state=open"), "{}", list[0]);
-        assert!(list[1].contains("state=closed"), "{}", list[1]);
-        assert!(list.iter().all(|c| !c.contains("state=all")));
     }
 
     #[test]
@@ -1221,7 +1209,6 @@ mod tests {
             project: project.to_string(),
             cfg: offline_cfg(),
             snapshot: None,
-            closed_snapshot: None,
         }
     }
 
@@ -1307,5 +1294,56 @@ mod tests {
             "a terminal card is dropped from the open index"
         );
         assert!(idx.board.iter().any(|f| f.task.id == "b"), "others untouched");
+    }
+
+    #[test]
+    fn a_completion_writes_through_to_the_top_of_the_done_history_page() {
+        // §4 write-through: a merge/cancel through shelbi splices the just-closed
+        // issue to the top of the cached done-history page, so it shows at the
+        // top of the done column immediately instead of waiting out the 10-minute
+        // TTL.
+        let _home = HomeGuard::new("wt-done");
+        // Seed a cached page as the last fetch left it (one older done card).
+        done_history::write_done_history(
+            "cache-wt-done",
+            &DoneHistory::from_page(&ClosedPage {
+                issues: vec![issue("older", "done")],
+                next_cursor: None,
+                remaining: None,
+                reset: None,
+            }),
+        )
+        .unwrap();
+        // The post-write single read shows `fresh` now done.
+        let store = cached_over_get("cache-wt-done", Some(issue("fresh", "done")));
+        store.move_status("fresh", &Column::done(), "merge").unwrap();
+
+        let page = done_history::read_done_history("cache-wt-done").unwrap();
+        assert_eq!(page.issues[0].task.id, "fresh", "the merge shows at the top");
+        assert!(page.issues.iter().any(|f| f.task.id == "older"));
+    }
+
+    #[test]
+    fn a_reopen_drops_the_card_from_the_done_history_page() {
+        // The complement: a card moved back out of a terminal column leaves the
+        // cached done-history page (and lands in the open index instead).
+        let _home = HomeGuard::new("wt-reopen");
+        done_history::write_done_history(
+            "cache-wt-reopen",
+            &DoneHistory::from_page(&ClosedPage {
+                issues: vec![issue("a", "done"), issue("b", "done")],
+                next_cursor: None,
+                remaining: None,
+                reset: None,
+            }),
+        )
+        .unwrap();
+        // Fresh read shows `a` reopened to todo.
+        let store = cached_over_get("cache-wt-reopen", Some(issue("a", "todo")));
+        store.move_status("a", &Column::todo(), "reopen").unwrap();
+
+        let page = done_history::read_done_history("cache-wt-reopen").unwrap();
+        assert!(!page.issues.iter().any(|f| f.task.id == "a"), "a left the history");
+        assert!(page.issues.iter().any(|f| f.task.id == "b"), "others untouched");
     }
 }

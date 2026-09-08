@@ -104,6 +104,13 @@ pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Ou
             match key.code {
                 KeyCode::Char('f') => app.toggle_workspace_dropdown(),
                 KeyCode::Char('w') => app.toggle_workflow_dropdown(),
+                // Load the next page of terminal `done`/`canceled` history — the
+                // on-demand done column's "load more" (§4). Routed directly like
+                // the dropdown toggles rather than through the action enum: it is
+                // a transient board affordance, not a chord worth rebinding, and
+                // keeping it out of the keymap avoids touching the shipped
+                // `keys.yaml` default (and its config-upgrade surface).
+                KeyCode::Char('m') => app.load_more_done(),
                 _ => {}
             }
         }

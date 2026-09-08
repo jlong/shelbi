@@ -11915,21 +11915,23 @@ pub fn mechanically_eligible(project: &Project) -> Result<Vec<String>> {
     Ok(mechanically_eligible_from(&tasks, &demoted))
 }
 
-/// The whole board — open plus terminal history — assembled from the two
-/// process-cached scoped reads (`list_open` + `list_closed`) rather than the
-/// live full `state=all` sweep [`IssueStore::list`] runs on the github backend.
+/// The whole board — open plus terminal history — assembled from the open index
+/// (`list_open`) plus the on-demand done-history page (`list_closed`) rather than
+/// the live full `state=all` sweep [`IssueStore::list`] runs on the github
+/// backend.
 ///
 /// The dependency checks in [`mechanically_eligible`] / [`resolve_probe_base`]
 /// need the `done` column visible, but both sit on periodic scan/heartbeat
 /// cadences, so paying the six-page history sweep every tick would defeat the
-/// caching. `list_open` (`state=open`) and `list_closed` (`state=closed`) are
-/// each served from their own long-lived process snapshot, so this reconstructs
-/// the full board cheaply. Deduped by id because the `file_system` backend's
+/// caching. The open board comes from the daemon-owned index; `list_closed` is
+/// the first on-demand page of terminal history (§4), served from the long-TTL
+/// `done-history.json` cache — the same cached page the Issues board and `issue
+/// list --status done|canceled` read, never a `state=closed` sweep or the
+/// refresh tick. Deduped by id because the `file_system` backend's
 /// `list_open`/`list_closed` both fall back to the whole-board `list`.
 fn board_from_caches(project: &Project) -> Result<Vec<shelbi_state::IssueFile>> {
     // The open board comes from the daemon-owned index (§5); the terminal
-    // history still comes from the store's long-TTL closed cache (the on-demand
-    // done path, out of the index).
+    // history comes from the on-demand done-history page (§4), out of the index.
     let mut tasks = open_board(project)?;
     let mut seen: std::collections::HashSet<String> =
         tasks.iter().map(|tf| tf.task.id.clone()).collect();
