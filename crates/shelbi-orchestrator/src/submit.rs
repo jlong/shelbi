@@ -825,7 +825,18 @@ pub(crate) fn claude_is_processing(screen: &str) -> bool {
         // direction is proof a prompt got submitted and claude is mid-turn.
         "tokens)",
     ];
-    BUSY_MARKERS.iter().any(|m| lower.contains(m))
+    if BUSY_MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    // The substring markers miss two live-turn shapes: a spinner between tool
+    // calls / while thinking carries no `tokens)` suffix and no interrupt
+    // footer (`· Julienning… (45s · thought for 1s)`), and a large-context pane
+    // draws a `⎿  Tip: …` context row *under* the spinner so the streaming line
+    // reads `… 154.6k tokens · thinking with high effort)` — again no `tokens)`.
+    // The shared, tip-tolerant spinner detector catches both; it only matches a
+    // live spinner directly above the input box, so a completed `⏺ … tokens)`
+    // row in scrollback still fails it (and is already covered by `tokens)`).
+    crate::ready::has_live_spinner(screen)
 }
 
 /// Strong current-turn signal used only for busy-pane queue classification.
@@ -1043,6 +1054,29 @@ mod tests {
         assert!(seed_busy_signal("", BUSY_SCREEN_SPINNER, &baseline));
         // The `esc to interrupt` footer is an equally valid busy signal.
         assert!(seed_busy_signal("", BUSY_SCREEN_ESC_FOOTER, &baseline));
+    }
+
+    // The 2026-09-08 golf capture: a large-context pane draws its
+    // context-pressure tip row (`⎿  Tip: …`) under the live spinner, and the
+    // streaming line reads `… tokens · thinking with high effort)` — no
+    // trailing `tokens)`, no `esc to interrupt`. Both `claude_is_processing`
+    // and the seed dispatch confirm must still see this pane as busy.
+    const TIP_ROW_UNDER_SPINNER: &str = "\
+· Metamorphosing… (45m 35s · ↓ 154.6k tokens · thinking with high effort)
+  ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  Model: Opus 4.8 | Ctx: 338.6k | ⎇ jlong/gh-cache-p0 | (+767,-93)";
+
+    #[test]
+    fn seed_verify_confirms_a_pane_showing_the_context_tip_row() {
+        // Acceptance criterion: a dispatch confirm-wait against a pane that
+        // shows the tip row must observe busy. The tip row has no `tokens)` /
+        // interrupt footer, so this relies on the tip-tolerant spinner scan.
+        assert!(claude_is_processing(TIP_ROW_UNDER_SPINNER));
+        let baseline = PaneBaseline::fresh(SubmitProfile::ClaudeUi);
+        assert!(seed_busy_signal("", TIP_ROW_UNDER_SPINNER, &baseline));
     }
 
     #[test]

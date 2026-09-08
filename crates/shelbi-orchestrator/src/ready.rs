@@ -131,24 +131,61 @@ pub fn is_claude_working(screen: &str) -> bool {
 /// gerund + elapsed timer) classifies every live-spinner form as working, which
 /// removes the flap edge entirely.
 ///
+/// ## Why the scan skips `⎿` continuation rows
+///
+/// Claude Code interposes auxiliary rows between the spinner and the input box.
+/// The one that broke this detector is the context-pressure tip a large-context
+/// pane draws under the spinner:
+///
+/// ```text
+/// · Metamorphosing… (45m 35s · ↓ 154.6k tokens · thinking with high effort)
+///   ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+/// ────────────────────────────────────────────────────
+/// ❯
+/// ```
+///
+/// The old scan took the last non-empty line above the box — the `⎿  Tip: …`
+/// row, not the spinner one line higher — so a hard-working pane read as idle
+/// for its whole turn once the tip appeared. We now skip past any `⎿`-prefixed
+/// continuation row to reach the spinner and test that. Skipping these rows is
+/// safe for the completed-turn case: a finished `⏺ … (1m 4s · 12.0k tokens)`
+/// row followed by a tip still fails the glyph test below (`⏺` is not a spinner
+/// glyph), so it stays idle.
+///
 /// ## What still keeps a completed turn from reading as busy
 ///
-/// The positional guard (immediately above the input box) plus the grammar
-/// check: a finished `⏺ Done. (1m 4s · 12.0k tokens)` row carries the `⏺` glyph
-/// (not a spinner glyph) and no gerund `…`, and a stale `tokens)` lingering in
-/// the scrollback isn't the row directly above the box. A bare `tokens)`
-/// substring was never enough and still isn't required.
+/// The positional guard (immediately above the input box, tolerating `⎿` rows)
+/// plus the grammar check: a finished `⏺ Done. (1m 4s · 12.0k tokens)` row
+/// carries the `⏺` glyph (not a spinner glyph) and no gerund `…`, and a stale
+/// `tokens)` lingering in the scrollback isn't the row directly above the box.
+/// A bare `tokens)` substring was never enough and still isn't required.
 pub fn has_live_spinner(screen: &str) -> bool {
     let Some(top) = input_box_top(screen) else {
         return false;
     };
     let lines: Vec<&str> = screen.lines().collect();
-    let Some(line) = lines[..top].iter().rev().find(|l| !l.trim().is_empty()) else {
+    // Scan upward from the input box to the first content line, skipping blank
+    // lines and Claude Code's `⎿`-prefixed continuation rows (the context-tip
+    // row and any other continuation). The spinner sits above those.
+    let Some(line) = lines[..top]
+        .iter()
+        .map(|l| l.trim())
+        .rev()
+        .find(|l| !l.is_empty() && !is_continuation_row(l))
+    else {
         return false;
     };
-    let line = line.trim();
     let spinner_glyph = line.chars().next().is_some_and(is_spinner_glyph);
     spinner_glyph && line.contains('…') && has_elapsed_timer(line)
+}
+
+/// True when `line` is one of Claude Code's `⎿`-prefixed continuation rows —
+/// the `⎿  Tip: …` context-pressure hint drawn under the spinner on a
+/// large-context pane, or any other continuation line. The live-spinner scan
+/// steps over these to reach the spinner row above them. `line` is expected
+/// already trimmed of leading whitespace.
+fn is_continuation_row(line: &str) -> bool {
+    line.starts_with('⎿')
 }
 
 /// True when `glyph` can lead Claude Code's animated spinner row.
@@ -844,6 +881,44 @@ mod tests {
   ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
         assert!(!has_live_spinner(done));
         assert!(!is_claude_working(done));
+    }
+
+    // The exact capture observed 2026-09-08 on golf: a large-context pane
+    // (338k) draws its context-pressure tip row (`⎿  Tip: …`) under the live
+    // spinner. The old scan took that tip row as the line above the box and
+    // read a hard-working pane as idle for its whole turn.
+    const TIP_ROW_UNDER_SPINNER: &str = "\
+· Metamorphosing… (45m 35s · ↓ 154.6k tokens · thinking with high effort)
+  ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  Model: Opus 4.8 | Ctx: 338.6k | ⎇ jlong/gh-cache-p0 | (+767,-93)";
+
+    #[test]
+    fn has_live_spinner_sees_spinner_above_the_context_tip_row() {
+        // THE REGRESSION this task fixes: the `⎿  Tip: …` context row sits
+        // between the spinner and the input box, so the last-non-empty scan
+        // landed on the tip, not the spinner. Skip `⎿` rows and the spinner one
+        // line up must still read as a live turn.
+        assert!(has_live_spinner(TIP_ROW_UNDER_SPINNER));
+        assert!(is_claude_working(TIP_ROW_UNDER_SPINNER));
+    }
+
+    #[test]
+    fn has_live_spinner_rejects_a_completed_turn_above_the_tip_row() {
+        // Skipping `⎿` rows must NOT turn a finished turn into a false positive:
+        // a completed `⏺ … (1m 4s · 12.0k tokens)` row followed by a tip row
+        // carries the `⏺` glyph (not a spinner glyph), so it still reads idle.
+        let done_with_tip = "\
+⏺ Done. (1m 4s · 12.0k tokens)
+  ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents";
+        assert!(!has_live_spinner(done_with_tip));
+        assert!(!is_claude_working(done_with_tip));
     }
 
     #[test]
