@@ -126,39 +126,93 @@ type GhRunner = Arc<dyn Fn(&[&str]) -> Result<String> + Send + Sync>;
 //
 // A consumer crate (the CLI) needs to exercise its command paths — which resolve
 // a store from project config via `resolve_issue_store` and can't be handed a
-// store directly — against a GitHub backend without a network. A thread-local
-// override lets a test install a canned `gh` runner that every `GitHubStore::new`
-// on that thread picks up. Thread-local (not global) so parallel tests don't
-// clobber each other; gated to test builds so it never ships.
+// store directly — against a GitHub backend without a network. An override lets
+// a test install a canned `gh` runner that every `GitHubStore::new` picks up,
+// returning canned JSON instead of shelling out.
+//
+// It is **process-global** (not thread-local): a cached remote board refreshes
+// on a background thread that builds its *own* store via
+// [`crate::issue_store::build_store`] (see [`crate::issue_cache`]), so a
+// thread-local override the refresh thread can't see would let that thread make
+// a real `gh` call — the live-call-under-test bug this guards against. Every
+// test that installs a runner already serializes on the shared test lock, so a
+// process-global cell doesn't let parallel tests clobber each other. Gated to
+// test builds so it never ships.
 
 #[cfg(any(test, feature = "test-support"))]
-thread_local! {
-    static GH_RUNNER_OVERRIDE: std::cell::RefCell<Option<GhRunner>> =
-        const { std::cell::RefCell::new(None) };
-}
+static GH_RUNNER_OVERRIDE: std::sync::RwLock<Option<GhRunner>> =
+    std::sync::RwLock::new(None);
 
 #[cfg(any(test, feature = "test-support"))]
 fn test_gh_runner_override() -> Option<GhRunner> {
-    GH_RUNNER_OVERRIDE.with(|cell| cell.borrow().clone())
+    GH_RUNNER_OVERRIDE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
-/// Install a fake `gh` runner for the current thread: every [`GitHubStore`]
-/// built on this thread (including those resolved from project config through
-/// [`crate::resolve_issue_store`]) routes its `gh api` calls to `runner`, which
-/// returns canned JSON. Test-only. Pair with [`clear_test_gh_runner`] so the
-/// override doesn't leak into a later test reusing the thread.
+/// Install a fake `gh` runner process-wide: every [`GitHubStore`] built after
+/// this — including those resolved from project config through
+/// [`crate::resolve_issue_store`] and the ones the cache's background refresh
+/// thread builds — routes its `gh api` calls to `runner`, which returns canned
+/// JSON. Test-only. Pair with [`clear_test_gh_runner`] so the override doesn't
+/// leak into a later test.
 #[cfg(any(test, feature = "test-support"))]
 pub fn set_test_gh_runner<F>(runner: F)
 where
     F: Fn(&[&str]) -> Result<String> + Send + Sync + 'static,
 {
-    GH_RUNNER_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(Arc::new(runner)));
+    *GH_RUNNER_OVERRIDE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(runner));
 }
 
-/// Remove any thread-local `gh` runner installed by [`set_test_gh_runner`].
+/// Remove any `gh` runner installed by [`set_test_gh_runner`].
 #[cfg(any(test, feature = "test-support"))]
 pub fn clear_test_gh_runner() {
-    GH_RUNNER_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    *GH_RUNNER_OVERRIDE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+// --- test-support: the read-path rate-limit park is inert under test ----------
+//
+// [`park_aware_read`] reacts to a live `gh` 403 by (a) probing `/rate_limit`
+// (another live call), (b) parking the token in `gh-budget/`, and (c) appending
+// a `board rate-limited` line to `events.log`. Those writes are keyed off the
+// *current* process-wide `SHELBI_HOME`, so a background board-refresh thread
+// that raced a real 403 from a rate-limited developer token would scribble into
+// whichever test's home was mounted at that instant, poisoning an unrelated
+// test's `events.log` assertions (the 44-failure cascade this fixes). In a test
+// build those side effects are therefore suppressed by default; a test that
+// deliberately exercises the park opts in with `set_test_park_side_effects`.
+
+#[cfg(any(test, feature = "test-support"))]
+static TEST_PARK_SIDE_EFFECTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the read-path park may run its `/rate_limit` probe and write its
+/// shared state (`gh-budget/` + the `board rate-limited` events.log line).
+/// Always true in a shipped build; in a test build it is gated on the
+/// [`set_test_park_side_effects`] opt-in so a raced background refresh can't
+/// poison a sibling test's home.
+fn read_park_side_effects_enabled() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        TEST_PARK_SIDE_EFFECTS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        true
+    }
+}
+
+/// Opt a test into the read-path park's shared-state writes, which are
+/// otherwise inert under test (see [`read_park_side_effects_enabled`]). Pair the
+/// `true` call with a `false` reset so the opt-in doesn't leak into a later test.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_test_park_side_effects(on: bool) {
+    TEST_PARK_SIDE_EFFECTS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The GitHub issues backend. A cheap handle: it holds the `owner/repo`
@@ -1086,26 +1140,39 @@ fn park_aware_read(
     }
     let result = read_policy.run(|| run_gh_with_token(&token, args));
     if let Err(ref e) = result {
-        if crate::gh_retry::is_rate_limit_error(e) {
+        // `read_park_side_effects_enabled` is always true in a shipped build; in
+        // a test build it gates the whole block — the `/rate_limit` reset probe
+        // (itself a live `gh` call) and the home-keyed park writes — off the
+        // opt-in, so a raced background refresh never touches shared state.
+        if crate::gh_retry::is_rate_limit_error(e) && read_park_side_effects_enabled() {
             let reset = crate::gh_retry::rate_limit_reset_epoch(e, now)
                 .or_else(|| probe_core_reset_and_record(&token, &key))
                 .unwrap_or(now + crate::gh_budget::DEFAULT_PARK_SECS);
-            if crate::gh_budget::park(&key, reset, now) {
-                let until = DateTime::from_timestamp(reset, 0)
-                    .map(|dt| dt.to_rfc3339())
-                    .unwrap_or_default();
-                if let Err(ev) = crate::append_board_rate_limited_event(project, &until) {
-                    tracing::warn!(project = %project, error = %ev, "append_board_rate_limited_event failed");
-                }
-                tracing::warn!(
-                    project = %project,
-                    until = %until,
-                    "GitHub read rate-limited; parking board reads for this token until reset",
-                );
-            }
+            record_read_park(project, &key, reset, now);
         }
     }
     result
+}
+
+/// Park the token keyed by `key` until `reset` and, iff this call is the one
+/// that transitioned it to parked, append the single `board rate-limited`
+/// events.log line for the window. Split out of [`park_aware_read`] so the park
+/// bookkeeping is unit-testable without a live `gh` call, and so the test-build
+/// opt-in gate has one place to wrap.
+fn record_read_park(project: &str, key: &str, reset: i64, now: i64) {
+    if crate::gh_budget::park(key, reset, now) {
+        let until = DateTime::from_timestamp(reset, 0)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_default();
+        if let Err(ev) = crate::append_board_rate_limited_event(project, &until) {
+            tracing::warn!(project = %project, error = %ev, "append_board_rate_limited_event failed");
+        }
+        tracing::warn!(
+            project = %project,
+            until = %until,
+            "GitHub read rate-limited; parking board reads for this token until reset",
+        );
+    }
 }
 
 /// The typed error a parked read returns instead of calling `gh`. Its `stderr`
@@ -2521,6 +2588,57 @@ mod tests {
         assert_eq!(crate::get_task_assignment("test-project", "t").unwrap(), None);
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// The read-path park writes home-keyed shared state (`gh-budget/` + a
+    /// `board rate-limited` events.log line). Those writes must be **inert under
+    /// test by default** — a background board-refresh thread that raced a real
+    /// 403 must not scribble into whichever test's `SHELBI_HOME` is mounted —
+    /// and only fire when a test explicitly opts in. This is the guard that
+    /// broke the 44-failure cascade.
+    #[test]
+    fn read_path_park_is_inert_under_test_unless_opted_in() {
+        // Poison-tolerant so a panic in this test can't cascade PoisonError
+        // failures onto every later shelbi-state test that shares the lock.
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let key = crate::gh_budget::token_key("tok-park-inert");
+        let now = 1_000i64;
+        let reset = now + 3_600;
+
+        // Default in a test build: the gate is closed, so a caller that respects
+        // it (as `park_aware_read` does) performs no park and no events.log write.
+        assert!(
+            !read_park_side_effects_enabled(),
+            "park side effects must default off under test"
+        );
+
+        // Opt in: the bookkeeping parks the token and writes exactly one line.
+        set_test_park_side_effects(true);
+        assert!(read_park_side_effects_enabled());
+        record_read_park("park-inert-proj", &key, reset, now);
+        assert_eq!(
+            crate::gh_budget::parked_until(&key, now),
+            Some(reset),
+            "opting in must actually park the token"
+        );
+        let log = std::fs::read_to_string(crate::events_log_path().unwrap()).unwrap_or_default();
+        let hits = log
+            .lines()
+            .filter(|l| l.contains("project=park-inert-proj") && l.contains("board rate-limited"))
+            .count();
+        assert_eq!(hits, 1, "exactly one board rate-limited line per window");
+
+        // Reset the opt-in so it can't leak into a later test on this process.
+        set_test_park_side_effects(false);
+        assert!(!read_park_side_effects_enabled());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// A throwaway `SHELBI_HOME` for tests that exercise the local assignment

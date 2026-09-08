@@ -265,7 +265,7 @@ mod tests {
     /// needs a real project on disk to write `state.json`.
     #[test]
     fn parity_table_chords_route_to_expected_outcomes() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (km, _home) = defaults_with_home();
         let mut app = App::new_sidebar("demo");
 
@@ -351,7 +351,7 @@ mod tests {
     /// longer match anything in the sidebar mode.
     #[test]
     fn keys_yml_override_redirects_nav_up_and_unbinds_defaults() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::write(

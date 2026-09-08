@@ -55,7 +55,7 @@ pub use issue_auth::{
 };
 pub use github_store::GitHubStore;
 #[cfg(any(test, feature = "test-support"))]
-pub use github_store::{clear_test_gh_runner, set_test_gh_runner};
+pub use github_store::{clear_test_gh_runner, set_test_gh_runner, set_test_park_side_effects};
 pub use issue_migrate::{
     apply_issue_migration, plan_issue_migration, IssueMigrationPlan, MigrationControls,
     PartialMigration,

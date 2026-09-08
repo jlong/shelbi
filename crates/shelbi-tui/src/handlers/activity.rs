@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn alt_z_drives_global_zen_toggle_not_activity_filter() {
         use crate::test_support::ENV_LOCK;
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-altz-test-{}-{}",
             std::process::id(),

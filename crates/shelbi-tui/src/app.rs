@@ -2177,7 +2177,7 @@ mod tests {
 
     #[test]
     fn load_workspaces_surfaces_local_and_remote_with_in_progress_task() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -2244,7 +2244,7 @@ mod tests {
     /// GitHub is returning 403 to the background refresh.
     #[test]
     fn sidebar_sections_built_from_snapshot_when_live_read_fails() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -2254,13 +2254,15 @@ mod tests {
         let mut project = fixture_project();
         project.name = name.into();
         // Remote backend → reads go through the cache, which serves the on-disk
-        // snapshot on a cold process. A bogus repo guarantees any live refresh
-        // fails (the reported 403), proving the snapshot — not the wire — is
-        // what paints the sidebar.
+        // snapshot on a cold process. The repo is a placeholder never contacted:
+        // a fake `gh` runner (installed below) makes every live refresh fail
+        // deterministically offline, proving the snapshot — not the wire — is
+        // what paints the sidebar, with no dependency on the developer's GitHub
+        // quota. See the failed-live-read setup after `save_project`.
         project.issue_tracker = shelbi_core::IssueTrackerConfig {
             backend: shelbi_core::IssueTrackerBackend::Github,
             github: Some(shelbi_core::GithubConnection {
-                repo: "acme/does-not-exist".into(),
+                repo: "shelbi-test/offline-only".into(),
             }),
             ..Default::default()
         };
@@ -2273,6 +2275,20 @@ mod tests {
             slot: None,
         });
         shelbi_state::save_project(&project).unwrap();
+
+        // The failed live read, offline: a fake `gh` runner that always returns a
+        // rate-limit-shaped 403. It is installed process-wide, so the *background*
+        // board-refresh thread the cache spawns picks it up too — no unit test
+        // ever makes a real `gh` call, and the rate-limit response the developer's
+        // token would give during a quota window is reproduced deterministically
+        // without touching the network. Cleared before the test returns.
+        shelbi_state::set_test_gh_runner(|_| {
+            Err(shelbi_core::Error::Command {
+                cmd: "gh api ...".into(),
+                status: "HTTP 403".into(),
+                stderr: "API rate limit exceeded for user".into(),
+            })
+        });
 
         let now = Utc::now();
         let issue = |id: &str, column: Column, assigned_to: Option<&str>| IssueFile {
@@ -2334,6 +2350,7 @@ mod tests {
             "a review slot never surfaces under Workspaces"
         );
 
+        shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -2515,7 +2532,7 @@ mod tests {
     /// slots.
     #[test]
     fn load_workspaces_excludes_review_tagged_slots() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -2542,7 +2559,7 @@ mod tests {
 
     #[test]
     fn rows_include_workspaces_with_idle_and_working_badges() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -2707,7 +2724,7 @@ mod tests {
         //     "Ready for Review" too (already on a slot, surfaced immediately),
         //     but ▶ with no ✓ and no location.
         //   - Pending: not on a review slot at all → "Queued for Review" (·).
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         // A dedicated work_dir so the marker write lands in this test's sandbox.
@@ -2876,7 +2893,7 @@ mod tests {
         // read as Loading (its id doesn't match the marker) — surfaced under
         // Ready (it's already on a slot) but WITHOUT the ✓, never inheriting the
         // stale "serving" from the slot it landed on.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("work");
@@ -2985,7 +3002,7 @@ mod tests {
         // assigned to it) must not appear there — its capacity lives in the
         // Ready/Queued for Review sections instead. This exercises the
         // "project *with* review workspaces" branch of the criterion.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3127,7 +3144,7 @@ mod tests {
         // without indent — grouping carries no information so the sidebar
         // stays compact. Adding a second machine flips the layout into
         // the grouped form (covered by [`rows_include_workspaces_with_idle_and_working_badges`]).
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3161,7 +3178,7 @@ mod tests {
         // Both machines render expanded by default; the row carries the
         // counts even when expanded so the renderer can decide whether
         // to surface them.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3232,7 +3249,7 @@ mod tests {
         // `~/.shelbi/state.json::sidebar.collapsed_machines`, so a
         // fresh `App` reads it back on first refresh — that's the
         // `shelbi reload` survival path the spec calls out.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3295,7 +3312,7 @@ mod tests {
         // (active), 1 idle. Collapsing hub surfaces "(3, 2 active)" via
         // the row's total/active fields — that's the count the
         // renderer hangs off the header.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3385,7 +3402,7 @@ mod tests {
         // doesn't declare. The sidebar must load and render without
         // error, and the unknown entry stays on disk untouched so
         // re-adding the machine later restores the prior state.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3435,7 +3452,7 @@ mod tests {
         // `toggle_machine_collapsed`, not `activate_view` — Space and
         // Enter both flow through `activate_selection`, so this is the
         // behavior the keymap depends on.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3466,7 +3483,7 @@ mod tests {
         // `Row::MachineGroup` for its host and carries the `indent: true`
         // flag so the renderer can shift it right by the leading-space
         // amount the wireframe specifies.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3509,7 +3526,7 @@ mod tests {
         // assigned in-progress task) collapse to `agent: None` so the
         // renderer surfaces the "idle" placeholder rather than the
         // default agent.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3579,7 +3596,7 @@ mod tests {
         // active workspaces carry it. The renderer keys off `agent` being
         // `Some` / `None` — this test pins the data shape so a future
         // refactor can't silently render a placeholder agent on idle rows.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3636,7 +3653,7 @@ mod tests {
 
     #[test]
     fn workspace_badge_reflects_status_yaml_when_task_in_progress() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3702,7 +3719,7 @@ mod tests {
         // task and its latched AwaitingInput state. The stale `?` must not stick
         // on the row — the freshly-assigned slot reads Working until the poller
         // catches up (never the previous task's badge).
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3754,7 +3771,7 @@ mod tests {
 
     #[test]
     fn workspace_badge_shows_awaiting_permission_when_blocked() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3827,7 +3844,7 @@ mod tests {
         // A usage-limited workspace (status.yaml recorded Paused by the poller)
         // renders the ⏸ pause badge, distinct from working/idle/awaiting, so a
         // slot stalled on the clock is visible at a glance.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3882,7 +3899,7 @@ mod tests {
         // session, so even a still-assigned Review task (before the
         // orchestrator loads it onto a review workspace) reads Idle on the
         // workspace row — completion lives in the review sections instead.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3938,7 +3955,7 @@ mod tests {
         // status.yaml says working but no in-progress task is assigned —
         // probably a leftover from a finished task. Show idle so the user
         // isn't misled.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3970,7 +3987,7 @@ mod tests {
     fn nav_is_chat_tasks_activity_no_review_destination() {
         // The sidebar nav stays at three items — Review is surfaced
         // inline as a live list below, never as a destination.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -4002,7 +4019,7 @@ mod tests {
         // section — nothing is loaded onto a review worktree, so there's no
         // Ready section. The row is two-line: title on line 1, branch on
         // line 2 (the configured-prefix fallback since the task pins none).
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -4073,7 +4090,7 @@ mod tests {
 
     #[test]
     fn nav_down_skips_section_headers() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -4222,7 +4239,7 @@ mod tests {
 
     #[test]
     fn toggle_zen_mode_flips_and_writes_state_and_event() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -4263,7 +4280,7 @@ mod tests {
         // Paused isn't reachable via the hotkey, but state.json may already
         // be Paused from a CLI invocation; toggling there should mean
         // "give me the on path", matching the spec's binary-toggle wording.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 

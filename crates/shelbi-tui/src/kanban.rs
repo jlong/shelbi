@@ -3099,7 +3099,7 @@ mod tests {
 
     #[test]
     fn move_card_is_blocked_by_mismatched_daemon_without_mutating_task() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = IsolatedKanbanEnv::new("mismatch-move");
         crate::test_support::provision_hub_repo_for_project(&env.home, "demo");
 
@@ -3134,7 +3134,7 @@ mod tests {
 
     #[test]
     fn reorder_is_blocked_by_mismatched_daemon_without_mutating_priorities() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = IsolatedKanbanEnv::new("mismatch-reorder");
         crate::test_support::provision_hub_repo_for_project(&env.home, "demo");
 
@@ -3174,7 +3174,7 @@ mod tests {
     /// live event tail picks up board nudges from the TUI.
     #[test]
     fn move_card_appends_user_tui_event() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-tui-move-card-{}-{}",
             std::process::id(),
@@ -3253,7 +3253,7 @@ mod tests {
     /// on the moved task while the board selection follows it.
     #[test]
     fn popover_move_right_persists_emits_event_and_keeps_popover_open() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-tui-popover-move-{}-{}",
             std::process::id(),
@@ -3572,7 +3572,7 @@ mod tests {
     /// the schema stays a plain `Option<String>`.
     #[test]
     fn apply_filter_persists_to_state_json_and_refresh_restores() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-tui-workspace-filter-{}-{}",
             std::process::id(),
@@ -3747,7 +3747,7 @@ mod tests {
         // cleared the filter they had just written into *their* temp home
         // (both use project "demo"), so hold `ENV_LOCK` and write into a
         // throwaway home of our own.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-tui-dropdown-clear-{}-{}",
             std::process::id(),
@@ -4815,7 +4815,7 @@ mod tests {
     /// can't be written to the cross-session state file.
     #[test]
     fn apply_workflow_filter_does_not_write_state_json() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = std::env::temp_dir().join(format!(
             "shelbi-kanban-workflow-filter-noop-persist-{}-{}",
             std::process::id(),
@@ -5292,7 +5292,7 @@ mod tests {
     /// each click alternates between the two explicit states.
     #[test]
     fn toggle_column_alternates_explicit_states() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-tui-toggle-column-{}-{}",
             std::process::id(),
@@ -5326,7 +5326,7 @@ mod tests {
     /// `refresh` rehydrates the same state.
     #[test]
     fn explicit_overrides_persist_across_app_restart() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-tui-column-override-persist-{}-{}",
             std::process::id(),
@@ -5367,7 +5367,7 @@ mod tests {
     /// instead of falling back to Auto.
     #[test]
     fn all_view_toggle_uses_project_default_workflow_key() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-tui-default-workflow-column-override-{}-{}",
             std::process::id(),
@@ -5466,7 +5466,7 @@ mod tests {
     /// must not auto-expand just because a card showed up.
     #[test]
     fn explicit_collapse_persists_when_tasks_arrive() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-tui-explicit-collapse-arrival-{}-{}",
             std::process::id(),
