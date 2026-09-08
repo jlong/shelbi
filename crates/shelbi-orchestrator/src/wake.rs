@@ -2736,8 +2736,11 @@ fn scan_batch(project: &Project, from: u64) -> Result<Option<QueuedBatch>> {
         return Ok(None);
     }
 
+    // "In flight" is a Ready/Active/Handoff card — all non-terminal — so the
+    // open-only read is the right, cheap scope (terminal history can't be in
+    // flight).
     let board_in_flight = shelbi_state::issue_store_for_project(project)?
-        .list()?
+        .list_open()?
         .iter()
         .any(|task| {
         matches!(

@@ -317,12 +317,18 @@ impl GitHubStore {
         let out = (self.gh)(&args)?;
         parse_jsonl(&out)
     }
-}
 
-impl IssueStore for GitHubStore {
-    fn list(&self) -> Result<Vec<IssueFile>> {
+    /// List the repo's issues at a single GitHub `state` (`open` / `closed` /
+    /// `all`), mapped onto `IssueFile`s with the local assignment overlay folded
+    /// in and the board sorted into canonical order. The shared core of
+    /// [`GitHubStore::list`], [`GitHubStore::list_open`] and
+    /// [`GitHubStore::list_in_status`], which differ only in the `-f state=` they
+    /// send — the whole point of the split is that a render/poll read pulls one
+    /// page of open issues, not the six-page `state=all` history.
+    fn list_with_state(&self, state: &str) -> Result<Vec<IssueFile>> {
         let path = format!("repos/{}/issues", self.repo);
-        let issues = self.api_issues(&path, &["-f", "state=all", "-f", "per_page=100"])?;
+        let state_arg = format!("state={state}");
+        let issues = self.api_issues(&path, &["-f", &state_arg, "-f", "per_page=100"])?;
         // Fold the local assignment overlay onto every issue in one read, rather
         // than statting a marker file per card.
         let assignments = crate::task_assignments(&self.project)?;
@@ -338,14 +344,41 @@ impl IssueStore for GitHubStore {
         sort_board(&mut out);
         Ok(out)
     }
+}
+
+impl IssueStore for GitHubStore {
+    fn list(&self) -> Result<Vec<IssueFile>> {
+        // Full history — `state=all`, a ~six-page sweep on a large board. Kept
+        // for the migrate / reconcile / dependency-resolution paths that
+        // genuinely need every issue, closed ones included; no render or poll
+        // path calls this. Those read [`GitHubStore::list_open`] (or a
+        // [`GitHubStore::list_in_status`] scoped by state), which request only
+        // the open (or only the closed) issues they need.
+        self.list_with_state("all")
+    }
+
+    fn list_open(&self) -> Result<Vec<IssueFile>> {
+        // Everything on the board except history. A closed GitHub issue always
+        // maps to a terminal `done`/`canceled` status (see the module doc), so
+        // `state=open` is exactly the non-terminal board the pollers, sidebar,
+        // `zen scan`, orchestrator drain and unfiltered `issue list` render and
+        // route from — one page for a board under 100 open issues, versus the
+        // six-page `state=all` sweep every one of them used to pay.
+        self.list_with_state("open")
+    }
 
     fn list_in_status(&self, status: &Column) -> Result<Vec<IssueFile>> {
-        // Client-side filter of the full board: the status lives in a label we
-        // already parse, and this keeps a single mapping path (no second query
-        // shape to keep in sync). `list` has already applied the assignment
-        // overlay, so the conflict/active-workspace scans see the owner.
+        // A closed issue is always terminal (`done`/`canceled`); an open issue
+        // never is. So a terminal-status query needs only the closed issues and
+        // any other status needs only the open ones — never the whole
+        // `state=all` history. Request exactly that state, then filter in
+        // memory: the status lives in a label we already parse, so this keeps a
+        // single mapping path (no second query shape to keep in sync), and the
+        // read has already applied the assignment overlay so the
+        // conflict/active-workspace scans see the owner.
+        let state = if is_terminal(status) { "closed" } else { "open" };
         Ok(self
-            .list()?
+            .list_with_state(state)?
             .into_iter()
             .filter(|tf| tf.task.column == *status)
             .collect())
@@ -1692,6 +1725,98 @@ mod tests {
         let board = store.list().unwrap();
         assert_eq!(board.len(), 1);
         assert_eq!(board[0].task.id, "real");
+    }
+
+    /// A store whose `gh` runner records every call (space-joined) and answers
+    /// any issues query with `issues_json`. Returns the store and the shared
+    /// call log so a test can assert the exact `-f state=…` each read path
+    /// sends.
+    fn recording_reader(
+        issues_json: &'static str,
+    ) -> (GitHubStore, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            Ok(issues_json.to_string())
+        });
+        (store, calls)
+    }
+
+    /// The `gh api` issues-list calls recorded so far (a GET on the issues
+    /// endpoint, excluding per-issue comment fetches).
+    fn issues_list_calls(calls: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.contains("repos/owner/repo/issues") && !c.contains("/comments"))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn list_in_status_requests_state_open_for_non_terminal() {
+        // Every non-terminal status is served from the open issues alone — one
+        // `state=open` list call, never the six-page `state=all` history.
+        for col in [
+            Column::backlog(),
+            Column::todo(),
+            Column::in_progress(),
+            Column::review(),
+        ] {
+            let (store, calls) = recording_reader("");
+            store.list_in_status(&col).unwrap();
+            let list_calls = issues_list_calls(&calls);
+            assert_eq!(list_calls.len(), 1, "{col}: exactly one list call");
+            let call = &list_calls[0];
+            assert!(call.contains("state=open"), "{col}: {call}");
+            assert!(!call.contains("state=all"), "{col} must not sweep all: {call}");
+            assert!(
+                !call.contains("state=closed"),
+                "{col} must not request closed: {call}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_in_status_requests_state_closed_for_terminal() {
+        // The terminal lanes (`done`/`canceled`) are history — they read the
+        // closed issues, never `state=all`, never `state=open`.
+        for col in [Column::done(), Column::canceled()] {
+            let (store, calls) = recording_reader("");
+            store.list_in_status(&col).unwrap();
+            let list_calls = issues_list_calls(&calls);
+            assert_eq!(list_calls.len(), 1, "{col}: exactly one list call");
+            let call = &list_calls[0];
+            assert!(call.contains("state=closed"), "{col}: {call}");
+            assert!(!call.contains("state=all"), "{col} must not sweep all: {call}");
+            assert!(
+                !call.contains("state=open"),
+                "{col} must not request open: {call}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_open_requests_state_open() {
+        let (store, calls) = recording_reader("");
+        store.list_open().unwrap();
+        let list_calls = issues_list_calls(&calls);
+        assert_eq!(list_calls.len(), 1);
+        assert!(list_calls[0].contains("state=open"), "{}", list_calls[0]);
+        assert!(!list_calls[0].contains("state=all"), "{}", list_calls[0]);
+    }
+
+    #[test]
+    fn list_keeps_the_full_state_all_sweep() {
+        // `list` still carries its full-history contract for migrate / reconcile
+        // callers — the one path that requests every issue.
+        let (store, calls) = recording_reader("");
+        store.list().unwrap();
+        let list_calls = issues_list_calls(&calls);
+        assert_eq!(list_calls.len(), 1);
+        assert!(list_calls[0].contains("state=all"), "{}", list_calls[0]);
     }
 
     #[test]

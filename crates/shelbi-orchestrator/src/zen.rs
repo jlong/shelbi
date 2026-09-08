@@ -1029,7 +1029,9 @@ fn ci_should_emit(prev: Option<&(String, String)>, head_sha: &str, conclusion: &
 /// the whole sweep.
 fn in_review_tasks_with_branch(project: &Project) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
-    for tf in shelbi_state::issue_store_for_project(project)?.list()? {
+    // Only Handoff-category (review) tasks are kept below, and those are always
+    // open, so the cheap open-only read suffices.
+    for tf in shelbi_state::issue_store_for_project(project)?.list_open()? {
         let workflow = load_task_workflow(&project.name, &tf.task);
         let workflow_ref = workflow.as_ref();
         let status = workflow_ref.and_then(|w| resolve_task_status(&tf.task, w));
@@ -1210,7 +1212,10 @@ fn auto_reconcile_target(workflow: &Workflow, from: &str) -> Option<(String, Col
 /// is skipped rather than failing the whole sweep.
 fn github_merge_reconcile_candidates(project: &Project) -> Result<Vec<GithubReconcileCandidate>> {
     let mut out = Vec::new();
-    for tf in shelbi_state::issue_store_for_project(project)?.list()? {
+    // Reconcile candidates are Handoff-category tasks awaiting an out-of-band
+    // merge — all still open — so the open-only read is the right, cheap scope
+    // here (a task that already reconciled to `done` needs no further action).
+    for tf in shelbi_state::issue_store_for_project(project)?.list_open()? {
         // Fall back to the default workflow when the task's workflow can't be
         // loaded — the same resilience [`crate::review_ui::approve_review_task`]
         // and the ready-handoff path use, so a transient workflow-YAML issue
@@ -12388,8 +12393,9 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
     // 2. Handoff-category probes — action-based bar gated by the task's
     //    workflow. Filter is on the resolved workflow status's category
     //    rather than `Column::review()` so custom workflows with renamed
-    //    handoff statuses still get probed.
-    for tf in shelbi_state::issue_store_for_project(project)?.list()? {
+    //    handoff statuses still get probed. Handoff tasks are always open, so
+    //    the open-only read is the right, cheap scope.
+    for tf in shelbi_state::issue_store_for_project(project)?.list_open()? {
         let workflow = load_task_workflow(&project.name, &tf.task);
         let workflow_ref = workflow.as_ref();
         let status = workflow_ref.and_then(|w| resolve_task_status(&tf.task, w));

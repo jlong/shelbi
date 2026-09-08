@@ -921,8 +921,12 @@ struct ProjectScope {
 
 impl ProjectScope {
     fn load(project: &str) -> Result<Self> {
+        // The id set is only a compatibility fallback for legacy log lines that
+        // predate `project=` scoping (see `line_belongs_to_project`); the modern
+        // path keys off the `project=` field directly. Those legacy lines are
+        // about active work, so the open-only read is the right, cheap scope.
         let task_ids = shelbi_state::issue_store_for(project)
-            .and_then(|s| s.list())
+            .and_then(|s| s.list_open())
             .map_err(|e| anyhow!(e))?
             .into_iter()
             .map(|tf| tf.task.id)

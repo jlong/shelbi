@@ -573,14 +573,27 @@ fn list(
     // `in-progress`.
     let filter = status_filter.map(Column::from_status_id);
 
-    let all = cached_issue_store(project)?.list().map_err(|e| anyhow!(e))?;
+    // Read only the state the view needs, never the whole `state=all` history:
+    // a status filter reads exactly that column (`list_in_status` requests
+    // `state=closed` for the terminal `done`/`canceled` lanes and `state=open`
+    // otherwise), and the unfiltered board reads the open issues alone. On a
+    // remote backend a closed issue is always terminal, so an unfiltered
+    // listing shows the live board and leaves the `done`/`canceled` history to
+    // an explicit `--status done|canceled`.
+    let store = cached_issue_store(project)?;
+    let all = match &filter {
+        Some(col) => store.list_in_status(col).map_err(|e| anyhow!(e))?,
+        None => store.list_open().map_err(|e| anyhow!(e))?,
+    };
     if all.is_empty() {
         println!("(no issues yet)");
         return Ok(());
     }
-    // Blocked-status lookup is computed against the unfiltered issue set:
-    // a workflow filter can hide a dependency target without changing
-    // whether the visible issue is actually blocked.
+    // Blocked-status lookup is computed against the issue set read above. On the
+    // open-only read a dependency that is already `done` is absent, so a task
+    // waiting only on completed work can show the 🔒 badge even though it is
+    // ready — an acceptable cosmetic trade for not sweeping the closed history
+    // on every listing.
     let columns: std::collections::HashMap<String, Column> = all
         .iter()
         .map(|tf| (tf.task.id.clone(), tf.task.column.clone()))

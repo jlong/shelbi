@@ -1139,14 +1139,19 @@ fn board_is_quiescent(project: &Project) -> bool {
     tasks_are_quiescent(&tasks)
 }
 
-/// The whole board for `project`, read through its configured (cached)
+/// The board's non-terminal issues for `project`, read through its configured
 /// [`IssueStore`] (so a `github` backend is honored, not the local filesystem).
+///
+/// Backs quiescence and active-workspace scans, which only ever look at active
+/// cards, so it takes the cheap open-only read ([`IssueStore::list_open`] —
+/// `state=open` on GitHub) rather than sweeping the `done`/`canceled` history.
+///
 /// Goes through [`shelbi_state::issue_store_for_project`] (the already-loaded
 /// `&Project`'s config, no redundant YAML re-read) so every poll/render/list read
 /// shares the one process-local `CachedIssueStore` — served from, and degrading
 /// identically off, the same snapshot the sidebar and Issues board use.
 fn list_issues(project: &Project) -> shelbi_core::Result<Vec<shelbi_state::IssueFile>> {
-    shelbi_state::issue_store_for_project(project)?.list()
+    shelbi_state::issue_store_for_project(project)?.list_open()
 }
 
 /// The whole board **only when it is a warm read** ([`shelbi_state::BoardState::Warm`]):
@@ -4228,12 +4233,15 @@ fn workspace_orphaned_by_board(
 }
 
 fn current_task_for(project: &Project, workspace_name: &str) -> Option<String> {
+    // Only an active card counts here, so the open-only board is enough — no
+    // reason to sweep the terminal history.
+    //
     // `issue_store_for_project` with the already-loaded `&Project` (no redundant
     // YAML re-read). It wraps the same process-local `CachedIssueStore` as the
     // sidebar's reads, so on a failed live refresh the poller keeps observing
     // the slot's last-known task from the snapshot rather than reading empty.
     shelbi_state::issue_store_for_project(project)
-        .and_then(|s| s.list())
+        .and_then(|s| s.list_open())
         .ok()?
         .into_iter()
         .find(|tf| {
