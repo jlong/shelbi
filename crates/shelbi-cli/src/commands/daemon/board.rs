@@ -1,0 +1,510 @@
+//! Hub-owned board-index refresh: the daemon is the single board reader per
+//! hub. Phase 1 of `Plans/github-issue-caching-and-rate-limits.md` §5.
+//!
+//! One [refresh loop](spawn_refresh_manager) per open project reads the board
+//! through the (uncached) store on the project's `issue_tracker.refresh_secs`
+//! cadence and publishes it to `<project_dir>/board-index.json`
+//! ([`shelbi_state::board_index`]). It appends a `board refreshed=<ts>
+//! changed=<n>` line to `events.log` **only when the board actually changed**,
+//! so a quiet board is silent. The file itself is rewritten every tick, so its
+//! `fetched_at` (and mtime) advance on the interval and stay a live freshness
+//! signal even when nothing moved.
+//!
+//! A [`refresh-board <project>`](BoardRefresher::refresh_now) hub message forces
+//! an immediate refresh and replies with the new `fetched_at`; callers wait at
+//! most two seconds for it.
+//!
+//! ## What this slice does *not* do
+//!
+//! Consumers still read the board through their own process caches — switching
+//! them to `board-index.json` is a follow-up (`gh-cache-p1-consumers-read-index`),
+//! as is write-through on mutations. Only remote backends are refreshed; a
+//! `file_system` project's local read is free and needs no daemon.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Result};
+
+use shelbi_state::board_index::{self, BoardIndex};
+use shelbi_state::IssueStore;
+
+/// How often the refresh manager wakes to re-discover open projects and run any
+/// whose per-project interval has elapsed. Far shorter than the default
+/// `refresh_secs` (30s) so a freshly opened project starts refreshing within a
+/// couple of seconds; the per-project interval gate keeps the actual backend
+/// reads on the configured cadence, not on this slice.
+const MANAGER_TICK: Duration = Duration::from_secs(2);
+
+/// Slice the manager sleeps in so a stop signal is noticed within ~250ms rather
+/// than up to a full [`MANAGER_TICK`].
+const STOP_POLL_SLICE: Duration = Duration::from_millis(250);
+
+/// The outcome of one board refresh: the `fetched_at` written and how many
+/// issues changed since the previously published index.
+struct RefreshOutcome {
+    fetched_at: String,
+    changed: usize,
+}
+
+/// Shared, cloneable handle to the daemon's board-refresh machinery. Held by
+/// both the manager loop and every `refresh-board` socket handler so the two
+/// never double-read the same project: each refresh takes that project's
+/// single-flight lock.
+#[derive(Clone, Default)]
+pub(super) struct BoardRefresher {
+    /// Per-project single-flight locks, minted on first use. The outer map is
+    /// only ever locked briefly to fetch (or create) a project's lock; the
+    /// actual refresh holds the inner per-project lock, so refreshes of
+    /// *different* projects still run concurrently.
+    locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+impl BoardRefresher {
+    /// The single-flight lock for `project`, created on first request. A
+    /// poisoned outer map is recovered rather than propagated — worst case is a
+    /// throwaway lock and a possible duplicate read, never a wedged daemon.
+    fn lock_for(&self, project: &str) -> Arc<Mutex<()>> {
+        let mut guard = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(guard.entry(project.to_string()).or_default())
+    }
+
+    /// Refresh `project` now, blocking on its single-flight lock so a concurrent
+    /// tick can't double-read: build the uncached store, publish the index, and
+    /// return the outcome (the new `fetched_at` and the change count).
+    fn refresh(&self, project: &str) -> Result<RefreshOutcome> {
+        let lock = self.lock_for(project);
+        let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let store = shelbi_state::raw_issue_store_for(project).map_err(|e| anyhow!(e))?;
+        refresh_with_store(project, store.as_ref())
+    }
+
+    /// Refresh now and return just the new `fetched_at` — the `refresh-board`
+    /// hub verb's reply. The caller waits at most two seconds for it.
+    pub(super) fn refresh_now(&self, project: &str) -> Result<String> {
+        Ok(self.refresh(project)?.fetched_at)
+    }
+
+    /// A tick-driven refresh: errors are logged and swallowed, since a single
+    /// failed tick must not take the manager loop down — the previous index
+    /// stays in place and the next tick tries again.
+    fn tick(&self, project: &str) {
+        match self.refresh(project) {
+            Ok(out) if out.changed > 0 => {
+                tracing::debug!(project, changed = out.changed, "shelbi daemon: board refreshed")
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(project, error = %e, "shelbi daemon: board refresh tick failed")
+            }
+        }
+    }
+}
+
+/// Read `project`'s board through `store`, publish it to `board-index.json`, and
+/// emit a `board refreshed=<ts> changed=<n>` event **iff** the board changed.
+///
+/// The file is rewritten every call (so `fetched_at`/mtime advance and stay a
+/// live freshness signal), but the events.log line is gated on a real change so
+/// a quiet board produces no log noise. Split from the store construction so it
+/// is unit-testable with a fake [`IssueStore`].
+fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOutcome> {
+    let board = store.list_open().map_err(|e| anyhow!(e))?;
+    let previous = board_index::read_board_index(project);
+    let changed = board_index::board_diff_count(previous.as_ref().map(|p| p.board.as_slice()), &board);
+
+    let index = BoardIndex::fresh(board);
+    board_index::write_board_index(project, &index).map_err(|e| anyhow!(e))?;
+
+    if changed > 0 {
+        emit_board_refreshed(project, &index.fetched_at, changed);
+    }
+    Ok(RefreshOutcome {
+        fetched_at: index.fetched_at,
+        changed,
+    })
+}
+
+/// Append the `board refreshed=<ts> changed=<n>` line for `project`.
+/// Best-effort: a failed events append is logged, never propagated — the index
+/// file is the durable artifact, the event is the orchestrator's nudge.
+fn emit_board_refreshed(project: &str, fetched_at: &str, changed: usize) {
+    let body = format!("project={project} board refreshed={fetched_at} changed={changed}");
+    if let Err(e) = shelbi_state::append_external_event(&body) {
+        tracing::debug!(project, error = %e, "shelbi daemon: failed to append board-refreshed event");
+    }
+}
+
+/// Spawn the board-refresh manager thread. Wakes every [`MANAGER_TICK`],
+/// discovers open projects on a remote backend, and refreshes any whose
+/// per-project interval has elapsed. Exits when the shared stop flag is set
+/// (the same flag the accept loop and reaper watch, so one signal stops all).
+pub(super) fn spawn_refresh_manager(refresher: BoardRefresher, stop: Arc<AtomicBool>) {
+    thread::Builder::new()
+        .name("shelbi-board-refresh-mgr".into())
+        .spawn(move || refresh_manager_loop(&refresher, &stop))
+        .ok();
+}
+
+fn refresh_manager_loop(refresher: &BoardRefresher, stop: &AtomicBool) {
+    // Last successful/attempted refresh time per project, so each project ticks
+    // on its own configured interval rather than on MANAGER_TICK.
+    let mut last: HashMap<String, Instant> = HashMap::new();
+    while !stop.load(Ordering::SeqCst) {
+        let open = open_remote_projects();
+        for project in &open {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let interval = refresh_interval_for(project);
+            let due = last.get(project).map_or(true, |t| t.elapsed() >= interval);
+            if due {
+                refresher.tick(project);
+                last.insert(project.clone(), Instant::now());
+            }
+        }
+        // Drop tracking for projects that have closed, so a reopen refreshes
+        // immediately rather than waiting out its stale last-tick time.
+        let open_set: std::collections::HashSet<&String> = open.iter().collect();
+        last.retain(|p, _| open_set.contains(p));
+        sleep_until_stop(MANAGER_TICK, stop);
+    }
+}
+
+/// Sleep up to `total`, waking early (within [`STOP_POLL_SLICE`]) when `stop`
+/// is set — the manager's responsiveness to SIGTERM.
+fn sleep_until_stop(total: Duration, stop: &AtomicBool) {
+    let mut waited = Duration::ZERO;
+    while waited < total && !stop.load(Ordering::SeqCst) {
+        thread::sleep(STOP_POLL_SLICE);
+        waited += STOP_POLL_SLICE;
+    }
+}
+
+/// The configured board-index refresh interval for `project`, defaulting when
+/// the project can't be loaded (transient during teardown) so a bad read just
+/// uses the standard cadence rather than hammering or stalling.
+fn refresh_interval_for(project: &str) -> Duration {
+    let secs = shelbi_state::load_project(project)
+        .map(|p| p.issue_tracker.refresh_interval_secs())
+        .unwrap_or(shelbi_core::DEFAULT_ISSUE_REFRESH_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Open projects (a live `shelbi-<name>` tmux session) whose issue tracker is a
+/// remote backend — the only ones a daemon refresh helps. A `file_system`
+/// project's board is a free local read and is skipped. tmux being unreachable
+/// (an empty listing) resolves to "no open projects": consumers then keep
+/// reading through their per-process caches, degraded but safe.
+fn open_remote_projects() -> Vec<String> {
+    open_project_names()
+        .into_iter()
+        .filter(|p| project_uses_remote_backend(p))
+        .collect()
+}
+
+/// True when `project`'s configured backend is remote (github / jira / linear).
+/// A load failure reads as "not remote" so a half-written config during
+/// teardown never trips a refresh.
+fn project_uses_remote_backend(project: &str) -> bool {
+    shelbi_state::load_project(project)
+        .map(|p| p.issue_tracker.backend.is_remote())
+        .unwrap_or(false)
+}
+
+/// Project names with a live `shelbi-<name>` tmux session. Mirrors the
+/// discovery `shelbi quit` uses; the hidden `_shelbi-<name>` stash sessions are
+/// excluded (their prefix is `_shelbi-`, not `shelbi-`). Empty when tmux is
+/// unreachable.
+fn open_project_names() -> Vec<String> {
+    let listing = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    parse_open_project_names(&listing)
+}
+
+/// Extract `<name>` from each `shelbi-<name>` session line, skipping the
+/// `_shelbi-` stash sessions, blanks, and the prefix-only `shelbi-` line.
+fn parse_open_project_names(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let name = line.trim();
+            let rest = name.strip_prefix("shelbi-")?;
+            if rest.is_empty() {
+                None
+            } else {
+                Some(rest.to_string())
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shelbi_core::{Column, Issue, Result as CoreResult};
+    use shelbi_state::issue_store::{
+        Cursor, IssueChange, IssueComment, IssueFields, NewIssue, PrioMove, StatusMove,
+    };
+    use shelbi_state::IssueFile;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A fake store returning a fixed open board and counting `list_open`
+    /// calls, so a test can drive the refresh without a real backend.
+    struct FakeStore {
+        board: Vec<IssueFile>,
+        opens: Arc<AtomicUsize>,
+    }
+
+    fn issue(id: &str, column: &str, priority: u32) -> IssueFile {
+        let task: Issue = serde_yaml::from_str(&format!(
+            "id: {id}\ntitle: {id}\ncolumn: {column}\npriority: {priority}\n\
+             created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n"
+        ))
+        .expect("issue fixture parses");
+        IssueFile {
+            task,
+            body: String::new(),
+        }
+    }
+
+    impl IssueStore for FakeStore {
+        fn list(&self) -> CoreResult<Vec<IssueFile>> {
+            Ok(self.board.clone())
+        }
+        fn list_open(&self) -> CoreResult<Vec<IssueFile>> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(self.board.clone())
+        }
+        fn list_in_status(&self, status: &Column) -> CoreResult<Vec<IssueFile>> {
+            Ok(self
+                .board
+                .iter()
+                .filter(|f| &f.task.column == status)
+                .cloned()
+                .collect())
+        }
+        fn get(&self, _id: &str) -> CoreResult<Option<IssueFile>> {
+            Ok(None)
+        }
+        fn add(&self, _s: NewIssue) -> CoreResult<Issue> {
+            unreachable!()
+        }
+        fn move_status(&self, _i: &str, _t: &Column, _r: &str) -> CoreResult<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn set_priority(&self, _i: &str, _p: PrioMove) -> CoreResult<()> {
+            Ok(())
+        }
+        fn set_fields(&self, _i: &str, _f: IssueFields) -> CoreResult<()> {
+            Ok(())
+        }
+        fn cancel(&self, _i: &str, _r: &str) -> CoreResult<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn move_status_and_unassign(
+            &self,
+            _i: &str,
+            _t: &Column,
+            _r: &str,
+        ) -> CoreResult<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn delete(&self, _id: &str) -> CoreResult<()> {
+            Ok(())
+        }
+        fn renumber(&self, _s: &Column) -> CoreResult<()> {
+            Ok(())
+        }
+        fn park_review(&self, _id: &str) -> CoreResult<Option<String>> {
+            Ok(None)
+        }
+        fn clear_parked(&self, _id: &str) -> CoreResult<()> {
+            Ok(())
+        }
+        fn reject_review(
+            &self,
+            _i: &str,
+            _r: &Column,
+            _s: &str,
+            _d: &str,
+        ) -> CoreResult<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn poll_changes(&self, _s: &Cursor) -> CoreResult<(Vec<IssueChange>, Cursor)> {
+            Ok((Vec::new(), Cursor::start()))
+        }
+        fn list_comments(&self, _id: &str) -> CoreResult<Vec<IssueComment>> {
+            Ok(Vec::new())
+        }
+        fn add_comment(&self, _id: &str, _b: &str) -> CoreResult<IssueComment> {
+            unreachable!()
+        }
+    }
+
+    /// RAII guard pointing `$SHELBI_HOME` at a fresh temp dir so a test's board
+    /// index and events.log writes land in isolation, never in the developer's
+    /// real `~/.shelbi`. Holds the shared ENV_LOCK because `set_var` is
+    /// process-global and tests run in parallel.
+    struct IsolatedHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+        home: PathBuf,
+    }
+    impl IsolatedHome {
+        fn new(tag: &str) -> Self {
+            let lock = crate::commands::test_support::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let home = std::env::temp_dir().join(format!(
+                "shelbi-board-daemon-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&home).unwrap();
+            let prev = std::env::var("SHELBI_HOME").ok();
+            std::env::set_var("SHELBI_HOME", &home);
+            Self {
+                _lock: lock,
+                prev,
+                home,
+            }
+        }
+    }
+    impl Drop for IsolatedHome {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("SHELBI_HOME", v),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    fn fake(board: Vec<IssueFile>) -> (FakeStore, Arc<AtomicUsize>) {
+        let opens = Arc::new(AtomicUsize::new(0));
+        (
+            FakeStore {
+                board,
+                opens: Arc::clone(&opens),
+            },
+            opens,
+        )
+    }
+
+    fn events_lines() -> Vec<String> {
+        std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn first_refresh_writes_the_index_and_emits_one_changed_line() {
+        let _iso = IsolatedHome::new("first");
+        let (store, opens) = fake(vec![issue("a", "todo", 0), issue("b", "review", 0)]);
+        let out = refresh_with_store("proj", &store).unwrap();
+        assert_eq!(opens.load(Ordering::SeqCst), 1, "one backend read");
+        assert_eq!(out.changed, 2, "a cold first tick counts every issue new");
+
+        // The index file exists and holds the board + a matching fetched_at.
+        let idx = board_index::read_board_index("proj").expect("index written");
+        assert_eq!(idx.board.len(), 2);
+        assert_eq!(idx.fetched_at, out.fetched_at);
+        assert!(!idx.stale);
+
+        // Exactly one `board refreshed` line, carrying the project + count.
+        let refreshed: Vec<_> = events_lines()
+            .into_iter()
+            .filter(|l| l.contains("board refreshed="))
+            .collect();
+        assert_eq!(refreshed.len(), 1, "one refreshed line: {refreshed:?}");
+        assert!(refreshed[0].contains("project=proj"), "{}", refreshed[0]);
+        assert!(refreshed[0].contains("changed=2"), "{}", refreshed[0]);
+    }
+
+    #[test]
+    fn a_quiet_tick_rewrites_the_file_but_emits_no_line() {
+        let _iso = IsolatedHome::new("quiet");
+        let (store, _) = fake(vec![issue("a", "todo", 0)]);
+        // Prime the index.
+        let first = refresh_with_store("proj", &store).unwrap();
+        assert_eq!(first.changed, 1);
+
+        // Second tick over an unchanged board: no new event, but fetched_at
+        // advances so the file stays a live freshness signal.
+        std::thread::sleep(Duration::from_millis(5));
+        let second = refresh_with_store("proj", &store).unwrap();
+        assert_eq!(second.changed, 0, "an unchanged board reports no change");
+        assert_ne!(
+            second.fetched_at, first.fetched_at,
+            "fetched_at advances every tick even when quiet"
+        );
+
+        // A third quiet tick, then assert still exactly one refreshed line
+        // total (only the first, changed tick emitted).
+        let third = refresh_with_store("proj", &store).unwrap();
+        assert_eq!(third.changed, 0);
+        let refreshed = events_lines()
+            .into_iter()
+            .filter(|l| l.contains("board refreshed="))
+            .count();
+        assert_eq!(refreshed, 1, "two quiet ticks add no lines");
+    }
+
+    #[test]
+    fn a_changed_board_emits_exactly_one_line_on_the_next_tick() {
+        let _iso = IsolatedHome::new("changed");
+        // Prime with one board.
+        let (store, _) = fake(vec![issue("a", "todo", 0)]);
+        refresh_with_store("proj", &store).unwrap();
+
+        // Now the board moves: `a` changes column. A fresh store models the
+        // next tick reading the moved board.
+        let (moved, _) = fake(vec![issue("a", "in_progress", 0)]);
+        let out = refresh_with_store("proj", &moved).unwrap();
+        assert_eq!(out.changed, 1, "one issue moved");
+
+        let refreshed = events_lines()
+            .into_iter()
+            .filter(|l| l.contains("board refreshed="))
+            .count();
+        assert_eq!(
+            refreshed, 2,
+            "the priming tick and the move each emit exactly one line"
+        );
+    }
+
+    #[test]
+    fn refresher_single_flights_per_project_lock() {
+        // The same project hands back the same lock (single-flight); a
+        // different project gets a distinct one (so unrelated projects refresh
+        // concurrently).
+        let r = BoardRefresher::default();
+        let a1 = r.lock_for("alpha");
+        let a2 = r.lock_for("alpha");
+        let b = r.lock_for("bravo");
+        assert!(Arc::ptr_eq(&a1, &a2), "same project ⇒ same lock");
+        assert!(!Arc::ptr_eq(&a1, &b), "different project ⇒ different lock");
+    }
+
+    #[test]
+    fn parse_open_project_names_strips_prefix_and_skips_stash() {
+        let listing = "shelbi-alpha\n_shelbi-alpha\nplain\nshelbi-\n   shelbi-bravo\n";
+        assert_eq!(parse_open_project_names(listing), vec!["alpha", "bravo"]);
+    }
+}

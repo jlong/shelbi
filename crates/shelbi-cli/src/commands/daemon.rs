@@ -11,10 +11,14 @@
 //!   message protocol, the unacked-message reaper, and graceful
 //!   shutdown. This is what `launchd`/`systemd` run with a bare
 //!   `shelbi daemon`.
+//! - [`board`] — the hub-owned board-index refresh loop (one per open
+//!   project) and the `refresh-board` hub verb. Phase 1 of
+//!   `Plans/github-issue-caching-and-rate-limits.md` §5.
 //! - [`supervise`] — the `install`/`uninstall`/`status`/`restart`
 //!   subcommands that manage the platform supervisor unit (launchd
 //!   plist on macOS, systemd `--user` service on Linux).
 
+mod board;
 mod serve;
 mod supervise;
 

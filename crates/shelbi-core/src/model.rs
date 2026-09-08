@@ -809,7 +809,25 @@ pub struct IssueTrackerConfig {
     /// Linear connection facts — required when `backend: linear`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear: Option<LinearConnection>,
+    /// How often (seconds) the hub daemon's board-index refresh loop re-reads
+    /// this project's board from the backend and rewrites
+    /// `<project_dir>/board-index.json`. Absent ⇒ [`DEFAULT_ISSUE_REFRESH_SECS`]
+    /// (30s); a `0` is treated as absent so a typo can't spin the loop. Only
+    /// meaningful for a remote backend — the daemon skips `file_system`, whose
+    /// local read is free. This is the value the Phase 3 budget governor
+    /// scales. See [`IssueTrackerConfig::refresh_interval_secs`]. Kept an
+    /// `Option` (not a defaulted scalar) so an absent value leaves
+    /// [`is_default`](Self::is_default) — and therefore the elided wire form —
+    /// untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_secs: Option<u64>,
 }
+
+/// Default cadence (seconds) of the daemon's board-index refresh loop when a
+/// project's `issue_tracker.refresh_secs` is unset. 30s balances a promptly
+/// fresh board against the per-tick API cost; the Phase 3 governor scales the
+/// live value up as the token budget tightens.
+pub const DEFAULT_ISSUE_REFRESH_SECS: u64 = 30;
 
 impl IssueTrackerConfig {
     /// True when this is the untouched default (`file_system`, no connection
@@ -817,6 +835,16 @@ impl IssueTrackerConfig {
     /// absent block stays absent across a load → save round-trip.
     pub fn is_default(&self) -> bool {
         *self == IssueTrackerConfig::default()
+    }
+
+    /// The board-index refresh cadence in seconds: the configured
+    /// `refresh_secs` when set to a positive value, else
+    /// [`DEFAULT_ISSUE_REFRESH_SECS`]. A `0` (or absent) folds to the default
+    /// so a misconfiguration can never turn the daemon's tick into a busy loop.
+    pub fn refresh_interval_secs(&self) -> u64 {
+        self.refresh_secs
+            .filter(|&s| s > 0)
+            .unwrap_or(DEFAULT_ISSUE_REFRESH_SECS)
     }
 
     /// Validate the **selected** backend's connection facts, naming the bad
@@ -6063,9 +6091,38 @@ agent_runners:
             linear: Some(LinearConnection {
                 team: "ENG".into(),
             }),
+            refresh_secs: Some(45),
         };
         let yaml = serde_yaml::to_string(&src).unwrap();
         let back: IssueTrackerConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(src, back);
+    }
+
+    #[test]
+    fn refresh_interval_folds_absent_and_zero_to_the_default() {
+        // Absent ⇒ default; an explicit positive value wins; a 0 (a typo that
+        // would otherwise spin the daemon tick) folds back to the default.
+        let mut cfg = IssueTrackerConfig::default();
+        assert_eq!(cfg.refresh_secs, None, "default leaves it unset");
+        assert_eq!(cfg.refresh_interval_secs(), DEFAULT_ISSUE_REFRESH_SECS);
+        cfg.refresh_secs = Some(90);
+        assert_eq!(cfg.refresh_interval_secs(), 90);
+        cfg.refresh_secs = Some(0);
+        assert_eq!(cfg.refresh_interval_secs(), DEFAULT_ISSUE_REFRESH_SECS);
+    }
+
+    #[test]
+    fn refresh_secs_absent_keeps_the_block_default_and_elided() {
+        // Adding refresh_secs must not disturb the "absent block stays absent"
+        // contract: a config with only a backend set (no refresh_secs) is still
+        // is_default() when it is the file_system default, and a parsed config
+        // that omits refresh_secs never materializes a non-None value that would
+        // flip is_default().
+        let parsed: IssueTrackerConfig = serde_yaml::from_str("backend: file_system").unwrap();
+        assert!(
+            parsed.is_default(),
+            "an explicit file_system backend with no refresh_secs is still the default"
+        );
+        assert_eq!(parsed.refresh_secs, None);
     }
 }

@@ -20,6 +20,7 @@ use shelbi_core::{
 };
 
 mod agent_workspaces;
+pub mod board_index;
 mod event_log;
 pub mod gh_budget;
 mod gh_retry;
@@ -60,10 +61,13 @@ pub use issue_migrate::{
     apply_issue_migration, plan_issue_migration, IssueMigrationPlan, MigrationControls,
     PartialMigration,
 };
+pub use board_index::{
+    board_index_path, read_board_index, write_board_index, BoardIndex, BOARD_INDEX_FILE,
+};
 pub use issue_store::{
-    issue_store_for, issue_store_for_project, resolve_issue_store, BoardState, Cursor,
-    FileSystemStore, IssueChange, IssueComment, IssueFields, IssueStore, NewIssue, PrioMove,
-    StatusMove,
+    issue_store_for, issue_store_for_project, raw_issue_store_for, resolve_issue_store, BoardState,
+    Cursor, FileSystemStore, IssueChange, IssueComment, IssueFields, IssueStore, NewIssue,
+    PrioMove, StatusMove,
 };
 pub use project_paths::ProjectPaths;
 pub use root::{
