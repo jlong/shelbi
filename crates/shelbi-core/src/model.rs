@@ -305,6 +305,18 @@ pub fn default_dialog_signatures(command: &str) -> Vec<DialogSignature> {
         RunnerKind::Claude => vec![
             DialogSignature::new("trust", "Do you trust the files"),
             DialogSignature::new("trust", "trust this folder"),
+            // The "Allow reads outside the working directories?" prompt a
+            // resumed (or any) session raises on its first tool call that
+            // reaches outside the worktree. Listed BEFORE the generic
+            // `permission` confirm so the more specific `reads-outside` kind
+            // wins the first-match scan even when this modal also shows an
+            // `Enter to confirm` footer — that names the dialog in events.log
+            // (`reason=dialog:reads-outside`) instead of a bare
+            // `dialog:permission`, so the orchestrator knows exactly which hand
+            // answer is needed. Not auto-answered by the readiness probe: unlike
+            // trusting shelbi's own worktree, allowing reads *outside* it is a
+            // real scope expansion that must stay a human/orchestrator call.
+            DialogSignature::new("reads-outside", "reads outside the working director"),
             DialogSignature::new("permission", "Enter to confirm"),
             // Interactive question/selection widget (`AskUserQuestion`). Two
             // anchors so single- and multi-select variants both match: the
@@ -4808,12 +4820,23 @@ updated_at: 2026-06-19T00:00:00Z
             "usage-limit must not be a naive substring signature"
         );
 
+        // The "reads outside the working directories" prompt gets its own
+        // named signature so a resumed session's out-of-worktree read surfaces
+        // as `dialog:reads-outside`, not a generic `dialog:permission`.
+        assert!(sigs.iter().any(|s| s.kind == "reads-outside"));
+
         // The permission confirm is listed before the question anchors so a
         // multi-select widget showing `Enter to confirm` still resolves (as
         // `permission`) via `detect_blocking_dialog`'s first-match order.
         let permission_at = sigs.iter().position(|s| s.kind == "permission").unwrap();
         let question_at = sigs.iter().position(|s| s.kind == "question").unwrap();
         assert!(permission_at < question_at);
+
+        // ...but `reads-outside` is listed BEFORE the generic permission confirm
+        // so the more specific kind wins even when the modal also shows an
+        // `Enter to confirm` footer.
+        let reads_outside_at = sigs.iter().position(|s| s.kind == "reads-outside").unwrap();
+        assert!(reads_outside_at < permission_at);
 
         // A basename is used, so an absolute path to the same binary still
         // resolves the built-ins.

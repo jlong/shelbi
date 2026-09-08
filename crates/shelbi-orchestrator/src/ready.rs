@@ -21,6 +21,19 @@ pub const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// How often to re-capture the pane while waiting for readiness.
 pub const READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Extra window granted *after* the resume-from-summary dialog is answered, so
+/// the compaction it kicks off has room to finish before the input box appears.
+///
+/// A `claude --continue` resume of an old/large session (the bug scenario ran
+/// ~240k tokens) interposes a "resume from summary vs full session" dialog and
+/// then, on the recommended choice, compacts the conversation — which can take
+/// well over the base [`READY_TIMEOUT`] on its own. Counting that compaction
+/// against the 30s readiness budget is exactly what read as a `readiness_timeout`
+/// stall and aborted the dispatch with the prompt un-sent. Once we've answered
+/// the dialog we know a compaction is running, so we push the deadline out by
+/// this much and keep polling for the input box the compaction ends at.
+pub const RESUME_COMPACTION_GRACE: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Poll the pane until claude's input box is on screen and ready to accept
 /// the initial prompt. Returns `Ok(true)` once ready, `Ok(false)` on
 /// timeout. Pane-injection callers abort on timeout so they never type into an
@@ -48,14 +61,28 @@ pub const READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// So we (a) auto-confirm the trust dialog (shelbi owns these worktrees, so
 /// trusting them is implied by the assignment) and (b) key readiness on
 /// signals unique to the *input box*, never present in a modal menu.
+///
+/// ## The resume-from-summary dialog
+///
+/// On a `claude --continue` resume of an old/large session, Claude interposes a
+/// third startup modal before the input box — a "resume from summary vs full
+/// session" prompt (see [`is_resume_summary_dialog`]). Like the trust dialog it
+/// draws neither an input-box footer nor a busy spinner, so a probe keyed on the
+/// input box alone sits until [`READY_TIMEOUT`] and aborts the resume with the
+/// prompt un-sent (the reported bug). We answer it with the recommended default
+/// (resume from summary — the pre-highlighted option, selected by a bare Enter),
+/// then grant [`RESUME_COMPACTION_GRACE`] for the compaction it starts so a slow
+/// summarize doesn't itself read as a stall. This only fires on a resume; a cold
+/// dispatch never shows the dialog, so keying it in unconditionally is safe.
 pub fn wait_for_claude_ready(
     host: &Host,
     addr: &TmuxAddr,
     timeout: std::time::Duration,
 ) -> Result<bool> {
-    let start = std::time::Instant::now();
+    let mut deadline = std::time::Instant::now() + timeout;
     let mut trust_dismissed = false;
-    while start.elapsed() < timeout {
+    let mut resume_summary_answered = false;
+    while std::time::Instant::now() < deadline {
         // A capture failure here is transient (pane still spinning up); keep
         // polling rather than aborting the whole task start.
         let screen = shelbi_tmux::capture(host, addr).unwrap_or_default();
@@ -65,6 +92,14 @@ pub fn wait_for_claude_ready(
         if !trust_dismissed && is_trust_dialog(&screen) {
             shelbi_tmux::send_enter(host, addr)?;
             trust_dismissed = true;
+        }
+        // Answer the resume-from-summary dialog once, then extend the deadline
+        // to cover the compaction it kicks off. Latched so a capture taken
+        // before Claude has consumed the Enter can't double-answer.
+        if !resume_summary_answered && is_resume_summary_dialog(&screen) {
+            shelbi_tmux::send_enter(host, addr)?;
+            resume_summary_answered = true;
+            deadline = std::time::Instant::now() + RESUME_COMPACTION_GRACE;
         }
         std::thread::sleep(READY_POLL_INTERVAL);
     }
@@ -239,6 +274,30 @@ pub(crate) fn is_input_box_rule(line: &str) -> bool {
 pub fn is_trust_dialog(screen: &str) -> bool {
     let s = screen.to_ascii_lowercase();
     s.contains("trust this folder") || s.contains("do you trust")
+}
+
+/// True when the captured pane shows claude's resume-from-summary dialog — the
+/// modal a `--continue` resume of an old/large session interposes before its
+/// input box:
+///
+/// ```text
+///   This session is 2h 49m old and 239.8k tokens.
+///   Resuming the full session will consume a substantial portion of your
+///   usage limits. We recommend resuming from a summary.
+///   ❯ 1. Resume from summary (recommended)
+///     2. Resume full session as-is
+///     3. Don't ask me again
+/// ```
+///
+/// Anchored on two wordings unique to this modal — the recommended option
+/// (`Resume from summary`) and the full-session warning banner (`Resuming the
+/// full session`) — so a partially-rendered dialog missing one still matches.
+/// Only consulted at spawn time on a freshly relaunched pane, before any prompt
+/// is delivered, so unlike the poll-time [`detect_blocking_dialog`] scan there
+/// is no live worker whose on-screen content could false-match.
+pub fn is_resume_summary_dialog(screen: &str) -> bool {
+    let s = screen.to_ascii_lowercase();
+    s.contains("resume from summary") || s.contains("resuming the full session")
 }
 
 /// Scan a captured pane for the first matching blocking-dialog signature,
@@ -929,6 +988,39 @@ mod tests {
         assert!(!is_trust_dialog(INPUT_BOX_SCREEN));
     }
 
+    // The exact resume-from-summary modal observed 2026-09-07 on charlie/golf:
+    // a `claude --continue` of an old, large session interposes this before the
+    // input box, and the readiness probe (keyed on the input box + trust dialog)
+    // sat until timeout because it recognized neither.
+    const RESUME_SUMMARY_DIALOG_SCREEN: &str = "\
+  This session is 2h 49m old and 239.8k tokens.
+  Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary.
+
+  ❯ 1. Resume from summary (recommended)
+    2. Resume full session as-is
+    3. Don't ask me again";
+
+    #[test]
+    fn resume_summary_dialog_detected_but_not_confused_with_ready_or_trust() {
+        assert!(is_resume_summary_dialog(RESUME_SUMMARY_DIALOG_SCREEN));
+        // Either anchor alone is enough (a partial render missing the other).
+        assert!(is_resume_summary_dialog("❯ 1. Resume from summary (recommended)"));
+        assert!(is_resume_summary_dialog(
+            "Resuming the full session will consume a substantial portion..."
+        ));
+        // Case-insensitive.
+        assert!(is_resume_summary_dialog("RESUME FROM SUMMARY"));
+        // The live input box, the trust dialog, and an empty capture are not it.
+        assert!(!is_resume_summary_dialog(INPUT_BOX_SCREEN));
+        assert!(!is_resume_summary_dialog(TRUST_DIALOG_SCREEN));
+        assert!(!is_resume_summary_dialog(""));
+        // And the resume modal is neither ready nor a trust dialog, so the
+        // readiness loop reaches its dedicated branch rather than returning
+        // ready early or mistaking it for the trust prompt.
+        assert!(!is_input_ready(RESUME_SUMMARY_DIALOG_SCREEN));
+        assert!(!is_trust_dialog(RESUME_SUMMARY_DIALOG_SCREEN));
+    }
+
     // The real usage-limit modal claude renders and blocks on. Note the
     // menu-option chrome (`❯ 1.` / `  2.`) — the load-bearing detail that
     // tells a rendered modal apart from a mere mention of the phrase.
@@ -960,6 +1052,39 @@ mod tests {
 
         // Empty signature list never matches, even on a real dialog.
         assert!(detect_blocking_dialog(TRUST_DIALOG_SCREEN, &[]).is_none());
+    }
+
+    // The "Allow reads outside the working directories?" modal a resumed
+    // session raises on its first out-of-worktree tool call. Note the
+    // `Enter to confirm` footer: without a dedicated, earlier-listed signature
+    // this would resolve to the generic `permission` kind.
+    const READS_OUTSIDE_DIALOG_SCREEN: &str = "\
+ Allow reads outside the working directories?
+
+ ❯ 1. Yes, keep allowing reads outside the working directories
+   2. No, block reads outside the working directories from now on
+   3. No, ask again next time
+
+ Enter to confirm · Esc to cancel";
+
+    #[test]
+    fn detect_blocking_dialog_names_the_reads_outside_prompt() {
+        // AC: a dialog the resume path can't answer is reported BY NAME in
+        // events.log, not as a bare `dialog:permission`. The dedicated
+        // `reads-outside` signature, listed before `permission`, wins the
+        // first-match scan even though this modal also shows `Enter to confirm`.
+        let sigs = shelbi_core::default_dialog_signatures("claude");
+        assert_eq!(
+            detect_blocking_dialog(READS_OUTSIDE_DIALOG_SCREEN, &sigs).as_deref(),
+            Some("reads-outside")
+        );
+        // A live/ready pane merely showing the wording (editing this code) is
+        // still vetoed, same as every other substring signature.
+        let ready_editing = format!(
+            "{READS_OUTSIDE_DIALOG_SCREEN}\n  ⏵⏵ accept edits on (shift+tab to cycle)"
+        );
+        assert!(is_input_ready(&ready_editing));
+        assert!(detect_blocking_dialog(&ready_editing, &sigs).is_none());
     }
 
     #[test]
