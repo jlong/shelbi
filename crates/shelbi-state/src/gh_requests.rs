@@ -26,8 +26,16 @@
 //! One line per request, hub-wide, under `<shelbi-root>/gh-requests.log`:
 //!
 //! ```text
-//! <rfc3339> budget=<graphql|rest> caller=<name>
+//! <rfc3339> budget=<graphql|rest> caller=<name> outcome=<ok|err:<class>>
 //! ```
+//!
+//! The `outcome` field distinguishes a request that reached GitHub and **spent**
+//! budget (`ok`) from an **attempt** that failed without spending it — most
+//! importantly `err:conn`, a connection-level failure where `gh` never reached
+//! the API. Without it a dead network reads as a 34k/hr burn rate (the
+//! 2026-09-08 incident); with it `shelbi doctor` projects exhaustion from spent
+//! requests alone and reports failed attempts separately. A line written by an
+//! older shelbi carries no `outcome` and is read back as `ok` (spent).
 //!
 //! Written with a single `O_APPEND` `write_all` (POSIX guarantees writes under
 //! `PIPE_BUF` are atomic relative to other appenders, and a request line is well
@@ -72,6 +80,33 @@ fn parse_budget(tag: &str) -> Option<Budget> {
     }
 }
 
+/// The outcome of a `gh` request: whether it reached GitHub and spent budget, or
+/// failed as an attempt (carrying a short error class for the diagnostics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The request reached GitHub and spent budget.
+    Ok,
+    /// The request failed with the given class ([`crate::gh_retry::error_class`]
+    /// — `conn` / `ratelimit` / `transient` / `other`). A `conn` failure spent
+    /// nothing; the others may have. Either way it is an *attempt*, not spend.
+    Err(&'static str),
+}
+
+impl Outcome {
+    /// The `outcome=` field token: `ok`, or `err:<class>`.
+    fn tag(self) -> String {
+        match self {
+            Outcome::Ok => "ok".to_string(),
+            Outcome::Err(class) => format!("err:{class}"),
+        }
+    }
+
+    /// Whether this outcome spent budget (`ok`).
+    pub fn is_ok(self) -> bool {
+        matches!(self, Outcome::Ok)
+    }
+}
+
 /// How much of the tail to scan on a read. 512 KiB is tens of thousands of
 /// request lines — far more than the last hour on any real hub, and enough that
 /// the doctor's short observation window is always fully covered — while keeping
@@ -101,16 +136,16 @@ fn sanitize_caller(caller: &str) -> String {
     }
 }
 
-/// Append one request record for `budget` made by `caller`. Best-effort: a
-/// missing root or any IO error is swallowed so a diagnostic append can never
-/// fail the API call it is describing.
-pub fn record_request(budget: Budget, caller: &str) {
-    record_request_at(budget, caller, Utc::now());
+/// Append one request record for `budget` made by `caller` with its `outcome`.
+/// Best-effort: a missing root or any IO error is swallowed so a diagnostic
+/// append can never fail the API call it is describing.
+pub fn record_request(budget: Budget, caller: &str, outcome: Outcome) {
+    record_request_at(budget, caller, outcome, Utc::now());
 }
 
 /// [`record_request`] with an explicit timestamp — the seam a test drives to
 /// simulate a request stream without waiting real time.
-pub fn record_request_at(budget: Budget, caller: &str, at: DateTime<Utc>) {
+pub fn record_request_at(budget: Budget, caller: &str, outcome: Outcome, at: DateTime<Utc>) {
     let Some(path) = log_path() else {
         return;
     };
@@ -118,10 +153,11 @@ pub fn record_request_at(budget: Budget, caller: &str, at: DateTime<Utc>) {
         let _ = crate::ensure_dir(parent);
     }
     let line = format!(
-        "{} budget={} caller={}\n",
+        "{} budget={} caller={} outcome={}\n",
         at.to_rfc3339(),
         budget_tag(budget),
         sanitize_caller(caller),
+        outcome.tag(),
     );
     // One finished buffer, one `write_all`, under O_APPEND — see the module docs.
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -138,10 +174,18 @@ pub fn record_request_at(budget: Budget, caller: &str, at: DateTime<Utc>) {
 pub struct RequestEntry {
     /// When the request was made.
     pub at: DateTime<Utc>,
-    /// Which budget it spent.
+    /// Which budget it concerns.
     pub budget: Budget,
     /// The caller label recorded for it.
     pub caller: String,
+    /// Whether the request reached GitHub and spent budget (`outcome=ok`). A
+    /// failed attempt (`outcome=err:*`, or an old line with no field read as
+    /// `ok`) that spent nothing is `false` — so a dead network never inflates
+    /// the observed spend rate.
+    pub spent: bool,
+    /// The error class for a failed attempt (`conn` / `ratelimit` / …), or
+    /// `None` when the request spent budget.
+    pub err_class: Option<String>,
 }
 
 /// Read the request records made within `window` before `now`, newest last.
@@ -186,17 +230,30 @@ fn parse_line(line: &str) -> Option<RequestEntry> {
         .with_timezone(&Utc);
     let mut budget = None;
     let mut caller = None;
+    // Default to spent for a line with no `outcome=` field — the format an older
+    // shelbi wrote, where every recorded request had reached GitHub.
+    let mut spent = true;
+    let mut err_class = None;
     for tok in tokens {
         if let Some(v) = tok.strip_prefix("budget=") {
             budget = parse_budget(v);
         } else if let Some(v) = tok.strip_prefix("caller=") {
             caller = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("outcome=") {
+            if v == "ok" {
+                spent = true;
+            } else {
+                spent = false;
+                err_class = v.strip_prefix("err:").map(str::to_string);
+            }
         }
     }
     Some(RequestEntry {
         at,
         budget: budget?,
         caller: caller.unwrap_or_else(|| "unknown".to_string()),
+        spent,
+        err_class,
     })
 }
 
@@ -205,13 +262,18 @@ fn parse_line(line: &str) -> Option<RequestEntry> {
 /// (rate + top callers) render.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BudgetRate {
-    /// Which budget these requests spent.
+    /// Which budget these requests concern.
     pub budget: Budget,
-    /// How many requests fell in the observation window.
+    /// How many requests in the window **spent** budget (`outcome=ok`). This is
+    /// the number the rate/exhaustion projection is built on — a failed attempt
+    /// (a dead network) must not read as spend.
     pub count: usize,
+    /// How many requests in the window were **failed attempts** (`outcome=err:*`)
+    /// that (for `conn`) spent nothing — reported separately from `count`.
+    pub failed: usize,
     /// The observation window, in seconds.
     pub window_secs: u64,
-    /// Callers ordered by descending request count in the window.
+    /// Callers ordered by descending *spent* request count in the window.
     pub top_callers: Vec<(String, usize)>,
 }
 
@@ -243,26 +305,37 @@ impl BudgetRate {
 /// caller breakdown newest-independent (ordered by count desc, then name).
 pub fn summarize(entries: &[RequestEntry], window: Duration) -> Vec<BudgetRate> {
     use std::collections::HashMap;
+    /// Per-budget accumulator: spent count, failed count, and spent-caller tally.
+    #[derive(Default)]
+    struct Acc {
+        spent: usize,
+        failed: usize,
+        callers: HashMap<String, usize>,
+    }
     let window_secs = window.as_secs();
-    let mut per_budget: HashMap<&'static str, (Budget, usize, HashMap<String, usize>)> =
-        HashMap::new();
+    let mut per_budget: HashMap<&'static str, (Budget, Acc)> = HashMap::new();
     for e in entries {
         let tag = budget_tag(e.budget);
         let slot = per_budget
             .entry(tag)
-            .or_insert_with(|| (e.budget, 0, HashMap::new()));
-        slot.1 += 1;
-        *slot.2.entry(e.caller.clone()).or_insert(0) += 1;
+            .or_insert_with(|| (e.budget, Acc::default()));
+        if e.spent {
+            slot.1.spent += 1;
+            *slot.1.callers.entry(e.caller.clone()).or_insert(0) += 1;
+        } else {
+            slot.1.failed += 1;
+        }
     }
     // Stable output order: graphql before rest.
     let mut rates: Vec<BudgetRate> = per_budget
         .into_values()
-        .map(|(budget, count, callers)| {
-            let mut top_callers: Vec<(String, usize)> = callers.into_iter().collect();
+        .map(|(budget, acc)| {
+            let mut top_callers: Vec<(String, usize)> = acc.callers.into_iter().collect();
             top_callers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             BudgetRate {
                 budget,
-                count,
+                count: acc.spent,
+                failed: acc.failed,
                 window_secs,
                 top_callers,
             }
@@ -328,23 +401,63 @@ mod tests {
         let _iso = IsolatedHome::new("round-trip");
         let now = Utc::now();
         // Two recent, one well outside the window.
-        record_request_at(Budget::Graphql, "board-refresh", now - chrono::Duration::seconds(10));
-        record_request_at(Budget::Rest, "write", now - chrono::Duration::seconds(20));
-        record_request_at(Budget::Graphql, "board-refresh", now - chrono::Duration::seconds(7200));
+        record_request_at(Budget::Graphql, "board-refresh", Outcome::Ok, now - chrono::Duration::seconds(10));
+        record_request_at(Budget::Rest, "write", Outcome::Ok, now - chrono::Duration::seconds(20));
+        record_request_at(Budget::Graphql, "board-refresh", Outcome::Ok, now - chrono::Duration::seconds(7200));
 
         let recent = recent_entries(Duration::from_secs(3600), now);
         assert_eq!(recent.len(), 2, "the 2h-old entry is outside the 1h window");
-        assert!(recent.iter().any(|e| e.budget == Budget::Rest && e.caller == "write"));
+        assert!(recent.iter().any(|e| e.budget == Budget::Rest && e.caller == "write" && e.spent));
+    }
+
+    #[test]
+    fn outcome_field_round_trips_and_separates_spent_from_failed() {
+        let _iso = IsolatedHome::new("outcome");
+        let now = Utc::now();
+        // Two spent GraphQL fetches, three failed connection attempts.
+        record_request_at(Budget::Graphql, "issue-fetch", Outcome::Ok, now);
+        record_request_at(Budget::Graphql, "issue-fetch", Outcome::Ok, now);
+        for _ in 0..3 {
+            record_request_at(Budget::Graphql, "issue-fetch", Outcome::Err("conn"), now);
+        }
+        let recent = recent_entries(Duration::from_secs(60), now);
+        assert_eq!(recent.iter().filter(|e| e.spent).count(), 2, "two spent");
+        let failed: Vec<&RequestEntry> = recent.iter().filter(|e| !e.spent).collect();
+        assert_eq!(failed.len(), 3, "three failed attempts");
+        assert!(failed.iter().all(|e| e.err_class.as_deref() == Some("conn")));
+
+        // The rate summary counts spend and failure separately, so a dead network
+        // never inflates the projected spend rate.
+        let rate = summarize(&recent, Duration::from_secs(60));
+        let gql = rate.iter().find(|r| r.budget == Budget::Graphql).unwrap();
+        assert_eq!(gql.count, 2, "spent count drives the projection");
+        assert_eq!(gql.failed, 3, "failed attempts reported separately");
+    }
+
+    #[test]
+    fn an_old_line_with_no_outcome_reads_as_spent() {
+        // Backward compatibility: a line written before the `outcome=` field
+        // counts as spent, so historical logs still project correctly.
+        let e = parse_line("2026-09-08T13:00:00Z budget=graphql caller=issue-fetch").unwrap();
+        assert!(e.spent, "a field-less line is spent");
+        assert_eq!(e.err_class, None);
     }
 
     #[test]
     fn summarize_counts_per_budget_and_ranks_callers() {
         let now = Utc::now();
+        let spent = |budget, caller: &str| RequestEntry {
+            at: now,
+            budget,
+            caller: caller.into(),
+            spent: true,
+            err_class: None,
+        };
         let entries = vec![
-            RequestEntry { at: now, budget: Budget::Graphql, caller: "board-refresh".into() },
-            RequestEntry { at: now, budget: Budget::Graphql, caller: "board-refresh".into() },
-            RequestEntry { at: now, budget: Budget::Graphql, caller: "issue-fetch".into() },
-            RequestEntry { at: now, budget: Budget::Rest, caller: "write".into() },
+            spent(Budget::Graphql, "board-refresh"),
+            spent(Budget::Graphql, "board-refresh"),
+            spent(Budget::Graphql, "issue-fetch"),
+            spent(Budget::Rest, "write"),
         ];
         let rates = summarize(&entries, Duration::from_secs(60));
         assert_eq!(rates.len(), 2);
@@ -361,6 +474,7 @@ mod tests {
         let rate = BudgetRate {
             budget: Budget::Rest,
             count: 600,
+            failed: 0,
             window_secs: 60,
             top_callers: vec![("pollers".into(), 600)],
         };
@@ -377,6 +491,7 @@ mod tests {
         let rate = BudgetRate {
             budget: Budget::Graphql,
             count: 0,
+            failed: 0,
             window_secs: 60,
             top_callers: Vec::new(),
         };
@@ -388,7 +503,7 @@ mod tests {
     fn a_caller_with_whitespace_is_sanitized_to_one_token() {
         let _iso = IsolatedHome::new("sanitize");
         let now = Utc::now();
-        record_request_at(Budget::Graphql, "board refresh tick", now);
+        record_request_at(Budget::Graphql, "board refresh tick", Outcome::Ok, now);
         let recent = recent_entries(Duration::from_secs(60), now);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].caller, "board-refresh-tick", "spaces collapsed so the token stays whole");

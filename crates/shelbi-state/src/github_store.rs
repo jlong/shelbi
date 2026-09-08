@@ -215,6 +215,38 @@ pub fn set_test_park_side_effects(on: bool) {
     TEST_PARK_SIDE_EFFECTS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+// --- test-support: an injectable clock for the read-path park -----------------
+//
+// The circuit breaker's escalating window is a function of "now", so a
+// deterministic test of the escalation (and of the "< 10 requests in 60s"
+// reproduction) needs to advance time without waiting. Production always reads
+// the real clock; a test sets an absolute epoch here and steps it forward.
+
+#[cfg(any(test, feature = "test-support"))]
+static TEST_NOW: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// The epoch the read-path park treats as "now" — the real clock in a shipped
+/// build, or the value pinned by [`set_test_now`] under test (0 = use the real
+/// clock, so an un-pinned test still behaves normally).
+fn read_now() -> i64 {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let t = TEST_NOW.load(std::sync::atomic::Ordering::Relaxed);
+        if t != 0 {
+            return t;
+        }
+    }
+    Utc::now().timestamp()
+}
+
+/// Pin the read-path park's clock to `epoch` (0 restores the real clock). Test
+/// seam for the circuit-breaker escalation; pair with a `0` reset so it doesn't
+/// leak into a later test.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_test_now(epoch: i64) {
+    TEST_NOW.store(epoch, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The GitHub issues backend. A cheap handle: it holds the `owner/repo`
 /// selector and the `gh` runner closure, and resolves everything else per call.
 #[derive(Clone)]
@@ -390,6 +422,75 @@ impl GitHubStore {
             repo: repo.into(),
             graphql: Arc::clone(&gh),
             gh,
+        }
+    }
+
+    /// Like [`GitHubStore::with_runner`] but routes the injected runner through
+    /// the production [`governed_read`] core (both the REST and GraphQL wrappers),
+    /// keyed off `token_secret` — so a test can drive the whole park lifecycle
+    /// (the rate-limit park, the connection circuit breaker, the request-log
+    /// outcome recording) through the public store API (`get` / `fetch_many`)
+    /// without a real token or `gh`. The caller must set `SHELBI_HOME`, hold the
+    /// test lock, and opt into park side effects, exactly as the wrapper-level
+    /// park tests do.
+    #[cfg(test)]
+    fn with_governed_runner(
+        repo: impl Into<String>,
+        token_secret: &str,
+        runner: impl Fn(&[&str]) -> Result<String> + Send + Sync + 'static,
+    ) -> Self {
+        clear_issue_caches_for_test();
+        let project = "test-project".to_string();
+        let key = crate::gh_budget::token_key(token_secret);
+        let base: GhRunner = Arc::new(runner);
+        // A single-attempt, no-sleep read policy: the park behavior is what's
+        // under test, not the retry backoff, so a live failure parks after one
+        // attempt without the ~1s real-time wait the production policy would take.
+        let policy = crate::gh_retry::RetryPolicy::for_test_reads(
+            1,
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        );
+
+        let rest_project = project.clone();
+        let rest_key = key.clone();
+        let rest_base = Arc::clone(&base);
+        let rest_policy = policy.clone();
+        let gh: GhRunner = Arc::new(move |args: &[&str]| {
+            governed_read(
+                &rest_project,
+                &rest_key,
+                &rest_policy,
+                crate::gh_budget::Budget::Rest,
+                args,
+                &|a| rest_base(a),
+                None,
+                None,
+            )
+        });
+
+        let gql_project = project.clone();
+        let gql_key = key.clone();
+        let gql_base = Arc::clone(&base);
+        let gql_policy = policy;
+        let graphql: GhRunner = Arc::new(move |args: &[&str]| {
+            governed_read(
+                &gql_project,
+                &gql_key,
+                &gql_policy,
+                crate::gh_budget::Budget::Graphql,
+                args,
+                &|a| gql_base(a),
+                None,
+                Some(graphql_caller(args)),
+            )
+        });
+
+        Self {
+            project,
+            repo: repo.into(),
+            gh,
+            graphql,
         }
     }
 
@@ -1607,15 +1708,21 @@ impl GitHubStore {
             args.push(format!("{k}={v}"));
         }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        // Every mutation spends one REST request: log it hub-wide for the Phase 3
-        // diagnostics before the call, so a write that then fails is still counted.
-        // Gated on `key.is_some()` — the same "governance active" signal the budget
-        // recording uses — so it is inert under test (where `budget_token_key`
-        // returns `None`) and never writes the request log into a test's home.
+        let result = (self.gh)(&refs);
+        // Every mutation attempt is logged hub-wide for the Phase 3 diagnostics,
+        // tagged with its outcome so a failed write (a dead network spent nothing;
+        // a 422 spent one) is distinguished from a spent request. Gated on
+        // `key.is_some()` — the "governance active" signal — so it is inert under
+        // test (where `budget_token_key` returns `None`) and never writes the
+        // request log into a test's home.
         if key.is_some() {
-            crate::gh_requests::record_request(crate::gh_budget::Budget::Rest, "write");
+            let outcome = match &result {
+                Ok(_) => crate::gh_requests::Outcome::Ok,
+                Err(e) => crate::gh_requests::Outcome::Err(crate::gh_retry::error_class(e)),
+            };
+            crate::gh_requests::record_request(crate::gh_budget::Budget::Rest, "write", outcome);
         }
-        let out = (self.gh)(&refs)?;
+        let out = result?;
         Ok(record_and_strip_rest(key.as_deref(), &out))
     }
 
@@ -1841,18 +1948,10 @@ fn run_gh_with_token(token: &SecretToken, args: &[&str]) -> Result<String> {
 }
 
 /// Run a read (`GET`) call under the per-token rate-limit park (plan Phase 0,
-/// item 3):
-///
-/// 1. Resolve the token once and key the shared per-token budget file off a hash
-///    of it.
-/// 2. If the token is already parked (a prior 403 set `parked_until` past now),
-///    short-circuit with a typed rate-limit error **without spawning `gh`** —
-///    this is what stops the thousand-per-hour 403 storm.
-/// 3. Otherwise run through the fail-fast read retry policy. On a rate-limit
-///    failure, resolve the reset time (from the error, else a free `/rate_limit`
-///    probe, else a short fallback) and park the token. The park write reports
-///    whether *this* call was the one that transitioned to parked, so the
-///    `board rate-limited` events.log line is written exactly once per window.
+/// item 3) *and* the connection-level circuit breaker. Resolves the token, keys
+/// the shared per-token budget file off a hash of it, and delegates to
+/// [`governed_read`] on the REST tier (no request-log line — REST reads aren't
+/// attributed, matching the historical scope — but full park participation).
 fn park_aware_read(
     project: &str,
     read_policy: &crate::gh_retry::RetryPolicy,
@@ -1860,24 +1959,169 @@ fn park_aware_read(
 ) -> Result<String> {
     let token = resolve_github_token_by_name(project)?;
     let key = crate::gh_budget::token_key(token.expose());
-    let now = Utc::now().timestamp();
-    if let Some(reset) = crate::gh_budget::parked_until(&key, crate::gh_budget::Budget::Rest, now) {
-        return Err(rate_limited_park_error(project, args, reset));
+    governed_read(
+        project,
+        &key,
+        read_policy,
+        crate::gh_budget::Budget::Rest,
+        args,
+        &|a| run_gh_with_token(&token, a),
+        Some(&token),
+        None,
+    )
+}
+
+/// The shared governed-read core behind both [`park_aware_read`] (REST) and
+/// [`graphql_governed_read`] (GraphQL), parameterized on the run closure and the
+/// budget-file key so a test can drive the whole park lifecycle without a real
+/// token or `gh` (see `with_governed_runner`). The flow:
+///
+/// 1. **Short-circuit** when reads are already parked — the network is down (the
+///    shared unreachable breaker) or this budget's quota is exhausted — returning
+///    the typed error **without spawning `gh`**. This is what turns a 900/min
+///    storm into a handful of attempts per window.
+/// 2. Otherwise run through the fail-fast read policy, then react
+///    ([`on_read_result`]): a success clears the breaker (network is back) and,
+///    for GraphQL, records the response's budget; a rate-limit failure parks the
+///    budget tier; a connection failure parks the (escalating) unreachable
+///    breaker. Each failure is attributed in the request log with its outcome
+///    when `log_caller` is set.
+#[allow(clippy::too_many_arguments)]
+fn governed_read(
+    project: &str,
+    key: &str,
+    read_policy: &crate::gh_retry::RetryPolicy,
+    budget: crate::gh_budget::Budget,
+    args: &[&str],
+    run: &dyn Fn(&[&str]) -> Result<String>,
+    token: Option<&SecretToken>,
+    log_caller: Option<&str>,
+) -> Result<String> {
+    let now = read_now();
+    if let Some(err) = read_park_short_circuit(project, key, budget, args, now) {
+        return Err(err);
     }
-    let result = read_policy.run(|| run_gh_with_token(&token, args));
-    if let Err(ref e) = result {
-        // `read_park_side_effects_enabled` is always true in a shipped build; in
-        // a test build it gates the whole block — the `/rate_limit` reset probe
-        // (itself a live `gh` call) and the home-keyed park writes — off the
-        // opt-in, so a raced background refresh never touches shared state.
-        if crate::gh_retry::is_rate_limit_error(e) && read_park_side_effects_enabled() {
-            let reset = crate::gh_retry::rate_limit_reset_epoch(e, now)
-                .or_else(|| probe_core_reset_and_record(&token, &key))
-                .unwrap_or(now + crate::gh_budget::DEFAULT_PARK_SECS);
-            record_read_park(project, &key, reset, now);
+    let result = read_policy.run(|| run(args));
+    on_read_result(project, key, budget, args, now, &result, token, log_caller);
+    result
+}
+
+/// The short-circuit decision shared by both read paths: an error to return
+/// *without spawning `gh`* when reads are parked, or `None` to go live. The
+/// unreachable breaker is checked first — a dead network parks *both* budgets, so
+/// it dominates a per-tier quota park.
+fn read_park_short_circuit(
+    project: &str,
+    key: &str,
+    budget: crate::gh_budget::Budget,
+    args: &[&str],
+    now: i64,
+) -> Option<Error> {
+    if let Some(until) = crate::gh_budget::unreachable_parked_until(key, now) {
+        return Some(unreachable_park_error(project, args, until));
+    }
+    crate::gh_budget::parked_until(key, budget, now)
+        .map(|reset| rate_limited_park_error(project, args, reset))
+}
+
+/// React to a governed read's result: clear/park the breakers and record the
+/// outcome. Split from [`governed_read`] so the bookkeeping is one place, and so
+/// the test-build opt-in gate ([`read_park_side_effects_enabled`]) wraps every
+/// shared-state park write in a single spot. Request-log attribution (when
+/// `log_caller` is set) is *not* gated — it mirrors the historical unconditional
+/// GraphQL recording, and is only reached from the production wrappers and the
+/// governed test constructor, never a raced background refresh.
+#[allow(clippy::too_many_arguments)]
+fn on_read_result(
+    project: &str,
+    key: &str,
+    budget: crate::gh_budget::Budget,
+    _args: &[&str],
+    now: i64,
+    result: &Result<String>,
+    token: Option<&SecretToken>,
+    log_caller: Option<&str>,
+) {
+    match result {
+        Ok(body) => {
+            if let Some(caller) = log_caller {
+                crate::gh_requests::record_request(budget, caller, crate::gh_requests::Outcome::Ok);
+            }
+            // Fold the GraphQL response's `rateLimit` into the governor's tier.
+            if budget == crate::gh_budget::Budget::Graphql {
+                if let Some((remaining, reset)) = extract_graphql_rate_limit(body) {
+                    crate::gh_budget::record(key, crate::gh_budget::Budget::Graphql, remaining, reset);
+                }
+            }
+            // A live success proves the API is reachable again — clear the
+            // connection breaker so the next outage escalates from the start.
+            if read_park_side_effects_enabled() {
+                crate::gh_budget::clear_unreachable(key);
+            }
+        }
+        Err(e) => {
+            if let Some(caller) = log_caller {
+                crate::gh_requests::record_request(
+                    budget,
+                    caller,
+                    crate::gh_requests::Outcome::Err(crate::gh_retry::error_class(e)),
+                );
+            }
+            // `read_park_side_effects_enabled` is always true in a shipped build;
+            // under test it gates the shared-state writes (the `/rate_limit` probe
+            // and the home-keyed park files) off the opt-in.
+            if !read_park_side_effects_enabled() {
+                return;
+            }
+            if crate::gh_retry::is_rate_limit_error(e) {
+                let reset = crate::gh_retry::rate_limit_reset_epoch(e, now)
+                    .or_else(|| token.and_then(|t| probe_core_reset_and_record(t, key)))
+                    .or_else(|| crate::gh_budget::recorded_reset_after(key, budget, now))
+                    .unwrap_or(now + crate::gh_budget::DEFAULT_PARK_SECS);
+                record_budget_park(project, key, budget, reset, now);
+            } else if crate::gh_retry::is_connection_error(e) {
+                // The network is down — park (escalating) so a dead network costs
+                // a handful of attempts per window, not one per caller per tick.
+                record_read_unreachable(project, key, now);
+            }
         }
     }
-    result
+}
+
+/// Park `budget`'s tier until `reset`, logging the one `board rate-limited` line
+/// per window through the tier-specific helper (kept by name so their existing
+/// unit tests stand).
+fn record_budget_park(
+    project: &str,
+    key: &str,
+    budget: crate::gh_budget::Budget,
+    reset: i64,
+    now: i64,
+) {
+    match budget {
+        crate::gh_budget::Budget::Rest => record_read_park(project, key, reset, now),
+        crate::gh_budget::Budget::Graphql => record_graphql_park(project, key, reset, now),
+    }
+}
+
+/// Park the token's reads after a connection-level failure (escalating window)
+/// and, iff this call transitioned the breaker from clear to parked, append the
+/// single `board unreachable` events.log line for the window. The network-down
+/// sibling of [`record_read_park`].
+fn record_read_unreachable(project: &str, key: &str, now: i64) {
+    if let Some(until_epoch) = crate::gh_budget::park_unreachable(key, now) {
+        let until = DateTime::from_timestamp(until_epoch, 0)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_default();
+        if let Err(ev) = crate::append_board_unreachable_event(project, &until) {
+            tracing::warn!(project = %project, error = %ev, "append_board_unreachable_event failed");
+        }
+        tracing::warn!(
+            project = %project,
+            until = %until,
+            "GitHub API unreachable (connection failure); parking board reads until the window expires",
+        );
+    }
 }
 
 /// Park the token keyed by `key` until `reset` and, iff this call is the one
@@ -1923,36 +2167,18 @@ fn graphql_governed_read(
 ) -> Result<String> {
     let token = resolve_github_token_by_name(project)?;
     let key = crate::gh_budget::token_key(token.expose());
-    let now = Utc::now().timestamp();
-    if let Some(reset) =
-        crate::gh_budget::parked_until(&key, crate::gh_budget::Budget::Graphql, now)
-    {
-        return Err(rate_limited_park_error(project, args, reset));
-    }
-    // A real GraphQL request is about to be spent: log it to the hub-wide request
-    // log so `shelbi status` / `shelbi doctor` can see the rate and who is driving
-    // it (Phase 3 §6). Best-effort; never fails the read.
-    crate::gh_requests::record_request(crate::gh_budget::Budget::Graphql, graphql_caller(args));
-    let result = read_policy.run(|| run_gh_with_token(&token, args));
-    match &result {
-        Ok(body) => {
-            // Every board / single-issue / search / batch response carries
-            // `data.rateLimit`; fold it into the governor's `graphql` tier.
-            if let Some((remaining, reset)) = extract_graphql_rate_limit(body) {
-                crate::gh_budget::record(&key, crate::gh_budget::Budget::Graphql, remaining, reset);
-            }
-        }
-        // See `read_park_side_effects_enabled`: always true in a shipped build; in
-        // a test build the park write is gated on the opt-in so a raced refresh
-        // never touches a sibling test's home.
-        Err(e) if crate::gh_retry::is_rate_limit_error(e) && read_park_side_effects_enabled() => {
-            let reset = crate::gh_retry::rate_limit_reset_epoch(e, now)
-                .unwrap_or(now + crate::gh_budget::DEFAULT_PARK_SECS);
-            record_graphql_park(project, &key, reset, now);
-        }
-        Err(_) => {}
-    }
-    result
+    // Attributed in the request log (Phase 3 §6) with its outcome so `shelbi
+    // doctor` can tell spent budget from a failed attempt (a dead network).
+    governed_read(
+        project,
+        &key,
+        read_policy,
+        crate::gh_budget::Budget::Graphql,
+        args,
+        &|a| run_gh_with_token(&token, a),
+        None,
+        Some(graphql_caller(args)),
+    )
 }
 
 /// The caller label recorded for a GraphQL read, derived from the query name in
@@ -2035,6 +2261,24 @@ fn rate_limited_park_error(project: &str, args: &[&str], reset: i64) -> Error {
         stderr: format!(
             "shelbi: board reads for project `{project}` are parked until the GitHub \
              API rate limit resets (x-ratelimit-reset: {reset}); not calling gh"
+        ),
+    }
+}
+
+/// The typed error a read parked by the connection breaker returns instead of
+/// calling `gh`. Its `stderr` carries the "error connecting to" phrasing so
+/// [`crate::gh_retry::is_connection_error`] classifies it exactly like the live
+/// connection failure it stands in for — a short-circuited unreachable read is
+/// indistinguishable, to every downstream classifier, from the real thing (and
+/// so is never mistaken for spent budget or a rate limit).
+fn unreachable_park_error(project: &str, args: &[&str], until: i64) -> Error {
+    Error::Command {
+        cmd: format!("gh {}", args.join(" ")),
+        status: "parked (unreachable)".to_string(),
+        stderr: format!(
+            "shelbi: board reads for project `{project}` are parked because the GitHub \
+             API is unreachable (error connecting to api.github.com); retrying after \
+             {until}; not calling gh"
         ),
     }
 }
@@ -4183,6 +4427,221 @@ mod tests {
         assert_eq!(hits, 1, "exactly one board rate-limited line per window");
 
         set_test_park_side_effects(false);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Regression (orchestrator note 2026-09-08): a GraphQL rate-limit error that
+    /// carries no reset hint must park until the tier's already-recorded
+    /// `reset_at` (from the last successful response), not the short
+    /// `DEFAULT_PARK_SECS` fallback. Before the fix the GraphQL path — where
+    /// `token` is `None`, so the `/rate_limit` probe is skipped — resolved to
+    /// `now + 60`, overwrote the real minutes-away reset, expired a minute later,
+    /// and re-fired a fresh `board rate-limited` line every tick for the rest of
+    /// the window (observed: 20 re-parks in a row). `park` must also never move a
+    /// known reset earlier.
+    #[test]
+    fn a_hintless_graphql_rate_limit_parks_until_the_recorded_reset() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+
+        let key = crate::gh_budget::token_key("tok-gql-reset");
+        let now = 5_000i64;
+        let recorded_reset = now + 1_200; // the resetAt the last success reported
+
+        // The last successful response recorded a real, minutes-away reset.
+        crate::gh_budget::record(
+            &key,
+            crate::gh_budget::Budget::Graphql,
+            Some(0),
+            Some(recorded_reset),
+        );
+
+        // A hintless 403 (no `x-ratelimit-reset`) now fails a GraphQL read. `token`
+        // is `None` on the GraphQL path, so the fallback is the recorded reset.
+        let err: Result<String> = Err(Error::Command {
+            cmd: "gh api graphql".into(),
+            status: "HTTP 403".into(),
+            stderr: "API rate limit exceeded".into(),
+        });
+        on_read_result(
+            "gql-reset-proj",
+            &key,
+            crate::gh_budget::Budget::Graphql,
+            &[],
+            now,
+            &err,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            crate::gh_budget::parked_until(&key, crate::gh_budget::Budget::Graphql, now),
+            Some(recorded_reset),
+            "a hintless rate limit parks until the recorded reset, not now+DEFAULT_PARK_SECS"
+        );
+        assert_eq!(
+            crate::gh_budget::read_state(&key).graphql.reset_at,
+            Some(recorded_reset),
+            "the known reset must not be moved earlier by the short fallback park"
+        );
+
+        set_test_park_side_effects(false);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A `gh` runner that always fails with a connection-level error (the
+    /// 2026-09-08 incident's phrasing), counting how many times it is actually
+    /// spawned so a test can prove a parked read makes no call.
+    fn conn_error_runner(
+        calls: std::sync::Arc<std::sync::Mutex<usize>>,
+    ) -> impl Fn(&[&str]) -> Result<String> + Send + Sync + 'static {
+        move |_args: &[&str]| {
+            *calls.lock().unwrap() += 1;
+            Err(Error::Command {
+                cmd: "gh api graphql".to_string(),
+                status: "exit status: 1".to_string(),
+                stderr: "error connecting to api.github.com:443".to_string(),
+            })
+        }
+    }
+
+    /// AC1: a connection failure parks reads through the store — a second `get`
+    /// within the window makes no `gh` call, and exactly one `board unreachable`
+    /// event is appended.
+    #[test]
+    fn a_connection_failure_parks_reads_and_a_second_get_makes_no_gh_call() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+        set_test_now(1_000);
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let store =
+            GitHubStore::with_governed_runner("owner/repo", "unreach-tok", conn_error_runner(calls.clone()));
+
+        // First `get`: goes live, the connection error fails and parks the token.
+        assert!(store.get("task-one").is_err(), "a dead network surfaces an error");
+        let after_first = *calls.lock().unwrap();
+        assert_eq!(after_first, 1, "the first get spawns exactly one (governed) gh call");
+
+        // Second `get` within the window: short-circuits before spawning `gh`.
+        assert!(store.get("task-one").is_err(), "still parked → still an error");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            after_first,
+            "a parked read must not spawn gh — this is what stops the storm"
+        );
+
+        // Exactly one `board unreachable` events.log line for the window.
+        let log = std::fs::read_to_string(crate::events_log_path().unwrap()).unwrap_or_default();
+        let hits = log
+            .lines()
+            .filter(|l| l.contains("project=test-project") && l.contains("board unreachable"))
+            .count();
+        assert_eq!(hits, 1, "exactly one board unreachable line per window");
+
+        set_test_park_side_effects(false);
+        set_test_now(0);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// AC6: pointing the runner at an unreachable host across a 60s outage logs
+    /// fewer than 10 requests — the escalating park short-circuits reads between
+    /// window boundaries, so only a handful of live attempts spend a log line.
+    #[test]
+    fn a_60s_outage_logs_fewer_than_ten_requests() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let store =
+            GitHubStore::with_governed_runner("owner/repo", "unreach-60s", conn_error_runner(calls.clone()));
+
+        // A reader ticks every 5s across a 60s outage (13 ticks). Most short-
+        // circuit on the park; only window-boundary reads go live.
+        let mut t = 1_000i64;
+        while t <= 1_060 {
+            set_test_now(t);
+            let _ = store.get("task-x");
+            t += 5;
+        }
+
+        let log =
+            std::fs::read_to_string(crate::shelbi_home().unwrap().join(crate::gh_requests::REQUESTS_LOG_FILE))
+                .unwrap_or_default();
+        let logged = log.lines().filter(|l| !l.trim().is_empty()).count();
+        assert!(logged < 10, "a 60s outage logged {logged} requests (must be < 10)");
+        assert!(logged >= 1, "but the live attempts are recorded (got {logged})");
+        // Every logged line is a connection-failure attempt, not spent budget.
+        assert!(
+            log.lines().filter(|l| !l.trim().is_empty()).all(|l| l.contains("outcome=err:conn")),
+            "every logged request during the outage is a failed connection attempt: {log}"
+        );
+
+        set_test_park_side_effects(false);
+        set_test_now(0);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// AC2 (wiring): a successful live read clears the connection breaker, so the
+    /// escalation resets. Parks via a connection error, waits out the window, then
+    /// a successful (empty) search on the same token clears the park.
+    #[test]
+    fn a_successful_read_clears_the_connection_breaker() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+
+        let key = crate::gh_budget::token_key("tok-clear");
+
+        // Park the breaker at t=1000 (window → until 1015).
+        set_test_now(1_000);
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let bad =
+            GitHubStore::with_governed_runner("owner/repo", "tok-clear", conn_error_runner(calls));
+        let _ = bad.get("task-x");
+        assert!(
+            crate::gh_budget::unreachable_parked_until(&key, 1_000).is_some(),
+            "the connection failure parked the breaker"
+        );
+
+        // Past the window, a successful (empty) search clears it.
+        set_test_now(1_030);
+        let good = GitHubStore::with_governed_runner("owner/repo", "tok-clear", |_args| {
+            Ok(r#"{"data":{"search":{"nodes":[]}}}"#.to_string())
+        });
+        assert!(good.get("task-x").unwrap().is_none(), "empty search resolves to no issue");
+        assert_eq!(
+            crate::gh_budget::unreachable_parked_until(&key, 1_030),
+            None,
+            "a successful read cleared the breaker"
+        );
+        assert_eq!(
+            crate::gh_budget::read_state(&key).unreachable,
+            crate::gh_budget::UnreachableState::default(),
+            "clearing also resets the escalation window"
+        );
+
+        set_test_park_side_effects(false);
+        set_test_now(0);
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

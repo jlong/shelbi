@@ -1816,6 +1816,25 @@ pub fn append_board_rate_limited_event(project: &str, until_rfc3339: &str) -> Re
     ))
 }
 
+/// Append `<rfc3339> project=<name> board unreachable until=<rfc3339>` to
+/// `~/.shelbi/events.log`. Emitted **once** per park window — when a
+/// connection-level `gh` failure (DNS/TCP/TLS the request never got past) trips
+/// the read-path circuit breaker and parks all board reads for a token until the
+/// (escalating) window expires — so the orchestrator (and `shelbi events tail`)
+/// sees one line explaining why the board stopped advancing, instead of the
+/// ~900/min `error connecting to` storm the un-parked retry loop produced. This
+/// is the network-down sibling of [`append_board_rate_limited_event`]: that one
+/// means the budget is exhausted (GitHub answered 403); this one means GitHub was
+/// never reached at all.
+pub fn append_board_unreachable_event(project: &str, until_rfc3339: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let until = sanitize_field(until_rfc3339);
+    append_event_line(&format!(
+        "{ts} project={project} board unreachable until={until}"
+    ))
+}
+
 /// Reminder appended to a heartbeat line while Zen Mode is On. Off-mode
 /// heartbeats pass `None` to [`append_heartbeat_event`] and carry no zen
 /// tokens at all. The poller decides which variant to emit on two cadences

@@ -245,6 +245,17 @@ fn github_section(project: &str) -> Option<String> {
     } else {
         out.push_str("read path: unknown\nboard index: (no index published)\n");
     }
+    // The connection-level circuit breaker is per token, shared across both
+    // budgets — a dead network parks all board reads. Surface it once (not per
+    // budget) so an operator sees "unreachable" as the reason the board stalled.
+    if let Some(until) = budget.as_ref().and_then(|s| {
+        shelbi_state::gh_budget::unreachable_verdict(&s.unreachable, now.timestamp())
+    }) {
+        let until_str = format_epoch_local(until)
+            .map(|hm| format!(", retrying after {hm}"))
+            .unwrap_or_default();
+        out.push_str(&format!("network: unreachable (board reads parked{until_str})\n"));
+    }
     // Per-budget: remaining, reset, requests in the last hour.
     for (label, budget_kind) in [
         ("graphql", shelbi_state::gh_budget::Budget::Graphql),
@@ -270,11 +281,16 @@ fn github_section(project: &str) -> Option<String> {
                     None
                 }
             });
-        let count = rates
-            .iter()
-            .find(|r| r.budget == budget_kind)
-            .map(|r| r.count)
-            .unwrap_or(0);
+        let rate = rates.iter().find(|r| r.budget == budget_kind);
+        // `count` is spent requests; failed attempts (a dead network) are shown
+        // separately so they never read as spend.
+        let count = rate.map(|r| r.count).unwrap_or(0);
+        let failed = rate.map(|r| r.failed).unwrap_or(0);
+        let failed_str = if failed > 0 {
+            format!(" ({failed} failed)")
+        } else {
+            String::new()
+        };
         let remaining_str = remaining
             .map(|r| format!("{r} remaining"))
             .unwrap_or_else(|| "remaining unknown".to_string());
@@ -288,7 +304,7 @@ fn github_section(project: &str) -> Option<String> {
             .is_some();
         let parked_str = if parked { " · parked" } else { "" };
         out.push_str(&format!(
-            "{label} budget: {remaining_str}{reset_str} · {count} request{} in the last hour{parked_str}\n",
+            "{label} budget: {remaining_str}{reset_str} · {count} request{} in the last hour{failed_str}{parked_str}\n",
             if count == 1 { "" } else { "s" },
         ));
     }
@@ -777,6 +793,7 @@ issue_tracker:\n\
         shelbi_state::gh_requests::record_request(
             shelbi_state::gh_budget::Budget::Graphql,
             "board-refresh",
+            shelbi_state::gh_requests::Outcome::Ok,
         );
 
         let section = github_section("g").expect("remote project has a GitHub section");

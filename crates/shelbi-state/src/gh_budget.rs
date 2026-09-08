@@ -49,6 +49,16 @@ const BUDGET_DIR: &str = "gh-budget";
 /// until the real reset, minutes away, so this fallback rarely fires.
 pub const DEFAULT_PARK_SECS: i64 = 60;
 
+/// First (shortest) window a connection-level failure parks reads for. Short so
+/// a one-packet blip barely delays reads; it doubles on each consecutive failure
+/// (see [`park_unreachable`]) up to [`UNREACHABLE_WINDOW_CAP_SECS`].
+pub const UNREACHABLE_WINDOW_START_SECS: i64 = 15;
+
+/// Ceiling the escalating unreachable park window doubles up to: 5 minutes. A
+/// sustained outage costs a handful of attempts every five minutes, not the
+/// ~900/min the un-parked retry loop produced on the 2026-09-08 incident.
+pub const UNREACHABLE_WINDOW_CAP_SECS: i64 = 300;
+
 /// Which of a token's two independent budgets a call concerns: GraphQL reads
 /// (the board index and single-issue fetches) or REST requests (writes and the
 /// REST fallback list). Selects the [`BudgetTier`] every tier-aware function
@@ -80,12 +90,29 @@ pub struct BudgetTier {
     pub parked_until: Option<i64>,
 }
 
-/// One token's persisted rate-limit state: its GraphQL and REST budgets.
+/// A token's connection-level circuit breaker — separate from the two budget
+/// tiers because a DNS/TCP/TLS failure kills *both* GraphQL and REST at once (the
+/// network is down, not a quota), and it carries no server reset to honor, so it
+/// escalates its own window instead.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnreachableState {
+    /// While set and in the future, every read (either budget) short-circuits
+    /// without calling `gh`. Cleared implicitly by expiry (like a tier park) and
+    /// explicitly by [`clear_unreachable`] on the first success.
+    pub parked_until: Option<i64>,
+    /// The current escalation window length (seconds) — doubled on each
+    /// consecutive failure up to the cap, reset to `None` on the first success.
+    pub window_secs: Option<i64>,
+}
+
+/// One token's persisted rate-limit state: its GraphQL and REST budgets, plus the
+/// connection-level circuit breaker.
 ///
-/// `#[serde(default)]` on each tier means a file written by an older shelbi
-/// (which stored a single flat `remaining`/`reset_at`/`parked_until`) reads back
-/// as two default (not-parked) tiers — dropping any in-flight park from before
-/// the upgrade, which is harmless: the next live 403 re-parks.
+/// `#[serde(default)]` on each field means a file written by an older shelbi
+/// (which stored a single flat `remaining`/`reset_at`/`parked_until`, and no
+/// `unreachable`) reads back as two default (not-parked) tiers and a clear
+/// breaker — dropping any in-flight park from before the upgrade, which is
+/// harmless: the next live failure re-parks.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RateLimitState {
     /// The GraphQL points budget.
@@ -94,6 +121,9 @@ pub struct RateLimitState {
     /// The REST requests budget.
     #[serde(default)]
     pub rest: BudgetTier,
+    /// The connection-level circuit breaker (shared across both budgets).
+    #[serde(default)]
+    pub unreachable: UnreachableState,
 }
 
 impl RateLimitState {
@@ -238,6 +268,13 @@ fn park_lock() -> &'static Mutex<()> {
 ///
 /// `reset_at` is clamped to strictly after `now` so a stale/past reset can't
 /// produce a park that's already expired (which would re-fire on the next read).
+///
+/// A **known reset is never moved earlier**: if the tier already recorded a
+/// later `reset_at` (from the last successful response's `rateLimit`/headers),
+/// the park honors that later time rather than a shorter incoming guess. Without
+/// this, a hintless 403 resolving to the short `DEFAULT_PARK_SECS` fallback would
+/// overwrite a real minutes-away reset, expire a minute later, and re-fire a
+/// fresh `board rate-limited` line every tick for the rest of the window.
 pub fn park(key: &str, budget: Budget, reset_at: i64, now: i64) -> bool {
     let _guard = park_lock().lock();
     let mut state = read_state(key);
@@ -245,10 +282,71 @@ pub fn park(key: &str, budget: Budget, reset_at: i64, now: i64) -> bool {
         return false; // already parked this window
     }
     let tier = state.tier_mut(budget);
-    tier.reset_at = Some(reset_at);
-    tier.parked_until = Some(reset_at.max(now + 1));
+    let effective = match tier.reset_at {
+        Some(prev) => prev.max(reset_at),
+        None => reset_at,
+    };
+    tier.reset_at = Some(effective);
+    tier.parked_until = Some(effective.max(now + 1));
     write_state(key, &state);
     true
+}
+
+/// The pure unreachable-park decision: the epoch reads are parked until on a
+/// connection outage, or `None` when the breaker is clear. Split out so the "is
+/// the network parked right now" rule is unit-testable without the file.
+pub fn unreachable_verdict(state: &UnreachableState, now: i64) -> Option<i64> {
+    match state.parked_until {
+        Some(until) if until > now => Some(until),
+        _ => None,
+    }
+}
+
+/// Whether reads are currently parked for `key` because the API was unreachable,
+/// and until when (epoch seconds).
+pub fn unreachable_parked_until(key: &str, now: i64) -> Option<i64> {
+    unreachable_verdict(&read_state(key).unreachable, now)
+}
+
+/// Park `key`'s reads after a connection-level failure, escalating the window on
+/// each consecutive failure. Returns `Some(until)` **iff this call transitioned
+/// the breaker from clear to parked** (the signal the caller uses to log one
+/// `board unreachable` line per window); a call that finds it already parked
+/// returns `None` and rewrites nothing.
+///
+/// The window starts at [`UNREACHABLE_WINDOW_START_SECS`] and doubles up to
+/// [`UNREACHABLE_WINDOW_CAP_SECS`] as long as failures keep recurring; a
+/// [`clear_unreachable`] on the first success resets it, so the next outage
+/// starts short again.
+pub fn park_unreachable(key: &str, now: i64) -> Option<i64> {
+    let _guard = park_lock().lock();
+    let mut state = read_state(key);
+    if unreachable_verdict(&state.unreachable, now).is_some() {
+        return None; // already parked this window
+    }
+    let next = match state.unreachable.window_secs {
+        Some(prev) if prev > 0 => (prev * 2).min(UNREACHABLE_WINDOW_CAP_SECS),
+        _ => UNREACHABLE_WINDOW_START_SECS,
+    };
+    let until = now + next;
+    state.unreachable.window_secs = Some(next);
+    state.unreachable.parked_until = Some(until);
+    write_state(key, &state);
+    Some(until)
+}
+
+/// Clear `key`'s unreachable breaker after a successful call, so the escalation
+/// resets and the next outage starts at the short window again. Reads the file
+/// first and only rewrites when there is state to clear, so a healthy read never
+/// pays a write.
+pub fn clear_unreachable(key: &str) {
+    let _guard = park_lock().lock();
+    let mut state = read_state(key);
+    if state.unreachable == UnreachableState::default() {
+        return; // nothing to clear — no write on the healthy path
+    }
+    state.unreachable = UnreachableState::default();
+    write_state(key, &state);
 }
 
 /// Record the latest `remaining` / `reset_at` seen for `budget`, without
@@ -268,6 +366,16 @@ pub fn record(key: &str, budget: Budget, remaining: Option<i64>, reset_at: Optio
         tier.reset_at = reset_at;
     }
     write_state(key, &state);
+}
+
+/// The `reset_at` already recorded for `budget` on `key`, **iff it is still in
+/// the future** relative to `now`. The fallback a hintless rate-limit error uses
+/// (the GraphQL path carries no `token`, so the `/rate_limit` probe is skipped):
+/// park until the reset the last successful response reported rather than a short
+/// [`DEFAULT_PARK_SECS`] that expires and re-fires the park each tick. `None`
+/// when no reset is recorded or the recorded one has already passed.
+pub fn recorded_reset_after(key: &str, budget: Budget, now: i64) -> Option<i64> {
+    read_state(key).tier(budget).reset_at.filter(|&r| r > now)
 }
 
 /// Record REST headers ([`parse_rate_limit_headers`] output) into the `rest`
@@ -594,6 +702,90 @@ mod tests {
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The unreachable breaker escalates its window (15s → 30s → … capped at
+    /// 5min), transitions (logs) exactly once per window, and a success clears it
+    /// so the next outage starts short again — the AC2 lifecycle, plus the AC6
+    /// property that a 60s outage costs only a handful of live attempts.
+    #[test]
+    fn unreachable_breaker_escalates_transitions_once_and_clears_on_success() {
+        let _g = crate::test_lock::LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-gh-unreach-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let key = token_key("unreach-token");
+        assert_eq!(unreachable_parked_until(&key, 0), None, "clean: not parked");
+
+        // Simulate a reader re-attempting the moment each window expires: park,
+        // then jump to expiry and park again. The window doubles from 15s to the
+        // 5min cap and holds there.
+        let mut now = 0i64;
+        let mut windows = Vec::new();
+        for _ in 0..8 {
+            let until = park_unreachable(&key, now).expect("a live failure transitions");
+            windows.push(until - now);
+            // A second failure inside the same window must not re-transition.
+            assert_eq!(park_unreachable(&key, now), None, "one transition per window");
+            clear_expiry_only(&key); // the window elapses without a success
+            now = until;
+        }
+        assert_eq!(
+            windows,
+            vec![15, 30, 60, 120, 240, 300, 300, 300],
+            "the window doubles from 15s and caps at 5min"
+        );
+
+        // AC6: a reader over a 60s outage makes only a handful of live attempts —
+        // every read inside a window short-circuits, so only the window-boundary
+        // reads spend an attempt. From clean: 15s → 45s → (105s) = 3 attempts.
+        clear_unreachable(&key);
+        let mut t = 0i64;
+        let mut attempts = 0;
+        while t <= 60 {
+            if unreachable_verdict(&read_state(&key).unreachable, t).is_some() {
+                t += 1; // parked — a real reader would short-circuit, no gh call
+                continue;
+            }
+            let until = park_unreachable(&key, t).expect("a live failure transitions");
+            attempts += 1;
+            clear_expiry_only(&key);
+            t = until;
+        }
+        assert!(attempts < 10, "a 60s outage costs {attempts} live attempts (< 10)");
+
+        // A success clears the breaker, so the next outage starts short again.
+        park_unreachable(&key, 1_000);
+        clear_unreachable(&key);
+        assert_eq!(unreachable_parked_until(&key, 1_001), None, "success cleared the park");
+        let until = park_unreachable(&key, 1_001).expect("new outage");
+        assert_eq!(
+            until - 1_001,
+            UNREACHABLE_WINDOW_START_SECS,
+            "after a success the escalation resets to the start window"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Test helper: expire the current unreachable park (clear only
+    /// `parked_until`, keep `window_secs`) so the next `park_unreachable`
+    /// escalates from the retained window rather than resetting — simulating a
+    /// window naturally elapsing without a success in between.
+    fn clear_expiry_only(key: &str) {
+        let _guard = park_lock().lock();
+        let mut state = read_state(key);
+        state.unreachable.parked_until = None;
+        write_state(key, &state);
     }
 
     /// `record` updates one tier's numbers without clobbering the other's, and
