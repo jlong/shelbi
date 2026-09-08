@@ -1342,8 +1342,9 @@ fn start(
     // abandoned rather than joined: we never block on the hung thread, and the
     // OS reaps it (releasing any process-scoped locks it holds) when this
     // short-lived CLI process exits moments later.
-    let launch_deadline = launch_timeout();
-    let addr = {
+    let launch_deadline = shelbi_orchestrator::workspace::launch_timeout();
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
         let project_owned = project_yaml.clone();
         let workspace_owned = workspace.clone();
         let task_id_owned = id.to_string();
@@ -1353,7 +1354,6 @@ fn start(
         // The issue-level `launch:` override rides into the thread as an owned
         // clone; `StartSpec` borrows it back below.
         let launch_owned = tf.task.launch.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = shelbi_orchestrator::workspace::start_workspace_on_task(
                 shelbi_orchestrator::workspace::StartSpec {
@@ -1369,81 +1369,107 @@ fn start(
             // The receiver is gone if we already timed out — ignore the error.
             let _ = tx.send(result);
         });
+    }
 
-        match rx.recv_timeout(launch_deadline) {
-            Ok(Ok(addr)) => addr,
-            Ok(Err(e)) => {
-                // Spawn failed cleanly. Roll the card back to its pre-start
-                // position so a failed launch doesn't leave it wedged in
-                // `in_progress` assigned to a workspace that isn't running.
-                // Best-effort: the original spawn error is what the user needs
-                // to see, but a rollback failure is surfaced too so a
-                // half-moved board isn't silent.
-                if let Err(re) = rollback_start(project, &original, &tf.body, prev_column.clone()) {
-                    eprintln!(
-                        "warning: `{id}` was moved to in_progress but the spawn failed and the \
-                         rollback also failed ({re}); run `shelbi issue move {id} --to \
-                         {prev_column}` to recover"
-                    );
-                }
-                return Err(anyhow!(e).context("launching workspace"));
+    // Wait for the launch, measuring the deadline from the LAST progress signal
+    // (a dispatch event recorded for this task/workspace) rather than one wall
+    // clock from here — a slow `git fetch` / `gh` call during launch extends the
+    // deadline instead of aborting a launch that is still moving (see
+    // `await_launch`). On a genuine timeout we first check whether the launch
+    // has meanwhile completed before undoing anything.
+    let mut launched_late = false;
+    let addr = match await_launch(&rx, launch_deadline, LAUNCH_POLL_INTERVAL, || {
+        dispatch_progress_token(id, &workspace_name)
+    }) {
+        LaunchWait::Completed(addr) => addr,
+        LaunchWait::SpawnFailed(e) => {
+            // Spawn failed cleanly. Roll the card back to its pre-start position
+            // AND tear down any pane the aborted launch left behind, so a failed
+            // launch never leaves a live worker stranded on a `todo` card (which
+            // the poller's orphan reaper would then race to kill).
+            rollback_and_teardown(
+                project,
+                &project_yaml,
+                workspace,
+                &original,
+                &tf.body,
+                prev_column.clone(),
+                id,
+            );
+            return Err(anyhow!(e).context("launching workspace"));
+        }
+        LaunchWait::Panicked => {
+            // Worker thread panicked before sending its result. Treat as a failed
+            // launch: record it, roll the card back + tear the pane down, surface.
+            if let Err(le) = shelbi_state::append_dispatch_event(
+                id,
+                &workspace_name,
+                "failed",
+                "launch_thread_panicked",
+            ) {
+                eprintln!("warning: append_dispatch_event failed: {le}");
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Launch blew past the ceiling — the worker thread is still
-                // blocked on git/ssh/a stale lock. Record a failed-dispatch
-                // event so the stall is visible in `~/.shelbi/events.log`
-                // (not something you find by `ps`-grepping a stuck process),
-                // roll the card back, and fail loudly. The abandoned thread
-                // dies with this process.
-                if let Err(le) = shelbi_state::append_dispatch_event(
-                    id,
-                    &workspace_name,
-                    "failed",
-                    &format!("launch_timeout_after_{}s", launch_deadline.as_secs()),
-                ) {
-                    eprintln!("warning: append_dispatch_event failed: {le}");
-                }
-                if let Err(re) = rollback_start(project, &original, &tf.body, prev_column.clone()) {
-                    eprintln!(
-                        "warning: `{id}` launch timed out and the rollback also failed ({re}); \
-                         run `shelbi issue move {id} --to {prev_column}` to recover"
-                    );
-                }
-                return Err(anyhow!(
-                    "launching workspace `{workspace_name}` on `{id}` timed out after {}s — \
-                     dispatch aborted and the issue rolled back to `{prev_column}`. The launch \
-                     likely blocked on git/ssh or a stale lock; check the workspace pane, then \
-                     re-run the dispatch.",
-                    launch_deadline.as_secs(),
-                ));
+            rollback_and_teardown(
+                project,
+                &project_yaml,
+                workspace,
+                &original,
+                &tf.body,
+                prev_column.clone(),
+                id,
+            );
+            return Err(anyhow!(
+                "launching workspace `{workspace_name}` on `{id}` failed: the launch thread \
+                 terminated unexpectedly before reporting a result"
+            ));
+        }
+        LaunchWait::IdleTimeout if launch_appears_complete(&project_yaml, workspace, id) => {
+            // The deadline elapsed with the launch thread abandoned, but the
+            // launch actually completed — a live pane for this workspace plus a
+            // confirmed/verified dispatch signal. Report a late success and LEAVE
+            // the card `in_progress`: rolling it back now would strand a live
+            // worker mid-task on a `todo` card. No `status=failed` event fires.
+            launched_late = true;
+            shelbi_orchestrator::workspace::workspace_tmux_addr(&project_yaml, workspace)
+                .map_err(|e| anyhow!(e))?
+        }
+        LaunchWait::IdleTimeout => {
+            // Launch blew past the ceiling with no completion in sight — the
+            // worker thread is still blocked on git/ssh/a stale lock. Record a
+            // failed-dispatch event so the stall is visible in
+            // `~/.shelbi/events.log` (not something you find by `ps`-grepping a
+            // stuck process), roll the card back, tear down any pane the launch
+            // spawned, and fail loudly. The abandoned thread dies with this
+            // process.
+            if let Err(le) = shelbi_state::append_dispatch_event(
+                id,
+                &workspace_name,
+                "failed",
+                &format!("launch_timeout_after_{}s", launch_deadline.as_secs()),
+            ) {
+                eprintln!("warning: append_dispatch_event failed: {le}");
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                // Worker thread panicked before sending its result. Treat as a
-                // failed launch: record it, roll the card back, and surface it.
-                if let Err(le) = shelbi_state::append_dispatch_event(
-                    id,
-                    &workspace_name,
-                    "failed",
-                    "launch_thread_panicked",
-                ) {
-                    eprintln!("warning: append_dispatch_event failed: {le}");
-                }
-                if let Err(re) = rollback_start(project, &original, &tf.body, prev_column.clone()) {
-                    eprintln!(
-                        "warning: `{id}` launch thread died and the rollback also failed ({re}); \
-                         run `shelbi issue move {id} --to {prev_column}` to recover"
-                    );
-                }
-                return Err(anyhow!(
-                    "launching workspace `{workspace_name}` on `{id}` failed: the launch thread \
-                     terminated unexpectedly before reporting a result"
-                ));
-            }
+            rollback_and_teardown(
+                project,
+                &project_yaml,
+                workspace,
+                &original,
+                &tf.body,
+                prev_column.clone(),
+                id,
+            );
+            return Err(anyhow!(
+                "launching workspace `{workspace_name}` on `{id}` timed out after {}s with no \
+                 completion signal — dispatch aborted, the issue rolled back to `{prev_column}`, \
+                 and the launched pane torn down. The launch likely blocked on git/ssh or a \
+                 stale lock; check the workspace, then re-run the dispatch.",
+                launch_deadline.as_secs(),
+            ));
         }
     };
 
-    // Spawn succeeded — record the dispatch event now (only successful
-    // starts get an events.log line; a rolled-back start leaves no
+    // Spawn succeeded (possibly late) — record the dispatch event now (only
+    // successful starts get an events.log line; a rolled-back start leaves no
     // misleading dispatch record).
     if prev_column != Column::in_progress() {
         let base_reason = reason.unwrap_or("user:cli:start");
@@ -1461,10 +1487,19 @@ fn start(
         }
     }
 
-    println!(
-        "✓ {id} → in_progress on {workspace_name} ({})",
-        addr.target()
-    );
+    if launched_late {
+        println!(
+            "✓ {id} → in_progress on {workspace_name} ({}) — launch confirmed after the {}s \
+             deadline; card left in_progress rather than rolled back",
+            addr.target(),
+            launch_deadline.as_secs(),
+        );
+    } else {
+        println!(
+            "✓ {id} → in_progress on {workspace_name} ({})",
+            addr.target()
+        );
+    }
     Ok(())
 }
 
@@ -1495,6 +1530,195 @@ fn rollback_start(project: &str, original: &Issue, _body: &str, prev_column: Col
     Ok(())
 }
 
+/// Roll the in_progress move back AND tear down the pane the failed launch
+/// spawned. A genuine launch failure must not leave a live worker stranded on a
+/// rolled-back (`todo`) card: nothing else owns that pane once the card is no
+/// longer active, and the poller's orphan reaper would otherwise race to kill it
+/// a tick later — turning a clean abort into a killed-mid-task worker. Both
+/// halves are best-effort and each surfaces its own failure so a half-cleaned
+/// board is never silent.
+fn rollback_and_teardown(
+    project: &str,
+    project_yaml: &shelbi_core::Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    original: &Issue,
+    body: &str,
+    prev_column: Column,
+    id: &str,
+) {
+    if let Err(re) = rollback_start(project, original, body, prev_column.clone()) {
+        eprintln!(
+            "warning: `{id}` launch failed and the rollback also failed ({re}); run \
+             `shelbi issue move {id} --to {prev_column}` to recover"
+        );
+    }
+    if let Err(te) = teardown_workspace_pane(project_yaml, workspace) {
+        eprintln!(
+            "warning: `{id}` launch failed; tearing down the workspace pane on `{}` also failed \
+             ({te}) — check the pane and kill it by hand if a stale worker is left",
+            workspace.name
+        );
+    }
+}
+
+/// Kill a workspace's tmux pane. Used on the launch-failure path to reclaim the
+/// pane an aborted dispatch left running. Resolving the machine/host/addr can
+/// fail on a mis-declared workspace; those surface as `Err` so the caller can
+/// warn rather than silently skipping the teardown.
+fn teardown_workspace_pane(
+    project_yaml: &shelbi_core::Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+) -> Result<()> {
+    let machine = project_yaml.machine(&workspace.machine).ok_or_else(|| {
+        anyhow!(
+            "machine `{}` for workspace `{}` is not declared",
+            workspace.machine,
+            workspace.name
+        )
+    })?;
+    let host = machine.host();
+    let addr = shelbi_orchestrator::workspace::workspace_tmux_addr(project_yaml, workspace)
+        .map_err(|e| anyhow!(e))?;
+    shelbi_orchestrator::workspace::kill_workspace_pane(&host, &addr, &workspace.name)
+        .map_err(|e| anyhow!(e))
+}
+
+/// Poll cadence of [`await_launch`]. Small enough that a completed or
+/// newly-progressing launch is noticed promptly, large enough not to hammer
+/// `events.log` while a slow launch settles.
+const LAUNCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Terminal outcome of [`await_launch`].
+enum LaunchWait {
+    /// The launch thread returned a live pane address.
+    Completed(shelbi_core::TmuxAddr),
+    /// The launch thread returned an error (a clean spawn failure).
+    SpawnFailed(shelbi_core::Error),
+    /// The launch thread panicked before reporting (the channel disconnected).
+    Panicked,
+    /// The idle deadline elapsed with no launch progress and the thread still
+    /// running — an abandoned, apparently-stuck launch.
+    IdleTimeout,
+}
+
+/// Wait for the launch worker thread, measuring the timeout from the LAST
+/// observed launch-progress signal rather than one wall clock from the CLI's
+/// start.
+///
+/// `progress_token` returns a value that changes whenever the launch records new
+/// progress (a fresh dispatch event for this task/workspace — the message
+/// channel coming up, a confirm landing). Each change resets the idle clock, so
+/// a launch that keeps moving — a cold `git fetch`, slow `gh` calls, staged pane
+/// bring-up — extends its own deadline instead of being aborted mid-flight. Only
+/// `idle_deadline` of true silence with the thread still running yields
+/// [`LaunchWait::IdleTimeout`]; a thread that reports (success or error) is
+/// noticed within `poll_interval` regardless.
+fn await_launch(
+    rx: &std::sync::mpsc::Receiver<shelbi_core::Result<shelbi_core::TmuxAddr>>,
+    idle_deadline: std::time::Duration,
+    poll_interval: std::time::Duration,
+    mut progress_token: impl FnMut() -> u64,
+) -> LaunchWait {
+    use std::sync::mpsc::RecvTimeoutError;
+    let mut last_token = progress_token();
+    let mut last_progress = std::time::Instant::now();
+    loop {
+        match rx.recv_timeout(poll_interval) {
+            Ok(Ok(addr)) => return LaunchWait::Completed(addr),
+            Ok(Err(e)) => return LaunchWait::SpawnFailed(e),
+            Err(RecvTimeoutError::Disconnected) => return LaunchWait::Panicked,
+            Err(RecvTimeoutError::Timeout) => {
+                let token = progress_token();
+                if token != last_token {
+                    last_token = token;
+                    last_progress = std::time::Instant::now();
+                }
+                if last_progress.elapsed() >= idle_deadline {
+                    return LaunchWait::IdleTimeout;
+                }
+            }
+        }
+    }
+}
+
+/// The launch-progress token [`await_launch`] watches: the number of dispatch
+/// events recorded for this task/workspace so far. It grows as the launch
+/// records progress (`status=message-channel`, then `status=confirmed`/
+/// `unverified`/`stuck`/…), so a change means the launch is still moving. Any
+/// read failure returns 0 — a stable token that simply doesn't reset the idle
+/// clock, which is the conservative choice (it can only shorten the wait, never
+/// extend it past the deadline forever).
+fn dispatch_progress_token(task_id: &str, workspace: &str) -> u64 {
+    let Ok(path) = shelbi_state::events_log_path() else {
+        return 0;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    count_dispatch_events(&text, task_id, workspace, &[])
+}
+
+/// Does the launch look genuinely complete? True when a live, non-user-shell
+/// pane exists for the workspace AND a confirm-level dispatch signal
+/// (`status=confirmed` — a busy seed observed or a verified submit — or
+/// `status=unverified` — delivered on a runner with no pane verifier) was
+/// recorded for this task. This is the safety net for a launch that timed out
+/// (its worker thread abandoned) yet actually succeeded: leaving the card
+/// `in_progress` here avoids rolling back and killing a live, working pane.
+///
+/// A live pane with only the earlier `status=message-channel` and no confirm is
+/// deliberately NOT "complete": that is exactly the never-confirmed launch the
+/// caller must roll back and tear down, so the reaper has nothing to reap.
+fn launch_appears_complete(
+    project_yaml: &shelbi_core::Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    task_id: &str,
+) -> bool {
+    let Some(machine) = project_yaml.machine(&workspace.machine) else {
+        return false;
+    };
+    let host = machine.host();
+    let Ok(addr) = shelbi_orchestrator::workspace::workspace_tmux_addr(project_yaml, workspace)
+    else {
+        return false;
+    };
+    let alive = matches!(
+        shelbi_orchestrator::workspace::probe_workspace_slot(
+            &host,
+            &addr,
+            shelbi_orchestrator::workspace::probe_deadline(),
+        ),
+        shelbi_orchestrator::workspace::SlotProbe::Alive { user_shell: false }
+    );
+    if !alive {
+        return false;
+    }
+    let text = shelbi_state::events_log_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    count_dispatch_events(&text, task_id, &workspace.name, &["confirmed", "unverified"]) > 0
+}
+
+/// Count `dispatch task=<id> workspace=<ws> status=<s> …` lines in an events.log
+/// body for one task/workspace. When `statuses` is non-empty, only lines whose
+/// `status=` is one of them count; an empty `statuses` counts every dispatch
+/// line for the pair. Split out so both the progress token and the completion
+/// check share one parser (and so it is unit-testable without touching disk).
+fn count_dispatch_events(log: &str, task_id: &str, workspace: &str, statuses: &[&str]) -> u64 {
+    let task_tok = format!("task={task_id} ");
+    let ws_tok = format!("workspace={workspace} ");
+    log.lines()
+        .filter(|l| l.contains(" dispatch ") && l.contains(&task_tok) && l.contains(&ws_tok))
+        .filter(|l| {
+            statuses.is_empty()
+                || statuses
+                    .iter()
+                    .any(|s| l.contains(&format!("status={s} ")) || l.ends_with(&format!("status={s}")))
+        })
+        .count() as u64
+}
+
 /// Compose the dispatch event's `reason=` value by appending the
 /// resolved agent name. `append_task_event` folds the embedded space into
 /// an underscore so the final on-the-wire shape is
@@ -1502,27 +1726,6 @@ fn rollback_start(project: &str, original: &Issue, _body: &str, prev_column: Col
 /// the activity-feed parser without breaking the single-token contract.
 fn dispatch_reason_with_agent(base: &str, agent: &str) -> String {
     format!("{base} agent={agent}")
-}
-
-/// Default wall-clock ceiling for the whole launch phase of `shelbi issue
-/// start` (worktree sync, SSH probes, pane creation, and the readiness/submit
-/// wait). Generous enough to cover a cold `git fetch` on a fresh cut plus the
-/// two 30s internal readiness probes without tripping on a healthy-but-slow
-/// machine, while still bounding the pathological "blocked forever" case that
-/// produced the phantom in_progress.
-const DEFAULT_LAUNCH_TIMEOUT_MS: u64 = 180_000;
-
-/// The launch-phase deadline, env-overridable via `SHELBI_LAUNCH_TIMEOUT_MS`
-/// (milliseconds) and clamped to a sane range so a fat-fingered override can't
-/// re-introduce an effectively-unbounded wait or starve a legitimately slow
-/// cold start. Mirrors the `SHELBI_PROBE_TIMEOUT_MS` knob on the slot probe.
-fn launch_timeout() -> std::time::Duration {
-    let ms = std::env::var("SHELBI_LAUNCH_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_LAUNCH_TIMEOUT_MS)
-        .clamp(10_000, 1_800_000);
-    std::time::Duration::from_millis(ms)
 }
 
 /// `shelbi issue resume` — relaunch the assigned workspace on the issue it is
@@ -3015,53 +3218,104 @@ workspaces:
     }
 
     #[test]
-    fn launch_timeout_defaults_and_clamps_env_override() {
-        // The launch-phase watchdog must never collapse to 0 (which would fail
-        // every dispatch instantly) nor blow back out to effectively-unbounded,
-        // regardless of what `SHELBI_LAUNCH_TIMEOUT_MS` is set to. Mirrors the
-        // probe-deadline clamp test.
-        let _g = TEST_LOCK.lock().unwrap();
-        let prev = std::env::var_os("SHELBI_LAUNCH_TIMEOUT_MS");
+    fn count_dispatch_events_scopes_by_task_workspace_and_status() {
+        // The launch-progress token and the completion check both key off this
+        // parser, so it must count only THIS task+workspace's dispatch lines and,
+        // when asked, only the confirm-level statuses.
+        let log = "\
+2026-09-08T04:30:06Z dispatch task=t1 workspace=alpha status=message-channel detail=mode=hooks
+2026-09-08T04:30:17Z dispatch task=t1 workspace=alpha status=confirmed detail=seed_busy_observed
+2026-09-08T04:30:20Z dispatch task=t2 workspace=alpha status=confirmed detail=seed_busy_observed
+2026-09-08T04:30:25Z dispatch task=t1 workspace=bravo status=confirmed detail=seed_busy_observed
+2026-09-08T04:30:30Z dispatch task=t1 workspace=alpha status=unverified detail=verification_unsupported";
 
-        std::env::remove_var("SHELBI_LAUNCH_TIMEOUT_MS");
+        // Every dispatch line for the (task, workspace) pair.
+        assert_eq!(count_dispatch_events(log, "t1", "alpha", &[]), 3);
+        // A different task / workspace is not counted.
+        assert_eq!(count_dispatch_events(log, "t2", "alpha", &[]), 1);
+        assert_eq!(count_dispatch_events(log, "t1", "bravo", &[]), 1);
+        // Confirm-level statuses only — message-channel is excluded, so a
+        // never-confirmed launch (message-channel alone) reads as 0.
         assert_eq!(
-            launch_timeout(),
-            std::time::Duration::from_millis(DEFAULT_LAUNCH_TIMEOUT_MS),
-            "default"
+            count_dispatch_events(log, "t1", "alpha", &["confirmed", "unverified"]),
+            2
         );
-
-        std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", "100");
+        // A trailing `status=confirmed` with no detail (end-of-line) still counts.
+        let trailing = "2026-09-08T04:30:17Z dispatch task=t1 workspace=alpha status=confirmed";
         assert_eq!(
-            launch_timeout(),
-            std::time::Duration::from_millis(10_000),
-            "clamps low"
+            count_dispatch_events(trailing, "t1", "alpha", &["confirmed"]),
+            1
         );
+    }
 
-        std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", "99999999");
-        assert_eq!(
-            launch_timeout(),
-            std::time::Duration::from_millis(1_800_000),
-            "clamps high"
+    #[test]
+    fn await_launch_reports_completion_spawn_failure_and_panic() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // A thread that reports Ok is Completed within a poll interval, even with
+        // a token that never advances.
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(shelbi_core::TmuxAddr {
+            session: "s".into(),
+            window: "w".into(),
+        }))
+        .unwrap();
+        assert!(matches!(
+            await_launch(&rx, Duration::from_secs(60), Duration::from_millis(10), || 0),
+            LaunchWait::Completed(_)
+        ));
+
+        // A clean spawn error is SpawnFailed.
+        let (tx, rx) = mpsc::channel::<shelbi_core::Result<shelbi_core::TmuxAddr>>();
+        tx.send(Err(shelbi_core::Error::Other("boom".into()))).unwrap();
+        assert!(matches!(
+            await_launch(&rx, Duration::from_secs(60), Duration::from_millis(10), || 0),
+            LaunchWait::SpawnFailed(_)
+        ));
+
+        // A dropped sender (panicked thread) is Panicked.
+        let (tx, rx) = mpsc::channel::<shelbi_core::Result<shelbi_core::TmuxAddr>>();
+        drop(tx);
+        assert!(matches!(
+            await_launch(&rx, Duration::from_secs(60), Duration::from_millis(10), || 0),
+            LaunchWait::Panicked
+        ));
+    }
+
+    #[test]
+    fn await_launch_times_out_on_silence_but_a_moving_launch_extends_its_deadline() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Sender never reports and the token never changes: the short idle
+        // deadline elapses and we get IdleTimeout.
+        let (_tx, rx) = mpsc::channel::<shelbi_core::Result<shelbi_core::TmuxAddr>>();
+        assert!(matches!(
+            await_launch(&rx, Duration::from_millis(30), Duration::from_millis(5), || 7),
+            LaunchWait::IdleTimeout
+        ));
+
+        // A token that advances on every check keeps resetting the idle clock, so
+        // even a deadline far shorter than the total wait never fires. Bound the
+        // test by stopping after a fixed number of advances.
+        let (_tx, rx) = mpsc::channel::<shelbi_core::Result<shelbi_core::TmuxAddr>>();
+        let mut ticks: u64 = 0;
+        let outcome = await_launch(&rx, Duration::from_millis(20), Duration::from_millis(2), || {
+            ticks += 1;
+            // Advance for a while (resetting the clock each check), then freeze so
+            // the deadline can finally elapse and the test terminates.
+            ticks.min(50)
+        });
+        assert!(
+            matches!(outcome, LaunchWait::IdleTimeout),
+            "a launch that stops progressing eventually times out",
         );
-
-        std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", "garbage");
-        assert_eq!(
-            launch_timeout(),
-            std::time::Duration::from_millis(DEFAULT_LAUNCH_TIMEOUT_MS),
-            "falls back on unparseable"
+        assert!(
+            ticks > 20,
+            "a progressing launch must have survived many idle-deadline windows \
+             before the token froze (got {ticks} checks)",
         );
-
-        std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", "45000");
-        assert_eq!(
-            launch_timeout(),
-            std::time::Duration::from_millis(45_000),
-            "honors an in-range override"
-        );
-
-        match prev {
-            Some(v) => std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", v),
-            None => std::env::remove_var("SHELBI_LAUNCH_TIMEOUT_MS"),
-        }
     }
 
     #[test]
