@@ -3774,6 +3774,49 @@ fn assigned_review_task_for(project: &Project, workspace_name: &str) -> Assigned
     }
 }
 
+/// The active-category (dev) task assignment of a slot, carrying board freshness
+/// so a stale or failed read never drives a resume. The dev analogue of
+/// [`AssignedReviewTask`]: a false "in_progress" off a rate-limit-parked
+/// snapshot would relaunch a dead dev slot onto a card that has since finished
+/// (churning `dev-resume`/`dev-resume-failed` up to the crash-loop cap), and a
+/// false "idle" would drop a genuinely stranded slot's crash history — the
+/// failures this enum exists to prevent.
+enum AssignedDevTask {
+    /// A warm read shows an active-category task pinned to the slot.
+    Assigned(String),
+    /// A warm read shows no active task points at the slot — genuinely idle
+    /// (finished, reassigned, or moved out of the active category); dropping the
+    /// crash history is safe.
+    None,
+    /// The board could not be read **warm** this tick (stale cache, cold
+    /// process, or a failed read — e.g. a rate-limit park). Neither "assigned"
+    /// nor "idle" is proven, so the caller must resume nothing and leave its
+    /// crash history untouched until the next tick.
+    Unknown,
+}
+
+/// The active-category task currently assigned to `workspace_name`, from a
+/// **warm** whole-board read through the cached issue store. The dev-slot resume
+/// pass reads this rather than [`current_task_for`] (which serves a stale/cold
+/// snapshot too), so it acts only on a board fresh enough to prove the card is
+/// still active on this slot — never on a rate-limit-parked `board-snapshot.json`.
+/// "Active" is resolved through the task's workflow ([`task_is_active`]), so a
+/// custom active status still counts and a `done`/backlog card does not. A
+/// `file_system` board always reads warm, so it is unaffected.
+fn assigned_dev_task_for(project: &Project, workspace_name: &str) -> AssignedDevTask {
+    let board = match shelbi_state::issue_store_for_project(project).and_then(|s| s.list_state()) {
+        Ok(shelbi_state::BoardState::Warm(board)) => board,
+        // Stale / Cold / failed: not a trustworthy read.
+        Ok(_) | Err(_) => return AssignedDevTask::Unknown,
+    };
+    match board.into_iter().find(|tf| {
+        tf.task.assigned_to.as_deref() == Some(workspace_name) && task_is_active(project, &tf.task)
+    }) {
+        Some(tf) => AssignedDevTask::Assigned(tf.task.id),
+        Option::None => AssignedDevTask::None,
+    }
+}
+
 /// Per-dev-slot crash-loop bookkeeping for [`maybe_resume_stranded_dev_slots`].
 ///
 /// The dev analogue of [`ReviewResumeState`], with one extra guard that its
@@ -3902,16 +3945,45 @@ fn maybe_resume_stranded_dev_slots(
             continue;
         }
 
-        // Nothing to resume unless a live `in_progress` task is still assigned
-        // to this slot; if not, drop the crash history.
-        let Some(task_id) = current_task_for(project, &ws.name) else {
-            state.remove(&ws.name);
-            continue;
+        // Nothing to resume unless a still-active task is assigned to this slot,
+        // read through the warm-only gate. A false "in_progress" off a
+        // rate-limit-parked snapshot would relaunch this dead slot onto a card
+        // that has already finished — the wasted-attempt churn every other
+        // destructive/dispatching poller path is gated against (see `warm_board`
+        // / `AssignedReviewTask`). This pass was written after that gate and had
+        // missed it, reading the cache via `current_task_for` with no freshness
+        // check. Both non-`Assigned` arms are a no-op with one debug line.
+        let task_id = match assigned_dev_task_for(project, &ws.name) {
+            AssignedDevTask::Assigned(id) => id,
+            // A warm read proves the slot is idle (task finished, reassigned, or
+            // moved out of the active category): drop its crash history.
+            AssignedDevTask::None => {
+                tracing::debug!(
+                    project = %project.name,
+                    workspace = %ws.name,
+                    "dev-slot resume skipped: no active task assigned on a warm board",
+                );
+                state.remove(&ws.name);
+                continue;
+            }
+            // Board not read warm (a rate-limit park serves a stale snapshot):
+            // neither assigned nor idle is proven. Resume nothing, and don't drop
+            // the crash history off an untrusted read — retry on the next warm
+            // tick, leaving this slot's state untouched.
+            AssignedDevTask::Unknown => {
+                tracing::debug!(
+                    project = %project.name,
+                    workspace = %ws.name,
+                    "dev-slot resume skipped: board not read warm this tick",
+                );
+                continue;
+            }
         };
 
         // A task the operator deliberately parked must STAY down — resuming it
         // is the churn loop. (Belt-and-suspenders: parking normally clears the
-        // assignment too, so `current_task_for` usually already returns None.)
+        // assignment too, so `assigned_dev_task_for` usually already returns
+        // `None`.)
         if shelbi_state::is_task_parked(&project.name, &task_id).unwrap_or(false) {
             state.remove(&ws.name);
             continue;
@@ -5678,6 +5750,131 @@ Intro prose.
         let _ = shelbi_state::issue_store_for("ghguard-wb-warm").unwrap().list_open().unwrap();
         let board = warm_board(&warm).expect("a primed board reads warm");
         assert!(board.iter().any(|tf| tf.task.id == "t"), "warm board carries the issue");
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A `github`-backed project named `name` with a single **dev** (non-`review`)
+    /// workspace `alpha`, persisted to disk so `issue_store_for` reads it back.
+    /// The dev-slot resume gate ([`assigned_dev_task_for`]) reads this board.
+    fn gh_dev_project(work_dir: &std::path::Path, name: &str) -> Project {
+        let mut project = local_project(work_dir);
+        project.name = name.into();
+        project.issue_tracker = shelbi_core::IssueTrackerConfig {
+            backend: IssueTrackerBackend::Github,
+            github: Some(shelbi_core::GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            ..Default::default()
+        };
+        // Leave `alpha`'s tags empty: a plain dev slot, not a review slot.
+        shelbi_state::save_project(&project).unwrap();
+        project
+    }
+
+    /// A github issue JSON for `id` carrying the `shelbi:status/<status>` label,
+    /// so the decoded card lands in the `<status>` column (`in-progress` → the
+    /// active category, `done` → done). `state:"open"` so it appears in the warm
+    /// open snapshot `list_state` serves.
+    fn gh_status_issue_json(id: &str, status: &str) -> String {
+        format!(
+            r#"{{"number":7,"title":"{id}","body":"Prose for {id}.","state":"open","labels":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/{status}"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
+        )
+    }
+
+    #[test]
+    fn assigned_dev_task_for_is_unknown_on_a_cold_or_failed_board() {
+        // The stale-skip case: on a rate-limit park (or any non-warm read) the
+        // dev-slot resume gate must resolve to Unknown, so the pass resumes
+        // nothing and leaves its crash history untouched.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = gh_guard_home("adt-cold");
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = gh_dev_project(&work_dir, "ghguard-adt-cold");
+        shelbi_state::set_test_gh_runner(|_| Err(shelbi_core::Error::Other("boom".into())));
+
+        assert!(
+            matches!(
+                assigned_dev_task_for(&project, "alpha"),
+                AssignedDevTask::Unknown
+            ),
+            "a cold/failed board must resolve to Unknown, never a false Assigned/None"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn assigned_dev_task_for_resolves_assigned_for_an_active_task_on_a_warm_board() {
+        // The warm-resume case: an `in_progress` (active-category) task pinned to
+        // the slot on a warm board resolves to Assigned, so the pass resumes it
+        // exactly as before the gate.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = gh_guard_home("adt-warm");
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let name = "ghguard-adt-warm";
+        let project = gh_dev_project(&work_dir, name);
+        // Assign the active card to `alpha` via the local overlay, then prime the
+        // cache so the warm snapshot carries the assignment.
+        shelbi_state::set_task_assignment(name, "t", Some("alpha")).unwrap();
+        install_gh_runner(gh_status_issue_json("t", "in-progress"));
+        let _ = shelbi_state::issue_store_for(name).unwrap().list_open().unwrap();
+
+        match assigned_dev_task_for(&project, "alpha") {
+            AssignedDevTask::Assigned(id) => assert_eq!(id, "t"),
+            AssignedDevTask::None => {
+                panic!("expected Assigned(t) for an active task on a warm board, got None")
+            }
+            AssignedDevTask::Unknown => {
+                panic!("expected Assigned(t) on a warm board, got Unknown")
+            }
+        }
+        // A slot with no active task pointed at it resolves to a definite None on
+        // the same warm read — not Unknown.
+        assert!(
+            matches!(
+                assigned_dev_task_for(&project, "not-a-slot"),
+                AssignedDevTask::None
+            ),
+            "a warm board with no match must be a definite None"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn assigned_dev_task_for_is_none_for_a_done_task_on_a_warm_board() {
+        // The done-no-op case: a card assigned to the slot but sitting in `done`
+        // (a non-active category) resolves to None on a warm board, so the pass
+        // does nothing and drops the slot's crash history.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = gh_guard_home("adt-done");
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let name = "ghguard-adt-done";
+        let project = gh_dev_project(&work_dir, name);
+        shelbi_state::set_task_assignment(name, "t", Some("alpha")).unwrap();
+        install_gh_runner(gh_status_issue_json("t", "done"));
+        let _ = shelbi_state::issue_store_for(name).unwrap().list_open().unwrap();
+
+        assert!(
+            matches!(
+                assigned_dev_task_for(&project, "alpha"),
+                AssignedDevTask::None
+            ),
+            "a done (non-active) task on a warm board must resolve to None, not Assigned"
+        );
 
         shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
