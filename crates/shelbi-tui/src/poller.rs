@@ -4758,7 +4758,7 @@ mod tests {
         // Criterion 1: a serving review slot is polled to a `serving` sub-state
         // (not "hasn't been polled"), and while it stays serving only last_seen
         // moves — the ordinary decide() dedupe, so the feed isn't spammed.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = review_serving_home();
         let prior_home = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", &home);
@@ -4802,7 +4802,7 @@ mod tests {
         // into serving — and carries the task title + notes + pane/worktree/url
         // location. A second (deduped) tick emits no further review-ready line,
         // so the pending/steady-state case stays silent.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = review_serving_home();
         let prior_home = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", &home);
@@ -4891,7 +4891,7 @@ Intro prose.
         // the sidebar drops the phantom Ready row. (Pane teardown needs a live
         // tmux; here the bogus addr probes Dead, so we assert the marker clear,
         // which happens before any kill.)
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = review_serving_home();
         let prior_home = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", &home);
@@ -4941,7 +4941,7 @@ Intro prose.
         // (and keeps `last_seen` advancing) instead of returning early on a
         // markerless title and freezing status.yaml. A benign screen must report
         // no dialog so the live/title path keeps owning the state.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = review_serving_home();
         let prior_home = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", &home);
@@ -5663,7 +5663,7 @@ Intro prose.
 
     #[test]
     fn assigned_review_task_for_is_unknown_on_a_cold_or_failed_board() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = gh_guard_home("art-cold");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -5688,7 +5688,7 @@ Intro prose.
 
     #[test]
     fn assigned_review_task_for_resolves_definitely_on_a_warm_board() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = gh_guard_home("art-warm");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -5729,7 +5729,7 @@ Intro prose.
 
     #[test]
     fn warm_board_is_none_on_a_cold_board_and_some_when_warm() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = gh_guard_home("wb");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -5999,7 +5999,7 @@ Intro prose.
 
     #[test]
     fn limit_resume_eligibility_is_task_runner_and_workflow_bound() {
-        let _env = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _env = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -6100,7 +6100,7 @@ Intro prose.
             return;
         }
 
-        let _env = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _env = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -6391,7 +6391,7 @@ while :; do sleep 60; done
         use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
 
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -6485,7 +6485,7 @@ while :; do sleep 60; done
 
     #[test]
     fn review_marker_promotes_in_progress_task_then_clears_itself() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-promote-{}-{}",
             std::process::id(),
@@ -6593,7 +6593,7 @@ while :; do sleep 60; done
         // backend error (network / GitHub 403 / timeout / malformed), the ready
         // marker must NOT be cleared. Clearing it strands a finished task
         // in-progress forever, because the worker wrote the marker exactly once.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-defer-{}-{}",
             std::process::id(),
@@ -6689,7 +6689,7 @@ while :; do sleep 60; done
         // shows no such task (Ok(None)) is real proof the task is gone, so the
         // marker is still cleared (with the existing warning) — a stale marker
         // must not linger forever.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-gone-{}-{}",
             std::process::id(),
@@ -6757,7 +6757,7 @@ while :; do sleep 60; done
             eprintln!("skipping: git not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-detach-{}-{}",
             std::process::id(),
@@ -6883,7 +6883,7 @@ while :; do sleep 60; done
             eprintln!("skipping: git not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-pushfail-{}-{}",
             std::process::id(),
@@ -7047,7 +7047,7 @@ while :; do sleep 60; done
             eprintln!("skipping: git not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-detachfail-{}-{}",
             std::process::id(),
@@ -7177,7 +7177,7 @@ while :; do sleep 60; done
             eprintln!("skipping: git not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-automerge-{}-{}",
             std::process::id(),
@@ -7340,7 +7340,7 @@ transitions:
             eprintln!("skipping: git not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-mergefail-{}-{}",
             std::process::id(),
@@ -7466,7 +7466,7 @@ transitions:
         // Neither a handoff status nor a merge-firing edge out of the
         // active status — still a misconfiguration: the task stays put and
         // the marker is consumed so it doesn't re-log every tick.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-deadend-{}-{}",
             std::process::id(),
@@ -7526,7 +7526,7 @@ transitions:
 
     #[test]
     fn absent_review_marker_is_a_noop() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-noop-{}-{}",
             std::process::id(),
@@ -7572,7 +7572,7 @@ transitions:
         // after start never fires (one full interval must pass first).
         // The second consideration, well past the interval and with no
         // recent events.log activity, emits exactly one heartbeat line.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-emit-{}-{}",
             std::process::id(),
@@ -7629,7 +7629,7 @@ transitions:
     fn zen_heartbeat_cue_only_fires_when_zen_is_on() {
         // Zen off (no state.json) → no cue at all, and any stale Zen cadence
         // counters are cleared so a later off→on re-enable starts fresh.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-zencue-off-{}-{}",
             std::process::id(),
@@ -7659,7 +7659,7 @@ transitions:
 
     #[test]
     fn zen_heartbeat_cue_summary_and_reread_cadences() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-zencue-on-{}-{}",
             std::process::id(),
@@ -7723,7 +7723,7 @@ transitions:
         // Zen on but no zenmode.md on disk (e.g. before the next reload
         // materializes it): the summary tick degrades to a bare `zen=on`
         // rather than dropping the heartbeat.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-zencue-missing-{}-{}",
             std::process::id(),
@@ -7762,7 +7762,7 @@ transitions:
         // A workspace transition lands in events.log moments before the
         // heartbeat attempt — the heartbeat must skip this consideration
         // so active boards don't get padded with no-op lines.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-debounce-{}-{}",
             std::process::id(),
@@ -7811,7 +7811,7 @@ transitions:
         // standard interval, but it must never silence the emitter. Live, the
         // heartbeat was observed to go quiet right after a zen toggle; this
         // pins the bound so a regression can't reintroduce a permanent stall.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-zen-{}-{}",
             std::process::id(),
@@ -7860,7 +7860,7 @@ transitions:
         // Project sets `heartbeat: off`: the function must clear any
         // outstanding schedule (so flipping it back on later starts a
         // fresh interval) and never append to events.log.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-off-{}-{}",
             std::process::id(),
@@ -7903,7 +7903,7 @@ transitions:
         // the feed must stay silent — no padding lines during the
         // offline window. The schedule still advances each attempt, and
         // once the probe flips back to true the next due tick emits.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-offline-{}-{}",
             std::process::id(),
@@ -7963,7 +7963,7 @@ transitions:
         // declared machine's health check just wedged the link). The offline
         // defer must be bounded by `standard`, not the current (max) interval —
         // otherwise one blip suppresses the heartbeat for a whole `max`.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-blip-{}-{}",
             std::process::id(),
@@ -8229,7 +8229,7 @@ transitions:
         // `workflow: None` task falls back to the built-in default even without
         // a project on disk — but pin SHELBI_HOME so the resolution is
         // deterministic regardless of the ambient environment.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-orphan-board-{}-{}",
             std::process::id(),
@@ -8299,7 +8299,7 @@ transitions:
     /// board hasn't caught up to the cross-process `in_progress` move yet.
     #[test]
     fn orphan_reaper_debounces_before_reaping() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -8385,7 +8385,7 @@ transitions:
             eprintln!("skipping: tmux not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -8496,7 +8496,7 @@ transitions:
             eprintln!("skipping: tmux not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -8603,7 +8603,7 @@ transitions:
             eprintln!("skipping: tmux not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -8714,7 +8714,7 @@ transitions:
 
     #[test]
     fn maybe_emit_heartbeat_backs_off_exponentially_while_quiescent() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-backoff-{}-{}",
             std::process::id(),
@@ -8764,7 +8764,7 @@ transitions:
 
     #[test]
     fn maybe_emit_heartbeat_holds_standard_while_work_in_flight() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-inflight-{}-{}",
             std::process::id(),
@@ -8810,7 +8810,7 @@ transitions:
         // history must still emit its first heartbeat — the seed captures the
         // existing mtime as the baseline, so stale history isn't mistaken for a
         // fresh event and the sweep isn't permanently debounced.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-history-{}-{}",
             std::process::id(),
@@ -8851,7 +8851,7 @@ transitions:
 
     #[test]
     fn maybe_emit_heartbeat_resets_to_standard_on_event_mid_backoff() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-reset-{}-{}",
             std::process::id(),
@@ -8912,7 +8912,7 @@ transitions:
         // where events never stop — went silent for over a day. The bounded
         // `window_start + standard` deadline guarantees a heartbeat still lands
         // at roughly the standard cadence while work flows.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-busy-{}-{}",
             std::process::id(),
@@ -8965,7 +8965,7 @@ transitions:
         // resumed clock oddity) must not permanently block emission. The clamp
         // pulls it back to within `max`, so the emitter recovers on its own —
         // no manual state edit.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-wedge-{}-{}",
             std::process::id(),

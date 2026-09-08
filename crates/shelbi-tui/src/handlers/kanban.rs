@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn header_click_wins_over_overlapping_card_hit() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-kanban-header-click-test-{}-{}",
             std::process::id(),
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn collapsed_header_click_expands_without_card_fallthrough() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-kanban-collapsed-header-click-test-{}-{}",
             std::process::id(),
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn default_kanban_chords_dispatch_to_expected_methods() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let km = fresh_keymaps();
         let mut app = KanbanApp::new("demo");
 
@@ -538,7 +538,7 @@ mod tests {
         // must both reach `reorder_up`. We can't observe the call
         // directly without state, so we check that the dispatcher
         // resolves the chord — both must dispatch via `km.kanban`.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let km = fresh_keymaps();
 
         assert_eq!(
@@ -574,7 +574,7 @@ mod tests {
         // effect" — we verify the popover dispatcher only consults
         // km.popover by checking that a global chord (Alt+Z) does not
         // close the popover, while a bound popover chord (Esc) does.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let km = fresh_keymaps();
 
         let mut app = KanbanApp::new("demo");
@@ -612,7 +612,7 @@ mod tests {
         // Same capital H / L the board's move_card_* uses, plus the
         // shift+arrow pair, so the move gesture is one muscle memory
         // whether the popover is open or not.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let km = fresh_keymaps();
 
         assert_eq!(
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn quit_global_chord_signals_outcome_quit() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let km = fresh_keymaps();
         let mut app = KanbanApp::new("demo");
 
@@ -665,7 +665,7 @@ mod tests {
         // Ctrl+P is intercepted by tmux in production, but the dispatcher
         // still surfaces it as its own variant so a future move of the
         // palette inside the TUI doesn't need to re-plumb the handler.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let km = fresh_keymaps();
         let mut app = KanbanApp::new("demo");
 
@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn unbound_chord_falls_through_without_panicking() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let km = fresh_keymaps();
         let mut app = KanbanApp::new("demo");
 
@@ -699,7 +699,7 @@ mod tests {
         // Tab is the default chord; this pins the route from the
         // dispatcher to the action so a future rebinding only changes
         // the chord, not the wiring.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let km = fresh_keymaps();
         assert_eq!(
             km.kanban.dispatch(key(KeyCode::Tab)),
@@ -726,7 +726,7 @@ mod tests {
         // Acceptance criterion: a project override of move_card_left
         // to `alt-h` makes Alt+H fire MoveCardLeft and bare `H` no
         // longer.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::temp_dir().join(format!(
             "shelbi-kanban-handler-override-{}-{}",
             std::process::id(),
