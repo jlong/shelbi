@@ -6990,8 +6990,11 @@ workspaces:
             }
             Ok(gh_issue_json("t", "in-progress"))
         });
-        // Prime the process cache so `list_state` reports Warm.
-        let _ = issue_store_for(name).unwrap().list().unwrap();
+        // Prime the process cache so `list_state` reports Warm. `list_open` is
+        // the cached render path that fills the open snapshot `list_state`
+        // serves (`list` is now a live, uncached pass-through and would not warm
+        // it); the one issue is in-progress, so it lands in the open board.
+        let _ = issue_store_for(name).unwrap().list_open().unwrap();
         let project = load_project(name).unwrap();
         assert_eq!(
             idle_workspace_count_warm(&project).unwrap(),

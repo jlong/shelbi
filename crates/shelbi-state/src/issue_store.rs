@@ -369,6 +369,22 @@ pub trait IssueStore {
         self.list()
     }
 
+    /// Only the terminal history — the `done`/`canceled` cards the Kanban's
+    /// terminal columns and `issue list --status done|canceled` render.
+    ///
+    /// The counterpart to [`IssueStore::list_open`]: on a remote backend a
+    /// closed issue is always terminal, so the `github` backend overrides this
+    /// to request `state=closed` in a single sweep and the process cache serves
+    /// both terminal columns from it (rather than two per-column sweeps). Kept
+    /// off the render/poll hot path — only the Kanban's terminal columns read
+    /// it, on a slow cadence behind the cache. The default is
+    /// [`IssueStore::list`], correct for the `file_system` backend (its
+    /// per-status read is already a cheap directory scan) and for any caller
+    /// that filters the returned superset to the terminal columns it wants.
+    fn list_closed(&self) -> Result<Vec<IssueFile>> {
+        self.list()
+    }
+
     /// The whole board tagged with its freshness ([`BoardState`]) so a render
     /// surface can paint a cold process instantly — from the on-disk snapshot
     /// when one exists, or a loading indicator when none does — instead of

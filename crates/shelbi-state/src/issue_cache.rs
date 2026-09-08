@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use shelbi_core::{Column, Issue, IssueTrackerConfig, Result};
+use shelbi_core::{Column, Issue, IssueTrackerConfig, Result, StatusCategory};
 
 use crate::issue_store::{
     BoardState, Cursor, IssueChange, IssueComment, IssueFields, IssueStore, NewIssue, PrioMove,
@@ -66,6 +66,14 @@ use crate::IssueFile;
 /// state dir (`<shelbi-root>/projects/<project>/`). JSON so a torn write is a
 /// clean parse failure (→ cache miss), not silently-valid garbage.
 const BOARD_SNAPSHOT_FILE: &str = "board-snapshot.json";
+
+/// Basename of the per-project on-disk snapshot for the **closed** (terminal
+/// `done`/`canceled`) board, a sibling of [`BOARD_SNAPSHOT_FILE`]. Kept
+/// separate so a resuming process serves the terminal columns from disk
+/// without a blocking `state=closed` sweep, and so the frequently-rewritten
+/// open snapshot the sidebar / `shelbi status` read stays exactly the open
+/// board (never bloated with history).
+const CLOSED_SNAPSHOT_FILE: &str = "board-snapshot-closed.json";
 
 /// How long a cached board is served before a background refresh is kicked.
 ///
@@ -84,6 +92,50 @@ const TTL: Duration = Duration::from_secs(20);
 /// [`TTL`]. A cached `list()` may lag the backend by up to this long (plus one
 /// background refresh round trip) before the snapshot catches up.
 pub const BOARD_CACHE_TTL: Duration = TTL;
+
+/// How long the **closed** (terminal `done`/`canceled`) board is served before
+/// a background refresh is kicked. Far longer than [`TTL`]: the terminal
+/// history barely changes, only the Kanban's terminal columns read it, and a
+/// `state=closed` sweep is the expensive read on a large board. A terminal
+/// status move *through this cache* invalidates it immediately, so an
+/// operator's own completion still shows promptly; an out-of-band close lands
+/// within this window.
+const CLOSED_TTL: Duration = Duration::from_secs(120);
+
+/// Which slice of a project's board a cache operation addresses. The two are
+/// cached wholly independently — distinct in-memory entry, on-disk snapshot,
+/// staleness window and single-flight refresh flag — because the open board
+/// moves constantly (short TTL, disk-persisted, the render/poll hot path)
+/// while the closed history is nearly static (long TTL, only the Kanban's
+/// terminal columns).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Non-terminal cards — `state=open` on the github backend.
+    Open,
+    /// Terminal `done`/`canceled` history — `state=closed` on the github backend.
+    Closed,
+}
+
+/// The read a background/cold refresh runs for `scope` against a freshly built
+/// store. Split out (rather than inlined in the refresh thread) so it is unit
+/// testable with a recording `gh` runner: `Open` must send `state=open`,
+/// `Closed` must send `state=closed`, neither the full `state=all` sweep.
+fn scoped_read(store: &dyn IssueStore, scope: Scope) -> Result<Vec<IssueFile>> {
+    match scope {
+        Scope::Open => store.list_open(),
+        Scope::Closed => store.list_closed(),
+    }
+}
+
+/// True for the terminal categories a closed GitHub issue maps to
+/// (`done`/`canceled`). A `list_in_status` for one of these is served from the
+/// closed cache; every other status from the open cache.
+fn is_terminal(status: &Column) -> bool {
+    matches!(
+        status.category(),
+        StatusCategory::Done | StatusCategory::Archived
+    )
+}
 
 /// One project's cached board.
 struct Entry {
@@ -116,20 +168,30 @@ fn refresh_flag(project: &str) -> Arc<AtomicBool> {
     Arc::clone(guard.entry(project.to_string()).or_default())
 }
 
-/// The cached board plus whether it is due a refresh. `None` when cold.
+/// The cached board for `key` plus whether it is older than `ttl` (due a
+/// refresh). `None` when cold. `key` is the scoped cache key (the bare project
+/// name for the open board, [`closed_key`] for the closed history), so the two
+/// scopes never collide.
 ///
 /// A poisoned lock is treated as a cache miss rather than a panic: the caller
 /// falls back to a live read, which is correct, just slower.
-fn snapshot(project: &str) -> Option<(Arc<Vec<IssueFile>>, bool)> {
+fn snapshot(key: &str, ttl: Duration) -> Option<(Arc<Vec<IssueFile>>, bool)> {
     let guard = cache().lock().ok()?;
-    let entry = guard.get(project)?;
-    Some((Arc::clone(&entry.board), entry.fetched_at.elapsed() >= TTL))
+    let entry = guard.get(key)?;
+    Some((Arc::clone(&entry.board), entry.fetched_at.elapsed() >= ttl))
+}
+
+/// The in-memory / refresh-flag / disk key for a project's **closed**-history
+/// cache — the open board keys off the bare project name, so this must not
+/// collide with it. The `\u{1}` separator can't appear in a project name.
+fn closed_key(project: &str) -> String {
+    format!("{project}\u{1}closed")
 }
 
 /// Publish a freshly read board to the in-memory cache and, when a snapshot
 /// path is known, to the on-disk snapshot. The disk write is atomic and
 /// best-effort: a failure just means the next cold process reads live.
-fn publish(project: &str, board: Vec<IssueFile>, snapshot: Option<&Path>) {
+fn publish(key: &str, board: Vec<IssueFile>, snapshot: Option<&Path>) {
     if let Some(path) = snapshot {
         write_snapshot_to_disk(path, &board);
     }
@@ -137,7 +199,7 @@ fn publish(project: &str, board: Vec<IssueFile>, snapshot: Option<&Path>) {
         return;
     };
     guard.insert(
-        project.to_string(),
+        key.to_string(),
         Entry {
             board: Arc::new(board),
             fetched_at: Instant::now(),
@@ -150,19 +212,19 @@ fn publish(project: &str, board: Vec<IssueFile>, snapshot: Option<&Path>) {
 /// cold process cannot trust the snapshot's age. Does not touch disk (the data
 /// came from there). No-op if a fresher in-memory entry already exists, so a
 /// completed background refresh is never clobbered by a stale disk seed.
-fn seed_stale_from_disk(project: &str, board: Vec<IssueFile>) {
+fn seed_stale_from_disk(key: &str, board: Vec<IssueFile>, ttl: Duration) {
     let Ok(mut guard) = cache().lock() else {
         return;
     };
-    if guard.contains_key(project) {
+    if guard.contains_key(key) {
         return;
     }
     guard.insert(
-        project.to_string(),
+        key.to_string(),
         Entry {
             board: Arc::new(board),
             fetched_at: Instant::now()
-                .checked_sub(TTL)
+                .checked_sub(ttl)
                 .unwrap_or_else(Instant::now),
         },
     );
@@ -171,13 +233,13 @@ fn seed_stale_from_disk(project: &str, board: Vec<IssueFile>) {
 /// Age the snapshot out without dropping it, so the next read serves the last
 /// known board *and* triggers a refresh. Dropping it instead would make the
 /// next read synchronous — a multi-second freeze right after a user action.
-fn mark_stale(project: &str) {
+fn mark_stale(key: &str, ttl: Duration) {
     let Ok(mut guard) = cache().lock() else {
         return;
     };
-    if let Some(entry) = guard.get_mut(project) {
+    if let Some(entry) = guard.get_mut(key) {
         entry.fetched_at = Instant::now()
-            .checked_sub(TTL)
+            .checked_sub(ttl)
             .unwrap_or_else(Instant::now);
     }
 }
@@ -189,6 +251,14 @@ fn snapshot_path(project: &str) -> Option<PathBuf> {
     crate::project_dir(project)
         .ok()
         .map(|dir| dir.join(BOARD_SNAPSHOT_FILE))
+}
+
+/// The on-disk snapshot path for `project`'s **closed** history, a sibling of
+/// [`snapshot_path`]'s open board. `None` on the same conditions.
+fn closed_snapshot_path(project: &str) -> Option<PathBuf> {
+    crate::project_dir(project)
+        .ok()
+        .map(|dir| dir.join(CLOSED_SNAPSHOT_FILE))
 }
 
 /// Read and parse the on-disk snapshot. A missing file, an unreadable file, or
@@ -233,10 +303,14 @@ pub(crate) struct CachedIssueStore {
     inner: Box<dyn IssueStore>,
     project: String,
     cfg: IssueTrackerConfig,
-    /// Where the persisted snapshot lives, resolved once at construction.
-    /// `None` when the shelbi root can't be resolved — the store then behaves
-    /// exactly like the old in-memory-only cache (no disk warm, no disk write).
+    /// Where the persisted open-board snapshot lives, resolved once at
+    /// construction. `None` when the shelbi root can't be resolved — the store
+    /// then behaves exactly like the old in-memory-only cache (no disk warm, no
+    /// disk write).
     snapshot: Option<PathBuf>,
+    /// Where the persisted closed-history snapshot lives (see
+    /// [`closed_snapshot_path`]). `None` on the same conditions as `snapshot`.
+    closed_snapshot: Option<PathBuf>,
 }
 
 impl CachedIssueStore {
@@ -246,7 +320,46 @@ impl CachedIssueStore {
             project: project.to_string(),
             cfg: cfg.clone(),
             snapshot: snapshot_path(project),
+            closed_snapshot: closed_snapshot_path(project),
         }
+    }
+
+    /// The scoped cache key, staleness window and on-disk snapshot path for
+    /// `scope` — the one place the open/closed asymmetry is spelled out.
+    fn scope_parts(&self, scope: Scope) -> (String, Duration, Option<PathBuf>) {
+        match scope {
+            Scope::Open => (self.project.clone(), TTL, self.snapshot.clone()),
+            Scope::Closed => (closed_key(&self.project), CLOSED_TTL, self.closed_snapshot.clone()),
+        }
+    }
+
+    /// Serve a scope's board as a plain `Vec` (the `list_open` / `list_closed`
+    /// contract). Non-blocking whenever it can be: the in-memory snapshot when
+    /// present (kicking a background refresh once it is stale), else the
+    /// on-disk snapshot on a warm resume (seeded stale, refreshed in the
+    /// background — no blocking sweep). Only a genuinely cold process with no
+    /// snapshot at all reads live and publishes, so a CLI one-shot never prints
+    /// an empty board.
+    fn serve(&self, scope: Scope) -> Result<Vec<IssueFile>> {
+        let (key, ttl, disk) = self.scope_parts(scope);
+        if let Some((board, stale)) = snapshot(&key, ttl) {
+            if stale {
+                self.kick_refresh(scope);
+            }
+            return Ok((*board).clone());
+        }
+        if let Some(path) = &disk {
+            if let Some(board) = read_snapshot_from_disk(path) {
+                seed_stale_from_disk(&key, board.clone(), ttl);
+                self.kick_refresh(scope);
+                return Ok(board);
+            }
+        }
+        // Genuinely cold: read live so a one-shot is correct, and publish to
+        // warm the next process (memory + disk).
+        let board = scoped_read(self.inner.as_ref(), scope)?;
+        publish(&key, board.clone(), disk.as_deref());
+        Ok(board)
     }
 
     /// Refresh the snapshot on a background thread, at most one at a time.
@@ -260,20 +373,24 @@ impl CachedIssueStore {
     /// place and the next read tries again. A board that briefly stops
     /// advancing beats one that renders an error or empties out because GitHub
     /// was slow for a moment.
-    fn kick_refresh(&self, flag: Arc<AtomicBool>) {
+    fn kick_refresh(&self, scope: Scope) {
+        let (key, _ttl, disk) = self.scope_parts(scope);
+        let flag = refresh_flag(&key);
         if flag.swap(true, Ordering::AcqRel) {
-            return; // already refreshing
+            return; // already refreshing this scope
         }
         let project = self.project.clone();
         let cfg = self.cfg.clone();
-        let snapshot = self.snapshot.clone();
         let thread_flag = Arc::clone(&flag);
         let spawned = std::thread::Builder::new()
             .name("shelbi-board-refresh".into())
             .spawn(move || {
                 if let Ok(store) = crate::issue_store::build_store(&project, &cfg) {
-                    match store.list() {
-                        Ok(board) => publish(&project, board, snapshot.as_deref()),
+                    // Scope-scoped read: `state=open` for the open board,
+                    // `state=closed` for the terminal history — never the full
+                    // `state=all` sweep this cache exists to eliminate.
+                    match scoped_read(store.as_ref(), scope) {
+                        Ok(board) => publish(&key, board, disk.as_deref()),
                         Err(e) => {
                             tracing::debug!(project = %project, error = %e, "board refresh failed")
                         }
@@ -288,39 +405,61 @@ impl CachedIssueStore {
         }
     }
 
-    /// Pass-through for a write: invalidate, then kick a refresh so the change
-    /// lands in the snapshot (in memory *and* on disk) without waiting out the
-    /// TTL.
+    /// Pass-through for a write that touches only non-terminal state:
+    /// invalidate the **open** board, then kick its refresh so the change lands
+    /// in the snapshot (in memory *and* on disk) without waiting out the TTL.
     fn invalidate(&self) {
-        mark_stale(&self.project);
-        self.kick_refresh(refresh_flag(&self.project));
+        mark_stale(&self.project, TTL);
+        self.kick_refresh(Scope::Open);
+    }
+
+    /// Pass-through for a write that moves a card **to or from a terminal
+    /// column** (a completion / cancellation): invalidate both the open board
+    /// *and* the closed history so the card leaves in-progress and appears in
+    /// done/canceled promptly, rather than the closed side lagging out its long
+    /// TTL after an operator's own action.
+    fn invalidate_with_closed(&self) {
+        self.invalidate();
+        mark_stale(&closed_key(&self.project), CLOSED_TTL);
+        self.kick_refresh(Scope::Closed);
     }
 }
 
 impl IssueStore for CachedIssueStore {
     fn list(&self) -> Result<Vec<IssueFile>> {
-        if let Some((board, stale)) = snapshot(&self.project) {
-            if stale {
-                self.kick_refresh(refresh_flag(&self.project));
-            }
-            return Ok((*board).clone());
-        }
-        // Cold in memory: `list` is the authoritative path (CLI one-shots go
-        // through it), so it reads live rather than serving the possibly-stale
-        // disk snapshot — no command ever prints stale data. The live read is
-        // published to memory *and* disk, warming the next cold process's
-        // `list_state`.
-        let board = self.inner.list()?;
-        publish(&self.project, board.clone(), self.snapshot.as_deref());
-        Ok(board)
+        // The authoritative *full* board (`state=all` on the github backend),
+        // read live and uncached. Only the migrate / reconcile / dependency
+        // paths call this now; every render and poll path takes `list_open`
+        // (served from the process-local open snapshot) or `list_in_status`, so
+        // this full sweep never lands on the hot path. Serving it from a cache
+        // would either lag those callers or force the open snapshot to carry
+        // the terminal history it deliberately omits, so it stays live.
+        self.inner.list()
+    }
+
+    fn list_open(&self) -> Result<Vec<IssueFile>> {
+        // The board the render/poll paths (pollers, sidebar, `zen scan`, the
+        // drain, unfiltered `issue list`) actually need — served from the
+        // process-local open snapshot, refreshed via `inner.list_open()`
+        // (`state=open`), never the full sweep.
+        self.serve(Scope::Open)
+    }
+
+    fn list_closed(&self) -> Result<Vec<IssueFile>> {
+        // The terminal history, served from the separate long-TTL closed
+        // snapshot (refreshed via `inner.list_closed()` = `state=closed`).
+        self.serve(Scope::Closed)
     }
 
     fn list_state(&self) -> Result<BoardState> {
-        // Warm/stale from the in-memory snapshot — the same fast path `list`
-        // takes once this process has read once.
-        if let Some((board, stale)) = snapshot(&self.project) {
+        // Warm/stale from the in-memory open snapshot — the same fast path
+        // `list_open` takes once this process has read once. Open-only by
+        // design: the sidebar and `shelbi status` filter it to the non-terminal
+        // columns they show, and the Kanban merges the terminal columns from
+        // its own `list_in_status(done|canceled)` reads.
+        if let Some((board, stale)) = snapshot(&self.project, TTL) {
             if stale {
-                self.kick_refresh(refresh_flag(&self.project));
+                self.kick_refresh(Scope::Open);
                 return Ok(BoardState::Stale((*board).clone()));
             }
             return Ok(BoardState::Warm((*board).clone()));
@@ -331,24 +470,31 @@ impl IssueStore for CachedIssueStore {
         // kick a refresh — a cold process can't trust the snapshot's TTL.
         if let Some(path) = &self.snapshot {
             if let Some(board) = read_snapshot_from_disk(path) {
-                seed_stale_from_disk(&self.project, board.clone());
-                self.kick_refresh(refresh_flag(&self.project));
+                seed_stale_from_disk(&self.project, board.clone(), TTL);
+                self.kick_refresh(Scope::Open);
                 return Ok(BoardState::Stale(board));
             }
         }
         // Genuinely cold: no memory, no snapshot on disk. Report it so the
         // caller renders a loading indicator (not an empty board) and kick the
         // background fetch that will fill the snapshot.
-        self.kick_refresh(refresh_flag(&self.project));
+        self.kick_refresh(Scope::Open);
         Ok(BoardState::Cold)
     }
 
-    /// Filtered from the cached board rather than issuing its own sweep.
-    /// `list()` is already canonical column-then-priority order, and filtering
-    /// preserves relative order, so the result matches a live call.
+    /// Filtered from the scope-appropriate cached board rather than issuing its
+    /// own sweep: the terminal `done`/`canceled` lanes come from the closed
+    /// cache (`state=closed`), every other status from the open cache
+    /// (`state=open`). Both are canonical column-then-priority order and
+    /// filtering preserves relative order, so the result matches a live call.
     fn list_in_status(&self, status: &Column) -> Result<Vec<IssueFile>> {
+        let scope = if is_terminal(status) {
+            Scope::Closed
+        } else {
+            Scope::Open
+        };
         Ok(self
-            .list()?
+            .serve(scope)?
             .into_iter()
             .filter(|f| &f.task.column == status)
             .collect())
@@ -369,7 +515,9 @@ impl IssueStore for CachedIssueStore {
 
     fn move_status(&self, id: &str, to: &Column, reason: &str) -> Result<Option<StatusMove>> {
         let out = self.inner.move_status(id, to, reason)?;
-        self.invalidate();
+        // A move can land in — or leave — a terminal column, so refresh the
+        // closed history too, not just the open board.
+        self.invalidate_with_closed();
         Ok(out)
     }
 
@@ -387,7 +535,8 @@ impl IssueStore for CachedIssueStore {
 
     fn cancel(&self, id: &str, reason: &str) -> Result<Option<StatusMove>> {
         let out = self.inner.cancel(id, reason)?;
-        self.invalidate();
+        // Cancel lands the card in the terminal `canceled` column.
+        self.invalidate_with_closed();
         Ok(out)
     }
 
@@ -398,7 +547,8 @@ impl IssueStore for CachedIssueStore {
         reason: &str,
     ) -> Result<Option<StatusMove>> {
         let out = self.inner.move_status_and_unassign(id, to, reason)?;
-        self.invalidate();
+        // Like `move_status`, the target may be terminal.
+        self.invalidate_with_closed();
         Ok(out)
     }
 
@@ -491,6 +641,29 @@ mod tests {
         fn list(&self) -> Result<Vec<IssueFile>> {
             self.lists.fetch_add(1, Ordering::SeqCst);
             Ok(self.board.clone())
+        }
+        // The open / closed reads the cache actually calls to fill each scope's
+        // snapshot. Each counts as one backend list read (shared `lists`
+        // counter) and returns its slice of the board, so a test can prove the
+        // open and closed caches are filled and served independently — exactly
+        // as a real backend partitions by `state=open` / `state=closed`.
+        fn list_open(&self) -> Result<Vec<IssueFile>> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .board
+                .iter()
+                .filter(|f| !is_terminal(&f.task.column))
+                .cloned()
+                .collect())
+        }
+        fn list_closed(&self) -> Result<Vec<IssueFile>> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .board
+                .iter()
+                .filter(|f| is_terminal(&f.task.column))
+                .cloned()
+                .collect())
         }
         fn list_in_status(&self, status: &Column) -> Result<Vec<IssueFile>> {
             Ok(self
@@ -585,6 +758,7 @@ mod tests {
                 project: project.to_string(),
                 cfg: offline_cfg(),
                 snapshot,
+                closed_snapshot: None,
             },
             lists,
             writes,
@@ -606,16 +780,35 @@ mod tests {
 
     #[test]
     fn first_read_hits_the_backend_and_later_reads_are_served_from_the_snapshot() {
+        // `list_open` is the render/poll path; it, not `list`, is the cached
+        // read. (`list` is now always a live pass-through — see the dedicated
+        // test below.)
         let (store, lists, _) = cached("cache-t1", vec![issue("a", "todo")]);
-        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(store.list_open().unwrap().len(), 1);
         assert_eq!(lists.load(Ordering::SeqCst), 1, "cold read must fetch");
         for _ in 0..5 {
-            assert_eq!(store.list().unwrap().len(), 1);
+            assert_eq!(store.list_open().unwrap().len(), 1);
         }
         assert_eq!(
             lists.load(Ordering::SeqCst),
             1,
             "warm reads must not touch the backend — this is the whole point"
+        );
+    }
+
+    #[test]
+    fn list_is_always_a_live_pass_through_never_cached() {
+        // `list` keeps the full-board contract for migrate / reconcile and is
+        // deliberately uncached: every call reaches the backend, and it never
+        // pollutes the open snapshot with terminal history.
+        let (store, lists, _) = cached("cache-t1b", vec![issue("a", "todo")]);
+        for _ in 0..3 {
+            assert_eq!(store.list().unwrap().len(), 1);
+        }
+        assert_eq!(
+            lists.load(Ordering::SeqCst),
+            3,
+            "list must pass through live on every call"
         );
     }
 
@@ -628,6 +821,12 @@ mod tests {
         let todo = store.list_in_status(&Column::todo()).unwrap();
         assert_eq!(todo.len(), 2);
         assert!(todo.iter().all(|f| f.task.column.as_str() == "todo"));
+        // Repeated non-terminal status reads are served from the one open
+        // snapshot — no per-status sweep.
+        for _ in 0..5 {
+            store.list_in_status(&Column::todo()).unwrap();
+            store.list_in_status(&Column::in_progress()).unwrap();
+        }
         assert_eq!(
             lists.load(Ordering::SeqCst),
             1,
@@ -636,15 +835,47 @@ mod tests {
     }
 
     #[test]
+    fn terminal_and_open_statuses_use_independent_caches() {
+        // done/canceled are served from the long-TTL closed cache; every other
+        // status from the open cache. Each fills once and serves repeatedly,
+        // and reading one scope never disturbs the other.
+        let (store, lists, _) = cached(
+            "cache-t2b",
+            vec![issue("a", "todo"), issue("b", "done"), issue("c", "canceled")],
+        );
+        // First terminal read fills the closed cache (one backend read).
+        assert_eq!(store.list_in_status(&Column::done()).unwrap().len(), 1);
+        assert_eq!(lists.load(Ordering::SeqCst), 1);
+        // canceled is served from the same closed snapshot — no extra read.
+        assert_eq!(store.list_in_status(&Column::canceled()).unwrap().len(), 1);
+        assert_eq!(
+            lists.load(Ordering::SeqCst),
+            1,
+            "both terminal lanes come from one closed read"
+        );
+        // The open cache is a separate fill; it must not carry terminal cards.
+        let open = store.list_open().unwrap();
+        assert_eq!(open.len(), 1);
+        assert!(open.iter().all(|f| f.task.column == Column::todo()));
+        assert_eq!(lists.load(Ordering::SeqCst), 2, "one open + one closed read");
+        // Repeated reads of either scope stay served from cache.
+        for _ in 0..5 {
+            store.list_in_status(&Column::done()).unwrap();
+            store.list_open().unwrap();
+        }
+        assert_eq!(lists.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn a_write_passes_through_and_keeps_serving_the_snapshot_without_blocking() {
         let (store, lists, writes) = cached("cache-t3", vec![issue("a", "todo")]);
-        store.list().unwrap();
+        store.list_open().unwrap();
         store.set_priority("a", PrioMove::Up).unwrap();
         assert_eq!(writes.load(Ordering::SeqCst), 1, "write must reach backend");
         // Invalidation ages the snapshot but must not discard it: the next read
         // still answers from cache (no multi-second stall after a user action)
         // and the refresh happens on a background thread.
-        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(store.list_open().unwrap().len(), 1);
         assert_eq!(
             lists.load(Ordering::SeqCst),
             1,
@@ -658,7 +889,7 @@ mod tests {
     fn list_state_warm_in_memory_after_a_read() {
         let (store, _lists, _) = cached("cache-ds1", vec![issue("a", "todo")]);
         // Seed memory with a fresh read.
-        store.list().unwrap();
+        store.list_open().unwrap();
         match store.list_state().unwrap() {
             BoardState::Warm(v) => assert_eq!(v.len(), 1),
             other => panic!("expected Warm after a fresh read, got {other:?}"),
@@ -735,17 +966,122 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // ----- gh `state=` argument, end-to-end through the cache ---------------
+
+    /// A `CachedIssueStore` wrapping a **real** [`crate::GitHubStore`] whose
+    /// `gh` runner records every call, so a test can assert the exact
+    /// `-f state=…` a cached read path sends through to `gh`. `snapshot` /
+    /// `closed_snapshot` are `None` so a single cold read never kicks a
+    /// background refresh (it would build a fresh, non-recording store), and
+    /// `cfg` is left `file_system` so any refresh that *does_ fire is a harmless
+    /// offline read that never touches `gh`. Each test uses a unique `project`
+    /// so the process-global cache starts cold.
+    fn cached_github(
+        project: &str,
+    ) -> (CachedIssueStore, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let gh = crate::GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            Ok(String::new()) // empty issues array
+        });
+        (
+            CachedIssueStore {
+                inner: Box::new(gh),
+                project: project.to_string(),
+                cfg: offline_cfg(),
+                snapshot: None,
+                closed_snapshot: None,
+            },
+            calls,
+        )
+    }
+
+    /// The recorded `gh api` issues-list calls (a GET on the issues endpoint,
+    /// excluding per-issue comment fetches).
+    fn recorded_list_calls(calls: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.contains("repos/owner/repo/issues") && !c.contains("/comments"))
+            .cloned()
+            .collect()
+    }
+
     #[test]
-    fn a_cold_list_warms_the_disk_snapshot_for_the_next_process() {
-        // `list` (the authoritative path) publishes its live read to disk, so a
-        // later cold `list_state` in another process starts warm.
+    fn cached_list_open_sends_exactly_one_state_open() {
+        let (store, calls) = cached_github("cache-gh-open");
+        store.list_open().unwrap();
+        let list = recorded_list_calls(&calls);
+        assert_eq!(list.len(), 1, "one page for a board under 100 open issues");
+        assert!(list[0].contains("state=open"), "{}", list[0]);
+        assert!(!list[0].contains("state=all"), "{}", list[0]);
+        assert!(!list[0].contains("state=closed"), "{}", list[0]);
+    }
+
+    #[test]
+    fn cached_list_in_status_non_terminal_sends_state_open() {
+        let (store, calls) = cached_github("cache-gh-todo");
+        store.list_in_status(&Column::todo()).unwrap();
+        let list = recorded_list_calls(&calls);
+        assert_eq!(list.len(), 1);
+        assert!(list[0].contains("state=open"), "{}", list[0]);
+        assert!(!list[0].contains("state=all"), "{}", list[0]);
+    }
+
+    #[test]
+    fn cached_list_in_status_terminal_sends_state_closed() {
+        let (store, calls) = cached_github("cache-gh-done");
+        store.list_in_status(&Column::done()).unwrap();
+        let list = recorded_list_calls(&calls);
+        assert_eq!(list.len(), 1);
+        assert!(list[0].contains("state=closed"), "{}", list[0]);
+        assert!(!list[0].contains("state=all"), "{}", list[0]);
+        assert!(!list[0].contains("state=open"), "{}", list[0]);
+    }
+
+    #[test]
+    fn cached_list_still_sends_the_full_state_all_sweep() {
+        // The one path that keeps the full contract, for migrate / reconcile.
+        let (store, calls) = cached_github("cache-gh-all");
+        store.list().unwrap();
+        let list = recorded_list_calls(&calls);
+        assert_eq!(list.len(), 1);
+        assert!(list[0].contains("state=all"), "{}", list[0]);
+    }
+
+    #[test]
+    fn scoped_read_maps_open_to_state_open_and_closed_to_state_closed() {
+        // The exact read the background refresh runs for each scope. Asserted
+        // directly against a recording store so the refresh's `state=` is
+        // covered without spawning its thread (which rebuilds a fresh store).
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let gh = crate::GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            Ok(String::new())
+        });
+        scoped_read(&gh, Scope::Open).unwrap();
+        scoped_read(&gh, Scope::Closed).unwrap();
+        let list = recorded_list_calls(&calls);
+        assert_eq!(list.len(), 2);
+        assert!(list[0].contains("state=open"), "{}", list[0]);
+        assert!(list[1].contains("state=closed"), "{}", list[1]);
+        assert!(list.iter().all(|c| !c.contains("state=all")));
+    }
+
+    #[test]
+    fn a_cold_list_open_warms_the_disk_snapshot_for_the_next_process() {
+        // `list_open` (the render/poll path) publishes its cold live read to
+        // disk, so a later cold `list_state` in another process starts warm.
         let path = temp_snapshot_path("cache-ds6");
         let _ = std::fs::remove_file(&path);
         let (store, lists, _) =
             cached_with_snapshot("cache-ds6", vec![issue("a", "todo")], Some(path.clone()));
-        store.list().unwrap();
-        assert_eq!(lists.load(Ordering::SeqCst), 1, "cold list reads live");
-        let read = read_snapshot_from_disk(&path).expect("list wrote a snapshot");
+        store.list_open().unwrap();
+        assert_eq!(lists.load(Ordering::SeqCst), 1, "cold list_open reads live");
+        let read = read_snapshot_from_disk(&path).expect("list_open wrote a snapshot");
         assert_eq!(read.len(), 1, "the live read was persisted to disk");
         let _ = std::fs::remove_file(&path);
     }

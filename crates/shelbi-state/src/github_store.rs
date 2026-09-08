@@ -241,8 +241,11 @@ impl GitHubStore {
 
     /// Construct a store over an arbitrary `gh` runner. The production seam for
     /// tests: inject a closure returning canned JSON instead of shelling out.
+    /// `pub(crate)` under `cfg(test)` so the `issue_cache` tests can wrap a
+    /// recording store in a [`crate::issue_cache::CachedIssueStore`] and assert
+    /// the exact `-f state=…` each cached read path sends through to `gh`.
     #[cfg(test)]
-    fn with_runner(
+    pub(crate) fn with_runner(
         repo: impl Into<String>,
         runner: impl Fn(&[&str]) -> Result<String> + Send + Sync + 'static,
     ) -> Self {
@@ -365,6 +368,15 @@ impl IssueStore for GitHubStore {
         // route from — one page for a board under 100 open issues, versus the
         // six-page `state=all` sweep every one of them used to pay.
         self.list_with_state("open")
+    }
+
+    fn list_closed(&self) -> Result<Vec<IssueFile>> {
+        // The terminal history in a single `state=closed` sweep — a closed
+        // GitHub issue always maps to `done`/`canceled` (see the module doc),
+        // so this is exactly the two terminal lanes. The process cache serves
+        // both of them by filtering this one read, instead of paying a
+        // per-column closed sweep for each.
+        self.list_with_state("closed")
     }
 
     fn list_in_status(&self, status: &Column) -> Result<Vec<IssueFile>> {

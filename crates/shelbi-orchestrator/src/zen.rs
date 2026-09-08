@@ -6593,7 +6593,11 @@ fn resolve_probe_base(
     let all_tasks = if task.depends_on.is_empty() {
         Vec::new()
     } else {
-        shelbi_state::issue_store_for_project(project)?.list()?
+        // Base resolution needs a dependency's branch, and a dep can be in any
+        // column (including terminal `done`), so it needs the full board — but
+        // this runs per-probe, so take the cheap cached scopes rather than the
+        // live `state=all` sweep.
+        board_from_caches(project)?
     };
     crate::lifecycle::resolve_base_branch(project, workflow, task, &all_tasks)
 }
@@ -11860,9 +11864,38 @@ printf 'target:%s\\n' \"$CARGO_TARGET_DIR\"";
 /// I/O: loads every task file in the project plus the events log. Returns an
 /// empty list when the backlog is empty or every backlog task is blocked.
 pub fn mechanically_eligible(project: &Project) -> Result<Vec<String>> {
-    let tasks = shelbi_state::issue_store_for_project(project)?.list()?;
+    // Runs on the heartbeat cadence, so it must not pay the full `state=all`
+    // sweep `list()` runs on the github backend. It needs the terminal `done`
+    // column visible (a backlog task unblocks once its deps are done — see
+    // `Issue::is_blocked`), so assemble the board from the two *cached* scoped
+    // reads instead of the live full sweep.
+    let tasks = board_from_caches(project)?;
     let demoted = read_demoted_task_ids()?;
     Ok(mechanically_eligible_from(&tasks, &demoted))
+}
+
+/// The whole board — open plus terminal history — assembled from the two
+/// process-cached scoped reads (`list_open` + `list_closed`) rather than the
+/// live full `state=all` sweep [`IssueStore::list`] runs on the github backend.
+///
+/// The dependency checks in [`mechanically_eligible`] / [`resolve_probe_base`]
+/// need the `done` column visible, but both sit on periodic scan/heartbeat
+/// cadences, so paying the six-page history sweep every tick would defeat the
+/// caching. `list_open` (`state=open`) and `list_closed` (`state=closed`) are
+/// each served from their own long-lived process snapshot, so this reconstructs
+/// the full board cheaply. Deduped by id because the `file_system` backend's
+/// `list_open`/`list_closed` both fall back to the whole-board `list`.
+fn board_from_caches(project: &Project) -> Result<Vec<shelbi_state::IssueFile>> {
+    let store = shelbi_state::issue_store_for_project(project)?;
+    let mut tasks = store.list_open()?;
+    let mut seen: std::collections::HashSet<String> =
+        tasks.iter().map(|tf| tf.task.id.clone()).collect();
+    for tf in store.list_closed()? {
+        if seen.insert(tf.task.id.clone()) {
+            tasks.push(tf);
+        }
+    }
+    Ok(tasks)
 }
 
 /// Pure-logic core of [`mechanically_eligible`]. Split out so the unit

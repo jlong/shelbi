@@ -5316,7 +5316,10 @@ Intro prose.
         // snapshot carries the assignment.
         shelbi_state::set_task_assignment(name, "t", Some("alpha")).unwrap();
         install_gh_runner(gh_review_issue_json("t"));
-        let _ = shelbi_state::issue_store_for(name).unwrap().list().unwrap();
+        // `list_open` is the cached render path that warms the open snapshot
+        // `list_state` serves (`list` is now a live, uncached pass-through); the
+        // issue is in the open `review` column, so it lands in that snapshot.
+        let _ = shelbi_state::issue_store_for(name).unwrap().list_open().unwrap();
 
         match assigned_review_task_for(&project, "alpha") {
             AssignedReviewTask::Assigned(id) => assert_eq!(id, "t"),
@@ -5356,9 +5359,11 @@ Intro prose.
         shelbi_state::clear_test_gh_runner();
 
         // Warm: prime the cache with one issue → Some(board) with that issue.
+        // `list_open` is the cached path that warms the open snapshot (`list` no
+        // longer caches); the issue is open, so it lands in that snapshot.
         let warm = gh_review_project(&work_dir, "ghguard-wb-warm");
         install_gh_runner(gh_review_issue_json("t"));
-        let _ = shelbi_state::issue_store_for("ghguard-wb-warm").unwrap().list().unwrap();
+        let _ = shelbi_state::issue_store_for("ghguard-wb-warm").unwrap().list_open().unwrap();
         let board = warm_board(&warm).expect("a primed board reads warm");
         assert!(board.iter().any(|tf| tf.task.id == "t"), "warm board carries the issue");
 

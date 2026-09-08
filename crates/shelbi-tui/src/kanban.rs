@@ -744,7 +744,14 @@ impl KanbanApp {
         // the board paints its chrome plus a loading overlay instead of
         // freezing on the network. A warm/stale (or `file_system`) board seeds
         // the snapshot and renders normally.
-        match shelbi_state::issue_store_for(&self.project_name).and_then(|s| s.list_state()) {
+        let store = match shelbi_state::issue_store_for(&self.project_name) {
+            Ok(store) => store,
+            Err(e) => {
+                self.status_line = format!("refresh failed: {e}");
+                return;
+            }
+        };
+        match store.list_state() {
             Ok(shelbi_state::BoardState::Cold) => {
                 // No data yet; leave `tasks` as-is (empty on first paint) and
                 // flag loading. The background refresh will fill it and the
@@ -754,7 +761,28 @@ impl KanbanApp {
             }
             Ok(state) => {
                 self.board_loading = false;
-                self.tasks = state.into_issues();
+                // `list_state` is the **open** board on a remote backend — its
+                // snapshot deliberately omits the terminal history so a render
+                // never pays a `state=all` sweep. The Kanban renders every
+                // column, though, so merge the terminal `done`/`canceled` lanes
+                // from `list_in_status`, which is served from a separate
+                // long-TTL closed cache (`state=closed`, refreshed rarely in the
+                // background). Dedupe by id so the local `file_system` backend —
+                // whose `list_state` already returns the full board, including
+                // any custom terminal status — is unaffected.
+                let mut tasks = state.into_issues();
+                let mut seen: HashSet<String> =
+                    tasks.iter().map(|tf| tf.task.id.clone()).collect();
+                for col in [Column::done(), Column::canceled()] {
+                    if let Ok(closed) = store.list_in_status(&col) {
+                        for tf in closed {
+                            if seen.insert(tf.task.id.clone()) {
+                                tasks.push(tf);
+                            }
+                        }
+                    }
+                }
+                self.tasks = tasks;
                 self.last_refresh = Instant::now();
                 self.clamp_selection();
             }
