@@ -423,6 +423,40 @@ impl CachedIssueStore {
         mark_stale(&closed_key(&self.project), CLOSED_TTL);
         self.kick_refresh(Scope::Closed);
     }
+
+    /// Write-through the just-mutated issue into the daemon-owned
+    /// `board-index.json` — the write-through half of
+    /// `Plans/github-issue-caching-and-rate-limits.md` §5. Every list consumer
+    /// now reads the board from that file (via [`crate::read_board`]) rather than
+    /// the backend, so after an operator's own write we splice the change into
+    /// the file directly, letting the sidebar and Issues board reflect it on
+    /// their next paint instead of waiting out the next daemon tick.
+    ///
+    /// The just-written issue is re-read through the cheap **single-issue** path
+    /// ([`IssueStore::get`] — one label-filtered request, never a board sweep),
+    /// so the patched entry carries every field correctly (including the true
+    /// priority read back from the metadata block). A card that has left the
+    /// open board — deleted, or moved into a terminal `done`/`canceled` column
+    /// the open index omits — is dropped from the file instead.
+    ///
+    /// Best-effort by design: if no daemon has published an index yet, or the
+    /// single read fails, this leaves the file alone and the next daemon tick
+    /// reconciles. The freshness envelope (`fetched_at`/`stale`) is never touched
+    /// here — only the daemon advances it — so a hand-patched index still reads
+    /// as exactly as fresh as the daemon last made it.
+    fn write_through_index(&self, id: &str) {
+        match self.inner.get(id) {
+            Ok(Some(f)) if !is_terminal(&f.task.column) => {
+                let _ = crate::board_index::patch_board_index_issue(&self.project, &f);
+            }
+            // Gone, or now in a terminal column ⇒ off the open board.
+            Ok(_) => {
+                let _ = crate::board_index::remove_board_index_issue(&self.project, id);
+            }
+            // A failed single read leaves the index for the daemon tick to fix.
+            Err(_) => {}
+        }
+    }
 }
 
 impl IssueStore for CachedIssueStore {
@@ -510,6 +544,9 @@ impl IssueStore for CachedIssueStore {
     fn add(&self, spec: NewIssue) -> Result<Issue> {
         let out = self.inner.add(spec)?;
         self.invalidate();
+        // Splice the new card into the published index so the sidebar/board see
+        // it before the next daemon tick (§5 write-through).
+        self.write_through_index(&out.id);
         Ok(out)
     }
 
@@ -518,18 +555,23 @@ impl IssueStore for CachedIssueStore {
         // A move can land in — or leave — a terminal column, so refresh the
         // closed history too, not just the open board.
         self.invalidate_with_closed();
+        // Write the move through to the published index (or drop the card from
+        // it when the move was into a terminal column).
+        self.write_through_index(id);
         Ok(out)
     }
 
     fn set_priority(&self, id: &str, pos: PrioMove) -> Result<()> {
         self.inner.set_priority(id, pos)?;
         self.invalidate();
+        self.write_through_index(id);
         Ok(())
     }
 
     fn set_fields(&self, id: &str, fields: IssueFields) -> Result<()> {
         self.inner.set_fields(id, fields)?;
         self.invalidate();
+        self.write_through_index(id);
         Ok(())
     }
 
@@ -537,6 +579,8 @@ impl IssueStore for CachedIssueStore {
         let out = self.inner.cancel(id, reason)?;
         // Cancel lands the card in the terminal `canceled` column.
         self.invalidate_with_closed();
+        // The card is now terminal, so this drops it from the open index.
+        self.write_through_index(id);
         Ok(out)
     }
 
@@ -549,6 +593,7 @@ impl IssueStore for CachedIssueStore {
         let out = self.inner.move_status_and_unassign(id, to, reason)?;
         // Like `move_status`, the target may be terminal.
         self.invalidate_with_closed();
+        self.write_through_index(id);
         Ok(out)
     }
 
@@ -1084,5 +1129,174 @@ mod tests {
         let read = read_snapshot_from_disk(&path).expect("list_open wrote a snapshot");
         assert_eq!(read.len(), 1, "the live read was persisted to disk");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- board-index write-through (§5) -----------------------------------
+
+    /// An inner store whose `get` returns a caller-chosen issue (or `None`), so
+    /// a write-through test can drive `CachedIssueStore`'s post-write single
+    /// read deterministically. Every mutation is an inert stub — the point is
+    /// what `write_through_index` splices into the file, not what the backend
+    /// does. Reuses the shared `issue` fixture's shape.
+    struct GetStore {
+        got: Option<IssueFile>,
+    }
+    impl IssueStore for GetStore {
+        fn list(&self) -> Result<Vec<IssueFile>> {
+            Ok(Vec::new())
+        }
+        fn list_in_status(&self, _s: &Column) -> Result<Vec<IssueFile>> {
+            Ok(Vec::new())
+        }
+        fn get(&self, _id: &str) -> Result<Option<IssueFile>> {
+            Ok(self.got.clone())
+        }
+        fn add(&self, _s: NewIssue) -> Result<Issue> {
+            unreachable!()
+        }
+        fn move_status(&self, _i: &str, _t: &Column, _r: &str) -> Result<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn set_priority(&self, _i: &str, _p: PrioMove) -> Result<()> {
+            Ok(())
+        }
+        fn set_fields(&self, _i: &str, _f: IssueFields) -> Result<()> {
+            Ok(())
+        }
+        fn cancel(&self, _i: &str, _r: &str) -> Result<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn move_status_and_unassign(
+            &self,
+            _i: &str,
+            _t: &Column,
+            _r: &str,
+        ) -> Result<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn delete(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn renumber(&self, _s: &Column) -> Result<()> {
+            Ok(())
+        }
+        fn park_review(&self, _id: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn clear_parked(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn reject_review(
+            &self,
+            _i: &str,
+            _r: &Column,
+            _s: &str,
+            _d: &str,
+        ) -> Result<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn poll_changes(&self, _s: &Cursor) -> Result<(Vec<IssueChange>, Cursor)> {
+            Ok((Vec::new(), Cursor::start()))
+        }
+        fn list_comments(&self, _id: &str) -> Result<Vec<IssueComment>> {
+            Ok(Vec::new())
+        }
+        fn add_comment(&self, _id: &str, _b: &str) -> Result<IssueComment> {
+            unreachable!()
+        }
+    }
+
+    fn cached_over_get(project: &str, got: Option<IssueFile>) -> CachedIssueStore {
+        CachedIssueStore {
+            inner: Box::new(GetStore { got }),
+            project: project.to_string(),
+            cfg: offline_cfg(),
+            snapshot: None,
+            closed_snapshot: None,
+        }
+    }
+
+    /// A `SHELBI_HOME`-isolating guard so the write-through's `board-index.json`
+    /// writes land in a temp dir, never the developer's real `~/.shelbi`. Held
+    /// under the crate test lock (`set_var` is process-global).
+    struct HomeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+        home: PathBuf,
+    }
+    impl HomeGuard {
+        fn new(tag: &str) -> Self {
+            let lock = crate::test_lock::LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let home = std::env::temp_dir().join(format!(
+                "shelbi-cache-wt-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&home).unwrap();
+            let prev = std::env::var("SHELBI_HOME").ok();
+            std::env::set_var("SHELBI_HOME", &home);
+            Self {
+                _lock: lock,
+                prev,
+                home,
+            }
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("SHELBI_HOME", v),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    #[test]
+    fn a_move_writes_through_to_the_board_index_before_the_next_tick() {
+        // §5 write-through: after a remote move the just-mutated issue is spliced
+        // into the daemon-owned `board-index.json` (re-read via the single-issue
+        // path), so the sidebar/board see the new column on their next paint.
+        let _home = HomeGuard::new("move");
+        // Seed the index as the daemon last published it: `a` in todo.
+        crate::write_board_index(
+            "cache-wt-move",
+            &crate::BoardIndex::fresh(vec![issue("a", "todo")]),
+        )
+        .unwrap();
+        // The post-write single read now shows `a` in review.
+        let store = cached_over_get("cache-wt-move", Some(issue("a", "review")));
+        store.move_status("a", &Column::review(), "handoff").unwrap();
+
+        let idx = crate::read_board_index("cache-wt-move").expect("index still present");
+        let a = idx.board.iter().find(|f| f.task.id == "a").expect("a present");
+        assert_eq!(a.task.column.as_str(), "review", "the move was written through");
+    }
+
+    #[test]
+    fn a_move_into_a_terminal_column_drops_the_card_from_the_index() {
+        // A move whose fresh read shows the card now terminal (done/canceled)
+        // takes it off the open index, since the open board omits history.
+        let _home = HomeGuard::new("term");
+        crate::write_board_index(
+            "cache-wt-term",
+            &crate::BoardIndex::fresh(vec![issue("a", "in-progress"), issue("b", "todo")]),
+        )
+        .unwrap();
+        // Fresh read shows `a` closed → done.
+        let store = cached_over_get("cache-wt-term", Some(issue("a", "done")));
+        store.cancel("a", "obsolete").unwrap();
+
+        let idx = crate::read_board_index("cache-wt-term").unwrap();
+        assert!(
+            !idx.board.iter().any(|f| f.task.id == "a"),
+            "a terminal card is dropped from the open index"
+        );
+        assert!(idx.board.iter().any(|f| f.task.id == "b"), "others untouched");
     }
 }

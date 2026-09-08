@@ -596,25 +596,24 @@ impl App {
             .ok()
             .and_then(|p| p.display_name.or(p.label));
         self.agents = load_agents(&self.project_name).unwrap_or_default();
-        // Read the board **once**, through the same three-state cached path the
-        // Issues board (`kanban.rs::refresh`) uses, and derive *both* the review
-        // sections and the workspace list from that single snapshot. This is the
-        // crux of the fix: a failed live refresh (e.g. GitHub returning 403) no
-        // longer collapses the sidebar to "no review tasks, all workspaces idle"
-        // while the Issues board — in the same process, off the same
-        // process-local cache — keeps painting the last-known board. The old
-        // code made two *further* `list_in_status` reads here whose `list()`
-        // hits the backend on a cold process and, on `Err`, `unwrap_or_default`ed
-        // to an empty section; deriving from the one `list_state` we already do
-        // removes those Err-blanking paths entirely.
+        // Read the board **once**, through the daemon-owned `board-index.json`
+        // (`Plans/github-issue-caching-and-rate-limits.md` §5) via the shared
+        // `read_board` helper — the same file the Issues board (`kanban.rs`) now
+        // reads — and derive *both* the review sections and the workspace list
+        // from that single snapshot. On a hub the daemon is the single board
+        // reader, so this `shelbi __sidebar` pane issues **no `gh api` of its
+        // own**; it just reads the published file, tagged with its freshness.
         //
-        // On a cold process with no persisted snapshot `list_state` returns
-        // `Cold` *without* blocking on the network, so we paint a loading
-        // indicator; a warm/stale (or `file_system`) board — including one
-        // served from the on-disk snapshot while a live refresh is failing —
-        // serves the last-known board.
+        // `read_board` returns the same three-state `BoardState` the pane already
+        // handled: `Warm`/`Stale` serve the last-known board (a lagging daemon
+        // degrades the sidebar exactly like the Issues board, never collapsing it
+        // to "no review tasks, all workspaces idle"); `Cold` (no index published
+        // yet) paints a loading indicator without blocking. The outer
+        // `issue_store_for` stays as the config-validity gate so a broken/absent
+        // project still classifies below; the board read itself no longer touches
+        // the backend.
         match shelbi_state::issue_store_for(&self.project_name) {
-            Ok(store) => match store.list_state() {
+            Ok(_store) => match shelbi_state::read_board(&self.project_name) {
                 Ok(state) if state.is_cold() => {
                     // Nothing to show yet; the background refresh is in flight.
                     // Leave the sections empty (the loading row stands in) and
@@ -632,7 +631,7 @@ impl App {
                     // the Issues board filters its columns from
                     // `state.into_issues()` — no second round trip, no separate
                     // store that could `Err` out and blank a section on its own.
-                    // A `github` 403 surfaces here as a served snapshot
+                    // A lagging daemon surfaces here as a served index
                     // (`Stale`), so the sidebar degrades exactly like the Issues
                     // board instead of collapsing to empty.
                     let review: Vec<IssueFile> = board
@@ -652,9 +651,9 @@ impl App {
                 }
                 Err(_) => {
                     // The project loaded fine but the board read itself failed (a
-                    // local `file_system` list error; a remote 403 is served from
-                    // the snapshot as `Ok(Stale)` above, never here). Keep the
-                    // last good sections on screen rather than collapsing them —
+                    // local `file_system` list error; a remote read returns the
+                    // published index as `Ok(Stale/Cold)` above, never here). Keep
+                    // the last good sections on screen rather than collapsing them —
                     // the Issues board degrades the same way (`kanban.rs` keeps
                     // its `tasks` on a failed refresh). `board_loading` is left
                     // untouched so a transient error never flashes a loading row
@@ -2231,34 +2230,25 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
-    /// AC: with the live board read failing (a remote `github` backend whose
-    /// refresh 403s), a *cold* sidebar process still builds its review sections
-    /// and workspace rows from the persisted board snapshot — the same
-    /// cached/snapshot path the Issues board uses — rather than collapsing to
-    /// "no review tasks, all workspaces idle". This is the crux of the bug:
-    /// one process holding a good snapshot must not paint an empty sidebar.
+    /// AC: a sidebar process builds its review sections and workspace rows from
+    /// the daemon-owned `board-index.json` (§5) — the same file the Issues board
+    /// reads — rather than sweeping the backend itself or collapsing to "no
+    /// review tasks, all workspaces idle". This is the crux of the bug: the pane
+    /// paints from the published index and never issues its own `gh api`.
     ///
-    /// The snapshot is seeded on disk and the in-memory cache is cold (a unique
-    /// project name), so `list_state` serves the disk snapshot as `Stale`
-    /// *without any live read* — exactly what happens in a fresh pane while
-    /// GitHub is returning 403 to the background refresh.
+    /// A `github` project with a seeded index and no `gh` reachable proves the
+    /// file — not the wire — paints the sidebar, deterministically offline.
     #[test]
     fn sidebar_sections_built_from_snapshot_when_live_read_fails() {
         let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        // A distinct project name keeps this test's entry isolated in the
-        // process-global board cache (so "cold in memory" actually holds).
         let name = "sidebar-degrade-gh";
         let mut project = fixture_project();
         project.name = name.into();
-        // Remote backend → reads go through the cache, which serves the on-disk
-        // snapshot on a cold process. The repo is a placeholder never contacted:
-        // a fake `gh` runner (installed below) makes every live refresh fail
-        // deterministically offline, proving the snapshot — not the wire — is
-        // what paints the sidebar, with no dependency on the developer's GitHub
-        // quota. See the failed-live-read setup after `save_project`.
+        // Remote backend → the board comes from the daemon-owned index, read
+        // straight off disk. The repo is a placeholder never contacted.
         project.issue_tracker = shelbi_core::IssueTrackerConfig {
             backend: shelbi_core::IssueTrackerBackend::Github,
             github: Some(shelbi_core::GithubConnection {
@@ -2275,20 +2265,6 @@ mod tests {
             slot: None,
         });
         shelbi_state::save_project(&project).unwrap();
-
-        // The failed live read, offline: a fake `gh` runner that always returns a
-        // rate-limit-shaped 403. It is installed process-wide, so the *background*
-        // board-refresh thread the cache spawns picks it up too — no unit test
-        // ever makes a real `gh` call, and the rate-limit response the developer's
-        // token would give during a quota window is reproduced deterministically
-        // without touching the network. Cleared before the test returns.
-        shelbi_state::set_test_gh_runner(|_| {
-            Err(shelbi_core::Error::Command {
-                cmd: "gh api ...".into(),
-                status: "HTTP 403".into(),
-                stderr: "API rate limit exceeded for user".into(),
-            })
-        });
 
         let now = Utc::now();
         let issue = |id: &str, column: Column, assigned_to: Option<&str>| IssueFile {
@@ -2316,15 +2292,16 @@ mod tests {
             issue("handoff-1", Column::review(), None),
             issue("work-1", Column::in_progress(), Some("alpha")),
         ];
-        shelbi_state::seed_board_snapshot_for_test(name, &board);
+        // Publish the board as the daemon would: the sidebar reads this file.
+        shelbi_state::write_board_index(name, &shelbi_state::BoardIndex::fresh(board)).unwrap();
 
         let mut app = App::new_sidebar(name);
         app.refresh().unwrap();
 
-        // Not "loading" — a served snapshot is real data, painted immediately.
+        // Not "loading" — a published index is real data, painted immediately.
         assert!(
             !app.board_loading,
-            "a snapshot-served board must render, not show a loading row"
+            "an index-served board must render, not show a loading row"
         );
         // The review-column task is listed (Queued for Review, since unassigned)
         // rather than the sections collapsing to empty.
@@ -2350,7 +2327,6 @@ mod tests {
             "a review slot never surfaces under Workspaces"
         );
 
-        shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
     }
 

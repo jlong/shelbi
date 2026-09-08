@@ -1031,7 +1031,7 @@ fn in_review_tasks_with_branch(project: &Project) -> Result<Vec<(String, String)
     let mut out = Vec::new();
     // Only Handoff-category (review) tasks are kept below, and those are always
     // open, so the cheap open-only read suffices.
-    for tf in shelbi_state::issue_store_for_project(project)?.list_open()? {
+    for tf in open_board(project)? {
         let workflow = load_task_workflow(&project.name, &tf.task);
         let workflow_ref = workflow.as_ref();
         let status = workflow_ref.and_then(|w| resolve_task_status(&tf.task, w));
@@ -1215,7 +1215,7 @@ fn github_merge_reconcile_candidates(project: &Project) -> Result<Vec<GithubReco
     // Reconcile candidates are Handoff-category tasks awaiting an out-of-band
     // merge — all still open — so the open-only read is the right, cheap scope
     // here (a task that already reconciled to `done` needs no further action).
-    for tf in shelbi_state::issue_store_for_project(project)?.list_open()? {
+    for tf in open_board(project)? {
         // Fall back to the default workflow when the task's workflow can't be
         // loaded — the same resilience [`crate::review_ui::approve_review_task`]
         // and the ready-handoff path use, so a transient workflow-YAML issue
@@ -2968,6 +2968,47 @@ mod pr_create_tests {
             updated_at: now,
             params: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn open_board_reads_the_daemon_index_not_the_backend() {
+        // The Zen scan sweeps (CI poll, merge-reconcile, dry-run tick, the
+        // eligibility board) read the open board from the daemon-owned
+        // `board-index.json` (§5) via `open_board`, never a per-tick `gh` sweep.
+        // A `github` project with a seeded index and no `gh` reachable still
+        // resolves — the sentinel id exists on no backend, so returning it
+        // proves the file was the source.
+        let _lock = crate::test_lock::acquire();
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::install(home.path());
+
+        let mut proj = project(std::path::Path::new("/tmp/zen-open"));
+        proj.name = "zen-open".into();
+        proj.issue_tracker = shelbi_core::IssueTrackerConfig {
+            backend: shelbi_core::IssueTrackerBackend::Github,
+            github: Some(shelbi_core::GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            ..Default::default()
+        };
+
+        let mut t = task();
+        t.id = "sentinel-open".into();
+        t.column = Column::in_progress();
+        shelbi_state::write_board_index(
+            "zen-open",
+            &shelbi_state::BoardIndex::fresh(vec![shelbi_state::IssueFile {
+                task: t,
+                body: String::new(),
+            }]),
+        )
+        .unwrap();
+
+        let board = open_board(&proj).unwrap();
+        assert!(
+            board.iter().any(|tf| tf.task.id == "sentinel-open"),
+            "the open card came from the daemon index"
+        );
     }
 
     fn pinned_identity(head_sha: &str, base_sha: &str) -> PinnedPrIdentity {
@@ -11886,16 +11927,30 @@ pub fn mechanically_eligible(project: &Project) -> Result<Vec<String>> {
 /// the full board cheaply. Deduped by id because the `file_system` backend's
 /// `list_open`/`list_closed` both fall back to the whole-board `list`.
 fn board_from_caches(project: &Project) -> Result<Vec<shelbi_state::IssueFile>> {
-    let store = shelbi_state::issue_store_for_project(project)?;
-    let mut tasks = store.list_open()?;
+    // The open board comes from the daemon-owned index (§5); the terminal
+    // history still comes from the store's long-TTL closed cache (the on-demand
+    // done path, out of the index).
+    let mut tasks = open_board(project)?;
     let mut seen: std::collections::HashSet<String> =
         tasks.iter().map(|tf| tf.task.id.clone()).collect();
+    let store = shelbi_state::issue_store_for_project(project)?;
     for tf in store.list_closed()? {
         if seen.insert(tf.task.id.clone()) {
             tasks.push(tf);
         }
     }
     Ok(tasks)
+}
+
+/// The **open** board for `project` from the daemon-owned `board-index.json`
+/// (`Plans/github-issue-caching-and-rate-limits.md` §5) via the shared
+/// [`shelbi_state::read_board`] helper — the read the Zen scan sweeps (the
+/// scoped CI poll, the GitHub-merge reconcile, the dry-run tick, and the
+/// eligibility board above) share instead of a per-tick backend `list_open`
+/// sweep. These all run on the heartbeat/scan cadence, so keeping them off the
+/// backend is exactly what §5 is for.
+fn open_board(project: &Project) -> Result<Vec<shelbi_state::IssueFile>> {
+    Ok(shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker)?.into_issues())
 }
 
 /// Pure-logic core of [`mechanically_eligible`]. Split out so the unit
@@ -12428,7 +12483,7 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
     //    rather than `Column::review()` so custom workflows with renamed
     //    handoff statuses still get probed. Handoff tasks are always open, so
     //    the open-only read is the right, cheap scope.
-    for tf in shelbi_state::issue_store_for_project(project)?.list_open()? {
+    for tf in open_board(project)? {
         let workflow = load_task_workflow(&project.name, &tf.task);
         let workflow_ref = workflow.as_ref();
         let status = workflow_ref.and_then(|w| resolve_task_status(&tf.task, w));

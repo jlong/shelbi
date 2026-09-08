@@ -739,11 +739,17 @@ impl KanbanApp {
             }
         };
         self.all_columns = self.compute_all_columns();
-        // Board freshness via the three-state API: on a cold process with no
-        // persisted snapshot this returns `Cold` without a blocking sweep, so
-        // the board paints its chrome plus a loading overlay instead of
-        // freezing on the network. A warm/stale (or `file_system`) board seeds
-        // the snapshot and renders normally.
+        // The **open** columns come from the daemon-owned `board-index.json`
+        // (`Plans/github-issue-caching-and-rate-limits.md` §5) via the shared
+        // `read_board` helper — never a per-pane backend sweep, so this
+        // `shelbi __tasks` pane issues no `gh api` list of its own. On a cold
+        // process with no index published yet `read_board` returns `Cold`
+        // without blocking, so the board paints its chrome plus a loading
+        // overlay; a warm/stale (or `file_system`) board renders normally.
+        //
+        // The `store` is still resolved for the terminal `done`/`canceled`
+        // lanes below, which stay on their own on-demand lazy path (see
+        // `gh-cache-p2-done-column-on-demand`) rather than the daemon index.
         let store = match shelbi_state::issue_store_for(&self.project_name) {
             Ok(store) => store,
             Err(e) => {
@@ -751,25 +757,25 @@ impl KanbanApp {
                 return;
             }
         };
-        match store.list_state() {
+        match shelbi_state::read_board(&self.project_name) {
             Ok(shelbi_state::BoardState::Cold) => {
                 // No data yet; leave `tasks` as-is (empty on first paint) and
-                // flag loading. The background refresh will fill it and the
-                // next tick renders the real board.
+                // flag loading. The daemon's next tick fills the index and the
+                // next refresh renders the real board.
                 self.board_loading = true;
                 self.last_refresh = Instant::now();
             }
             Ok(state) => {
                 self.board_loading = false;
-                // `list_state` is the **open** board on a remote backend — its
-                // snapshot deliberately omits the terminal history so a render
-                // never pays a `state=all` sweep. The Kanban renders every
-                // column, though, so merge the terminal `done`/`canceled` lanes
-                // from `list_in_status`, which is served from a separate
-                // long-TTL closed cache (`state=closed`, refreshed rarely in the
-                // background). Dedupe by id so the local `file_system` backend —
-                // whose `list_state` already returns the full board, including
-                // any custom terminal status — is unaffected.
+                // The index is the **open** board — it deliberately omits the
+                // terminal history so a render never pays a `state=all` sweep.
+                // The Kanban renders every column, though, so merge the terminal
+                // `done`/`canceled` lanes from `list_in_status`, served from the
+                // separate long-TTL closed cache (`state=closed`, refreshed
+                // rarely in the background). Dedupe by id so the local
+                // `file_system` backend — whose open board already returns the
+                // full board, including any custom terminal status — is
+                // unaffected.
                 let mut tasks = state.into_issues();
                 let mut seen: HashSet<String> =
                     tasks.iter().map(|tf| tf.task.id.clone()).collect();
@@ -3095,6 +3101,59 @@ mod tests {
         assert_eq!(app.selected_column, 2);
         assert_eq!(app.selected_row, 4);
         assert!(!app.popover_is_open());
+    }
+
+    /// Register a `github`-backed project under the isolated home so the board
+    /// read resolves a remote backend the daemon owns (read from the index).
+    fn register_github_project(home: &std::path::Path, name: &str) {
+        let projects = home.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join(format!("{name}.yaml")),
+            format!(
+                "name: {name}\nrepo: /tmp/{name}\ndefault_branch: main\n\
+orchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/{name}\nworkspaces: []\n\
+issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn refresh_renders_open_columns_from_the_daemon_index_not_the_backend() {
+        // The Issues board's open columns come from the daemon-owned
+        // `board-index.json` (§5), never a per-pane `gh` sweep. A `github`
+        // project with a seeded index and no `gh` reachable still renders — the
+        // sentinel id exists on no backend, so its presence proves the file was
+        // the source. (The done column stays on its own lazy path.)
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = IsolatedKanbanEnv::new("index-open");
+        register_github_project(&env.home, "demo");
+        shelbi_state::write_board_index(
+            "demo",
+            &shelbi_state::BoardIndex::fresh(vec![
+                task_file("sentinel-open", Column::in_progress(), 0, "2026-07-13T12:00:00Z"),
+            ]),
+        )
+        .unwrap();
+        // The done/canceled lanes stay on their own lazy store path; keep it
+        // offline with an empty `gh` so the test never touches the network.
+        shelbi_state::set_test_gh_runner(|_| Ok(String::new()));
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+        assert!(
+            !app.board_loading,
+            "a published index is real data, not a loading state"
+        );
+        assert!(
+            app.tasks.iter().any(|tf| tf.task.id == "sentinel-open"),
+            "the open card came from the index; tasks={:?}",
+            app.tasks.iter().map(|tf| &tf.task.id).collect::<Vec<_>>()
+        );
+
+        shelbi_state::clear_test_gh_runner();
     }
 
     #[test]

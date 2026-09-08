@@ -305,13 +305,21 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
         return Ok(());
     }
 
+    // Both the in-progress and review columns come from the daemon-owned
+    // `board-index.json` (§5) in one read, filtered in memory — never a pair of
+    // backend `list_in_status` sweeps from this CLI. Both are open (non-terminal)
+    // columns, so the open index carries them.
+    let board = shelbi_state::read_board(project)
+        .map_err(|e| anyhow!(e))?
+        .into_issues();
+
     // Surfaces every in-progress task assigned to the workspace. There
     // should normally be at most one, but if shelbi's state diverged we
     // print all of them in the STATE cell so the user sees the mess.
-    let store = shelbi_state::issue_store_for(project).map_err(|e| anyhow!(e))?;
-    let in_progress = store
-        .list_in_status(&Column::in_progress())
-        .map_err(|e| anyhow!(e))?;
+    let in_progress: Vec<&shelbi_state::IssueFile> = board
+        .iter()
+        .filter(|tf| tf.task.column == Column::in_progress())
+        .collect();
     let assigned: Vec<&Issue> = in_progress.iter().map(|tf| &tf.task).collect();
 
     // A `review`-tagged slot holds a review-column (handoff) task while it
@@ -319,9 +327,11 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
     // so without this it looks like a live pane no active task points at and
     // gets mislabeled `orphaned session`. Map each review slot to the task it's
     // serving so `list` renders it as `review: <id>` (and the probe skips it).
-    let review = store
-        .list_in_status(&Column::review())
-        .map_err(|e| anyhow!(e))?;
+    let review: Vec<shelbi_state::IssueFile> = board
+        .iter()
+        .filter(|tf| tf.task.column == Column::review())
+        .cloned()
+        .collect();
     let review_by_ws = review_assignments(&p, &review);
 
     let occupied = occupied_idle_workspaces(&p, &assigned, &review_by_ws)?;
@@ -859,6 +869,73 @@ workspaces: []\n"
             ),
         )
         .unwrap();
+    }
+
+    /// Register a `github`-backed project `name` with a dev slot `alpha` and a
+    /// `review`-tagged slot `review-1`, so `print_workspaces` reads a remote
+    /// board the daemon owns (`board-index.json`, never `gh`).
+    fn register_github_project_with_slots(home: &std::path::Path, name: &str) {
+        let projects = home.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join(format!("{name}.yaml")),
+            format!(
+                "name: {name}\nrepo: /tmp/{name}\ndefault_branch: main\n\
+orchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/{name}\n\
+workspaces:\n  - name: alpha\n    machine: local\n  - name: review-1\n    machine: local\n    tags: [review]\n\
+issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn workspace_list_reads_the_index_and_makes_no_gh_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // `shelbi workspace list` on a `github` project reads the in-progress and
+        // review columns from the daemon-owned index (§5) in one file read, not a
+        // pair of backend `list_in_status` sweeps. A recording `gh` runner proves
+        // no `gh` is spawned; the seeded index carries the assignments the render
+        // reflects.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project_with_slots(&home, "gw");
+        shelbi_state::write_board_index(
+            "gw",
+            &shelbi_state::BoardIndex::fresh(vec![
+                shelbi_state::IssueFile {
+                    task: make_task("work-1", Column::in_progress(), 0, Some("alpha")),
+                    body: String::new(),
+                },
+                shelbi_state::IssueFile {
+                    task: make_task("rev-1", Column::review(), 0, Some("review-1")),
+                    body: String::new(),
+                },
+            ]),
+        )
+        .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rec = Arc::clone(&calls);
+        shelbi_state::set_test_gh_runner(move |_| {
+            rec.fetch_add(1, Ordering::SeqCst);
+            Ok(String::new())
+        });
+
+        print_workspaces("gw").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "workspace list must read the index, never issue a `gh` list"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     fn make_task(id: &str, column: Column, priority: u32, assigned_to: Option<&str>) -> Issue {
