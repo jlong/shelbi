@@ -341,6 +341,13 @@ pub enum BoardState {
 pub struct BoardRead {
     /// The open board, in canonical column-then-priority order.
     pub board: Vec<IssueFile>,
+    /// The backend's native issue `number` for each id on `board`, when the
+    /// backend has one (GitHub). This is what lets a later `get(id)` resolve the
+    /// id to a number through the published index and fetch that one issue in a
+    /// single request, instead of an eventually-consistent label search. Empty
+    /// for backends with no per-issue number (the filesystem board, the process
+    /// cache); the daemon folds it into [`crate::BoardIndex::numbers`].
+    pub numbers: Vec<(String, i64)>,
     /// Remaining API budget on the token behind this read, when the backend
     /// reported it (GraphQL `rateLimit.remaining`).
     pub remaining: Option<u64>,
@@ -458,9 +465,32 @@ pub trait IssueStore {
         let _ = (since, previous);
         Ok(BoardRead {
             board: self.list_open()?,
+            numbers: Vec::new(),
             remaining: None,
             reset: None,
         })
+    }
+
+    /// Fetch a freshly-read copy of several issues by id in as few backend round
+    /// trips as the backend allows — the batch sibling of [`IssueStore::get`].
+    ///
+    /// Returns the issues that exist, in no guaranteed order; ids with no issue
+    /// are simply absent from the result (never an error). The default resolves
+    /// each id through [`IssueStore::get`] one at a time — correct for the
+    /// `file_system` backend (a cheap local read) and the process cache. The
+    /// `github` backend overrides it to resolve every id to a number and pull
+    /// them all in **one aliased GraphQL request** (`a: issue(number: …) { … } b:
+    /// …`), one point each and a single round trip — the read the orchestrator
+    /// drain and `zen scan` use when they need fresh copies of a handful of
+    /// specific issues rather than the whole published board index.
+    fn fetch_many(&self, ids: &[&str]) -> Result<Vec<IssueFile>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(tf) = self.get(id)? {
+                out.push(tf);
+            }
+        }
+        Ok(out)
     }
 
     /// Every issue in a single status column, in priority order.

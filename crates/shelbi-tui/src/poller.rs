@@ -5686,6 +5686,7 @@ Intro prose.
     fn seed_stale_index(name: &str) {
         let idx = shelbi_state::BoardIndex {
             board: vec![idx_issue("t", "review", Some("alpha"))],
+            numbers: std::collections::BTreeMap::new(),
             fetched_at: chrono::Utc::now().to_rfc3339(),
             stale: true,
             remaining: None,

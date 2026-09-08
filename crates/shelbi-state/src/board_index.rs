@@ -64,6 +64,16 @@ pub struct BoardIndex {
     /// See the module docs for why this is a `Vec<IssueFile>` rather than
     /// per-field index entries in Phase 1.
     pub board: Vec<IssueFile>,
+    /// The backend's native issue `number` for each open issue, keyed by shelbi
+    /// id. This is the id→number map the single-issue fetch path resolves
+    /// through (`Plans/github-issue-caching-and-rate-limits.md` §3): a `get(id)`
+    /// on a remote backend looks the number up here and fetches that one issue in
+    /// a single request, falling back to a label search only for an id the open
+    /// index does not carry (a done task, or one added since the last tick).
+    /// Empty on the `file_system` backend (no per-issue number) and on an index
+    /// written by a pre-Phase-2 daemon, both of which force the search fallback.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub numbers: std::collections::BTreeMap<String, i64>,
     /// RFC3339 timestamp of the read that produced `board`. Advances every tick
     /// (the daemon rewrites the file each refresh), so a consumer reads it — or
     /// the file mtime — as the freshness signal.
@@ -92,7 +102,7 @@ impl BoardIndex {
     /// its own; the GraphQL board path uses [`BoardIndex::fresh_at`] to carry the
     /// budget and a pre-read watermark.
     pub fn fresh(board: Vec<IssueFile>) -> Self {
-        Self::fresh_at(board, Utc::now().to_rfc3339(), None, None)
+        Self::fresh_at(board, Vec::new(), Utc::now().to_rfc3339(), None, None)
     }
 
     /// Build a fresh (non-stale) index with an explicit `fetched_at` and the
@@ -106,12 +116,14 @@ impl BoardIndex {
     /// GraphQL `rateLimit` numbers, `None` when the backend didn't surface them.
     pub fn fresh_at(
         board: Vec<IssueFile>,
+        numbers: Vec<(String, i64)>,
         fetched_at: String,
         remaining: Option<u64>,
         reset: Option<i64>,
     ) -> Self {
         Self {
             board,
+            numbers: numbers.into_iter().collect(),
             fetched_at,
             stale: false,
             remaining,
@@ -259,6 +271,30 @@ pub fn patch_board_index_issue(project: &str, issue: &IssueFile) -> Result<()> {
     write_board_index(project, &idx)
 }
 
+/// [`patch_board_index_issue`] that also records the issue's backend `number` in
+/// the id→number map, in one atomic rewrite — the single-issue fetch's
+/// write-through (§3 "reads also refresh that issue's entry in the index"). Used
+/// when the writer holds both the freshly-read issue and its number, so a later
+/// `get` in another process resolves the number without a search. `None` for a
+/// backend with no per-issue number leaves the map untouched.
+pub fn patch_board_index_issue_with_number(
+    project: &str,
+    issue: &IssueFile,
+    number: Option<i64>,
+) -> Result<()> {
+    let Some(mut idx) = read_board_index(project) else {
+        return Ok(());
+    };
+    match idx.board.iter_mut().find(|f| f.task.id == issue.task.id) {
+        Some(existing) => *existing = issue.clone(),
+        None => idx.board.push(issue.clone()),
+    }
+    if let Some(number) = number {
+        idx.numbers.insert(issue.task.id.clone(), number);
+    }
+    write_board_index(project, &idx)
+}
+
 /// Drop an issue from the published index — the write-through for a mutation
 /// that takes a card off the *open* board (a cancel, or a move into a terminal
 /// `done`/`canceled` column, which the open index deliberately omits). Preserves
@@ -270,9 +306,33 @@ pub fn remove_board_index_issue(project: &str, id: &str) -> Result<()> {
     };
     let before = idx.board.len();
     idx.board.retain(|f| f.task.id != id);
-    if idx.board.len() == before {
+    let had_number = idx.numbers.remove(id).is_some();
+    if idx.board.len() == before && !had_number {
         return Ok(());
     }
+    write_board_index(project, &idx)
+}
+
+/// Record a remote backend's native issue `number` for `id` in the published
+/// index's id→number map, so a later single-issue `get(id)` resolves the number
+/// locally and fetches that one issue in a single request instead of a label
+/// search. Used by the write path the moment it learns a number: a create
+/// returns the new issue's number (so an immediate `get` after `add` resolves
+/// without the eventually-consistent search), and a fresh single-issue fetch
+/// re-confirms it.
+///
+/// The freshness envelope (`fetched_at`, `stale`, budget) is left untouched —
+/// only the daemon advances that. A no-op when no index has been published yet
+/// (the first tick will carry the number) or when the map already maps `id` to
+/// the same number.
+pub fn record_board_index_number(project: &str, id: &str, number: i64) -> Result<()> {
+    let Some(mut idx) = read_board_index(project) else {
+        return Ok(());
+    };
+    if idx.numbers.get(id) == Some(&number) {
+        return Ok(());
+    }
+    idx.numbers.insert(id.to_string(), number);
     write_board_index(project, &idx)
 }
 
@@ -494,6 +554,7 @@ mod tests {
     fn index_aged(board: Vec<IssueFile>, secs_ago: i64, stale: bool) -> BoardIndex {
         BoardIndex {
             board,
+            numbers: std::collections::BTreeMap::new(),
             fetched_at: (Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339(),
             stale,
             remaining: None,
@@ -595,6 +656,44 @@ mod tests {
         // Removing an id that isn't there leaves the file unchanged.
         remove_board_index_issue("proj", "ghost").unwrap();
         assert_eq!(read_board_index("proj").unwrap().board.len(), 1);
+    }
+
+    #[test]
+    fn patch_with_number_and_record_number_maintain_the_id_to_number_map() {
+        let _iso = IsolatedHome::new("numbers");
+        let mut idx = index_aged(vec![issue("a", "todo", 0)], 0, false);
+        idx.numbers.insert("a".into(), 1);
+        write_board_index("proj", &idx).unwrap();
+
+        // A single-issue fetch write-through carries the number in.
+        patch_board_index_issue_with_number("proj", &issue("b", "review", 0), Some(2)).unwrap();
+        // A create records a number without touching the board.
+        record_board_index_number("proj", "c", 3).unwrap();
+
+        let back = read_board_index("proj").unwrap();
+        assert_eq!(back.numbers.get("a"), Some(&1), "existing mapping preserved");
+        assert_eq!(back.numbers.get("b"), Some(&2), "patched issue's number recorded");
+        assert_eq!(back.numbers.get("c"), Some(&3), "create-recorded number present");
+
+        // Removing an issue drops its number too.
+        remove_board_index_issue("proj", "b").unwrap();
+        assert_eq!(read_board_index("proj").unwrap().numbers.get("b"), None);
+    }
+
+    #[test]
+    fn fresh_at_carries_the_numbers_and_survives_a_round_trip() {
+        let idx = BoardIndex::fresh_at(
+            vec![issue("a", "todo", 0)],
+            vec![("a".to_string(), 7)],
+            Utc::now().to_rfc3339(),
+            Some(4999),
+            None,
+        );
+        assert_eq!(idx.numbers.get("a"), Some(&7));
+        // The map round-trips through the on-disk (de)serialization.
+        let bytes = serde_json::to_vec(&idx).unwrap();
+        let back: BoardIndex = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.numbers.get("a"), Some(&7));
     }
 
     #[test]

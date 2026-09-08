@@ -260,6 +260,10 @@ impl GitHubStore {
         // is the real `gh` CLI with resolved auth.
         #[cfg(any(test, feature = "test-support"))]
         if let Some(runner) = test_gh_runner_override() {
+            // A test builds a fresh store per command; start it with clean
+            // process-global caches so a number/issue one test cached can't be
+            // served to another (both statics outlive a single test).
+            clear_issue_caches_for_test();
             return Self {
                 project,
                 repo,
@@ -330,6 +334,9 @@ impl GitHubStore {
         repo: impl Into<String>,
         runner: impl Fn(&[&str]) -> Result<String> + Send + Sync + 'static,
     ) -> Self {
+        // Clean process-global caches so one test's cached number/issue can't
+        // be served to the next (see [`clear_issue_caches_for_test`]).
+        clear_issue_caches_for_test();
         let gh: GhRunner = Arc::new(runner);
         Self {
             project: "test-project".to_string(),
@@ -506,8 +513,12 @@ impl IssueStore for GitHubStore {
             Err(e) => {
                 self.note_graphql_fallback(&e);
                 let board = self.list_with_state("open")?;
+                // The degraded REST list doesn't surface issue numbers, so the
+                // index carries none this tick and a `get` falls back to search
+                // until the GraphQL path recovers.
                 return Ok(BoardRead {
                     board,
+                    numbers: Vec::new(),
                     remaining: None,
                     reset: None,
                 });
@@ -517,14 +528,23 @@ impl IssueStore for GitHubStore {
         let assignments = crate::task_assignments(&self.project)?;
         match since {
             None => {
+                // Cold read: capture every open issue's number alongside its
+                // mapped card, so the daemon can publish the full id→number map.
+                let mut numbers: Vec<(String, i64)> = Vec::with_capacity(page.issues.len());
                 let mut board: Vec<IssueFile> = page
                     .issues
                     .into_iter()
-                    .map(|gh| fold_assignment(gh.into_issue_file(), &assignments))
+                    .map(|gh| {
+                        let number = gh.number;
+                        let tf = fold_assignment(gh.into_issue_file(), &assignments);
+                        numbers.push((tf.task.id.clone(), number));
+                        tf
+                    })
                     .collect();
                 sort_board(&mut board);
                 Ok(BoardRead {
                     board,
+                    numbers,
                     remaining: page.remaining,
                     reset: page.reset,
                 })
@@ -534,15 +554,21 @@ impl IssueStore for GitHubStore {
                     .iter()
                     .map(|tf| (tf.task.id.clone(), tf.clone()))
                     .collect();
+                // Numbers for the issues this delta actually saw and left open;
+                // the daemon merges them onto the prior index's map, so untouched
+                // issues keep the number an earlier tick recorded.
+                let mut numbers: Vec<(String, i64)> = Vec::new();
                 for gh in page.issues {
                     // The index is the GitHub-*open* set. A closed issue (however
                     // its stale status label reads) leaves the open board; every
                     // other touched issue is upserted in place.
                     let closed = gh.is_closed();
+                    let number = gh.number;
                     let tf = gh.into_issue_file();
                     if closed {
                         by_id.remove(&tf.task.id);
                     } else {
+                        numbers.push((tf.task.id.clone(), number));
                         by_id.insert(tf.task.id.clone(), tf);
                     }
                 }
@@ -553,6 +579,7 @@ impl IssueStore for GitHubStore {
                 sort_board(&mut board);
                 Ok(BoardRead {
                     board,
+                    numbers,
                     remaining: page.remaining,
                     reset: page.reset,
                 })
@@ -579,20 +606,74 @@ impl IssueStore for GitHubStore {
 
     fn get(&self, id: &str) -> Result<Option<IssueFile>> {
         shelbi_core::validate_task_id(id)?;
-        let path = format!("repos/{}/issues", self.repo);
-        let label = format!("labels={}", id_label(id));
-        let issues = self.api_issues(
-            &path,
-            &["-f", "state=all", "-f", &label, "-f", "per_page=100"],
-        )?;
-        let Some(gh) = issues.into_iter().find(|gh| !gh.is_pull_request()) else {
+        // The fresh single-issue path (`Plans/github-issue-caching-and-rate-limits.md`
+        // §3). Resolve the id to a GitHub `number` — from the process-local cache,
+        // then the published index's id→number map — and fetch that one issue
+        // through GraphQL (one point), instead of the old eventually-consistent
+        // label-filtered REST list. Every action path (`issue show`/`start`/
+        // `resume`/`move`/`edit`/`prio`, review-slot load, `zen probe`, the
+        // ready-marker handoff, the review→done transition) reads through here, so
+        // each acts on the latest body and status, never a stale index copy.
+        //
+        // Fast path: a number the index or a prior read already resolved. It is
+        // verified against the fetched issue's id, so a (practically impossible)
+        // stale mapping can never return the wrong issue — it just falls through
+        // to the authoritative search.
+        if let Some(number) = self.cached_number(id).or_else(|| self.index_number(id)) {
+            if let Some(tf) = self.fetch(number)? {
+                if tf.task.id == id {
+                    self.remember_number(id, number);
+                    self.refresh_index_entry(&tf, number);
+                    return Ok(Some(tf));
+                }
+            }
+            // The cached/index number no longer names this id — re-resolve.
+            self.forget_number(id);
+        }
+        // Search fallback: an id the open index does not carry — a done/canceled
+        // task, or one added since the last daemon tick. One GraphQL point, and
+        // (unlike REST label search) the number it returns is fetched directly,
+        // so the eventual-consistency window only ever delays *resolution*, never
+        // returns a stale body.
+        let Some(number) = self.search_number(id)? else {
             return Ok(None);
         };
-        let mut tf = gh.into_issue_file();
-        // Fold in the local assignment overlay so a caller reads the owning
-        // workspace even though the tracker stores no assignment.
-        tf.task.assigned_to = crate::get_task_assignment(&self.project, id)?;
+        let Some(tf) = self.fetch(number)? else {
+            return Ok(None);
+        };
+        if tf.task.id != id {
+            return Ok(None);
+        }
+        self.remember_number(id, number);
+        self.refresh_index_entry(&tf, number);
         Ok(Some(tf))
+    }
+
+    fn fetch_many(&self, ids: &[&str]) -> Result<Vec<IssueFile>> {
+        // Resolve every id to a number (cache / index / search), then pull them
+        // all in one aliased GraphQL request — the batch read the orchestrator
+        // drain and `zen scan` use when they need fresh copies of a handful of
+        // specific issues rather than the whole published board. Ids that don't
+        // resolve are simply absent from the result, matching the default's
+        // "present issues only, never an error" contract.
+        let mut numbers: Vec<i64> = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(n) = self.resolve_number(id)? {
+                numbers.push(n);
+            }
+        }
+        numbers.sort_unstable();
+        numbers.dedup();
+        let fetched = self.fetch_many_numbers(&numbers)?;
+        // Warm the per-number cache and the id→number map from the batch, but
+        // leave the published index to the daemon: a bulk fresh read is a
+        // decision input, not a sidebar update, and rewriting the index file
+        // once per issue would be needless write amplification.
+        for (tf, number) in &fetched {
+            self.cache_issue(*number, tf);
+            self.remember_number(&tf.task.id, *number);
+        }
+        Ok(fetched.into_iter().map(|(tf, _)| tf).collect())
     }
 
     fn add(&self, spec: NewIssue) -> Result<Issue> {
@@ -638,6 +719,21 @@ impl IssueStore for GitHubStore {
         ];
         let out = self.api_send("POST", &format!("repos/{}/issues", self.repo), &fields)?;
         let created: GhIssue = parse_json_object(&out)?;
+
+        // Record the number the create returned so an immediate `get(id)` after
+        // `add` resolves it directly (plan open question: "`add` followed by an
+        // immediate `get` should use the number the create returned, not the
+        // search", which is eventually consistent). A non-terminal card also
+        // seeds the published index's id→number map for other processes before
+        // the next daemon tick; a terminal card stays off the open index.
+        self.remember_number(&spec.id, created.number);
+        if !is_terminal(&spec.column) {
+            let _ = crate::board_index::record_board_index_number(
+                &self.project,
+                &spec.id,
+                created.number,
+            );
+        }
 
         // Creating straight into a terminal status closes the issue, so the
         // board and GitHub agree the moment the card exists.
@@ -1023,7 +1119,14 @@ impl GitHubStore {
             &path,
             &["-f", "state=all", "-f", &label, "-f", "per_page=100"],
         )?;
-        Ok(issues.into_iter().find(|gh| !gh.is_pull_request()))
+        let found = issues.into_iter().find(|gh| !gh.is_pull_request());
+        if let Some(gh) = &found {
+            // A write helper already fetched this issue's number; remember it so
+            // the post-write `get` (the CachedIssueStore write-through) resolves
+            // it from the cache and never pays a search.
+            self.remember_number(id, gh.number);
+        }
+        Ok(found)
     }
 
     /// Split `owner/repo` into its two halves for the GraphQL `owner`/`name`
@@ -1142,6 +1245,216 @@ impl GitHubStore {
             remaining: budget.as_ref().and_then(|r| r.remaining),
             reset: budget.and_then(|r| r.reset_at).map(|dt| dt.timestamp()),
         })
+    }
+
+    // --- fresh single-issue fetch (plan §3) ----------------------------------
+
+    /// Fetch one issue by its GitHub `number`, fresh through GraphQL (one point),
+    /// with a small per-number cache keyed by `updatedAt`.
+    ///
+    /// The cache is served only when the published board index shows **no newer**
+    /// `updatedAt` for this issue than the cached copy — so a card that moved or
+    /// was edited (its `updatedAt` advanced in the index) is always re-read live,
+    /// while a repeat read of an unchanged issue in the same process costs no
+    /// request. An issue the index doesn't carry (a done task, or no index yet)
+    /// can't be proven fresh, so it is always fetched live. Returns `None` for a
+    /// number that names no issue (deleted, or a pull request).
+    fn fetch(&self, number: i64) -> Result<Option<IssueFile>> {
+        if let Some(tf) = self.cached_issue_if_fresh(number)? {
+            return Ok(Some(tf));
+        }
+        let Some(node) = self.graphql_single_issue(number)? else {
+            self.forget_issue(number);
+            return Ok(None);
+        };
+        let mut tf = node.into_gh_issue().into_issue_file();
+        // Fold the local assignment overlay so a caller reads the owning
+        // workspace even though the tracker stores no assignment.
+        tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
+        self.cache_issue(number, &tf);
+        self.remember_number(&tf.task.id, number);
+        Ok(Some(tf))
+    }
+
+    /// The cached full issue for `number` when the published index does not show
+    /// a newer `updatedAt` than the cached copy — the freshness gate the plan
+    /// calls for ("invalidated whenever the index shows a newer `updatedAt` for
+    /// that number"). `None` (a live fetch) on a cache miss, on an index that has
+    /// a strictly newer `updatedAt`, or on an issue the index doesn't carry.
+    fn cached_issue_if_fresh(&self, number: i64) -> Result<Option<IssueFile>> {
+        let Some((cached_updated, tf)) = issue_cache_get(&self.repo, number) else {
+            return Ok(None);
+        };
+        let Some(idx) = crate::board_index::read_board_index(&self.project) else {
+            return Ok(None);
+        };
+        let Some(entry) = idx.board.iter().find(|f| f.task.id == tf.task.id) else {
+            return Ok(None);
+        };
+        if entry.task.updated_at > cached_updated {
+            return Ok(None);
+        }
+        // Not newer than what we cached — serve it, re-folding the owner overlay
+        // (which can change without bumping GitHub's `updatedAt`).
+        let mut tf = tf;
+        tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
+        Ok(Some(tf))
+    }
+
+    /// Fetch several issues by number in one aliased GraphQL request
+    /// (`i0: issue(number: …) { … } i1: …`), one point each and a single round
+    /// trip. Chunked so a very large batch stays within a sane query size.
+    /// Returns each `(issue, number)` that exists; missing numbers are dropped.
+    fn fetch_many_numbers(&self, numbers: &[i64]) -> Result<Vec<(IssueFile, i64)>> {
+        const CHUNK: usize = 50;
+        let mut out = Vec::with_capacity(numbers.len());
+        for chunk in numbers.chunks(CHUNK) {
+            for (node, number) in self.graphql_issues_by_number(chunk)? {
+                let mut tf = node.into_gh_issue().into_issue_file();
+                tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
+                out.push((tf, number));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolve a shelbi id to a GitHub `number`: the process-local cache, then
+    /// the published index's id→number map, then a label search (the fallback for
+    /// an id the open index doesn't carry). A number learned from the index or
+    /// search is remembered so the next resolution is free.
+    fn resolve_number(&self, id: &str) -> Result<Option<i64>> {
+        if let Some(n) = self.cached_number(id) {
+            return Ok(Some(n));
+        }
+        if let Some(n) = self.index_number(id) {
+            self.remember_number(id, n);
+            return Ok(Some(n));
+        }
+        let n = self.search_number(id)?;
+        if let Some(n) = n {
+            self.remember_number(id, n);
+        }
+        Ok(n)
+    }
+
+    /// The number for `id` from the process-local id→number cache, if known.
+    fn cached_number(&self, id: &str) -> Option<i64> {
+        id_number_cache()
+            .lock()
+            .ok()?
+            .get(&(self.repo.clone(), id.to_string()))
+            .copied()
+    }
+
+    /// The number for `id` from the published board index's id→number map, if the
+    /// open index carries it.
+    fn index_number(&self, id: &str) -> Option<i64> {
+        crate::board_index::read_board_index(&self.project)?
+            .numbers
+            .get(id)
+            .copied()
+    }
+
+    /// Remember `id`→`number` in the process-local cache. A poisoned lock is a
+    /// silent miss (the next resolution just re-reads the index or searches).
+    fn remember_number(&self, id: &str, number: i64) {
+        if let Ok(mut guard) = id_number_cache().lock() {
+            guard.insert((self.repo.clone(), id.to_string()), number);
+        }
+    }
+
+    /// Drop `id`'s cached number after a fetch proved the mapping stale, so the
+    /// search fallback re-resolves it authoritatively.
+    fn forget_number(&self, id: &str) {
+        if let Ok(mut guard) = id_number_cache().lock() {
+            guard.remove(&(self.repo.clone(), id.to_string()));
+        }
+    }
+
+    /// Cache the full issue for `number`, keyed by its `updatedAt`.
+    fn cache_issue(&self, number: i64, tf: &IssueFile) {
+        if let Ok(mut guard) = issue_cache().lock() {
+            guard.insert(
+                (self.repo.clone(), number),
+                (tf.task.updated_at, tf.clone()),
+            );
+        }
+    }
+
+    /// Drop any cached full issue for `number` (a fetch found it gone).
+    fn forget_issue(&self, number: i64) {
+        if let Ok(mut guard) = issue_cache().lock() {
+            guard.remove(&(self.repo.clone(), number));
+        }
+    }
+
+    /// Write a freshly-read issue back into the published index so a move/edit we
+    /// just read is visible to the sidebar on its next paint (§3 "reads also
+    /// refresh that issue's entry in the index"). A terminal card is dropped from
+    /// the open index; a non-terminal one is upserted with its number. A no-op
+    /// when no index has been published yet.
+    fn refresh_index_entry(&self, tf: &IssueFile, number: i64) {
+        if is_terminal(&tf.task.column) {
+            let _ = crate::board_index::remove_board_index_issue(&self.project, &tf.task.id);
+        } else {
+            let _ = crate::board_index::patch_board_index_issue_with_number(
+                &self.project,
+                tf,
+                Some(number),
+            );
+        }
+    }
+
+    /// Fetch one issue node by number via the single-issue GraphQL query, or
+    /// `None` when the number names no issue (deleted, or a pull request — GraphQL
+    /// `issue(number:)` returns null for a PR).
+    fn graphql_single_issue(&self, number: i64) -> Result<Option<GhIssueNode>> {
+        let (owner, name) = self.owner_and_name()?;
+        let query_arg = format!("query={SINGLE_ISSUE_QUERY}");
+        let owner_arg = format!("owner={owner}");
+        let name_arg = format!("name={name}");
+        // `number` is an `Int!`, so pass it with `-F` (typed) rather than `-f`
+        // (raw string), which would send `"5"` and fail the scalar coercion.
+        let number_arg = format!("number={number}");
+        let args: Vec<&str> = vec![
+            "api", "graphql", "-f", &query_arg, "-f", &owner_arg, "-f", &name_arg, "-F",
+            &number_arg,
+        ];
+        let out = (self.graphql)(&args)?;
+        parse_single_issue_response(&out)
+    }
+
+    /// Fetch a chunk of issues in one aliased GraphQL request. Numbers are
+    /// integers inlined into the query text (never user input), aliased `i0`,
+    /// `i1`, … so one response carries them all. Returns each `(node, number)`
+    /// that resolved to a real issue.
+    fn graphql_issues_by_number(&self, numbers: &[i64]) -> Result<Vec<(GhIssueNode, i64)>> {
+        if numbers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (owner, name) = self.owner_and_name()?;
+        let query = build_issues_by_number_query(numbers);
+        let query_arg = format!("query={query}");
+        let owner_arg = format!("owner={owner}");
+        let name_arg = format!("name={name}");
+        let args: Vec<&str> = vec![
+            "api", "graphql", "-f", &query_arg, "-f", &owner_arg, "-f", &name_arg,
+        ];
+        let out = (self.graphql)(&args)?;
+        parse_issues_by_number_response(&out, numbers)
+    }
+
+    /// Resolve an id to a number via GitHub's search API — the fallback for an id
+    /// the open index doesn't carry (a done task, or one added since the last
+    /// tick). One point: `search(query: "repo:o/r label:\"shelbi:id/<label>\"",
+    /// type: ISSUE, first: 2)`, taking the first issue's number.
+    fn search_number(&self, id: &str) -> Result<Option<i64>> {
+        let q = format!("repo:{} label:\"{}\"", self.repo, id_label(id));
+        let query_arg = format!("query={ID_SEARCH_QUERY}");
+        let q_arg = format!("q={q}");
+        let args: Vec<&str> = vec!["api", "graphql", "-f", &query_arg, "-f", &q_arg];
+        let out = (self.graphql)(&args)?;
+        parse_search_number_response(&out)
     }
 
     /// Live-read the comments on a GitHub issue by its number, oldest first.
@@ -1607,6 +1920,237 @@ struct GraphQlBoardPage {
     issues: Vec<GhIssue>,
     remaining: Option<u64>,
     reset: Option<i64>,
+}
+
+// --- single-issue + aliased multi-fetch + id search (plan §3) -----------------
+
+/// The fresh single-issue read: one issue by number, the same node shape the
+/// board index parses so [`GhIssueNode`] serves both. One point.
+const SINGLE_ISSUE_QUERY: &str = r#"
+query Issue($owner: String!, $name: String!, $number: Int!) {
+  rateLimit { remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      number title state stateReason createdAt updatedAt body
+      labels(first: 10) { nodes { name } }
+    }
+  }
+}
+"#;
+
+/// Resolve an id to a number for an issue the open index doesn't carry (a done
+/// task, or one added since the last tick): search by the `shelbi:id/*` label.
+/// One point.
+const ID_SEARCH_QUERY: &str = r#"
+query IdSearch($q: String!) {
+  rateLimit { remaining resetAt }
+  search(query: $q, type: ISSUE, first: 2) {
+    nodes { ... on Issue { number } }
+  }
+}
+"#;
+
+/// Build the aliased multi-issue query for `numbers`: each is inlined as its own
+/// `i<k>: issue(number: <n>) { … }` field (numbers are integers, never user
+/// input), so one request and one round trip return them all. The node shape
+/// matches [`GhIssueNode`] so the same mapping serves single, aliased and board
+/// reads.
+fn build_issues_by_number_query(numbers: &[i64]) -> String {
+    let mut aliases = String::new();
+    for (k, n) in numbers.iter().enumerate() {
+        aliases.push_str(&format!(
+            "    i{k}: issue(number: {n}) {{ number title state stateReason createdAt \
+             updatedAt body labels(first: 10) {{ nodes {{ name }} }} }}\n"
+        ));
+    }
+    format!(
+        "query IssuesByNumber($owner: String!, $name: String!) {{\n  \
+         rateLimit {{ remaining resetAt }}\n  \
+         repository(owner: $owner, name: $name) {{\n{aliases}  }}\n}}\n"
+    )
+}
+
+/// `{ "data": { "rateLimit": …, "repository": { "issue": <node>|null } } }`.
+#[derive(Debug, Deserialize)]
+struct SingleIssueResponse {
+    #[serde(default)]
+    data: Option<SingleIssueData>,
+    #[serde(default)]
+    errors: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SingleIssueData {
+    repository: Option<SingleIssueRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SingleIssueRepo {
+    #[serde(default)]
+    issue: Option<GhIssueNode>,
+}
+
+/// Parse a single-issue GraphQL response into its node, or `None` when the
+/// number names no issue (deleted, or a pull request → `issue` is null). A
+/// GraphQL `errors` array or a missing `repository` is a hard error, exactly as
+/// on the board read.
+fn parse_single_issue_response(text: &str) -> Result<Option<GhIssueNode>> {
+    let resp: SingleIssueResponse = serde_json::from_str(text.trim())
+        .map_err(|e| Error::Other(format!("gh graphql returned unparseable JSON: {e}")))?;
+    if let Some(errors) = resp.errors.as_ref().filter(|e| !e.is_empty()) {
+        return Err(Error::Other(format!(
+            "GitHub GraphQL returned errors on the single-issue read: {}",
+            summarize_graphql_errors(errors)
+        )));
+    }
+    let data = resp
+        .data
+        .ok_or_else(|| Error::Other("gh graphql single-issue response carried no data".into()))?;
+    let repository = data.repository.ok_or_else(|| {
+        Error::Other(
+            "gh graphql single-issue response has no repository (wrong name, or the token \
+             can't see it)"
+                .into(),
+        )
+    })?;
+    Ok(repository.issue)
+}
+
+/// `{ "data": { "rateLimit": …, "repository": { "i0": <node>|null, … } } }`.
+#[derive(Debug, Deserialize)]
+struct AliasResponse {
+    #[serde(default)]
+    data: Option<AliasData>,
+    #[serde(default)]
+    errors: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AliasData {
+    repository: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Parse an aliased multi-issue response, pairing each present `i<k>` node with
+/// `numbers[k]` (the order the aliases were built in). Null aliases (a number
+/// that named no issue) are skipped.
+fn parse_issues_by_number_response(
+    text: &str,
+    numbers: &[i64],
+) -> Result<Vec<(GhIssueNode, i64)>> {
+    let resp: AliasResponse = serde_json::from_str(text.trim())
+        .map_err(|e| Error::Other(format!("gh graphql returned unparseable JSON: {e}")))?;
+    if let Some(errors) = resp.errors.as_ref().filter(|e| !e.is_empty()) {
+        return Err(Error::Other(format!(
+            "GitHub GraphQL returned errors on the multi-issue read: {}",
+            summarize_graphql_errors(errors)
+        )));
+    }
+    let data = resp
+        .data
+        .ok_or_else(|| Error::Other("gh graphql multi-issue response carried no data".into()))?;
+    let repository = data.repository.ok_or_else(|| {
+        Error::Other("gh graphql multi-issue response has no repository".into())
+    })?;
+    let mut out = Vec::new();
+    for (k, number) in numbers.iter().enumerate() {
+        let Some(value) = repository.get(&format!("i{k}")) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let node: GhIssueNode = serde_json::from_value(value.clone())
+            .map_err(|e| Error::Other(format!("gh graphql returned unparseable issue node: {e}")))?;
+        out.push((node, *number));
+    }
+    Ok(out)
+}
+
+/// `{ "data": { "rateLimit": …, "search": { "nodes": [ { "number": n }, … ] } } }`.
+#[derive(Debug, Deserialize)]
+struct SearchResponse {
+    #[serde(default)]
+    data: Option<SearchData>,
+    #[serde(default)]
+    errors: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchData {
+    search: Option<SearchConnection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchConnection {
+    #[serde(default)]
+    nodes: Vec<SearchNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchNode {
+    /// Present via the `... on Issue { number }` inline fragment; a non-Issue
+    /// node (a PR the query filtered out anyway) has none.
+    #[serde(default)]
+    number: Option<i64>,
+}
+
+/// The first issue number a label search returned, or `None` when nothing
+/// matched. A GraphQL `errors` array is a hard error.
+fn parse_search_number_response(text: &str) -> Result<Option<i64>> {
+    let resp: SearchResponse = serde_json::from_str(text.trim())
+        .map_err(|e| Error::Other(format!("gh graphql returned unparseable JSON: {e}")))?;
+    if let Some(errors) = resp.errors.as_ref().filter(|e| !e.is_empty()) {
+        return Err(Error::Other(format!(
+            "GitHub GraphQL returned errors on the id search: {}",
+            summarize_graphql_errors(errors)
+        )));
+    }
+    Ok(resp
+        .data
+        .and_then(|d| d.search)
+        .map(|s| s.nodes)
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|n| n.number))
+}
+
+/// Process-local id→number resolution cache, keyed by `(repo, shelbi id)`. Small
+/// and process-scoped (like the board snapshot cache); the daemon's index is the
+/// cross-process authority.
+type IdNumberCache = std::sync::Mutex<std::collections::HashMap<(String, String), i64>>;
+static ID_NUMBER_CACHE: std::sync::OnceLock<IdNumberCache> = std::sync::OnceLock::new();
+fn id_number_cache() -> &'static IdNumberCache {
+    ID_NUMBER_CACHE.get_or_init(Default::default)
+}
+
+/// Per-number full-issue cache keyed by `(repo, number)` → `(updatedAt, issue)`,
+/// invalidated when the published index shows a newer `updatedAt` (plan §3).
+type IssueCache = std::sync::Mutex<std::collections::HashMap<(String, i64), (DateTime<Utc>, IssueFile)>>;
+static ISSUE_CACHE: std::sync::OnceLock<IssueCache> = std::sync::OnceLock::new();
+fn issue_cache() -> &'static IssueCache {
+    ISSUE_CACHE.get_or_init(Default::default)
+}
+
+/// The cached `(updatedAt, issue)` for `(repo, number)`, if any.
+fn issue_cache_get(repo: &str, number: i64) -> Option<(DateTime<Utc>, IssueFile)> {
+    issue_cache()
+        .lock()
+        .ok()?
+        .get(&(repo.to_string(), number))
+        .cloned()
+}
+
+/// Clear both process-local caches — the id→number map and the per-number full
+/// issue cache — so a test's cache state can't leak into another (both statics
+/// are process-global). Test-only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_issue_caches_for_test() {
+    if let Ok(mut g) = id_number_cache().lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = issue_cache().lock() {
+        g.clear();
+    }
 }
 
 /// Top-level GraphQL envelope: `{ "data": {...}, "errors": [...] }`.
@@ -2159,14 +2703,89 @@ fn strip_code_fence(inner: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Reshape one canned REST issue object (the first non-blank JSONL line, or
+    /// `""` for "no issue") into the GraphQL response the reworked `get` /
+    /// `fetch` / `search` path expects, dispatching on the query name in `args`.
+    /// This lets the existing REST-shaped fake runners keep driving `get` now
+    /// that it resolves through GraphQL: a `search` gets the issue's number, a
+    /// single or aliased `Issue` gets the mapped node.
+    fn rest_to_graphql(args: &[&str], rest_issue: &str) -> String {
+        let joined = args.join(" ");
+        let first = rest_issue
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        let value: Option<serde_json::Value> =
+            serde_json::from_str(first).ok().filter(serde_json::Value::is_object);
+        if joined.contains("IdSearch") {
+            let number = value
+                .as_ref()
+                .and_then(|v| v.get("number"))
+                .and_then(serde_json::Value::as_i64);
+            return match number {
+                Some(n) => format!(
+                    r#"{{"data":{{"rateLimit":{{"remaining":4999}},"search":{{"nodes":[{{"number":{n}}}]}}}}}}"#
+                ),
+                None => r#"{"data":{"rateLimit":{"remaining":4999},"search":{"nodes":[]}}}"#
+                    .to_string(),
+            };
+        }
+        let node = value.as_ref().map(rest_issue_to_gql_node);
+        if joined.contains("IssuesByNumber") {
+            return match node {
+                Some(n) => format!(
+                    r#"{{"data":{{"rateLimit":{{"remaining":4999}},"repository":{{"i0":{n}}}}}}}"#
+                ),
+                None => r#"{"data":{"rateLimit":{"remaining":4999},"repository":{}}}"#.to_string(),
+            };
+        }
+        match node {
+            Some(n) => format!(
+                r#"{{"data":{{"rateLimit":{{"remaining":4999}},"repository":{{"issue":{n}}}}}}}"#
+            ),
+            None => r#"{"data":{"rateLimit":{"remaining":4999},"repository":{"issue":null}}}"#
+                .to_string(),
+        }
+    }
+
+    /// Map a REST issue object onto the GraphQL node shape [`GhIssueNode`] parses
+    /// (camelCase keys, `labels { nodes { name } }`, upper-cased `state`).
+    fn rest_issue_to_gql_node(v: &serde_json::Value) -> String {
+        let label_nodes: Vec<serde_json::Value> = v
+            .get("labels")
+            .and_then(|l| l.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|l| serde_json::json!({ "name": l.get("name").cloned().unwrap_or(serde_json::Value::Null) }))
+            .collect();
+        serde_json::json!({
+            "number": v.get("number").cloned().unwrap_or(serde_json::json!(0)),
+            "title": v.get("title").cloned().unwrap_or(serde_json::json!("")),
+            "state": v.get("state").and_then(|s| s.as_str()).unwrap_or("open").to_uppercase(),
+            "stateReason": v.get("state_reason").cloned().unwrap_or(serde_json::Value::Null),
+            "createdAt": v.get("created_at").cloned().unwrap_or(serde_json::json!("2026-01-01T00:00:00Z")),
+            "updatedAt": v.get("updated_at").cloned().unwrap_or(serde_json::json!("2026-01-01T00:00:00Z")),
+            "body": v.get("body").cloned().unwrap_or(serde_json::json!("")),
+            "labels": { "nodes": label_nodes },
+        })
+        .to_string()
+    }
+
     /// Build a store whose `gh` runner dispatches on the endpoint path in the
     /// args, returning canned JSONL. `issues_json` answers the issues endpoint;
-    /// `comments_json` answers any `/comments` endpoint.
+    /// `comments_json` answers any `/comments` endpoint. A GraphQL call (the
+    /// reworked `get`/`fetch`/`search` path) is answered from `issues_json`
+    /// reshaped by [`rest_to_graphql`].
     fn store_with(
         issues_json: &'static str,
         comments_json: &'static str,
     ) -> GitHubStore {
         GitHubStore::with_runner("owner/repo", move |args| {
+            if args.contains(&"graphql") {
+                return Ok(rest_to_graphql(args, issues_json));
+            }
             let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
             if path.contains("/comments") {
                 Ok(comments_json.to_string())
@@ -2294,6 +2913,9 @@ mod tests {
         let rec = calls.clone();
         let store = GitHubStore::with_runner("owner/repo", move |args| {
             rec.lock().unwrap().push(args.join(" "));
+            if args.contains(&"graphql") {
+                return Ok(rest_to_graphql(args, issues_json));
+            }
             Ok(issues_json.to_string())
         });
         (store, calls)
@@ -2379,9 +3001,13 @@ mod tests {
     fn get_returns_the_matching_issue_and_none_for_missing() {
         let issues = r#"{"number":7,"title":"Do the thing","body":"prose","state":"open","labels":[{"name":"shelbi:id/do-thing"},{"name":"shelbi:status/review"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         // The runner returns the issue for any issues query; for the "missing"
-        // case we return an empty result.
+        // case we return an empty result. GraphQL reads (the reworked `get`) are
+        // reshaped from the same JSON.
         let store = GitHubStore::with_runner("owner/repo", move |args| {
             let has_missing = args.iter().any(|a| a.contains("shelbi:id/missing"));
+            if args.contains(&"graphql") {
+                return Ok(rest_to_graphql(args, if has_missing { "" } else { issues }));
+            }
             if has_missing {
                 Ok(String::new())
             } else {
@@ -2579,6 +3205,11 @@ mod tests {
         let rec = calls.clone();
         let store = GitHubStore::with_runner("owner/repo", move |args| {
             rec.lock().unwrap().push(args.join(" "));
+            // The reworked `get` reads through GraphQL; answer it from the same
+            // single-issue JSON the REST `get_raw` path returns.
+            if args.contains(&"graphql") {
+                return Ok(rest_to_graphql(args, by_id_json));
+            }
             let method = args
                 .iter()
                 .position(|a| *a == "-X")
@@ -3144,8 +3775,29 @@ mod tests {
         // right number; a plain list returns all three.
         let calls: Calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let rec = calls.clone();
+        let table = [("a", 1, 0), ("b", 2, 1), ("c", 3, 2)];
+        let rest_line = |id: &str, num: i64, prio: i64| {
+            format!(
+                r#"{{"number":{num},"title":"{id}","body":"<!-- shelbi:begin -->\n```yaml\npriority: {prio}\n```\n<!-- shelbi:end -->","state":"open","labels":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/todo"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
+            )
+        };
         let store = GitHubStore::with_runner("owner/repo", move |args| {
             rec.lock().unwrap().push(args.join(" "));
+            // The reworked `get` (which set_priority uses to read the target)
+            // reads through GraphQL: answer the search and single-issue queries
+            // for whichever id/number they name.
+            if args.contains(&"graphql") {
+                let joined = args.join(" ");
+                let rest = table
+                    .iter()
+                    .find(|(id, num, _)| {
+                        joined.contains(&format!("shelbi:id/{id}"))
+                            || joined.contains(&format!("number={num}"))
+                    })
+                    .map(|(id, num, prio)| rest_line(id, *num, *prio))
+                    .unwrap_or_default();
+                return Ok(rest_to_graphql(args, &rest));
+            }
             let method = args
                 .iter()
                 .position(|a| *a == "-X")
@@ -3159,11 +3811,9 @@ mod tests {
             if path.ends_with("/labels") {
                 return Ok(String::new());
             }
-            for (id, num, prio) in [("a", 1, 0), ("b", 2, 1), ("c", 3, 2)] {
+            for (id, num, prio) in table {
                 if args.iter().any(|a| *a == format!("labels=shelbi:id/{id}")) {
-                    return Ok(format!(
-                        r#"{{"number":{num},"title":"{id}","body":"<!-- shelbi:begin -->\n```yaml\npriority: {prio}\n```\n<!-- shelbi:end -->","state":"open","labels":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/todo"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
-                    ));
+                    return Ok(rest_line(id, num, prio));
                 }
             }
             Ok(list.to_string())
@@ -3715,6 +4365,322 @@ mod tests {
         assert_eq!(
             combine_gh_error_detail("could not resolve host", ""),
             "could not resolve host"
+        );
+    }
+
+    // --- fresh single-issue fetch (plan §3) ----------------------------------
+
+    /// An isolated `SHELBI_HOME` (so a test's board-index writes and assignment
+    /// overlay reads land in a temp dir, never the real `~/.shelbi`) that also
+    /// resets the process-global issue caches. Holds the crate test lock because
+    /// `set_var` and the caches are process-global.
+    struct HomeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+        home: std::path::PathBuf,
+    }
+    impl HomeGuard {
+        fn new(tag: &str) -> Self {
+            let lock = crate::test_lock::LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let home = std::env::temp_dir().join(format!(
+                "shelbi-gh-fetch-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&home).unwrap();
+            let prev = std::env::var("SHELBI_HOME").ok();
+            std::env::set_var("SHELBI_HOME", &home);
+            clear_issue_caches_for_test();
+            Self {
+                _lock: lock,
+                prev,
+                home,
+            }
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("SHELBI_HOME", v),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    /// A store whose runner records every call and answers from `f`.
+    fn graphql_recorder<F>(f: F) -> (GitHubStore, Calls)
+    where
+        F: Fn(&[&str]) -> Result<String> + Send + Sync + 'static,
+    {
+        let calls: Calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            f(args)
+        });
+        (store, calls)
+    }
+
+    /// The recorded `gh api graphql` calls.
+    fn graphql_calls(calls: &Calls) -> Vec<String> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.contains("graphql"))
+            .cloned()
+            .collect()
+    }
+
+    /// One GraphQL issue node (the shape [`GhIssueNode`] parses). `reason` empty
+    /// → `null`.
+    fn gql_node(
+        number: i64,
+        id: &str,
+        status: &str,
+        state: &str,
+        reason: &str,
+        body: &str,
+        updated: &str,
+    ) -> String {
+        let reason_json = if reason.is_empty() {
+            "null".to_string()
+        } else {
+            format!("\"{reason}\"")
+        };
+        format!(
+            r#"{{"number":{number},"title":"T {id}","state":"{state}","stateReason":{reason_json},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"{updated}","body":"{body}","labels":{{"nodes":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/{status}"}}]}}}}"#
+        )
+    }
+
+    fn gql_single(node: &str) -> String {
+        format!(
+            r#"{{"data":{{"rateLimit":{{"remaining":4999,"resetAt":"2026-01-01T01:00:00Z"}},"repository":{{"issue":{node}}}}}}}"#
+        )
+    }
+
+    fn gql_search(number: i64) -> String {
+        format!(
+            r#"{{"data":{{"rateLimit":{{"remaining":4999}},"search":{{"nodes":[{{"number":{number}}}]}}}}}}"#
+        )
+    }
+
+    fn gql_aliased(nodes: &[(usize, &str)]) -> String {
+        let inner: Vec<String> = nodes.iter().map(|(k, n)| format!("\"i{k}\":{n}")).collect();
+        format!(
+            r#"{{"data":{{"rateLimit":{{"remaining":4999}},"repository":{{{}}}}}}}"#,
+            inner.join(",")
+        )
+    }
+
+    fn idx_issue(id: &str, column: &str, updated: &str) -> IssueFile {
+        let task: shelbi_core::Issue = serde_yaml::from_str(&format!(
+            "id: {id}\ntitle: {id}\ncolumn: {column}\npriority: 0\n\
+             created_at: 2026-01-01T00:00:00Z\nupdated_at: {updated}\n"
+        ))
+        .expect("issue fixture parses");
+        IssueFile {
+            task,
+            body: String::new(),
+        }
+    }
+
+    /// Publish a board index for `project` with an explicit id→number map.
+    fn write_test_index(project: &str, numbers: &[(&str, i64)], board: Vec<IssueFile>) {
+        let idx = crate::board_index::BoardIndex::fresh_at(
+            board,
+            numbers.iter().map(|(id, n)| (id.to_string(), *n)).collect(),
+            Utc::now().to_rfc3339(),
+            None,
+            None,
+        );
+        crate::board_index::write_board_index(project, &idx).unwrap();
+    }
+
+    #[test]
+    fn fetch_reads_one_issue_via_a_single_graphql_request() {
+        let _home = HomeGuard::new("fetch");
+        let node = gql_node(7, "foo", "in-progress", "OPEN", "", "Fresh body", "2026-08-02T00:00:00Z");
+        let (store, calls) = graphql_recorder(move |_args| Ok(gql_single(&node)));
+
+        let tf = store.fetch(7).unwrap().expect("issue exists");
+        assert_eq!(tf.task.id, "foo");
+        assert_eq!(tf.task.column, Column::in_progress());
+        assert_eq!(tf.body, "Fresh body");
+        assert_eq!(graphql_calls(&calls).len(), 1, "one single-issue request");
+    }
+
+    #[test]
+    fn fetch_returns_none_for_a_number_that_is_not_an_issue() {
+        let _home = HomeGuard::new("fetch-none");
+        let (store, _calls) = graphql_recorder(|_args| {
+            Ok(r#"{"data":{"repository":{"issue":null}}}"#.to_string())
+        });
+        assert!(store.fetch(404).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_resolves_through_the_index_and_reads_the_edit_in_one_request() {
+        // Acceptance: `issue show <id>` after an out-of-band edit prints the
+        // edit, with one GraphQL request — the index gives the number, and the
+        // single-issue fetch reads the live body/status.
+        let _home = HomeGuard::new("getidx");
+        write_test_index(
+            "test-project",
+            &[("foo", 7)],
+            vec![idx_issue("foo", "todo", "2026-08-01T00:00:00Z")],
+        );
+        let node = gql_node(7, "foo", "in-progress", "OPEN", "", "Edited on GitHub", "2026-08-03T00:00:00Z");
+        let (store, calls) = graphql_recorder(move |args| {
+            let joined = args.join(" ");
+            assert!(joined.contains("query Issue"), "expected the single-issue query: {joined}");
+            Ok(gql_single(&node))
+        });
+
+        let tf = store.get("foo").unwrap().expect("issue exists");
+        assert_eq!(tf.body, "Edited on GitHub");
+        assert_eq!(tf.task.column, Column::in_progress());
+        assert_eq!(
+            graphql_calls(&calls).len(),
+            1,
+            "the index carried the number, so no search — exactly one request"
+        );
+    }
+
+    #[test]
+    fn get_falls_back_to_search_for_a_done_task_not_in_the_index() {
+        // Acceptance: `get` for a done task (absent from the open index) succeeds
+        // via the search fallback.
+        let _home = HomeGuard::new("getsearch");
+        let node = gql_node(42, "done-task", "done", "CLOSED", "completed", "done body", "2026-07-02T00:00:00Z");
+        let (store, calls) = graphql_recorder(move |args| {
+            if args.join(" ").contains("IdSearch") {
+                Ok(gql_search(42))
+            } else {
+                Ok(gql_single(&node))
+            }
+        });
+
+        let tf = store.get("done-task").unwrap().expect("found via search");
+        assert_eq!(tf.task.id, "done-task");
+        assert_eq!(tf.task.column, Column::done());
+        let g = graphql_calls(&calls);
+        assert_eq!(g.len(), 2, "one search + one fetch");
+        assert!(g[0].contains("IdSearch"), "the first request is the search: {}", g[0]);
+    }
+
+    #[test]
+    fn fetch_many_resolves_several_ids_in_one_aliased_request() {
+        // Acceptance: several ids resolve in one aliased request. The index
+        // carries the numbers, so no per-id search precedes the batch.
+        let _home = HomeGuard::new("many");
+        write_test_index(
+            "test-project",
+            &[("a", 1), ("b", 2)],
+            vec![
+                idx_issue("a", "todo", "2026-01-01T00:00:00Z"),
+                idx_issue("b", "review", "2026-01-01T00:00:00Z"),
+            ],
+        );
+        let na = gql_node(1, "a", "todo", "OPEN", "", "body a", "2026-01-01T00:00:00Z");
+        let nb = gql_node(2, "b", "review", "OPEN", "", "body b", "2026-01-01T00:00:00Z");
+        let (store, calls) = graphql_recorder(move |args| {
+            assert!(
+                args.join(" ").contains("IssuesByNumber"),
+                "expected the aliased query"
+            );
+            Ok(gql_aliased(&[(0, &na), (1, &nb)]))
+        });
+
+        let got = store.fetch_many(&["a", "b"]).unwrap();
+        let ids: std::collections::HashSet<_> = got.iter().map(|t| t.task.id.clone()).collect();
+        assert_eq!(got.len(), 2);
+        assert!(ids.contains("a") && ids.contains("b"));
+        assert_eq!(
+            graphql_calls(&calls).len(),
+            1,
+            "one aliased request; the index resolved both numbers"
+        );
+    }
+
+    #[test]
+    fn fetch_serves_the_cache_until_the_index_shows_a_newer_updated_at() {
+        // Acceptance: the per-number cache is invalidated by a newer index
+        // `updatedAt` for that number.
+        let _home = HomeGuard::new("cacheinv");
+        let t1 = "2026-08-01T00:00:00Z";
+        let t2 = "2026-08-05T00:00:00Z";
+        write_test_index("test-project", &[("foo", 5)], vec![idx_issue("foo", "todo", t1)]);
+        let node = gql_node(5, "foo", "todo", "OPEN", "", "body", t1);
+        let (store, calls) = graphql_recorder(move |_a| Ok(gql_single(&node)));
+
+        // Cold: a live read that caches the issue at updatedAt T1.
+        store.fetch(5).unwrap().expect("issue exists");
+        assert_eq!(graphql_calls(&calls).len(), 1);
+
+        // The index still shows T1 (not newer than the cache) — served from cache.
+        store.fetch(5).unwrap().expect("issue exists");
+        assert_eq!(
+            graphql_calls(&calls).len(),
+            1,
+            "an unchanged index serves the cached issue"
+        );
+
+        // Bump the index's updatedAt for this issue — the cache is now invalid.
+        write_test_index("test-project", &[("foo", 5)], vec![idx_issue("foo", "todo", t2)]);
+        store.fetch(5).unwrap().expect("issue exists");
+        assert_eq!(
+            graphql_calls(&calls).len(),
+            2,
+            "a newer index updatedAt forces a live re-read"
+        );
+    }
+
+    #[test]
+    fn add_records_the_created_number_so_get_resolves_without_a_search() {
+        // Acceptance: a task created seconds ago resolves via the create-returned
+        // number, never the eventually-consistent label search.
+        let _home = HomeGuard::new("add");
+        // A published (empty) index for `record_board_index_number` to patch.
+        write_test_index("test-project", &[], vec![]);
+        let (store, calls) = graphql_recorder(move |args| {
+            let joined = args.join(" ");
+            let method = args
+                .iter()
+                .position(|a| *a == "-X")
+                .and_then(|i| args.get(i + 1))
+                .copied()
+                .unwrap_or("GET");
+            if method == "POST" && joined.contains("/issues") && !joined.contains("/labels") {
+                return Ok(r#"{"number":99,"title":"New card","state":"open","created_at":"2026-08-03T00:00:00Z","updated_at":"2026-08-03T00:00:00Z","labels":[]}"#.to_string());
+            }
+            if method == "POST" && joined.contains("/labels") {
+                return Ok("{}".to_string());
+            }
+            // Every GET (dup check, column list, label list) is empty.
+            Ok(String::new())
+        });
+
+        let created = store.add(NewIssue::new("newcard", "New card", Column::todo(), "Body")).unwrap();
+        assert_eq!(created.id, "newcard");
+
+        // The create-returned number is remembered in the process cache and
+        // written into the published index's id→number map.
+        assert_eq!(store.cached_number("newcard"), Some(99));
+        let idx = crate::board_index::read_board_index("test-project").expect("index present");
+        assert_eq!(idx.numbers.get("newcard"), Some(&99));
+
+        // Resolving the id now takes the create number — no GraphQL search.
+        assert_eq!(store.resolve_number("newcard").unwrap(), Some(99));
+        assert!(
+            graphql_calls(&calls).is_empty(),
+            "a just-created card resolves without a label search"
         );
     }
 }
