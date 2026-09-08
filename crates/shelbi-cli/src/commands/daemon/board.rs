@@ -31,6 +31,7 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 
 use shelbi_state::board_index::{self, BoardIndex};
+use shelbi_state::gh_budget::{self, BudgetThresholds, BudgetTier, TickPlan};
 use shelbi_state::IssueStore;
 
 /// How often the refresh manager wakes to re-discover open projects and run any
@@ -209,27 +210,107 @@ pub(super) fn spawn_refresh_manager(refresher: BoardRefresher, stop: Arc<AtomicB
 
 fn refresh_manager_loop(refresher: &BoardRefresher, stop: &AtomicBool) {
     // Last successful/attempted refresh time per project, so each project ticks
-    // on its own configured interval rather than on MANAGER_TICK.
+    // on its own governed interval rather than on MANAGER_TICK.
     let mut last: HashMap<String, Instant> = HashMap::new();
+    // Per-project token key, resolved once and cached — the budget file is keyed
+    // by a hash of the token, and resolving it can shell out to the keychain, so
+    // we must not do it every MANAGER_TICK.
+    let mut token_keys: HashMap<String, Option<String>> = HashMap::new();
+    // Projects currently paused by the governor, so a pause logs once per episode
+    // (on entry) rather than every 2s tick.
+    let mut paused: std::collections::HashSet<String> = std::collections::HashSet::new();
     while !stop.load(Ordering::SeqCst) {
         let open = open_remote_projects();
         for project in &open {
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-            let interval = refresh_interval_for(project);
-            let due = last.get(project).map_or(true, |t| t.elapsed() >= interval);
-            if due {
-                refresher.tick(project);
-                last.insert(project.clone(), Instant::now());
+            let now = chrono::Utc::now().timestamp();
+            match governor_plan(project, &mut token_keys, now) {
+                TickPlan::Refresh(interval) => {
+                    if paused.remove(project) {
+                        tracing::info!(project, "shelbi daemon: board refresh resumed (budget recovered)");
+                    }
+                    let due = last.get(project).map_or(true, |t| t.elapsed() >= interval);
+                    if due {
+                        refresher.tick(project);
+                        last.insert(project.clone(), Instant::now());
+                    }
+                }
+                TickPlan::Pause { until } => {
+                    // Budget too low (or parked): skip the list read, serve the
+                    // last index (marked stale by its age). Log once per episode.
+                    if paused.insert(project.clone()) {
+                        tracing::warn!(
+                            project,
+                            until,
+                            "shelbi daemon: board refresh paused (low/parked GraphQL budget); serving cache until reset",
+                        );
+                    }
+                }
             }
         }
         // Drop tracking for projects that have closed, so a reopen refreshes
         // immediately rather than waiting out its stale last-tick time.
         let open_set: std::collections::HashSet<&String> = open.iter().collect();
         last.retain(|p, _| open_set.contains(p));
+        token_keys.retain(|p, _| open_set.contains(p));
+        paused.retain(|p| open_set.contains(p));
         sleep_until_stop(MANAGER_TICK, stop);
     }
+}
+
+/// The governor's decision for this project's tick (plan Phase 3 §6): scale the
+/// configured cadence, or pause the refresh, from the token's GraphQL budget and
+/// the project's `issue_tracker.budget` thresholds.
+fn governor_plan(
+    project: &str,
+    token_keys: &mut HashMap<String, Option<String>>,
+    now: i64,
+) -> TickPlan {
+    let cfg = shelbi_state::load_project(project)
+        .map(|p| p.issue_tracker)
+        .unwrap_or_default();
+    let budget = &cfg.budget;
+    let thresholds = BudgetThresholds {
+        graphql_high: budget.graphql_high(),
+        graphql_medium: budget.graphql_medium(),
+        base_secs: cfg.refresh_interval_secs(),
+        slow_secs: budget.slow_refresh_secs(),
+    };
+    let tier = graphql_tier_for(project, token_keys);
+    gh_budget::tick_plan(&tier, &thresholds, now)
+}
+
+/// The GraphQL budget tier the governor scales from: the per-token `budget.json`
+/// (the plan's per-token, hub-wide source), or — when the token can't be resolved
+/// in the daemon — the per-project board index's last-seen `remaining`/`reset`,
+/// which needs no token. A cold hub with neither reads as the default (unknown)
+/// tier, which the governor runs at the configured cadence.
+fn graphql_tier_for(project: &str, token_keys: &mut HashMap<String, Option<String>>) -> BudgetTier {
+    if let Some(key) = token_key_for(project, token_keys) {
+        return gh_budget::read_state(&key).graphql;
+    }
+    board_index::read_board_index(project)
+        .map(|idx| BudgetTier {
+            remaining: idx.remaining.map(|r| r as i64),
+            reset_at: idx.reset,
+            parked_until: None,
+        })
+        .unwrap_or_default()
+}
+
+/// The token-file key for `project`, resolved once and memoized in `token_keys`
+/// (a `None` entry memoizes a resolution failure so it isn't retried every tick).
+fn token_key_for(project: &str, token_keys: &mut HashMap<String, Option<String>>) -> Option<String> {
+    if let Some(cached) = token_keys.get(project) {
+        return cached.clone();
+    }
+    let key = shelbi_state::resolve_github_token_by_name(project)
+        .ok()
+        .map(|t| gh_budget::token_key(t.expose()));
+    token_keys.insert(project.to_string(), key.clone());
+    key
 }
 
 /// Sleep up to `total`, waking early (within [`STOP_POLL_SLICE`]) when `stop`
@@ -240,16 +321,6 @@ fn sleep_until_stop(total: Duration, stop: &AtomicBool) {
         thread::sleep(STOP_POLL_SLICE);
         waited += STOP_POLL_SLICE;
     }
-}
-
-/// The configured board-index refresh interval for `project`, defaulting when
-/// the project can't be loaded (transient during teardown) so a bad read just
-/// uses the standard cadence rather than hammering or stalling.
-fn refresh_interval_for(project: &str) -> Duration {
-    let secs = shelbi_state::load_project(project)
-        .map(|p| p.issue_tracker.refresh_interval_secs())
-        .unwrap_or(shelbi_core::DEFAULT_ISSUE_REFRESH_SECS);
-    Duration::from_secs(secs)
 }
 
 /// Open projects (a live `shelbi-<name>` tmux session) whose issue tracker is a

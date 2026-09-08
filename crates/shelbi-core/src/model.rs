@@ -821,6 +821,96 @@ pub struct IssueTrackerConfig {
     /// untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_secs: Option<u64>,
+    /// Rate-limit budget governor thresholds (Phase 3 §1 of
+    /// `Plans/github-issue-caching-and-rate-limits.md`). Every field defaults, so
+    /// an untouched block is the shipped policy; only meaningful for a remote
+    /// backend. Kept a defaulted value (not an `Option`) with a
+    /// `skip_serializing_if` so an all-default block stays elided from the wire
+    /// form and leaves [`is_default`](Self::is_default) untouched.
+    #[serde(default, skip_serializing_if = "BudgetConfig::is_default")]
+    pub budget: BudgetConfig,
+}
+
+/// Default GraphQL points above which the daemon uses its configured refresh
+/// cadence unthrottled (plan §6 governor table, top band).
+pub const DEFAULT_BUDGET_GRAPHQL_HIGH: u64 = 2_000;
+/// Default GraphQL points at/above which the daemon slows to
+/// [`DEFAULT_BUDGET_SLOW_REFRESH_SECS`] rather than pausing (plan §6, middle
+/// band `500 – 2,000`).
+pub const DEFAULT_BUDGET_GRAPHQL_MEDIUM: u64 = 500;
+/// Default GraphQL points below which reads are served from cache with a warning
+/// (plan §6, bottom band `< 100`); between this and
+/// [`DEFAULT_BUDGET_GRAPHQL_MEDIUM`] the index refresh is paused until the reset
+/// while user-initiated single fetches still run.
+pub const DEFAULT_BUDGET_GRAPHQL_LOW: u64 = 100;
+/// Default throttled refresh cadence (seconds) for the `500 – 2,000` band.
+pub const DEFAULT_BUDGET_SLOW_REFRESH_SECS: u64 = 120;
+/// Default REST reserve: below this many REST requests remaining a mutating call
+/// is refused up front (naming the reset time) rather than failing on a 403 deep
+/// inside a transition (plan §6 "REST reserve for writes").
+pub const DEFAULT_BUDGET_REST_RESERVE: u64 = 100;
+
+/// The `issue_tracker.budget` block: the rate-limit governor's thresholds. Every
+/// field is an `Option` folding to a shipped default (the constants above), so a
+/// user overrides only what they mean to and an absent block is the default
+/// policy. See `Plans/github-issue-caching-and-rate-limits.md` §6.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BudgetConfig {
+    /// GraphQL points above which the configured refresh cadence runs
+    /// unthrottled. Default [`DEFAULT_BUDGET_GRAPHQL_HIGH`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql_high: Option<u64>,
+    /// GraphQL points down to which the daemon slows (rather than pauses) the
+    /// index refresh. Default [`DEFAULT_BUDGET_GRAPHQL_MEDIUM`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql_medium: Option<u64>,
+    /// GraphQL points below which reads are served from cache with a warning.
+    /// Default [`DEFAULT_BUDGET_GRAPHQL_LOW`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql_low: Option<u64>,
+    /// Throttled refresh cadence (seconds) for the middle GraphQL band. Default
+    /// [`DEFAULT_BUDGET_SLOW_REFRESH_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow_refresh_secs: Option<u64>,
+    /// REST requests-remaining reserve below which a mutating call is refused up
+    /// front. Default [`DEFAULT_BUDGET_REST_RESERVE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest_reserve: Option<u64>,
+}
+
+impl BudgetConfig {
+    /// True when every field is unset — the untouched default. Drives the
+    /// `skip_serializing_if` that keeps an all-default block off the wire.
+    pub fn is_default(&self) -> bool {
+        *self == BudgetConfig::default()
+    }
+
+    /// GraphQL "high" threshold, defaulted.
+    pub fn graphql_high(&self) -> u64 {
+        self.graphql_high.unwrap_or(DEFAULT_BUDGET_GRAPHQL_HIGH)
+    }
+
+    /// GraphQL "medium" threshold, defaulted.
+    pub fn graphql_medium(&self) -> u64 {
+        self.graphql_medium.unwrap_or(DEFAULT_BUDGET_GRAPHQL_MEDIUM)
+    }
+
+    /// GraphQL "low" threshold, defaulted.
+    pub fn graphql_low(&self) -> u64 {
+        self.graphql_low.unwrap_or(DEFAULT_BUDGET_GRAPHQL_LOW)
+    }
+
+    /// Throttled refresh cadence (seconds), defaulted.
+    pub fn slow_refresh_secs(&self) -> u64 {
+        self.slow_refresh_secs
+            .filter(|&s| s > 0)
+            .unwrap_or(DEFAULT_BUDGET_SLOW_REFRESH_SECS)
+    }
+
+    /// REST write reserve, defaulted.
+    pub fn rest_reserve(&self) -> u64 {
+        self.rest_reserve.unwrap_or(DEFAULT_BUDGET_REST_RESERVE)
+    }
 }
 
 /// Default cadence (seconds) of the daemon's board-index refresh loop when a
@@ -6092,6 +6182,12 @@ agent_runners:
                 team: "ENG".into(),
             }),
             refresh_secs: Some(45),
+            budget: BudgetConfig {
+                graphql_high: Some(3_000),
+                slow_refresh_secs: Some(90),
+                rest_reserve: Some(150),
+                ..Default::default()
+            },
         };
         let yaml = serde_yaml::to_string(&src).unwrap();
         let back: IssueTrackerConfig = serde_yaml::from_str(&yaml).unwrap();

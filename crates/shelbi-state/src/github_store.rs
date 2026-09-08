@@ -314,7 +314,7 @@ impl GitHubStore {
         let graphql_project = project.clone();
         let graphql_read_policy = crate::gh_retry::RetryPolicy::reads();
         let graphql: GhRunner = Arc::new(move |args: &[&str]| {
-            graphql_read_policy.run(|| run_gh(&graphql_project, args))
+            graphql_governed_read(&graphql_project, &graphql_read_policy, args)
         });
         Self {
             project,
@@ -1584,14 +1584,87 @@ impl GitHubStore {
     /// lists. Every value is passed as a distinct argv entry, so newlines and
     /// shell metacharacters in a title / body / comment are never interpreted.
     fn api_send(&self, method: &str, path: &str, fields: &[(&str, String)]) -> Result<String> {
-        let mut args: Vec<String> = vec!["api".into(), "-X".into(), method.into(), path.into()];
+        // Write reserve (plan §6): the single choke point for every REST mutation,
+        // so a low REST budget refuses the write here — up front, naming the reset
+        // time — instead of letting it fail on a 403 deep inside a transition. Only
+        // an actual write is gated (this method is writes-only); the preliminary
+        // reads a mutator makes ride the separate GraphQL budget.
+        // Resolve the token once (gated inert under test) and reuse the key for
+        // both the reserve check and the REST-budget recording, so a write shells
+        // to the keychain at most once here.
+        let key = self.budget_token_key();
+        self.check_write_reserve(key.as_deref())?;
+        // `--include` prepends the response's status line + headers so the REST
+        // rate-limit budget (`x-ratelimit-*`) can be recorded; the body is split
+        // back off before the caller parses it. See [`record_and_strip_rest`].
+        let mut args: Vec<String> =
+            vec!["api".into(), "--include".into(), "-X".into(), method.into(), path.into()];
         for (k, v) in fields {
             args.push("-f".into());
             args.push(format!("{k}={v}"));
         }
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        (self.gh)(&refs)
+        let out = (self.gh)(&refs)?;
+        Ok(record_and_strip_rest(key.as_deref(), &out))
     }
+
+    /// The token-file key for this store's project, resolved for the budget
+    /// governor — or `None` when governance is inert. Inert under test by default
+    /// (like the read-path park): keying the budget file would shell to the
+    /// keychain on every write in every write-path test and read whichever
+    /// `SHELBI_HOME` is mounted. A shipped build always resolves; a test opts in
+    /// via [`set_test_park_side_effects`]. Also `None` when no token resolves
+    /// (then the reserve fails open and no REST budget is recorded).
+    fn budget_token_key(&self) -> Option<String> {
+        if !read_park_side_effects_enabled() {
+            return None;
+        }
+        resolve_github_token_by_name(&self.project)
+            .ok()
+            .map(|t| crate::gh_budget::token_key(t.expose()))
+    }
+
+    /// Refuse a mutation up front when the token's REST budget is below the
+    /// configured reserve floor (plan §6). Returns the reset time in the error so
+    /// the caller sees *when* it can write again, rather than a bare 403. Fails
+    /// open: a `None` key (governance inert, or no token) or an unrecorded REST
+    /// `remaining` lets the write proceed — the reserve narrows the failure
+    /// window, it is not a hard gate.
+    fn check_write_reserve(&self, key: Option<&str>) -> Result<()> {
+        let Some(key) = key else {
+            return Ok(());
+        };
+        let rest = crate::gh_budget::read_state(key)
+            .tier(crate::gh_budget::Budget::Rest)
+            .clone();
+        let Some(remaining) = rest.remaining else {
+            return Ok(());
+        };
+        let reserve = self.budget_config().rest_reserve() as i64;
+        if remaining >= reserve {
+            return Ok(());
+        }
+        let when = rest
+            .reset_at
+            .and_then(|r| DateTime::from_timestamp(r, 0))
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| "an unknown time".to_string());
+        Err(Error::Other(format!(
+            "shelbi: refusing to write to {}: only {remaining} GitHub REST requests remain \
+             (reserve floor {reserve}); the limit resets at {when}. Not sending the request.",
+            self.repo
+        )))
+    }
+
+    /// The project's `issue_tracker.budget` thresholds, defaulting when the
+    /// project can't be loaded (a test store, or a transient config read) — a
+    /// missing config just means the shipped defaults.
+    fn budget_config(&self) -> shelbi_core::BudgetConfig {
+        crate::load_project(&self.project)
+            .map(|p| p.issue_tracker.budget)
+            .unwrap_or_default()
+    }
+
 
     /// Replace an issue's entire label set (`PUT .../labels`). The caller
     /// computes the full desired set — keeping the id anchor and any human
@@ -1777,7 +1850,7 @@ fn park_aware_read(
     let token = resolve_github_token_by_name(project)?;
     let key = crate::gh_budget::token_key(token.expose());
     let now = Utc::now().timestamp();
-    if let Some(reset) = crate::gh_budget::parked_until(&key, now) {
+    if let Some(reset) = crate::gh_budget::parked_until(&key, crate::gh_budget::Budget::Rest, now) {
         return Err(rate_limited_park_error(project, args, reset));
     }
     let result = read_policy.run(|| run_gh_with_token(&token, args));
@@ -1802,7 +1875,7 @@ fn park_aware_read(
 /// bookkeeping is unit-testable without a live `gh` call, and so the test-build
 /// opt-in gate has one place to wrap.
 fn record_read_park(project: &str, key: &str, reset: i64, now: i64) {
-    if crate::gh_budget::park(key, reset, now) {
+    if crate::gh_budget::park(key, crate::gh_budget::Budget::Rest, reset, now) {
         let until = DateTime::from_timestamp(reset, 0)
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_default();
@@ -1815,6 +1888,100 @@ fn record_read_park(project: &str, key: &str, reset: i64, now: i64) {
             "GitHub read rate-limited; parking board reads for this token until reset",
         );
     }
+}
+
+/// Run a GraphQL read (the board index and single-issue fetches) under the
+/// per-token **GraphQL** budget park — the governor's read side (plan Phase 3
+/// §6). Mirrors [`park_aware_read`] but on the `graphql` tier, which GitHub
+/// prices on a budget separate from REST:
+///
+/// 1. Resolve the token once and key the shared per-token budget file off it.
+/// 2. If the GraphQL budget is already parked (a prior 403/429 set its
+///    `parked_until`), short-circuit with the typed rate-limit error **without
+///    spawning `gh`** — so a genuinely exhausted GraphQL budget stops re-issuing
+///    403s, and the daemon's governor holds the tick until the reset.
+/// 3. Otherwise run through the fail-fast read retry policy. On success, record
+///    the `rateLimit { remaining resetAt }` the response carried into the
+///    `graphql` tier (the number the governor scales the tick from). On a
+///    rate-limit failure, park the GraphQL budget until its reset — once, with a
+///    single `board rate-limited` events.log line.
+fn graphql_governed_read(
+    project: &str,
+    read_policy: &crate::gh_retry::RetryPolicy,
+    args: &[&str],
+) -> Result<String> {
+    let token = resolve_github_token_by_name(project)?;
+    let key = crate::gh_budget::token_key(token.expose());
+    let now = Utc::now().timestamp();
+    if let Some(reset) =
+        crate::gh_budget::parked_until(&key, crate::gh_budget::Budget::Graphql, now)
+    {
+        return Err(rate_limited_park_error(project, args, reset));
+    }
+    let result = read_policy.run(|| run_gh_with_token(&token, args));
+    match &result {
+        Ok(body) => {
+            // Every board / single-issue / search / batch response carries
+            // `data.rateLimit`; fold it into the governor's `graphql` tier.
+            if let Some((remaining, reset)) = extract_graphql_rate_limit(body) {
+                crate::gh_budget::record(&key, crate::gh_budget::Budget::Graphql, remaining, reset);
+            }
+        }
+        // See `read_park_side_effects_enabled`: always true in a shipped build; in
+        // a test build the park write is gated on the opt-in so a raced refresh
+        // never touches a sibling test's home.
+        Err(e) if crate::gh_retry::is_rate_limit_error(e) && read_park_side_effects_enabled() => {
+            let reset = crate::gh_retry::rate_limit_reset_epoch(e, now)
+                .unwrap_or(now + crate::gh_budget::DEFAULT_PARK_SECS);
+            record_graphql_park(project, &key, reset, now);
+        }
+        Err(_) => {}
+    }
+    result
+}
+
+/// Park the token's **GraphQL** budget until `reset` and, iff this call is the
+/// one that transitioned it to parked, append the single `board rate-limited`
+/// events.log line for the window. The GraphQL sibling of [`record_read_park`];
+/// split out so the park bookkeeping is unit-testable and the test-build opt-in
+/// gate has one place to wrap.
+fn record_graphql_park(project: &str, key: &str, reset: i64, now: i64) {
+    if crate::gh_budget::park(key, crate::gh_budget::Budget::Graphql, reset, now) {
+        let until = DateTime::from_timestamp(reset, 0)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_default();
+        if let Err(ev) = crate::append_board_rate_limited_event(project, &until) {
+            tracing::warn!(project = %project, error = %ev, "append_board_rate_limited_event failed");
+        }
+        tracing::warn!(
+            project = %project,
+            until = %until,
+            "GitHub GraphQL rate-limited; parking board reads for this token until reset",
+        );
+    }
+}
+
+/// Extract `data.rateLimit { remaining resetAt }` from any GraphQL response —
+/// board page, single issue, search, or aliased batch, all of which request it.
+/// Returns `(remaining, reset_epoch)`; best-effort `None` when the body isn't the
+/// expected envelope (a `gh` error string, an `errors`-only response), which just
+/// means this response updates no budget.
+fn extract_graphql_rate_limit(body: &str) -> Option<(Option<i64>, Option<i64>)> {
+    #[derive(Deserialize)]
+    struct Env {
+        data: Option<Data>,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        #[serde(rename = "rateLimit")]
+        rate_limit: Option<GhRateLimit>,
+    }
+    let env: Env = serde_json::from_str(body.trim()).ok()?;
+    let rl = env.data?.rate_limit?;
+    Some((
+        rl.remaining.map(|r| r as i64),
+        rl.reset_at.map(|dt| dt.timestamp()),
+    ))
 }
 
 /// The typed error a parked read returns instead of calling `gh`. Its `stderr`
@@ -1843,10 +2010,30 @@ fn probe_core_reset_and_record(token: &SecretToken, key: &str) -> Option<i64> {
     let out = run_gh_with_token(token, &["api", "--include", "-X", "GET", "rate_limit"]).ok()?;
     // Best-effort budget snapshot from the header block (stops at the blank
     // line, so it never reads the body below).
-    crate::gh_budget::record_rate_limit(key, &crate::gh_budget::parse_rate_limit_headers(&out));
+    crate::gh_budget::record_rest_headers(key, &crate::gh_budget::parse_rate_limit_headers(&out));
     let body = http_response_body(&out);
     let probe: RateLimitProbe = serde_json::from_str(body).ok()?;
     probe.resources.core.reset
+}
+
+/// Split the body off a `gh api --include` write response, recording the REST
+/// rate-limit headers into the token's `rest` budget on the way (plan §6 — the
+/// REST reserve reads what this records). A real `--include` response begins with
+/// the HTTP status line (`HTTP/…`); a canned test body (or an unexpected shape)
+/// does not, and is returned verbatim with no recording — so injected test
+/// runners that answer with bare JSON are untouched. A `None` key (governance
+/// inert) strips the body but records nothing.
+fn record_and_strip_rest(key: Option<&str>, raw: &str) -> String {
+    if !raw.starts_with("HTTP/") {
+        return raw.to_string();
+    }
+    if let Some(key) = key {
+        crate::gh_budget::record_rest_headers(
+            key,
+            &crate::gh_budget::parse_rate_limit_headers(raw),
+        );
+    }
+    http_response_body(raw).to_string()
 }
 
 /// The body of a `gh api --include` response: everything after the first blank
@@ -3844,7 +4031,7 @@ mod tests {
         assert!(read_park_side_effects_enabled());
         record_read_park("park-inert-proj", &key, reset, now);
         assert_eq!(
-            crate::gh_budget::parked_until(&key, now),
+            crate::gh_budget::parked_until(&key, crate::gh_budget::Budget::Rest, now),
             Some(reset),
             "opting in must actually park the token"
         );
@@ -3859,6 +4046,105 @@ mod tests {
         set_test_park_side_effects(false);
         assert!(!read_park_side_effects_enabled());
 
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn write_reserve_refuses_a_mutation_naming_the_reset_and_sends_no_write() {
+        // Acceptance (plan §6): with the REST budget under the reserve floor an
+        // `issue move` is refused up front — the message names the reset time and
+        // no mutating request is sent, rather than failing on a 403 mid-transition.
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::set_var("GH_TOKEN", "tok-reserve-test");
+
+        // Seed the token's REST budget below the default reserve (100), with a
+        // known reset the refusal must echo.
+        let key = crate::gh_budget::token_key("tok-reserve-test");
+        let reset = 1_800_000_000i64;
+        crate::gh_budget::record(&key, crate::gh_budget::Budget::Rest, Some(50), Some(reset));
+        // The reserve is inert under test by default; opt it in.
+        set_test_park_side_effects(true);
+
+        let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/in-progress"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", "{}");
+
+        let err = store
+            .move_status("t", &Column::review(), "handoff")
+            .expect_err("a low REST budget must refuse the move");
+        let msg = err.to_string();
+        let reset_rfc = DateTime::from_timestamp(reset, 0).unwrap().to_rfc3339();
+        assert!(msg.contains(&reset_rfc), "refusal names the reset time: {msg}");
+        assert!(msg.contains("50"), "refusal names the remaining: {msg}");
+
+        // No mutating request reached `gh`: refused before the write.
+        let calls = calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| {
+                c.contains("-X POST")
+                    || c.contains("-X PATCH")
+                    || c.contains("-X PUT")
+                    || c.contains("-X DELETE")
+            }),
+            "no mutating request must be sent under a low REST budget: {calls:?}"
+        );
+
+        set_test_park_side_effects(false);
+        std::env::remove_var("GH_TOKEN");
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn graphql_rate_limit_extracts_and_parks_once() {
+        // The `rateLimit` parser pulls remaining/resetAt from any GraphQL envelope
+        // (board, single-issue, search, batch all carry `data.rateLimit`).
+        let body = r#"{"data":{"rateLimit":{"remaining":1234,"resetAt":"2026-09-08T01:00:00Z"},"repository":{"issue":null}}}"#;
+        let (remaining, reset) = extract_graphql_rate_limit(body).expect("rateLimit present");
+        assert_eq!(remaining, Some(1234));
+        let expected = DateTime::parse_from_rfc3339("2026-09-08T01:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(reset, Some(expected));
+        // A bare `gh` error string is not a GraphQL envelope.
+        assert!(extract_graphql_rate_limit("gh: HTTP 403 Forbidden").is_none());
+
+        // Park-once: two 429s in the same window write exactly one events line and
+        // the GraphQL budget short-circuits until its reset, leaving REST alone.
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+
+        let key = crate::gh_budget::token_key("tok-gql-park");
+        let now = 2_000i64;
+        let reset_epoch = now + 3_600;
+        record_graphql_park("gql-park-proj", &key, reset_epoch, now);
+        record_graphql_park("gql-park-proj", &key, reset_epoch, now + 10);
+        assert_eq!(
+            crate::gh_budget::parked_until(&key, crate::gh_budget::Budget::Graphql, now),
+            Some(reset_epoch),
+            "the GraphQL budget is parked until reset"
+        );
+        assert_eq!(
+            crate::gh_budget::parked_until(&key, crate::gh_budget::Budget::Rest, now),
+            None,
+            "the REST budget is untouched by a GraphQL park"
+        );
+        let log = std::fs::read_to_string(crate::events_log_path().unwrap()).unwrap_or_default();
+        let hits = log
+            .lines()
+            .filter(|l| l.contains("project=gql-park-proj") && l.contains("board rate-limited"))
+            .count();
+        assert_eq!(hits, 1, "exactly one board rate-limited line per window");
+
+        set_test_park_side_effects(false);
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
