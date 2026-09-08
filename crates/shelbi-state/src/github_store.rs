@@ -98,7 +98,7 @@ use shelbi_core::{
     Column, Error, IssueLaunchConfig, IssueZenConfig, Result, DEFAULT_WORKFLOW_NAME,
 };
 
-use crate::issue_store::{Cursor, IssueChange, IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove};
+use crate::issue_store::{BoardRead, Cursor, IssueChange, IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove};
 use crate::{resolve_github_token_by_name, IssueFile, SecretToken};
 use shelbi_core::Issue;
 
@@ -226,6 +226,12 @@ pub struct GitHubStore {
     project: String,
     repo: String,
     gh: GhRunner,
+    /// The runner for GraphQL reads (the board index). It shares `gh`'s token
+    /// resolution but deliberately **not** its read-park governor: GraphQL is a
+    /// separate points budget from the REST hourly limit, so a board read must
+    /// survive REST exhaustion — the whole reason the board index moved to
+    /// GraphQL. See [`GitHubStore::new`].
+    graphql: GhRunner,
 }
 
 impl std::fmt::Debug for GitHubStore {
@@ -254,7 +260,12 @@ impl GitHubStore {
         // is the real `gh` CLI with resolved auth.
         #[cfg(any(test, feature = "test-support"))]
         if let Some(runner) = test_gh_runner_override() {
-            return Self { project, repo, gh: runner };
+            return Self {
+                project,
+                repo,
+                gh: runner.clone(),
+                graphql: runner,
+            };
         }
         let project_for_write = project.clone();
         let base: GhRunner = Arc::new(move |args: &[&str]| run_gh(&project_for_write, args));
@@ -290,7 +301,23 @@ impl GitHubStore {
             // last snapshot, marked stale, and no further request is made.
             park_aware_read(&project_for_read, &read_policy, args)
         });
-        Self { project, repo, gh }
+        // GraphQL board reads share the REST token resolution (`run_gh`: env →
+        // keychain → out-of-repo `tokens.yml`) and the fail-fast read retry
+        // policy, but skip the REST read-park: GitHub prices GraphQL points on a
+        // separate 5,000/hour budget, so a board read stays available even when
+        // the REST hourly limit is exhausted. The Phase 3 governor adds a
+        // GraphQL-budget reserve of its own.
+        let graphql_project = project.clone();
+        let graphql_read_policy = crate::gh_retry::RetryPolicy::reads();
+        let graphql: GhRunner = Arc::new(move |args: &[&str]| {
+            graphql_read_policy.run(|| run_gh(&graphql_project, args))
+        });
+        Self {
+            project,
+            repo,
+            gh,
+            graphql,
+        }
     }
 
     /// Construct a store over an arbitrary `gh` runner. The production seam for
@@ -303,10 +330,12 @@ impl GitHubStore {
         repo: impl Into<String>,
         runner: impl Fn(&[&str]) -> Result<String> + Send + Sync + 'static,
     ) -> Self {
+        let gh: GhRunner = Arc::new(runner);
         Self {
             project: "test-project".to_string(),
             repo: repo.into(),
-            gh: Arc::new(runner),
+            graphql: Arc::clone(&gh),
+            gh,
         }
     }
 
@@ -324,6 +353,7 @@ impl GitHubStore {
         Self {
             project: "test-project".to_string(),
             repo: repo.into(),
+            graphql: Arc::clone(&gh),
             gh,
         }
     }
@@ -351,6 +381,7 @@ impl GitHubStore {
         Self {
             project: "test-project".to_string(),
             repo: repo.into(),
+            graphql: Arc::clone(&gh),
             gh,
         }
     }
@@ -431,6 +462,102 @@ impl IssueStore for GitHubStore {
         // both of them by filtering this one read, instead of paying a
         // per-column closed sweep for each.
         self.list_with_state("closed")
+    }
+
+    fn refresh_board(
+        &self,
+        since: Option<DateTime<Utc>>,
+        previous: &[IssueFile],
+    ) -> Result<BoardRead> {
+        // The daemon's board-index read, on the separate GraphQL points budget.
+        // The local assignment overlay is folded onto the *whole* board every
+        // tick, cold or incremental: `assigned_to` is local routing that never
+        // bumps a GitHub issue's `updatedAt`, so it can't ride in an incremental
+        // delta — re-reading it here keeps ownership fresh even on a quiet board.
+        // Run the GraphQL read, but fall back to the REST open list on any
+        // failure that isn't a rate limit — a GHES host without `filterBy.since`,
+        // a token missing GraphQL scope, or a transport blip. A rate limit still
+        // propagates so the daemon leaves the index untouched and the Phase 3
+        // governor sees it. Whichever path we're on is logged once per repo, not
+        // per tick.
+        let graphql = match since {
+            // Cold read: every open issue in one paginated GraphQL query
+            // (`states: [OPEN]`), which excludes pull requests for free.
+            None => self.graphql_open_board(),
+            // Incremental tick: only issues touched since the last refresh
+            // (`filterBy: { since }`, no `states` filter), so a just-closed issue
+            // comes back and is dropped from the open index — done/canceled
+            // transitions reach the board without ever listing history. A quiet
+            // board returns zero nodes and costs a single point.
+            Some(since) => self.graphql_board_delta(since),
+        };
+        let page = match graphql {
+            Ok(page) => {
+                self.note_graphql_recovered();
+                page
+            }
+            // A rate limit is terminal for this tick: propagate it (no REST
+            // fallback — the two budgets are separate, and hammering REST on a
+            // GraphQL limit helps nobody).
+            Err(e) if crate::gh_retry::is_rate_limit_error(&e) => return Err(e),
+            // Any other failure: serve the REST open list as a full board. The
+            // delta path falls back the same way — a full REST open read simply
+            // replaces the previous board.
+            Err(e) => {
+                self.note_graphql_fallback(&e);
+                let board = self.list_with_state("open")?;
+                return Ok(BoardRead {
+                    board,
+                    remaining: None,
+                    reset: None,
+                });
+            }
+        };
+
+        let assignments = crate::task_assignments(&self.project)?;
+        match since {
+            None => {
+                let mut board: Vec<IssueFile> = page
+                    .issues
+                    .into_iter()
+                    .map(|gh| fold_assignment(gh.into_issue_file(), &assignments))
+                    .collect();
+                sort_board(&mut board);
+                Ok(BoardRead {
+                    board,
+                    remaining: page.remaining,
+                    reset: page.reset,
+                })
+            }
+            Some(_) => {
+                let mut by_id: std::collections::HashMap<String, IssueFile> = previous
+                    .iter()
+                    .map(|tf| (tf.task.id.clone(), tf.clone()))
+                    .collect();
+                for gh in page.issues {
+                    // The index is the GitHub-*open* set. A closed issue (however
+                    // its stale status label reads) leaves the open board; every
+                    // other touched issue is upserted in place.
+                    let closed = gh.is_closed();
+                    let tf = gh.into_issue_file();
+                    if closed {
+                        by_id.remove(&tf.task.id);
+                    } else {
+                        by_id.insert(tf.task.id.clone(), tf);
+                    }
+                }
+                let mut board: Vec<IssueFile> = by_id
+                    .into_values()
+                    .map(|tf| fold_assignment(tf, &assignments))
+                    .collect();
+                sort_board(&mut board);
+                Ok(BoardRead {
+                    board,
+                    remaining: page.remaining,
+                    reset: page.reset,
+                })
+            }
+        }
     }
 
     fn list_in_status(&self, status: &Column) -> Result<Vec<IssueFile>> {
@@ -899,6 +1026,124 @@ impl GitHubStore {
         Ok(issues.into_iter().find(|gh| !gh.is_pull_request()))
     }
 
+    /// Split `owner/repo` into its two halves for the GraphQL `owner`/`name`
+    /// variables. `validate()` already accepted the config, so this only guards
+    /// against an empty or over-slashed value reaching the query.
+    fn owner_and_name(&self) -> Result<(&str, &str)> {
+        self.repo
+            .split_once('/')
+            .filter(|(owner, name)| !owner.is_empty() && !name.is_empty() && !name.contains('/'))
+            .ok_or_else(|| {
+                Error::InvalidIssueTracker(format!(
+                    "issue_tracker.github.repo must be `owner/repo`, got `{}`",
+                    self.repo
+                ))
+            })
+    }
+
+    /// Cold board read: every open issue via the paginated `BoardIndex` query.
+    fn graphql_open_board(&self) -> Result<GraphQlBoardPage> {
+        self.graphql_paginate(BOARD_INDEX_QUERY, None)
+    }
+
+    /// Incremental board read: issues touched at/after `since` (both open and
+    /// just-closed), via the `BoardIndexDelta` query.
+    fn graphql_board_delta(&self, since: DateTime<Utc>) -> Result<GraphQlBoardPage> {
+        self.graphql_paginate(BOARD_INDEX_DELTA_QUERY, Some(since))
+    }
+
+    /// Record that this repo just fell back to the REST list, and warn **once**
+    /// per fallback episode (not per tick). A repo already in the fallback set
+    /// logs nothing until it recovers.
+    fn note_graphql_fallback(&self, err: &Error) {
+        let newly = graphql_fallback_repos()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.repo.clone());
+        if newly {
+            tracing::warn!(
+                repo = %self.repo,
+                error = %err,
+                "GitHub GraphQL board read failed (not a rate limit); falling back to the REST open list",
+            );
+        }
+    }
+
+    /// Record that this repo's GraphQL board read succeeded, and — only if it was
+    /// previously in the REST fallback — log **once** that it recovered. A repo
+    /// that was never in fallback logs nothing.
+    fn note_graphql_recovered(&self) {
+        let was = graphql_fallback_repos()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.repo);
+        if was {
+            tracing::info!(
+                repo = %self.repo,
+                "GitHub GraphQL board read recovered; back on the GraphQL path",
+            );
+        }
+    }
+
+    /// Drive `query` across every page, following `pageInfo.endCursor`, and
+    /// collect the issue nodes (mapped onto the REST [`GhIssue`] shape so the one
+    /// existing label/metadata mapping serves both backends). The token budget
+    /// from the last page's `rateLimit` rides back on the result.
+    fn graphql_paginate(
+        &self,
+        query: &str,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<GraphQlBoardPage> {
+        let (owner, name) = self.owner_and_name()?;
+        let since_str = since.map(|s| s.to_rfc3339());
+        let mut after: Option<String> = None;
+        let mut issues: Vec<GhIssue> = Vec::new();
+        // The budget from the most recent page. Left uninitialized: the `loop`
+        // body assigns it before any break, so it is definitely set by the time
+        // it is read after the loop, and no dead initializer is flagged.
+        let mut budget: Option<GhRateLimit>;
+
+        loop {
+            let query_arg = format!("query={query}");
+            let owner_arg = format!("owner={owner}");
+            let name_arg = format!("name={name}");
+            // All variables are passed with `-f` (raw string), which is the right
+            // wire form for the `String`/`DateTime` GraphQL scalars this query
+            // declares and avoids `-F`'s magic coercion of a numeric-looking
+            // cursor or timestamp.
+            let mut args: Vec<&str> = vec![
+                "api", "graphql", "-f", &query_arg, "-f", &owner_arg, "-f", &name_arg,
+            ];
+            let after_arg = after.as_ref().map(|c| format!("after={c}"));
+            if let Some(arg) = after_arg.as_deref() {
+                args.push("-f");
+                args.push(arg);
+            }
+            let since_arg = since_str.as_ref().map(|s| format!("since={s}"));
+            if let Some(arg) = since_arg.as_deref() {
+                args.push("-f");
+                args.push(arg);
+            }
+
+            let out = (self.graphql)(&args)?;
+            let page = parse_graphql_board_response(&out)?;
+            budget = page.rate_limit;
+            issues.extend(page.connection.nodes.into_iter().map(GhIssueNode::into_gh_issue));
+
+            match page.connection.page_info.end_cursor {
+                Some(cursor) if page.connection.page_info.has_next_page => after = Some(cursor),
+                // No next page — or `hasNextPage` with no cursor to advance on,
+                // which we stop on rather than loop forever.
+                _ => break,
+            }
+        }
+        Ok(GraphQlBoardPage {
+            issues,
+            remaining: budget.as_ref().and_then(|r| r.remaining),
+            reset: budget.and_then(|r| r.reset_at).map(|dt| dt.timestamp()),
+        })
+    }
+
     /// Live-read the comments on a GitHub issue by its number, oldest first.
     fn comments_for_number(&self, number: i64) -> Result<Vec<IssueComment>> {
         self.comments_for_number_since(number, None)
@@ -1282,6 +1527,231 @@ fn sort_board(issues: &mut [IssueFile]) {
     });
 }
 
+/// Fold the current local assignment overlay onto one issue — the workspace
+/// that owns it, or `None`. Shared by the cold and incremental board reads so
+/// ownership is refreshed every tick regardless of GitHub `updatedAt`.
+fn fold_assignment(
+    mut tf: IssueFile,
+    assignments: &std::collections::BTreeMap<String, String>,
+) -> IssueFile {
+    tf.task.assigned_to = assignments.get(&tf.task.id).cloned();
+    tf
+}
+
+// --- GitHub GraphQL board index ----------------------------------------------
+//
+// The board index reads through GraphQL rather than REST (plan §2): one query
+// returns exactly the fields the board needs, `body` rides along for free
+// (GraphQL prices connections, not fields), and `repository.issues` excludes
+// pull requests so the `is_pull_request` filter isn't needed on this path. The
+// nodes map onto the same [`GhIssue`] shape the REST path parses, so the whole
+// label → id/status/column + fenced-metadata mapping is reused unchanged.
+
+/// Repos currently served from the REST fallback because their last GraphQL
+/// board read failed with a non-rate-limit error. Process-global (the daemon is
+/// one process) and keyed by `owner/repo`, so the "which path is active" log
+/// fires once per repo on each transition — a warning on the first fallback, an
+/// info when GraphQL recovers — never on every 30-second tick.
+static GRAPHQL_FALLBACK_REPOS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+/// The (lazily initialized) set of repos in GraphQL fallback.
+fn graphql_fallback_repos() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    GRAPHQL_FALLBACK_REPOS.get_or_init(Default::default)
+}
+
+/// Cold fetch of every open issue, newest-updated first, one page of 100. `body`
+/// and `labels(first: 10)` ride along; `rateLimit` reports the points budget.
+const BOARD_INDEX_QUERY: &str = r#"
+query BoardIndex($owner: String!, $name: String!, $after: String) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    issues(states: [OPEN], first: 100, after: $after,
+           orderBy: { field: UPDATED_AT, direction: DESC }) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number title state stateReason createdAt updatedAt body
+        labels(first: 10) { nodes { name } }
+      }
+    }
+  }
+}
+"#;
+
+/// Incremental fetch: issues touched at/after `$since`, with **no** `states`
+/// filter so a just-closed issue comes back and is dropped from the open index.
+/// A quiet board returns zero nodes (one point). Identical node shape to
+/// [`BOARD_INDEX_QUERY`] so both share [`GhIssueNode`].
+const BOARD_INDEX_DELTA_QUERY: &str = r#"
+query BoardIndexDelta($owner: String!, $name: String!, $after: String, $since: DateTime!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    issues(first: 100, after: $after,
+           filterBy: { since: $since },
+           orderBy: { field: UPDATED_AT, direction: DESC }) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number title state stateReason createdAt updatedAt body
+        labels(first: 10) { nodes { name } }
+      }
+    }
+  }
+}
+"#;
+
+/// The collected result of a (possibly paginated) GraphQL board read: every
+/// issue node mapped onto [`GhIssue`], plus the token budget the last page
+/// reported.
+struct GraphQlBoardPage {
+    issues: Vec<GhIssue>,
+    remaining: Option<u64>,
+    reset: Option<i64>,
+}
+
+/// Top-level GraphQL envelope: `{ "data": {...}, "errors": [...] }`.
+#[derive(Debug, Deserialize)]
+struct GraphQlResponse {
+    #[serde(default)]
+    data: Option<GraphQlData>,
+    #[serde(default)]
+    errors: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlData {
+    #[serde(rename = "rateLimit")]
+    rate_limit: Option<GhRateLimit>,
+    repository: Option<GhRepository>,
+}
+
+/// The `rateLimit` block on every board response — the free budget signal the
+/// index stamps into `board-index.json` and the Phase 3 governor reads.
+#[derive(Debug, Deserialize)]
+struct GhRateLimit {
+    #[serde(default)]
+    remaining: Option<u64>,
+    #[serde(rename = "resetAt", default)]
+    reset_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhRepository {
+    issues: GhIssuesConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhIssuesConnection {
+    #[serde(rename = "pageInfo")]
+    page_info: GhPageInfo,
+    nodes: Vec<GhIssueNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhPageInfo {
+    #[serde(rename = "hasNextPage")]
+    has_next_page: bool,
+    #[serde(rename = "endCursor")]
+    end_cursor: Option<String>,
+}
+
+/// One issue node from `repository.issues`. GraphQL enums arrive upper-cased
+/// (`OPEN`/`CLOSED`, `COMPLETED`/`NOT_PLANNED`), so [`GhIssueNode::into_gh_issue`]
+/// lower-cases them onto the REST [`GhIssue`] shape the mapping already handles.
+#[derive(Debug, Deserialize)]
+struct GhIssueNode {
+    number: i64,
+    title: String,
+    state: String,
+    #[serde(rename = "stateReason", default)]
+    state_reason: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: DateTime<Utc>,
+    #[serde(rename = "updatedAt")]
+    updated_at: DateTime<Utc>,
+    #[serde(default)]
+    body: Option<String>,
+    labels: GhLabelConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhLabelConnection {
+    nodes: Vec<GhLabel>,
+}
+
+impl GhIssueNode {
+    /// Map a GraphQL issue node onto the REST [`GhIssue`] the whole board
+    /// mapping is written against: lower-case the `state`/`stateReason` enums to
+    /// match REST, and never set `pull_request` (the issues connection excludes
+    /// PRs). `createdAt` is carried so the persisted `Issue.created_at` stays
+    /// accurate rather than collapsing onto `updatedAt`.
+    fn into_gh_issue(self) -> GhIssue {
+        GhIssue {
+            number: self.number,
+            title: self.title,
+            body: self.body,
+            state: self.state.to_ascii_lowercase(),
+            state_reason: self.state_reason.map(|r| r.to_ascii_lowercase()),
+            labels: self.labels.nodes,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            pull_request: None,
+        }
+    }
+}
+
+/// The one issues-connection page a single GraphQL response carries.
+struct GraphQlResponsePage {
+    connection: GhIssuesConnection,
+    rate_limit: Option<GhRateLimit>,
+}
+
+/// Parse one `gh api graphql` board response into its issues page + budget.
+///
+/// A GraphQL `errors` array (returned with HTTP 200, so `gh` exits 0) fails the
+/// read: a partial board must never be published as if it were complete — the
+/// previous index stays in place and the next tick retries. A missing
+/// `repository` (bad name, or no access) is the same hard error.
+fn parse_graphql_board_response(text: &str) -> Result<GraphQlResponsePage> {
+    let resp: GraphQlResponse = serde_json::from_str(text.trim())
+        .map_err(|e| Error::Other(format!("gh graphql returned unparseable JSON: {e}")))?;
+    if let Some(errors) = resp.errors.as_ref().filter(|e| !e.is_empty()) {
+        return Err(Error::Other(format!(
+            "GitHub GraphQL returned errors on the board read: {}",
+            summarize_graphql_errors(errors)
+        )));
+    }
+    let data = resp
+        .data
+        .ok_or_else(|| Error::Other("gh graphql board response carried no data".into()))?;
+    let repository = data.repository.ok_or_else(|| {
+        Error::Other(
+            "gh graphql board response has no repository (wrong name, or the token \
+             can't see it)"
+                .into(),
+        )
+    })?;
+    Ok(GraphQlResponsePage {
+        connection: repository.issues,
+        rate_limit: data.rate_limit,
+    })
+}
+
+/// A short, log-safe summary of a GraphQL `errors` array — each error's
+/// `message`, joined — for the [`Error::Other`] a failed board read surfaces.
+fn summarize_graphql_errors(errors: &[serde_json::Value]) -> String {
+    let msgs: Vec<String> = errors
+        .iter()
+        .map(|e| {
+            e.get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<no message>")
+                .to_string()
+        })
+        .collect();
+    msgs.join("; ")
+}
+
 // --- GitHub REST wire shapes -------------------------------------------------
 
 /// One issue object from `GET /repos/{owner}/{repo}/issues`. Only the fields
@@ -1317,6 +1787,13 @@ impl GhIssue {
     /// returns both; a PR carries a `pull_request` object).
     fn is_pull_request(&self) -> bool {
         self.pull_request.is_some()
+    }
+
+    /// True when GitHub reports the issue closed — the signal the incremental
+    /// board merge uses to drop it from the open index (a closed issue always
+    /// maps to a terminal `done`/`canceled` status).
+    fn is_closed(&self) -> bool {
+        self.state == "closed"
     }
 
     /// The stable shelbi id, in resolution order: the authoritative `id` in the
@@ -2909,6 +3386,315 @@ mod tests {
         // `get` resolves via the same single server-side label query.
         let got = store.get(id).unwrap().expect("issue exists");
         assert_eq!(got.task.id, id);
+    }
+
+    // --- GraphQL board index (Phase 2) --------------------------------------
+
+    /// RAII guard pointing `$SHELBI_HOME` at a fresh temp dir under the shared
+    /// test lock, so `refresh_board`'s `task_assignments` read is deterministic
+    /// (an empty overlay unless the test writes one) and never touches the
+    /// developer's real `~/.shelbi`.
+    struct IsolatedHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+        home: std::path::PathBuf,
+    }
+    impl IsolatedHome {
+        fn new(tag: &str) -> Self {
+            let lock = crate::test_lock::LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let home = std::env::temp_dir().join(format!(
+                "shelbi-gh-graphql-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&home).unwrap();
+            let prev = std::env::var("SHELBI_HOME").ok();
+            std::env::set_var("SHELBI_HOME", &home);
+            Self {
+                _lock: lock,
+                prev,
+                home,
+            }
+        }
+    }
+    impl Drop for IsolatedHome {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("SHELBI_HOME", v),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    /// A store whose `gh` runner answers any GraphQL call with `json` (and
+    /// asserts the call really is a `graphql` invocation). `refresh_board` reads
+    /// only through the GraphQL runner, so this drives the whole board path.
+    fn graphql_store(json: &'static str) -> GitHubStore {
+        GitHubStore::with_runner("owner/repo", move |args| {
+            assert!(
+                args.contains(&"graphql"),
+                "expected a graphql call, got {args:?}"
+            );
+            Ok(json.to_string())
+        })
+    }
+
+    /// A minimal open `IssueFile` for a previous-board fixture.
+    fn prev_issue(id: &str, column: &str, priority: u32) -> IssueFile {
+        let task: shelbi_core::Issue = serde_yaml::from_str(&format!(
+            "id: {id}\ntitle: {id}\ncolumn: {column}\npriority: {priority}\n\
+             created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n"
+        ))
+        .expect("issue fixture parses");
+        IssueFile {
+            task,
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn refresh_board_cold_maps_open_issues_and_surfaces_the_budget() {
+        let _iso = IsolatedHome::new("cold");
+        // One GraphQL page of open issues: the node shape mirrors the REST
+        // mapping (labels → id/status/column, fenced metadata block), and
+        // `rateLimit` rides along.
+        let json = r#"{"data":{"rateLimit":{"cost":11,"remaining":4989,"resetAt":"2026-09-08T01:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"c1"},"nodes":[
+{"number":7,"title":"Do the thing","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-02T00:00:00Z","body":"Prose here.\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: app\npriority: 2\n```\n<!-- shelbi:end -->","labels":{"nodes":[{"name":"shelbi:id/do-thing"},{"name":"shelbi:status/in-progress"}]}},
+{"number":3,"title":"Fresh","state":"OPEN","stateReason":null,"createdAt":"2026-08-03T00:00:00Z","updatedAt":"2026-08-03T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/fresh"},{"name":"shelbi:status/todo"}]}}
+]}}}}"#;
+        let store = graphql_store(json);
+
+        let read = store.refresh_board(None, &[]).unwrap();
+        assert_eq!(read.board.len(), 2);
+        // Canonical order: todo sorts before in-progress.
+        assert_eq!(read.board[0].task.id, "fresh");
+        assert_eq!(read.board[0].task.column, Column::todo());
+        assert_eq!(read.board[1].task.id, "do-thing");
+        assert_eq!(read.board[1].task.column, Column::in_progress());
+        assert_eq!(read.board[1].task.workflow.as_deref(), Some("app"));
+        assert_eq!(read.board[1].task.priority, 2);
+        assert_eq!(read.board[1].body, "Prose here.");
+        // createdAt is carried, not collapsed onto updatedAt.
+        assert_ne!(
+            read.board[1].task.created_at,
+            read.board[1].task.updated_at
+        );
+
+        // The budget rides back for the index envelope.
+        assert_eq!(read.remaining, Some(4989));
+        let expected_reset = DateTime::parse_from_rfc3339("2026-09-08T01:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(read.reset, Some(expected_reset));
+    }
+
+    #[test]
+    fn refresh_board_incremental_removes_closed_and_upserts_open() {
+        let _iso = IsolatedHome::new("delta");
+        // Previous open board: a (todo), b (review).
+        let previous = vec![prev_issue("a", "todo", 0), prev_issue("b", "review", 0)];
+
+        // Delta since the last refresh: `b` was closed as completed (leaves the
+        // open index), `a` moved to in-progress (upserted), and a new `c` opened.
+        let json = r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T02:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"z"},"nodes":[
+{"number":2,"title":"b","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-09-08T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/b"},{"name":"shelbi:status/review"}]}},
+{"number":1,"title":"a","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-09-08T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/a"},{"name":"shelbi:status/in-progress"}]}},
+{"number":9,"title":"c","state":"OPEN","stateReason":null,"createdAt":"2026-09-08T00:00:00Z","updatedAt":"2026-09-08T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/c"},{"name":"shelbi:status/todo"}]}}
+]}}}}"#;
+        let store = graphql_store(json);
+
+        let since = Some(Utc::now());
+        let read = store.refresh_board(since, &previous).unwrap();
+        let ids: Vec<_> = read.board.iter().map(|f| f.task.id.clone()).collect();
+        // b is gone (closed); a and c remain, in canonical order (todo < in-progress).
+        assert_eq!(ids, vec!["c".to_string(), "a".to_string()]);
+        // a's status was upserted from the delta.
+        let a = read.board.iter().find(|f| f.task.id == "a").unwrap();
+        assert_eq!(a.task.column, Column::in_progress());
+        assert_eq!(read.remaining, Some(4999));
+    }
+
+    #[test]
+    fn refresh_board_incremental_is_a_noop_on_a_quiet_board() {
+        let _iso = IsolatedHome::new("quiet");
+        let previous = vec![prev_issue("a", "todo", 0)];
+        // Zero touched nodes — a quiet tick. The previous board carries forward
+        // unchanged, and the single point still reports the budget.
+        let json = r#"{"data":{"rateLimit":{"remaining":4998,"resetAt":"2026-09-08T03:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}"#;
+        let store = graphql_store(json);
+
+        let read = store.refresh_board(Some(Utc::now()), &previous).unwrap();
+        assert_eq!(read.board.len(), 1);
+        assert_eq!(read.board[0].task.id, "a");
+        assert_eq!(read.remaining, Some(4998));
+    }
+
+    #[test]
+    fn refresh_board_refolds_the_assignment_overlay_each_tick() {
+        let _iso = IsolatedHome::new("overlay");
+        // The overlay carries an owner for `a` that never bumps GitHub
+        // `updatedAt`, so it can't ride in the delta — the tick must re-read it.
+        crate::set_task_assignment("test-project", "a", Some("alpha")).unwrap();
+        let previous = vec![prev_issue("a", "todo", 0)];
+        // A quiet delta (no GitHub activity on `a`).
+        let json = r#"{"data":{"rateLimit":{"remaining":5000,"resetAt":"2026-09-08T04:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}"#;
+        let store = graphql_store(json);
+
+        let read = store.refresh_board(Some(Utc::now()), &previous).unwrap();
+        assert_eq!(read.board.len(), 1);
+        assert_eq!(
+            read.board[0].task.assigned_to.as_deref(),
+            Some("alpha"),
+            "the local assignment overlay is folded onto the board every tick"
+        );
+    }
+
+    #[test]
+    fn refresh_board_paginates_until_has_next_page_is_false() {
+        let _iso = IsolatedHome::new("paginate");
+        // Two pages: the first advertises a next page + cursor, the second ends
+        // it. Both nodes must land in the board.
+        let page1 = r#"{"data":{"rateLimit":{"remaining":4990,"resetAt":"2026-09-08T05:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":true,"endCursor":"CUR1"},"nodes":[
+{"number":1,"title":"a","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-01T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/a"},{"name":"shelbi:status/todo"}]}}
+]}}}}"#;
+        let page2 = r#"{"data":{"rateLimit":{"remaining":4989,"resetAt":"2026-09-08T05:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"CUR2"},"nodes":[
+{"number":2,"title":"b","state":"OPEN","stateReason":null,"createdAt":"2026-08-02T00:00:00Z","updatedAt":"2026-08-02T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/b"},{"name":"shelbi:status/todo"}]}}
+]}}}}"#;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_rec = calls.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            let n = call_rec.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                // First page must not carry an `after` cursor.
+                assert!(!args.iter().any(|a| a.starts_with("after=")), "{args:?}");
+                Ok(page1.to_string())
+            } else {
+                // Second page follows the first page's endCursor.
+                assert!(
+                    args.contains(&"after=CUR1"),
+                    "second page must page on CUR1: {args:?}"
+                );
+                Ok(page2.to_string())
+            }
+        });
+
+        let read = store.refresh_board(None, &[]).unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let ids: Vec<_> = read.board.iter().map(|f| f.task.id.clone()).collect();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+        // The budget from the last page wins.
+        assert_eq!(read.remaining, Some(4989));
+    }
+
+    #[test]
+    fn refresh_board_falls_back_to_rest_on_a_graphql_errors_array() {
+        let _iso = IsolatedHome::new("fallback-errors");
+        // A non-rate-limit GraphQL failure (here an `errors` array — the shape a
+        // GHES host or a token missing GraphQL scope returns) falls back to the
+        // REST open list rather than failing the whole refresh. The runner
+        // answers the GraphQL call with the errors array and the REST list with
+        // one open issue.
+        let store = GitHubStore::with_runner("owner/repo", |args| {
+            if args.contains(&"graphql") {
+                Ok(
+                    r#"{"data":null,"errors":[{"message":"Something went wrong while fetching"}]}"#
+                        .to_string(),
+                )
+            } else {
+                Ok(r#"{"number":5,"title":"Rest one","state":"open","labels":[{"name":"shelbi:id/rest-one"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#.to_string())
+            }
+        });
+
+        let read = store.refresh_board(None, &[]).unwrap();
+        assert_eq!(read.board.len(), 1);
+        assert_eq!(read.board[0].task.id, "rest-one");
+        // A REST fallback carries no GraphQL budget.
+        assert_eq!(read.remaining, None);
+        assert_eq!(read.reset, None);
+    }
+
+    #[test]
+    fn refresh_board_delta_falls_back_to_a_full_rest_open_read() {
+        let _iso = IsolatedHome::new("fallback-delta");
+        // A GHES host that doesn't support `filterBy.since` fails the delta query;
+        // the fallback is a *full* REST open read that replaces the previous board
+        // (the stale card is gone, the live one is in).
+        let previous = vec![prev_issue("stale", "todo", 0)];
+        let store = GitHubStore::with_runner("owner/repo", |args| {
+            if args.contains(&"graphql") {
+                Err(Error::Command {
+                    cmd: "gh api graphql".into(),
+                    status: "HTTP 400".into(),
+                    stderr: "Field 'filterBy' doesn't exist on type 'IssueConnection'".into(),
+                })
+            } else {
+                Ok(r#"{"number":1,"title":"a","state":"open","labels":[{"name":"shelbi:id/a"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#.to_string())
+            }
+        });
+
+        let read = store.refresh_board(Some(Utc::now()), &previous).unwrap();
+        let ids: Vec<_> = read.board.iter().map(|f| f.task.id.clone()).collect();
+        assert_eq!(ids, vec!["a".to_string()], "the full REST read replaces the previous board");
+        assert_eq!(read.remaining, None);
+    }
+
+    #[test]
+    fn refresh_board_propagates_a_graphql_rate_limit_error() {
+        let _iso = IsolatedHome::new("ratelimit");
+        // A rate limit is NOT a fallback trigger: it propagates so the daemon
+        // leaves the index untouched and the Phase 3 governor sees it — and the
+        // REST path (a separate budget) is never touched.
+        let rest_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = rest_called.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            if args.contains(&"graphql") {
+                Err(Error::Command {
+                    cmd: "gh api graphql".into(),
+                    status: "HTTP 403".into(),
+                    stderr: "API rate limit exceeded; x-ratelimit-reset: 1800000000".into(),
+                })
+            } else {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(String::new())
+            }
+        });
+
+        let err = store.refresh_board(None, &[]).unwrap_err();
+        assert!(
+            crate::gh_retry::is_rate_limit_error(&err),
+            "a rate limit propagates rather than falling back: {err}"
+        );
+        assert!(
+            !rest_called.load(std::sync::atomic::Ordering::SeqCst),
+            "the REST list must not be called on a rate limit"
+        );
+    }
+
+    #[test]
+    fn refresh_board_incremental_sends_the_since_variable() {
+        let _iso = IsolatedHome::new("since-var");
+        let since = DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let json = r#"{"data":{"rateLimit":{"remaining":5000,"resetAt":"2026-09-08T06:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}"#;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let rec = seen.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            Ok(json.to_string())
+        });
+        store.refresh_board(Some(since), &[]).unwrap();
+        let call = &seen.lock().unwrap()[0];
+        assert!(
+            call.contains("since=2026-09-01T12:00:00+00:00"),
+            "the delta query carries the since watermark: {call}"
+        );
     }
 
     #[test]
