@@ -105,6 +105,22 @@ pub fn issue_store_for(project: &str) -> Result<Box<dyn IssueStore>> {
     resolve_issue_store(project, &cfg)
 }
 
+/// The cached [`IssueStore`] for an **already-loaded** [`shelbi_core::Project`]
+/// — the read/render entry point for the many poll and orchestration paths that
+/// hold a `&Project`. It routes through the same process cache as
+/// [`issue_store_for`] (a remote backend is wrapped in the shared snapshot
+/// cache), but reads the backend from the project's in-memory `issue_tracker`
+/// rather than re-loading the YAML by name, which both saves a disk read on
+/// every tick and keeps the store consistent with the config the caller already
+/// resolved. [`resolve_issue_store`] itself stays reserved for constructing a
+/// store for a **write** (or a not-yet-registered backend); read/list/render
+/// paths that hold a `&Project` use this.
+pub fn issue_store_for_project(
+    project: &shelbi_core::Project,
+) -> Result<Box<dyn IssueStore>> {
+    resolve_issue_store(&project.name, &project.issue_tracker)
+}
+
 /// Creation spec handed to [`IssueStore::add`]. Carries the durable issue
 /// definition without the fields a store assigns itself (priority within a
 /// column, timestamps). For the filesystem backend the `id` is client-chosen;

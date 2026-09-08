@@ -99,7 +99,7 @@ use shelbi_core::{
 };
 
 use crate::issue_store::{Cursor, IssueChange, IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove};
-use crate::{resolve_github_token_by_name, IssueFile};
+use crate::{resolve_github_token_by_name, IssueFile, SecretToken};
 use shelbi_core::Issue;
 
 /// Label prefix carrying an issue's stable shelbi id (`shelbi:id/<slug>`).
@@ -202,8 +202,8 @@ impl GitHubStore {
         if let Some(runner) = test_gh_runner_override() {
             return Self { project, repo, gh: runner };
         }
-        let project_for_gh = project.clone();
-        let base: GhRunner = Arc::new(move |args: &[&str]| run_gh(&project_for_gh, args));
+        let project_for_write = project.clone();
+        let base: GhRunner = Arc::new(move |args: &[&str]| run_gh(&project_for_write, args));
         // Two retry policies, chosen per call by HTTP method:
         //
         // * Mutating calls (`POST`/`PATCH`/`PUT`/`DELETE` — create, move, edit,
@@ -220,13 +220,21 @@ impl GitHubStore {
         // See [`crate::gh_retry`].
         let read_policy = crate::gh_retry::RetryPolicy::reads();
         let write_policy = crate::gh_retry::RetryPolicy::production();
+        let project_for_read = project.clone();
         let gh: GhRunner = Arc::new(move |args: &[&str]| {
-            let policy = if is_mutating_gh(args) {
-                &write_policy
-            } else {
-                &read_policy
-            };
-            policy.run(|| base(args))
+            if is_mutating_gh(args) {
+                return write_policy.run(|| base(args));
+            }
+            // Read path. The primary REST budget is per token and shared across
+            // every shelbi process on the hub; when it is exhausted, retrying
+            // per-caller-per-tick (six pollers, the sidebar, the daemon drain)
+            // just re-issues thousands of 403s an hour and drives destructive
+            // decisions off failed reads. So the first read-path 403/429 *parks*
+            // this token until its reset (plan Phase 0, item 3): after that a
+            // read short-circuits before spawning `gh`, returning the same typed
+            // rate-limit error the live call would — the cache keeps serving its
+            // last snapshot, marked stale, and no further request is made.
+            park_aware_read(&project_for_read, &read_policy, args)
         });
         Self { project, repo, gh }
     }
@@ -971,6 +979,14 @@ fn is_mutating_gh(args: &[&str]) -> bool {
 /// found, not authed) becomes an [`Error::Command`] — never a stale render.
 fn run_gh(project: &str, args: &[&str]) -> Result<String> {
     let token = resolve_github_token_by_name(project)?;
+    run_gh_with_token(&token, args)
+}
+
+/// Run `gh` with an already-resolved token. Split from [`run_gh`] so the
+/// read-path park governor can resolve the token once (to key its per-token
+/// budget file) and reuse it for the call, and so the free `/rate_limit` probe
+/// can shell out without going back through the park check that would block it.
+fn run_gh_with_token(token: &SecretToken, args: &[&str]) -> Result<String> {
     let output = std::process::Command::new("gh")
         .args(args)
         .env("GH_TOKEN", token.expose())
@@ -997,6 +1013,117 @@ fn run_gh(project: &str, args: &[&str]) -> Result<String> {
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Run a read (`GET`) call under the per-token rate-limit park (plan Phase 0,
+/// item 3):
+///
+/// 1. Resolve the token once and key the shared per-token budget file off a hash
+///    of it.
+/// 2. If the token is already parked (a prior 403 set `parked_until` past now),
+///    short-circuit with a typed rate-limit error **without spawning `gh`** —
+///    this is what stops the thousand-per-hour 403 storm.
+/// 3. Otherwise run through the fail-fast read retry policy. On a rate-limit
+///    failure, resolve the reset time (from the error, else a free `/rate_limit`
+///    probe, else a short fallback) and park the token. The park write reports
+///    whether *this* call was the one that transitioned to parked, so the
+///    `board rate-limited` events.log line is written exactly once per window.
+fn park_aware_read(
+    project: &str,
+    read_policy: &crate::gh_retry::RetryPolicy,
+    args: &[&str],
+) -> Result<String> {
+    let token = resolve_github_token_by_name(project)?;
+    let key = crate::gh_budget::token_key(token.expose());
+    let now = Utc::now().timestamp();
+    if let Some(reset) = crate::gh_budget::parked_until(&key, now) {
+        return Err(rate_limited_park_error(project, args, reset));
+    }
+    let result = read_policy.run(|| run_gh_with_token(&token, args));
+    if let Err(ref e) = result {
+        if crate::gh_retry::is_rate_limit_error(e) {
+            let reset = crate::gh_retry::rate_limit_reset_epoch(e, now)
+                .or_else(|| probe_core_reset_and_record(&token, &key))
+                .unwrap_or(now + crate::gh_budget::DEFAULT_PARK_SECS);
+            if crate::gh_budget::park(&key, reset, now) {
+                let until = DateTime::from_timestamp(reset, 0)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_default();
+                if let Err(ev) = crate::append_board_rate_limited_event(project, &until) {
+                    tracing::warn!(project = %project, error = %ev, "append_board_rate_limited_event failed");
+                }
+                tracing::warn!(
+                    project = %project,
+                    until = %until,
+                    "GitHub read rate-limited; parking board reads for this token until reset",
+                );
+            }
+        }
+    }
+    result
+}
+
+/// The typed error a parked read returns instead of calling `gh`. Its `stderr`
+/// carries the "rate limit" phrasing and the `x-ratelimit-reset` epoch so
+/// [`crate::gh_retry::is_rate_limit_error`] classifies it as rate-limited and
+/// [`crate::gh_retry::rate_limit_reset_epoch`] can recover the reset — keeping a
+/// short-circuited read indistinguishable, to every downstream classifier, from
+/// the live 403 it stands in for.
+fn rate_limited_park_error(project: &str, args: &[&str], reset: i64) -> Error {
+    Error::Command {
+        cmd: format!("gh {}", args.join(" ")),
+        status: "parked (rate limit)".to_string(),
+        stderr: format!(
+            "shelbi: board reads for project `{project}` are parked until the GitHub \
+             API rate limit resets (x-ratelimit-reset: {reset}); not calling gh"
+        ),
+    }
+}
+
+/// Fetch the authoritative core-REST reset epoch via the free `/rate_limit`
+/// endpoint (it never consumes quota and answers `200` even when the core budget
+/// is exhausted), and opportunistically record the response's rate-limit headers
+/// to the per-token budget file for the Phase 3 governor. Returns the core reset
+/// from the JSON body — the value a bare, headerless 403 could not carry.
+fn probe_core_reset_and_record(token: &SecretToken, key: &str) -> Option<i64> {
+    let out = run_gh_with_token(token, &["api", "--include", "-X", "GET", "rate_limit"]).ok()?;
+    // Best-effort budget snapshot from the header block (stops at the blank
+    // line, so it never reads the body below).
+    crate::gh_budget::record_rate_limit(key, &crate::gh_budget::parse_rate_limit_headers(&out));
+    let body = http_response_body(&out);
+    let probe: RateLimitProbe = serde_json::from_str(body).ok()?;
+    probe.resources.core.reset
+}
+
+/// The body of a `gh api --include` response: everything after the first blank
+/// line that separates the header block from the payload. Handles both CRLF and
+/// LF separators; falls back to the whole string when no blank line is found
+/// (e.g. `--include` was not honored), so a plain JSON body still parses.
+fn http_response_body(raw: &str) -> &str {
+    if let Some(idx) = raw.find("\r\n\r\n") {
+        &raw[idx + 4..]
+    } else if let Some(idx) = raw.find("\n\n") {
+        &raw[idx + 2..]
+    } else {
+        raw
+    }
+}
+
+/// Minimal shape of `GET /rate_limit` — only the core resource's reset, which is
+/// all the park needs; other fields are ignored.
+#[derive(Deserialize)]
+struct RateLimitProbe {
+    resources: RateLimitProbeResources,
+}
+
+#[derive(Deserialize)]
+struct RateLimitProbeResources {
+    core: RateLimitProbeResource,
+}
+
+#[derive(Deserialize)]
+struct RateLimitProbeResource {
+    reset: Option<i64>,
 }
 
 /// Merge a failed `gh` invocation's `stderr` and `stdout` into one diagnostic
@@ -1458,6 +1585,46 @@ mod tests {
                 Ok(issues_json.to_string())
             }
         })
+    }
+
+    #[test]
+    fn rate_limited_park_error_round_trips_through_the_shared_classifiers() {
+        // The short-circuit error a parked read returns must be indistinguishable
+        // to every downstream classifier from the live 403 it stands in for:
+        // classified as a rate limit, and carrying the reset it is parked until.
+        let err = rate_limited_park_error("gh", &["api", "repos/owner/repo/issues"], 1_700_000_500);
+        assert!(
+            crate::gh_retry::is_rate_limit_error(&err),
+            "a parked read must classify as rate-limited"
+        );
+        assert_eq!(
+            crate::gh_retry::rate_limit_reset_epoch(&err, 1_700_000_000),
+            Some(1_700_000_500),
+            "the reset epoch must be recoverable from the parked error"
+        );
+    }
+
+    #[test]
+    fn http_response_body_splits_off_the_header_block() {
+        // CRLF-separated (real gh --include output).
+        assert_eq!(
+            http_response_body("HTTP/2.0 200 OK\r\nx-ratelimit-reset: 5\r\n\r\n{\"ok\":true}"),
+            "{\"ok\":true}"
+        );
+        // LF-separated.
+        assert_eq!(
+            http_response_body("HTTP/2.0 200 OK\nx-ratelimit-reset: 5\n\n{\"ok\":true}"),
+            "{\"ok\":true}"
+        );
+        // No header block (a plain body): returned unchanged so it still parses.
+        assert_eq!(http_response_body("{\"ok\":true}"), "{\"ok\":true}");
+    }
+
+    #[test]
+    fn rate_limit_probe_parses_the_core_reset_from_the_body() {
+        let body = r#"{"resources":{"core":{"limit":5000,"remaining":0,"reset":1700000123},"graphql":{"remaining":42}}}"#;
+        let probe: RateLimitProbe = serde_json::from_str(body).unwrap();
+        assert_eq!(probe.resources.core.reset, Some(1_700_000_123));
     }
 
     #[test]

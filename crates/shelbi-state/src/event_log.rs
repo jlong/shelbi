@@ -1800,6 +1800,22 @@ pub fn append_heartbeat_event(
     append_event_line(&line)
 }
 
+/// Append `<rfc3339> project=<name> board rate-limited until=<rfc3339>` to
+/// `~/.shelbi/events.log`. Emitted **once** per park window — when the first
+/// read 403/429 rate-limit response parks all board reads for a token until its
+/// reset — so the orchestrator (and `shelbi events tail`) sees a single line
+/// explaining why the board stopped advancing, instead of the thousand-per-hour
+/// 403 spam the un-parked retry loop produced. `until` is the reset time the
+/// park is honoring; board reads resume serving live once it passes.
+pub fn append_board_rate_limited_event(project: &str, until_rfc3339: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let until = sanitize_field(until_rfc3339);
+    append_event_line(&format!(
+        "{ts} project={project} board rate-limited until={until}"
+    ))
+}
+
 /// Reminder appended to a heartbeat line while Zen Mode is On. Off-mode
 /// heartbeats pass `None` to [`append_heartbeat_event`] and carry no zen
 /// tokens at all. The poller decides which variant to emit on two cadences

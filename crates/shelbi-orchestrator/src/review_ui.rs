@@ -394,7 +394,7 @@ pub fn focus_dashboard(project_name: &str) -> Result<()> {
 /// created lazily on the first [`ReviewMidView::Editor`] request.
 pub fn show_review_view(project_name: &str, task_id: &str, view: ReviewMidView) -> Result<()> {
     let project = shelbi_state::load_project(project_name)?;
-    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let store = shelbi_state::issue_store_for_project(&project)?;
     let tf = store
         .get(task_id)?
         .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
@@ -451,7 +451,7 @@ pub fn show_review_view(project_name: &str, task_id: &str, view: ReviewMidView) 
 /// "nothing to recover".
 fn review_window_name(project_name: &str, task_id: &str) -> Option<String> {
     let project = shelbi_state::load_project(project_name).ok()?;
-    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker).ok()?;
+    let store = shelbi_state::issue_store_for_project(&project).ok()?;
     let tf = store.get(task_id).ok().flatten()?;
     let name = tf
         .task

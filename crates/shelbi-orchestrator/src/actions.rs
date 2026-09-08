@@ -301,7 +301,7 @@ pub fn open_pr(
         return Ok(num);
     }
 
-    let target = resolve_pr_target(project, project_name, task, target_override)?;
+    let target = resolve_pr_target(project, task, target_override)?;
     let title = head_commit_subject(&host, &wt)?;
     let task_path = shelbi_state::task_path(project_name, &task.id)
         .map_err(|e| Error::Other(format!("resolve task path for `{}`: {e}", task.id)))?
@@ -337,11 +337,10 @@ pub fn open_pr(
 /// tasks is the only side-effect; nothing here pushes or talks to gh.
 fn resolve_pr_target(
     project: &Project,
-    project_name: &str,
     task: &Issue,
     target_override: Option<&str>,
 ) -> Result<String> {
-    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let store = shelbi_state::issue_store_for_project(project)?;
     Ok(resolve_pr_target_from(
         project.base_branch(),
         task,
@@ -571,7 +570,7 @@ fn restack_children(
     onto: &str,
 ) -> Vec<RestackOutcome> {
     let mut outcomes = Vec::new();
-    let tasks = match shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+    let tasks = match shelbi_state::issue_store_for_project(project)
         .and_then(|s| s.list())
     {
         Ok(t) => t,
@@ -1587,7 +1586,7 @@ fn deferred_multi_parent_child_needing_branch(
     parent_task: &Issue,
     parent_branch: &str,
 ) -> Option<String> {
-    let tasks = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+    let tasks = shelbi_state::issue_store_for_project(project)
         .and_then(|s| s.list())
         .ok()?;
     tasks

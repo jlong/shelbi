@@ -482,6 +482,13 @@ struct HeartbeatSchedule {
     /// `None` whenever Zen is observed off so re-enabling Zen doesn't fire a
     /// re-read off a stale, hour-old timestamp.
     zen_last_reread: Option<Instant>,
+    /// The idle-workspace count from the last **warm** board read. The heartbeat
+    /// reuses it on any tick whose board read is stale, cold, or failed (a
+    /// rate-limit park, a cold cache), so `idle_workspaces=` reflects the last
+    /// trusted assignments instead of a stale board that would make every slot
+    /// look idle and pull work onto busy workers. `None` until the first warm
+    /// read, where it falls back to the pre-existing quiet-board default of 0.
+    last_warm_idle: Option<usize>,
 }
 
 /// Cadence for the scoped CI poll. Independent of the 5s supervisor tick so a
@@ -810,7 +817,7 @@ fn maybe_reconcile_issues(
         return;
     }
 
-    let store = match shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker) {
+    let store = match shelbi_state::issue_store_for_project(project) {
         Ok(s) => s,
         Err(e) => {
             tracing::debug!(project = %project.name, error = %e, "issue-reconcile: store resolve failed");
@@ -993,15 +1000,25 @@ fn maybe_emit_heartbeat(
         return;
     }
 
-    // Both counts are cheap on-disk reads (task YAMLs + the events log, same
-    // files the tick already touches) and are computed fresh so the heartbeat
-    // is accurate at emit time. A read failure shouldn't sink the heartbeat —
-    // fall back to 0, which the orchestrator treats as "nothing to do" (a
-    // silent ack), the same as a genuinely quiet board.
+    // Both counts are computed fresh so the heartbeat is accurate at emit time.
+    // A read failure shouldn't sink the heartbeat — `zen_eligible` falls back to
+    // 0, which the orchestrator treats as "nothing to do" (a silent ack), the
+    // same as a genuinely quiet board.
     let zen_eligible = shelbi_orchestrator::zen::mechanically_eligible(project)
         .map(|ids| ids.len())
         .unwrap_or(0);
-    let idle_workspaces = shelbi_state::idle_workspace_count(project).unwrap_or(0);
+    // `idle_workspaces` is read through the cached issue store and gated on
+    // board freshness. On a warm read it is recomputed and remembered; on a
+    // stale/cold/failed read (a rate-limit park, a cold cache) we reuse the last
+    // warm count rather than a stale board that would report every workspace
+    // idle. With no warm read yet, fall back to 0 (the quiet-board default).
+    let idle_workspaces = match shelbi_state::idle_workspace_count_warm(project) {
+        Ok(Some(count)) => {
+            schedule.last_warm_idle = Some(count);
+            count
+        }
+        _ => schedule.last_warm_idle.unwrap_or(0),
+    };
     // Zen-pairing: only while Zen Mode is On does the heartbeat carry a
     // `zen=on` marker and (on two cadences) a re-injected reminder of what
     // Zen means. Off / paused / an unreadable state.json all leave the line
@@ -1122,24 +1139,35 @@ fn board_is_quiescent(project: &Project) -> bool {
     tasks_are_quiescent(&tasks)
 }
 
-/// The whole board for `project`, read through its configured [`IssueStore`]
-/// (so a `github` backend is honored, not the local filesystem).
-///
-/// Uses [`shelbi_state::resolve_issue_store`] with the already-loaded
-/// `&Project`'s config rather than re-reading the YAML by name: this poller
-/// helper always holds a live project, and the crate steers `&Project`-holders
-/// here to avoid a redundant (and newly-fallible) config read. Both entry points
-/// wrap the same process-local `CachedIssueStore`, so this read is served from —
-/// and degrades identically off — the same snapshot the sidebar/Issues board use.
+/// The whole board for `project`, read through its configured (cached)
+/// [`IssueStore`] (so a `github` backend is honored, not the local filesystem).
+/// Goes through [`shelbi_state::issue_store_for_project`] (the already-loaded
+/// `&Project`'s config, no redundant YAML re-read) so every poll/render/list read
+/// shares the one process-local `CachedIssueStore` — served from, and degrading
+/// identically off, the same snapshot the sidebar and Issues board use.
 fn list_issues(project: &Project) -> shelbi_core::Result<Vec<shelbi_state::IssueFile>> {
-    shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?.list()
+    shelbi_state::issue_store_for_project(project)?.list()
 }
 
-/// Read one issue through the project's configured [`IssueStore`], mapping a
-/// missing issue to an error so callers keep the `Result<IssueFile>` shape the
-/// old `load_task` free function had (a missing card was an `Err` there too).
+/// The whole board **only when it is a warm read** ([`shelbi_state::BoardState::Warm`]):
+/// `Some(board)` on a warm read, `None` when the cache served a stale snapshot,
+/// is cold, or the read failed (a rate-limit park). Destructive poller paths
+/// read through this so a stale/failed board — which cannot prove a card is gone
+/// — never drives a reap. A `file_system` board always reads warm, so it is
+/// unaffected.
+fn warm_board(project: &Project) -> Option<Vec<shelbi_state::IssueFile>> {
+    match shelbi_state::issue_store_for_project(project).and_then(|s| s.list_state()) {
+        Ok(shelbi_state::BoardState::Warm(board)) => Some(board),
+        _ => None,
+    }
+}
+
+/// Read one issue through the project's configured (cached) [`IssueStore`],
+/// mapping a missing issue to an error so callers keep the `Result<IssueFile>`
+/// shape the old `load_task` free function had (a missing card was an `Err`
+/// there too).
 fn load_issue(project: &Project, id: &str) -> shelbi_core::Result<shelbi_state::IssueFile> {
-    shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?
+    shelbi_state::issue_store_for_project(project)?
         .get(id)?
         .ok_or_else(|| shelbi_core::Error::Other(format!("issue `{id}` not found")))
 }
@@ -2299,8 +2327,7 @@ fn maybe_apply_ready_handoff(
     //                  exactly once). Leave the marker in place, defer, and
     //                  retry next tick.
     let loaded =
-        shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
-            .and_then(|store| store.get(&task_id));
+        shelbi_state::issue_store_for_project(project).and_then(|store| store.get(&task_id));
 
     // Any successful read ends a prior load-error outage, so drop the deferral
     // sidecar (best-effort) — the next outage should log afresh.
@@ -3599,9 +3626,17 @@ fn maybe_resume_stranded_review_slots(
 
         // Pane dead. Nothing to resume unless a review-column task is still
         // assigned to this slot; if not, drop the crash history.
-        let Some(task_id) = assigned_review_task_for(project, &ws.name) else {
-            state.remove(&ws.name);
-            continue;
+        let task_id = match assigned_review_task_for(project, &ws.name) {
+            AssignedReviewTask::Assigned(id) => id,
+            // A warm read proves the slot is idle: drop its crash history.
+            AssignedReviewTask::None => {
+                state.remove(&ws.name);
+                continue;
+            }
+            // Board not read warm (a rate-limit park serves a stale snapshot):
+            // don't drop the crash history off an untrusted read, and don't
+            // resume off one either. Leave the state intact and retry next tick.
+            AssignedReviewTask::Unknown => continue,
         };
 
         // A task the operator deliberately unloaded (`shelbi workspace stop` /
@@ -3678,21 +3713,41 @@ fn maybe_resume_stranded_review_slots(
     }
 }
 
-/// The id of a review-column (handoff) task currently assigned to
-/// `workspace_name`, if any. The resume pass reads this to tell a stranded
-/// review slot (its task still pinned to it on disk) from a genuinely idle
-/// one. Mirrors the `list_column(review)` scan the auto-loader uses.
-fn assigned_review_task_for(project: &Project, workspace_name: &str) -> Option<String> {
-    // Through `issue_store_for` (like the sidebar / Issues board) so this read
-    // is served from the process-local board cache and a failed live refresh
-    // keeps the last-known review column rather than reading as "nothing
-    // assigned" — the same graceful-degradation the sidebar sections now get.
-    shelbi_state::issue_store_for(&project.name)
-        .and_then(|s| s.list_in_status(&Column::review()))
-        .ok()?
-        .into_iter()
-        .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace_name))
-        .map(|tf| tf.task.id)
+/// The review-column task assignment of a slot, carrying board freshness so a
+/// stale or failed read never drives a destructive decision. A false "no task"
+/// off a rate-limit-parked snapshot would reap a serving review slot or drop its
+/// crash history — the failure this enum exists to prevent.
+enum AssignedReviewTask {
+    /// A warm read shows this review-column task pinned to the slot.
+    Assigned(String),
+    /// A warm read shows no review-column task points at the slot — genuinely
+    /// idle; a destructive action (reap, drop history) may proceed.
+    None,
+    /// The board could not be read **warm** this tick (stale cache, cold
+    /// process, or a failed read — e.g. a rate-limit park). Neither "assigned"
+    /// nor "idle" is proven, so the caller must take no destructive action and
+    /// try again next tick.
+    Unknown,
+}
+
+/// The review-column (handoff) task currently assigned to `workspace_name`, from
+/// a **warm** whole-board read through the cached issue store. The resume and
+/// reap passes read this to tell a stranded review slot (its task still pinned to
+/// it on the board) from a genuinely idle one — and to *skip* both when the read
+/// isn't warm. Filters the same review column the auto-loader routes to.
+fn assigned_review_task_for(project: &Project, workspace_name: &str) -> AssignedReviewTask {
+    let board = match shelbi_state::issue_store_for_project(project).and_then(|s| s.list_state()) {
+        Ok(shelbi_state::BoardState::Warm(board)) => board,
+        // Stale / Cold / failed: not a trustworthy read.
+        Ok(_) | Err(_) => return AssignedReviewTask::Unknown,
+    };
+    match board.into_iter().find(|tf| {
+        tf.task.column == Column::review()
+            && tf.task.assigned_to.as_deref() == Some(workspace_name)
+    }) {
+        Some(tf) => AssignedReviewTask::Assigned(tf.task.id),
+        Option::None => AssignedReviewTask::None,
+    }
 }
 
 /// Drive a `review`-tagged slot's serving lifecycle for one poll tick. Returns
@@ -3721,7 +3776,7 @@ fn handle_review_slot(
     let marker =
         shelbi_orchestrator::workspace::workspace_review_loaded_marker(machine, workspace);
     match assigned_review_task_for(project, &workspace.name) {
-        Some(task_id) => {
+        AssignedReviewTask::Assigned(task_id) => {
             match shelbi_orchestrator::workspace::probe_review_slot_serving(
                 project, workspace, &task_id,
             ) {
@@ -3743,7 +3798,14 @@ fn handle_review_slot(
                 None => false,
             }
         }
-        None => maybe_reap_orphaned_review_slot(project, workspace, host, addr, &marker),
+        AssignedReviewTask::None => {
+            maybe_reap_orphaned_review_slot(project, workspace, host, addr, &marker)
+        }
+        // Board not read warm this tick (a rate-limit park serves a stale
+        // snapshot): the slot's task can't be resolved, so reaping it would be a
+        // destructive action off an untrusted read. Take no authoritative action
+        // and let the caller observe the pane normally; retry next tick.
+        AssignedReviewTask::Unknown => false,
     }
 }
 
@@ -4041,9 +4103,17 @@ fn maybe_reconcile_orphaned_pane(
     addr: &shelbi_core::TmuxAddr,
     orphan_since: &mut Option<Instant>,
 ) -> bool {
-    // Read the board explicitly so a transient failure stays distinguishable
-    // from a genuinely empty result — never reap on an unreadable board.
-    let Ok(tasks) = list_issues(project) else {
+    // Require a WARM board read: "no active task points here" may only reap when
+    // it comes from a trusted read. A stale snapshot (a rate-limit park serving
+    // the last board), a cold cache, or a failed read all fail this — reaping on
+    // one would kill a live worker whose in_progress card the stale board simply
+    // hasn't caught up to. On a non-warm read we can neither confirm nor deny the
+    // orphan, so we *hold* any in-flight grace clock steady (not reset it — a
+    // remote board goes briefly stale between refreshes on every cycle, and
+    // resetting each time would stop the grace from ever accumulating) and bail
+    // without acting. The clock is only cleared by a warm read that shows the
+    // slot is no longer orphaned, below.
+    let Some(tasks) = warm_board(project) else {
         return false;
     };
     if !workspace_orphaned_by_board(project, workspace, &tasks) {
@@ -4141,11 +4211,11 @@ fn workspace_orphaned_by_board(
 }
 
 fn current_task_for(project: &Project, workspace_name: &str) -> Option<String> {
-    // `resolve_issue_store` with the already-loaded `&Project` (no redundant
+    // `issue_store_for_project` with the already-loaded `&Project` (no redundant
     // YAML re-read). It wraps the same process-local `CachedIssueStore` as the
     // sidebar's reads, so on a failed live refresh the poller keeps observing
     // the slot's last-known task from the snapshot rather than reading empty.
-    shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+    shelbi_state::issue_store_for_project(project)
         .and_then(|s| s.list())
         .ok()?
         .into_iter()
@@ -5122,6 +5192,154 @@ Intro prose.
             issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
         }
+    }
+
+    // --- freshness-guard tests: no destructive action on a stale/failed board ---
+    //
+    // These drive the two poller reaper inputs — `assigned_review_task_for` (the
+    // review-slot reaper/resume) and `warm_board` (the dev orphan reaper) —
+    // against a `github` board via the injectable fake `gh` runner. A cold or
+    // failed read must resolve to "unknown" / `None` so no reap or history-drop
+    // fires; a warm read must resolve to a definite answer so the paths still act
+    // normally. A `file_system` board is always warm, so it is unaffected.
+
+    /// A `github`-backed project named `name` with a review workspace, persisted
+    /// to disk (so `issue_store_for` reads it back) and returned for the in-memory
+    /// half a reaper input needs.
+    fn gh_review_project(work_dir: &std::path::Path, name: &str) -> Project {
+        let mut project = local_project(work_dir);
+        project.name = name.into();
+        project.issue_tracker = shelbi_core::IssueTrackerConfig {
+            backend: IssueTrackerBackend::Github,
+            github: Some(shelbi_core::GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            ..Default::default()
+        };
+        project.workspaces[0].tags = vec!["review".into()];
+        shelbi_state::save_project(&project).unwrap();
+        project
+    }
+
+    fn gh_review_issue_json(id: &str) -> String {
+        format!(
+            r#"{{"number":7,"title":"{id}","body":"Prose for {id}.","state":"open","labels":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/review"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
+        )
+    }
+
+    /// Install a fake `gh` runner that answers the issues endpoint with `body`
+    /// and empty sets for `/labels` and `/comments`.
+    fn install_gh_runner(body: String) {
+        shelbi_state::set_test_gh_runner(move |args: &[&str]| -> shelbi_core::Result<String> {
+            let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+            if path.ends_with("/labels") || path.contains("/comments") {
+                return Ok(String::new());
+            }
+            Ok(body.clone())
+        });
+    }
+
+    fn gh_guard_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "shb-gh-guard-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    #[test]
+    fn assigned_review_task_for_is_unknown_on_a_cold_or_failed_board() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = gh_guard_home("art-cold");
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = gh_review_project(&work_dir, "ghguard-art-cold");
+        // Failing runner: the board never warms → a non-warm read → Unknown, so
+        // the reaper/resume takes no destructive action this tick.
+        shelbi_state::set_test_gh_runner(|_| Err(shelbi_core::Error::Other("boom".into())));
+
+        assert!(
+            matches!(
+                assigned_review_task_for(&project, "alpha"),
+                AssignedReviewTask::Unknown
+            ),
+            "a cold/failed board must resolve to Unknown, never a false None"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn assigned_review_task_for_resolves_definitely_on_a_warm_board() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = gh_guard_home("art-warm");
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let name = "ghguard-art-warm";
+        let project = gh_review_project(&work_dir, name);
+        // A review-column issue assigned (via the local overlay GitHub reads fold
+        // in) to `alpha`. Set the overlay first, then prime the cache so the warm
+        // snapshot carries the assignment.
+        shelbi_state::set_task_assignment(name, "t", Some("alpha")).unwrap();
+        install_gh_runner(gh_review_issue_json("t"));
+        let _ = shelbi_state::issue_store_for(name).unwrap().list().unwrap();
+
+        match assigned_review_task_for(&project, "alpha") {
+            AssignedReviewTask::Assigned(id) => assert_eq!(id, "t"),
+            AssignedReviewTask::None => panic!("expected Assigned(t) on a warm board, got None"),
+            AssignedReviewTask::Unknown => {
+                panic!("expected Assigned(t) on a warm board, got Unknown")
+            }
+        }
+        // A workspace with no review task points at it resolves to a definite
+        // None on the same warm read — not Unknown.
+        assert!(
+            matches!(
+                assigned_review_task_for(&project, "not-a-slot"),
+                AssignedReviewTask::None
+            ),
+            "a warm board with no match must be a definite None"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn warm_board_is_none_on_a_cold_board_and_some_when_warm() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = gh_guard_home("wb");
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        // Cold: a failing runner leaves the board cold → None, so the dev orphan
+        // reaper cannot reap off it.
+        let cold = gh_review_project(&work_dir, "ghguard-wb-cold");
+        shelbi_state::set_test_gh_runner(|_| Err(shelbi_core::Error::Other("boom".into())));
+        assert!(warm_board(&cold).is_none(), "a cold/failed board is not warm");
+        shelbi_state::clear_test_gh_runner();
+
+        // Warm: prime the cache with one issue → Some(board) with that issue.
+        let warm = gh_review_project(&work_dir, "ghguard-wb-warm");
+        install_gh_runner(gh_review_issue_json("t"));
+        let _ = shelbi_state::issue_store_for("ghguard-wb-warm").unwrap().list().unwrap();
+        let board = warm_board(&warm).expect("a primed board reads warm");
+        assert!(board.iter().any(|tf| tf.task.id == "t"), "warm board carries the issue");
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     fn in_progress_task(id: &str, workspace: &str) -> Issue {

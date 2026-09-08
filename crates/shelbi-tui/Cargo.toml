@@ -26,5 +26,6 @@ tracing = { workspace = true }
 [dev-dependencies]
 # The sidebar's degraded-render test seeds an on-disk board snapshot for a
 # remote (github) backend so a cold process serves it while a live read fails;
-# this feature exposes `shelbi_state::seed_board_snapshot_for_test`. Dev-only.
+# the freshness-guard tests drive the poller's reaper paths against a `github`
+# board via the injectable fake `gh` runner. Both live behind this feature.
 shelbi-state = { workspace = true, features = ["test-support"] }

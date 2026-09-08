@@ -361,7 +361,7 @@ fn category_counts(project: &str) -> Result<CategoryCounts> {
 /// automatic daemon restart is safe.
 pub(crate) fn workspace_idle_busy(project: &str) -> Result<(usize, usize)> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    let in_progress = shelbi_state::resolve_issue_store(project, &p.issue_tracker)
+    let in_progress = shelbi_state::issue_store_for(project)
         .and_then(|s| s.list_in_status(&Column::in_progress()))
         .map_err(|e| anyhow!(e))?;
     let mut idle = 0usize;

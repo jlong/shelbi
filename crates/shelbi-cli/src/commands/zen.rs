@@ -293,7 +293,7 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
         ZenCmd::Status => status(&project_name),
         ZenCmd::Probe { task_id } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
-            let tf = shelbi_state::resolve_issue_store(&project_name, &project.issue_tracker)
+            let tf = shelbi_state::issue_store_for(&project_name)
                 .map_err(|e| anyhow!(e))?
                 .get(&task_id)
                 .map_err(|e| anyhow!(e))?
@@ -347,7 +347,7 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
         }
         ZenCmd::PrCreate { task_id, identity } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
-            let tf = shelbi_state::resolve_issue_store(&project_name, &project.issue_tracker)
+            let tf = shelbi_state::issue_store_for(&project_name)
                 .map_err(|e| anyhow!(e))?
                 .get(&task_id)
                 .map_err(|e| anyhow!(e))?
