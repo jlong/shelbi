@@ -659,6 +659,7 @@ fn scan_feed_batch(project: &str, cursor: u64) -> Result<Option<FeedBatch>> {
             from: cursor.to_string(),
             through: through.to_string(),
         },
+        board: response.board,
         events: response.events,
     }))
 }
@@ -722,6 +723,7 @@ fn feed_scan(
                 from: cursor.to_string(),
                 through: through.to_string(),
             },
+            board: response.board,
             events: response.events,
         },
         through,
@@ -810,6 +812,11 @@ struct FeedBatch {
     /// The exact command that advances the durable cursor past this batch.
     /// Re-emitted verbatim on every restart until it is acked.
     ack: String,
+    /// How the board scope was obtained. Omitted on the happy path (a live
+    /// read); present as `snapshot` / `unavailable` when the issue backend was
+    /// unreachable — the batch is still delivered and ackable either way.
+    #[serde(skip_serializing_if = "BoardAvailability::is_live")]
+    board: BoardAvailability,
     events: Vec<NormalizedEvent>,
 }
 
@@ -866,6 +873,7 @@ fn parse_drain(project: &str, read: shelbi_state::EventLogRead) -> Result<DrainR
         project: project.to_string(),
         cursor: next_cursor.to_string(),
         cursor_offset: next_cursor,
+        board: scope.board,
         events,
     })
 }
@@ -913,28 +921,103 @@ fn parse_cursor(cursor: &str) -> Result<u64> {
         .map_err(|_| anyhow!("cursor `{cursor}` is not a Shelbi event cursor"))
 }
 
+/// How the board data behind a drain was obtained. Reported on every batch so
+/// a consumer can tell an authoritative read from a degraded one — and, crucially,
+/// so a batch produced with *no* live board read is still delivered and ackable
+/// rather than aborting the drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BoardAvailability {
+    /// A live, authoritative issue-backend read succeeded.
+    Live,
+    /// The live read failed (issue backend unreachable / rate-limited), so the
+    /// scope was resolved from the persisted board snapshot instead.
+    Snapshot,
+    /// No board data at all — neither a live read nor a snapshot. Board-derived
+    /// enrichment is omitted; delivery and ack still work.
+    Unavailable,
+}
+
+impl BoardAvailability {
+    /// Whether this was a live read. Used to skip the `board` field on the
+    /// happy path so the batch stays byte-identical to the pre-degradation
+    /// shape; the field appears only when the board was *not* read live.
+    fn is_live(&self) -> bool {
+        matches!(self, BoardAvailability::Live)
+    }
+}
+
 #[derive(Debug)]
 struct ProjectScope {
     project: String,
     task_ids: HashSet<String>,
+    board: BoardAvailability,
 }
 
 impl ProjectScope {
+    /// Resolve the project scope for a drain. Board reachability never aborts
+    /// the drain: the durable facts live in `events.log`, so a batch must
+    /// deliver (and be ackable) even when the issue backend is down.
+    ///
+    /// A live board read is preferred — its task ids let legacy, pre-project-
+    /// scoped lines be matched by `task=`. When that read fails (e.g. GitHub
+    /// rate-limited, HTTP 403) the persisted board snapshot is used instead;
+    /// when there is no snapshot either, the scope proceeds with no task ids and
+    /// the board is reported [`BoardAvailability::Unavailable`]. Either degraded
+    /// path only affects legacy-line matching — modern lines carry `project=`
+    /// and are scoped without the board at all.
     fn load(project: &str) -> Result<Self> {
-        // The id set is only a compatibility fallback for legacy log lines that
-        // predate `project=` scoping (see `line_belongs_to_project`); the modern
-        // path keys off the `project=` field directly. Those legacy lines are
-        // about active work, so the open-only read is the right, cheap scope.
-        let task_ids = shelbi_state::issue_store_for(project)
-            .and_then(|s| s.list_open())
-            .map_err(|e| anyhow!(e))?
-            .into_iter()
-            .map(|tf| tf.task.id)
-            .collect();
+        let (task_ids, board) = Self::read_board(project);
         Ok(Self {
             project: project.to_string(),
             task_ids,
+            board,
         })
+    }
+
+    fn read_board(project: &str) -> (HashSet<String>, BoardAvailability) {
+        let Ok(store) = shelbi_state::issue_store_for(project) else {
+            // Can't even construct the backend — proceed with no enrichment
+            // rather than abort the drain.
+            return (HashSet::new(), BoardAvailability::Unavailable);
+        };
+        // A live read is authoritative; a snapshot fallback (served by
+        // `list_state` without any live read) keeps enrichment working when the
+        // backend is unreachable. `is_cold()` means neither exists.
+        //
+        // The live read is `list_open()`, not `list()`: after #1217 the cached
+        // store's `list()` is an uncached `state=all` sweep, and the drain only
+        // needs the non-terminal board — the task ids here are just a legacy-line
+        // matching fallback for active work.
+        Self::resolve_board(store.list_open(), || {
+            store
+                .list_state()
+                .ok()
+                .filter(|state| !state.is_cold())
+                .map(shelbi_state::BoardState::into_issues)
+        })
+    }
+
+    /// Turn a live board read (which may have failed) and a lazy snapshot
+    /// fallback into the scope's task ids and a [`BoardAvailability`] tag. Pure
+    /// over its inputs so the three degradation cases are unit-testable without
+    /// standing up a backend: the snapshot closure is evaluated only when the
+    /// live read failed.
+    fn resolve_board(
+        live: shelbi_core::Result<Vec<shelbi_state::IssueFile>>,
+        snapshot: impl FnOnce() -> Option<Vec<shelbi_state::IssueFile>>,
+    ) -> (HashSet<String>, BoardAvailability) {
+        match live {
+            Ok(board) => (Self::task_ids(board), BoardAvailability::Live),
+            Err(_) => match snapshot() {
+                Some(board) => (Self::task_ids(board), BoardAvailability::Snapshot),
+                None => (HashSet::new(), BoardAvailability::Unavailable),
+            },
+        }
+    }
+
+    fn task_ids(board: Vec<shelbi_state::IssueFile>) -> HashSet<String> {
+        board.into_iter().map(|tf| tf.task.id).collect()
     }
 }
 
@@ -944,6 +1027,11 @@ struct DrainResponse {
     cursor: String,
     #[serde(skip)]
     cursor_offset: u64,
+    /// How the board scope was obtained. Omitted on the happy path (a live
+    /// read); present as `snapshot` / `unavailable` when the issue backend was
+    /// unreachable, so a consumer knows board-derived enrichment is degraded.
+    #[serde(skip_serializing_if = "BoardAvailability::is_live")]
+    board: BoardAvailability,
     events: Vec<NormalizedEvent>,
 }
 
@@ -1350,6 +1438,126 @@ workspaces: []\n";
         assert_eq!(response.events[0].workspace.as_deref(), Some("alpha"));
         assert_eq!(response.events[1].task.as_deref(), Some("owned"));
         assert_eq!(response.events[1].kind, "task_transition");
+    }
+
+    /// An `IssueFile` with just enough shape for `ProjectScope::task_ids` to
+    /// pull an id — the board-availability tests never touch the rest.
+    fn issue_file(id: &str) -> shelbi_state::IssueFile {
+        let now = Utc::now();
+        shelbi_state::IssueFile {
+            task: Issue {
+                id: id.into(),
+                title: id.into(),
+                column: Column::todo(),
+                priority: 0,
+                assigned_to: None,
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                launch: None,
+                created_at: now,
+                updated_at: now,
+                params: BTreeMap::new(),
+            },
+            body: String::new(),
+        }
+    }
+
+    /// The pure core of the degradation policy: a live read wins; a live
+    /// failure falls back to the snapshot; a live failure with no snapshot is
+    /// `unavailable` and never aborts.
+    #[test]
+    fn resolve_board_reports_the_three_availability_states() {
+        // Live read succeeds: task ids populated, tagged Live.
+        let (ids, avail) =
+            ProjectScope::resolve_board(Ok(vec![issue_file("live-1")]), || unreachable!());
+        assert_eq!(avail, BoardAvailability::Live);
+        assert!(ids.contains("live-1"));
+
+        // Live read fails, snapshot serves: ids from the snapshot, tagged Snapshot.
+        let (ids, avail) = ProjectScope::resolve_board(
+            Err(shelbi_core::Error::Other("rate limited".into())),
+            || Some(vec![issue_file("snap-1")]),
+        );
+        assert_eq!(avail, BoardAvailability::Snapshot);
+        assert!(ids.contains("snap-1"));
+
+        // Live read fails, no snapshot: empty ids, tagged Unavailable — never an
+        // error.
+        let (ids, avail) = ProjectScope::resolve_board(
+            Err(shelbi_core::Error::Other("rate limited".into())),
+            || None,
+        );
+        assert_eq!(avail, BoardAvailability::Unavailable);
+        assert!(ids.is_empty());
+    }
+
+    /// The happy path (a local `file_system` board, always a live read) must not
+    /// grow a `board` field — the batch shape stays byte-identical to before the
+    /// degradation handling, so only a degraded drain announces itself.
+    #[test]
+    fn board_field_is_omitted_on_a_live_read() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task("demo", "owned");
+        append_task_event("demo", "owned", "default", Column::todo(), Column::done(), "x")
+            .unwrap();
+
+        let response = drain_once("demo", 0).unwrap();
+        assert_eq!(response.board, BoardAvailability::Live);
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(
+            json.get("board").is_none(),
+            "a live read must not emit a board field: {json}"
+        );
+    }
+
+    /// Regression for the drain aborting when the issue backend is unreachable.
+    /// A project whose board cannot be read at all still delivers its raw event
+    /// lines, tags the batch `board: unavailable`, keeps the raw `from_category`
+    /// / `to_category` tokens, and stays ackable — everything the orchestrator
+    /// needs is already in `events.log`.
+    #[test]
+    fn unreachable_board_still_delivers_acks_and_keeps_category_tokens() {
+        let (_guard, _tmp) = setup_home();
+        // `degraded` is never registered, so `issue_store_for` fails exactly as a
+        // rate-limited/unreachable backend read would — the board is unavailable.
+        // Modern lines carry `project=`, so they are still scoped without a board.
+        let fixture = "\
+2026-01-02T03:04:05+00:00 project=degraded task=fix-1 workflow=task todo -> in_progress reason=dispatch from_category=backlog to_category=active
+";
+        fs::write(shelbi_state::events_log_path().unwrap(), fixture).unwrap();
+
+        // `events next` (non-follow) still returns a populated batch, tagged.
+        let response = drain_once("degraded", 0).unwrap();
+        assert_eq!(response.board, BoardAvailability::Unavailable);
+        assert_eq!(response.events.len(), 1, "raw line must still deliver");
+        let event = &response.events[0];
+        assert_eq!(event.task.as_deref(), Some("fix-1"));
+        assert!(event.raw.contains("from_category=backlog"));
+        assert_eq!(
+            event.metadata.get("from_category").map(String::as_str),
+            Some("backlog"),
+            "category tokens from the raw line survive an unavailable board"
+        );
+        assert_eq!(
+            event.metadata.get("to_category").map(String::as_str),
+            Some("active")
+        );
+
+        // The batch has a delivery id and the field says the board was degraded.
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["board"], "unavailable");
+
+        // The delivery id acks cleanly — the whole point: delivery and ack keep
+        // working with the backend down.
+        let batch = scan_feed_batch("degraded", 0).unwrap().unwrap();
+        assert_eq!(batch.board, BoardAvailability::Unavailable);
+        assert!(!batch.delivery_id.is_empty());
+        ack_delivery("degraded", &batch.delivery_id).unwrap();
+        // Idempotent re-ack is still fine after the cursor advanced.
+        ack_delivery("degraded", &batch.delivery_id).unwrap();
     }
 
     #[test]
@@ -2150,6 +2358,7 @@ workspaces: []\n";
             project: "demo".to_string(),
             cursor: FeedCursor { from: "0".to_string(), through: "10".to_string() },
             ack: "shelbi orchestrator events ack shelbi-event/demo/0-10".to_string(),
+            board: BoardAvailability::Live,
             events: Vec::new(),
         };
         let batch = serde_json::to_value(batch).unwrap();
