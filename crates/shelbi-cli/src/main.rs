@@ -1025,8 +1025,8 @@ mod cli_tests {
         assert!(Cli::try_parse_from(["shelbi", "issue", "comment", "fix-login"]).is_err());
     }
 
-    /// `shelbi issue-store migrate --to github` parses into the target backend
-    /// and the (default-off) dry-run flag.
+    /// `shelbi issue-store migrate --to github` parses into the target backend,
+    /// the (default-off) dry-run flag, and the default pacing.
     #[test]
     fn issue_store_migrate_parses_target_and_dry_run() {
         use commands::issue_store::{IssueStoreCmd, MigrateTarget};
@@ -1034,23 +1034,34 @@ mod cli_tests {
         let cli = Cli::parse_from(["shelbi", "issue-store", "migrate", "--to", "github"]);
         match cli.cmd {
             Some(Cmd::IssueStore {
-                cmd: IssueStoreCmd::Migrate { to, dry_run },
+                cmd: IssueStoreCmd::Migrate { to, dry_run, pace_secs },
             }) => {
                 assert_eq!(to, MigrateTarget::Github);
                 assert!(!dry_run, "dry_run defaults off");
+                assert!(pace_secs > 0.0, "pacing defaults on for a bulk run");
             }
             other => panic!("expected IssueStore::Migrate, got {other:?}"),
         }
 
-        // `file_system` is the reverse target; `--dry-run` flips the flag.
-        let cli =
-            Cli::parse_from(["shelbi", "issue-store", "migrate", "--to", "file_system", "--dry-run"]);
+        // `file_system` is the reverse target; `--dry-run` flips the flag, and
+        // `--pace-secs 0` disables pacing.
+        let cli = Cli::parse_from([
+            "shelbi",
+            "issue-store",
+            "migrate",
+            "--to",
+            "file_system",
+            "--dry-run",
+            "--pace-secs",
+            "0",
+        ]);
         match cli.cmd {
             Some(Cmd::IssueStore {
-                cmd: IssueStoreCmd::Migrate { to, dry_run },
+                cmd: IssueStoreCmd::Migrate { to, dry_run, pace_secs },
             }) => {
                 assert_eq!(to, MigrateTarget::FileSystem);
                 assert!(dry_run);
+                assert_eq!(pace_secs, 0.0);
             }
             other => panic!("expected IssueStore::Migrate, got {other:?}"),
         }

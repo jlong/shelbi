@@ -203,7 +203,31 @@ impl GitHubStore {
             return Self { project, repo, gh: runner };
         }
         let project_for_gh = project.clone();
-        let gh: GhRunner = Arc::new(move |args: &[&str]| run_gh(&project_for_gh, args));
+        let base: GhRunner = Arc::new(move |args: &[&str]| run_gh(&project_for_gh, args));
+        // Two retry policies, chosen per call by HTTP method:
+        //
+        // * Mutating calls (`POST`/`PATCH`/`PUT`/`DELETE` — create, move, edit,
+        //   comment, labels, and so the whole `issue-store migrate` loop) get the
+        //   long production policy: a rate limit (esp. the secondary
+        //   content-creation limit a bulk migration trips) or a transient blip is
+        //   waited out with backoff, honoring any `Retry-After`.
+        // * Read calls (`GET`) get the fail-fast read policy: when the *primary*
+        //   hourly limit is exhausted `gh` reports `API rate limit exceeded` with
+        //   no `Retry-After`, and blocking every board read for minutes behind
+        //   backoff would stall dialog detection, marker handling and dispatch —
+        //   so a hintless rate limit fails immediately there.
+        //
+        // See [`crate::gh_retry`].
+        let read_policy = crate::gh_retry::RetryPolicy::reads();
+        let write_policy = crate::gh_retry::RetryPolicy::production();
+        let gh: GhRunner = Arc::new(move |args: &[&str]| {
+            let policy = if is_mutating_gh(args) {
+                &write_policy
+            } else {
+                &read_policy
+            };
+            policy.run(|| base(args))
+        });
         Self { project, repo, gh }
     }
 
@@ -218,6 +242,51 @@ impl GitHubStore {
             project: "test-project".to_string(),
             repo: repo.into(),
             gh: Arc::new(runner),
+        }
+    }
+
+    /// Like [`GitHubStore::with_runner`] but routes the injected runner through
+    /// `policy`, so a test can drive the retry/backoff seam (e.g. a simulated
+    /// 429) against canned responses without a network or a real wait.
+    #[cfg(test)]
+    fn with_runner_and_policy(
+        repo: impl Into<String>,
+        policy: crate::gh_retry::RetryPolicy,
+        runner: impl Fn(&[&str]) -> Result<String> + Send + Sync + 'static,
+    ) -> Self {
+        let base: GhRunner = Arc::new(runner);
+        let gh: GhRunner = Arc::new(move |args: &[&str]| policy.run(|| base(args)));
+        Self {
+            project: "test-project".to_string(),
+            repo: repo.into(),
+            gh,
+        }
+    }
+
+    /// Like [`GitHubStore::with_runner_and_policy`] but selects between a read
+    /// and a write policy per call by HTTP method, exactly as [`GitHubStore::new`]
+    /// does — so a test can assert that the `GET` path fails fast while the
+    /// mutating path still retries.
+    #[cfg(test)]
+    fn with_runner_and_policies(
+        repo: impl Into<String>,
+        read_policy: crate::gh_retry::RetryPolicy,
+        write_policy: crate::gh_retry::RetryPolicy,
+        runner: impl Fn(&[&str]) -> Result<String> + Send + Sync + 'static,
+    ) -> Self {
+        let base: GhRunner = Arc::new(runner);
+        let gh: GhRunner = Arc::new(move |args: &[&str]| {
+            let policy = if is_mutating_gh(args) {
+                &write_policy
+            } else {
+                &read_policy
+            };
+            policy.run(|| base(args))
+        });
+        Self {
+            project: "test-project".to_string(),
+            repo: repo.into(),
+            gh,
         }
     }
 
@@ -876,6 +945,23 @@ impl GitHubStore {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Whether a `gh api` invocation mutates state, inferred from its `-X <method>`
+/// argument: `POST` / `PATCH` / `PUT` / `DELETE` are writes, everything else
+/// (`GET`, or an absent `-X`) is a read. Drives which retry policy wraps the
+/// call in [`GitHubStore::new`].
+fn is_mutating_gh(args: &[&str]) -> bool {
+    args.iter()
+        .position(|a| *a == "-X")
+        .and_then(|i| args.get(i + 1))
+        .map(|method| {
+            matches!(
+                method.to_ascii_uppercase().as_str(),
+                "POST" | "PATCH" | "PUT" | "DELETE"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// Run the real `gh` CLI with resolved auth. The token is resolved through the
@@ -1714,6 +1800,138 @@ mod tests {
         assert!(create.contains("priority: 0"));
         assert!(create.contains("Prose body"));
         assert!(create.contains(META_BEGIN));
+    }
+
+    #[test]
+    fn add_retries_a_secondary_rate_limit_on_the_create_and_completes() {
+        // The issue-create POST is rate-limited once (403 secondary limit with a
+        // Retry-After), then succeeds. With a no-wait retry policy the `add`
+        // still lands, exercising the store's retry seam end to end.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let created = r#"{"number":10,"title":"T","body":"","state":"open","labels":[],"created_at":"2026-08-03T00:00:00Z","updated_at":"2026-08-03T00:00:00Z"}"#;
+        let create_posts = std::sync::Arc::new(AtomicU32::new(0));
+        let counter = create_posts.clone();
+        let sleep: std::sync::Arc<dyn Fn(std::time::Duration) + Send + Sync> =
+            std::sync::Arc::new(|_| {});
+        let notify: std::sync::Arc<dyn Fn(&crate::gh_retry::RetryNotice) + Send + Sync> =
+            std::sync::Arc::new(|_| {});
+        let policy = crate::gh_retry::RetryPolicy::for_test(5, sleep, notify);
+        let store = GitHubStore::with_runner_and_policy("owner/repo", policy, move |args| {
+            let method = args
+                .iter()
+                .position(|a| *a == "-X")
+                .and_then(|i| args.get(i + 1))
+                .copied()
+                .unwrap_or("GET");
+            let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+            if method == "POST" && path.ends_with("/issues") {
+                // First create attempt is throttled; the retry succeeds.
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(Error::Command {
+                        cmd: "gh api ...".into(),
+                        status: "exit status: 1".into(),
+                        stderr: "HTTP 403: You have exceeded a secondary rate limit.\nRetry-After: 1".into(),
+                    });
+                }
+                return Ok(created.to_string());
+            }
+            if method != "GET" {
+                return Ok("{}".to_string());
+            }
+            // All reads (dup check, column list, labels) come back empty.
+            Ok(String::new())
+        });
+
+        let issue = store
+            .add(NewIssue::new("do-thing", "Do the thing", Column::todo(), "b"))
+            .unwrap();
+        assert_eq!(issue.id, "do-thing");
+        assert_eq!(create_posts.load(Ordering::SeqCst), 2, "create was retried once");
+    }
+
+    #[test]
+    fn add_does_not_retry_a_terminal_validation_error_on_the_create() {
+        // A 422 validation failure on the create is terminal — `add` fails after
+        // exactly one create attempt, never spinning on a permanent error.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let create_posts = std::sync::Arc::new(AtomicU32::new(0));
+        let counter = create_posts.clone();
+        let sleep: std::sync::Arc<dyn Fn(std::time::Duration) + Send + Sync> =
+            std::sync::Arc::new(|_| {});
+        let notify: std::sync::Arc<dyn Fn(&crate::gh_retry::RetryNotice) + Send + Sync> =
+            std::sync::Arc::new(|_| {});
+        let policy = crate::gh_retry::RetryPolicy::for_test(5, sleep, notify);
+        let store = GitHubStore::with_runner_and_policy("owner/repo", policy, move |args| {
+            let method = args
+                .iter()
+                .position(|a| *a == "-X")
+                .and_then(|i| args.get(i + 1))
+                .copied()
+                .unwrap_or("GET");
+            let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+            if method == "POST" && path.ends_with("/issues") {
+                counter.fetch_add(1, Ordering::SeqCst);
+                return Err(Error::Command {
+                    cmd: "gh api ...".into(),
+                    status: "exit status: 1".into(),
+                    stderr: "HTTP 422: Validation Failed\ninvalid field".into(),
+                });
+            }
+            if method != "GET" {
+                return Ok("{}".to_string());
+            }
+            Ok(String::new())
+        });
+
+        assert!(store
+            .add(NewIssue::new("do-thing", "Do the thing", Column::todo(), "b"))
+            .is_err());
+        assert_eq!(create_posts.load(Ordering::SeqCst), 1, "no retry on a 422");
+    }
+
+    #[test]
+    fn list_under_the_primary_rate_limit_fails_fast_without_retrying() {
+        // A read (`GET`) under the exhausted primary limit — `API rate limit
+        // exceeded`, which `gh` reports with no Retry-After — must return Err
+        // after exactly one attempt and never sleep, so a board read is never
+        // blocked for minutes behind backoff.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let get_calls = std::sync::Arc::new(AtomicU32::new(0));
+        let counter = get_calls.clone();
+        let slept = std::sync::Arc::new(AtomicU32::new(0));
+        let sleep_counter = slept.clone();
+        let read_sleep: std::sync::Arc<dyn Fn(std::time::Duration) + Send + Sync> =
+            std::sync::Arc::new(move |_| {
+                sleep_counter.fetch_add(1, Ordering::SeqCst);
+            });
+        let notify: std::sync::Arc<dyn Fn(&crate::gh_retry::RetryNotice) + Send + Sync> =
+            std::sync::Arc::new(|_| {});
+        let read_policy = crate::gh_retry::RetryPolicy::for_test_reads(2, read_sleep, notify.clone());
+        let write_policy = crate::gh_retry::RetryPolicy::for_test(5, std::sync::Arc::new(|_| {}), notify);
+        let store = GitHubStore::with_runner_and_policies(
+            "owner/repo",
+            read_policy,
+            write_policy,
+            move |args| {
+                let method = args
+                    .iter()
+                    .position(|a| *a == "-X")
+                    .and_then(|i| args.get(i + 1))
+                    .copied()
+                    .unwrap_or("GET");
+                assert_eq!(method, "GET", "list issues only a GET");
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(Error::Command {
+                    cmd: "gh api ...".into(),
+                    status: "exit status: 1".into(),
+                    stderr: "HTTP 403: API rate limit exceeded for user ID 1.".into(),
+                })
+            },
+        );
+
+        assert!(store.list().is_err());
+        assert_eq!(get_calls.load(Ordering::SeqCst), 1, "read is not retried");
+        assert_eq!(slept.load(Ordering::SeqCst), 0, "read never sleeps on a hintless limit");
     }
 
     #[test]
