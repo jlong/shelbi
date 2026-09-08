@@ -1,4 +1,4 @@
-//! Per-token GitHub rate-limit park state, shared hub-wide through a small file.
+//! Per-token GitHub rate-limit budget, shared hub-wide through a small file.
 //!
 //! ## The failure this exists to stop
 //!
@@ -10,9 +10,9 @@
 //! Nothing looked at the rate-limit headers, so nothing knew *when* the budget
 //! would reset, and nothing backed off until it did.
 //!
-//! ## What it does (plan Phase 0, item 3)
+//! ## What it does
 //!
-//! The first read-path 403/429 rate-limit response **parks** all board reads for
+//! A rate-limit 403/429 response **parks** all reads on the affected budget for
 //! that token until its reset time. While parked, a read short-circuits before
 //! ever spawning `gh` — it returns the same typed rate-limit [`Error`] the real
 //! call would, so the cache keeps serving its last snapshot marked stale, and no
@@ -21,15 +21,22 @@
 //! the hub (daemon, panes, CLI), not just the one that hit the limit. The file
 //! is keyed by a **hash** of the token, never the token itself.
 //!
-//! Parking is *reactive* for Phase 0: it kicks in on the first 403, not on a
-//! remaining-quota threshold. The proactive budget governor (adaptive tick,
-//! reserve floors) is Phase 3; this module already records `remaining` /
-//! `reset_at` when a header parse hands them over, so that governor has the data
-//! it needs without a second store.
+//! ## Two budgets, per token, hub-wide (plan Phase 3 §6)
+//!
+//! GitHub prices GraphQL reads (the board index and single-issue fetches) on a
+//! **separate** 5,000-points-per-hour budget from the REST requests that writes
+//! use. This file therefore carries **two** [`BudgetTier`]s — `graphql` and
+//! `rest` — each with its own `remaining` / `reset_at` (recorded from every
+//! response: `rateLimit { … }` in GraphQL, `x-ratelimit-*` headers from `gh api
+//! --include` on REST) and its own `parked_until`. The daemon's governor reads
+//! `graphql` to scale (or pause) the index-refresh tick; the write path reads
+//! `rest` to reserve a floor for mutations. Several projects on one token share
+//! one file, so the governor is per token, not per project.
 
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -42,18 +49,70 @@ const BUDGET_DIR: &str = "gh-budget";
 /// until the real reset, minutes away, so this fallback rarely fires.
 pub const DEFAULT_PARK_SECS: i64 = 60;
 
-/// One token's persisted rate-limit state.
+/// Which of a token's two independent budgets a call concerns: GraphQL reads
+/// (the board index and single-issue fetches) or REST requests (writes and the
+/// REST fallback list). Selects the [`BudgetTier`] every tier-aware function
+/// reads or updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Budget {
+    /// The GraphQL points budget — the board-index reader and single-issue
+    /// fetches.
+    Graphql,
+    /// The REST requests budget — mutations and the REST fallback list.
+    Rest,
+}
+
+/// One budget's persisted state (GraphQL *or* REST). Both tiers share this shape
+/// so the governor and the write reserve read the same fields off whichever one
+/// they care about.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BudgetTier {
+    /// Requests/points remaining in the current window, last time a response
+    /// surfaced it. The governor scales the tick off the `graphql` value; the
+    /// write reserve refuses below a floor off the `rest` value.
+    pub remaining: Option<i64>,
+    /// When the current window resets (epoch seconds).
+    pub reset_at: Option<i64>,
+    /// While set and in the future, every read on this budget short-circuits
+    /// without calling `gh`. Cleared implicitly: once `now` passes it,
+    /// [`park_verdict`] reports not-parked and reads resume — no file rewrite
+    /// needed.
+    pub parked_until: Option<i64>,
+}
+
+/// One token's persisted rate-limit state: its GraphQL and REST budgets.
+///
+/// `#[serde(default)]` on each tier means a file written by an older shelbi
+/// (which stored a single flat `remaining`/`reset_at`/`parked_until`) reads back
+/// as two default (not-parked) tiers — dropping any in-flight park from before
+/// the upgrade, which is harmless: the next live 403 re-parks.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RateLimitState {
-    /// Requests remaining in the current window, last time a header parse saw
-    /// it. Informational for Phase 0; the Phase 3 governor reads it.
-    pub remaining: Option<i64>,
-    /// When the current window resets (epoch seconds), from `x-ratelimit-reset`.
-    pub reset_at: Option<i64>,
-    /// While set and in the future, every read short-circuits without calling
-    /// `gh`. Cleared implicitly: once `now` passes it, [`park_verdict`] reports
-    /// not-parked and reads resume — no file rewrite needed.
-    pub parked_until: Option<i64>,
+    /// The GraphQL points budget.
+    #[serde(default)]
+    pub graphql: BudgetTier,
+    /// The REST requests budget.
+    #[serde(default)]
+    pub rest: BudgetTier,
+}
+
+impl RateLimitState {
+    /// The tier for `budget` — the read-side accessor the governor and reserve
+    /// use.
+    pub fn tier(&self, budget: Budget) -> &BudgetTier {
+        match budget {
+            Budget::Graphql => &self.graphql,
+            Budget::Rest => &self.rest,
+        }
+    }
+
+    /// The mutable tier for `budget`, for a record/park read-modify-write.
+    fn tier_mut(&mut self, budget: Budget) -> &mut BudgetTier {
+        match budget {
+            Budget::Graphql => &mut self.graphql,
+            Budget::Rest => &mut self.rest,
+        }
+    }
 }
 
 /// Rate-limit numbers parsed out of a `gh api --include` response's header
@@ -144,75 +203,161 @@ fn write_state(key: &str, state: &RateLimitState) {
     }
 }
 
-/// The pure park decision: given a state and the current epoch, the reset time
-/// reads are parked until, or `None` when the token is free. Split out so the
-/// "is this token parked right now" rule is unit-testable without the file.
-pub fn park_verdict(state: &RateLimitState, now: i64) -> Option<i64> {
-    match state.parked_until {
+/// The pure park decision: given a tier and the current epoch, the reset time
+/// reads are parked until, or `None` when the budget is free. Split out so the
+/// "is this budget parked right now" rule is unit-testable without the file.
+pub fn park_verdict(tier: &BudgetTier, now: i64) -> Option<i64> {
+    match tier.parked_until {
         Some(until) if until > now => Some(until),
         _ => None,
     }
 }
 
-/// Whether `key` is currently parked, and until when (epoch seconds). Reads the
-/// file each call; reads are cache-gated so this is not on a hot path.
-pub fn parked_until(key: &str, now: i64) -> Option<i64> {
-    park_verdict(&read_state(key), now)
+/// Whether `budget` is currently parked for `key`, and until when (epoch
+/// seconds). Reads the file each call; reads are cache-gated so this is not on a
+/// hot path.
+pub fn parked_until(key: &str, budget: Budget, now: i64) -> Option<i64> {
+    park_verdict(read_state(key).tier(budget), now)
 }
 
-/// Process-global lock serializing [`park`] so N concurrent poller threads that
-/// all see a 403 in the same window produce exactly **one** park transition
-/// (and therefore one events.log line) rather than one per thread. Cross-process
-/// racers still dedupe through the file check inside the lock, with only a small
-/// window; within a process this makes it exact.
+/// Process-global lock serializing budget-file writes so N concurrent threads
+/// that all see a 403 in the same window produce exactly **one** park transition
+/// (and therefore one events.log line) rather than one per thread, and so a
+/// `park` and a `record` on the two tiers never lose each other's write.
+/// Cross-process racers still dedupe through the file check inside the lock, with
+/// only a small window; within a process this makes it exact.
 fn park_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Park `key` until `reset_at`. Returns `true` **iff this call transitioned the
-/// token from not-parked to parked** — the signal the caller uses to log the
-/// `board rate-limited` line exactly once per window. A call that finds the
-/// token already parked returns `false` and rewrites nothing.
+/// Park `budget` for `key` until `reset_at`. Returns `true` **iff this call
+/// transitioned the budget from not-parked to parked** — the signal the caller
+/// uses to log the `board rate-limited` line exactly once per window. A call
+/// that finds the budget already parked returns `false` and rewrites nothing.
 ///
 /// `reset_at` is clamped to strictly after `now` so a stale/past reset can't
 /// produce a park that's already expired (which would re-fire on the next read).
-pub fn park(key: &str, reset_at: i64, now: i64) -> bool {
+pub fn park(key: &str, budget: Budget, reset_at: i64, now: i64) -> bool {
     let _guard = park_lock().lock();
     let mut state = read_state(key);
-    if park_verdict(&state, now).is_some() {
+    if park_verdict(state.tier(budget), now).is_some() {
         return false; // already parked this window
     }
-    state.reset_at = Some(reset_at);
-    state.parked_until = Some(reset_at.max(now + 1));
+    let tier = state.tier_mut(budget);
+    tier.reset_at = Some(reset_at);
+    tier.parked_until = Some(reset_at.max(now + 1));
     write_state(key, &state);
     true
 }
 
-/// Record the latest `remaining` / `reset_at` a header parse saw, without
-/// parking. Phase 0 doesn't act on these, but capturing them keeps the file the
-/// single source the Phase 3 governor will read. No-op when neither is present.
-pub fn record_rate_limit(key: &str, headers: &RateLimitHeaders) {
-    if headers.remaining.is_none() && headers.reset_at.is_none() {
+/// Record the latest `remaining` / `reset_at` seen for `budget`, without
+/// parking. Keeps the file the single source the governor and write reserve
+/// read. No-op when neither is present.
+pub fn record(key: &str, budget: Budget, remaining: Option<i64>, reset_at: Option<i64>) {
+    if remaining.is_none() && reset_at.is_none() {
         return;
     }
     let _guard = park_lock().lock();
     let mut state = read_state(key);
-    if headers.remaining.is_some() {
-        state.remaining = headers.remaining;
+    let tier = state.tier_mut(budget);
+    if remaining.is_some() {
+        tier.remaining = remaining;
     }
-    if headers.reset_at.is_some() {
-        state.reset_at = headers.reset_at;
+    if reset_at.is_some() {
+        tier.reset_at = reset_at;
     }
     write_state(key, &state);
 }
 
-/// Clear any park recorded for `key`. Test-support and an explicit "resume now"
-/// hook; production relies on the implicit expiry in [`park_verdict`].
+/// Record REST headers ([`parse_rate_limit_headers`] output) into the `rest`
+/// tier — the convenience the write path and the `/rate_limit` probe use.
+pub fn record_rest_headers(key: &str, headers: &RateLimitHeaders) {
+    record(key, Budget::Rest, headers.remaining, headers.reset_at);
+}
+
+/// Clear any park recorded for `key` on both budgets. Test-support and an
+/// explicit "resume now" hook; production relies on the implicit expiry in
+/// [`park_verdict`].
 #[cfg(any(test, feature = "test-support"))]
 pub fn clear(key: &str) {
     let _guard = park_lock().lock();
     write_state(key, &RateLimitState::default());
+}
+
+// --- the governor (plan Phase 3 §6) ------------------------------------------
+
+/// The daemon's per-tick decision for a project's board-index refresh, from the
+/// GraphQL budget behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickPlan {
+    /// Run the refresh this tick, then wait `interval` before the next — the
+    /// configured cadence in the healthy band, or the throttled cadence in the
+    /// middle band.
+    Refresh(Duration),
+    /// Skip the refresh; the GraphQL budget is too low (or parked) to spend on a
+    /// list read. `until` is the epoch the daemon should hold off until — the
+    /// budget's reset (or the park expiry) — after which it resumes optimistically
+    /// (the reset refills the budget). Consumers keep serving the last index,
+    /// marked stale.
+    Pause { until: i64 },
+}
+
+/// The governor thresholds, resolved from `issue_tracker.budget` + the project's
+/// refresh cadence. Passed to [`tick_plan`] so the decision stays a pure
+/// function of numbers, unit-testable without config or the clock.
+#[derive(Debug, Clone, Copy)]
+pub struct BudgetThresholds {
+    /// GraphQL points above which `base_secs` runs unthrottled.
+    pub graphql_high: u64,
+    /// GraphQL points down to which the daemon slows (rather than pauses).
+    pub graphql_medium: u64,
+    /// The configured refresh cadence (seconds).
+    pub base_secs: u64,
+    /// The throttled cadence (seconds) for the middle band.
+    pub slow_secs: u64,
+}
+
+/// Decide this tick from the GraphQL `tier` and the `thresholds` (plan §6 table):
+///
+/// | GraphQL remaining | plan |
+/// | --- | --- |
+/// | parked | pause until the park expires |
+/// | `> high` (or unknown) | refresh at `base_secs` |
+/// | `medium ..= high` | refresh at `slow_secs` |
+/// | `< medium`, reset in the future | pause until `reset_at` |
+/// | `< medium`, reset passed/unknown | refresh at `base_secs` (budget refilled) |
+///
+/// The last row is what lets a paused project self-heal: once the window resets
+/// the low `remaining` is stale, so the governor refreshes once, which reads the
+/// live `rateLimit` and repopulates the budget — back to the healthy band.
+pub fn tick_plan(tier: &BudgetTier, thresholds: &BudgetThresholds, now: i64) -> TickPlan {
+    // A park (from an actual 403/429) is the hardest signal: hold off until it
+    // expires regardless of the last-seen `remaining`.
+    if let Some(until) = park_verdict(tier, now) {
+        return TickPlan::Pause { until };
+    }
+    let base = TickPlan::Refresh(Duration::from_secs(thresholds.base_secs));
+    // An unknown budget (never read, or a cold hub) runs at the configured
+    // cadence — the first read populates it.
+    let Some(remaining) = tier.remaining else {
+        return base;
+    };
+    let high = thresholds.graphql_high as i64;
+    let medium = thresholds.graphql_medium as i64;
+    if remaining > high {
+        base
+    } else if remaining > medium {
+        TickPlan::Refresh(Duration::from_secs(thresholds.slow_secs))
+    } else {
+        // Low band: pause until the reset, then resume optimistically. A stale
+        // (passed) or absent reset means the window has almost certainly rolled,
+        // so refresh rather than pause forever on a number we can no longer trust.
+        match tier.reset_at {
+            Some(reset) if reset > now => TickPlan::Pause { until: reset },
+            _ => base,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -271,18 +416,18 @@ mod tests {
 
     #[test]
     fn park_verdict_is_parked_only_while_reset_is_in_the_future() {
-        let state = RateLimitState {
+        let tier = BudgetTier {
             parked_until: Some(1_000),
             ..Default::default()
         };
-        assert_eq!(park_verdict(&state, 999), Some(1_000), "before reset: parked");
-        assert_eq!(park_verdict(&state, 1_000), None, "at reset: not parked");
-        assert_eq!(park_verdict(&state, 1_001), None, "past reset: not parked");
+        assert_eq!(park_verdict(&tier, 999), Some(1_000), "before reset: parked");
+        assert_eq!(park_verdict(&tier, 1_000), None, "at reset: not parked");
+        assert_eq!(park_verdict(&tier, 1_001), None, "past reset: not parked");
     }
 
     #[test]
     fn park_verdict_is_never_parked_without_a_marker() {
-        assert_eq!(park_verdict(&RateLimitState::default(), 0), None);
+        assert_eq!(park_verdict(&BudgetTier::default(), 0), None);
     }
 
     #[test]
@@ -294,13 +439,130 @@ mod tests {
         assert_ne!(key, token_key("a-different-token"));
     }
 
-    /// End-to-end park lifecycle against a real budget file: the first 403 in a
-    /// window transitions to parked (returns `true`, so the caller logs the one
-    /// `board rate-limited` line), a second 403 in the same window does not
-    /// (returns `false`, so no duplicate line), the token reads as parked until
-    /// its reset, and a fresh 403 after the reset opens a new window.
+    // --- governor bands -------------------------------------------------------
+
+    fn thresholds() -> BudgetThresholds {
+        BudgetThresholds {
+            graphql_high: 2_000,
+            graphql_medium: 500,
+            base_secs: 30,
+            slow_secs: 120,
+        }
+    }
+
+    fn tier(remaining: Option<i64>, reset_at: Option<i64>) -> BudgetTier {
+        BudgetTier {
+            remaining,
+            reset_at,
+            parked_until: None,
+        }
+    }
+
     #[test]
-    fn park_transitions_once_per_window_and_expires_at_reset() {
+    fn governor_unknown_budget_uses_the_base_cadence() {
+        assert_eq!(
+            tick_plan(&tier(None, None), &thresholds(), 1_000),
+            TickPlan::Refresh(Duration::from_secs(30)),
+        );
+    }
+
+    #[test]
+    fn governor_high_band_uses_the_base_cadence() {
+        // > 2,000 → configured 30s.
+        assert_eq!(
+            tick_plan(&tier(Some(2_500), None), &thresholds(), 1_000),
+            TickPlan::Refresh(Duration::from_secs(30)),
+        );
+    }
+
+    #[test]
+    fn governor_middle_band_slows_to_120s() {
+        // The acceptance seed: 1,500 remaining stretches the tick to 120s.
+        assert_eq!(
+            tick_plan(&tier(Some(1_500), None), &thresholds(), 1_000),
+            TickPlan::Refresh(Duration::from_secs(120)),
+        );
+    }
+
+    #[test]
+    fn governor_middle_band_boundaries_land_where_the_thresholds_split() {
+        // The exact band edges (defaults high=2,000, medium=500). `tick_plan`
+        // uses `> high` for base and `> medium` for slow, so:
+        //   remaining == high (2,000)  -> slow (not > high, but > medium)
+        //   just inside the band       -> slow
+        //   remaining == medium (500)  -> pause (not > medium; low band)
+        // The `medium` edge pauses only while its reset is in the future, matching
+        // the low-band rule.
+        let th = thresholds();
+        let slow = TickPlan::Refresh(Duration::from_secs(120));
+        assert_eq!(
+            tick_plan(&tier(Some(2_000), None), &th, 1_000),
+            slow,
+            "remaining == high is the top of the slow band, not the base band",
+        );
+        assert_eq!(
+            tick_plan(&tier(Some(1_999), None), &th, 1_000),
+            slow,
+            "just below high is squarely in the slow band",
+        );
+        assert_eq!(
+            tick_plan(&tier(Some(501), None), &th, 1_000),
+            slow,
+            "just above medium is still the slow band",
+        );
+        assert_eq!(
+            tick_plan(&tier(Some(500), Some(5_000)), &th, 1_000),
+            TickPlan::Pause { until: 5_000 },
+            "remaining == medium falls into the low band and pauses until reset",
+        );
+        // And `> high` is the base band, so the slow band's upper edge is exclusive
+        // at the top.
+        assert_eq!(
+            tick_plan(&tier(Some(2_001), None), &th, 1_000),
+            TickPlan::Refresh(Duration::from_secs(30)),
+            "one point above high is the base band, not the slow band",
+        );
+    }
+
+    #[test]
+    fn governor_low_band_pauses_until_the_reset() {
+        // 300 remaining with a future reset pauses the index refresh.
+        assert_eq!(
+            tick_plan(&tier(Some(300), Some(5_000)), &thresholds(), 1_000),
+            TickPlan::Pause { until: 5_000 },
+        );
+    }
+
+    #[test]
+    fn governor_low_band_with_a_passed_reset_resumes() {
+        // The window has rolled: the low `remaining` is stale, so refresh once to
+        // repopulate rather than pause forever.
+        assert_eq!(
+            tick_plan(&tier(Some(50), Some(900)), &thresholds(), 1_000),
+            TickPlan::Refresh(Duration::from_secs(30)),
+        );
+    }
+
+    #[test]
+    fn governor_pauses_a_parked_budget_regardless_of_remaining() {
+        let parked = BudgetTier {
+            remaining: Some(4_999),
+            reset_at: Some(9_000),
+            parked_until: Some(4_000),
+        };
+        assert_eq!(
+            tick_plan(&parked, &thresholds(), 1_000),
+            TickPlan::Pause { until: 4_000 },
+        );
+    }
+
+    /// End-to-end park lifecycle against a real budget file, per tier: the first
+    /// 403 in a window transitions to parked (returns `true`, so the caller logs
+    /// the one `board rate-limited` line), a second 403 in the same window does
+    /// not (returns `false`, so no duplicate line), the budget reads as parked
+    /// until its reset, and the *other* tier is untouched by the park.
+    #[test]
+    fn park_transitions_once_per_window_per_tier_and_leaves_the_other_alone() {
         let _g = crate::test_lock::LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!(
             "shelbi-gh-budget-test-{}-{}",
@@ -314,21 +576,58 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         let key = token_key("a-token");
-        assert_eq!(parked_until(&key, 100), None, "a clean token is not parked");
+        assert_eq!(parked_until(&key, Budget::Graphql, 100), None, "clean: not parked");
 
-        assert!(park(&key, 500, 100), "first 403 in the window transitions to parked");
         assert!(
-            !park(&key, 500, 200),
+            park(&key, Budget::Graphql, 500, 100),
+            "first 403 in the window transitions to parked"
+        );
+        assert!(
+            !park(&key, Budget::Graphql, 500, 200),
             "a second 403 in the same window must not re-transition (no duplicate log)"
         );
 
-        assert_eq!(parked_until(&key, 400), Some(500), "parked until the reset");
-        assert_eq!(parked_until(&key, 500), None, "at the reset, reads resume");
+        assert_eq!(parked_until(&key, Budget::Graphql, 400), Some(500), "parked until reset");
+        assert_eq!(parked_until(&key, Budget::Graphql, 500), None, "at reset, reads resume");
+        // The REST tier was never parked by the GraphQL 403.
+        assert_eq!(parked_until(&key, Budget::Rest, 400), None, "other tier untouched");
 
-        assert!(
-            park(&key, 900, 500),
-            "a 403 in the next window transitions again (a fresh log line)"
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `record` updates one tier's numbers without clobbering the other's, and
+    /// persists across a read — the property the governor and write reserve rely
+    /// on when GraphQL and REST responses interleave.
+    #[test]
+    fn record_updates_one_tier_and_preserves_the_other() {
+        let _g = crate::test_lock::LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-gh-budget-record-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let key = token_key("rec-token");
+        record(&key, Budget::Graphql, Some(1_500), Some(9_000));
+        record_rest_headers(
+            &key,
+            &RateLimitHeaders {
+                remaining: Some(42),
+                reset_at: Some(8_000),
+            },
         );
+
+        let state = read_state(&key);
+        assert_eq!(state.graphql.remaining, Some(1_500));
+        assert_eq!(state.graphql.reset_at, Some(9_000));
+        assert_eq!(state.rest.remaining, Some(42), "REST recorded independently");
+        assert_eq!(state.rest.reset_at, Some(8_000));
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
