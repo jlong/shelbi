@@ -2076,6 +2076,7 @@ fn on_read_result(
             if crate::gh_retry::is_rate_limit_error(e) {
                 let reset = crate::gh_retry::rate_limit_reset_epoch(e, now)
                     .or_else(|| token.and_then(|t| probe_core_reset_and_record(t, key)))
+                    .or_else(|| crate::gh_budget::recorded_reset_after(key, budget, now))
                     .unwrap_or(now + crate::gh_budget::DEFAULT_PARK_SECS);
                 record_budget_park(project, key, budget, reset, now);
             } else if crate::gh_retry::is_connection_error(e) {
@@ -4424,6 +4425,70 @@ mod tests {
             .filter(|l| l.contains("project=gql-park-proj") && l.contains("board rate-limited"))
             .count();
         assert_eq!(hits, 1, "exactly one board rate-limited line per window");
+
+        set_test_park_side_effects(false);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Regression (orchestrator note 2026-09-08): a GraphQL rate-limit error that
+    /// carries no reset hint must park until the tier's already-recorded
+    /// `reset_at` (from the last successful response), not the short
+    /// `DEFAULT_PARK_SECS` fallback. Before the fix the GraphQL path — where
+    /// `token` is `None`, so the `/rate_limit` probe is skipped — resolved to
+    /// `now + 60`, overwrote the real minutes-away reset, expired a minute later,
+    /// and re-fired a fresh `board rate-limited` line every tick for the rest of
+    /// the window (observed: 20 re-parks in a row). `park` must also never move a
+    /// known reset earlier.
+    #[test]
+    fn a_hintless_graphql_rate_limit_parks_until_the_recorded_reset() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+
+        let key = crate::gh_budget::token_key("tok-gql-reset");
+        let now = 5_000i64;
+        let recorded_reset = now + 1_200; // the resetAt the last success reported
+
+        // The last successful response recorded a real, minutes-away reset.
+        crate::gh_budget::record(
+            &key,
+            crate::gh_budget::Budget::Graphql,
+            Some(0),
+            Some(recorded_reset),
+        );
+
+        // A hintless 403 (no `x-ratelimit-reset`) now fails a GraphQL read. `token`
+        // is `None` on the GraphQL path, so the fallback is the recorded reset.
+        let err: Result<String> = Err(Error::Command {
+            cmd: "gh api graphql".into(),
+            status: "HTTP 403".into(),
+            stderr: "API rate limit exceeded".into(),
+        });
+        on_read_result(
+            "gql-reset-proj",
+            &key,
+            crate::gh_budget::Budget::Graphql,
+            &[],
+            now,
+            &err,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            crate::gh_budget::parked_until(&key, crate::gh_budget::Budget::Graphql, now),
+            Some(recorded_reset),
+            "a hintless rate limit parks until the recorded reset, not now+DEFAULT_PARK_SECS"
+        );
+        assert_eq!(
+            crate::gh_budget::read_state(&key).graphql.reset_at,
+            Some(recorded_reset),
+            "the known reset must not be moved earlier by the short fallback park"
+        );
 
         set_test_park_side_effects(false);
         std::env::remove_var("SHELBI_HOME");

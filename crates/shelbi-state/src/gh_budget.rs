@@ -268,6 +268,13 @@ fn park_lock() -> &'static Mutex<()> {
 ///
 /// `reset_at` is clamped to strictly after `now` so a stale/past reset can't
 /// produce a park that's already expired (which would re-fire on the next read).
+///
+/// A **known reset is never moved earlier**: if the tier already recorded a
+/// later `reset_at` (from the last successful response's `rateLimit`/headers),
+/// the park honors that later time rather than a shorter incoming guess. Without
+/// this, a hintless 403 resolving to the short `DEFAULT_PARK_SECS` fallback would
+/// overwrite a real minutes-away reset, expire a minute later, and re-fire a
+/// fresh `board rate-limited` line every tick for the rest of the window.
 pub fn park(key: &str, budget: Budget, reset_at: i64, now: i64) -> bool {
     let _guard = park_lock().lock();
     let mut state = read_state(key);
@@ -275,8 +282,12 @@ pub fn park(key: &str, budget: Budget, reset_at: i64, now: i64) -> bool {
         return false; // already parked this window
     }
     let tier = state.tier_mut(budget);
-    tier.reset_at = Some(reset_at);
-    tier.parked_until = Some(reset_at.max(now + 1));
+    let effective = match tier.reset_at {
+        Some(prev) => prev.max(reset_at),
+        None => reset_at,
+    };
+    tier.reset_at = Some(effective);
+    tier.parked_until = Some(effective.max(now + 1));
     write_state(key, &state);
     true
 }
@@ -355,6 +366,16 @@ pub fn record(key: &str, budget: Budget, remaining: Option<i64>, reset_at: Optio
         tier.reset_at = reset_at;
     }
     write_state(key, &state);
+}
+
+/// The `reset_at` already recorded for `budget` on `key`, **iff it is still in
+/// the future** relative to `now`. The fallback a hintless rate-limit error uses
+/// (the GraphQL path carries no `token`, so the `/rate_limit` probe is skipped):
+/// park until the reset the last successful response reported rather than a short
+/// [`DEFAULT_PARK_SECS`] that expires and re-fires the park each tick. `None`
+/// when no reset is recorded or the recorded one has already passed.
+pub fn recorded_reset_after(key: &str, budget: Budget, now: i64) -> Option<i64> {
+    read_state(key).tier(budget).reset_at.filter(|&r| r > now)
 }
 
 /// Record REST headers ([`parse_rate_limit_headers`] output) into the `rest`
