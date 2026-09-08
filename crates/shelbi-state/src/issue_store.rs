@@ -105,6 +105,20 @@ pub fn issue_store_for(project: &str) -> Result<Box<dyn IssueStore>> {
     resolve_issue_store(project, &cfg)
 }
 
+/// The **uncached** backend store for `project`, resolved from its on-disk
+/// YAML — the direct reader the hub daemon's board-index refresh loop uses.
+///
+/// Unlike [`issue_store_for`] this deliberately skips the process-local
+/// [`crate::issue_cache`] layer: the daemon *is* the single reader per hub, so
+/// each tick must be a genuine backend read (and publish to `board-index.json`),
+/// never a value served from — or deferred to — an in-process snapshot. Every
+/// other consumer keeps reading through the cache; this one path owns the live
+/// fetch.
+pub fn raw_issue_store_for(project: &str) -> Result<Box<dyn IssueStore>> {
+    let cfg = crate::load_project(project)?.issue_tracker;
+    build_store(project, &cfg)
+}
+
 /// The cached [`IssueStore`] for an **already-loaded** [`shelbi_core::Project`]
 /// — the read/render entry point for the many poll and orchestration paths that
 /// hold a `&Project`. It routes through the same process cache as

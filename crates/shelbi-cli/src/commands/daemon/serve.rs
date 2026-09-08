@@ -193,6 +193,10 @@ fn ack_timeout_from_env() -> Duration {
 struct Daemon {
     pending: Arc<Mutex<PendingMap>>,
     ack_timeout: Duration,
+    /// Hub-owned board-index refresh machinery, shared with the manager thread
+    /// so a `refresh-board` socket request and a scheduled tick single-flight
+    /// through the same per-project lock. See [`super::board`].
+    board: super::board::BoardRefresher,
 }
 
 impl Daemon {
@@ -200,6 +204,7 @@ impl Daemon {
         Self {
             pending: Arc::new(Mutex::new(PendingMap::new())),
             ack_timeout,
+            board: super::board::BoardRefresher::default(),
         }
     }
 }
@@ -260,6 +265,9 @@ pub(super) fn run_foreground() -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     install_shutdown_listener(stop.clone(), sock.clone())?;
     spawn_reaper(daemon.clone(), stop.clone());
+    // The single board reader per hub: one refresh loop per open project,
+    // publishing `board-index.json` on each project's configured cadence.
+    super::board::spawn_refresh_manager(daemon.board.clone(), stop.clone());
 
     serve(&listener, &daemon, &stop);
 
@@ -655,7 +663,15 @@ fn handle_client(stream: UnixStream, daemon: &Daemon) {
             continue;
         }
         match dispatch(line, daemon) {
-            Ok(()) => {
+            // A verb with a custom reply (e.g. `refresh-board` → the new
+            // `fetched_at`) writes that reply, newline-terminated, in place of
+            // the bare `ok\n`. Every legacy verb returns `None` and keeps its
+            // exact post-dispatch ack, so pre-handshake clients are unaffected.
+            Ok(Some(reply)) => {
+                let _ = (&stream).write_all(reply.as_bytes());
+                let _ = (&stream).write_all(b"\n");
+            }
+            Ok(None) => {
                 let _ = (&stream).write_all(shelbi_state::DAEMON_ACK);
             }
             Err(e) => {
@@ -709,17 +725,33 @@ struct Message {
     msg_id: Option<String>,
 }
 
-fn dispatch(raw: &str, daemon: &Daemon) -> Result<()> {
+/// Dispatch one client frame. `Ok(None)` means "reply with the standard
+/// `ok\n` ack"; `Ok(Some(reply))` carries a verb-specific reply line the caller
+/// writes instead (only `refresh-board` uses this today). `Err` is logged and
+/// gets no ack, so the sender never mistakes a rejection for delivery.
+fn dispatch(raw: &str, daemon: &Daemon) -> Result<Option<String>> {
     let msg: Message = serde_json::from_str(raw).context("invalid JSON payload")?;
     match msg.verb.as_str() {
-        "event" => handle_event(&msg),
-        "request-clarification" => handle_request_clarification(&msg),
-        "message-pushed" => handle_message_pushed(&msg, daemon),
-        "message-ack" => handle_message_ack(&msg, daemon),
+        "event" => handle_event(&msg).map(|()| None),
+        "request-clarification" => handle_request_clarification(&msg).map(|()| None),
+        "message-pushed" => handle_message_pushed(&msg, daemon).map(|()| None),
+        "message-ack" => handle_message_ack(&msg, daemon).map(|()| None),
+        "refresh-board" => handle_refresh_board(&msg, daemon).map(Some),
         // Debug-escaped so a control-byte-laden verb can't smuggle ANSI
         // sequences into the daemon log.
         other => Err(anyhow!("unknown verb {other:?}")),
     }
+}
+
+/// On-demand board refresh (`Plans/github-issue-caching-and-rate-limits.md`
+/// §5): force a fresh read of `project`'s board now, publish `board-index.json`,
+/// and reply with the new `fetched_at`. The caller (a consumer that needs a
+/// board fresher than the file) waits at most two seconds for this reply, then
+/// falls back to the file or the single-issue path — so a slow backend read
+/// degrades to a timeout, never a hang.
+fn handle_refresh_board(msg: &Message, daemon: &Daemon) -> Result<String> {
+    let project = required(msg.project.as_deref(), "refresh-board", "project")?;
+    daemon.board.refresh_now(project)
 }
 
 fn handle_event(msg: &Message) -> Result<()> {
@@ -1008,6 +1040,78 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("task_id"), "{err}");
+    }
+
+    /// Minimal `file_system`-backend project YAML under the isolated home, so
+    /// `refresh-board` can build a real (local, offline) store and read an
+    /// empty board without a network backend.
+    fn write_fs_project_yaml(home: &Path, name: &str) {
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::write(
+            home.join(format!("projects/{name}.yaml")),
+            format!(
+                "name: {name}\nrepo: /tmp/{name}\ndefault_branch: main\n\
+                 orchestrator:\n  runner: claude\n\
+                 agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+                 machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/{name}\n\
+                 workspaces:\n  - {{ name: dev, machine: local, runner: claude }}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dispatch_refresh_board_requires_project_field() {
+        // The verb is wired and validates its required field — a missing
+        // project is a rejection (no ack), never a panic.
+        let err = dispatch(r#"{"verb":"refresh-board"}"#, &test_daemon()).unwrap_err();
+        assert!(err.to_string().contains("project"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_refresh_board_publishes_index_and_replies_with_fetched_at() {
+        // End-to-end through the socket dispatch: a `refresh-board` for a real
+        // (file_system) project reads the board, writes board-index.json, and
+        // replies with the new fetched_at rather than the bare `ok`.
+        let iso = IsolatedShelbiHome::new("refresh-board");
+        write_fs_project_yaml(&iso.home, "p");
+        let reply = dispatch(r#"{"verb":"refresh-board","project":"p"}"#, &test_daemon())
+            .expect("refresh-board dispatch")
+            .expect("refresh-board replies with a fetched_at, not the bare ack");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(reply.trim()).is_ok(),
+            "reply is an RFC3339 fetched_at: {reply:?}"
+        );
+        let index = shelbi_state::read_board_index("p").expect("index published");
+        assert_eq!(index.fetched_at, reply.trim());
+        assert!(!index.stale);
+    }
+
+    #[test]
+    fn handle_client_writes_the_refresh_board_reply_not_a_bare_ack() {
+        // The wire path: a `refresh-board` frame gets the fetched_at line back,
+        // distinguishable from the 3-byte `ok\n` a legacy verb returns.
+        use std::net::Shutdown;
+        let iso = IsolatedShelbiHome::new("refresh-board-wire");
+        write_fs_project_yaml(&iso.home, "p");
+        let d = test_daemon();
+        let (client, server) = UnixStream::pair().unwrap();
+        let handler = thread::spawn(move || handle_client(server, &d));
+
+        (&client)
+            .write_all(b"{\"verb\":\"refresh-board\",\"project\":\"p\"}\n")
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut bytes = Vec::new();
+        (&client).read_to_end(&mut bytes).unwrap();
+        handler.join().unwrap();
+
+        let reply = String::from_utf8(bytes).unwrap();
+        assert_ne!(reply, "ok\n", "refresh-board must not reply with the bare ack");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(reply.trim()).is_ok(),
+            "wire reply is an RFC3339 fetched_at: {reply:?}"
+        );
     }
 
     #[test]

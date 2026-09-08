@@ -29,7 +29,8 @@ pub use model::{
     PromptInjectionKind, PromptInjectionSpec, RunnerKind, Session, SessionProject, Status, Issue,
     IssueLaunchConfig, IssueZenConfig,
     TmuxAddr, WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS,
-    DEFAULT_WORKFLOW_NAME, HEARTBEAT_DEFAULT, KNOWN_OPTIONAL_TASK_FIELDS, LOCAL_PROJECT_FIELDS,
+    DEFAULT_ISSUE_REFRESH_SECS, DEFAULT_WORKFLOW_NAME, HEARTBEAT_DEFAULT, KNOWN_OPTIONAL_TASK_FIELDS,
+    LOCAL_PROJECT_FIELDS,
     MAX_TASK_ID_LEN, SHARED_PROJECT_FIELDS, SUBTASK_WORKFLOW_NAME, TASK_WORKFLOW_NAME,
 };
 pub use placeholders::{extract_placeholders, substitute_placeholders};
