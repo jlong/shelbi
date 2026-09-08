@@ -36,12 +36,14 @@
 //! dropped), and matches the shape every list consumer already understands.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use shelbi_core::Result;
+use shelbi_core::{IssueTrackerConfig, Result};
 
+use crate::issue_store::BoardState;
 use crate::IssueFile;
 
 /// Basename of the hub-owned board index, under the project's state dir
@@ -130,6 +132,129 @@ pub fn read_board_index(project: &str) -> Option<BoardIndex> {
 pub fn read_board_index_at(path: &Path) -> Option<BoardIndex> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// The shared read every **list** consumer uses instead of sweeping the backend
+/// itself: the board the daemon published, tagged with its freshness. This is
+/// the consumer-side half of `Plans/github-issue-caching-and-rate-limits.md` §5
+/// — the sidebar, Issues board, workspace pollers, `zen scan`, the orchestrator
+/// drain and `issue list` / `status` / `workspace list` all route their board
+/// reads through here.
+///
+/// For a **remote** project the daemon is the single board reader per hub, so
+/// this returns the persisted `board-index.json` and **never touches the
+/// backend** — a consumer running inside a `shelbi __sidebar` / `__tasks` pane
+/// spawns no `gh api` of its own. The index's `stale` flag and the age of its
+/// `fetched_at` (against the project's refresh cadence) decide
+/// [`BoardState::Warm`] vs [`BoardState::Stale`]; a missing or torn file is
+/// [`BoardState::Cold`] (the daemon publishes one within a tick or two of the
+/// hub opening).
+///
+/// For a **local** (`file_system`) project there is no daemon and no index — the
+/// board is a cheap, authoritative directory read, so this returns
+/// [`BoardState::Warm`] straight from disk, exactly as before.
+pub fn read_board(project: &str) -> Result<BoardState> {
+    let cfg = crate::load_project(project)?.issue_tracker;
+    read_board_with_cfg(project, &cfg)
+}
+
+/// [`read_board`] for a caller that already holds the resolved
+/// [`IssueTrackerConfig`] (a poll or render path with a `&Project` in hand),
+/// saving the per-read project-YAML load.
+pub fn read_board_with_cfg(project: &str, cfg: &IssueTrackerConfig) -> Result<BoardState> {
+    if !cfg.backend.is_remote() {
+        // Local board: a directory scan is cheap and always authoritative, and
+        // there is no daemon-owned index to read. Serve it warm.
+        let store = crate::issue_store::build_store(project, cfg)?;
+        return Ok(BoardState::Warm(store.list_open()?));
+    }
+    Ok(board_state_from_index(project, cfg.refresh_interval_secs()))
+}
+
+/// Map the on-disk index to a [`BoardState`] from its `stale` flag and the age
+/// of its `fetched_at` relative to `interval_secs` (the project's refresh
+/// cadence). A missing or torn file is [`BoardState::Cold`]; an index the daemon
+/// flagged stale, or one older than [`index_stale_threshold`] (the daemon has
+/// missed several ticks — stopped, wedged, or rate-limited), is
+/// [`BoardState::Stale`]; anything fresher is [`BoardState::Warm`].
+fn board_state_from_index(project: &str, interval_secs: u64) -> BoardState {
+    let Some(idx) = read_board_index(project) else {
+        return BoardState::Cold;
+    };
+    if idx.stale || fetched_at_is_stale(&idx.fetched_at, interval_secs) {
+        BoardState::Stale(idx.board)
+    } else {
+        BoardState::Warm(idx.board)
+    }
+}
+
+/// How old a published index may get before it reads as [`BoardState::Stale`]:
+/// three refresh intervals, with a 90s floor. The daemon rewrites the index
+/// every `interval_secs` (so `fetched_at`/mtime advance even on a quiet board),
+/// which means a *running* daemon keeps the index comfortably inside this
+/// window; crossing it means several ticks have been missed and the board can
+/// no longer be trusted as current. One or two missed ticks (network jitter,
+/// a slow sweep) stay Warm so a healthy hub never flickers to a stale banner.
+fn index_stale_threshold(interval_secs: u64) -> Duration {
+    Duration::from_secs(interval_secs.saturating_mul(3).max(90))
+}
+
+/// Whether an index `fetched_at` timestamp is old enough — or unparseable
+/// enough — to be treated as stale. An RFC3339 timestamp older than
+/// [`index_stale_threshold`] is stale; a timestamp we can't parse is not
+/// something we can vouch for as fresh, so it is stale too.
+fn fetched_at_is_stale(fetched_at: &str, interval_secs: u64) -> bool {
+    let Ok(ts) = DateTime::parse_from_rfc3339(fetched_at) else {
+        return true;
+    };
+    let age = Utc::now().signed_duration_since(ts.with_timezone(&Utc));
+    age.to_std()
+        .is_ok_and(|a| a >= index_stale_threshold(interval_secs))
+}
+
+/// Splice a single freshly-mutated issue into the published index in place — the
+/// write-through half of §5. After a mutation the writer holds a current copy of
+/// the one issue it touched; patching it into `board-index.json` (with the same
+/// atomic temp-file-and-rename [`write_board_index`] uses) lets the sidebar and
+/// Issues board reflect the change on their next paint, before the next daemon
+/// tick reconciles it.
+///
+/// The entry is matched by task id: replaced in place when present (a moved /
+/// edited card), appended otherwise (a freshly-added card). The index's
+/// freshness envelope (`fetched_at`, `stale`, budget) is preserved untouched —
+/// only the daemon advances that. Relative ordering of a patched entry is left
+/// as-is (the daemon's next tick restores the canonical column-then-priority
+/// order); consumers that care order by column and priority themselves.
+///
+/// A no-op when no index has been published yet (nothing to patch — the first
+/// tick will include the issue). Only meaningful for a remote project; a
+/// `file_system` project has no index and never calls this.
+pub fn patch_board_index_issue(project: &str, issue: &IssueFile) -> Result<()> {
+    let Some(mut idx) = read_board_index(project) else {
+        return Ok(());
+    };
+    match idx.board.iter_mut().find(|f| f.task.id == issue.task.id) {
+        Some(existing) => *existing = issue.clone(),
+        None => idx.board.push(issue.clone()),
+    }
+    write_board_index(project, &idx)
+}
+
+/// Drop an issue from the published index — the write-through for a mutation
+/// that takes a card off the *open* board (a cancel, or a move into a terminal
+/// `done`/`canceled` column, which the open index deliberately omits). Preserves
+/// the freshness envelope like [`patch_board_index_issue`]. A no-op when no
+/// index exists or the id isn't in it.
+pub fn remove_board_index_issue(project: &str, id: &str) -> Result<()> {
+    let Some(mut idx) = read_board_index(project) else {
+        return Ok(());
+    };
+    let before = idx.board.len();
+    idx.board.retain(|f| f.task.id != id);
+    if idx.board.len() == before {
+        return Ok(());
+    }
+    write_board_index(project, &idx)
 }
 
 /// How many issues differ between an old and a new board — the `changed=<n>`
@@ -286,5 +411,180 @@ mod tests {
         let old = vec![issue("a", "todo", 0), issue("b", "todo", 1)];
         let new = vec![issue("a", "todo", 1), issue("b", "todo", 0)];
         assert_eq!(board_diff_count(Some(&old), &new), 2);
+    }
+
+    // --- consumer read helper + write-through -------------------------------
+
+    use shelbi_core::{GithubConnection, IssueTrackerBackend, IssueTrackerConfig};
+
+    /// An isolated `SHELBI_HOME` so a test's board-index writes land in a temp
+    /// dir, never the developer's real `~/.shelbi`. Holds the crate-wide test
+    /// lock because `set_var` is process-global.
+    struct IsolatedHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+        home: PathBuf,
+    }
+    impl IsolatedHome {
+        fn new(tag: &str) -> Self {
+            let lock = crate::test_lock::LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let home = std::env::temp_dir().join(format!(
+                "shelbi-board-index-home-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&home).unwrap();
+            let prev = std::env::var("SHELBI_HOME").ok();
+            std::env::set_var("SHELBI_HOME", &home);
+            Self {
+                _lock: lock,
+                prev,
+                home,
+            }
+        }
+    }
+    impl Drop for IsolatedHome {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("SHELBI_HOME", v),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    /// A `github` tracker config — a remote backend, so `read_board_with_cfg`
+    /// must read the published index file rather than sweep the backend.
+    fn github_cfg() -> IssueTrackerConfig {
+        IssueTrackerConfig {
+            backend: IssueTrackerBackend::Github,
+            github: Some(GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Build an index with an explicit `fetched_at` age and `stale` flag, so the
+    /// Warm/Stale mapping can be exercised without waiting real time.
+    fn index_aged(board: Vec<IssueFile>, secs_ago: i64, stale: bool) -> BoardIndex {
+        BoardIndex {
+            board,
+            fetched_at: (Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339(),
+            stale,
+            remaining: None,
+            reset: None,
+        }
+    }
+
+    #[test]
+    fn read_board_serves_a_fresh_remote_index_as_warm_without_touching_the_backend() {
+        // The core §5 guarantee: for a remote project `read_board` reads the
+        // published file — it never builds a store, so it can issue no `gh` list.
+        // A sentinel id that exists on no backend proves the file was the source.
+        let _iso = IsolatedHome::new("warm");
+        let idx = index_aged(vec![issue("sentinel-only-in-index", "todo", 0)], 0, false);
+        write_board_index("proj", &idx).unwrap();
+
+        match read_board_with_cfg("proj", &github_cfg()).unwrap() {
+            BoardState::Warm(board) => {
+                assert_eq!(board.len(), 1);
+                assert_eq!(board[0].task.id, "sentinel-only-in-index");
+            }
+            other => panic!("expected Warm from a fresh index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_board_reports_an_aged_index_as_stale() {
+        // No `stale` flag, but `fetched_at` is older than the stale threshold
+        // (3 × the 30s default interval, floored at 90s): a lagging daemon.
+        let _iso = IsolatedHome::new("aged");
+        let idx = index_aged(vec![issue("a", "review", 0)], 600, false);
+        write_board_index("proj", &idx).unwrap();
+
+        match read_board_with_cfg("proj", &github_cfg()).unwrap() {
+            BoardState::Stale(board) => assert_eq!(board.len(), 1),
+            other => panic!("expected Stale from an aged index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_board_reports_a_flagged_index_as_stale_even_when_fresh() {
+        // The daemon can flag an index stale (a failed refresh carrying the
+        // previous board forward); that wins regardless of `fetched_at` age.
+        let _iso = IsolatedHome::new("flagged");
+        let idx = index_aged(vec![issue("a", "todo", 0)], 0, true);
+        write_board_index("proj", &idx).unwrap();
+
+        assert!(matches!(
+            read_board_with_cfg("proj", &github_cfg()).unwrap(),
+            BoardState::Stale(_)
+        ));
+    }
+
+    #[test]
+    fn read_board_is_cold_when_no_index_has_been_published() {
+        // A remote project on a hub whose daemon hasn't written the file yet:
+        // Cold, and still no backend touch (no `gh` on PATH is required).
+        let _iso = IsolatedHome::new("cold");
+        assert!(matches!(
+            read_board_with_cfg("proj", &github_cfg()).unwrap(),
+            BoardState::Cold
+        ));
+    }
+
+    #[test]
+    fn patch_replaces_in_place_and_appends_and_preserves_freshness() {
+        let _iso = IsolatedHome::new("patch");
+        let original = index_aged(vec![issue("a", "todo", 0), issue("b", "todo", 1)], 0, false);
+        write_board_index("proj", &original).unwrap();
+
+        // Replace `a` in place (moved to review) — same id, new column.
+        patch_board_index_issue("proj", &issue("a", "review", 0)).unwrap();
+        // Append a brand-new card.
+        patch_board_index_issue("proj", &issue("c", "todo", 2)).unwrap();
+
+        let back = read_board_index("proj").unwrap();
+        assert_eq!(back.board.len(), 3, "one replaced in place, one appended");
+        let a = back.board.iter().find(|f| f.task.id == "a").unwrap();
+        assert_eq!(a.task.column.as_str(), "review", "the move was written through");
+        assert!(back.board.iter().any(|f| f.task.id == "c"));
+        // The freshness envelope is the daemon's to advance, not the patch's.
+        assert_eq!(back.fetched_at, original.fetched_at);
+    }
+
+    #[test]
+    fn remove_drops_a_card_and_is_a_noop_for_an_unknown_id() {
+        let _iso = IsolatedHome::new("remove");
+        write_board_index(
+            "proj",
+            &index_aged(vec![issue("a", "todo", 0), issue("b", "todo", 1)], 0, false),
+        )
+        .unwrap();
+
+        remove_board_index_issue("proj", "a").unwrap();
+        let back = read_board_index("proj").unwrap();
+        assert_eq!(back.board.len(), 1);
+        assert_eq!(back.board[0].task.id, "b");
+
+        // Removing an id that isn't there leaves the file unchanged.
+        remove_board_index_issue("proj", "ghost").unwrap();
+        assert_eq!(read_board_index("proj").unwrap().board.len(), 1);
+    }
+
+    #[test]
+    fn patch_and_remove_are_noops_when_no_index_exists() {
+        // Before the daemon's first tick there is no file to patch; the write
+        // still landed on the backend, and the first tick will include it.
+        let _iso = IsolatedHome::new("noindex");
+        patch_board_index_issue("proj", &issue("a", "todo", 0)).unwrap();
+        remove_board_index_issue("proj", "a").unwrap();
+        assert!(read_board_index("proj").is_none());
     }
 }

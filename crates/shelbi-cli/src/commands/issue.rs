@@ -390,6 +390,17 @@ fn cached_issue_store(project: &str) -> Result<Box<dyn IssueStore>> {
     shelbi_state::issue_store_for(project).map_err(|e| anyhow!(e))
 }
 
+/// Whether `status` is a terminal (`done`/`canceled`) column. Those cards live
+/// in the closed history the daemon's open `board-index.json` deliberately
+/// omits, so a listing filtered to one reads it on demand through the store
+/// rather than the index. Everything else is served from the index.
+fn is_terminal_status(status: &Column) -> bool {
+    matches!(
+        status.category(),
+        shelbi_core::StatusCategory::Done | shelbi_core::StatusCategory::Archived
+    )
+}
+
 /// Load one issue through the configured backend, erroring when it doesn't
 /// exist — the `Result<IssueFile>` shape the old `load_task` free function had,
 /// so callers that expect the issue to be present read the same.
@@ -573,17 +584,21 @@ fn list(
     // `in-progress`.
     let filter = status_filter.map(Column::from_status_id);
 
-    // Read only the state the view needs, never the whole `state=all` history:
-    // a status filter reads exactly that column (`list_in_status` requests
-    // `state=closed` for the terminal `done`/`canceled` lanes and `state=open`
-    // otherwise), and the unfiltered board reads the open issues alone. On a
-    // remote backend a closed issue is always terminal, so an unfiltered
-    // listing shows the live board and leaves the `done`/`canceled` history to
-    // an explicit `--status done|canceled`.
-    let store = cached_issue_store(project)?;
+    // The open board comes from the daemon-owned `board-index.json` (§5), never
+    // a backend sweep: `read_open_board_for_cli` reads the published file and
+    // notes staleness when the daemon is behind. A terminal (`done`/`canceled`)
+    // filter is the one exception — that history is loaded on demand and is not
+    // in the open index — so it still reads its column through the store
+    // (`list_in_status` requests `state=closed`).
     let all = match &filter {
-        Some(col) => store.list_in_status(col).map_err(|e| anyhow!(e))?,
-        None => store.list_open().map_err(|e| anyhow!(e))?,
+        Some(col) if is_terminal_status(col) => cached_issue_store(project)?
+            .list_in_status(col)
+            .map_err(|e| anyhow!(e))?,
+        Some(col) => super::read_open_board_for_cli(project)?
+            .into_iter()
+            .filter(|tf| &tf.task.column == col)
+            .collect(),
+        None => super::read_open_board_for_cli(project)?,
     };
     if all.is_empty() {
         println!("(no issues yet)");

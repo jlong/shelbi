@@ -70,6 +70,44 @@ pub fn require_project(explicit: Option<String>) -> Result<String> {
     ))
 }
 
+/// Read a project's **open** board for a CLI listing through the daemon-owned
+/// `board-index.json` (the consumer half of
+/// `Plans/github-issue-caching-and-rate-limits.md` §5), never the backend.
+///
+/// On a hub the daemon is the single board reader, so `shelbi issue list`
+/// renders from the published file and issues no `gh api` list of its own. When
+/// the index is lagging — a stopped or wedged daemon, so its `fetched_at` has
+/// aged past the refresh cadence — a one-line note is printed to **stderr** so
+/// the listing on stdout stays clean and pipeable while the operator still
+/// learns the data may be old. A `file_system` project has no daemon and reads
+/// its local board straight from disk (always warm, no note).
+///
+/// When the index is genuinely **cold** (no daemon has ever published one — a
+/// bare CLI on a machine with no hub), this falls back to a direct backend read
+/// so a script still lists the board, exactly as before the daemon owned it
+/// (§5's "behaviour is unchanged for scripts"). That is the one path here that
+/// may touch the backend, and only when there is no hub to read from.
+///
+/// Returns the issues to display.
+pub(crate) fn read_open_board_for_cli(project: &str) -> Result<Vec<shelbi_state::IssueFile>> {
+    use shelbi_state::BoardState;
+    match shelbi_state::read_board(project).map_err(|e| anyhow!(e))? {
+        BoardState::Warm(board) => Ok(board),
+        BoardState::Stale(board) => {
+            eprintln!(
+                "note: the board index is stale (the hub daemon may be stopped) — \
+                 showing the last published board"
+            );
+            Ok(board)
+        }
+        // No hub has published an index. Fall back to a direct backend read so a
+        // bare CLI still lists the board (the daemon, once running, takes over).
+        BoardState::Cold => shelbi_state::issue_store_for(project)
+            .and_then(|s| s.list_open())
+            .map_err(|e| anyhow!(e)),
+    }
+}
+
 /// Open `path` in the user's editor, honoring the conventional
 /// `$VISUAL` → `$EDITOR` → `vi` precedence and splitting an editor value
 /// that carries arguments (`VISUAL="code --wait"`,
@@ -190,6 +228,74 @@ mod editor_tests {
 
         std::env::remove_var("EDITOR");
         std::env::remove_var("VISUAL");
+    }
+}
+
+#[cfg(test)]
+mod board_cli_tests {
+    use crate::commands::test_support::ENV_LOCK;
+
+    fn fresh_home() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "shelbi-cli-board-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn register_github_project(home: &std::path::Path, name: &str) {
+        let projects = home.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join(format!("{name}.yaml")),
+            format!(
+                "name: {name}\nrepo: /tmp/{name}\ndefault_branch: main\n\
+orchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/{name}\nworkspaces: []\n\
+issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn ifile(id: &str, column: &str) -> shelbi_state::IssueFile {
+        let task: shelbi_core::Issue = serde_yaml::from_str(&format!(
+            "id: {id}\ntitle: {id}\ncolumn: {column}\npriority: 0\n\
+             created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n"
+        ))
+        .unwrap();
+        shelbi_state::IssueFile {
+            task,
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn read_open_board_for_cli_serves_the_index_without_a_backend_list() {
+        // `shelbi issue list` (and `status`/`workspace list`) read the board
+        // from the daemon-owned `board-index.json` (§5). A `github` project with
+        // a seeded index and no `gh` reachable still lists — the sentinel id
+        // exists on no backend, so returning it proves the file was the source.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "g");
+        shelbi_state::write_board_index(
+            "g",
+            &shelbi_state::BoardIndex::fresh(vec![ifile("sentinel-only-in-index", "todo")]),
+        )
+        .unwrap();
+
+        let board = super::read_open_board_for_cli("g").unwrap();
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0].task.id, "sentinel-only-in-index");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 

@@ -1158,29 +1158,28 @@ fn board_is_quiescent(project: &Project) -> bool {
     tasks_are_quiescent(&tasks)
 }
 
-/// The board's non-terminal issues for `project`, read through its configured
-/// [`IssueStore`] (so a `github` backend is honored, not the local filesystem).
+/// The board's non-terminal issues for `project`, read from the daemon-owned
+/// `board-index.json` (`Plans/github-issue-caching-and-rate-limits.md` §5) via
+/// the shared [`shelbi_state::read_board`] helper — never a per-pane backend
+/// sweep, so a `shelbi __sidebar`/`__tasks` pane's poller issues no `gh api` of
+/// its own. On a remote backend the index is exactly the open board; on a
+/// `file_system` project (no daemon) it is the cheap local read.
 ///
 /// Backs quiescence and active-workspace scans, which only ever look at active
-/// cards, so it takes the cheap open-only read ([`IssueStore::list_open`] —
-/// `state=open` on GitHub) rather than sweeping the `done`/`canceled` history.
-///
-/// Goes through [`shelbi_state::issue_store_for_project`] (the already-loaded
-/// `&Project`'s config, no redundant YAML re-read) so every poll/render/list read
-/// shares the one process-local `CachedIssueStore` — served from, and degrading
-/// identically off, the same snapshot the sidebar and Issues board use.
+/// cards, so the open board is all they need.
 fn list_issues(project: &Project) -> shelbi_core::Result<Vec<shelbi_state::IssueFile>> {
-    shelbi_state::issue_store_for_project(project)?.list_open()
+    Ok(shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker)?.into_issues())
 }
 
-/// The whole board **only when it is a warm read** ([`shelbi_state::BoardState::Warm`]):
-/// `Some(board)` on a warm read, `None` when the cache served a stale snapshot,
-/// is cold, or the read failed (a rate-limit park). Destructive poller paths
-/// read through this so a stale/failed board — which cannot prove a card is gone
-/// — never drives a reap. A `file_system` board always reads warm, so it is
-/// unaffected.
+/// The whole board **only when the daemon-owned index reads warm**
+/// ([`shelbi_state::BoardState::Warm`]): `Some(board)` when the published
+/// `board-index.json` is fresh, `None` when it is stale (the daemon is lagging),
+/// cold (none published yet), or the read failed. Destructive poller paths read
+/// through this so a stale/failed board — which cannot prove a card is gone —
+/// never drives a reap. A `file_system` board always reads warm, so it is
+/// unaffected. Like [`list_issues`] this reads the index, not the backend.
 fn warm_board(project: &Project) -> Option<Vec<shelbi_state::IssueFile>> {
-    match shelbi_state::issue_store_for_project(project).and_then(|s| s.list_state()) {
+    match shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker) {
         Ok(shelbi_state::BoardState::Warm(board)) => Some(board),
         _ => None,
     }
@@ -3760,10 +3759,11 @@ enum AssignedReviewTask {
 /// it on the board) from a genuinely idle one — and to *skip* both when the read
 /// isn't warm. Filters the same review column the auto-loader routes to.
 fn assigned_review_task_for(project: &Project, workspace_name: &str) -> AssignedReviewTask {
-    let board = match shelbi_state::issue_store_for_project(project).and_then(|s| s.list_state()) {
-        Ok(shelbi_state::BoardState::Warm(board)) => board,
-        // Stale / Cold / failed: not a trustworthy read.
-        Ok(_) | Err(_) => return AssignedReviewTask::Unknown,
+    // Warmth-gated read of the daemon-owned index (via [`warm_board`]): a stale,
+    // cold, or failed board can't prove the card is still pinned here, so we
+    // report Unknown and the resume/reap passes leave the slot alone.
+    let Some(board) = warm_board(project) else {
+        return AssignedReviewTask::Unknown;
     };
     match board.into_iter().find(|tf| {
         tf.task.column == Column::review()
@@ -3804,10 +3804,11 @@ enum AssignedDevTask {
 /// custom active status still counts and a `done`/backlog card does not. A
 /// `file_system` board always reads warm, so it is unaffected.
 fn assigned_dev_task_for(project: &Project, workspace_name: &str) -> AssignedDevTask {
-    let board = match shelbi_state::issue_store_for_project(project).and_then(|s| s.list_state()) {
-        Ok(shelbi_state::BoardState::Warm(board)) => board,
-        // Stale / Cold / failed: not a trustworthy read.
-        Ok(_) | Err(_) => return AssignedDevTask::Unknown,
+    // Warmth-gated read of the daemon-owned index (via [`warm_board`]): only a
+    // fresh board proves the card is still active on this slot; a stale/cold
+    // read yields Unknown so the dev-resume pass acts on nothing this tick.
+    let Some(board) = warm_board(project) else {
+        return AssignedDevTask::Unknown;
     };
     match board.into_iter().find(|tf| {
         tf.task.assigned_to.as_deref() == Some(workspace_name) && task_is_active(project, &tf.task)
@@ -4552,16 +4553,18 @@ fn workspace_orphaned_by_board(
 }
 
 fn current_task_for(project: &Project, workspace_name: &str) -> Option<String> {
-    // Only an active card counts here, so the open-only board is enough — no
-    // reason to sweep the terminal history.
+    // Only an active card counts here, so the open board (which the index is) is
+    // enough — no reason to reach the terminal history.
     //
-    // `issue_store_for_project` with the already-loaded `&Project` (no redundant
-    // YAML re-read). It wraps the same process-local `CachedIssueStore` as the
-    // sidebar's reads, so on a failed live refresh the poller keeps observing
-    // the slot's last-known task from the snapshot rather than reading empty.
-    shelbi_state::issue_store_for_project(project)
-        .and_then(|s| s.list_open())
+    // Read from the daemon-owned `board-index.json` (§5) via the shared helper,
+    // not the backend: on a lagging daemon the poller keeps observing the slot's
+    // last-known task from the published index rather than reading empty, and
+    // the pane spawns no `gh api` of its own. (Unlike [`assigned_dev_task_for`]
+    // this is not warmth-gated — it serves the last-known board even when
+    // stale, for callers that only need a best-effort current assignment.)
+    shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker)
         .ok()?
+        .into_issues()
         .into_iter()
         .find(|tf| {
             tf.task.assigned_to.as_deref() == Some(workspace_name)
@@ -5630,24 +5633,6 @@ Intro prose.
         project
     }
 
-    fn gh_review_issue_json(id: &str) -> String {
-        format!(
-            r#"{{"number":7,"title":"{id}","body":"Prose for {id}.","state":"open","labels":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/review"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
-        )
-    }
-
-    /// Install a fake `gh` runner that answers the issues endpoint with `body`
-    /// and empty sets for `/labels` and `/comments`.
-    fn install_gh_runner(body: String) {
-        shelbi_state::set_test_gh_runner(move |args: &[&str]| -> shelbi_core::Result<String> {
-            let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
-            if path.ends_with("/labels") || path.contains("/comments") {
-                return Ok(String::new());
-            }
-            Ok(body.clone())
-        });
-    }
-
     fn gh_guard_home(tag: &str) -> std::path::PathBuf {
         let home = std::env::temp_dir().join(format!(
             "shb-gh-guard-{tag}-{}-{}",
@@ -5661,6 +5646,54 @@ Intro prose.
         home
     }
 
+    /// An index `IssueFile` for `id` in `column`, with the assignment overlay
+    /// already folded in (as the daemon's `list_open` does), so the poller's
+    /// board reads carry the owning workspace. Bypasses the backend entirely —
+    /// the whole point of the §5 switch is that these functions read the file.
+    fn idx_issue(id: &str, column: &str, assigned: Option<&str>) -> shelbi_state::IssueFile {
+        let now = Utc::now();
+        let task = Issue {
+            id: id.into(),
+            title: id.into(),
+            column: Column::from_status_id(column),
+            priority: 0,
+            assigned_to: assigned.map(str::to_string),
+            workflow: None,
+            branch: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            launch: None,
+            created_at: now,
+            updated_at: now,
+            params: std::collections::BTreeMap::new(),
+        };
+        shelbi_state::IssueFile {
+            task,
+            body: String::new(),
+        }
+    }
+
+    /// Publish a fresh (warm) board index for `name`, as the daemon would.
+    fn seed_warm_index(name: &str, board: Vec<shelbi_state::IssueFile>) {
+        shelbi_state::write_board_index(name, &shelbi_state::BoardIndex::fresh(board)).unwrap();
+    }
+
+    /// Publish a **stale**-flagged index for `name` — the "not warm" state a
+    /// lagging/rate-limited daemon leaves behind (a failed refresh carrying the
+    /// previous board forward). `warm_board` and the assigned-task gates must
+    /// refuse to act on it.
+    fn seed_stale_index(name: &str) {
+        let idx = shelbi_state::BoardIndex {
+            board: vec![idx_issue("t", "review", Some("alpha"))],
+            fetched_at: chrono::Utc::now().to_rfc3339(),
+            stale: true,
+            remaining: None,
+            reset: None,
+        };
+        shelbi_state::write_board_index(name, &idx).unwrap();
+    }
+
     #[test]
     fn assigned_review_task_for_is_unknown_on_a_cold_or_failed_board() {
         let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5669,19 +5702,19 @@ Intro prose.
         let work_dir = home.join("repo");
         std::fs::create_dir_all(&work_dir).unwrap();
         let project = gh_review_project(&work_dir, "ghguard-art-cold");
-        // Failing runner: the board never warms → a non-warm read → Unknown, so
-        // the reaper/resume takes no destructive action this tick.
-        shelbi_state::set_test_gh_runner(|_| Err(shelbi_core::Error::Other("boom".into())));
+        // A stale index (a lagging daemon) is not a trustworthy read → Unknown,
+        // so the reaper/resume takes no destructive action this tick. (A cold
+        // index — none published — behaves the same via `warm_board`.)
+        seed_stale_index("ghguard-art-cold");
 
         assert!(
             matches!(
                 assigned_review_task_for(&project, "alpha"),
                 AssignedReviewTask::Unknown
             ),
-            "a cold/failed board must resolve to Unknown, never a false None"
+            "a stale/cold board must resolve to Unknown, never a false None"
         );
 
-        shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -5695,15 +5728,9 @@ Intro prose.
         std::fs::create_dir_all(&work_dir).unwrap();
         let name = "ghguard-art-warm";
         let project = gh_review_project(&work_dir, name);
-        // A review-column issue assigned (via the local overlay GitHub reads fold
-        // in) to `alpha`. Set the overlay first, then prime the cache so the warm
-        // snapshot carries the assignment.
-        shelbi_state::set_task_assignment(name, "t", Some("alpha")).unwrap();
-        install_gh_runner(gh_review_issue_json("t"));
-        // `list_open` is the cached render path that warms the open snapshot
-        // `list_state` serves (`list` is now a live, uncached pass-through); the
-        // issue is in the open `review` column, so it lands in that snapshot.
-        let _ = shelbi_state::issue_store_for(name).unwrap().list_open().unwrap();
+        // A review-column issue assigned to `alpha`, published to the daemon-owned
+        // index — the file the function now reads (no backend touch).
+        seed_warm_index(name, vec![idx_issue("t", "review", Some("alpha"))]);
 
         match assigned_review_task_for(&project, "alpha") {
             AssignedReviewTask::Assigned(id) => assert_eq!(id, "t"),
@@ -5722,7 +5749,6 @@ Intro prose.
             "a warm board with no match must be a definite None"
         );
 
-        shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -5735,23 +5761,17 @@ Intro prose.
         let work_dir = home.join("repo");
         std::fs::create_dir_all(&work_dir).unwrap();
 
-        // Cold: a failing runner leaves the board cold → None, so the dev orphan
-        // reaper cannot reap off it.
+        // Cold: no index published → None, so the dev orphan reaper cannot reap
+        // off it. (`warm_board` reads the file, never the backend.)
         let cold = gh_review_project(&work_dir, "ghguard-wb-cold");
-        shelbi_state::set_test_gh_runner(|_| Err(shelbi_core::Error::Other("boom".into())));
         assert!(warm_board(&cold).is_none(), "a cold/failed board is not warm");
-        shelbi_state::clear_test_gh_runner();
 
-        // Warm: prime the cache with one issue → Some(board) with that issue.
-        // `list_open` is the cached path that warms the open snapshot (`list` no
-        // longer caches); the issue is open, so it lands in that snapshot.
+        // Warm: publish an index with one issue → Some(board) with that issue.
         let warm = gh_review_project(&work_dir, "ghguard-wb-warm");
-        install_gh_runner(gh_review_issue_json("t"));
-        let _ = shelbi_state::issue_store_for("ghguard-wb-warm").unwrap().list_open().unwrap();
+        seed_warm_index("ghguard-wb-warm", vec![idx_issue("t", "review", None)]);
         let board = warm_board(&warm).expect("a primed board reads warm");
         assert!(board.iter().any(|tf| tf.task.id == "t"), "warm board carries the issue");
 
-        shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -5774,16 +5794,6 @@ Intro prose.
         project
     }
 
-    /// A github issue JSON for `id` carrying the `shelbi:status/<status>` label,
-    /// so the decoded card lands in the `<status>` column (`in-progress` → the
-    /// active category, `done` → done). `state:"open"` so it appears in the warm
-    /// open snapshot `list_state` serves.
-    fn gh_status_issue_json(id: &str, status: &str) -> String {
-        format!(
-            r#"{{"number":7,"title":"{id}","body":"Prose for {id}.","state":"open","labels":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/{status}"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
-        )
-    }
-
     #[test]
     fn assigned_dev_task_for_is_unknown_on_a_cold_or_failed_board() {
         // The stale-skip case: on a rate-limit park (or any non-warm read) the
@@ -5795,17 +5805,18 @@ Intro prose.
         let work_dir = home.join("repo");
         std::fs::create_dir_all(&work_dir).unwrap();
         let project = gh_dev_project(&work_dir, "ghguard-adt-cold");
-        shelbi_state::set_test_gh_runner(|_| Err(shelbi_core::Error::Other("boom".into())));
+        // A stale index is not a trustworthy read → Unknown, so the dev-slot
+        // resume gate resumes nothing and leaves its crash history untouched.
+        seed_stale_index("ghguard-adt-cold");
 
         assert!(
             matches!(
                 assigned_dev_task_for(&project, "alpha"),
                 AssignedDevTask::Unknown
             ),
-            "a cold/failed board must resolve to Unknown, never a false Assigned/None"
+            "a stale/cold board must resolve to Unknown, never a false Assigned/None"
         );
 
-        shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -5822,11 +5833,9 @@ Intro prose.
         std::fs::create_dir_all(&work_dir).unwrap();
         let name = "ghguard-adt-warm";
         let project = gh_dev_project(&work_dir, name);
-        // Assign the active card to `alpha` via the local overlay, then prime the
-        // cache so the warm snapshot carries the assignment.
-        shelbi_state::set_task_assignment(name, "t", Some("alpha")).unwrap();
-        install_gh_runner(gh_status_issue_json("t", "in-progress"));
-        let _ = shelbi_state::issue_store_for(name).unwrap().list_open().unwrap();
+        // An active (in-progress) card assigned to `alpha`, published to the
+        // daemon-owned index — the file the gate now reads.
+        seed_warm_index(name, vec![idx_issue("t", "in-progress", Some("alpha"))]);
 
         match assigned_dev_task_for(&project, "alpha") {
             AssignedDevTask::Assigned(id) => assert_eq!(id, "t"),
@@ -5847,7 +5856,6 @@ Intro prose.
             "a warm board with no match must be a definite None"
         );
 
-        shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -5856,7 +5864,9 @@ Intro prose.
     fn assigned_dev_task_for_is_none_for_a_done_task_on_a_warm_board() {
         // The done-no-op case: a card assigned to the slot but sitting in `done`
         // (a non-active category) resolves to None on a warm board, so the pass
-        // does nothing and drops the slot's crash history.
+        // does nothing and drops the slot's crash history. (The open index would
+        // not normally carry a done card; a warm index that still does must
+        // resolve None, not Assigned.)
         let _g = crate::test_support::ENV_LOCK.lock().unwrap();
         let home = gh_guard_home("adt-done");
         std::env::set_var("SHELBI_HOME", &home);
@@ -5864,9 +5874,7 @@ Intro prose.
         std::fs::create_dir_all(&work_dir).unwrap();
         let name = "ghguard-adt-done";
         let project = gh_dev_project(&work_dir, name);
-        shelbi_state::set_task_assignment(name, "t", Some("alpha")).unwrap();
-        install_gh_runner(gh_status_issue_json("t", "done"));
-        let _ = shelbi_state::issue_store_for(name).unwrap().list_open().unwrap();
+        seed_warm_index(name, vec![idx_issue("t", "done", Some("alpha"))]);
 
         assert!(
             matches!(
@@ -5876,7 +5884,6 @@ Intro prose.
             "a done (non-active) task on a warm board must resolve to None, not Assigned"
         );
 
-        shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

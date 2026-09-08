@@ -976,43 +976,29 @@ impl ProjectScope {
     }
 
     fn read_board(project: &str) -> (HashSet<String>, BoardAvailability) {
-        let Ok(store) = shelbi_state::issue_store_for(project) else {
-            // Can't even construct the backend — proceed with no enrichment
-            // rather than abort the drain.
-            return (HashSet::new(), BoardAvailability::Unavailable);
-        };
-        // A live read is authoritative; a snapshot fallback (served by
-        // `list_state` without any live read) keeps enrichment working when the
-        // backend is unreachable. `is_cold()` means neither exists.
-        //
-        // The live read is `list_open()`, not `list()`: after #1217 the cached
-        // store's `list()` is an uncached `state=all` sweep, and the drain only
-        // needs the non-terminal board — the task ids here are just a legacy-line
-        // matching fallback for active work.
-        Self::resolve_board(store.list_open(), || {
-            store
-                .list_state()
-                .ok()
-                .filter(|state| !state.is_cold())
-                .map(shelbi_state::BoardState::into_issues)
-        })
+        // Read the board from the daemon-owned `board-index.json`
+        // (`Plans/github-issue-caching-and-rate-limits.md` §5) via the shared
+        // helper, never a backend sweep from the drain: a Warm index is
+        // authoritative (Live), a Stale one is the last board the daemon
+        // published (Snapshot), and Cold — or a read error — means no usable
+        // board (Unavailable). Either degraded tag only affects legacy-line
+        // matching; modern lines carry `project=` and scope without the board.
+        match shelbi_state::read_board(project) {
+            Ok(state) => Self::resolve_board(state),
+            Err(_) => (HashSet::new(), BoardAvailability::Unavailable),
+        }
     }
 
-    /// Turn a live board read (which may have failed) and a lazy snapshot
-    /// fallback into the scope's task ids and a [`BoardAvailability`] tag. Pure
-    /// over its inputs so the three degradation cases are unit-testable without
-    /// standing up a backend: the snapshot closure is evaluated only when the
-    /// live read failed.
-    fn resolve_board(
-        live: shelbi_core::Result<Vec<shelbi_state::IssueFile>>,
-        snapshot: impl FnOnce() -> Option<Vec<shelbi_state::IssueFile>>,
-    ) -> (HashSet<String>, BoardAvailability) {
-        match live {
-            Ok(board) => (Self::task_ids(board), BoardAvailability::Live),
-            Err(_) => match snapshot() {
-                Some(board) => (Self::task_ids(board), BoardAvailability::Snapshot),
-                None => (HashSet::new(), BoardAvailability::Unavailable),
-            },
+    /// Turn a [`shelbi_state::BoardState`] read from the index into the scope's
+    /// task ids and a [`BoardAvailability`] tag: `Warm` ⇒ Live, `Stale` ⇒ the
+    /// last published index (Snapshot), `Cold` ⇒ Unavailable. Pure over its
+    /// input so the three cases are unit-testable without standing up a backend.
+    fn resolve_board(state: shelbi_state::BoardState) -> (HashSet<String>, BoardAvailability) {
+        use shelbi_state::BoardState;
+        match state {
+            BoardState::Warm(board) => (Self::task_ids(board), BoardAvailability::Live),
+            BoardState::Stale(board) => (Self::task_ids(board), BoardAvailability::Snapshot),
+            BoardState::Cold => (HashSet::new(), BoardAvailability::Unavailable),
         }
     }
 
@@ -1470,26 +1456,22 @@ workspaces: []\n";
     /// `unavailable` and never aborts.
     #[test]
     fn resolve_board_reports_the_three_availability_states() {
-        // Live read succeeds: task ids populated, tagged Live.
-        let (ids, avail) =
-            ProjectScope::resolve_board(Ok(vec![issue_file("live-1")]), || unreachable!());
+        use shelbi_state::BoardState;
+        // A Warm index: task ids populated, tagged Live.
+        let (ids, avail) = ProjectScope::resolve_board(BoardState::Warm(vec![issue_file("live-1")]));
         assert_eq!(avail, BoardAvailability::Live);
         assert!(ids.contains("live-1"));
 
-        // Live read fails, snapshot serves: ids from the snapshot, tagged Snapshot.
-        let (ids, avail) = ProjectScope::resolve_board(
-            Err(shelbi_core::Error::Other("rate limited".into())),
-            || Some(vec![issue_file("snap-1")]),
-        );
+        // A Stale index (the daemon lagging): ids from the last published board,
+        // tagged Snapshot.
+        let (ids, avail) =
+            ProjectScope::resolve_board(BoardState::Stale(vec![issue_file("snap-1")]));
         assert_eq!(avail, BoardAvailability::Snapshot);
         assert!(ids.contains("snap-1"));
 
-        // Live read fails, no snapshot: empty ids, tagged Unavailable — never an
-        // error.
-        let (ids, avail) = ProjectScope::resolve_board(
-            Err(shelbi_core::Error::Other("rate limited".into())),
-            || None,
-        );
+        // A Cold index (none published yet): empty ids, tagged Unavailable —
+        // never an error.
+        let (ids, avail) = ProjectScope::resolve_board(BoardState::Cold);
         assert_eq!(avail, BoardAvailability::Unavailable);
         assert!(ids.is_empty());
     }

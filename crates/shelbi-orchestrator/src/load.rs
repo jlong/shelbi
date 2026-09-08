@@ -21,6 +21,28 @@ use crate::branch;
 use crate::supervision::{BASE_BACKOFF, CRASH_LOOP_WINDOW, MAX_RESTARTS_IN_WINDOW};
 use crate::workspace::{start_workspace_on_task, StartSpec};
 
+/// The **active** board for `project` — its in-progress plus review-column cards
+/// — read from the daemon-owned `board-index.json`
+/// (`Plans/github-issue-caching-and-rate-limits.md` §5) via the shared
+/// [`shelbi_state::read_board`] helper, not two backend `list_in_status`
+/// sweeps. Both are open (non-terminal) columns, so the open index carries them.
+///
+/// This is the busy/occupancy scan every load and review-slot picker shares:
+/// they only ever look at these two active columns to decide which workspace is
+/// free. Reading the index (instead of the backend) keeps the autoloader off
+/// GitHub's list budget and consistent with what the sidebar and pollers see.
+fn active_board(project: &Project) -> Result<Vec<IssueFile>> {
+    Ok(
+        shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker)?
+            .into_issues()
+            .into_iter()
+            .filter(|tf| {
+                tf.task.column == Column::in_progress() || tf.task.column == Column::review()
+            })
+            .collect(),
+    )
+}
+
 /// Load `task_id` onto a free workspace whose effective tags satisfy the
 /// task's current status's required tags, dispatching that status's agent.
 /// Returns the tmux target (`session:window`) of the pane the caller should
@@ -68,9 +90,9 @@ pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
         )));
     }
 
-    // Busy = holding some *other* active (in-progress / handoff) task.
-    let mut active = store.list_in_status(&Column::in_progress())?;
-    active.extend(store.list_in_status(&Column::review())?);
+    // Busy = holding some *other* active (in-progress / handoff) task. Read from
+    // the daemon-owned index, not the backend (§5).
+    let active = active_board(&project)?;
     let busy: HashSet<&str> = active
         .iter()
         .filter(|t| t.task.id != task_id)
@@ -101,10 +123,8 @@ pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
 /// lives in one place.
 pub fn free_review_workspaces(project_name: &str) -> Result<Vec<WorkspaceSpec>> {
     let project = shelbi_state::load_project(project_name)?;
-    let store = shelbi_state::issue_store_for_project(&project)?;
     let review_tag: BTreeSet<String> = std::iter::once("review".to_string()).collect();
-    let mut active = store.list_in_status(&Column::in_progress())?;
-    active.extend(store.list_in_status(&Column::review())?);
+    let active = active_board(&project)?;
     let busy: HashSet<&str> = active
         .iter()
         .filter_map(|t| t.task.assigned_to.as_deref())
@@ -147,9 +167,7 @@ pub struct ReviewSlotOccupant {
 /// review-column scan the busy check does, so the two never disagree.
 pub fn review_slots(project_name: &str) -> Result<Vec<ReviewSlot>> {
     let project = shelbi_state::load_project(project_name)?;
-    let store = shelbi_state::issue_store_for_project(&project)?;
-    let mut active = store.list_in_status(&Column::in_progress())?;
-    active.extend(store.list_in_status(&Column::review())?);
+    let active = active_board(&project)?;
     Ok(review_slots_from(&project, &active))
 }
 
@@ -247,8 +265,14 @@ fn evict_review_slot_locked(
     let store = shelbi_state::issue_store_for(project_name)?;
     // Only review-column tasks are "loaded for review"; an in-progress task on
     // the slot (an odd state) isn't ours to bounce back to the review queue —
-    // leave it for `load_review_task_locked`'s busy guard to reject.
-    let review = store.list_in_status(&Column::review())?;
+    // leave it for `load_review_task_locked`'s busy guard to reject. The occupant
+    // is found from the daemon-owned index (§5); the `store` is kept for the
+    // assignment-clear write below.
+    let review: Vec<IssueFile> = shelbi_state::read_board(project_name)?
+        .into_issues()
+        .into_iter()
+        .filter(|tf| tf.task.column == Column::review())
+        .collect();
     let Some(occupant) = review
         .into_iter()
         .find(|tf| tf.task.id != keep && tf.task.assigned_to.as_deref() == Some(workspace_name))
@@ -379,11 +403,13 @@ fn review_slot_busy_with_other(
     workspace_name: &str,
     task_id: &str,
 ) -> Result<bool> {
-    let store = shelbi_state::issue_store_for(project_name)?;
-    let mut active = store.list_in_status(&Column::in_progress())?;
-    active.extend(store.list_in_status(&Column::review())?);
+    // The same active (in-progress + review) scan as [`active_board`], asked of
+    // one slot — read from the daemon-owned index (§5), not the backend.
+    let active = shelbi_state::read_board(project_name)?.into_issues();
     Ok(active.iter().any(|t| {
-        t.task.id != task_id && t.task.assigned_to.as_deref() == Some(workspace_name)
+        (t.task.column == Column::in_progress() || t.task.column == Column::review())
+            && t.task.id != task_id
+            && t.task.assigned_to.as_deref() == Some(workspace_name)
     }))
 }
 
@@ -411,14 +437,15 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
     let _guard = shelbi_state::lock_review_load(project_name)?;
 
     let project = shelbi_state::load_project(project_name)?;
-    let store = shelbi_state::issue_store_for_project(&project)?;
-    // Require a WARM board read before consuming a scarce review slot. A stale
-    // snapshot (a rate-limit park serving the last board), a cold cache, or a
-    // failed read cannot prove a task is still sitting in review awaiting a slot;
-    // auto-loading off one would dispatch against untrusted state. Skip the tick
-    // and retry when the board is warm again — the same "no destructive action
-    // on a stale read" rule the poller's reapers follow.
-    let review_tasks: Vec<IssueFile> = match store.list_state()? {
+    // Require a WARM read of the daemon-owned index (§5) before consuming a
+    // scarce review slot. A stale index (the daemon lagging or rate-limit
+    // parked), a cold one (none published yet), or a failed read cannot prove a
+    // task is still sitting in review awaiting a slot; auto-loading off one would
+    // dispatch against untrusted state. Skip the tick and retry when the index
+    // is warm again — the same "no destructive action on a stale read" rule the
+    // poller's reapers follow.
+    let review_tasks: Vec<IssueFile> =
+        match shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker)? {
         shelbi_state::BoardState::Warm(board) => board
             .into_iter()
             // Board order (priority, then id) — the same order the sidebar shows.
@@ -1001,6 +1028,72 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// A `github` tracker config — a remote backend whose board the daemon owns,
+    /// so the load/autoload scans must read `board-index.json`, not the backend.
+    fn github_cfg() -> shelbi_core::IssueTrackerConfig {
+        shelbi_core::IssueTrackerConfig {
+            backend: shelbi_core::IssueTrackerBackend::Github,
+            github: Some(shelbi_core::GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn ifile(task: Issue) -> IssueFile {
+        IssueFile {
+            task,
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn active_board_reads_the_daemon_index_not_the_backend() {
+        // Autoload planning reads its busy/occupancy scan from the daemon-owned
+        // index (§5). On a `github` project with a seeded index and no `gh` on
+        // hand, `active_board`/`free_review_workspaces` still resolve — the
+        // sentinel ids exist on no backend, so returning them proves the file
+        // (not a `gh` list) was the source.
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let mut project = tagged_project();
+        project.issue_tracker = github_cfg();
+        shelbi_state::save_project(&project).unwrap();
+
+        let mut inprog = todo_task("sentinel-active", &[]);
+        inprog.column = Column::in_progress();
+        inprog.assigned_to = Some("alpha".into());
+        shelbi_state::write_board_index(
+            "demo",
+            &shelbi_state::BoardIndex::fresh(vec![
+                ifile(inprog),
+                ifile(review_task("sentinel-review", "review-1")),
+                // A todo card must be excluded from the active (in-progress +
+                // review) scan.
+                ifile(todo_task("sentinel-todo", &[])),
+            ]),
+        )
+        .unwrap();
+
+        let active = active_board(&project).unwrap();
+        let ids: Vec<&str> = active.iter().map(|t| t.task.id.as_str()).collect();
+        assert!(ids.contains(&"sentinel-active"), "in-progress card from index");
+        assert!(ids.contains(&"sentinel-review"), "review card from index");
+        assert!(!ids.contains(&"sentinel-todo"), "todo is not active");
+
+        // review-1 reads busy (from the index), so only review-2 is offered.
+        let free: Vec<String> = free_review_workspaces("demo")
+            .unwrap()
+            .into_iter()
+            .map(|w| w.name)
+            .collect();
+        assert_eq!(free, vec!["review-2".to_string()]);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

@@ -336,7 +336,15 @@ struct CategoryCounts {
 }
 
 fn category_counts(project: &str) -> Result<CategoryCounts> {
-    let tasks = shelbi_state::issue_store_for(project).and_then(|s| s.list()).map_err(|e| anyhow!(e))?;
+    // Read the board from the daemon-owned `board-index.json` (§5), never a
+    // backend sweep. On a remote backend the index is the *open* board, so the
+    // terminal `done` history is not in it (it is loaded on demand); the summary
+    // therefore counts the done cards present in the read — the full board on a
+    // `file_system` project, and the open pipeline on a remote one. The full
+    // done history is a `shelbi issue list --status done` away.
+    let tasks = shelbi_state::read_board(project)
+        .map_err(|e| anyhow!(e))?
+        .into_issues();
     let mut c = CategoryCounts::default();
     for tf in &tasks {
         match tf.task.column.category() {
@@ -361,9 +369,14 @@ fn category_counts(project: &str) -> Result<CategoryCounts> {
 /// automatic daemon restart is safe.
 pub(crate) fn workspace_idle_busy(project: &str) -> Result<(usize, usize)> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    let in_progress = shelbi_state::issue_store_for(project)
-        .and_then(|s| s.list_in_status(&Column::in_progress()))
-        .map_err(|e| anyhow!(e))?;
+    // The in-progress column comes from the daemon-owned index (§5), filtered in
+    // memory — never a backend `list_in_status` sweep from this CLI.
+    let in_progress: Vec<_> = shelbi_state::read_board(project)
+        .map_err(|e| anyhow!(e))?
+        .into_issues()
+        .into_iter()
+        .filter(|tf| tf.task.column == Column::in_progress())
+        .collect();
     let mut idle = 0usize;
     let mut busy = 0usize;
     for w in &p.workspaces {
@@ -528,6 +541,83 @@ workspaces: []\n",
         )
         .unwrap();
         p
+    }
+
+    /// Register a `github`-backed project `name` under `home` so a board read
+    /// resolves a remote backend whose board the daemon owns (read from
+    /// `board-index.json`, never `gh`).
+    fn register_github_project(home: &std::path::Path, name: &str) {
+        let projects = home.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join(format!("{name}.yaml")),
+            format!(
+                "name: {name}\n\
+repo: /tmp/{name}\n\
+default_branch: main\n\
+orchestrator:\n\
+\x20 runner: claude\n\
+agent_runners:\n\
+\x20 claude:\n\
+\x20\x20\x20 command: claude\n\
+\x20\x20\x20 flags: []\n\
+machines:\n\
+\x20 - name: local\n\
+\x20\x20\x20 kind: local\n\
+\x20\x20\x20 work_dir: /tmp/{name}\n\
+workspaces: []\n\
+issue_tracker:\n\
+\x20 backend: github\n\
+\x20 github:\n\
+\x20\x20\x20 repo: owner/repo\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn ifile(id: &str, column: &str) -> shelbi_state::IssueFile {
+        let task: shelbi_core::Issue = serde_yaml::from_str(&format!(
+            "id: {id}\ntitle: {id}\ncolumn: {column}\npriority: 0\n\
+             created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n"
+        ))
+        .unwrap();
+        shelbi_state::IssueFile {
+            task,
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn category_counts_reads_the_daemon_index_for_a_remote_project() {
+        // `shelbi status` on a `github` project counts the board from the
+        // daemon-owned index (§5), not a `gh` sweep: with a seeded index and no
+        // `gh` reachable, the counts still resolve — the open index carries the
+        // non-terminal columns, so `done` here reflects only what's in the open
+        // board (the full done history is an explicit `issue list --status done`).
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "g");
+
+        shelbi_state::write_board_index(
+            "g",
+            &shelbi_state::BoardIndex::fresh(vec![
+                ifile("a", "backlog"),
+                ifile("b", "todo"),
+                ifile("c", "in-progress"),
+                ifile("d", "review"),
+            ]),
+        )
+        .unwrap();
+
+        let counts = category_counts("g").unwrap();
+        assert_eq!(counts.backlog, 1);
+        assert_eq!(counts.ready, 1);
+        assert_eq!(counts.active, 1);
+        assert_eq!(counts.handoff, 1);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
