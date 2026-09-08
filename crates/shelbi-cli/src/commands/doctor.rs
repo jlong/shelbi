@@ -58,6 +58,18 @@ pub fn run(project: Option<String>) -> Result<()> {
     let budget = github_budget_snapshot(&project);
 
     println!("GitHub API budget health for `{project}`:");
+    // The connection-level circuit breaker is per token, not per budget: a dead
+    // network parks both. Surface it up front — a parked breaker is why the board
+    // stopped advancing, and it explains a burst of failed attempts below.
+    if let Some(until) = budget
+        .as_ref()
+        .and_then(|s| shelbi_state::gh_budget::unreachable_verdict(&s.unreachable, now.timestamp()))
+    {
+        let until_str = DateTime::from_timestamp(until, 0)
+            .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+            .unwrap_or_else(|| "an unknown time".to_string());
+        println!("  network: UNREACHABLE — board reads parked, retrying after {until_str}");
+    }
     for (label, kind) in [("graphql", Budget::Graphql), ("rest", Budget::Rest)] {
         let remaining = budget.as_ref().and_then(|s| s.tier(kind).remaining);
         report_budget(label, kind, &entries, remaining, now);
@@ -75,14 +87,22 @@ fn report_budget(
     now: DateTime<Utc>,
 ) {
     let mine: Vec<&RequestEntry> = entries.iter().filter(|e| e.budget == kind).collect();
-    let count = mine.len();
+    // Split spent requests from failed attempts: only spend drives the
+    // exhaustion projection, so a dead network (all `err:conn`) never reads as a
+    // 34k/hr burn rate (the 2026-09-08 misreport). Failed attempts are reported
+    // on their own line.
+    let spent: Vec<&RequestEntry> = mine.iter().copied().filter(|e| e.spent).collect();
+    let failed: Vec<&RequestEntry> = mine.iter().copied().filter(|e| !e.spent).collect();
+    let count = spent.len();
     let remaining_str = remaining
         .map(|r| format!("{r} remaining"))
         .unwrap_or_else(|| "remaining unknown".to_string());
 
-    let Some(rate) = observed_rate(&mine, now) else {
-        // No traffic on this budget in the window: nothing to project.
+    let Some(rate) = observed_rate(&spent, now) else {
+        // No spend on this budget in the window: nothing to project. Still note
+        // any failed attempts so a dead-network burst is visible.
         println!("  {label}: {count} requests in the last hour · {remaining_str} · idle");
+        report_failed_attempts(&failed);
         return;
     };
 
@@ -101,7 +121,7 @@ fn report_budget(
              (under {} min).",
             EXHAUSTION_WARN.as_secs() / 60,
         );
-        let callers = top_callers(&mine);
+        let callers = top_callers(&spent);
         if !callers.is_empty() {
             let named = callers
                 .iter()
@@ -111,6 +131,30 @@ fn report_budget(
             println!("    Top callers: {named}");
         }
     }
+    report_failed_attempts(&failed);
+}
+
+/// Print a line summarizing failed attempts (requests that did not spend budget)
+/// grouped by class, so an operator sees a dead network (`conn`) as attempts, not
+/// as spend. No-op when there were none.
+fn report_failed_attempts(failed: &[&RequestEntry]) {
+    if failed.is_empty() {
+        return;
+    }
+    use std::collections::BTreeMap;
+    let mut by_class: BTreeMap<&str, usize> = BTreeMap::new();
+    for e in failed {
+        *by_class.entry(e.err_class.as_deref().unwrap_or("unknown")).or_insert(0) += 1;
+    }
+    let named = by_class
+        .iter()
+        .map(|(class, n)| format!("{class} ({n})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "    {} failed attempt(s), no budget spent: {named}",
+        failed.len()
+    );
 }
 
 /// The observed requests-per-second for a budget's entries, measured over the
@@ -190,6 +234,18 @@ mod tests {
             at,
             budget,
             caller: caller.to_string(),
+            spent: true,
+            err_class: None,
+        }
+    }
+
+    fn failed_entry(class: &str, budget: Budget, at: DateTime<Utc>) -> RequestEntry {
+        RequestEntry {
+            at,
+            budget,
+            caller: "issue-fetch".to_string(),
+            spent: false,
+            err_class: Some(class.to_string()),
         }
     }
 
@@ -254,6 +310,7 @@ mod tests {
             shelbi_state::gh_requests::record_request_at(
                 Budget::Rest,
                 "pollers",
+                shelbi_state::gh_requests::Outcome::Ok,
                 now - chrono::Duration::milliseconds(100 * (100 - i)),
             );
         }
@@ -275,5 +332,35 @@ mod tests {
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// AC3: a dead network (100 connection failures, 2 real fetches) must not
+    /// read as a burn rate — the projection is built on *spent* requests only, so
+    /// the observed rate stays low and no false exhaustion warning fires.
+    #[test]
+    fn failed_attempts_do_not_inflate_the_spend_rate() {
+        let now = Utc::now();
+        let mut entries: Vec<RequestEntry> = (0..100)
+            .map(|i| {
+                failed_entry("conn", Budget::Graphql, now - chrono::Duration::milliseconds(100 * (100 - i)))
+            })
+            .collect();
+        // Two genuinely spent fetches over ~5s.
+        entries.push(entry("issue-fetch", Budget::Graphql, now - chrono::Duration::seconds(5)));
+        entries.push(entry("issue-fetch", Budget::Graphql, now));
+
+        let spent: Vec<&RequestEntry> = entries.iter().filter(|e| e.spent).collect();
+        let failed: Vec<&RequestEntry> = entries.iter().filter(|e| !e.spent).collect();
+        assert_eq!(failed.len(), 100, "the connection failures are counted as attempts");
+
+        let rate = observed_rate(&spent, now).expect("a rate over the spent requests");
+        // 2 spent over ~5s ≈ 0.4 req/s — nowhere near the ~10 req/s a naive
+        // count-all rate would have faked from the dead network.
+        assert!(rate < 1.0, "spend rate stays low despite 100 failed attempts, got {rate}");
+        let exhaust = seconds_to_exhaustion(rate, Some(5_000));
+        assert!(
+            exhaust >= EXHAUSTION_WARN.as_secs_f64(),
+            "no false exhaustion warning from a dead network ({exhaust}s)"
+        );
     }
 }

@@ -2338,6 +2338,87 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
+    /// AC5: a sidebar tick that needs many cards while the live board is
+    /// unavailable serves the (stale) published index and issues **zero** backend
+    /// requests — verified by a `gh` runner that counts and errors on any call.
+    /// This is the "serves the stale index" branch of the acceptance criterion.
+    #[test]
+    fn sidebar_tick_serves_the_stale_index_with_no_backend_requests() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let name = "sidebar-stale-index";
+        let mut project = fixture_project();
+        project.name = name.into();
+        project.issue_tracker = shelbi_core::IssueTrackerConfig {
+            backend: shelbi_core::IssueTrackerBackend::Github,
+            github: Some(shelbi_core::GithubConnection {
+                repo: "shelbi-test/offline-only".into(),
+            }),
+            ..Default::default()
+        };
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        let issue = |id: &str, column: Column, assigned_to: Option<&str>| IssueFile {
+            task: Issue {
+                id: id.into(),
+                title: id.into(),
+                column,
+                priority: 0,
+                assigned_to: assigned_to.map(str::to_string),
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                launch: None,
+                created_at: now,
+                updated_at: now,
+                params: BTreeMap::new(),
+            },
+            body: String::new(),
+        };
+        // Several cards across the columns the sidebar renders.
+        let board = vec![
+            issue("r1", Column::review(), None),
+            issue("r2", Column::review(), None),
+            issue("w1", Column::in_progress(), Some("alpha")),
+            issue("t1", Column::todo(), None),
+        ];
+        // Publish the index as the daemon would; the sidebar serves it straight
+        // off disk (the live backend below is never contacted).
+        shelbi_state::write_board_index(name, &shelbi_state::BoardIndex::fresh(board)).unwrap();
+
+        // Any `gh` call is a failure of the "serves the index" contract: count and
+        // error on every invocation.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rec = std::sync::Arc::clone(&calls);
+        shelbi_state::set_test_gh_runner(move |_args| {
+            rec.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(shelbi_core::Error::Other("gh must not be called for a sidebar tick".into()))
+        });
+
+        let mut app = App::new_sidebar(name);
+        app.refresh().unwrap();
+
+        assert!(!app.board_loading, "a published index renders immediately");
+        assert!(
+            app.queued_review.iter().any(|e| e.task_id == "r1")
+                && app.queued_review.iter().any(|e| e.task_id == "r2"),
+            "both review cards are served from the index"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a sidebar tick must make no backend request — it serves the stale index"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+    }
+
     /// A `config_error` renders an inline error row under a still-present
     /// `Workspaces` header instead of dropping the whole section — the core
     /// of AC1. Pure `rows()` check, no disk.

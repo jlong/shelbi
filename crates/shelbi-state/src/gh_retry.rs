@@ -61,7 +61,14 @@ enum Disposition {
     /// Rate limited; the inner value is a server-provided wait hint if one was
     /// present in the error (`Retry-After` / `x-ratelimit-reset`).
     RateLimited(Option<Duration>),
-    /// Transient (5xx / network) — retry with computed backoff.
+    /// A connection-level failure — DNS / TCP / TLS — where `gh` never reached
+    /// api.github.com and so spent no budget. Retried like a transient blip, but
+    /// classified separately so the read-path circuit breaker can *park* reads
+    /// (a dead network recurs on every caller's next tick) and the request log
+    /// can record it as an attempted-but-unspent request.
+    Connection,
+    /// Transient (5xx / server) — GitHub answered, so the network is up; retry
+    /// with computed backoff.
     Transient,
     /// Permanent — never retry.
     Terminal,
@@ -170,7 +177,10 @@ impl RetryPolicy {
                     return Err(err)
                 }
                 Disposition::RateLimited(hint) => (RetryKind::RateLimited, hint),
-                Disposition::Transient => (RetryKind::Transient, None),
+                // A connection failure retries like a transient blip (a single
+                // packet may have dropped); the read-path circuit breaker handles
+                // a *persistent* outage by parking, so the retry here stays short.
+                Disposition::Connection | Disposition::Transient => (RetryKind::Transient, None),
             };
             if attempt >= self.max_attempts {
                 return Err(err);
@@ -268,6 +278,16 @@ fn classify(err: &Error) -> Disposition {
         return Disposition::RateLimited(parse_wait_hint(stderr));
     }
 
+    // Connection-level: `gh` never reached api.github.com — DNS, TCP, or TLS
+    // failed — so no budget was spent. Classified before the (server-side)
+    // transient bucket so the read-path circuit breaker can park a dead network
+    // (which recurs on every caller's next tick) rather than let each reader
+    // re-issue it. `error connecting to` is the exact phrasing `gh` prints when
+    // the system resolver can't resolve the host (the 2026-09-08 incident).
+    if is_connection_hay(&hay) {
+        return Disposition::Connection;
+    }
+
     let transient = hay.contains("http 500")
         || hay.contains("http 502")
         || hay.contains("http 503")
@@ -277,18 +297,35 @@ fn classify(err: &Error) -> Disposition {
         || hay.contains("gateway time")
         || hay.contains("timeout")
         || hay.contains("timed out")
-        || hay.contains("could not resolve host")
-        || hay.contains("connection refused")
-        || hay.contains("connection reset")
-        || hay.contains("network is unreachable")
-        || hay.contains("temporary failure")
-        || hay.contains("i/o timeout")
-        || hay.contains("dial tcp");
+        || hay.contains("temporary failure");
     if transient {
         return Disposition::Transient;
     }
 
     Disposition::Terminal
+}
+
+/// Whether a lowercased `gh` error haystack names a connection-level failure —
+/// DNS / TCP / TLS the request never got past, so nothing was spent. Kept as one
+/// list so [`classify`] and [`is_connection_error`] agree on the boundary.
+fn is_connection_hay(hay: &str) -> bool {
+    hay.contains("error connecting to")
+        || hay.contains("could not resolve host")
+        || hay.contains("could not resolve")
+        || hay.contains("no such host")
+        || hay.contains("name or service not known")
+        || hay.contains("nodename nor servname")
+        || hay.contains("temporary failure in name resolution")
+        || hay.contains("connection refused")
+        || hay.contains("connection reset")
+        || hay.contains("connection timed out")
+        || hay.contains("network is unreachable")
+        || hay.contains("no route to host")
+        || hay.contains("tls handshake")
+        || hay.contains("handshake timeout")
+        || hay.contains("i/o timeout")
+        || hay.contains("dial tcp")
+        || hay.contains("getaddrinfo")
 }
 
 /// Parse a server-provided wait hint from an error body: a `Retry-After: <secs>`
@@ -328,6 +365,29 @@ fn parse_after_key(hay: &str, key: &str) -> Option<u64> {
 /// the two must agree on what "rate limited" means, so they share one source.
 pub fn is_rate_limit_error(err: &Error) -> bool {
     matches!(classify(err), Disposition::RateLimited(_))
+}
+
+/// Whether a `gh` failure is a connection-level failure (DNS / TCP / TLS the
+/// request never got past). Public so the read-path circuit breaker
+/// ([`crate::gh_budget`]) can *park* reads on a dead network — which recurs on
+/// every caller's next tick — the same way [`is_rate_limit_error`] parks an
+/// exhausted budget, without re-implementing the classification.
+pub fn is_connection_error(err: &Error) -> bool {
+    matches!(classify(err), Disposition::Connection)
+}
+
+/// A short, stable class tag for a `gh` failure, for the request log's `outcome`
+/// field (`err:<class>`) so `shelbi doctor` can tell attempted-but-unspent
+/// requests (a dead network, `conn`) from spent-then-throttled ones
+/// (`ratelimit`). A non-[`Error::Command`] error — never a real `gh` invocation
+/// — is `other`.
+pub fn error_class(err: &Error) -> &'static str {
+    match classify(err) {
+        Disposition::RateLimited(_) => "ratelimit",
+        Disposition::Connection => "conn",
+        Disposition::Transient => "transient",
+        Disposition::Terminal => "other",
+    }
 }
 
 /// The absolute reset time (epoch seconds) a rate-limit error names in its
@@ -550,6 +610,52 @@ mod tests {
         assert_eq!(out.unwrap(), "ok");
         assert_eq!(*calls.lock().unwrap(), 2);
         assert_eq!(*waits.lock().unwrap(), vec![1], "honored the server hint once");
+    }
+
+    #[test]
+    fn connection_failures_classify_as_connection_not_rate_limit_or_terminal() {
+        // The 2026-09-08 incident string, plus the common resolver/TLS phrasings,
+        // must all read as a connection failure — the read-path circuit breaker
+        // keys its park off this, and none of them spent budget.
+        for detail in [
+            "error connecting to api.github.com:443",
+            "could not resolve host: api.github.com",
+            "dial tcp: lookup api.github.com: nodename nor servname provided",
+            "net/http: TLS handshake timeout",
+            "connection refused",
+            "getaddrinfo ENOTFOUND api.github.com",
+        ] {
+            let err = command_err("exit status: 1", detail);
+            assert!(
+                is_connection_error(&err),
+                "`{detail}` should classify as a connection failure"
+            );
+            assert!(!is_rate_limit_error(&err), "`{detail}` is not a rate limit");
+            assert_eq!(error_class(&err), "conn", "class for `{detail}`");
+        }
+    }
+
+    #[test]
+    fn a_server_5xx_stays_transient_not_a_connection_failure() {
+        // GitHub answering 5xx means the network is up — the request reached the
+        // server and (likely) spent budget — so it must NOT trip the connection
+        // park; it stays a retryable transient with class `transient`.
+        let err = command_err("exit status: 1", "HTTP 502: Bad Gateway");
+        assert!(!is_connection_error(&err));
+        assert_eq!(error_class(&err), "transient");
+    }
+
+    #[test]
+    fn error_class_tags_rate_limit_and_terminal() {
+        assert_eq!(
+            error_class(&command_err("exit status: 1", "HTTP 403: API rate limit exceeded")),
+            "ratelimit"
+        );
+        assert_eq!(
+            error_class(&command_err("exit status: 1", "HTTP 422: Validation Failed")),
+            "other"
+        );
+        assert_eq!(error_class(&Error::Other("not a gh failure".into())), "other");
     }
 
     #[test]

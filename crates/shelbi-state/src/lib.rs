@@ -66,8 +66,8 @@ pub use issue_migrate::{
 pub use board_index::{
     board_index_path, mark_board_index_stale, patch_board_index_issue, read_board,
     read_board_index, read_board_report, read_board_report_with_cfg, read_board_with_cfg,
-    remove_board_index_issue, write_board_index, BoardFreshness, BoardIndex, BoardReport,
-    BoardSource, ReadPath, BOARD_INDEX_FILE,
+    record_board_index_number, remove_board_index_issue, write_board_index, BoardFreshness,
+    BoardIndex, BoardReport, BoardSource, ReadPath, BOARD_INDEX_FILE,
 };
 pub use done_history::{
     done_history_path, patch_done_history_issue, read_done_history, remove_done_history_issue,
@@ -135,6 +135,7 @@ pub use workflows::{
 };
 pub use event_log::{
     append_board_rate_limited_event,
+    append_board_unreachable_event,
     append_ci_event, append_clarification_event, append_dispatch_event, append_external_event,
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
     append_limit_resume_event, append_marker_deferred_event,

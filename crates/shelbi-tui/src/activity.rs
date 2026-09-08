@@ -240,6 +240,14 @@ impl Event {
 }
 
 /// Cached subset of an issue's frontmatter that the feed renders.
+#[derive(Debug, Clone)]
+struct TaskMeta {
+    title: String,
+    branch: Option<String>,
+    assigned_to: Option<String>,
+}
+
+/// One entry in the feed's task-metadata cache.
 ///
 /// Invalidation is backend-aware. For the filesystem board, `mtime` lets us
 /// re-read lazily only when the task file changes — exact and free. A remote
@@ -247,19 +255,23 @@ impl Event {
 /// `mtime` is always `None`; a pure mtime check would then read `None == None`
 /// and never refresh, freezing a remote issue's title / branch / assignment at
 /// whatever the first fetch saw. For those entries we fall back to a short
-/// time-to-live (`REMOTE_META_TTL`): the cache is re-fetched from the
-/// [`shelbi_state::IssueStore`] once it ages past the TTL, so remote edits
-/// surface without re-hitting the API on every render frame.
+/// time-to-live (`REMOTE_META_TTL`).
+///
+/// `meta` is `None` for a **confirmed miss** — an id the store resolved to
+/// nothing (a done task the open index doesn't carry, or a deleted one). Caching
+/// the miss (a *negative cache*, with the same TTL) is what stops the feed from
+/// re-resolving an unresolvable id on every render frame: the storm the
+/// 2026-09-08 incident attributed to the Activity view (`GitHubStore::get` per
+/// event, id-search + issue-fetch per tick, no negative cache).
 #[derive(Debug, Clone)]
-struct TaskMeta {
-    title: String,
-    branch: Option<String>,
-    assigned_to: Option<String>,
+struct TaskCacheEntry {
+    /// Resolved metadata, or `None` for a confirmed miss (negative cache).
+    meta: Option<TaskMeta>,
     /// Task-file modification time on the filesystem backend; `None` for a
     /// backend with no local task file (the TTL path takes over then).
     mtime: Option<SystemTime>,
-    /// When this entry was last fetched from the store — drives the TTL refresh
-    /// for entries that have no `mtime` to compare against.
+    /// When this entry was last resolved from the store — drives the TTL refresh
+    /// for entries that have no `mtime` to compare against (and every miss).
     fetched: Instant,
 }
 
@@ -346,7 +358,7 @@ pub struct ActivityApp {
     /// read the tail on subsequent ticks.
     log_offset: u64,
     log_mtime: Option<SystemTime>,
-    task_cache: HashMap<String, TaskMeta>,
+    task_cache: HashMap<String, TaskCacheEntry>,
     pub last_refresh: Instant,
     pub status_line: String,
     /// Vertical scroll offset, in lines from the top of the rendered
@@ -561,6 +573,12 @@ impl ActivityApp {
             }
             self.events.push(parse_event_line(line));
         }
+
+        // Resolve titles for the (possibly newly-loaded) events in one batched
+        // request, off the per-frame render path. Only reached when the log
+        // actually grew (the early returns above cover the idle case), so an idle
+        // feed makes no request at all.
+        self.resolve_task_meta();
     }
 
     pub fn maybe_refresh(&mut self) {
@@ -609,49 +627,104 @@ impl ActivityApp {
         self.auto_scroll = false;
     }
 
-    /// Look up the latest known metadata for a task. Re-reads the
-    /// task file lazily when its mtime has changed; returns `None`
-    /// when the file is gone (deleted task) so callers fall back to
-    /// the task id as the display label.
-    fn task_meta(&mut self, id: &str) -> Option<&TaskMeta> {
-        let path = match shelbi_state::task_path(&self.project_name, id) {
-            Ok(p) => p,
-            Err(_) => return None,
-        };
-        let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-        let stale = match self.task_cache.get(id) {
+    /// The latest known metadata for a task, read from the cache — a pure lookup
+    /// that never touches the store (that is [`ActivityApp::resolve_task_meta`]'s
+    /// job, batched on the refresh cadence). Returns `None` for a not-yet-resolved
+    /// id, a confirmed miss (negative cache), or a deleted task, so callers fall
+    /// back to the task id as the display label. Deliberately off the per-frame
+    /// render path so a draw costs no API call — the fix for the Activity view's
+    /// per-event `get` storm (the 2026-09-08 incident).
+    fn task_meta(&self, id: &str) -> Option<&TaskMeta> {
+        self.task_cache.get(id).and_then(|e| e.meta.as_ref())
+    }
+
+    /// Whether `id`'s cache entry needs re-resolving. Backend-aware: the
+    /// filesystem board invalidates exactly on the task file's `mtime`; a remote
+    /// backend (no local file) and every confirmed miss fall back to the TTL.
+    fn task_meta_stale(&self, id: &str, mtime: Option<SystemTime>) -> bool {
+        match self.task_cache.get(id) {
             None => true,
-            Some(cached) => {
-                if mtime.is_some() || cached.mtime.is_some() {
-                    // Filesystem backend: exact, free invalidation on file change.
-                    cached.mtime != mtime
+            Some(entry) => {
+                if mtime.is_some() || entry.mtime.is_some() {
+                    entry.mtime != mtime
                 } else {
-                    // No local file (remote backend): fall back to a TTL so a
-                    // remote edit is picked up without an mtime to compare.
-                    cached.fetched.elapsed() >= REMOTE_META_TTL
-                }
-            }
-        };
-        if stale {
-            match shelbi_state::issue_store_for(&self.project_name).and_then(|s| s.get(id)) {
-                Ok(Some(tf)) => {
-                    self.task_cache.insert(
-                        id.to_string(),
-                        TaskMeta {
-                            title: tf.task.title,
-                            branch: tf.task.branch,
-                            assigned_to: tf.task.assigned_to,
-                            mtime,
-                            fetched: Instant::now(),
-                        },
-                    );
-                }
-                Ok(None) | Err(_) => {
-                    self.task_cache.remove(id);
+                    entry.fetched.elapsed() >= REMOTE_META_TTL
                 }
             }
         }
-        self.task_cache.get(id)
+    }
+
+    /// Resolve every task id the loaded feed references that is stale or unknown,
+    /// in **one** batched [`shelbi_state::IssueStore::fetch_many`] request (the
+    /// `github` backend collapses it into a single aliased GraphQL call), then
+    /// cache the hits *and* the misses. Called on the refresh cadence rather than
+    /// per render frame, so:
+    ///
+    /// * a draw never issues an API call (the per-event `get` storm is gone), and
+    /// * an unresolvable id (a done task the open index doesn't carry) is
+    ///   negative-cached for the TTL instead of re-searched every tick.
+    ///
+    /// On an idle feed (no new events, entries still within their TTL) this
+    /// resolves nothing and makes no request — O(1) per tick, not O(N).
+    fn resolve_task_meta(&mut self) {
+        use std::collections::HashSet;
+        // Collect the unique, stale/unknown ids referenced by the loaded events.
+        let mut wanted: Vec<String> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for ev in &self.events {
+            let Some(id) = event_task_id(ev) else { continue };
+            if !seen.insert(id) {
+                continue;
+            }
+            let mtime = task_file_mtime(&self.project_name, id);
+            if self.task_meta_stale(id, mtime) {
+                wanted.push(id.to_string());
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        let store = match shelbi_state::issue_store_for(&self.project_name) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
+        // One aliased request for every miss; ids that don't resolve are simply
+        // absent from the result (the `fetch_many` contract).
+        let fetched = store.fetch_many(&refs).unwrap_or_default();
+        let now = Instant::now();
+        let mut resolved: HashSet<String> = HashSet::new();
+        for tf in fetched {
+            let id = tf.task.id.clone();
+            let mtime = task_file_mtime(&self.project_name, &id);
+            resolved.insert(id.clone());
+            self.task_cache.insert(
+                id,
+                TaskCacheEntry {
+                    meta: Some(TaskMeta {
+                        title: tf.task.title,
+                        branch: tf.task.branch,
+                        assigned_to: tf.task.assigned_to,
+                    }),
+                    mtime,
+                    fetched: now,
+                },
+            );
+        }
+        // Negative-cache the misses so an unresolvable id isn't re-searched until
+        // the TTL — the fix for "no negative/closed-id cache".
+        for id in wanted {
+            if !resolved.contains(&id) {
+                self.task_cache.insert(
+                    id,
+                    TaskCacheEntry {
+                        meta: None,
+                        mtime: None,
+                        fetched: now,
+                    },
+                );
+            }
+        }
     }
 
     /// Find the matching `* -> in_progress` event preceding `idx` for
@@ -1891,6 +1964,34 @@ fn detail_secondary(sys: &SystemEvent) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// The task id an event references for title resolution, or `None` for an event
+/// that names no task (or one whose subject isn't a task). Mirrors the renderers'
+/// own choice of which system kinds carry a task id in `target` (dispatch /
+/// rebase / worktree-detach / message), so [`ActivityApp::resolve_task_meta`]
+/// batch-resolves exactly the ids the feed will look up.
+fn event_task_id(ev: &Event) -> Option<&str> {
+    match ev {
+        Event::Issue { id, .. } => Some(id.as_str()),
+        Event::ZenDryRun { task_id, .. } => Some(task_id.as_str()),
+        Event::System(sys) => match sys.kind {
+            SystemKind::Dispatch
+            | SystemKind::Rebase
+            | SystemKind::WorktreeDetach
+            | SystemKind::Message => sys.target.as_deref(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The task file's modification time for the filesystem backend, or `None` when
+/// there is no local file (a remote backend — the TTL path takes over) or the
+/// id/path can't be resolved.
+fn task_file_mtime(project: &str, id: &str) -> Option<SystemTime> {
+    let path = shelbi_state::task_path(project, id).ok()?;
+    fs::metadata(&path).ok().and_then(|m| m.modified().ok())
 }
 
 /// Resolve a task id to its human title via the cache, falling back to the
@@ -3680,5 +3781,167 @@ mod tests {
             Some(Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap()),
             "must pair the review event with its task's own in_progress event"
         );
+    }
+
+    // --- AC4: the Activity view batches title resolution and negative-caches ---
+
+    fn register_github_project(home: &std::path::Path, name: &str) {
+        let projects = home.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join(format!("{name}.yaml")),
+            format!(
+                "name: {name}\nrepo: /tmp/{name}\ndefault_branch: main\n\
+orchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/{name}\nworkspaces: []\n\
+issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn done_issue_event(id: &str) -> Event {
+        Event::Issue {
+            ts: Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap(),
+            id: id.into(),
+            workflow: DEFAULT_WORKFLOW_NAME.into(),
+            from: Column::review(),
+            to: Column::done(),
+            reason: "user:review-accept".into(),
+            agent: None,
+            from_category: Column::review().category(),
+            to_category: Column::done().category(),
+            raw: String::new(),
+        }
+    }
+
+    /// AC4: with the Activity view open on a board of done tasks, one refresh
+    /// resolves every referenced title in a single aliased `fetch_many` request,
+    /// and every subsequent (idle) tick makes **no** further request — the
+    /// negative/positive cache holds. This is the fix for the per-event `get`
+    /// storm the 2026-09-08 incident attributed to `__activity`.
+    #[test]
+    fn activity_view_batches_titles_and_idle_ticks_cost_no_requests() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-activity-batch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "actv");
+
+        // Seed the id→number map so resolution takes the index fast path (no
+        // per-id search) and `fetch_many` is a single aliased request for all
+        // three — the O(1) batch AC4 requires.
+        shelbi_state::write_board_index("actv", &shelbi_state::BoardIndex::fresh(Vec::new())).unwrap();
+        for (id, n) in [("d1", 1), ("d2", 2), ("d3", 3)] {
+            shelbi_state::record_board_index_number("actv", id, n).unwrap();
+        }
+
+        // A fake `gh` that counts GraphQL calls and answers the aliased
+        // IssuesByNumber batch with all three done issues in one response.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rec = std::sync::Arc::clone(&calls);
+        shelbi_state::set_test_gh_runner(move |args: &[&str]| {
+            let joined = args.join(" ");
+            if joined.contains("graphql") {
+                rec.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if joined.contains("IssuesByNumber") {
+                Ok(r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T12:00:00Z"},
+                "repository":{
+                  "i0":{"number":1,"title":"Done One","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-02T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/d1"},{"name":"shelbi:status/done"}]}},
+                  "i1":{"number":2,"title":"Done Two","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-02T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/d2"},{"name":"shelbi:status/done"}]}},
+                  "i2":{"number":3,"title":"Done Three","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-02T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/d3"},{"name":"shelbi:status/done"}]}}
+                }}}"#.to_string())
+            } else {
+                Ok(String::new())
+            }
+        });
+
+        let mut app = ActivityApp::new("actv");
+        app.events = vec![done_issue_event("d1"), done_issue_event("d2"), done_issue_event("d3")];
+
+        // Warmup: one batched aliased request resolves all three titles.
+        app.resolve_task_meta();
+        let after_warmup = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(after_warmup, 1, "three titles resolved in ONE aliased request");
+        assert_eq!(app.task_meta("d1").map(|m| m.title.as_str()), Some("Done One"));
+        assert_eq!(app.task_meta("d3").map(|m| m.title.as_str()), Some("Done Three"));
+
+        // Idle ticks: no new events, entries within their TTL → no requests.
+        for _ in 0..5 {
+            app.resolve_task_meta();
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            after_warmup,
+            "an idle board costs no GraphQL requests per tick (O(1), not O(N))"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// AC4: an id the store can't resolve is negative-cached, so it is not
+    /// re-searched on every tick — the "no negative/closed-id cache" defect.
+    #[test]
+    fn activity_view_negative_caches_unresolvable_ids() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-activity-neg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "actv-neg");
+
+        // No index numbers → resolution falls to the id-search, which we answer
+        // empty (the id resolves to nothing). Count those search calls.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rec = std::sync::Arc::clone(&calls);
+        shelbi_state::set_test_gh_runner(move |args: &[&str]| {
+            if args.join(" ").contains("graphql") {
+                rec.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            // An empty search result: the id names no issue.
+            Ok(r#"{"data":{"search":{"nodes":[]}}}"#.to_string())
+        });
+
+        let mut app = ActivityApp::new("actv-neg");
+        app.events = vec![done_issue_event("ghost")];
+
+        app.resolve_task_meta();
+        let after_first = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after_first >= 1, "the first resolution searches for the id");
+        assert!(app.task_meta("ghost").is_none(), "an unresolved id has no title");
+
+        // The miss is cached: further ticks do not re-search within the TTL.
+        for _ in 0..5 {
+            app.resolve_task_meta();
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            after_first,
+            "an unresolvable id is negative-cached, not re-searched every tick"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
