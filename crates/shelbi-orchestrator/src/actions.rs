@@ -244,6 +244,20 @@ pub fn push_branch(project: &Project, task: &Issue) -> Result<()> {
     let (host, worktree) = locate_workspace_worktree(project, task)?;
     let wt = worktree.to_string_lossy().into_owned();
 
+    // No-op when `origin/<branch>` already holds this exact local tip. The
+    // poller's pre-handoff push (`push_workspace_branch_to_origin`) publishes
+    // the branch — and updates the local `refs/remotes/origin/<branch>`
+    // tracking ref — *before* this transition's `[push_branch, open_pr]` runs,
+    // so by the time we get here the branch is usually already on origin. A
+    // second `git push` would then be pure redundancy that can nonetheless
+    // hang on a flaky SSH path and, by short-circuiting the edge, skip
+    // `open_pr` — the exact review-with-no-PR incident this guards against.
+    // The comparison is a purely local ref read (no network), so it can't
+    // itself wedge.
+    if branch_tip_already_on_origin(&host, &wt, &branch)? {
+        return Ok(());
+    }
+
     let out = run_in_dir(&host, &wt, &["git", "push", "-u", "origin", "--", &branch])?;
     if !out.status.success() {
         return Err(Error::Command {
@@ -253,6 +267,39 @@ pub fn push_branch(project: &Project, task: &Issue) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// True when the local `refs/heads/<branch>` tip equals the remote-tracking
+/// `refs/remotes/origin/<branch>` tip — i.e. this exact commit is already
+/// published on origin, so a `git push` would be a no-op. Both refs are read
+/// locally (`git rev-parse`); a missing tracking ref (branch never pushed)
+/// or an unreadable local branch is treated as "not yet on origin" so the
+/// caller pushes.
+fn branch_tip_already_on_origin(host: &Host, wt: &str, branch: &str) -> Result<bool> {
+    let local = rev_parse_commit(host, wt, &format!("refs/heads/{branch}"))?;
+    let remote = rev_parse_commit(host, wt, &format!("refs/remotes/origin/{branch}"))?;
+    Ok(match (local, remote) {
+        (Some(l), Some(r)) => l == r,
+        _ => false,
+    })
+}
+
+/// Resolve `refspec` to its commit SHA via `git rev-parse --verify --quiet`,
+/// returning `Ok(None)` when the ref doesn't exist (the quiet flag makes a
+/// missing ref a clean non-zero exit rather than an error). A spawn failure
+/// is a real error.
+fn rev_parse_commit(host: &Host, wt: &str, refspec: &str) -> Result<Option<String>> {
+    let arg = format!("{refspec}^{{commit}}");
+    let out = run_in_dir(
+        host,
+        wt,
+        &["git", "rev-parse", "--verify", "--quiet", &arg],
+    )?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok((!sha.is_empty()).then_some(sha))
 }
 
 /// Open a PR for the task's branch. Idempotent — if an open PR for the
@@ -2205,6 +2252,67 @@ mod tests {
         run_git(&local, &["push", "-u", "origin", "feature"]);
 
         (tmp, remote, local)
+    }
+
+    #[test]
+    fn push_branch_is_a_noop_when_origin_already_holds_the_tip() {
+        // `fixture_repo_with_origin` pushes `feature` to origin, so the
+        // worktree's `refs/remotes/origin/feature` already equals the local
+        // tip — the shape the pre-handoff push leaves behind. `push_branch`
+        // must recognize that and skip the redundant `git push` entirely.
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        let project = project_with_local_workspace_holding(&local, "alice", "feature");
+        let mut task = task_on_branch("t", "feature");
+        task.assigned_to = Some("alice".into());
+
+        crate::git::record_git_invocations();
+        push_branch(&project, &task).expect("push_branch");
+        let invocations = crate::git::take_git_invocations();
+
+        assert!(
+            !invocations.iter().any(|argv| argv.contains(&"push".to_string())),
+            "push_branch should not run `git push` when origin already holds the tip; ran: {invocations:?}"
+        );
+        // Sanity: it did *something* (the local-vs-tracking ref comparison),
+        // so the no-op is the equality check firing, not an empty short-circuit.
+        assert!(
+            invocations
+                .iter()
+                .any(|argv| argv.iter().any(|a| a == "rev-parse")),
+            "expected the up-to-date check to rev-parse the refs; ran: {invocations:?}"
+        );
+    }
+
+    #[test]
+    fn push_branch_pushes_when_local_is_ahead_of_origin() {
+        // Local `feature` advanced past `origin/feature` (a normal commit the
+        // worker made) — `push_branch` must actually push it.
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        let project = project_with_local_workspace_holding(&local, "alice", "feature");
+        // Advance the branch inside the workspace worktree without pushing, so
+        // the local tip is ahead of the tracking ref.
+        let wt_path = local.join(".shelbi").join("wt").join("alice");
+        run_git(&wt_path, &["commit", "--allow-empty", "-q", "-m", "more work"]);
+        let mut task = task_on_branch("t", "feature");
+        task.assigned_to = Some("alice".into());
+
+        crate::git::record_git_invocations();
+        push_branch(&project, &task).expect("push_branch");
+        let invocations = crate::git::take_git_invocations();
+
+        assert!(
+            invocations.iter().any(|argv| argv.contains(&"push".to_string())),
+            "push_branch must run `git push` when local is ahead of origin; ran: {invocations:?}"
+        );
+        // And the push actually reached origin.
+        let wt = local.to_string_lossy().into_owned();
+        let local_tip = rev_parse_commit(&Host::Local, &wt, "refs/heads/feature")
+            .unwrap()
+            .unwrap();
+        let remote_tip = rev_parse_commit(&Host::Local, &wt, "refs/remotes/origin/feature")
+            .unwrap()
+            .unwrap();
+        assert_eq!(local_tip, remote_tip, "origin/feature should now match local");
     }
 
     #[test]

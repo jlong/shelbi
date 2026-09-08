@@ -2251,6 +2251,36 @@ pub fn append_marker_deferred_event(
     ))
 }
 
+/// Append a **ready-handoff transition-action failure** line to
+/// `~/.shelbi/events.log`. Emitted by the poller's ready-marker handoff when a
+/// review edge's action (`push_branch` / `open_pr`) errors: the card is left in
+/// `in_progress` with the marker in place to retry next tick, and this line is
+/// the visible trail explaining why it didn't advance — so a flaky push that
+/// short-circuits `open_pr` can never silently strand a review card with no PR.
+///
+/// `<rfc3339> handoff-action-failed task=<id> workspace=<name> action=<action> status=failed detail=<detail>`
+///
+/// `action` is the failing action's wire name (`push_branch`, `open_pr`, …) or
+/// `unknown` when the failure wasn't a named git action. Same task-scoped,
+/// `project=`-less shape as [`append_push_event`] / [`append_marker_deferred_event`];
+/// whitespace in every field folds to underscores so the record stays a single
+/// parseable line.
+pub fn append_handoff_action_failed_event(
+    task_id: &str,
+    workspace: &str,
+    action: &str,
+    detail: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let task_id = sanitize_field(task_id);
+    let workspace = sanitize_field(workspace);
+    let action = sanitize_field(action);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} handoff-action-failed task={task_id} workspace={workspace} action={action} status=failed detail={detail}"
+    ))
+}
+
 /// Append `<rfc3339> <body>` to `~/.shelbi/events.log`. Used by the hub
 /// daemon (`shelbi daemon`) for `event`-verb messages received over the
 /// Unix socket — the worker hands us a pre-formatted body line (e.g.

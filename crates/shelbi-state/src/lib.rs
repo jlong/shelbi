@@ -137,6 +137,7 @@ pub use event_log::{
     append_board_rate_limited_event,
     append_board_unreachable_event,
     append_ci_event, append_clarification_event, append_dispatch_event, append_external_event,
+    append_handoff_action_failed_event,
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
     append_limit_resume_event, append_marker_deferred_event,
     append_github_merge_reconcile_event, append_merge_event, append_message_ack_event,

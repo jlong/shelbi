@@ -2499,6 +2499,61 @@ fn maybe_apply_ready_handoff(
                         return;
                     }
                 }
+            } else {
+                // Review handoff: run the edge's actions (`push_branch`,
+                // `open_pr`) and GATE the column move on them, BEFORE advancing
+                // — the mirror of the merge-edge gate above. Running the
+                // transition first is what stops a failed action from silently
+                // stranding a review card with no PR: the pre-handoff push
+                // already published the branch (so `push_branch` no-ops and
+                // `open_pr` is idempotent), so on failure we can leave the card
+                // in-progress with the marker in place and retry the whole
+                // edge next tick. A failure records a `handoff-action-failed`
+                // line so the deferral is visible rather than a swallowed warn.
+                //
+                // Note this fires with the worker's worktree still holding the
+                // branch (detach happens only after the move below); both
+                // `push_branch` (pushes `refs/heads/<branch>`) and `open_pr`
+                // (`gh pr create --head <branch>`) are independent of the
+                // worktree's HEAD, so the held branch doesn't matter here.
+                match shelbi_orchestrator::transition::execute_transition_reporting(
+                    project,
+                    &project.name,
+                    &tf.task,
+                    &tf.body,
+                    &workflow,
+                    &from_status,
+                    &to_status,
+                ) {
+                    Ok(outcomes) => {
+                        for o in outcomes {
+                            tracing::info!(workspace = %workspace.name, task = %task_id, action = %o.action, line = %o.line, "ready-handoff action fired");
+                        }
+                    }
+                    Err(fa) => {
+                        let action = fa
+                            .action
+                            .map(|a| a.as_str())
+                            .unwrap_or("unknown");
+                        let detail = fa.error.to_string();
+                        if let Err(ev) = shelbi_state::append_handoff_action_failed_event(
+                            &task_id,
+                            &workspace.name,
+                            action,
+                            &detail,
+                        ) {
+                            tracing::warn!(workspace = %workspace.name, task = %task_id, error = %ev, "append_handoff_action_failed_event failed");
+                        }
+                        tracing::warn!(
+                            workspace = %workspace.name,
+                            task = %task_id,
+                            action = %action,
+                            error = %detail,
+                            "ready-handoff transition action failed; leaving ready marker in place and NOT advancing to review",
+                        );
+                        return;
+                    }
+                }
             }
 
             // Route the status advance through the issue-tracker seam so the
@@ -2564,8 +2619,12 @@ fn maybe_apply_ready_handoff(
                     }
                 }
             } else {
-                // Handoff to a review status. Release the worker's worktree from
-                // the task branch now that the move landed — detach the HEAD in
+                // Handoff to a review status. The edge's actions
+                // (`push_branch`, `open_pr`, plus any `run:`/`ready:` serving
+                // commands) already ran and succeeded BEFORE the move above —
+                // that gate is what guarantees a review card arrives with its
+                // PR. All that's left is to release the worker's worktree from
+                // the task branch now that the move landed: detach the HEAD in
                 // place so `<task.branch>` is no longer held by any worktree, or
                 // the review checkout and the later merge / `delete_branch` die
                 // on `already checked out at <worktree>`. Its failure never
@@ -2574,29 +2633,6 @@ fn maybe_apply_ready_handoff(
                 // whole function runs on later ticks even after the pane has
                 // died), so both routes leave the branch free.
                 detach_workspace_worktree_after_handoff(workspace, machine, host, &task_id);
-
-                // Fire the edge's transition actions + `run:` / `ready:`
-                // commands (serving). Best-effort — the move already happened,
-                // so a command failure logs but doesn't roll it back. A
-                // workflow with no edge declared for this move is a clean no-op.
-                match shelbi_orchestrator::transition::execute_transition(
-                    project,
-                    &project.name,
-                    &tf.task,
-                    &tf.body,
-                    &workflow,
-                    &from_status,
-                    &to_status,
-                ) {
-                    Ok(outcomes) => {
-                        for o in outcomes {
-                            tracing::info!(workspace = %workspace.name, task = %task_id, action = %o.action, line = %o.line, "ready-handoff action fired");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "ready-handoff transition command failed");
-                    }
-                }
             }
 
             tracing::info!(workspace = %workspace.name, task = %task_id, to = %to_status, "advanced task via ready marker");
@@ -7113,6 +7149,179 @@ while :; do sleep 60; done
                 && l.contains(" task=fix-login ")
                 && l.contains("reason=worktree-detach-failed")),
             "a detach failure must be traceably logged; log: {log:?}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn review_handoff_leaves_task_in_progress_when_open_pr_action_fails() {
+        // The incident: the pre-handoff push lands and the card advances to
+        // review, but the transition's `open_pr` fails on a flaky path — leaving
+        // a review card with no PR and no signal. The fix gates the advance on
+        // the edge's actions, so a failing `open_pr` keeps the card in-progress
+        // with the marker in place to retry, and records a
+        // `handoff-action-failed action=open_pr` line so the deferral is visible.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-openprfail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Main clone + a bare origin it pushes `main` to, so the pre-handoff
+        // push succeeds and only `open_pr` is left to fail.
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        assert!(git_in(&work_dir, &["init", "-q", "-b", "main"]).status.success());
+        assert!(git_in(&work_dir, &["config", "user.email", "test@shelbi.local"]).status.success());
+        assert!(git_in(&work_dir, &["config", "user.name", "Shelbi Test"]).status.success());
+        std::fs::write(work_dir.join("README.md"), "# repo\n").unwrap();
+        assert!(git_in(&work_dir, &["add", "README.md"]).status.success());
+        assert!(git_in(&work_dir, &["commit", "-q", "-m", "init"]).status.success());
+        let bare = home.join("origin.git");
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let bare_str = bare.to_string_lossy().into_owned();
+        assert!(git_in(&work_dir, &["remote", "add", "origin", &bare_str]).status.success());
+        assert!(git_in(&work_dir, &["push", "-q", "-u", "origin", "main"]).status.success());
+
+        // Workspace worktree on the task branch with a commit of its own; NOT
+        // pushed here — the handoff push publishes it, after which the
+        // transition's `push_branch` no-ops and only `open_pr` runs.
+        let project = local_project(&work_dir);
+        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        assert!(git_in(
+            &work_dir,
+            &["worktree", "add", "-q", "-b", "shelbi/fix-login", wt.to_str().unwrap(), "main"],
+        )
+        .status
+        .success());
+        std::fs::write(wt.join("work.txt"), "v0\n").unwrap();
+        assert!(git_in(&wt, &["add", "work.txt"]).status.success());
+        assert!(git_in(&wt, &["commit", "-q", "-m", "task work"]).status.success());
+
+        write_project_workflow(
+            "task",
+            r#"
+name: task
+git:
+  base_branch: main
+  merge_strategy: squash
+statuses:
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer    }
+  - { id: review,      owner: user,  agent: orchestrator }
+  - { id: done,        owner: user }
+transitions:
+  - { from: in-progress, to: review, actions: [push_branch, open_pr] }
+  - { from: review, to: done, actions: [merge] }
+"#,
+        );
+        let mut task = in_progress_task("fix-login", "alpha");
+        task.workflow = Some("task".into());
+        task.branch = Some("shelbi/fix-login".into());
+        shelbi_state::save_task("demo", &task, "body").unwrap();
+
+        // A `gh` stub that FAILS `pr list`, so `open_pr`'s idempotency lookup
+        // errors and the action fails deterministically regardless of whether a
+        // real `gh` is on the machine. `run_in_dir` sources `~/.profile`, so
+        // prepending the stub dir there (with HOME pinned) shadows `gh` while
+        // real `git` still resolves from the system PATH.
+        let bin = home.join("stub-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join("gh"),
+            "#!/bin/sh\ncase \"$*\" in\n  *\"pr list\"*) echo 'no GitHub remote' >&2; exit 1 ;;\n  *) exit 1 ;;\nesac\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            home.join(".profile"),
+            format!("export PATH=\"{}:$PATH\"\n", bin.display()),
+        )
+        .unwrap();
+        let prev_home = std::env::var_os("HOME");
+        let prev_shell = std::env::var_os("SHELL");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("SHELL", "/bin/sh");
+
+        let marker = write_marker(&project, "fix-login\n");
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
+        );
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_shell {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+
+        // The card stays in-progress and the marker is retained for a retry.
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login")
+                .unwrap()
+                .task
+                .column,
+            Column::in_progress(),
+            "a failed open_pr action must leave the card in-progress, not advance to review with no PR",
+        );
+        assert!(
+            marker.exists(),
+            "the ready marker must be retained so the edge retries next tick",
+        );
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.lines().any(|l| l.contains(" handoff-action-failed ")
+                && l.contains(" task=fix-login ")
+                && l.contains(" action=open_pr ")),
+            "a handoff-action-failed action=open_pr line must be emitted; log: {log:?}",
+        );
+        assert!(
+            !log.lines().any(|l| l.contains(" task=fix-login ")
+                && l.contains(" in_progress -> review ")),
+            "no review transition must be logged; log: {log:?}",
+        );
+
+        // The branch WAS published by the pre-handoff push (so the retry's
+        // push_branch will no-op and only open_pr re-runs).
+        assert!(
+            git_in(&bare, &["rev-parse", "shelbi/fix-login"]).status.success(),
+            "the pre-handoff push should have published the branch to origin",
         );
 
         std::env::remove_var("SHELBI_HOME");
