@@ -23,3 +23,8 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+# The sidebar's degraded-render test seeds an on-disk board snapshot for a
+# remote (github) backend so a cold process serves it while a live read fails;
+# this feature exposes `shelbi_state::seed_board_snapshot_for_test`. Dev-only.
+shelbi-state = { workspace = true, features = ["test-support"] }

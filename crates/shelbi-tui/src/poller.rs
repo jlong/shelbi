@@ -1124,6 +1124,13 @@ fn board_is_quiescent(project: &Project) -> bool {
 
 /// The whole board for `project`, read through its configured [`IssueStore`]
 /// (so a `github` backend is honored, not the local filesystem).
+///
+/// Uses [`shelbi_state::resolve_issue_store`] with the already-loaded
+/// `&Project`'s config rather than re-reading the YAML by name: this poller
+/// helper always holds a live project, and the crate steers `&Project`-holders
+/// here to avoid a redundant (and newly-fallible) config read. Both entry points
+/// wrap the same process-local `CachedIssueStore`, so this read is served from —
+/// and degrades identically off — the same snapshot the sidebar/Issues board use.
 fn list_issues(project: &Project) -> shelbi_core::Result<Vec<shelbi_state::IssueFile>> {
     shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?.list()
 }
@@ -3676,7 +3683,11 @@ fn maybe_resume_stranded_review_slots(
 /// review slot (its task still pinned to it on disk) from a genuinely idle
 /// one. Mirrors the `list_column(review)` scan the auto-loader uses.
 fn assigned_review_task_for(project: &Project, workspace_name: &str) -> Option<String> {
-    shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+    // Through `issue_store_for` (like the sidebar / Issues board) so this read
+    // is served from the process-local board cache and a failed live refresh
+    // keeps the last-known review column rather than reading as "nothing
+    // assigned" — the same graceful-degradation the sidebar sections now get.
+    shelbi_state::issue_store_for(&project.name)
         .and_then(|s| s.list_in_status(&Column::review()))
         .ok()?
         .into_iter()
@@ -4130,6 +4141,10 @@ fn workspace_orphaned_by_board(
 }
 
 fn current_task_for(project: &Project, workspace_name: &str) -> Option<String> {
+    // `resolve_issue_store` with the already-loaded `&Project` (no redundant
+    // YAML re-read). It wraps the same process-local `CachedIssueStore` as the
+    // sidebar's reads, so on a failed live refresh the poller keeps observing
+    // the slot's last-known task from the snapshot rather than reading empty.
     shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
         .and_then(|s| s.list())
         .ok()?

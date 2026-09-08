@@ -27,6 +27,8 @@ mod hub_config;
 mod hub_version;
 mod issue_cache;
 pub use issue_cache::BOARD_CACHE_TTL;
+#[cfg(any(test, feature = "test-support"))]
+pub use issue_cache::seed_board_snapshot_for_test;
 pub mod issue_auth;
 pub mod issue_migrate;
 pub mod issue_store;

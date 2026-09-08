@@ -210,6 +210,21 @@ fn write_snapshot_to_disk(path: &Path, board: &[IssueFile]) {
     }
 }
 
+/// Test-support: seed the on-disk board snapshot for `project` exactly as a
+/// successful read would, so a *cold* process serves it (reported as
+/// [`BoardState::Stale`]) from [`IssueStore::list_state`] without any live read.
+///
+/// Lets cross-crate tests exercise the snapshot-served (degraded) render path —
+/// a remote board whose live refresh is failing — deterministically, without
+/// standing up a real backend. Keeps the snapshot's on-disk location and format
+/// encapsulated here rather than hardcoded in each test.
+#[cfg(any(test, feature = "test-support"))]
+pub fn seed_board_snapshot_for_test(project: &str, board: &[IssueFile]) {
+    if let Some(path) = snapshot_path(project) {
+        write_snapshot_to_disk(&path, board);
+    }
+}
+
 /// A remote [`IssueStore`] with non-blocking cached reads.
 ///
 /// Reads are served from the process-local snapshot; writes pass through and
