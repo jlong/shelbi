@@ -248,8 +248,12 @@ pub(super) fn heal_daemon_unit_path() {
 
 /// Whether a launchd plist already carries the `PATH` env key. The single marker
 /// the self-heal detection and [`render_launchd_plist`] must agree on — a test
-/// asserts a freshly-rendered plist satisfies it so the two can't drift.
-#[cfg(any(target_os = "macos", test))]
+/// asserts a freshly-rendered plist satisfies it so the two can't drift. Gated
+/// macOS-only (unlike its `systemd_unit_has_path` twin, which its unconditional
+/// test forces to `any(linux, test)`): [`render_launchd_plist`] is macOS-only, so
+/// the drift-guard test that consumes this helper is macOS-only too — compiling
+/// it for a Linux `--all-targets` test build would leave it caller-less.
+#[cfg(target_os = "macos")]
 fn launchd_unit_has_path(content: &str) -> bool {
     content.contains("<key>PATH</key>")
 }
