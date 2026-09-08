@@ -26,3 +26,9 @@ crossterm = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
+
+[dev-dependencies]
+# Test-only: a scoped subscriber capturing the one-line warning the event-log
+# reader emits when it detects (and heals) a cursor rewound behind its acked
+# high-water mark. Not linked into normal builds.
+tracing-subscriber = { workspace = true }
