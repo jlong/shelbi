@@ -73,7 +73,7 @@ pub fn list_active_workspaces(project_name: &str) -> Vec<ActiveWorkspace> {
         Ok(p) => p,
         Err(_) => return Vec::new(),
     };
-    let in_progress = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)
+    let in_progress = shelbi_state::issue_store_for(project_name)
         .and_then(|s| s.list_in_status(&Column::in_progress()))
         .unwrap_or_default();
 

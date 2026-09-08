@@ -321,6 +321,32 @@ fn parse_after_key(hay: &str, key: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// Whether a `gh` failure is a GitHub rate limit (primary or the
+/// content-creation *secondary* limit) or a 429. Public so the read-path park
+/// governor ([`crate::gh_budget`]) can decide to stop hitting the API without
+/// re-implementing the same classification the retry policy already applies —
+/// the two must agree on what "rate limited" means, so they share one source.
+pub fn is_rate_limit_error(err: &Error) -> bool {
+    matches!(classify(err), Disposition::RateLimited(_))
+}
+
+/// The absolute reset time (epoch seconds) a rate-limit error names in its
+/// captured body, if any: an `x-ratelimit-reset: <epoch>` header (present only
+/// when the call was made with `--include`, or on the typed park error) is an
+/// absolute epoch and is returned directly; a `Retry-After: <secs>` is relative,
+/// so it yields `now + secs`. `None` when neither is present — the caller then
+/// falls back to a free `rate_limit` probe for the real reset.
+pub fn rate_limit_reset_epoch(err: &Error, now: i64) -> Option<i64> {
+    let Error::Command { stderr, .. } = err else {
+        return None;
+    };
+    let lower = stderr.to_ascii_lowercase();
+    if let Some(reset) = parse_after_key(&lower, "x-ratelimit-reset") {
+        return Some(reset as i64);
+    }
+    parse_after_key(&lower, "retry-after").map(|secs| now + secs as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

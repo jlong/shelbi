@@ -28,3 +28,6 @@ libc = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 serde_yaml = { workspace = true }
+# The review-autoload freshness-guard test drives `autoload_review_queue` against
+# a `github` board via the injectable fake `gh` runner (behind this feature).
+shelbi-state = { workspace = true, features = ["test-support"] }

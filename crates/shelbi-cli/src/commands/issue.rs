@@ -374,25 +374,27 @@ pub fn run(project_opt: Option<String>, cmd: IssueCmd) -> Result<()> {
 /// backend (plan Decision D4 — comments are first-class). Routed through the
 /// [`IssueStore`] seam so it works the same on `file_system` or `github`.
 fn comment(project: &str, id: &str, text: &str) -> Result<()> {
-    let store = resolve_issue_store(project)?;
+    let store = cached_issue_store(project)?;
     let posted = store.add_comment(id, text).map_err(|e| anyhow!(e))?;
     println!("✓ commented on {id} (comment {})", posted.id);
     Ok(())
 }
 
-/// Resolve the project's configured issue-tracker backend into a live store.
-/// The project YAML's `issue_tracker` block selects and validates the backend
-/// (`file_system` by default, `github` for issues in a repo).
-fn resolve_issue_store(project: &str) -> Result<Box<dyn IssueStore>> {
-    let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    shelbi_state::resolve_issue_store(project, &project_yaml.issue_tracker).map_err(|e| anyhow!(e))
+/// The project's configured issue-tracker backend as a **cached** live store.
+/// Routes through [`shelbi_state::issue_store_for`] (the name-based cached read
+/// entry point) so every CLI read/list command shares the one process cache
+/// rather than constructing an uncached store; the project YAML's
+/// `issue_tracker` block still selects and validates the backend (`file_system`
+/// by default, `github` for issues in a repo).
+fn cached_issue_store(project: &str) -> Result<Box<dyn IssueStore>> {
+    shelbi_state::issue_store_for(project).map_err(|e| anyhow!(e))
 }
 
 /// Load one issue through the configured backend, erroring when it doesn't
 /// exist — the `Result<IssueFile>` shape the old `load_task` free function had,
 /// so callers that expect the issue to be present read the same.
 fn load_issue(project: &str, id: &str) -> Result<shelbi_state::IssueFile> {
-    resolve_issue_store(project)?
+    cached_issue_store(project)?
         .get(id)
         .map_err(|e| anyhow!(e))?
         .ok_or_else(|| anyhow!("issue `{id}` not found"))
@@ -482,7 +484,7 @@ fn add_with_stdin(project: &str, args: AddArgs, stdin_body: Option<String>) -> R
     // (priority = current length), validates deps (self-ref / unknown id /
     // cycle), and is create-exclusive — the authoritative no-overwrite
     // guarantee. The up-front existence checks above stay as advisory races.
-    let store = resolve_issue_store(project)?;
+    let store = cached_issue_store(project)?;
     let spec = shelbi_state::NewIssue {
         id: id.clone(),
         title: args.title.clone(),
@@ -571,7 +573,7 @@ fn list(
     // `in-progress`.
     let filter = status_filter.map(Column::from_status_id);
 
-    let all = resolve_issue_store(project)?.list().map_err(|e| anyhow!(e))?;
+    let all = cached_issue_store(project)?.list().map_err(|e| anyhow!(e))?;
     if all.is_empty() {
         println!("(no issues yet)");
         return Ok(());
@@ -626,7 +628,7 @@ fn show(project: &str, id: &str) -> Result<()> {
     // `github` backend never writes that file, so reading it would fail on a
     // GitHub-only issue. `render_task_file` reconstructs the exact
     // frontmatter+body representation from any backend's `IssueFile`.
-    let store = resolve_issue_store(project)?;
+    let store = cached_issue_store(project)?;
     let tf = store
         .get(id)
         .map_err(|e| anyhow!(e))?
@@ -691,7 +693,7 @@ fn depends(project: &str, args: DependsArgs) -> Result<()> {
     }
     tf.task.depends_on = updated;
 
-    let store = resolve_issue_store(project)?;
+    let store = cached_issue_store(project)?;
     let existing = store.list().map_err(|e| anyhow!(e))?;
     shelbi_state::validate_depends_on(&tf.task, &existing).map_err(|e| anyhow!(e))?;
     store
@@ -808,7 +810,7 @@ fn move_to(
     // Route the status change through the board seam. `move_status` returns a
     // `StatusMove`; unpack it back into the `(from, to, workflow)` tuple the
     // event-append + rollback logic below already speaks.
-    let store = resolve_issue_store(project)?;
+    let store = cached_issue_store(project)?;
     let moved = store
         .move_status(id, &column, reason.unwrap_or("user:cli"))
         .map_err(|e| anyhow!(e))?
@@ -1064,7 +1066,7 @@ fn assign(project: &str, id: &str, workspace: &str, force: bool) -> Result<()> {
     guard_review_slot(&project_yaml, ws, workspace, id, force)?;
     // `id` must exist — surface a clear error before the assignment write.
     load_issue(project, id)?;
-    let store = resolve_issue_store(project)?;
+    let store = cached_issue_store(project)?;
     store
         .set_fields(
             id,
@@ -1087,7 +1089,7 @@ fn unassign(project: &str, id: &str) -> Result<()> {
     // must stay unloaded, not be re-grabbed by the review auto-loader on the
     // next tick. `park_review_task` clears `assigned_to` and sets the parked
     // marker in one locked write. A non-review issue is a plain unassign.
-    let store = resolve_issue_store(project)?;
+    let store = cached_issue_store(project)?;
     if tf.task.column == Column::review() {
         store.park_review(id).map_err(|e| anyhow!(e))?;
         println!("✓ {id} unassigned (parked — won't auto-reload for review)");
@@ -1108,7 +1110,7 @@ fn unassign(project: &str, id: &str) -> Result<()> {
 
 fn prio(project: &str, args: PrioArgs) -> Result<()> {
     let tf = load_issue(project, &args.id)?;
-    let col = resolve_issue_store(project)?
+    let col = cached_issue_store(project)?
         .list_in_status(&tf.task.column)
         .map_err(|e| anyhow!(e))?;
     let pos = col
@@ -1131,7 +1133,7 @@ fn prio(project: &str, args: PrioArgs) -> Result<()> {
         bail!("specify one of --up, --down, --top, --bottom, --set N");
     };
 
-    let store = resolve_issue_store(project)?;
+    let store = cached_issue_store(project)?;
     store
         .set_priority(&args.id, shelbi_state::PrioMove::Set(new_pos as u32))
         .map_err(|e| anyhow!(e))?;
@@ -1231,7 +1233,7 @@ fn start(
     // Refuse to clobber another in-flight issue on the same workspace. Pulling
     // a workspace off mid-issue is intentional — make the user do it explicitly
     // via `issue move <other> --to todo` first.
-    let conflict = resolve_issue_store(project)?
+    let conflict = cached_issue_store(project)?
         .list_in_status(&Column::in_progress())
         .map_err(|e| anyhow!(e))?
         .into_iter()
@@ -1301,7 +1303,7 @@ fn start(
     // `in_progress` pointing at a pane that never launched.
     let original = tf.task.clone();
     let prev_column = tf.task.column.clone();
-    let store = resolve_issue_store(project)?;
+    let store = cached_issue_store(project)?;
     // `move_status` appends the card to `in_progress` and renumbers both the
     // source and destination columns; the follow-up `set_fields` records the
     // workspace + branch. Two locked writes through the store replace the old
@@ -1471,7 +1473,7 @@ fn start(
 /// both the column we bumped the card out of and `in_progress` (where the
 /// aborted card was briefly appended) so priorities stay contiguous.
 fn rollback_start(project: &str, original: &Issue, _body: &str, prev_column: Column) -> Result<()> {
-    let store = resolve_issue_store(project)?;
+    let store = cached_issue_store(project)?;
     // Move the card back out of `in_progress` (where `start` appended it) and
     // restore its pre-dispatch owner/branch. `move_status` renumbers both the
     // source and destination columns so priorities stay contiguous.
@@ -1572,7 +1574,7 @@ fn resume(
     // Refuse to clobber a DIFFERENT in-flight issue on the same workspace —
     // same guard as `start`. Resuming this issue onto a workspace busy with
     // another would leave two agents racing one worktree.
-    let conflict = resolve_issue_store(project)?
+    let conflict = cached_issue_store(project)?
         .list_in_status(&Column::in_progress())
         .map_err(|e| anyhow!(e))?
         .into_iter()
@@ -1609,7 +1611,7 @@ fn resume(
     let original = tf.task.clone();
     let prev_column = tf.task.column.clone();
     let moved_into_progress = prev_column != Column::in_progress();
-    let store = resolve_issue_store(project)?;
+    let store = cached_issue_store(project)?;
     if moved_into_progress {
         store
             .move_status(id, &Column::in_progress(), reason.unwrap_or("user:cli"))
@@ -2031,7 +2033,7 @@ fn edit_non_interactive(
     if fields.contains(&"body") {
         updates.body = Some(tf.body.clone());
     }
-    resolve_issue_store(project)?
+    cached_issue_store(project)?
         .set_fields(&args.id, updates)
         .map_err(|e| anyhow!(e))?;
 
@@ -2055,7 +2057,7 @@ fn edit_non_interactive(
 fn rm(project: &str, id: &str) -> Result<()> {
     let tf = load_issue(project, id)?;
     let column = tf.task.column;
-    let store = resolve_issue_store(project)?;
+    let store = cached_issue_store(project)?;
     store.delete(id).map_err(|e| anyhow!(e))?;
     store.renumber(&column).map_err(|e| anyhow!(e))?;
     println!("✓ {id} deleted");

@@ -21,6 +21,7 @@ use shelbi_core::{
 
 mod agent_workspaces;
 mod event_log;
+pub mod gh_budget;
 mod gh_retry;
 pub mod github_store;
 mod hub_config;
@@ -60,8 +61,9 @@ pub use issue_migrate::{
     PartialMigration,
 };
 pub use issue_store::{
-    issue_store_for, resolve_issue_store, BoardState, Cursor, FileSystemStore, IssueChange,
-    IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
+    issue_store_for, issue_store_for_project, resolve_issue_store, BoardState, Cursor,
+    FileSystemStore, IssueChange, IssueComment, IssueFields, IssueStore, NewIssue, PrioMove,
+    StatusMove,
 };
 pub use project_paths::ProjectPaths;
 pub use root::{
@@ -119,6 +121,7 @@ pub use workflows::{
     scaffold_project_workflow, statuses_path, workflow_path, workflows_dir,
 };
 pub use event_log::{
+    append_board_rate_limited_event,
     append_ci_event, append_clarification_event, append_dispatch_event, append_external_event,
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
     append_limit_resume_event, append_marker_deferred_event,
@@ -2711,6 +2714,29 @@ pub fn list_ready(project: &str) -> Result<Vec<IssueFile>> {
 pub fn idle_workspace_count(project: &Project) -> Result<usize> {
     let in_progress = list_column(&project.name, Column::in_progress())?;
     Ok(idle_workspace_count_from(&project.workspaces, &in_progress))
+}
+
+/// Like [`idle_workspace_count`], but read through the project's configured
+/// (cached) issue store and **gated on board freshness**. Returns `Some(count)`
+/// only when the whole-board read is [`BoardState::Warm`]; `None` when it is
+/// stale, cold, or the read failed. The heartbeat uses this so its
+/// `idle_workspaces=` number reflects a *trusted* board: `idle_workspace_count`
+/// reads the local `tasks/` directory, which for a `github` board is empty and
+/// so reports every workspace idle — the exact wrong signal during a rate-limit
+/// outage, when it would pull backlog work onto workers that are actually busy.
+/// A `file_system` board's read is always warm (its snapshot is authoritative),
+/// so this returns `Some` for it exactly as before.
+pub fn idle_workspace_count_warm(project: &Project) -> Result<Option<usize>> {
+    let store = issue_store_for_project(project)?;
+    let board = match store.list_state()? {
+        BoardState::Warm(board) => board,
+        BoardState::Stale(_) | BoardState::Cold => return Ok(None),
+    };
+    let in_progress: Vec<IssueFile> = board
+        .into_iter()
+        .filter(|tf| tf.task.column == Column::in_progress())
+        .collect();
+    Ok(Some(idle_workspace_count_from(&project.workspaces, &in_progress)))
 }
 
 /// Pure core of [`idle_workspace_count`]. Split out so unit tests can drive it
@@ -6860,5 +6886,143 @@ mod tests {
         let listed = list_agents("myapp").unwrap();
         assert!(listed.iter().any(|a| a == "developer"), "got: {listed:?}");
         std::env::remove_var("SHELBI_HOME");
+    }
+}
+
+#[cfg(test)]
+mod gh_freshness_guard_tests {
+    //! Freshness gating for the destructive/heartbeat paths against a `github`
+    //! board (plan Phase 0): a stale, cold, or failed read must never drive a
+    //! destructive action or a wrong heartbeat count. These cover the two guards
+    //! that live in this crate — the heartbeat's `idle_workspace_count_warm` and
+    //! the ready-marker path's reliance on `get` erroring (not returning
+    //! `Ok(None)`) on a failed read. The poller's reaper guards and the review
+    //! auto-load guard are covered in their own crates.
+    use super::*;
+    use crate::test_lock::LOCK;
+
+    fn fresh_home() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-gh-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// A `github`-backed project with one plain `dev` workspace. No `tasks/`
+    /// directory is created — the board lives (notionally) on GitHub, reached
+    /// through the fake `gh` runner the caller installs.
+    fn write_gh_project(home: &std::path::Path, name: &str) {
+        fs::create_dir_all(home.join("projects")).unwrap();
+        fs::write(
+            home.join(format!("projects/{name}.yaml")),
+            format!(
+                r#"name: {name}
+repo: /tmp/{name}
+default_branch: main
+issue_tracker:
+  backend: github
+  github:
+    repo: owner/repo
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+machines:
+  - name: local
+    kind: local
+    work_dir: /tmp/{name}
+workspaces:
+  - {{ name: dev, machine: local, runner: claude }}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn gh_issue_json(id: &str, status: &str) -> String {
+        format!(
+            r#"{{"number":7,"title":"{id}","body":"Prose for {id}.","state":"open","labels":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/{status}"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
+        )
+    }
+
+    #[test]
+    fn idle_workspace_count_warm_is_none_on_a_cold_or_failed_read() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let name = "ghguard-idle-cold";
+        write_gh_project(&home, name);
+        // A failing runner: the board never warms, so `list_state` stays Cold and
+        // the heartbeat must not report a (wrong, all-idle) count off it.
+        set_test_gh_runner(|_| Err(shelbi_core::Error::Other("boom".into())));
+        let project = load_project(name).unwrap();
+        assert_eq!(
+            idle_workspace_count_warm(&project).unwrap(),
+            None,
+            "a cold/failed board must not yield an idle count"
+        );
+        clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn idle_workspace_count_warm_counts_from_a_warm_board() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let name = "ghguard-idle-warm";
+        write_gh_project(&home, name);
+        // One in-progress issue with no assignment overlay → the single `dev`
+        // workspace is idle, so a warm read reports exactly one idle workspace.
+        set_test_gh_runner(move |args: &[&str]| -> Result<String> {
+            let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+            if path.ends_with("/labels") || path.contains("/comments") {
+                return Ok(String::new());
+            }
+            Ok(gh_issue_json("t", "in-progress"))
+        });
+        // Prime the process cache so `list_state` reports Warm.
+        let _ = issue_store_for(name).unwrap().list().unwrap();
+        let project = load_project(name).unwrap();
+        assert_eq!(
+            idle_workspace_count_warm(&project).unwrap(),
+            Some(1),
+            "warm board: `dev` is idle (no assignment)"
+        );
+        clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn get_errors_rather_than_returning_none_on_a_failed_read() {
+        // The ready-marker path clears a marker on `Ok(None)` (task genuinely
+        // gone) but defers on `Err`. A failed / rate-limit-parked read must be
+        // `Err`, never `Ok(None)`, so a finished task is not stranded by a
+        // cleared marker during an outage — the "no destructive action on a
+        // failed read" guard for the ready-marker path.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let name = "ghguard-get-fail";
+        write_gh_project(&home, name);
+        set_test_gh_runner(|_| Err(shelbi_core::Error::Other("API rate limit exceeded".into())));
+        let store = issue_store_for(name).unwrap();
+        assert!(
+            store.get("t").is_err(),
+            "a failed single-issue read must be Err, not Ok(None)"
+        );
+        clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -107,7 +107,7 @@ pub fn run(
         .filter(|s| !s.is_empty())
         .and_then(|tid| {
             let store =
-                shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker).ok()?;
+                shelbi_state::issue_store_for(&project.name).ok()?;
             store.get(&tid).ok().flatten()
         })
         .map(|tf| tf.task.launch)

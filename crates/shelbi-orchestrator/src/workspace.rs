@@ -371,7 +371,7 @@ pub fn probe_review_slot_serving(
 ) -> Option<ReviewServing> {
     let machine = project.machine(&workspace.machine)?;
     let host = machine.host();
-    let tf = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+    let tf = shelbi_state::issue_store_for_project(project)
         .ok()?
         .get(task_id)
         .ok()
@@ -4652,7 +4652,7 @@ fn resolve_handoff_base_branch(project: &Project, task_id: &str) -> String {
 /// workflow can't be loaded, the workflow has no `git.base_branch`, or a
 /// placeholder in it can't be resolved from the task's params.
 fn resolve_workflow_base_branch(project: &Project, task_id: &str) -> Option<String> {
-    let task_file = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+    let task_file = shelbi_state::issue_store_for_project(project)
         .ok()?
         .get(task_id)
         .ok()
@@ -4772,7 +4772,7 @@ fn review_dispatch_extras(
 /// render it as a prompt section — or `None` when there's no recipe (diff-only)
 /// or the task/workflow can't be loaded.
 fn review_recipe_section(project: &Project, task_id: &str, port: Option<u16>) -> Option<String> {
-    let tf = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)
+    let tf = shelbi_state::issue_store_for_project(project)
         .ok()?
         .get(task_id)
         .ok()

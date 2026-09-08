@@ -41,7 +41,7 @@ pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
     // this shared boundary rather than relying on every UI surface to remember.
     shelbi_state::ensure_daemon_matches_for_mutation()?;
     let project = shelbi_state::load_project(project_name)?;
-    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let store = shelbi_state::issue_store_for_project(&project)?;
     let tf = store
         .get(task_id)?
         .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
@@ -101,7 +101,7 @@ pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
 /// lives in one place.
 pub fn free_review_workspaces(project_name: &str) -> Result<Vec<WorkspaceSpec>> {
     let project = shelbi_state::load_project(project_name)?;
-    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let store = shelbi_state::issue_store_for_project(&project)?;
     let review_tag: BTreeSet<String> = std::iter::once("review".to_string()).collect();
     let mut active = store.list_in_status(&Column::in_progress())?;
     active.extend(store.list_in_status(&Column::review())?);
@@ -147,7 +147,7 @@ pub struct ReviewSlotOccupant {
 /// review-column scan the busy check does, so the two never disagree.
 pub fn review_slots(project_name: &str) -> Result<Vec<ReviewSlot>> {
     let project = shelbi_state::load_project(project_name)?;
-    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let store = shelbi_state::issue_store_for_project(&project)?;
     let mut active = store.list_in_status(&Column::in_progress())?;
     active.extend(store.list_in_status(&Column::review())?);
     Ok(review_slots_from(&project, &active))
@@ -304,7 +304,7 @@ fn load_review_task_locked(
     workspace_name: &str,
 ) -> Result<String> {
     let project = shelbi_state::load_project(project_name)?;
-    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let store = shelbi_state::issue_store_for_project(&project)?;
     let ws = project
         .workspace(workspace_name)
         .filter(|w| project.effective_tags(w).contains("review"))
@@ -411,9 +411,23 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
     let _guard = shelbi_state::lock_review_load(project_name)?;
 
     let project = shelbi_state::load_project(project_name)?;
-    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
-    // Board order (priority, then id) — the same order the sidebar shows.
-    let review_tasks = store.list_in_status(&Column::review())?;
+    let store = shelbi_state::issue_store_for_project(&project)?;
+    // Require a WARM board read before consuming a scarce review slot. A stale
+    // snapshot (a rate-limit park serving the last board), a cold cache, or a
+    // failed read cannot prove a task is still sitting in review awaiting a slot;
+    // auto-loading off one would dispatch against untrusted state. Skip the tick
+    // and retry when the board is warm again — the same "no destructive action
+    // on a stale read" rule the poller's reapers follow.
+    let review_tasks: Vec<IssueFile> = match store.list_state()? {
+        shelbi_state::BoardState::Warm(board) => board
+            .into_iter()
+            // Board order (priority, then id) — the same order the sidebar shows.
+            .filter(|tf| tf.task.column == Column::review())
+            .collect(),
+        shelbi_state::BoardState::Stale(_) | shelbi_state::BoardState::Cold => {
+            return Ok(Vec::new())
+        }
+    };
     // Only tasks whose workflow review status is *review-tagged* may be
     // auto-grabbed onto a scarce review slot. A handoff status that declares no
     // `review` tag (an orchestrator-owned `review` status, the bare default
@@ -685,7 +699,7 @@ pub struct AutoLoadedReview {
 /// through [`dispatch_task_onto`] launches the Review agent.
 pub fn load_task_for_review(project_name: &str, task_id: &str) -> Result<String> {
     let project = shelbi_state::load_project(project_name)?;
-    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let store = shelbi_state::issue_store_for_project(&project)?;
     let tf = store
         .get(task_id)?
         .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
@@ -768,7 +782,7 @@ fn dispatch_task_onto(
     let branch = branch::branch_name_for_task(project, Some(workflow), &tf.task)?;
 
     let agent = dispatch_agent_for(project, ws, agent);
-    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let store = shelbi_state::issue_store_for_project(project)?;
 
     // Persist the assignment before dispatch so a concurrent load can't pick
     // the same slot, and roll it back on a dispatch failure. `set_fields` does
@@ -1534,6 +1548,39 @@ mod tests {
         assert_eq!(after.task.assigned_to.as_deref(), Some("alpha"));
         assert!(after.task.branch.is_none());
 
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn autoload_review_queue_skips_a_non_warm_github_board() {
+        // Freshness guard (plan Phase 0): auto-load must not consume a scarce
+        // review slot off a stale/cold/failed board. A `github` project whose
+        // board never warms (a failing `gh` runner, standing in for a rate-limit
+        // park) must produce no auto-loads and no dispatch — the tick is skipped
+        // and retried when the board is warm again.
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let mut project = tagged_project();
+        project.name = "ghguard-autoload".into();
+        project.issue_tracker = shelbi_core::IssueTrackerConfig {
+            backend: shelbi_core::IssueTrackerBackend::Github,
+            github: Some(shelbi_core::GithubConnection {
+                repo: "owner/repo".into(),
+            }),
+            ..Default::default()
+        };
+        shelbi_state::save_project(&project).unwrap();
+        shelbi_state::set_test_gh_runner(|_| Err(shelbi_core::Error::Other("boom".into())));
+
+        let loaded = autoload_review_queue("ghguard-autoload").unwrap();
+        assert!(
+            loaded.is_empty(),
+            "a non-warm board must yield no auto-loads, got {loaded:?}"
+        );
+
+        shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
