@@ -154,6 +154,13 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     // pre-existing dead-but-assigned slot on purpose.
     let mut review_resume: HashMap<String, ReviewResumeState> = HashMap::new();
 
+    // Per-dev-slot crash-loop bookkeeping for the resume-a-stranded-dev-slot
+    // pass. Project-wide (it walks every non-review slot), so it lives on the
+    // supervisor tick alongside `review_resume`, keyed by workspace name. A
+    // poller restart re-seeds it to empty, which is correct: this pass adopts a
+    // pre-existing dead-but-assigned slot on purpose (the `quit`+reopen case).
+    let mut dev_resume: HashMap<String, DevResumeState> = HashMap::new();
+
     // Scoped CI poll state. Project-wide (needs the whole in-review set), so it
     // lives on the supervisor tick. Its own cadence (`CI_POLL_CADENCE`) keeps
     // the GitHub round-trips gentle, independent of the 5s supervisor tick, and
@@ -264,6 +271,18 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
                 // clobbered, and crash-loop-capped so a slot that can't stay up
                 // surfaces a gave-up line instead of relaunching forever.
                 maybe_resume_stranded_review_slots(&project, &mut review_resume);
+
+                // Resume a *dev* slot whose `in_progress` task is assigned on
+                // disk but whose pane is dead and never seen alive this session
+                // — the `quit`+reopen case the per-workspace pane supervisor
+                // refuses to adopt (it only restarts a pane it saw come up and
+                // then die). Without this, reopening a project with in-flight
+                // dev work strands each worker: assigned on the board, pane gone,
+                // brought back by nobody. Relaunches via `--continue` so the
+                // conversation is preserved; crash-loop-capped, and it stands
+                // down the moment the pane is alive so it never races the pane
+                // supervisor's fresh-restart path.
+                maybe_resume_stranded_dev_slots(&project, &mut dev_resume);
 
                 // Scoped CI poll: for every in-review PR, sample its checks and
                 // emit a `ci` state-change on a pass/fail transition so CI flows
@@ -3750,6 +3769,234 @@ fn assigned_review_task_for(project: &Project, workspace_name: &str) -> Assigned
     }
 }
 
+/// Per-dev-slot crash-loop bookkeeping for [`maybe_resume_stranded_dev_slots`].
+///
+/// The dev analogue of [`ReviewResumeState`], with one extra guard that its
+/// review cousin doesn't need: an `ever_alive` latch. A dev slot's `in_progress`
+/// task is *active*, so the ordinary per-workspace pane supervisor
+/// ([`maybe_supervise_workspace`], backed by
+/// [`shelbi_orchestrator::supervision::SupervisionState`]) already relaunches it
+/// with a fresh context-clearing dispatch when it crashes after coming up. This
+/// pass exists only for the case that supervisor deliberately refuses: a slot
+/// whose pane is dead *from the poller's first sighting* — a `quit`+reopen — has
+/// never been seen alive, so `SupervisionState`'s "don't adopt a pre-existing
+/// dead pane" guard leaves it stranded. We adopt exactly that pane and bring it
+/// back with a conversation-preserving `resume` (`claude --continue`). Once the
+/// pane is alive again we set `ever_alive` and hand all future crashes back to
+/// the pane supervisor, so the two never double-launch the same slot.
+#[derive(Debug, Default)]
+struct DevResumeState {
+    /// Seen alive since this poller started. Once set, this pass stands down
+    /// for the slot — a later crash is the pane supervisor's to restart.
+    ever_alive: bool,
+    /// Resume timestamps still inside [`CRASH_LOOP_WINDOW`] (pruned each
+    /// decision). Length is the crash-loop counter.
+    restarts: Vec<Instant>,
+    /// Latched once the gave-up line is emitted, so it neither spams nor resumes
+    /// while the slot stays down. Cleared when the slot recovers.
+    gave_up: bool,
+}
+
+impl DevResumeState {
+    /// The slot's pane is alive (booting, or resumed and serving). Latch
+    /// `ever_alive` so future crashes belong to the pane supervisor, and — once
+    /// it has stayed up past [`STABLE_RECOVERY`] since our last resume — forget
+    /// the crash history so an unrelated crash much later starts from zero.
+    fn note_alive(&mut self, now: Instant) {
+        self.ever_alive = true;
+        match self.restarts.last() {
+            Some(&last) if now.duration_since(last) >= STABLE_RECOVERY => {
+                self.restarts.clear();
+                self.gave_up = false;
+            }
+            Some(_) => {}
+            None => self.gave_up = false,
+        }
+    }
+
+    /// The slot's pane is dead and never seen alive by this pass (the stranded
+    /// reopen case). Decide whether to resume now, wait out the backoff, or give
+    /// up. `now` is threaded in so the timing is unit-testable.
+    fn decide_dead(&mut self, now: Instant) -> ReviewResumeAction {
+        if self.gave_up {
+            return ReviewResumeAction::None;
+        }
+        self.restarts
+            .retain(|&t| now.duration_since(t) < CRASH_LOOP_WINDOW);
+        if self.restarts.len() >= MAX_RESTARTS_IN_WINDOW {
+            self.gave_up = true;
+            return ReviewResumeAction::GaveUp;
+        }
+        if let Some(&last) = self.restarts.last() {
+            let wait = BASE_BACKOFF * (1u32 << (self.restarts.len() - 1));
+            if now.duration_since(last) < wait {
+                return ReviewResumeAction::None;
+            }
+        }
+        self.restarts.push(now);
+        ReviewResumeAction::Resume
+    }
+}
+
+/// Resume any *dev* slot whose `in_progress` task is assigned on disk but whose
+/// pane is dead and was never seen alive this session — the `quit`+reopen half
+/// of pane recovery that the ordinary supervisor deliberately skips.
+///
+/// On reopen a stranded dev task is dead from the poller's first sighting, so
+/// [`maybe_supervise_workspace`]'s `ever_alive` guard refuses to adopt it and
+/// nothing brings the worker back without a hand `shelbi issue resume`. This
+/// closes that gap the same way [`maybe_resume_stranded_review_slots`] closes it
+/// for review slots — one resume per stranded task, crash-loop-capped — but
+/// relaunches through [`resume_workspace_on_task`] so a claude worker reloads
+/// its prior conversation via `--continue` (a real *resume*, not a fresh
+/// context-clearing dispatch).
+///
+/// For each **local**, non-`review` slot: probe the pane; if alive, latch it and
+/// let the pane supervisor own any future crash. If it's dead but this pass has
+/// already seen it alive, stand down (a genuine crash is the supervisor's). If
+/// it's dead and never seen alive, and a live `in_progress` task is still
+/// assigned (and not parked), resume it. Probe failures read as ALIVE so a
+/// transient tmux hiccup never triggers a resume onto a genuinely working slot.
+fn maybe_resume_stranded_dev_slots(
+    project: &Project,
+    state: &mut HashMap<String, DevResumeState>,
+) {
+    for ws in &project.workspaces {
+        // Review slots have their own resume pass; this one is dev-only.
+        if project.effective_tags(ws).contains("review") {
+            continue;
+        }
+        let Some(machine) = project.machine(&ws.machine) else {
+            continue;
+        };
+        let host = machine.host();
+        // Local slots only, same rationale as the pane supervisor: a remote
+        // dead pane can't be told apart from a deliberate teardown.
+        if !matches!(host, shelbi_core::Host::Local) {
+            continue;
+        }
+        let Ok(addr) = shelbi_orchestrator::workspace::workspace_tmux_addr(project, ws) else {
+            continue;
+        };
+        let now = Instant::now();
+        let entry = state.entry(ws.name.clone()).or_default();
+
+        // Uncertainty (a probe error) reads as ALIVE so a transient tmux hiccup
+        // never triggers a resume that would clobber a genuinely working slot.
+        let alive =
+            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true);
+        if alive {
+            entry.note_alive(now);
+            continue;
+        }
+
+        // Pane dead. Only the never-seen-alive (reopen) case is ours; a pane
+        // that came up and later crashed is the supervisor's fresh-restart job,
+        // and acting here too would double-launch the slot.
+        if entry.ever_alive {
+            continue;
+        }
+
+        // Nothing to resume unless a live `in_progress` task is still assigned
+        // to this slot; if not, drop the crash history.
+        let Some(task_id) = current_task_for(project, &ws.name) else {
+            state.remove(&ws.name);
+            continue;
+        };
+
+        // A task the operator deliberately parked must STAY down — resuming it
+        // is the churn loop. (Belt-and-suspenders: parking normally clears the
+        // assignment too, so `current_task_for` usually already returns None.)
+        if shelbi_state::is_task_parked(&project.name, &task_id).unwrap_or(false) {
+            state.remove(&ws.name);
+            continue;
+        }
+
+        match entry.decide_dead(now) {
+            ReviewResumeAction::None => {}
+            ReviewResumeAction::Resume => match resume_dev_workspace(project, ws, &task_id) {
+                Ok(()) => {
+                    let _ = shelbi_state::append_dispatch_event(
+                        &task_id,
+                        &ws.name,
+                        "dev-resume",
+                        "resuming stranded dev slot after restart/crash",
+                    );
+                    tracing::info!(
+                        project = %project.name,
+                        task = %task_id,
+                        workspace = %ws.name,
+                        "resumed stranded dev slot",
+                    );
+                }
+                Err(e) => {
+                    let _ = shelbi_state::append_dispatch_event(
+                        &task_id,
+                        &ws.name,
+                        "dev-resume-failed",
+                        &e,
+                    );
+                    tracing::warn!(
+                        project = %project.name,
+                        task = %task_id,
+                        workspace = %ws.name,
+                        error = %e,
+                        "dev-slot resume failed",
+                    );
+                }
+            },
+            ReviewResumeAction::GaveUp => {
+                if let Err(e) = shelbi_state::append_supervision_event(
+                    &project.name,
+                    Some(&ws.name),
+                    "gave-up",
+                    "dev-resume-crash-loop",
+                ) {
+                    tracing::warn!(workspace = %ws.name, error = %e, "append_supervision_event failed");
+                }
+                tracing::warn!(
+                    project = %project.name,
+                    workspace = %ws.name,
+                    "gave up resuming dev slot after the crash-loop cap; left for the user",
+                );
+            }
+        }
+    }
+}
+
+/// Relaunch `workspace` on its stranded `task_id` as a conversation-preserving
+/// resume. Mirrors [`redispatch_workspace`]'s resolution (issue → workflow →
+/// branch → active agent) but calls [`resume_workspace_on_task`] instead of the
+/// context-clearing [`start_workspace_on_task`], so a claude worker comes back
+/// with `--continue`. The card is already `in_progress` and assigned to the
+/// slot, so no board move is made here.
+fn resume_dev_workspace(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    task_id: &str,
+) -> std::result::Result<(), String> {
+    let tf = load_issue(project, task_id).map_err(|e| e.to_string())?;
+    let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
+        .map_err(|e| e.to_string())?;
+    let branch =
+        shelbi_orchestrator::branch::branch_name_for_task(project, Some(&workflow), &tf.task)
+            .map_err(|e| e.to_string())?;
+    let agent = shelbi_orchestrator::dispatch::resolve_active_agent(&project.name, &tf.task);
+    shelbi_orchestrator::workspace::resume_workspace_on_task(
+        shelbi_orchestrator::workspace::StartSpec {
+            project,
+            workspace,
+            task_id,
+            branch: &branch,
+            task_body: &tf.body,
+            agent: Some(&agent),
+            launch_override: tf.task.launch.as_ref(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Drive a `review`-tagged slot's serving lifecycle for one poll tick. Returns
 /// `true` when it took authoritative action (recorded serving, or reaped an
 /// orphan) and the caller should skip the rest of the tick; `false` when the
@@ -4345,6 +4592,71 @@ mod tests {
             s.decide_dead(t0 + STABLE_RECOVERY + Duration::from_secs(2)),
             ReviewResumeAction::Resume
         );
+    }
+
+    // -- dev-slot resume state machine --------------------------------------
+
+    #[test]
+    fn dev_resume_adopts_a_pane_dead_from_the_first_sighting() {
+        // The reopen case: a dev slot dead the first time this pass looks at it
+        // (never seen alive) is exactly the pane `SupervisionState` refuses to
+        // adopt, so this pass must resume it.
+        let mut s = DevResumeState::default();
+        let t = Instant::now();
+        assert!(!s.ever_alive);
+        assert_eq!(s.decide_dead(t), ReviewResumeAction::Resume);
+    }
+
+    #[test]
+    fn dev_resume_stands_down_once_the_pane_has_been_seen_alive() {
+        // After the resumed pane comes up, this pass latches `ever_alive` and
+        // hands future crashes to the pane supervisor's fresh-restart path — so
+        // the two never double-launch the same slot. The caller enforces the
+        // hand-off by skipping `decide_dead` while `ever_alive` is set; this
+        // asserts the latch that gates it.
+        let mut s = DevResumeState::default();
+        let t = Instant::now();
+        assert_eq!(s.decide_dead(t), ReviewResumeAction::Resume);
+        s.note_alive(t + Duration::from_secs(1));
+        assert!(s.ever_alive, "a live sighting must latch the hand-off guard");
+    }
+
+    #[test]
+    fn dev_resume_backs_off_then_caps_into_gave_up() {
+        // Same crash-loop cap + exponential backoff as the review pass, so a
+        // dev slot that can't boot stops relaunching after the cap.
+        let mut s = DevResumeState::default();
+        let t0 = Instant::now();
+        assert_eq!(s.decide_dead(t0), ReviewResumeAction::Resume);
+        assert_eq!(
+            s.decide_dead(t0 + Duration::from_secs(1)),
+            ReviewResumeAction::None,
+            "inside the backoff window → wait"
+        );
+        let t1 = t0 + BASE_BACKOFF + Duration::from_secs(1);
+        assert_eq!(s.decide_dead(t1), ReviewResumeAction::Resume);
+        let t2 = t1 + BASE_BACKOFF * 2 + Duration::from_secs(1);
+        assert_eq!(s.decide_dead(t2), ReviewResumeAction::Resume);
+        let t3 = t2 + BASE_BACKOFF * 4 + Duration::from_secs(1);
+        assert_eq!(s.decide_dead(t3), ReviewResumeAction::GaveUp);
+        assert_eq!(
+            s.decide_dead(t3 + Duration::from_secs(1)),
+            ReviewResumeAction::None,
+            "give-up is emitted once, then quiet"
+        );
+    }
+
+    #[test]
+    fn dev_resume_clears_history_once_the_slot_recovers() {
+        let mut s = DevResumeState::default();
+        let t0 = Instant::now();
+        assert_eq!(s.decide_dead(t0), ReviewResumeAction::Resume);
+        // Briefly alive (before STABLE_RECOVERY) keeps the history…
+        s.note_alive(t0 + Duration::from_secs(1));
+        assert_eq!(s.restarts.len(), 1);
+        // …alive past STABLE_RECOVERY forgets it.
+        s.note_alive(t0 + STABLE_RECOVERY + Duration::from_secs(1));
+        assert!(s.restarts.is_empty());
     }
 
     /// A unique temp SHELBI_HOME for a serving test, keyed by pid+nanos.
