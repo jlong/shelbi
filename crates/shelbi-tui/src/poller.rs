@@ -4608,6 +4608,41 @@ Intro prose.
     }
 
     #[test]
+    fn live_context_tip_row_under_spinner_reads_working() {
+        // THE REGRESSION (captured live 2026-09-08 on golf): a large-context
+        // pane draws its context-pressure tip row (`⎿  Tip: …`) between the
+        // spinner and the input box. The last-non-empty scan landed on the tip,
+        // not the spinner, so the sidebar read a hard-working slot as
+        // AwaitingInput for its whole turn. The tip-tolerant spinner scan must
+        // classify this as Working.
+        let screen = "\
+· Metamorphosing… (45m 35s · ↓ 154.6k tokens · thinking with high effort)
+  ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  Model: Opus 4.8 | Ctx: 338.6k | ⎇ jlong/gh-cache-p0 | (+767,-93)";
+        assert_eq!(
+            live_workspace_state(screen),
+            Some(WorkspaceState::Working)
+        );
+
+        // A completed `⏺` turn followed by the same tip row is still idle:
+        // skipping the tip row must not promote the finished-turn row.
+        let done = "\
+⏺ Done. (1m 4s · 12.0k tokens)
+  ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents";
+        assert_eq!(
+            live_workspace_state(done),
+            Some(WorkspaceState::AwaitingInput)
+        );
+    }
+
+    #[test]
     fn first_observation_is_a_transition_from_none() {
         let out = decide("alpha", None, None, WorkspaceState::Working, ts(100));
         assert!(out.transitioned);
