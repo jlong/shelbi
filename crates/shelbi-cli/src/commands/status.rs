@@ -159,7 +159,73 @@ fn print_summary(project: &str) -> Result<()> {
     if let Some(line) = github_summary_line(project) {
         println!("github: {line}");
     }
+    for task in review_tasks_missing_pr(project) {
+        println!("review: {task} — no PR");
+    }
     Ok(())
+}
+
+/// Ids of review-column (handoff-category) tasks whose PR-opening workflow
+/// declares `open_pr` yet have no open GitHub PR for their branch — the
+/// review-with-no-PR state the ready-handoff gate is meant to prevent, surfaced
+/// here so any that slip through (a manual move, an out-of-band PR close) are
+/// visible instead of silent.
+///
+/// Best-effort and side-effect free: every failure (project unreadable, no hub
+/// machine, a `gh` error) drops the check rather than the whole `status`
+/// output, and a task is flagged only when its workflow actually opens PRs — so
+/// a subtask / research flow that never opens one is never mislabeled.
+fn review_tasks_missing_pr(project: &str) -> Vec<String> {
+    let Ok(p) = shelbi_state::load_project(project) else {
+        return Vec::new();
+    };
+    // Run the `gh pr list --head <branch>` probe from the hub's checkout: it
+    // queries GitHub for the branch regardless of any worktree, and gh reads
+    // the repo from the cwd, so the hub work_dir names the right repository.
+    let Some((host, hub_wt)) = p
+        .machines
+        .iter()
+        .find(|m| matches!(m.kind, MachineKind::Local))
+        .map(|m| (m.host(), m.work_dir.to_string_lossy().into_owned()))
+    else {
+        return Vec::new();
+    };
+    let Ok(board) = shelbi_state::read_board(project) else {
+        return Vec::new();
+    };
+    let mut missing = Vec::new();
+    for tf in board.into_issues() {
+        if tf.task.column.category() != StatusCategory::Handoff {
+            continue;
+        }
+        let Some(branch) = tf.task.branch.as_deref() else {
+            continue;
+        };
+        // Only a workflow that opens PRs can be "missing" one.
+        let Ok(workflow) = shelbi_state::load_task_workflow(project, &p, &tf.task) else {
+            continue;
+        };
+        if !workflow_opens_pr(&workflow) {
+            continue;
+        }
+        // Ok(None) is a clean "no open PR"; a real gh error (auth/network)
+        // propagates as Err and we skip rather than cry wolf.
+        if let Ok(None) = shelbi_orchestrator::actions::detect_open_pr(&host, &hub_wt, branch) {
+            missing.push(tf.task.id.clone());
+        }
+    }
+    missing
+}
+
+/// Whether any transition in `workflow` declares the `open_pr` action — i.e.
+/// the workflow's review stage is PR-backed. Used to avoid flagging a review
+/// task in a PR-less flow (subtask/research) as "no PR".
+fn workflow_opens_pr(workflow: &shelbi_core::Workflow) -> bool {
+    workflow
+        .transitions
+        .iter()
+        .flatten()
+        .any(|t| t.actions.contains(&shelbi_core::TransitionAction::OpenPr))
 }
 
 // ---------------------------------------------------------------------------
@@ -934,6 +1000,73 @@ issue_tracker:\n\
         assert_eq!(counts.active, 1);
         assert_eq!(counts.handoff, 1);
         assert_eq!(counts.done, 3);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn workflow_opens_pr_detects_pr_backed_flows() {
+        // The `task` flow opens a PR on `in-progress -> review`; the `subtask`
+        // flow merges without one; the bare `default` declares no transitions.
+        assert!(workflow_opens_pr(&shelbi_core::task_workflow()));
+        assert!(!workflow_opens_pr(&shelbi_core::subtask_workflow()));
+        assert!(!workflow_opens_pr(&shelbi_core::default_workflow()));
+    }
+
+    #[test]
+    fn review_tasks_missing_pr_flags_a_review_card_without_a_pr() {
+        // Criterion 4: a review card whose PR-backed workflow has no open PR is
+        // visible in `shelbi status`. Provision a real hub repo (scaffolds the
+        // PR-opening `task` workflow), put a task in the review column, and stub
+        // `gh pr list` to report no PR — the task must be flagged.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let _repo = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
+
+        let mut task = make_task("r1", Column::review());
+        task.branch = Some("shelbi/r1".into());
+        shelbi_state::save_task("p", &task, "").unwrap();
+
+        // A `gh` stub that reports no open PR (empty stdout, exit 0), so
+        // `detect_open_pr` returns `Ok(None)` deterministically whether or not a
+        // real `gh` is installed. `run_in_dir` sources `~/.profile`, so
+        // prepending the stub dir there (HOME pinned) shadows `gh`; real `git`
+        // still resolves from the system PATH.
+        let bin = home.join("stub-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("gh"), "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            home.join(".profile"),
+            format!("export PATH=\"{}:$PATH\"\n", bin.display()),
+        )
+        .unwrap();
+        let prev_home = std::env::var_os("HOME");
+        let prev_shell = std::env::var_os("SHELL");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("SHELL", "/bin/sh");
+
+        let missing = review_tasks_missing_pr("p");
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_shell {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+
+        assert!(
+            missing.iter().any(|id| id == "r1"),
+            "a review card with no PR must be flagged; got {missing:?}"
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

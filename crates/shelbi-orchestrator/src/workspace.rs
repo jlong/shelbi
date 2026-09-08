@@ -863,8 +863,10 @@ impl RebaseOutcome {
 pub fn fetch_origin_base_ref(host: &Host, worktree: &Path, base_branch: &str) -> String {
     let wt = worktree.to_string_lossy().into_owned();
     // Best-effort: ignore the fetch's exit status; the rev-parse below is the
-    // authority on whether a usable `origin/<base>` tip now exists.
-    let _ = shelbi_ssh::run(
+    // authority on whether a usable `origin/<base>` tip now exists. Bounded so a
+    // wedged network fetch (dead SSH connection) can't freeze the poller thread
+    // — a timeout falls through to the local `base_branch` name below.
+    let _ = run_git_bounded(
         host,
         [
             "git", "-C", &wt, "fetch", "--quiet", "origin", "--", base_branch,
@@ -1201,12 +1203,34 @@ impl PushOutcome {
     }
 }
 
+/// Wall-clock ceiling on a single git invocation the poller's ready-handoff
+/// drives directly (the pre-handoff `push`, its `ls-remote` tip read, and the
+/// rebase's `git fetch`). These reach the network — a `git push` spawns
+/// `ssh git@github.com git-receive-pack` — and a dead SSH connection can leave
+/// that child parked for many minutes with no output. The poller runs one
+/// workspace per thread, so an unbounded hang freezes that workspace's whole
+/// poll loop (the six-minute freeze this guards against). 120s is far above any
+/// healthy push/fetch yet bounds the wedge; a timeout surfaces as a failed step
+/// that leaves the ready marker in place to retry next tick.
+const POLLER_GIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run a git command on `host` under the [`POLLER_GIT_DEADLINE`] wall-clock
+/// bound. A timeout comes back as `ErrorKind::TimedOut`, which the ready-handoff
+/// push/fetch callers already map to a failed step.
+fn run_git_bounded<I, S>(host: &Host, argv: I) -> std::io::Result<std::process::Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    shelbi_ssh::run_with_deadline(host, argv, POLLER_GIT_DEADLINE)
+}
+
 /// Read the exact tip `origin/<branch>` currently points at, querying the
 /// remote itself (`git ls-remote`) rather than the possibly-stale local
 /// remote-tracking ref. `Ok(None)` when origin has no such branch yet (never
 /// pushed, or a local-only repo). `Err(reason)` when the query itself failed.
 fn origin_branch_tip(host: &Host, wt: &str, branch: &str) -> std::result::Result<Option<String>, String> {
-    let out = shelbi_ssh::run(
+    let out = run_git_bounded(
         host,
         ["git", "-C", wt, "ls-remote", "--heads", "origin", branch],
     )
@@ -1380,7 +1404,7 @@ pub fn push_workspace_branch_to_origin(host: &Host, worktree: &Path, branch: &st
     argv.push("origin".into());
     argv.push(refspec);
 
-    match shelbi_ssh::run(host, &argv) {
+    match run_git_bounded(host, &argv) {
         Ok(o) if o.status.success() => PushOutcome::Pushed {
             local_sha,
             remote_before: remote_sha,

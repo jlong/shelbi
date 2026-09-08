@@ -211,7 +211,56 @@ pub fn execute_transition_except(
     to: &str,
     skip: &[TransitionAction],
 ) -> Result<Vec<ActionOutcome>> {
-    let target = resolve_effective_target(workflow, task, from, to)?;
+    run_transition_actions(project, project_name, task, task_body, workflow, from, to, skip)
+        .map_err(|(_, e)| e)
+}
+
+/// Which transition action failed, paired with the error it raised — the
+/// error half of [`execute_transition_reporting`]. `action` is `None` when the
+/// failure came from target resolution or a `run:`/`ready:` shell command
+/// rather than a named git action.
+#[derive(Debug)]
+pub struct FailedAction {
+    pub action: Option<TransitionAction>,
+    pub error: Error,
+}
+
+/// Like [`execute_transition`] but, on failure, reports *which* action failed
+/// alongside the error. The poller's ready-handoff review path uses this so a
+/// failed `push_branch` / `open_pr` produces a `handoff action-failed
+/// action=<name>` events.log line (and leaves the card un-advanced) instead of
+/// a swallowed warn that strands a review card with no PR.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_transition_reporting(
+    project: &Project,
+    project_name: &str,
+    task: &Issue,
+    task_body: &str,
+    workflow: &Workflow,
+    from: &str,
+    to: &str,
+) -> std::result::Result<Vec<ActionOutcome>, FailedAction> {
+    run_transition_actions(project, project_name, task, task_body, workflow, from, to, &[])
+        .map_err(|(action, error)| FailedAction { action, error })
+}
+
+/// Shared engine for [`execute_transition_except`] and
+/// [`execute_transition_reporting`]: fire the edge's git actions (skipping any
+/// in `skip`) then its `run:`/`ready:` shell commands, short-circuiting on the
+/// first failure. On error returns the offending action (`None` for target
+/// resolution or a `run:` command) so a caller can name it.
+#[allow(clippy::too_many_arguments)]
+fn run_transition_actions(
+    project: &Project,
+    project_name: &str,
+    task: &Issue,
+    task_body: &str,
+    workflow: &Workflow,
+    from: &str,
+    to: &str,
+    skip: &[TransitionAction],
+) -> std::result::Result<Vec<ActionOutcome>, (Option<TransitionAction>, Error)> {
+    let target = resolve_effective_target(workflow, task, from, to).map_err(|e| (None, e))?;
     let mut outcomes = Vec::new();
     for &action in workflow.actions_for_transition(from, to) {
         if skip.contains(&action) {
@@ -224,7 +273,8 @@ pub fn execute_transition_except(
             task_body,
             action,
             target.as_deref(),
-        )?;
+        )
+        .map_err(|e| (Some(action), e))?;
         outcomes.push(ActionOutcome { action, line });
     }
 
@@ -235,7 +285,7 @@ pub fn execute_transition_except(
     // git side-effects done, exactly as a mid-list action failure would).
     if let Some(transition) = workflow.transition(from, to) {
         if !transition.run.is_empty() || transition.ready.is_some() {
-            run_shell_commands(project, task, transition)?;
+            run_shell_commands(project, task, transition).map_err(|e| (None, e))?;
         }
     }
 

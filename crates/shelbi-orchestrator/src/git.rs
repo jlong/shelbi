@@ -25,13 +25,86 @@ use crate::workspace::workspace_worktree;
 /// the user's rc files and rebuilds `PATH` the same way it does in
 /// their terminal — see [`login_shell_prefix`] for the exact contract.
 pub(crate) fn run_in_dir(host: &Host, dir: &str, argv: &[&str]) -> Result<Output> {
+    run_in_dir_with_deadline(host, dir, argv, GIT_OP_DEADLINE)
+}
+
+/// Wall-clock ceiling on a single git/gh invocation routed through
+/// [`run_in_dir`]. Generous enough that no healthy `git push` / `gh pr
+/// create` / `git fetch` brushes it, low enough that a wedged network op
+/// (a dead SSH connection to `git@github.com`, a Tailscale web-auth park)
+/// fails the step in a couple of minutes instead of freezing the caller.
+///
+/// The poller runs every per-workflow action (`push_branch`, `open_pr`,
+/// `merge`, `delete_branch`) through here on a single workspace thread, so
+/// without a bound one hung child stalls that workspace's whole poll loop
+/// indefinitely — the exact six-minute freeze this guards against.
+const GIT_OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// [`run_in_dir`] with an explicit wall-clock `deadline` instead of the
+/// [`GIT_OP_DEADLINE`] default — split out so tests can drive the timeout
+/// path with a short deadline. On a timeout the child (and the whole
+/// process group it leads, ssh grandchildren included) is killed and the
+/// `ErrorKind::TimedOut` is surfaced to the caller after a `warn`.
+pub(crate) fn run_in_dir_with_deadline(
+    host: &Host,
+    dir: &str,
+    argv: &[&str],
+    deadline: std::time::Duration,
+) -> Result<Output> {
+    #[cfg(test)]
+    record_git_invocation(argv);
     let escaped: Vec<String> = argv.iter().map(|a| shelbi_agent::shell_escape(a)).collect();
     let line = format!(
         "cd {} && {}",
         shelbi_agent::shell_escape(dir),
         escaped.join(" ")
     );
-    run_login_shell_script(host, &line).map_err(Error::Io)
+    match run_login_shell_script_with_deadline(host, &line, deadline) {
+        Ok(out) => Ok(out),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            tracing::warn!(
+                dir = %dir,
+                argv = ?argv,
+                deadline_secs = deadline.as_secs(),
+                error = %e,
+                "git/gh command exceeded its wall-clock deadline and was killed",
+            );
+            Err(Error::Io(e))
+        }
+        Err(e) => Err(Error::Io(e)),
+    }
+}
+
+// Test-only recorder of the argv every `run_in_dir_with_deadline` call
+// spawns, so a test can assert *which* git commands ran (e.g. that a no-op
+// `push_branch` never reached `git push`). Off unless a test opts in via
+// `record_git_invocations`; the real command still runs.
+#[cfg(test)]
+thread_local! {
+    static GIT_INVOCATIONS: std::cell::RefCell<Option<Vec<Vec<String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Begin recording git/gh invocations on this thread; clears any prior log.
+#[cfg(test)]
+pub(crate) fn record_git_invocations() {
+    GIT_INVOCATIONS.with(|c| *c.borrow_mut() = Some(Vec::new()));
+}
+
+/// Take and stop the recording started by [`record_git_invocations`],
+/// returning each invocation's argv in call order.
+#[cfg(test)]
+pub(crate) fn take_git_invocations() -> Vec<Vec<String>> {
+    GIT_INVOCATIONS.with(|c| c.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(test)]
+fn record_git_invocation(argv: &[&str]) {
+    GIT_INVOCATIONS.with(|c| {
+        if let Some(log) = c.borrow_mut().as_mut() {
+            log.push(argv.iter().map(|a| a.to_string()).collect());
+        }
+    });
 }
 
 /// Hand `script` to a login shell on `host`.
@@ -1151,6 +1224,41 @@ mod tests {
             None => std::env::remove_var("SHELL"),
         }
         assert_eq!(shell, "/bin/sh");
+    }
+
+    #[test]
+    fn run_in_dir_with_deadline_kills_a_wedged_child() {
+        // A hung `git push` (its `ssh git@github.com` child parked on a dead
+        // connection) is the freeze this bounds. `sleep 30` stands in for that
+        // never-returning child: the deadline must kill the whole process group
+        // — login shell + `sleep` grandchild — and surface `TimedOut` promptly,
+        // not block for the full sleep. `run_in_dir_with_deadline` logs the
+        // kill at `warn` before returning (see its body).
+        let _guard = crate::test_lock::acquire();
+        let tmp = tempfile::tempdir().unwrap();
+        let deadline = std::time::Duration::from_millis(300);
+
+        let start = std::time::Instant::now();
+        let result = run_in_dir_with_deadline(
+            &Host::Local,
+            tmp.path().to_str().unwrap(),
+            &["sleep", "30"],
+            deadline,
+        );
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(Error::Io(io)) => assert_eq!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut,
+                "expected a TimedOut error, got: {io}"
+            ),
+            other => panic!("expected Err(Io(TimedOut)), got {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the deadline must fire promptly (child killed), took {elapsed:?}"
+        );
     }
 
     #[test]
