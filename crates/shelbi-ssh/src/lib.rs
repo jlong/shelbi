@@ -1604,6 +1604,21 @@ where
 mod tests {
     use super::*;
 
+    /// Serializes tests that read or write `SHELBI_SSH_LOG_LEVEL`.
+    ///
+    /// `ssh_log_level()` (and thus every arg builder that embeds `LogLevel=`)
+    /// reads a process-global env var, so a test that toggles the level races
+    /// any concurrent test that asserts a built ssh argv. Both sides take this
+    /// lock so no test can observe another's toggle. Poison is fine — a panic
+    /// under the lock doesn't corrupt the env, so recover the guard.
+    static SSH_LOG_LEVEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn ssh_log_level_guard() -> std::sync::MutexGuard<'static, ()> {
+        SSH_LOG_LEVEL_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn local_command_args() {
         let cmd = build_command(&Host::Local, ["echo", "hi"]);
@@ -1614,6 +1629,9 @@ mod tests {
 
     #[test]
     fn ssh_command_args() {
+        // Held across both the actual build and the `expected` rebuild below so
+        // a concurrent `SHELBI_SSH_LOG_LEVEL` toggle can't diverge the two.
+        let _env = ssh_log_level_guard();
         let cmd = build_command(
             &Host::Ssh {
                 host: "m2.local".into(),
@@ -1634,6 +1652,9 @@ mod tests {
 
     #[test]
     fn ssh_pty_command_uses_t_flag() {
+        // Held across both the actual build and the `expected` rebuild below so
+        // a concurrent `SHELBI_SSH_LOG_LEVEL` toggle can't diverge the two.
+        let _env = ssh_log_level_guard();
         let cmd = build_pty_command(
             &Host::Ssh {
                 host: "m2.local".into(),
@@ -2223,6 +2244,8 @@ mod tests {
 
     #[test]
     fn ssh_log_level_defaults_to_error_and_honors_override() {
+        // Serialize against the arg-builder tests that read the same env var.
+        let _env = ssh_log_level_guard();
         std::env::remove_var("SHELBI_SSH_LOG_LEVEL");
         assert_eq!(ssh_log_level(), "ERROR");
 
