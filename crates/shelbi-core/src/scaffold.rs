@@ -163,10 +163,14 @@ const PROJECT_SECTIONS: &[Section] = &[
     },
     Section {
         prose: &[
-            "Permissions posture rendered into the workspace settings template.",
-            "`auto` maps to claude's acceptEdits. Default auto.",
+            "Optional project-wide permission ceiling for launched agents.",
+            "Leave it unset (the default) to pass NO `--permission-mode` and",
+            "let each agent run under your own ~/.claude permissions.defaultMode.",
+            "Set it only to impose a concrete ceiling that clamps every agent's",
+            "requested posture downward, never up: plan | default | acceptEdits |",
+            "bypassPermissions (aliases: read-only, auto, full-access).",
         ],
-        yaml: "workspace_permissions_mode: auto\n",
+        yaml: "# workspace_permissions_mode: acceptEdits\n",
     },
     Section {
         prose: &[

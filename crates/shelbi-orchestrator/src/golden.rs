@@ -92,11 +92,11 @@ fn claude_orchestrator_argv_is_frozen() {
 #[test]
 fn claude_worker_argv_is_frozen() {
     let cold =
-        crate::workspace::workspace_launch_command(&claude_runner(), "auto", true, false);
+        crate::workspace::workspace_launch_command(&claude_runner(), Some("auto"), true, false);
     assert_golden("claude/worker-argv-cold.txt", &cold);
 
     let resume =
-        crate::workspace::workspace_launch_command(&claude_runner(), "auto", true, true);
+        crate::workspace::workspace_launch_command(&claude_runner(), Some("auto"), true, true);
     assert_golden("claude/worker-argv-resume.txt", &resume);
 }
 

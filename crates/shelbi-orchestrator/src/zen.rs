@@ -2917,7 +2917,7 @@ mod pr_create_tests {
             }],
             workspace_poll_interval_secs: 5,
             github_reconcile_interval_secs: 900,
-            workspace_permissions_mode: "auto".into(),
+            workspace_permissions_mode: Some("auto".into()),
             workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
@@ -9454,7 +9454,7 @@ mod probe_tests {
             }],
             workspace_poll_interval_secs: 5,
             github_reconcile_interval_secs: 900,
-            workspace_permissions_mode: "auto".into(),
+            workspace_permissions_mode: Some("auto".into()),
             workspace_settings_template: None,
             zen: ZenConfig {
                 checks: ZenChecks {

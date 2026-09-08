@@ -184,8 +184,16 @@ impl RunnerAdapter {
     /// this runner is `claude` and the mode is non-default. See the free
     /// [`with_permission_mode`] wrapper for the full rationale; this is the
     /// adapter-scoped form that skips re-detecting the runner kind.
-    pub fn with_permission_mode(self, spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSpec {
-        if !self.is_claude() || mode == "default" {
+    pub fn with_permission_mode(self, spec: &AgentRunnerSpec, mode: Option<&str>) -> AgentRunnerSpec {
+        // `None` (nothing configured) and `Some("default")` (claude's own
+        // baseline) both mean "pass no flag" — the agent runs under the user's
+        // `permissions.defaultMode`. A flag is appended only for claude and only
+        // for a concrete, non-default mode.
+        let mode = match mode {
+            Some(m) if m != "default" => m,
+            _ => return spec.clone(),
+        };
+        if !self.is_claude() {
             return spec.clone();
         }
         if spec
@@ -293,11 +301,15 @@ impl RunnerAdapter {
 }
 
 /// Return a copy of `spec` with `--permission-mode <mode>` appended when the
-/// runner is `claude` and the mode is non-default. Passing the mode on the
-/// command line is the authoritative signal; relying on `settings.json`'s
-/// `defaultMode` is fragile (silent fallback to interactive on any I/O race
-/// or version regression). For non-claude runners (and the `default` mode,
-/// which is claude's own baseline) the spec is returned unchanged.
+/// runner is `claude` and a concrete, non-default mode is given. Passing the
+/// mode on the command line is the authoritative signal; relying on
+/// `settings.json`'s `defaultMode` is fragile (silent fallback to interactive
+/// on any I/O race or version regression).
+///
+/// `mode` is `Option`: **`None` means nothing was configured**, so shelbi
+/// passes no flag and the agent runs under the user's own
+/// `permissions.defaultMode`. `Some("default")` (claude's baseline) is treated
+/// the same way. For non-claude runners the spec is always returned unchanged.
 ///
 /// Idempotent: if the user-authored YAML already includes `--permission-mode`
 /// in `flags` (common for projects that adopted the flag before this helper
@@ -305,7 +317,7 @@ impl RunnerAdapter {
 /// doesn't end up with two copies. Two copies don't break claude — the
 /// right-most wins — but they clutter pane captures and obscure which mode
 /// the workspace is actually running in.
-pub fn with_permission_mode(spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSpec {
+pub fn with_permission_mode(spec: &AgentRunnerSpec, mode: Option<&str>) -> AgentRunnerSpec {
     RunnerAdapter::for_spec(spec).with_permission_mode(spec, mode)
 }
 
@@ -709,7 +721,7 @@ mod tests {
             dialog_signatures: vec![],
             integration: None,
         };
-        let out = with_permission_mode(&spec, "auto");
+        let out = with_permission_mode(&spec, Some("auto"));
         assert_eq!(out.command, "claude");
         assert_eq!(out.flags, vec!["--permission-mode", "auto"]);
         assert_eq!(launch_command(&out), "claude --permission-mode auto");
@@ -724,7 +736,7 @@ mod tests {
             dialog_signatures: vec![],
             integration: None,
         };
-        let out = with_permission_mode(&spec, "acceptEdits");
+        let out = with_permission_mode(&spec, Some("acceptEdits"));
         assert_eq!(
             out.flags,
             vec![
@@ -746,7 +758,7 @@ mod tests {
             dialog_signatures: vec![],
             integration: None,
         };
-        let out = with_permission_mode(&spec, "auto");
+        let out = with_permission_mode(&spec, Some("auto"));
         assert_eq!(out.flags, vec!["--permission-mode", "auto"]);
     }
 
@@ -759,7 +771,7 @@ mod tests {
             dialog_signatures: vec![],
             integration: None,
         };
-        let out = with_permission_mode(&spec, "auto");
+        let out = with_permission_mode(&spec, Some("auto"));
         // Codex doesn't understand --permission-mode; leave it alone.
         assert_eq!(out.flags, vec!["--print"]);
     }
@@ -775,8 +787,24 @@ mod tests {
             dialog_signatures: vec![],
             integration: None,
         };
-        let out = with_permission_mode(&spec, "default");
+        let out = with_permission_mode(&spec, Some("default"));
         assert!(out.flags.is_empty());
+    }
+
+    #[test]
+    fn with_permission_mode_none_defers_and_passes_no_flag() {
+        // `None` means nothing was configured anywhere: shelbi must pass no
+        // --permission-mode so claude reads the user's own defaultMode.
+        let spec = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        };
+        let out = with_permission_mode(&spec, None);
+        assert!(out.flags.is_empty());
+        assert_eq!(launch_command(&out), "claude");
     }
 
     #[test]
@@ -793,7 +821,7 @@ mod tests {
             dialog_signatures: vec![],
             integration: None,
         };
-        let out = with_permission_mode(&spec, "auto");
+        let out = with_permission_mode(&spec, Some("auto"));
         assert_eq!(out.flags, vec!["--permission-mode", "auto"]);
         assert_eq!(launch_command(&out), "claude --permission-mode auto");
     }
@@ -811,7 +839,7 @@ mod tests {
             dialog_signatures: vec![],
             integration: None,
         };
-        let out = with_permission_mode(&spec, "auto");
+        let out = with_permission_mode(&spec, Some("auto"));
         assert_eq!(out.flags, vec!["--permission-mode=plan"]);
     }
 
@@ -828,7 +856,7 @@ mod tests {
             dialog_signatures: vec![],
             integration: None,
         };
-        let out = with_permission_mode(&spec, "auto");
+        let out = with_permission_mode(&spec, Some("auto"));
         assert_eq!(out.flags, vec!["--permission-mode", "plan"]);
     }
 
@@ -861,7 +889,7 @@ mod tests {
         assert!(adapter.needs_claude_readiness_probe());
         // Launch-flag assembly follows the adapter, not the basename.
         assert_eq!(
-            with_permission_mode(&wrapped, "auto").flags,
+            with_permission_mode(&wrapped, Some("auto")).flags,
             vec!["--permission-mode", "auto"]
         );
 

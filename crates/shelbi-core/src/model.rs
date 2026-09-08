@@ -103,11 +103,18 @@ pub struct Project {
     /// [`Project::github_reconcile_interval`].
     #[serde(default = "default_github_reconcile_interval_secs")]
     pub github_reconcile_interval_secs: u64,
-    /// Permissions posture rendered into the workspace settings template
-    /// (see [`Project::workspace_settings_template`]). The default `auto`
-    /// is mapped to claude's `acceptEdits` at render time.
-    #[serde(default = "default_workspace_permissions_mode")]
-    pub workspace_permissions_mode: String,
+    /// Explicit project-wide permission ceiling for launched agents. When
+    /// **unset** (`None`), shelbi passes no `--permission-mode` on the runner
+    /// command line and renders no `defaultMode` into the workspace settings,
+    /// so the launched agent runs under the user's own
+    /// `~/.claude/settings.json` `permissions.defaultMode` — shelbi stops
+    /// mediating a value nobody asked it to set. Set it only to impose a
+    /// concrete ceiling: an explicitly-set value clamps every agent's
+    /// requested `permissions_mode` downward (never up), and is passed on the
+    /// CLI as the authoritative signal. See [`crate::clamp_permission_mode`]
+    /// and [`crate::resolve_agent_launch`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_permissions_mode: Option<String>,
     /// Optional override for the path to the per-project workspace settings
     /// template. When `None`, the default at
     /// `~/.shelbi/projects/<name>/workspace-settings.json.template` is used.
@@ -889,10 +896,6 @@ fn default_workspace_poll_interval_secs() -> u64 {
 /// workspace-poll tick). `0` disables the pass entirely.
 fn default_github_reconcile_interval_secs() -> u64 {
     900
-}
-
-fn default_workspace_permissions_mode() -> String {
-    "auto".to_string()
 }
 
 impl Project {
@@ -3647,7 +3650,9 @@ agent_runners:
             p.github_reconcile_interval(),
             Some(std::time::Duration::from_secs(900))
         );
-        assert_eq!(p.workspace_permissions_mode, "auto");
+        // Omitted → unset, so shelbi passes no `--permission-mode` and defers
+        // to the user's own permissions.defaultMode.
+        assert_eq!(p.workspace_permissions_mode, None);
         assert!(p.workspace_settings_template.is_none());
     }
 
@@ -3720,7 +3725,7 @@ workspace_settings_template: /etc/shelbi/p.json
 "#;
         let p: Project = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(p.workspace_poll_interval_secs, 12);
-        assert_eq!(p.workspace_permissions_mode, "acceptEdits");
+        assert_eq!(p.workspace_permissions_mode.as_deref(), Some("acceptEdits"));
         assert_eq!(
             p.workspace_settings_template.as_deref(),
             Some(std::path::Path::new("/etc/shelbi/p.json"))
@@ -3770,7 +3775,7 @@ workspace_settings_template: /etc/shelbi/p.json
             }],
             workspace_poll_interval_secs: default_workspace_poll_interval_secs(),
             github_reconcile_interval_secs: default_github_reconcile_interval_secs(),
-            workspace_permissions_mode: default_workspace_permissions_mode(),
+            workspace_permissions_mode: None,
             workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
@@ -3869,7 +3874,7 @@ workspaces:
             workspaces,
             workspace_poll_interval_secs: default_workspace_poll_interval_secs(),
             github_reconcile_interval_secs: default_github_reconcile_interval_secs(),
-            workspace_permissions_mode: default_workspace_permissions_mode(),
+            workspace_permissions_mode: None,
             workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
@@ -4173,7 +4178,7 @@ workspaces:
             workspaces: vec![],
             workspace_poll_interval_secs: default_workspace_poll_interval_secs(),
             github_reconcile_interval_secs: default_github_reconcile_interval_secs(),
-            workspace_permissions_mode: default_workspace_permissions_mode(),
+            workspace_permissions_mode: None,
             workspace_settings_template: None,
             zen,
             heartbeat: HeartbeatConfig::default(),
@@ -5499,7 +5504,7 @@ git:
             github_url: Some("git@github.com:example/shelbi.git".into()),
             workspace_poll_interval_secs: 7,
             github_reconcile_interval_secs: 900,
-            workspace_permissions_mode: "acceptEdits".into(),
+            workspace_permissions_mode: Some("acceptEdits".into()),
             workspace_settings_template: Some(PathBuf::from("workspace-settings.json.template")),
             zen: ZenConfig {
                 checks: ZenChecks {

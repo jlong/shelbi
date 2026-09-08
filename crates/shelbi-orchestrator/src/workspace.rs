@@ -1820,8 +1820,11 @@ pub struct ResolvedWorkspaceLaunch {
     /// with the resolved `model` / `reasoning_effort` already injected as launch
     /// flags via the adapter.
     pub runner: shelbi_core::AgentRunnerSpec,
-    /// The permission mode, clamped to the project ceiling (never escalated).
-    pub permission_mode: String,
+    /// The permission mode, clamped to the project ceiling (never escalated),
+    /// or `None` when nothing is configured anywhere — in which case shelbi
+    /// passes no `--permission-mode` and the agent runs under the user's own
+    /// `permissions.defaultMode`.
+    pub permission_mode: Option<String>,
 }
 
 /// Resolve which runner spec + permission mode a dispatch launches with, given
@@ -1942,7 +1945,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //     prompt on every command — exactly the bug we're trying to avoid.
     //     Surface it up front so the failure mode is "shelbi rejected this
     //     machine" instead of "my workspace keeps pausing for no reason."
-    require_auto_mode_supported(&host, &runner, &permission_mode)?;
+    require_auto_mode_supported(&host, &runner, permission_mode.as_deref())?;
 
     // 0b. Clear any stale review marker left in the worktree from a previous
     //     task before we reuse the worktree — otherwise the poller could read
@@ -2045,7 +2048,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         project: spec.project,
         workspace: spec.workspace,
         runner: &runner,
-        permission_mode: &permission_mode,
+        permission_mode: permission_mode.as_deref(),
         host: &host,
         worktree: &worktree,
         addr: &addr,
@@ -2108,7 +2111,7 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // same rationale as the dev path. Held until this function returns.
     let _dispatch_lock = shelbi_state::lock_workspace(&spec.project.name, &spec.workspace.name)?;
 
-    require_auto_mode_supported(&host, &runner, &permission_mode)?;
+    require_auto_mode_supported(&host, &runner, permission_mode.as_deref())?;
 
     // Clear any stale review marker before we relaunch so the poller can't read
     // an old task id and misfire. A task being resumed is in `in_progress`, so
@@ -2171,7 +2174,7 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         project: spec.project,
         workspace: spec.workspace,
         runner: &runner,
-        permission_mode: &permission_mode,
+        permission_mode: permission_mode.as_deref(),
         host: &host,
         worktree: &worktree,
         addr: &addr,
@@ -2192,10 +2195,11 @@ struct SpawnArgs<'a> {
     workspace: &'a WorkspaceSpec,
     runner: &'a shelbi_core::AgentRunnerSpec,
     /// Permission mode already clamped to the project ceiling (see
-    /// [`resolve_workspace_launch`]). Threaded here rather than re-read from
-    /// `project.workspace_permissions_mode` so an agent's tighter request
-    /// reaches the launch command.
-    permission_mode: &'a str,
+    /// [`resolve_workspace_launch`]), or `None` when nothing is configured and
+    /// shelbi should pass no `--permission-mode`. Threaded here rather than
+    /// re-read from `project.workspace_permissions_mode` so an agent's tighter
+    /// request reaches the launch command.
+    permission_mode: Option<&'a str>,
     host: &'a Host,
     worktree: &'a Path,
     addr: &'a TmuxAddr,
@@ -2764,9 +2768,9 @@ const CLAUDE_AUTO_MODE_MIN: (u32, u32, u32) = (2, 1, 83);
 fn require_auto_mode_supported(
     host: &Host,
     runner: &shelbi_core::AgentRunnerSpec,
-    mode: &str,
+    mode: Option<&str>,
 ) -> Result<()> {
-    if mode != "auto" {
+    if mode != Some("auto") {
         return Ok(());
     }
     // Only the `claude` CLI accepts `--permission-mode`; other runners
@@ -2922,9 +2926,9 @@ pub fn render_workspace_settings_preferring_agent(
         None => shelbi_state::render_workspace_settings(project)
             .map_err(|e| Error::Other(format!("{e}")))?,
     };
-    let template = template.replace(
-        "{{workspace_permissions_mode}}",
-        &project.workspace_permissions_mode,
+    let template = shelbi_state::apply_workspace_permissions_mode(
+        &template,
+        project.workspace_permissions_mode.as_deref(),
     );
     // Deploy-time migration: anchor any relative `.shelbi/hooks/…` hook command
     // against `$CLAUDE_PROJECT_DIR` so it resolves from any CWD. A relative path
@@ -4430,7 +4434,7 @@ pub fn remote_hub_env_prefix(host: &Host) -> String {
 /// `--append-system-prompt "$(cat …)"` (see [`with_agent_system_prompt`]).
 pub fn workspace_launch_command(
     runner: &shelbi_core::AgentRunnerSpec,
-    permissions_mode: &str,
+    permissions_mode: Option<&str>,
     include_agent_instructions: bool,
     resume: bool,
 ) -> String {
@@ -4445,7 +4449,7 @@ pub fn workspace_launch_command(
 
 pub fn workspace_launch_command_with_startup_prompt(
     runner: &shelbi_core::AgentRunnerSpec,
-    permissions_mode: &str,
+    permissions_mode: Option<&str>,
     include_agent_instructions: bool,
     resume: bool,
     startup_prompt_rel: Option<&str>,
@@ -5688,7 +5692,7 @@ mod tests {
             ],
             workspace_poll_interval_secs: 5,
             github_reconcile_interval_secs: 900,
-            workspace_permissions_mode: "auto".into(),
+            workspace_permissions_mode: Some("auto".into()),
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
@@ -5751,8 +5755,9 @@ mod tests {
             resolved.runner.flags,
             vec!["--model", "claude-opus-4-8", "--effort", "high"]
         );
-        // `read-only` request ≤ `auto` ceiling → honored, mapped to claude `plan`.
-        assert_eq!(resolved.permission_mode, "plan");
+        // `read-only` request ≤ `auto` ceiling → honored, mapped to claude
+        // `default` (its no-edit intent is enforced by a deny block, not plan).
+        assert_eq!(resolved.permission_mode.as_deref(), Some("default"));
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -5928,7 +5933,7 @@ mod tests {
             resolve_workspace_launch(&project, &project.workspaces[0], Some("developer"), None).unwrap();
         assert_eq!(resolved.runner.command, "claude");
         assert!(resolved.runner.flags.is_empty());
-        assert_eq!(resolved.permission_mode, "auto");
+        assert_eq!(resolved.permission_mode.as_deref(), Some("auto"));
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -6407,7 +6412,7 @@ mod tests {
         // non-claude runner has no such flag shelbi drives.
         let p = fixture_project();
         let claude = p.runner("claude").unwrap();
-        let launch = workspace_launch_command(claude, &p.workspace_permissions_mode, false, true);
+        let launch = workspace_launch_command(claude, p.workspace_permissions_mode.as_deref(), false, true);
         assert!(
             launch.contains("--continue"),
             "claude resume must add --continue: {launch}"
@@ -6420,7 +6425,7 @@ mod tests {
             dialog_signatures: vec![],
             integration: None,
         };
-        let launch = workspace_launch_command(&codex, &p.workspace_permissions_mode, false, true);
+        let launch = workspace_launch_command(&codex, p.workspace_permissions_mode.as_deref(), false, true);
         assert!(
             !launch.contains("--continue"),
             "non-claude runner must not get --continue: {launch}"
@@ -6433,7 +6438,7 @@ mod tests {
         );
 
         // A normal (non-resume) dispatch never adds --continue, even for claude.
-        let launch = workspace_launch_command(claude, &p.workspace_permissions_mode, false, false);
+        let launch = workspace_launch_command(claude, p.workspace_permissions_mode.as_deref(), false, false);
         assert!(
             !launch.contains("--continue"),
             "non-resume must not add --continue: {launch}"
@@ -6451,7 +6456,7 @@ mod tests {
         };
         let launch = workspace_launch_command_with_startup_prompt(
             &codex,
-            "auto",
+            Some("auto"),
             true,
             true,
             Some(WORKTREE_STARTUP_PROMPT_REL),
@@ -6485,7 +6490,7 @@ mod tests {
         };
         let launch = workspace_launch_command_with_startup_prompt(
             &claude,
-            "auto",
+            Some("auto"),
             true,
             false,
             Some(WORKTREE_STARTUP_PROMPT_REL),
@@ -6509,7 +6514,7 @@ mod tests {
         };
         let launch = workspace_launch_command_with_startup_prompt(
             &claude,
-            "auto",
+            Some("auto"),
             true,
             true,
             Some(WORKTREE_STARTUP_PROMPT_REL),
@@ -7317,7 +7322,7 @@ mod tests {
             integration: None,
         };
         for mode in ["acceptEdits", "bypassPermissions", "plan", "default"] {
-            require_auto_mode_supported(&Host::Local, &runner, mode).unwrap();
+            require_auto_mode_supported(&Host::Local, &runner, Some(mode)).unwrap();
         }
     }
 
@@ -7330,7 +7335,7 @@ mod tests {
         let p = fixture_project(); // workspace_permissions_mode = "auto"
         let runner = p.runner("claude").unwrap().clone();
         let runner_with_mode =
-            shelbi_agent::with_permission_mode(&runner, &p.workspace_permissions_mode);
+            shelbi_agent::with_permission_mode(&runner, p.workspace_permissions_mode.as_deref());
         let launch = shelbi_agent::launch_command(&runner_with_mode);
         assert_eq!(launch, "claude --permission-mode auto");
     }
@@ -7338,10 +7343,10 @@ mod tests {
     #[test]
     fn spawn_path_passes_through_non_auto_modes() {
         let mut p = fixture_project();
-        p.workspace_permissions_mode = "acceptEdits".into();
+        p.workspace_permissions_mode = Some("acceptEdits".into());
         let runner = p.runner("claude").unwrap().clone();
         let runner_with_mode =
-            shelbi_agent::with_permission_mode(&runner, &p.workspace_permissions_mode);
+            shelbi_agent::with_permission_mode(&runner, p.workspace_permissions_mode.as_deref());
         let launch = shelbi_agent::launch_command(&runner_with_mode);
         assert_eq!(launch, "claude --permission-mode acceptEdits");
     }
@@ -7351,10 +7356,10 @@ mod tests {
         // `default` is claude's own baseline; passing the flag is a no-op
         // that just clutters the command line.
         let mut p = fixture_project();
-        p.workspace_permissions_mode = "default".into();
+        p.workspace_permissions_mode = Some("default".into());
         let runner = p.runner("claude").unwrap().clone();
         let runner_with_mode =
-            shelbi_agent::with_permission_mode(&runner, &p.workspace_permissions_mode);
+            shelbi_agent::with_permission_mode(&runner, p.workspace_permissions_mode.as_deref());
         let launch = shelbi_agent::launch_command(&runner_with_mode);
         assert_eq!(launch, "claude");
     }
@@ -7379,7 +7384,7 @@ mod tests {
         );
         let runner = p.runner("claude").unwrap().clone();
         let runner_with_mode =
-            shelbi_agent::with_permission_mode(&runner, &p.workspace_permissions_mode);
+            shelbi_agent::with_permission_mode(&runner, p.workspace_permissions_mode.as_deref());
         let launch = shelbi_agent::launch_command(&runner_with_mode);
         assert_eq!(launch, "claude --permission-mode auto");
     }
@@ -7402,7 +7407,7 @@ mod tests {
             },
         );
         let runner = p.runner("codex").unwrap().clone();
-        let launch = workspace_launch_command(&runner, &p.workspace_permissions_mode, false, false);
+        let launch = workspace_launch_command(&runner, p.workspace_permissions_mode.as_deref(), false, false);
         assert_eq!(launch, "codex --print");
         assert!(!launch.contains("--permission-mode"));
         assert!(!launch.contains("core.hooksPath"));
@@ -7428,9 +7433,9 @@ mod tests {
         // With an agent deployed: claude gets --permission-mode + the
         // instructions system-prompt. Both hosts produce the same shape.
         let local_launch =
-            workspace_launch_command(local_runner, &p.workspace_permissions_mode, true, false);
+            workspace_launch_command(local_runner, p.workspace_permissions_mode.as_deref(), true, false);
         let remote_launch =
-            workspace_launch_command(remote_runner, &p.workspace_permissions_mode, true, false);
+            workspace_launch_command(remote_runner, p.workspace_permissions_mode.as_deref(), true, false);
         assert_eq!(local_launch, remote_launch);
         assert_eq!(
             local_launch,
@@ -7456,9 +7461,9 @@ mod tests {
         // Bare pane (no agent): both hosts still agree — no
         // --append-system-prompt on either.
         let local_bare =
-            workspace_launch_command(local_runner, &p.workspace_permissions_mode, false, false);
+            workspace_launch_command(local_runner, p.workspace_permissions_mode.as_deref(), false, false);
         let remote_bare =
-            workspace_launch_command(remote_runner, &p.workspace_permissions_mode, false, false);
+            workspace_launch_command(remote_runner, p.workspace_permissions_mode.as_deref(), false, false);
         assert_eq!(local_bare, remote_bare);
         assert_eq!(local_bare, "claude --permission-mode auto");
     }
@@ -7475,7 +7480,7 @@ mod tests {
             dialog_signatures: vec![],
             integration: None,
         };
-        require_auto_mode_supported(&Host::Local, &runner, "auto").unwrap();
+        require_auto_mode_supported(&Host::Local, &runner, Some("auto")).unwrap();
     }
 
     #[test]
@@ -8354,7 +8359,7 @@ mod tests {
         .unwrap();
 
         let mut project = fixture_project();
-        project.workspace_permissions_mode = "acceptEdits".into();
+        project.workspace_permissions_mode = Some("acceptEdits".into());
         let rendered =
             render_workspace_settings_preferring_agent(&project, Some("developer")).unwrap();
         assert!(
@@ -10211,7 +10216,7 @@ mod sync_worktree_git_tests {
             ],
             workspace_poll_interval_secs: 5,
             github_reconcile_interval_secs: 900,
-            workspace_permissions_mode: "auto".into(),
+            workspace_permissions_mode: Some("auto".into()),
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
@@ -10892,7 +10897,7 @@ mod sync_worktree_freshcut_tests {
             workspaces: vec![],
             workspace_poll_interval_secs: 5,
             github_reconcile_interval_secs: 900,
-            workspace_permissions_mode: "acceptEdits".into(),
+            workspace_permissions_mode: Some("acceptEdits".into()),
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
@@ -11276,7 +11281,7 @@ mod sync_worktree_freshcut_tests {
             github_reconcile_interval_secs: 900,
             // NOT "auto": keeps `require_auto_mode_supported` from probing
             // the host's claude binary — this test is about the sync step.
-            workspace_permissions_mode: "acceptEdits".into(),
+            workspace_permissions_mode: Some("acceptEdits".into()),
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),

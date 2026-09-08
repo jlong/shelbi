@@ -103,8 +103,18 @@ pub struct AgentManifest {
     /// [`RunnerKind`] (`claude` / `codex` / `generic`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub runners: BTreeMap<RunnerKind, RunnerManifestConfig>,
-    /// The permission posture the agent *requests*. Clamped to the project
-    /// ceiling and never escalated (see [`clamp_permission_mode`]).
+    /// The permission posture the agent *requests* as a launch mode. Clamped to
+    /// an explicit project ceiling and never escalated (see
+    /// [`clamp_permission_mode`]). Optional and opt-in: an agent that omits it
+    /// inherits the project ceiling (or, when that is unset too, defers to the
+    /// user's own `permissions.defaultMode`).
+    ///
+    /// This is a *launch mode*, not a no-edit switch: `read-only` maps to
+    /// claude's `default`, **not** `plan`, so it never disables tool use. To
+    /// forbid edits, use a `permissions.deny` block on
+    /// `Edit`/`Write`/`NotebookEdit` in the agent's `settings.json` instead —
+    /// claude enforces that without blocking the read/exec tools an agent needs
+    /// to do its job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions_mode: Option<String>,
     /// Compatibility hints (advisory this milestone).
@@ -172,15 +182,25 @@ impl AgentManifest {
 }
 
 /// A permission mode expressed as a rank on a single tightest→loosest axis, so
-/// two vocabularies compare cleanly: the plan's generic names (`read-only`,
-/// `auto-edit`, `full-access`) and the Claude/shelbi names shelbi already emits
-/// (`plan`, `default`, `auto`/`acceptEdits`, `bypassPermissions`). Higher rank =
-/// looser (more capability). An unrecognized string ranks as `default` so a
-/// typo can never silently *widen* the ceiling.
+/// two vocabularies compare cleanly: the plan's generic names (`auto-edit`,
+/// `full-access`) and the Claude/shelbi names shelbi already emits (`plan`,
+/// `default`, `auto`/`acceptEdits`, `bypassPermissions`). Higher rank = looser
+/// (more capability). An unrecognized string ranks as `default` so a typo can
+/// never silently *widen* the ceiling.
+///
+/// `read-only` is deliberately **not** ranked alongside `plan` any more: a
+/// no-edit posture is no longer a launch mode (it maps to `default` as a
+/// launch flag — see [`permission_flag_value`]) but a `permissions.deny` block
+/// on `Edit`/`Write`/`NotebookEdit` in the agent's `settings.json`, which
+/// Claude actually enforces. As a launch posture `read-only` therefore behaves
+/// like `default`, so it ranks there.
 fn permission_rank(mode: &str) -> u8 {
     match mode.trim() {
-        "read-only" | "readonly" | "plan" => 0,
-        "default" => 1,
+        "plan" => 0,
+        // `read-only`/`readonly` launch as `default` (their no-edit intent is
+        // enforced by a deny block, not by disabling all tool use), so they
+        // rank with `default` rather than with `plan`.
+        "read-only" | "readonly" | "default" => 1,
         "auto" | "auto-edit" | "acceptEdits" | "acceptedits" => 2,
         "full-access" | "full" | "bypassPermissions" | "bypass" => 3,
         _ => 1,
@@ -192,29 +212,55 @@ fn permission_rank(mode: &str) -> u8 {
 /// Claude modes shelbi actually launches with; everything shelbi already emits
 /// (`auto`, `default`, `plan`, `acceptEdits`, `bypassPermissions`) passes
 /// through untouched so existing behavior is byte-for-byte preserved.
+///
+/// `read-only` maps to `default`, **not** `plan`: Claude's plan mode is "take
+/// no action, write a plan, ask the human to approve it", which disables all
+/// tool use — so an agent that must actually run install/build/serve commands
+/// (the review loader) could never do its job. A no-edit posture belongs in a
+/// `permissions.deny` block on `Edit`/`Write`/`NotebookEdit`, which Claude
+/// enforces without blocking read/exec tools; as a *launch* mode `read-only`
+/// therefore imposes nothing beyond claude's baseline.
 fn permission_flag_value(mode: &str) -> String {
     match mode.trim() {
-        "read-only" | "readonly" => "plan".to_string(),
+        "read-only" | "readonly" => "default".to_string(),
         "full-access" | "full" => "bypassPermissions".to_string(),
         other => other.to_string(),
     }
 }
 
 /// Resolve the effective permission mode as a **ceiling clamp**: unlike model
-/// (taste), permissions is a security boundary, so the project always wins the
-/// *loosen* direction. The agent may request equal-or-tighter and gets it; a
-/// request looser than the ceiling is clamped down to the ceiling, never
-/// granted. `ceiling` is the project cap (its `workspace_permissions_mode`);
-/// `request` is the agent manifest's `permissions_mode` (absent → the ceiling
-/// applies unchanged). The returned string is already the runner-flag value.
-pub fn clamp_permission_mode(ceiling: &str, request: Option<&str>) -> String {
-    match request {
-        None => permission_flag_value(ceiling),
-        Some(req) => {
-            if permission_rank(req) <= permission_rank(ceiling) {
-                permission_flag_value(req)
+/// (taste), permissions is a security boundary, so an explicit project ceiling
+/// always wins the *loosen* direction. The agent may request equal-or-tighter
+/// and gets it; a request looser than the ceiling is clamped down to the
+/// ceiling, never granted.
+///
+/// Both inputs are `Option`, and **`None` means "not configured"**, which is
+/// distinct from any concrete mode:
+///
+/// - `ceiling = None`, `request = None` → `None`: nothing is configured
+///   anywhere, so shelbi passes no flag and the launched agent runs under the
+///   user's own `permissions.defaultMode`.
+/// - `ceiling = None`, `request = Some(req)` → the agent's own request,
+///   unclamped (no project ceiling exists to clamp against). An agent that
+///   sets a posture is opting in; with no ceiling there is nothing to lower it
+///   to.
+/// - `ceiling = Some(c)`, `request = None` → the project ceiling verbatim.
+/// - `ceiling = Some(c)`, `request = Some(req)` → the request when it is
+///   equal-or-tighter than the ceiling, otherwise the ceiling.
+///
+/// A returned `Some` is already the runner-flag value; the launcher treats
+/// both `None` and `Some("default")` as "pass nothing" (see
+/// [`crate::with_permission_mode`]).
+pub fn clamp_permission_mode(ceiling: Option<&str>, request: Option<&str>) -> Option<String> {
+    match (ceiling, request) {
+        (None, None) => None,
+        (None, Some(req)) => Some(permission_flag_value(req)),
+        (Some(c), None) => Some(permission_flag_value(c)),
+        (Some(c), Some(req)) => {
+            if permission_rank(req) <= permission_rank(c) {
+                Some(permission_flag_value(req))
             } else {
-                permission_flag_value(ceiling)
+                Some(permission_flag_value(c))
             }
         }
     }
@@ -230,7 +276,10 @@ pub struct ResolvedAgentLaunch {
     pub kind: RunnerKind,
     pub model: Option<String>,
     pub effort: Option<ReasoningEffort>,
-    pub permission_mode: String,
+    /// The clamped permission mode, or `None` when nothing was configured
+    /// anywhere and shelbi should pass no `--permission-mode` (deferring to the
+    /// user's own `permissions.defaultMode`). See [`clamp_permission_mode`].
+    pub permission_mode: Option<String>,
 }
 
 /// Resolve runner kind + model + effort + permission mode for `agent_name`,
@@ -257,6 +306,9 @@ pub struct ResolvedAgentLaunch {
 /// `permissions_mode`), and the project ceiling
 /// (`workspace_permissions_mode`) clamps it downward (see
 /// [`clamp_permission_mode`]) — a task override can only tighten, never widen.
+/// When neither a request nor a project ceiling is set, the resolved mode is
+/// `None`: shelbi passes no `--permission-mode` and the agent runs under the
+/// user's own `permissions.defaultMode`.
 pub fn resolve_agent_launch(
     project: &Project,
     agent_name: &str,
@@ -294,8 +346,10 @@ pub fn resolve_agent_launch(
     let permission_request = task_override
         .and_then(|o| o.permission_mode.as_deref())
         .or_else(|| manifest.and_then(|m| m.permissions_mode.as_deref()));
-    let permission_mode =
-        clamp_permission_mode(&project.workspace_permissions_mode, permission_request);
+    let permission_mode = clamp_permission_mode(
+        project.workspace_permissions_mode.as_deref(),
+        permission_request,
+    );
 
     ResolvedAgentLaunch {
         kind,
@@ -480,20 +534,63 @@ workspaces: []
     #[test]
     fn permission_mode_clamps_down_never_up() {
         // Ceiling `auto` (rank 2). An agent requesting the tighter `read-only`
-        // gets it (mapped to claude's `plan`).
-        assert_eq!(clamp_permission_mode("auto", Some("read-only")), "plan");
+        // gets it — and `read-only` now maps to claude's `default` (a no-edit
+        // posture is enforced by a deny block, not by plan mode).
+        assert_eq!(
+            clamp_permission_mode(Some("auto"), Some("read-only")).as_deref(),
+            Some("default")
+        );
         // An agent requesting the looser `full-access` is clamped to the
-        // ceiling, not granted.
-        assert_eq!(clamp_permission_mode("read-only", Some("full-access")), "plan");
+        // ceiling, not granted. With `read-only` ceiling → `default` flag.
+        assert_eq!(
+            clamp_permission_mode(Some("read-only"), Some("full-access")).as_deref(),
+            Some("default")
+        );
         // Equal request is honored.
-        assert_eq!(clamp_permission_mode("auto", Some("auto")), "auto");
+        assert_eq!(
+            clamp_permission_mode(Some("auto"), Some("auto")).as_deref(),
+            Some("auto")
+        );
         // No request → the ceiling applies unchanged.
-        assert_eq!(clamp_permission_mode("auto", None), "auto");
+        assert_eq!(
+            clamp_permission_mode(Some("auto"), None).as_deref(),
+            Some("auto")
+        );
         // Claude-vocabulary ceiling passes through untouched.
         assert_eq!(
-            clamp_permission_mode("acceptEdits", Some("bypassPermissions")),
-            "acceptEdits"
+            clamp_permission_mode(Some("acceptEdits"), Some("bypassPermissions")).as_deref(),
+            Some("acceptEdits")
         );
+    }
+
+    #[test]
+    fn unset_permission_mode_defers() {
+        // Nothing configured anywhere → no flag (defer to the user's
+        // permissions.defaultMode).
+        assert_eq!(clamp_permission_mode(None, None), None);
+        // No ceiling but an agent opts into a posture → the agent's request,
+        // unclamped (there is no ceiling to lower it to).
+        assert_eq!(
+            clamp_permission_mode(None, Some("acceptEdits")).as_deref(),
+            Some("acceptEdits")
+        );
+        // `read-only` requested with no ceiling → maps to `default`, never
+        // `plan`.
+        assert_eq!(
+            clamp_permission_mode(None, Some("read-only")).as_deref(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn read_only_and_plan_no_longer_alias() {
+        // `plan` is the genuine, tightest launch mode; `read-only` launches as
+        // `default` and its no-edit intent moves to a deny block.
+        assert_eq!(permission_rank("plan"), 0);
+        assert_eq!(permission_rank("read-only"), permission_rank("default"));
+        assert_ne!(permission_rank("read-only"), permission_rank("plan"));
+        assert_eq!(permission_flag_value("read-only"), "default");
+        assert_eq!(permission_flag_value("plan"), "plan");
     }
 
     #[test]
@@ -607,21 +704,22 @@ workspaces: []
         // Project ceiling is `auto` (base_project default). A task requesting the
         // looser `full-access` is clamped down to the ceiling, never escalated.
         let project = base_project();
-        assert_eq!(project.workspace_permissions_mode, "auto");
+        assert_eq!(project.workspace_permissions_mode.as_deref(), Some("auto"));
         let escalate = IssueLaunchConfig {
             permission_mode: Some("full-access".into()),
             ..Default::default()
         };
         let r = resolve_agent_launch(&project, "review", None, Some(&escalate));
-        assert_eq!(r.permission_mode, "auto");
+        assert_eq!(r.permission_mode.as_deref(), Some("auto"));
 
-        // A tighter request (read-only) is honored, mapped to claude's `plan`.
+        // A tighter request (read-only) is honored, mapped to claude's `default`
+        // (a no-edit posture is enforced by a deny block, not plan mode).
         let tighten = IssueLaunchConfig {
             permission_mode: Some("read-only".into()),
             ..Default::default()
         };
         let r = resolve_agent_launch(&project, "review", None, Some(&tighten));
-        assert_eq!(r.permission_mode, "plan");
+        assert_eq!(r.permission_mode.as_deref(), Some("default"));
 
         // The task request wins over the manifest's: manifest asks read-only but
         // the task asks (and is granted) the equal-to-ceiling `auto`.
@@ -631,6 +729,23 @@ workspaces: []
             ..Default::default()
         };
         let r = resolve_agent_launch(&project, "review", Some(&m), Some(&task_auto));
-        assert_eq!(r.permission_mode, "auto");
+        assert_eq!(r.permission_mode.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn unset_project_ceiling_defers_and_honors_agent_request() {
+        // A project with no `workspace_permissions_mode` (the new default).
+        let mut project = base_project();
+        project.workspace_permissions_mode = None;
+
+        // No agent request either → resolved mode is None (pass no flag).
+        let r = resolve_agent_launch(&project, "review", None, None);
+        assert_eq!(r.permission_mode, None);
+
+        // An agent that opts into a posture is honored unclamped (no ceiling to
+        // lower it to).
+        let m = AgentManifest::from_yaml_str("name: r\npermissions_mode: acceptEdits\n").unwrap();
+        let r = resolve_agent_launch(&project, "review", Some(&m), None);
+        assert_eq!(r.permission_mode.as_deref(), Some("acceptEdits"));
     }
 }

@@ -414,6 +414,11 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_workflow(entry, &text, out);
     } else if id == "global.preferences" {
         sniff_user_config(entry, &text, out);
+    } else if matches!(entry.format, SurfaceFormat::Yaml)
+        && id.contains(".agent.")
+        && id.ends_with(".manifest")
+    {
+        sniff_agent_manifest(entry, &text, out);
     } else if matches!(entry.format, SurfaceFormat::Json)
         && (id.ends_with(".settings") || id.ends_with("workspace-settings-template"))
     {
@@ -577,6 +582,9 @@ fn sniff_project_registration(
         let Some(key) = k.as_str() else { continue };
         match key {
             "display_name" => sniff_display_name(project, entry, text, map, v, out),
+            "workspace_permissions_mode" => {
+                sniff_workspace_permissions_mode(entry, text, v, out)
+            }
             "workers" => out.push(finding(
                 entry,
                 Classification::AutoHeal,
@@ -634,6 +642,94 @@ fn sniff_project_registration(
     }
     if let Some(zen) = get(&value, "zen") {
         sniff_zen_danger_paths(entry, text, zen, out);
+    }
+}
+
+/// Sniff a project's `workspace_permissions_mode`. Absent configuration is now
+/// neutral: shelbi passes no `--permission-mode` and each agent runs under the
+/// user's own `permissions.defaultMode`. But older installs carry an *explicit*
+/// value they never deliberately chose:
+///
+/// - `auto` — the value the pre-2026-09 scaffold always wrote, so shelbi kept
+///   overriding the user's `defaultMode` on every launch even when they never
+///   asked for a ceiling.
+/// - `default` — the magic-string workaround that meant "pass nothing"; a real
+///   absence expresses the same intent without the surprising literal.
+///
+/// Both route to [`Classification::NeedsJudgment`]: whether the value was a
+/// deliberate ceiling or an inherited default is genuinely ambiguous (the
+/// serialized form is identical either way), and dropping it changes launch
+/// behavior for a user whose `defaultMode` isn't `auto` — a potentially lossy
+/// rewrite the AGENTS.md guardrail says to hand to judgment, not auto-heal. A
+/// deliberate ceiling (`acceptEdits` / `bypassPermissions` / `plan` / …) is
+/// left untouched.
+fn sniff_workspace_permissions_mode(
+    entry: &InventoryEntry,
+    text: &str,
+    v: &Value,
+    out: &mut Vec<UpgradeFinding>,
+) {
+    let Some(mode) = v.as_str() else { return };
+    let (code, message) = match mode.trim() {
+        "auto" => (
+            "PROJECT_WORKSPACE_PERMISSIONS_MODE_IMPLICIT_AUTO",
+            "`workspace_permissions_mode: auto` is the old shipped default — shelbi \
+             passes `--permission-mode auto` on every launch, overriding your own \
+             ~/.claude permissions.defaultMode even if you never chose a ceiling",
+        ),
+        "default" => (
+            "PROJECT_WORKSPACE_PERMISSIONS_MODE_MAGIC_DEFAULT",
+            "`workspace_permissions_mode: default` is the magic-string workaround for \
+             \"pass no --permission-mode\"; an omitted key now expresses that directly",
+        ),
+        _ => return,
+    };
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        code,
+        message,
+        "If you want each agent to run under your own ~/.claude permissions.defaultMode, \
+         remove the `workspace_permissions_mode:` line entirely. Keep it only if you \
+         intend a concrete project-wide ceiling (plan | acceptEdits | bypassPermissions), \
+         which clamps every agent's requested posture downward.",
+        locate_key(text, "workspace_permissions_mode"),
+    ));
+}
+
+/// Sniff an agent `agent.yaml` manifest for a live `permissions_mode:
+/// read-only` (or `readonly`). This used to map onto Claude's *plan* mode,
+/// which disables all tool use — so a claude-runner agent that declared it
+/// (the review loader, the adversarial reviewer) could never run its
+/// build/serve steps and stalled on an ExitPlanMode prompt. `read-only` now
+/// maps to `default`, so the declaration is inert as a launch mode; but a
+/// genuine no-edit posture belongs in a `permissions.deny` block on
+/// `Edit`/`Write`/`NotebookEdit` in the agent's `settings.json`, which Claude
+/// enforces without blocking the read/exec tools the agent needs.
+///
+/// Routed to [`Classification::NeedsJudgment`]: an agent manifest is
+/// user-customizable config, and whether the author wants a true no-edit
+/// posture (→ move to a deny block) or nothing at all (→ drop the key) is their
+/// call, not a mechanical rewrite.
+fn sniff_agent_manifest(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    let Ok(value) = serde_yaml::from_str::<Value>(text) else {
+        return; // a YAML syntax error is the lint's job
+    };
+    let mode = get(&value, "permissions_mode").and_then(Value::as_str);
+    if matches!(mode.map(str::trim), Some("read-only") | Some("readonly")) {
+        out.push(finding(
+            entry,
+            Classification::NeedsJudgment,
+            "AGENT_PERMISSIONS_MODE_READ_ONLY",
+            "agent manifest declares `permissions_mode: read-only` — this no longer means \
+             plan mode (a no-edit posture is enforced by a deny block now), and on a \
+             claude runner it previously stalled the agent on an ExitPlanMode prompt",
+            "Remove `permissions_mode: read-only` from the manifest. To keep a no-edit \
+             posture, add a `permissions.deny` block on Edit/Write/NotebookEdit in this \
+             agent's settings.json instead (which Claude enforces while still allowing the \
+             read/exec tools the agent needs).",
+            locate_key(text, "permissions_mode"),
+        ));
     }
 }
 
@@ -1810,6 +1906,80 @@ mod tests {
         let fs = project_findings("name: Same\ndisplay_name: Same\n");
         let f = find(&fs, "PROJECT_DISPLAY_NAME_DEPRECATED").expect("finding");
         assert_eq!(f.classification, Classification::AutoHeal);
+    }
+
+    // ---- workspace_permissions_mode -------------------------------------
+
+    #[test]
+    fn implicit_auto_permission_ceiling_needs_judgment() {
+        let fs = project_findings("name: demo\nworkspace_permissions_mode: auto\n");
+        let f = find(&fs, "PROJECT_WORKSPACE_PERMISSIONS_MODE_IMPLICIT_AUTO").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+    }
+
+    #[test]
+    fn magic_default_permission_ceiling_needs_judgment() {
+        let fs = project_findings("name: demo\nworkspace_permissions_mode: default\n");
+        let f = find(&fs, "PROJECT_WORKSPACE_PERMISSIONS_MODE_MAGIC_DEFAULT").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+    }
+
+    #[test]
+    fn deliberate_permission_ceiling_is_left_alone() {
+        // A concrete, tighter ceiling is a real choice — never flagged.
+        for mode in ["acceptEdits", "bypassPermissions", "plan"] {
+            let fs = project_findings(&format!("name: demo\nworkspace_permissions_mode: {mode}\n"));
+            assert!(
+                !codes(&fs)
+                    .iter()
+                    .any(|c| c.starts_with("PROJECT_WORKSPACE_PERMISSIONS_MODE")),
+                "mode `{mode}` must not be flagged: {:?}",
+                codes(&fs)
+            );
+        }
+    }
+
+    // ---- agent manifest permissions_mode --------------------------------
+
+    fn manifest_entry() -> InventoryEntry {
+        entry(
+            "project.demo.agent.adversarial.manifest",
+            "project:demo",
+            SurfaceFormat::Yaml,
+        )
+    }
+
+    #[test]
+    fn agent_manifest_read_only_needs_judgment() {
+        let mut out = Vec::new();
+        sniff_agent_manifest(
+            &manifest_entry(),
+            "name: adversarial\npreferred_runner: claude\npermissions_mode: read-only\n",
+            &mut out,
+        );
+        let f = find(&out, "AGENT_PERMISSIONS_MODE_READ_ONLY").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+    }
+
+    #[test]
+    fn agent_manifest_commented_or_other_mode_is_clean() {
+        // A commented-out key never parses as active → no finding.
+        let mut out = Vec::new();
+        sniff_agent_manifest(
+            &manifest_entry(),
+            "name: review\npreferred_runner: claude\n# permissions_mode: read-only\n",
+            &mut out,
+        );
+        assert!(out.is_empty(), "commented key must not fire: {out:?}");
+
+        // A concrete non-read-only posture is not this deprecation.
+        let mut out = Vec::new();
+        sniff_agent_manifest(
+            &manifest_entry(),
+            "name: dev\npermissions_mode: acceptEdits\n",
+            &mut out,
+        );
+        assert!(out.is_empty(), "acceptEdits must not fire: {out:?}");
     }
 
     #[test]

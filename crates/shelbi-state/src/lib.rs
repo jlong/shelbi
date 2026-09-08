@@ -177,6 +177,19 @@ pub(crate) mod test_lock {
 pub const DEFAULT_WORKSPACE_SETTINGS_TEMPLATE: &str =
     include_str!("default_workspace_settings.json.template");
 
+/// Workspace settings the **review** agent scaffolds: the same pane-state /
+/// message-tail hooks as [`DEFAULT_WORKSPACE_SETTINGS_TEMPLATE`], plus a
+/// `permissions.deny` block on `Edit`/`Write`/`NotebookEdit`.
+///
+/// The review agent loads, builds, and serves a finished branch for a human to
+/// inspect — it must never modify the code under review. That no-edit posture
+/// is enforced here, in a deny block Claude actually honors while still
+/// allowing the read/exec tools the agent needs, rather than in a launch mode
+/// (`plan`) that would disable all tool use and stall the agent on an
+/// ExitPlanMode prompt. See [`crate::agent_workspaces::DEFAULT_AGENTS`].
+pub const DEFAULT_REVIEW_WORKSPACE_SETTINGS_TEMPLATE: &str =
+    include_str!("default_review_settings.json.template");
+
 /// Default shelbi root directory.
 ///
 /// Resolves via [`root::resolve`] — see that function for the full
@@ -473,6 +486,11 @@ fn save_project_config(project: &Project) -> Result<()> {
     save_project(project)
 }
 
+/// The placeholder a user-authored workspace-settings template may still carry
+/// to have shelbi stamp the project's permission mode into
+/// `permissions.defaultMode`. The shipped default no longer uses it.
+const WORKSPACE_PERMISSIONS_MODE_PLACEHOLDER: &str = "{{workspace_permissions_mode}}";
+
 /// Render the workspace settings JSON for `project`: read the template file
 /// resolved by [`workspace_settings_template_path`] (falling back to
 /// [`DEFAULT_WORKSPACE_SETTINGS_TEMPLATE`] when the file is missing — a fresh
@@ -484,6 +502,14 @@ fn save_project_config(project: &Project) -> Result<()> {
 /// longer uses the placeholder: claude's permission mode is now passed on
 /// the CLI by the workspace spawn path, which is authoritative and immune to
 /// the settings.json races that motivated this change.
+///
+/// When `workspace_permissions_mode` is **unset** (`None`), shelbi must not
+/// write a `defaultMode` the user never chose — doing so would override the
+/// user's own `~/.claude/settings.json` `permissions.defaultMode`. So the
+/// placeholder is not filled with a value; instead the `defaultMode` entry
+/// carrying it is dropped from the rendered JSON (see
+/// [`drop_placeholder_default_mode`]). A template that doesn't reference the
+/// placeholder — including the shipped default — renders unchanged.
 pub fn render_workspace_settings(project: &Project) -> Result<String> {
     let path = workspace_settings_template_path(project)?;
     let template = match read_to_string_at(&path) {
@@ -493,10 +519,64 @@ pub fn render_workspace_settings(project: &Project) -> Result<String> {
         }
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
-    Ok(template.replace(
-        "{{workspace_permissions_mode}}",
-        &project.workspace_permissions_mode,
+    Ok(apply_workspace_permissions_mode(
+        &template,
+        project.workspace_permissions_mode.as_deref(),
     ))
+}
+
+/// Substitute the `{{workspace_permissions_mode}}` placeholder in a
+/// workspace-settings template. `Some(mode)` fills it verbatim; `None` (the
+/// user configured no ceiling) drops the `defaultMode` entry entirely so no
+/// value the user never chose is written and claude falls back to the user's
+/// own `permissions.defaultMode` (see [`drop_placeholder_default_mode`]).
+///
+/// Public so both settings sources that carry the placeholder route through the
+/// same logic: the project-wide template ([`render_workspace_settings`]) and a
+/// per-agent `settings.json` substituted at deploy time.
+pub fn apply_workspace_permissions_mode(template: &str, mode: Option<&str>) -> String {
+    match mode {
+        Some(mode) => template.replace(WORKSPACE_PERMISSIONS_MODE_PLACEHOLDER, mode),
+        None => drop_placeholder_default_mode(template),
+    }
+}
+
+/// Render a workspace-settings template for the **unset** permission mode:
+/// remove any `permissions.defaultMode` whose value is the
+/// `{{workspace_permissions_mode}}` placeholder so no `defaultMode` the user
+/// never chose is written, letting claude fall back to the user's own
+/// `permissions.defaultMode`.
+///
+/// A template that doesn't reference the placeholder is returned verbatim (the
+/// common case — the shipped default and any template that hard-codes its own
+/// mode). When the placeholder is present the template is parsed as JSON, the
+/// `defaultMode` key is dropped (and an emptied `permissions` object with it),
+/// and the result is re-serialized. If the template can't be parsed as JSON
+/// (a hand-authored template with comments, say), the placeholder is replaced
+/// with `default` as a last-resort fallback — claude's baseline, the closest
+/// non-panicking behavior when the structured drop isn't possible.
+fn drop_placeholder_default_mode(template: &str) -> String {
+    if !template.contains(WORKSPACE_PERMISSIONS_MODE_PLACEHOLDER) {
+        return template.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(template) else {
+        return template.replace(WORKSPACE_PERMISSIONS_MODE_PLACEHOLDER, "default");
+    };
+    if let Some(permissions) = value.get_mut("permissions").and_then(|p| p.as_object_mut()) {
+        let is_placeholder = permissions
+            .get("defaultMode")
+            .and_then(|m| m.as_str())
+            .map(|m| m.contains(WORKSPACE_PERMISSIONS_MODE_PLACEHOLDER))
+            .unwrap_or(false);
+        if is_placeholder {
+            permissions.remove("defaultMode");
+        }
+        if permissions.is_empty() {
+            value.as_object_mut().map(|o| o.remove("permissions"));
+        }
+    }
+    serde_json::to_string_pretty(&value)
+        .unwrap_or_else(|_| template.replace(WORKSPACE_PERMISSIONS_MODE_PLACEHOLDER, "default"))
 }
 
 /// Outcome of [`self_heal_workspace_settings_template`].
@@ -3471,7 +3551,7 @@ mod tests {
             workspaces: vec![],
             workspace_poll_interval_secs: 5,
             github_reconcile_interval_secs: 900,
-            workspace_permissions_mode: "auto".into(),
+            workspace_permissions_mode: Some("auto".into()),
             workspace_settings_template: override_template,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
@@ -3695,7 +3775,7 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let mut p = fixture_project("myapp", None);
-        p.workspace_permissions_mode = "bypassPermissions".into();
+        p.workspace_permissions_mode = Some("bypassPermissions".into());
         let tpl_path = workspace_settings_template_path(&p).unwrap();
         ensure_dir(tpl_path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -3706,6 +3786,41 @@ mod tests {
         let rendered = render_workspace_settings(&p).unwrap();
         assert!(rendered.contains("\"defaultMode\":\"bypassPermissions\""));
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn render_workspace_settings_unset_drops_placeholder_default_mode() {
+        // With no `workspace_permissions_mode` configured, a template that still
+        // carries the placeholder must NOT write a `defaultMode` the user never
+        // chose — the key is dropped so claude falls back to the user's own
+        // permissions.defaultMode.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let mut p = fixture_project("myapp", None);
+        p.workspace_permissions_mode = None;
+        let tpl_path = workspace_settings_template_path(&p).unwrap();
+        ensure_dir(tpl_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &tpl_path,
+            r#"{"permissions":{"defaultMode":"{{workspace_permissions_mode}}"},"custom":true}"#,
+        )
+        .unwrap();
+        let rendered = render_workspace_settings(&p).unwrap();
+        assert!(!rendered.contains("{{"), "placeholder must be resolved: {rendered}");
+        assert!(!rendered.contains("defaultMode"), "no defaultMode may be written: {rendered}");
+        assert!(rendered.contains("\"custom\""), "rest of the template survives: {rendered}");
+        // Result must still parse as valid JSON for claude.
+        let _: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn apply_workspace_permissions_mode_leaves_placeholderless_template_untouched() {
+        // The shipped default carries no placeholder, so the unset path must
+        // return it byte-for-byte (no spurious JSON reserialization).
+        let out = apply_workspace_permissions_mode(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE, None);
+        assert_eq!(out, DEFAULT_WORKSPACE_SETTINGS_TEMPLATE);
     }
 
     #[test]
@@ -3788,7 +3903,7 @@ mod tests {
             "plan",
         ] {
             let mut p = fixture_project("myapp", None);
-            p.workspace_permissions_mode = mode.into();
+            p.workspace_permissions_mode = Some(mode.into());
             let rendered = render_workspace_settings(&p).unwrap();
             assert!(
                 !rendered.contains("{{"),
