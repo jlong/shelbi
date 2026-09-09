@@ -520,6 +520,7 @@ fn pr_create_impl(
             branch,
             &expected.base_branch,
             &expected.base_sha,
+            published_head,
             &origin_repository,
             &push_target,
             num,
@@ -585,6 +586,7 @@ fn pr_create_impl(
         branch,
         &expected.base_branch,
         &expected.base_sha,
+        published_head,
         &origin_repository,
         &push_target,
         num,
@@ -620,6 +622,7 @@ fn verify_pr_identity(
     branch: &str,
     target: &str,
     expected_base_sha: &str,
+    published_head: Option<&str>,
     origin_repository: &RepositoryIdentity,
     push_target: &str,
     pr: u64,
@@ -648,10 +651,13 @@ fn verify_pr_identity(
             "while its PR head was being verified",
         )?;
         verify_pr_structural_identity(
+            host,
+            worktree,
             &identity,
             branch,
             target,
             expected_base_sha,
+            published_head,
             origin_repository,
             pr,
         )?;
@@ -688,11 +694,15 @@ fn verify_pr_identity(
 /// provenance. These fields do not lag GitHub's API the way the head OID does
 /// right after a push, so a mismatch here is always a hard, non-retryable
 /// refusal.
+#[allow(clippy::too_many_arguments)]
 fn verify_pr_structural_identity(
+    host: &Host,
+    worktree: &std::path::Path,
     identity: &crate::git::PrIdentity,
     branch: &str,
     target: &str,
     expected_base_sha: &str,
+    published_head: Option<&str>,
     origin_repository: &RepositoryIdentity,
     pr: u64,
 ) -> Result<()> {
@@ -711,12 +721,34 @@ fn verify_pr_structural_identity(
         )));
     }
     if identity.base_oid != expected_base_sha {
-        return Err(Error::Other(format!(
-            "open PR #{pr} for branch `{branch}` reports base `{target}` at {}, but the Zen \
-             probe reviewed base commit {expected_base_sha}; refusing to reuse or merge a PR \
-             after its base moved",
-            identity.base_oid
-        )));
+        // An auto-opened PR records the base ref's tip at handoff time. When the
+        // base moves before the Zen probe runs, the probe rebases the branch
+        // onto the current base, but the PR keeps reporting the pre-rebase base
+        // until its head branch is pushed again — which `pr-create` has just
+        // done. GitHub synchronizes the PR onto the reviewed base off that push,
+        // so a recorded base equal to the flow's own prior state (the commit the
+        // still-published pre-rebase head was built on) is not a base moving out
+        // from under us; it is the base we are resynchronizing away from. Accept
+        // it and let the push carry the PR forward. Any base the probe never
+        // recorded stays a hard refusal.
+        let accepts_prior_base = match published_head {
+            Some(published_head) => base_is_flow_prior_state(
+                host,
+                worktree,
+                &identity.base_oid,
+                published_head,
+                expected_base_sha,
+            )?,
+            None => false,
+        };
+        if !accepts_prior_base {
+            return Err(Error::Other(format!(
+                "open PR #{pr} for branch `{branch}` reports base `{target}` at {}, but the Zen \
+                 probe reviewed base commit {expected_base_sha}; refusing to reuse or merge a PR \
+                 after its base moved",
+                identity.base_oid
+            )));
+        }
     }
     if identity.head_repository.id != origin_repository.id {
         return Err(Error::Other(format!(
@@ -730,6 +762,37 @@ fn verify_pr_structural_identity(
         )));
     }
     Ok(())
+}
+
+/// True when `base_oid` — the base a reused PR still reports — is the exact base
+/// the flow's own handoff push saw: the commit the probe's still-published
+/// pre-rebase head (`published_head`) was built on. That commit is the merge
+/// base of the published head and the reviewed base (`reviewed_base`): the
+/// probe rebased the branch from it onto `reviewed_base`, and the auto-opened
+/// PR recorded it as its base. Recognizing it lets the head push `pr-create`
+/// just performed resynchronize the PR onto `reviewed_base` instead of
+/// dead-ending on the base-moved guard. Any other base — one the probe never
+/// recorded — returns false so the caller still refuses. Reachability of
+/// `published_head` is not assumed: if `merge-base` cannot resolve it the
+/// answer is a conservative false.
+fn base_is_flow_prior_state(
+    host: &Host,
+    worktree: &std::path::Path,
+    base_oid: &str,
+    published_head: &str,
+    reviewed_base: &str,
+) -> Result<bool> {
+    let wt = worktree.to_string_lossy().into_owned();
+    let out = run_in_dir(
+        host,
+        &wt,
+        &["git", "merge-base", published_head, reviewed_base],
+    )?;
+    if !out.status.success() {
+        return Ok(false);
+    }
+    let merge_base = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok(!merge_base.is_empty() && merge_base == base_oid)
 }
 
 /// Re-read the durable task branch ref and require it to stay on the commit
@@ -4716,6 +4779,146 @@ esac
         assert!(err.contains("after its base moved"), "{err}");
         assert!(!gh_calls(&log).contains("pr create"));
         assert_eq!(remote_head(&origin), identity.integration_sha);
+    }
+
+    fn origin_main_sha(origin: &Path) -> String {
+        git_stdout(
+            origin.parent().unwrap(),
+            &[
+                "--git-dir",
+                origin.to_str().unwrap(),
+                "rev-parse",
+                "refs/heads/main",
+            ],
+        )
+    }
+
+    #[test]
+    fn auto_opened_pr_whose_base_moved_once_is_resynchronized_by_the_push() {
+        // The common busy-board case: the handoff push auto-opened a PR while
+        // `main` was at the pre-move tip, then a sibling merged and moved `main`
+        // before the Zen flow ran. The probe rebases the branch onto the new
+        // base, but the open PR still records the base the handoff push saw —
+        // and that base only advances once the branch is pushed again, which is
+        // exactly what `pr-create` does. The recorded base is the flow's own
+        // prior state (the commit the still-published pre-rebase head was built
+        // on), so `pr-create` must reuse the PR off its own push rather than
+        // demanding a manual push + re-probe.
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(true);
+        let published_head = remote_head(&origin);
+        assert_eq!(task_branch_head(&worktree), published_head);
+        // The base the handoff PR was opened against — the merge base the probe
+        // will record for the published head once `main` moves ahead of it.
+        let handoff_base = origin_main_sha(&origin);
+        // Handoff detaches the finished worktree so the probe advances the
+        // durable ref in its own isolated checkout.
+        run_git(&worktree, &["checkout", "-q", "--detach"]);
+
+        // A sibling merges: the default branch advances past the handoff base.
+        advance_origin_main_with_base_fix(base.path(), &origin);
+
+        let project = project(base.path());
+        let stub = tempfile::tempdir().unwrap();
+        // A PR is already open for this branch (the handoff push opened it), so
+        // `pr-create` reuses rather than creating. Its recorded base lags at the
+        // handoff base.
+        let log = install_gh_stub(stub.path(), &origin, Some(1250), None);
+        override_gh_pr_base_oid(stub.path(), &handoff_base);
+        let (report, result) = {
+            let _env = EnvGuard::install(stub.path());
+            let report = probe_in_workflow(
+                &project,
+                None,
+                &task(),
+                TASK_BRANCH,
+                RebasePolicy::RebaseOntoDefault,
+            )
+            .unwrap();
+            let identity = report_identity(&report);
+            let result = pr_create_impl(
+                &project,
+                PROJECT_NAME,
+                &task(),
+                "body",
+                &identity,
+                fast_head_retry(),
+            );
+            (report, result)
+        };
+
+        // Sanity: the probe rebased onto the moved base and recorded the handoff
+        // base as the merge base for the still-published pre-rebase head.
+        assert_ne!(report.head_sha, published_head, "the probe must rebase");
+        assert_eq!(report.published_head_sha, published_head);
+        assert_ne!(report.base_sha, handoff_base, "the base must have moved");
+
+        // No manual push, no dead-end: the reused PR is accepted and its number
+        // returned once the push resynchronizes it.
+        assert_eq!(result.unwrap(), 1250);
+        assert!(
+            !gh_calls(&log).contains("pr create"),
+            "the existing PR must be reused, not recreated: {}",
+            gh_calls(&log)
+        );
+        assert_eq!(
+            remote_head(&origin),
+            report.integration_sha,
+            "pr-create's own push must advance the remote tip to the reviewed \
+             integration commit"
+        );
+    }
+
+    #[test]
+    fn open_pr_whose_base_is_unknown_to_the_probe_is_rejected_even_with_a_published_head() {
+        // The resynchronize path only accepts a base equal to the flow's own
+        // prior state. A recorded base the probe never saw — not the merge base
+        // of the published head and the reviewed base — is still a concurrent
+        // base move and must be refused, even when the probe recorded a
+        // published head (so the acceptance path is actually reachable).
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(true);
+        let published_head = remote_head(&origin);
+        assert_eq!(task_branch_head(&worktree), published_head);
+        run_git(&worktree, &["checkout", "-q", "--detach"]);
+
+        advance_origin_main_with_base_fix(base.path(), &origin);
+
+        let project = project(base.path());
+        let stub = tempfile::tempdir().unwrap();
+        let log = install_gh_stub(stub.path(), &origin, Some(1250), None);
+        let alien_base = "dddddddddddddddddddddddddddddddddddddddd";
+        override_gh_pr_base_oid(stub.path(), alien_base);
+        let (report, result) = {
+            let _env = EnvGuard::install(stub.path());
+            let report = probe_in_workflow(
+                &project,
+                None,
+                &task(),
+                TASK_BRANCH,
+                RebasePolicy::RebaseOntoDefault,
+            )
+            .unwrap();
+            let identity = report_identity(&report);
+            let result = pr_create_impl(
+                &project,
+                PROJECT_NAME,
+                &task(),
+                "body",
+                &identity,
+                fast_head_retry(),
+            );
+            (report, result)
+        };
+
+        // The probe recorded a published head, so the acceptance path is live —
+        // yet the alien base is not the flow's prior state and must be rejected.
+        assert_eq!(report.published_head_sha, published_head);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("PR #1250"), "{err}");
+        assert!(err.contains(alien_base), "{err}");
+        assert!(err.contains("after its base moved"), "{err}");
+        assert!(!gh_calls(&log).contains("pr create"), "{}", gh_calls(&log));
     }
 
     #[test]
