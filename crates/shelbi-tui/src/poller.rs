@@ -3960,6 +3960,16 @@ impl DevResumeState {
     }
 }
 
+/// How recently a `dispatch … status=confirmed` line must sit for
+/// [`maybe_resume_stranded_dev_slots`] to treat the slot as alive on the
+/// strength of that confirmation alone. A launch confirms busy within a few
+/// seconds; the dev-resume probe that misfired did so ~2s after the
+/// confirmation. This window comfortably covers dispatch latency plus tick
+/// jitter while staying far shorter than any pre-`quit` confirmation, so a
+/// genuinely stranded slot (whose last confirmation predates the reopen) is
+/// still resumed.
+const DISPATCH_CONFIRM_GRACE: Duration = Duration::from_secs(60);
+
 /// Resume any *dev* slot whose `in_progress` task is assigned on disk but whose
 /// pane is dead and was never seen alive this session — the `quit`+reopen half
 /// of pane recovery that the ordinary supervisor deliberately skips.
@@ -3974,11 +3984,16 @@ impl DevResumeState {
 /// context-clearing dispatch).
 ///
 /// For each **local**, non-`review` slot: probe the pane; if alive, latch it and
-/// let the pane supervisor own any future crash. If it's dead but this pass has
-/// already seen it alive, stand down (a genuine crash is the supervisor's). If
-/// it's dead and never seen alive, and a live `in_progress` task is still
-/// assigned (and not parked), resume it. Probe failures read as ALIVE so a
-/// transient tmux hiccup never triggers a resume onto a genuinely working slot.
+/// let the pane supervisor own any future crash. If it's dead but a dispatch
+/// just confirmed it busy ([`DISPATCH_CONFIRM_GRACE`]), latch it alive too — the
+/// launch path's confirmation is authoritative over a momentary dead read of the
+/// freshly launched window, which is the spurious-resume race this pass had. If
+/// it's dead but this pass has already seen it alive, stand down (a genuine crash
+/// is the supervisor's). If it's dead and never seen alive, and a live
+/// `in_progress` task is still assigned (and not parked), re-probe once more
+/// right before relaunching (the board/park reads aren't free) and resume only
+/// if still dead. Probe failures read as ALIVE so a transient tmux hiccup never
+/// triggers a resume onto a genuinely working slot.
 fn maybe_resume_stranded_dev_slots(
     project: &Project,
     state: &mut HashMap<String, DevResumeState>,
@@ -4008,6 +4023,21 @@ fn maybe_resume_stranded_dev_slots(
         let alive =
             shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true);
         if alive {
+            entry.note_alive(now);
+            continue;
+        }
+
+        // A dispatch that just confirmed this slot's pane busy
+        // (`seed_busy_observed` / `busy_observed`) is authoritative over a
+        // momentary dead read of the freshly launched window. `shelbi issue
+        // start` runs in the orchestrator pane, a separate process, so the
+        // confirmation reaches this pass only through the durable events log;
+        // when it's there, latch the slot alive and hand future crashes to the
+        // pane supervisor. This is the fix for the spurious `--continue` that
+        // relaunched a slot ~2s after its dispatch confirmed busy. The grace
+        // window keeps a stale pre-`quit` confirmation from masking a genuinely
+        // stranded slot.
+        if shelbi_state::recent_dispatch_confirmed(&ws.name, DISPATCH_CONFIRM_GRACE) {
             entry.note_alive(now);
             continue;
         }
@@ -4060,6 +4090,20 @@ fn maybe_resume_stranded_dev_slots(
         // `None`.)
         if shelbi_state::is_task_parked(&project.name, &task_id).unwrap_or(false) {
             state.remove(&ws.name);
+            continue;
+        }
+
+        // Re-probe liveness right before relaunching. The warm board read and
+        // park check above aren't free, and a dispatch can bring the pane up in
+        // that gap — so trust a fresh probe (or a confirmation that landed
+        // meanwhile) over the earlier one rather than resuming onto a slot that
+        // has since come alive. A probe error still reads as ALIVE, and the
+        // re-probe runs before `decide_dead` so a slot found alive here doesn't
+        // pollute the crash-loop history.
+        if shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true)
+            || shelbi_state::recent_dispatch_confirmed(&ws.name, DISPATCH_CONFIRM_GRACE)
+        {
+            entry.note_alive(now);
             continue;
         }
 
@@ -4775,6 +4819,38 @@ mod tests {
         assert_eq!(s.decide_dead(t), ReviewResumeAction::Resume);
         s.note_alive(t + Duration::from_secs(1));
         assert!(s.ever_alive, "a live sighting must latch the hand-off guard");
+    }
+
+    #[test]
+    fn dev_resume_stands_down_when_a_dispatch_confirmed_the_slot_this_tick() {
+        // The spurious-resume race: a slot never seen alive is dispatched onto,
+        // the launch confirms busy, and the very next tick the pass probes the
+        // freshly launched window and (momentarily) reads it dead. Without the
+        // confirmation guard this would `decide_dead` → Resume and relaunch the
+        // live pane with `--continue`. `maybe_resume_stranded_dev_slots` calls
+        // `note_alive` on a `recent_dispatch_confirmed` hit *before* it consults
+        // `ever_alive`, so the pass stands down. This asserts that ordering on
+        // the state machine: a confirmation latches the hand-off guard, which
+        // then gates `decide_dead` out.
+        let mut s = DevResumeState::default();
+        let t = Instant::now();
+        // Never alive: absent the confirmation, this slot would resume now.
+        assert!(!s.ever_alive);
+
+        // A dispatch confirmed the pane busy this tick → the pass latches it.
+        s.note_alive(t);
+        assert!(
+            s.ever_alive,
+            "a dispatch confirmation must latch the slot alive",
+        );
+
+        // With `ever_alive` set the caller skips `decide_dead` entirely, so no
+        // resume is issued and the crash history stays empty — nothing to age
+        // out into a later spurious relaunch.
+        assert!(
+            s.restarts.is_empty(),
+            "standing down on a confirmation records no restart",
+        );
     }
 
     #[test]
