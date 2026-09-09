@@ -49,6 +49,7 @@
 //! bridge (`shelbi_orchestrator::wake`), which also derives its queue batch
 //! ids via [`delivery_id`].
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
@@ -695,6 +696,51 @@ pub fn read_event_log_from(cursor: u64) -> Result<EventLogRead> {
         // The blocking acquire never returns without the lock held.
         FeedRead::LockUnavailable => unreachable!("blocking lock never reports unavailable"),
     }
+}
+
+/// For each task with a recorded status transition in the current `events.log`
+/// generation, the status column its **most recent** transition landed it in,
+/// scoped to `project`.
+///
+/// This is the hub-vs-external discriminator the poller's issue-reconcile pass
+/// consults before reconciling a github board move: every shelbi-driven move (a
+/// ready-marker handoff, an orchestrator `shelbi issue move`, a dispatch)
+/// appends its own transition here, so a board move whose target this map
+/// already records was made by the hub itself and must not be reconciled a
+/// second time. A board move with no matching entry — a human changing the
+/// status directly on github.com — is genuinely external and is reconciled.
+///
+/// Reads only the current generation: the reconcile window is seconds-to-minutes
+/// and rotation is size-based and infrequent, so a hub move recent enough to
+/// race a reconcile sweep is always still in the current generation. Task lines
+/// that are not status transitions (a `task edit`; `ci`/`comment` lines already
+/// classify as their own [`EventKind`]s) carry no ` -> ` segment and are
+/// skipped. Best-effort and read-only; a missing/empty log yields an empty map.
+pub fn latest_task_transition_targets(project: &str) -> Result<HashMap<String, Column>> {
+    let read = read_event_log_from(event_log_current_base()?)?;
+    let text = String::from_utf8_lossy(&read.bytes);
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let env = EventEnvelope::from_log_line(line);
+        if env.kind != EventKind::Task || env.project.as_deref() != Some(project) {
+            continue;
+        }
+        let (Some(task), Some(to)) = (event_field(line, "task"), transition_target(line)) else {
+            continue;
+        };
+        // Later lines overwrite earlier ones, so the final insert per task is its
+        // most recent transition.
+        out.insert(task.to_string(), Column::from_status_id(to));
+    }
+    Ok(out)
+}
+
+/// Pull the `to` status id out of a task-transition line's `<from> -> <to>`
+/// segment (the wire shape [`task_event_body`] emits). `None` for a task line
+/// that carries no transition arrow (e.g. a `task edit`). The `to` token is the
+/// column's wire spelling; the caller normalizes it via [`Column::from_status_id`].
+fn transition_target(body: &str) -> Option<&str> {
+    body.split(" -> ").nth(1)?.split_whitespace().next()
 }
 
 /// Deadline/cancel-aware sibling of [`read_event_log_from`] for the consuming
@@ -4737,6 +4783,81 @@ mod tests {
         assert_eq!(parsed[1][9], "to_category=handoff");
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn latest_task_transition_targets_folds_to_the_most_recent_move_per_task() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Two moves for `fix-login`: the later review wins over the earlier
+        // in_progress.
+        append_task_event(
+            "demo",
+            "fix-login",
+            "default",
+            Column::todo(),
+            Column::in_progress(),
+            "assigned",
+        )
+        .unwrap();
+        append_task_event(
+            "demo",
+            "fix-login",
+            "default",
+            Column::in_progress(),
+            Column::review(),
+            READY_MARKER_HANDOFF_CAUSE,
+        )
+        .unwrap();
+        // A different task in the same project.
+        append_task_event(
+            "demo",
+            "add-search",
+            "default",
+            Column::todo(),
+            Column::in_progress(),
+            "user:cli",
+        )
+        .unwrap();
+        // A task in a different project must not leak into `demo`'s map.
+        append_task_event(
+            "other",
+            "fix-login",
+            "default",
+            Column::todo(),
+            Column::done(),
+            "user:cli",
+        )
+        .unwrap();
+        // A non-transition task line (a content edit) carries no ` -> ` and must
+        // be ignored rather than clobbering the recorded target.
+        append_task_edit_event("demo", "fix-login", "title,body", "user:cli").unwrap();
+
+        let map = latest_task_transition_targets("demo").unwrap();
+        assert_eq!(map.get("fix-login"), Some(&Column::review()));
+        assert_eq!(map.get("add-search"), Some(&Column::in_progress()));
+        // Scoped to `demo`: the `other` project's move is absent, and its
+        // `fix-login` done target did not overwrite demo's review.
+        assert_eq!(map.len(), 2);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn transition_target_extracts_the_to_column_or_none() {
+        assert_eq!(
+            transition_target(
+                "project=demo task=t workflow=default in_progress -> review reason=x"
+            ),
+            Some("review")
+        );
+        // A `task edit` line has no transition arrow.
+        assert_eq!(
+            transition_target("project=demo task=t edited fields=title reason=x"),
+            None
+        );
     }
 
     /// Contract test binding the ready-marker handoff emitter to the
