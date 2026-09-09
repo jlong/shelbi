@@ -658,7 +658,12 @@ enum IssueReconcileEvent {
 /// `seen` to the new baseline. The decision rules:
 ///
 /// - **Upsert whose column changed** (`from != to`) → a `Transition` event: the
-///   external close/reopen/relabel, reconciled as the matching board move.
+///   external close/reopen/relabel, reconciled as the matching board move —
+///   *unless* `recorded_target` proves the hub itself made the move. When the
+///   event log's most recent transition for the issue already lands it at the
+///   new column (a ready-marker handoff, an orchestrator `shelbi issue move`, a
+///   dispatch — every hub-driven move appends its own transition), re-emitting
+///   would double-count the one move, so the baseline advances silently instead.
 /// - **Upsert we have no prior column for** → record the baseline, emit nothing.
 ///   This is the post-restart / newly-appeared-issue case; inventing a `from`
 ///   would be a lie, and the issue's *next* genuine move reconciles normally.
@@ -666,11 +671,19 @@ enum IssueReconcileEvent {
 ///   baseline, emit nothing.
 /// - **New comment** → a `Comment` event, always (plan D4).
 ///
+/// `recorded_target(id)` returns the status the event log's most recent
+/// transition for `id` landed it in, or `None` when the log records no
+/// transition for it. It is the hub-vs-external discriminator: a github board
+/// move whose target the event log already records was made by shelbi, so it is
+/// suppressed; a github move with no matching hub transition (a human changing
+/// the status on github.com) is genuinely external and reconciled.
+///
 /// Split out so tests drive it with in-memory fixtures, mirroring
 /// [`tasks_are_quiescent`] / the orchestrator's `reconcile_candidates_with`.
 fn plan_issue_reconcile(
     changes: Vec<IssueChange>,
     seen: &mut HashMap<String, Column>,
+    recorded_target: impl Fn(&str) -> Option<Column>,
 ) -> Vec<IssueReconcileEvent> {
     let mut out = Vec::new();
     for change in changes {
@@ -679,7 +692,12 @@ fn plan_issue_reconcile(
                 let task = issue.task;
                 let to = task.column.clone();
                 if let Some(from) = seen.get(&task.id) {
-                    if *from != to {
+                    // Suppress a move the hub made itself: the event log's latest
+                    // transition for this issue already records it landing at
+                    // `to`, so a reconcile transition would be a duplicate of the
+                    // move that emitted that record.
+                    let hub_originated = recorded_target(&task.id).as_ref() == Some(&to);
+                    if *from != to && !hub_originated {
                         out.push(IssueReconcileEvent::Transition {
                             id: task.id.clone(),
                             workflow: task
@@ -872,7 +890,26 @@ fn maybe_reconcile_issues(
     // Steady state: pull the delta since the watermark and reconcile it.
     match store.poll_changes(&schedule.cursor) {
         Ok((changes, next_cursor)) => {
-            for ev in plan_issue_reconcile(changes, &mut schedule.seen_status) {
+            // The hub-vs-external discriminator: the status each task's most
+            // recent event-log transition landed it in. A github board move whose
+            // target the log already records was made by shelbi itself (the
+            // ready-marker handoff, an orchestrator `shelbi issue move`, a
+            // dispatch — each appends its own transition), so reconciling it would
+            // double-count the move. Loaded once per sweep, and only when there is
+            // an upsert to weigh, so a comment-only or empty delta pays nothing. A
+            // read failure yields an empty map, falling back to the prior
+            // always-reconcile behavior rather than dropping a genuine move.
+            let recorded = if changes
+                .iter()
+                .any(|c| matches!(c, IssueChange::Upserted(_)))
+            {
+                shelbi_state::latest_task_transition_targets(&project.name).unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
+            for ev in
+                plan_issue_reconcile(changes, &mut schedule.seen_status, |id| recorded.get(id).cloned())
+            {
                 emit_issue_reconcile_event(&project.name, ev);
             }
             schedule.cursor = next_cursor;
@@ -8303,6 +8340,13 @@ transitions:
         IssueChange::Upserted(Box::new(tf(task)))
     }
 
+    /// A `recorded_target` closure for the genuinely-external case: the event
+    /// log records no hub transition for any issue, so every board move is
+    /// reconciled. Used by the tests that model human moves on the tracker.
+    fn no_hub_moves(_id: &str) -> Option<Column> {
+        None
+    }
+
     #[test]
     fn plan_issue_reconcile_maps_external_moves_reopens_and_relabels() {
         // Baseline: `a` in-progress, `b` in todo. Both then move on the tracker
@@ -8314,6 +8358,7 @@ transitions:
         let events = plan_issue_reconcile(
             vec![upsert(done_task("a")), upsert(review_task("b"))],
             &mut seen,
+            no_hub_moves,
         );
         assert_eq!(
             events,
@@ -8335,11 +8380,15 @@ transitions:
         // The baseline advanced to the new columns, so a repeat poll of the same
         // state emits nothing (no duplicate transition).
         assert_eq!(seen.get("a"), Some(&Column::done()));
-        let repeat = plan_issue_reconcile(vec![upsert(done_task("a"))], &mut seen);
+        let repeat = plan_issue_reconcile(vec![upsert(done_task("a"))], &mut seen, no_hub_moves);
         assert!(repeat.is_empty());
 
         // A reopen (done → in-progress) reconciles as the reverse transition.
-        let reopened = plan_issue_reconcile(vec![upsert(in_progress_task("a", "alpha"))], &mut seen);
+        let reopened = plan_issue_reconcile(
+            vec![upsert(in_progress_task("a", "alpha"))],
+            &mut seen,
+            no_hub_moves,
+        );
         assert_eq!(
             reopened,
             vec![IssueReconcileEvent::Transition {
@@ -8357,17 +8406,17 @@ transitions:
         // is only recorded — no `from` to honestly report, so no event — and its
         // next genuine move reconciles normally.
         let mut seen = HashMap::new();
-        let first = plan_issue_reconcile(vec![upsert(review_task("c"))], &mut seen);
+        let first = plan_issue_reconcile(vec![upsert(review_task("c"))], &mut seen, no_hub_moves);
         assert!(first.is_empty());
         assert_eq!(seen.get("c"), Some(&Column::review()));
 
         // A same-column edit (body / priority bump, column unchanged) is likewise
         // a no-op transition.
-        let noop = plan_issue_reconcile(vec![upsert(review_task("c"))], &mut seen);
+        let noop = plan_issue_reconcile(vec![upsert(review_task("c"))], &mut seen, no_hub_moves);
         assert!(noop.is_empty());
 
         // Now `c` actually moves → the transition surfaces.
-        let moved = plan_issue_reconcile(vec![upsert(done_task("c"))], &mut seen);
+        let moved = plan_issue_reconcile(vec![upsert(done_task("c"))], &mut seen, no_hub_moves);
         assert_eq!(
             moved,
             vec![IssueReconcileEvent::Transition {
@@ -8375,6 +8424,63 @@ transitions:
                 workflow: DEFAULT_WORKFLOW_NAME.into(),
                 from: Column::review(),
                 to: Column::done(),
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_issue_reconcile_suppresses_a_hub_originated_move() {
+        // The regression: a ready-marker handoff (or an orchestrator
+        // `shelbi issue move`) flips the github card in_progress -> review AND
+        // appends its own transition to the event log. The reconcile sweep then
+        // sees the board move via `poll_changes` with `seen` still at
+        // in_progress. Because the event log's latest transition for the card
+        // already lands it at review, the move is hub-originated and must NOT be
+        // re-emitted.
+        let mut seen = HashMap::from([("d".to_string(), Column::in_progress())]);
+        let recorded = HashMap::from([("d".to_string(), Column::review())]);
+        let events = plan_issue_reconcile(vec![upsert(review_task("d"))], &mut seen, |id| {
+            recorded.get(id).cloned()
+        });
+        assert!(
+            events.is_empty(),
+            "a move the hub already recorded must not reconcile a second time"
+        );
+        // The baseline still advances, so a later genuine external move off
+        // review reconciles normally.
+        assert_eq!(seen.get("d"), Some(&Column::review()));
+
+        // Same board move, but the event log has NO matching hub transition (its
+        // latest record for the card is the earlier in_progress, or nothing) —
+        // this is a human moving the status on github.com, so it reconciles.
+        let mut seen = HashMap::from([("e".to_string(), Column::in_progress())]);
+        let recorded = HashMap::from([("e".to_string(), Column::in_progress())]);
+        let external = plan_issue_reconcile(vec![upsert(review_task("e"))], &mut seen, |id| {
+            recorded.get(id).cloned()
+        });
+        assert_eq!(
+            external,
+            vec![IssueReconcileEvent::Transition {
+                id: "e".into(),
+                workflow: DEFAULT_WORKFLOW_NAME.into(),
+                from: Column::in_progress(),
+                to: Column::review(),
+            }],
+            "a github move with no matching hub transition is external and reconciles"
+        );
+
+        // And a card the event log has never recorded a transition for (target
+        // `None`) is still reconciled — the discriminator only suppresses a move
+        // the hub demonstrably made.
+        let mut seen = HashMap::from([("f".to_string(), Column::in_progress())]);
+        let untracked = plan_issue_reconcile(vec![upsert(review_task("f"))], &mut seen, no_hub_moves);
+        assert_eq!(
+            untracked,
+            vec![IssueReconcileEvent::Transition {
+                id: "f".into(),
+                workflow: DEFAULT_WORKFLOW_NAME.into(),
+                from: Column::in_progress(),
+                to: Column::review(),
             }]
         );
     }
@@ -8394,6 +8500,7 @@ transitions:
                 comment,
             }],
             &mut seen,
+            no_hub_moves,
         );
         assert_eq!(
             events,
