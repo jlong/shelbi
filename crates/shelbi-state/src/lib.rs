@@ -155,7 +155,7 @@ pub use event_log::{
     event_follower_path, event_log_current_base, event_log_head, events_log_path,
     latest_task_transition_targets,
     message_delivery_status, read_event_log_from, read_event_log_from_deadline,
-    read_or_initialize_event_cursor, read_or_initialize_event_cursor_deadline,
+    read_or_initialize_event_cursor, read_or_initialize_event_cursor_deadline, recent_dispatch_confirmed,
     release_event_follower, task_event_body, write_event_cursor,
     EventEnvelope, EventKind, EventLogRead, FeedRead, HandoffCause, MessageDelivery, ReviewReadyEvent, ZenHeartbeatCue, ACTIONS_SKIPPED_MARKER, DAEMON_ACK,
     EXTERNAL_ISSUE_COMMENT_CAUSE, EXTERNAL_ISSUE_RECONCILE_CAUSE,
