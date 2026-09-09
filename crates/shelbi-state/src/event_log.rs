@@ -9,7 +9,31 @@
 //!   `.log.migration.json`) and crash recovery for the rename/index window;
 //! - monotonic logical cursors ([`read_event_log_from`], [`event_log_head`],
 //!   [`event_log_current_base`]) and each project's applied cursor
-//!   ([`read_or_initialize_event_cursor`] / [`write_event_cursor`]);
+//!   ([`read_or_initialize_event_cursor`] / [`write_event_cursor`]), guarded
+//!   by a durable per-project acked high-water mark (`event-cursor.hwm`) so a
+//!   cursor that a stale index or a botched reinit rewinds behind an already
+//!   acked position is detected and resumed from the mark, never replayed;
+//!
+//! ## On-disk bookkeeping files
+//!
+//! Every generation of `~/.shelbi/events.log` shares one monotonic *logical*
+//! byte space; three sidecar files map physical file offsets into it, and a
+//! per-project pair tracks how far each consumer has drained:
+//!
+//! - `events.log.index.json` ([`EventLogIndex`]) — the persisted `current_base`
+//!   / `previous_base` for the live file and the retained `.1` generation. This
+//!   is the authority that keeps a logical cursor stable across rotation: an
+//!   offset in `.1` still resolves, and a rotation only ever *raises* the bases,
+//!   so an acked cursor is never remapped backwards. Absent only before the
+//!   one-time legacy-offset migration establishes it.
+//! - `events.log.rotation.json` ([`EventLogRotation`]) — the crash-recovery
+//!   journal for the narrow rename/index window (see [`recover_event_log_rotation`]).
+//! - `events.log.migration.json` ([`EventLogMigration`]) — the one-time marker
+//!   pinning the legacy physical-offset cutoff while cursors are normalized.
+//! - `<project>/event-cursor` — the consumer's *applied* logical position, and
+//!   `<project>/event-cursor.hwm` — the monotonic high-water mark of everything
+//!   it has ever acked. The mark only moves forward, so the reader treats a
+//!   cursor found behind it as a rewind ([`reconcile_cursor_with_hwm`]).
 //! - the normalized, harness-neutral [`EventEnvelope`] and its [`EventKind`]
 //!   vocabulary, plus the [`HandoffCause`] reason classification shared with
 //!   `shelbi orchestrator events drain`;
@@ -398,6 +422,18 @@ fn normalize_legacy_event_cursors(current_len: u64) -> Result<()> {
             .map_or(true, |cursor| cursor > current_len)
         {
             atomic_write(&cursor_path, b"0")?;
+            // The acked high-water mark is a *logical*-space value. When this
+            // one-time physical→logical migration restarts a cursor at zero, any
+            // pre-existing mark is a stale physical offset that would otherwise
+            // resurrect the reset cursor on the next read, so drop it too. In a
+            // real upgrade no mark exists yet (the old binary never wrote one),
+            // making this a no-op; it only bites synthetic pre-seeded state.
+            let hwm_path = cursor_path.with_file_name("event-cursor.hwm");
+            if let Err(e) = fs::remove_file(&hwm_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(shelbi_core::Error::Io(e));
+                }
+            }
         }
     }
     Ok(())
@@ -765,6 +801,93 @@ fn event_cursor_lock_path(project: &str) -> Result<PathBuf> {
     Ok(project_dir(project)?.join("event-cursor.lock"))
 }
 
+/// Per-project durable high-water mark: the highest logical cursor this project
+/// has ever acked. Sibling of `event-cursor` in the project config dir.
+///
+/// Where `event-cursor` is the *applied* position — which a consumer's ack
+/// advances and which, in the incident this guards against, a stale index or a
+/// botched missing-cursor reinit rewound to an old rotated offset — this mark
+/// only ever moves forward. It is the durable record of "we have already
+/// delivered and acked through here", so a cursor found behind it is proof of a
+/// rewind and is corrected rather than trusted. See [`reconcile_cursor_with_hwm`].
+fn event_cursor_hwm_path(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("event-cursor.hwm"))
+}
+
+/// Read a project's acked high-water mark, or `None` when absent or garbled.
+/// A missing/garbled mark reads as "no mark on record" rather than an error:
+/// the worst case is that a single rewind slips through to the ordinary
+/// retained-window guards, never a wedged reader.
+fn read_event_cursor_hwm(project: &str) -> Result<Option<u64>> {
+    let path = event_cursor_hwm_path(project)?;
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(text.trim().parse().ok()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
+/// Advance a project's acked high-water mark to `cursor` when it is higher.
+/// Monotonic by construction: a lower value never rewrites a higher one, so the
+/// mark stays the durable ceiling the applied cursor is reconciled against on
+/// the next read. The caller holds the per-project cursor lock (so the mark and
+/// the cursor advance together under one ack). The atomic rename keeps a reader
+/// from ever observing a half-written mark.
+fn bump_event_cursor_hwm(project: &str, cursor: u64) -> Result<()> {
+    if read_event_cursor_hwm(project)?.unwrap_or(0) < cursor {
+        atomic_write(
+            &event_cursor_hwm_path(project)?,
+            cursor.to_string().as_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Outcome of reconciling a project's stored `event-cursor` against its durable
+/// acked high-water mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorResolution {
+    /// The stored cursor is at or ahead of the mark (the healthy case): use it.
+    Trusted(u64),
+    /// The stored cursor is *behind* the mark — proof it was rewound (a stale
+    /// index remap, a botched reinit, a clobbered cursor file). Resume from the
+    /// mark instead, never from the rewound value.
+    Rewound { stored: u64, hwm: u64 },
+}
+
+/// Reconcile a stored cursor against the acked high-water mark. Pure, so the
+/// rewind policy is unit-testable without touching disk. A stored cursor equal
+/// to or ahead of the mark is trusted; only a strictly lower one is a rewind.
+fn reconcile_cursor_with_hwm(stored: u64, hwm: Option<u64>) -> CursorResolution {
+    match hwm {
+        Some(hwm) if stored < hwm => CursorResolution::Rewound { stored, hwm },
+        _ => CursorResolution::Trusted(stored),
+    }
+}
+
+/// Reconcile a just-read (or just-initialized) cursor against the durable acked
+/// high-water mark, healing a detected rewind. On a rewind, log one line naming
+/// both values and durably repair the cursor file forward to the mark, so the
+/// reader resumes from the high-water mark and a later read finds the cursor
+/// already healed — the discrepancy is logged once per rewind, not every tick.
+/// The caller holds the per-project cursor lock; `path` is the project's
+/// `event-cursor` path, threaded in to avoid re-deriving it.
+fn resolve_and_repair_cursor(project: &str, path: &Path, stored: u64) -> Result<u64> {
+    match reconcile_cursor_with_hwm(stored, read_event_cursor_hwm(project)?) {
+        CursorResolution::Trusted(cursor) => Ok(cursor),
+        CursorResolution::Rewound { stored, hwm } => {
+            tracing::warn!(
+                project,
+                rewound_cursor = stored,
+                acked_high_water_mark = hwm,
+                "event cursor is behind the acked high-water mark; resuming from the high-water mark"
+            );
+            atomic_write(path, hwm.to_string().as_bytes())?;
+            Ok(hwm)
+        }
+    }
+}
+
 /// True once the logical event-log index has been established on disk. While it
 /// is absent a cursor read must still trigger the one-time legacy-cursor
 /// migration (a side effect of loading the index); once it exists that load is a
@@ -796,13 +919,19 @@ pub fn read_or_initialize_event_cursor(project: &str) -> Result<u64> {
         load_event_log_index(&log_path)?;
     }
     match fs::read_to_string(&path) {
-        Ok(text) => text.trim().parse().map_err(|_| {
-            shelbi_core::Error::Other(format!("invalid event cursor in {}", path.display()))
-        }),
+        Ok(text) => {
+            let stored = text.trim().parse().map_err(|_| {
+                shelbi_core::Error::Other(format!("invalid event cursor in {}", path.display()))
+            })?;
+            resolve_and_repair_cursor(project, &path, stored)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let _log_lock = acquire_file_lock(&event_log_lock_path(&log_path))?;
             let index = load_event_log_index(&log_path)?;
-            let cursor = index.current_base;
+            // A missing cursor initializes at the current generation base — but
+            // if the acked high-water mark is ahead of it (the incident's
+            // missing-cursor reinit against a stale index), resume from the mark.
+            let cursor = resolve_and_repair_cursor(project, &path, index.current_base)?;
             atomic_write(&path, cursor.to_string().as_bytes())?;
             Ok(cursor)
         }
@@ -837,11 +966,12 @@ pub fn read_or_initialize_event_cursor_deadline(
         load_event_log_index(&log_path)?;
     }
     match fs::read_to_string(&path) {
-        Ok(text) => text
-            .trim()
-            .parse()
-            .map(Some)
-            .map_err(|_| shelbi_core::Error::Other(format!("invalid event cursor in {}", path.display()))),
+        Ok(text) => {
+            let stored = text.trim().parse().map_err(|_| {
+                shelbi_core::Error::Other(format!("invalid event cursor in {}", path.display()))
+            })?;
+            resolve_and_repair_cursor(project, &path, stored).map(Some)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let Some(_log_lock) =
                 acquire_file_lock_deadline(&event_log_lock_path(&log_path), deadline, cancelled)?
@@ -849,7 +979,10 @@ pub fn read_or_initialize_event_cursor_deadline(
                 return Ok(None);
             };
             let index = load_event_log_index(&log_path)?;
-            let cursor = index.current_base;
+            // A missing cursor initializes at the current generation base — but
+            // if the acked high-water mark is ahead of it (the incident's
+            // missing-cursor reinit against a stale index), resume from the mark.
+            let cursor = resolve_and_repair_cursor(project, &path, index.current_base)?;
             atomic_write(&path, cursor.to_string().as_bytes())?;
             Ok(Some(cursor))
         }
@@ -872,7 +1005,13 @@ pub fn write_event_cursor(project: &str, cursor: u64) -> Result<()> {
     // the sibling `write_event_cursor_atomicity_never_concatenates` regression
     // test. The prior garbled `<old><new>` cursor value that motivated it could
     // only have come from a non-atomic writer that has since been retired.
-    atomic_write(&path, cursor.to_string().as_bytes())
+    atomic_write(&path, cursor.to_string().as_bytes())?;
+    // Advance the durable acked high-water mark alongside the applied cursor,
+    // under the same lock. Every legitimate cursor write comes from an ack (or a
+    // forward-only drain fast-forward), so the mark tracks the furthest position
+    // ever delivered — the ceiling the next read reconciles a rewound cursor up
+    // to. Monotonic: a lower `cursor` leaves a higher mark untouched.
+    bump_event_cursor_hwm(project, cursor)
 }
 
 // ---------------------------------------------------------------------------
@@ -2774,6 +2913,41 @@ mod tests {
         p
     }
 
+    /// Run `f` with a scoped tracing subscriber and return everything it logged.
+    /// Scoped via `with_default` (not a global install) so it captures only this
+    /// call and never races another test — tests already serialize on `TEST_LOCK`.
+    fn capture_tracing<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        (out, logs)
+    }
+
     fn journal_for(path: &Path, old_base: u64) -> EventLogRotation {
         let metadata = std::fs::metadata(path).unwrap();
         EventLogRotation {
@@ -3170,6 +3344,145 @@ mod tests {
         assert_eq!(std::fs::read(&rotated).unwrap(), b"y".repeat(2048));
         assert_eq!(index.previous_base, Some(2048));
         assert_eq!(index.current_base, 4096);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn reconcile_cursor_with_hwm_trusts_at_or_ahead_and_flags_behind() {
+        // No mark on record: trust the stored cursor unchanged.
+        assert_eq!(
+            reconcile_cursor_with_hwm(40, None),
+            CursorResolution::Trusted(40)
+        );
+        // At or ahead of the mark: healthy, trust it.
+        assert_eq!(
+            reconcile_cursor_with_hwm(100, Some(100)),
+            CursorResolution::Trusted(100)
+        );
+        assert_eq!(
+            reconcile_cursor_with_hwm(150, Some(100)),
+            CursorResolution::Trusted(150)
+        );
+        // Strictly behind the mark: a rewind, carrying both values.
+        assert_eq!(
+            reconcile_cursor_with_hwm(40, Some(100)),
+            CursorResolution::Rewound {
+                stored: 40,
+                hwm: 100
+            }
+        );
+    }
+
+    #[test]
+    fn ack_then_rotation_then_append_drains_only_new_lines() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Seed the current generation with history the consumer then acks.
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+        append_workspace_event("demo", "beta", None, WorkspaceState::Working).unwrap();
+        let acked = event_log_head().unwrap();
+        write_event_cursor("demo", acked).unwrap();
+
+        // The hub rotates events.log exactly as the size-cap path does.
+        let path = events_log_path().unwrap();
+        {
+            let _lock = acquire_file_lock(&event_log_lock_path(&path)).unwrap();
+            let mut index = load_event_log_index(&path).unwrap();
+            assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap());
+        }
+        assert!(path.with_extension("log.1").exists());
+
+        // New events land in the fresh generation.
+        append_workspace_event("demo", "gamma", None, WorkspaceState::Working).unwrap();
+
+        // The acked cursor survives rotation unmoved, and draining from it
+        // returns only the post-ack line — the logical offset is stable across
+        // the rename, so the rotated history is never redelivered.
+        let cursor = read_or_initialize_event_cursor("demo").unwrap();
+        assert_eq!(cursor, acked);
+        let read = read_event_log_from(cursor).unwrap();
+        let text = String::from_utf8(read.bytes).unwrap();
+        assert!(text.contains("workspace=gamma"), "drain = {text}");
+        assert!(!text.contains("workspace=alpha"), "drain = {text}");
+        assert!(!text.contains("workspace=beta"), "drain = {text}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn cursor_behind_high_water_mark_resumes_from_mark_and_logs_once() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Establish the logical index (as any live hub already has) so the read
+        // path skips the one-time legacy-offset migration.
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+
+        // A prior ack recorded a high-water mark (the incident's 05:30 ack).
+        write_event_cursor("demo", 17_111_374).unwrap();
+
+        // A stale index / botched reinit rewinds the applied cursor to an old
+        // rotated offset (the incident: event-cursor held ~events.log.1's size).
+        atomic_write(&event_cursor_path("demo").unwrap(), b"8388867").unwrap();
+
+        // The closure stays minimal: read twice and return the values, so an
+        // assertion failure can't panic inside the scoped subscriber.
+        let (reads, logs) = capture_tracing(|| {
+            let first = read_or_initialize_event_cursor("demo").unwrap();
+            // Second read finds the cursor healed on disk, so it stays quiet.
+            let second = read_or_initialize_event_cursor("demo").unwrap();
+            (first, second)
+        });
+
+        // Both reads resume from the high-water mark, not the rewound value.
+        assert_eq!(reads, (17_111_374, 17_111_374));
+
+        let cursor_path = event_cursor_path("demo").unwrap();
+        // The rewound cursor file was durably repaired to the mark.
+        assert_eq!(
+            std::fs::read_to_string(&cursor_path).unwrap().trim(),
+            "17111374"
+        );
+
+        // The discrepancy was logged exactly once, naming both values.
+        assert_eq!(
+            logs.matches("behind the acked high-water mark").count(),
+            1,
+            "logs = {logs}"
+        );
+        assert!(logs.contains("8388867"), "logs = {logs}");
+        assert!(logs.contains("17111374"), "logs = {logs}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn missing_cursor_reinit_below_high_water_mark_resumes_from_mark() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A prior ack left a high-water mark, then the cursor file went missing
+        // (the incident's reinit path). The current generation base is 0, so a
+        // naive reinit would resume from 0 and replay everything.
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+        write_event_cursor("demo", 500).unwrap();
+        std::fs::remove_file(event_cursor_path("demo").unwrap()).unwrap();
+
+        assert_eq!(read_or_initialize_event_cursor("demo").unwrap(), 500);
+        assert_eq!(
+            std::fs::read_to_string(event_cursor_path("demo").unwrap())
+                .unwrap()
+                .trim(),
+            "500"
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
