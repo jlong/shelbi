@@ -137,6 +137,162 @@ fn ensure_log_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+// --------------------------- daemon PATH env -----------------------------
+//
+// launchd hands a supervised agent a bare `PATH=/usr/bin:/bin:/usr/sbin:/sbin`
+// and `systemd --user` a similarly minimal one, so a `gh` installed by Homebrew
+// (`/opt/homebrew/bin`), a custom prefix, or a version manager is invisible to
+// the daemon. Every board-refresh tick then fails inside
+// `resolve_github_token_by_name` (the `gh auth token` probe can't find `gh`) and
+// no index is ever published. We bake a PATH into the unit that covers the `gh`
+// resolved at install time plus the usual bindirs, and — because a plist rewrite
+// only reaches the daemon on its *next* relaunch — the running daemon also
+// augments its own in-process PATH on startup ([`ensure_gh_on_path`]).
+
+/// The directory the `gh` CLI resolves from on the *installing* user's PATH, or
+/// `None` when `gh` isn't installed. Resolved once at install time and baked
+/// into the unit so a `gh` in a nonstandard location (a version-manager shim, a
+/// custom `--prefix`, `~/.local/bin`) stays reachable under the supervisor.
+fn resolved_gh_dir() -> Option<String> {
+    which::which("gh")
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
+}
+
+/// Build the ordered, de-duplicated PATH the supervised daemon should run under.
+/// `gh_dir` is the directory `gh` resolved from at install time (most specific,
+/// so first); the fixed bindirs cover a `gh` installed later, and the launchd /
+/// systemd default (`/usr/bin:/bin:/usr/sbin:/sbin`) is appended so system tools
+/// stay reachable. Pure (no filesystem access) so the renderer stays testable.
+fn build_daemon_path(gh_dir: Option<&str>, home: Option<&std::path::Path>) -> String {
+    let mut dirs: Vec<String> = Vec::new();
+    let mut push = |d: String| {
+        if !d.is_empty() && !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    };
+    if let Some(dir) = gh_dir {
+        push(dir.to_string());
+    }
+    push("/opt/homebrew/bin".to_string());
+    push("/usr/local/bin".to_string());
+    if let Some(home) = home {
+        push(home.join("bin").to_string_lossy().into_owned());
+        push(home.join(".local/bin").to_string_lossy().into_owned());
+    }
+    for d in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        push(d.to_string());
+    }
+    dirs.join(":")
+}
+
+/// The PATH value baked into a freshly-installed unit, resolved from the current
+/// (installing) environment.
+fn daemon_path_value() -> String {
+    build_daemon_path(resolved_gh_dir().as_deref(), dirs::home_dir().as_deref())
+}
+
+/// Prepend any [`build_daemon_path`] directory missing from the running daemon's
+/// `$PATH` so its `gh auth token` probe finds `gh` **right now**, without waiting
+/// for a supervisor-unit rewrite to take effect on the next relaunch. Called once
+/// at daemon startup. Idempotent: a daemon already launched with the baked PATH
+/// (a fresh install) finds every dir present and does nothing.
+pub(super) fn ensure_gh_on_path() {
+    let current = std::env::var("PATH").unwrap_or_default();
+    let have: std::collections::HashSet<&str> =
+        current.split(':').filter(|s| !s.is_empty()).collect();
+    let target = build_daemon_path(resolved_gh_dir().as_deref(), dirs::home_dir().as_deref());
+    let additions: Vec<&str> = target
+        .split(':')
+        .filter(|d| !d.is_empty() && !have.contains(d))
+        .collect();
+    if additions.is_empty() {
+        return;
+    }
+    // Prepend the additions so a `gh` in one of them wins over any stale copy
+    // earlier on the inherited PATH.
+    let combined = if current.is_empty() {
+        additions.join(":")
+    } else {
+        format!("{}:{current}", additions.join(":"))
+    };
+    std::env::set_var("PATH", combined);
+}
+
+/// Rewrite the installed supervisor unit if it predates the `PATH` env baked into
+/// fresh installs, so an existing install self-heals to a unit whose supervised
+/// daemon can find `gh`. The rewrite is durable — it corrects the next
+/// `bootstrap`/login relaunch — while the *running* daemon is fixed immediately
+/// by [`ensure_gh_on_path`], so no self-reload (which would kill this process) is
+/// needed. A rewrite is disclosed on events.log. Best-effort throughout: a heal
+/// hiccup must never take the daemon down.
+pub(super) fn heal_daemon_unit_path() {
+    #[cfg(target_os = "macos")]
+    let healed = heal_launchd_path();
+    #[cfg(target_os = "linux")]
+    let healed = heal_systemd_path();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let healed: Option<PathBuf> = None;
+
+    if let Some(path) = healed {
+        let body = format!("daemon-unit-upgrade added=PATH unit={}", path.display());
+        if let Err(e) = shelbi_state::append_external_event(&body) {
+            tracing::debug!(error = %e, "shelbi daemon: failed to disclose daemon-unit-upgrade");
+        }
+        tracing::warn!(
+            unit = %path.display(),
+            "shelbi daemon: added PATH to supervisor unit for gh auth (takes full effect on next daemon restart)",
+        );
+    }
+}
+
+/// Whether a launchd plist already carries the `PATH` env key. The single marker
+/// the self-heal detection and [`render_launchd_plist`] must agree on — a test
+/// asserts a freshly-rendered plist satisfies it so the two can't drift. Gated
+/// macOS-only (unlike its `systemd_unit_has_path` twin, which its unconditional
+/// test forces to `any(linux, test)`): [`render_launchd_plist`] is macOS-only, so
+/// the drift-guard test that consumes this helper is macOS-only too — compiling
+/// it for a Linux `--all-targets` test build would leave it caller-less.
+#[cfg(target_os = "macos")]
+fn launchd_unit_has_path(content: &str) -> bool {
+    content.contains("<key>PATH</key>")
+}
+
+/// Whether a systemd unit already carries a `PATH` environment line. See
+/// [`launchd_unit_has_path`] for the drift-guard rationale.
+#[cfg(any(target_os = "linux", test))]
+fn systemd_unit_has_path(content: &str) -> bool {
+    content.contains("Environment=PATH=")
+}
+
+/// Rewrite the launchd plist iff it lacks a `PATH` env key. Returns the rewritten
+/// path on a change, `None` when the plist is absent or already carries PATH.
+#[cfg(target_os = "macos")]
+fn heal_launchd_path() -> Option<PathBuf> {
+    let path = launch_agent_plist_path().ok()?;
+    let existing = fs::read_to_string(&path).ok()?;
+    if launchd_unit_has_path(&existing) {
+        return None;
+    }
+    let rendered = render_launchd_plist(&LaunchdInputs::resolve().ok()?);
+    fs::write(&path, rendered).ok()?;
+    Some(path)
+}
+
+/// Rewrite the systemd unit iff it lacks a `PATH` environment line. Returns the
+/// rewritten path on a change, `None` when the unit is absent or already sets it.
+#[cfg(target_os = "linux")]
+fn heal_systemd_path() -> Option<PathBuf> {
+    let path = systemd_unit_path().ok()?;
+    let existing = fs::read_to_string(&path).ok()?;
+    if systemd_unit_has_path(&existing) {
+        return None;
+    }
+    let rendered = render_systemd_unit(&SystemdInputs::resolve().ok()?);
+    fs::write(&path, rendered).ok()?;
+    Some(path)
+}
+
 // --------------------------- macOS / launchd ------------------------------
 
 #[cfg(target_os = "macos")]
@@ -490,6 +646,9 @@ struct LaunchdInputs {
     state_root: PathBuf,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    /// The `PATH` the supervised daemon runs under, so its `gh auth token`
+    /// probe finds `gh` despite launchd's minimal default PATH.
+    path: String,
 }
 
 #[cfg(target_os = "macos")]
@@ -502,6 +661,7 @@ impl LaunchdInputs {
             stdout_path: log_dir.join("daemon.out"),
             stderr_path: log_dir.join("daemon.err"),
             state_root,
+            path: daemon_path_value(),
         })
     }
 }
@@ -513,6 +673,7 @@ fn render_launchd_plist(inputs: &LaunchdInputs) -> String {
     let root = xml_escape(&inputs.state_root.to_string_lossy());
     let out = xml_escape(&inputs.stdout_path.to_string_lossy());
     let err = xml_escape(&inputs.stderr_path.to_string_lossy());
+    let path = xml_escape(&inputs.path);
     // ThrottleInterval=1 matches the systemd `RestartSec=1s` knob — both
     // platforms aim for a sub-second relaunch on crash so worker writes
     // resume promptly without hammering the OS in a crash loop.
@@ -532,6 +693,8 @@ fn render_launchd_plist(inputs: &LaunchdInputs) -> String {
     <dict>
         <key>SHELBI_ROOT</key>
         <string>{root}</string>
+        <key>PATH</key>
+        <string>{path}</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -735,6 +898,9 @@ struct SystemdInputs {
     binary: PathBuf,
     state_root: PathBuf,
     log_path: PathBuf,
+    /// The `PATH` the supervised daemon runs under, so its `gh auth token`
+    /// probe finds `gh` despite systemd's minimal default PATH.
+    path: String,
 }
 
 impl SystemdInputs {
@@ -745,6 +911,7 @@ impl SystemdInputs {
             binary: current_binary()?,
             log_path: state_root.join("logs/daemon.log"),
             state_root,
+            path: daemon_path_value(),
         })
     }
 }
@@ -765,6 +932,7 @@ After=default.target
 Type=simple
 ExecStart={exe} daemon
 Environment=SHELBI_ROOT={root}
+Environment=PATH={path}
 Restart=always
 RestartSec=1s
 StandardOutput=append:{log}
@@ -776,6 +944,7 @@ WantedBy=default.target
         exe = inputs.binary.display(),
         root = inputs.state_root.display(),
         log = inputs.log_path.display(),
+        path = inputs.path,
     )
 }
 
@@ -792,11 +961,16 @@ mod tests {
             state_root: PathBuf::from("/Users/dev/.shelbi"),
             stdout_path: PathBuf::from("/Users/dev/.shelbi/logs/daemon.out"),
             stderr_path: PathBuf::from("/Users/dev/.shelbi/logs/daemon.err"),
+            path: "/opt/homebrew/bin:/usr/bin:/bin".to_string(),
         };
         let plist = render_launchd_plist(&inputs);
         assert!(
             plist.contains("<string>dev.shelbi.daemon</string>"),
             "{plist}"
+        );
+        assert!(
+            plist.contains("<key>PATH</key>\n        <string>/opt/homebrew/bin:/usr/bin:/bin</string>"),
+            "PATH env baked into the plist: {plist}"
         );
         assert!(
             !plist.contains(LEGACY_SERVICE_LABEL),
@@ -831,6 +1005,7 @@ mod tests {
             state_root: PathBuf::from("/o&p<x>/.shelbi"),
             stdout_path: PathBuf::from("/o&p<x>/.shelbi/logs/daemon.out"),
             stderr_path: PathBuf::from("/o&p<x>/.shelbi/logs/daemon.err"),
+            path: "/opt/homebrew/bin:/usr/bin:/bin".to_string(),
         };
         let plist = render_launchd_plist(&inputs);
         assert!(
@@ -846,8 +1021,13 @@ mod tests {
             binary: PathBuf::from("/home/dev/bin/shelbi"),
             state_root: PathBuf::from("/home/dev/.shelbi"),
             log_path: PathBuf::from("/home/dev/.shelbi/logs/daemon.log"),
+            path: "/opt/homebrew/bin:/usr/bin:/bin".to_string(),
         };
         let unit = render_systemd_unit(&inputs);
+        assert!(
+            unit.contains("Environment=PATH=/opt/homebrew/bin:/usr/bin:/bin"),
+            "PATH env baked into the unit: {unit}"
+        );
         assert!(
             unit.contains("ExecStart=/home/dev/bin/shelbi daemon"),
             "ExecStart: {unit}"
@@ -953,5 +1133,115 @@ mod tests {
             "a&amp;b&lt;c&gt;d&quot;e&apos;f"
         );
         assert_eq!(xml_escape("plain/path/to/binary"), "plain/path/to/binary");
+    }
+
+    #[test]
+    fn daemon_path_leads_with_resolved_gh_dir_then_bindirs_and_defaults() {
+        // The dir `gh` resolved from is first (so a nonstandard gh wins), the
+        // usual package bindirs follow, and the supervisor's minimal default is
+        // still present so system tools stay reachable.
+        let home = PathBuf::from("/home/dev");
+        let path = build_daemon_path(Some("/custom/gh/bin"), Some(&home));
+        let dirs: Vec<&str> = path.split(':').collect();
+        assert_eq!(dirs[0], "/custom/gh/bin", "resolved gh dir leads: {path}");
+        assert!(dirs.contains(&"/opt/homebrew/bin"), "homebrew bindir: {path}");
+        assert!(dirs.contains(&"/usr/local/bin"), "usrlocal bindir: {path}");
+        assert!(dirs.contains(&"/home/dev/bin"), "~/bin: {path}");
+        assert!(dirs.contains(&"/home/dev/.local/bin"), "~/.local/bin: {path}");
+        for d in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+            assert!(dirs.contains(&d), "default dir {d}: {path}");
+        }
+    }
+
+    #[test]
+    fn daemon_path_dedups_when_gh_lives_in_a_standard_bindir() {
+        // A gh already under /opt/homebrew/bin must not be listed twice.
+        let path = build_daemon_path(Some("/opt/homebrew/bin"), None);
+        let count = path.split(':').filter(|d| *d == "/opt/homebrew/bin").count();
+        assert_eq!(count, 1, "no duplicate homebrew bindir: {path}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_heal_detects_a_pre_path_plist_and_leaves_a_fresh_one() {
+        // A pre-PATH plist (SHELBI_ROOT only) is detected as needing the heal;
+        // the freshly-rendered plist already carries PATH, so the detection tied
+        // to the renderer can't drift into re-writing a healthy unit forever.
+        let legacy = "\
+    <key>EnvironmentVariables</key>\n    \
+    <dict>\n        \
+    <key>SHELBI_ROOT</key>\n        \
+    <string>/x</string>\n    \
+    </dict>";
+        assert!(!launchd_unit_has_path(legacy), "pre-PATH plist needs heal");
+        let fresh = render_launchd_plist(&LaunchdInputs {
+            binary: PathBuf::from("/Users/dev/bin/shelbi"),
+            state_root: PathBuf::from("/Users/dev/.shelbi"),
+            stdout_path: PathBuf::from("/Users/dev/.shelbi/logs/daemon.out"),
+            stderr_path: PathBuf::from("/Users/dev/.shelbi/logs/daemon.err"),
+            path: "/opt/homebrew/bin:/usr/bin:/bin".to_string(),
+        });
+        assert!(launchd_unit_has_path(&fresh), "fresh plist carries PATH: {fresh}");
+    }
+
+    #[test]
+    fn systemd_heal_detects_a_pre_path_unit_and_leaves_a_fresh_one() {
+        let legacy = "[Service]\nExecStart=/x daemon\nEnvironment=SHELBI_ROOT=/x\n";
+        assert!(!systemd_unit_has_path(legacy), "pre-PATH unit needs heal");
+        let fresh = render_systemd_unit(&SystemdInputs {
+            binary: PathBuf::from("/home/dev/bin/shelbi"),
+            state_root: PathBuf::from("/home/dev/.shelbi"),
+            log_path: PathBuf::from("/home/dev/.shelbi/logs/daemon.log"),
+            path: "/opt/homebrew/bin:/usr/bin:/bin".to_string(),
+        });
+        assert!(systemd_unit_has_path(&fresh), "fresh unit carries PATH: {fresh}");
+    }
+
+    /// Acceptance criterion: the rendered unit carries a PATH under which the
+    /// daemon's `gh auth token` probe succeeds — i.e. the directory the real
+    /// `gh` binary resolves from is present. Skips (like the tmux-driven tests)
+    /// when `gh` isn't installed on the build host, where there is nothing to
+    /// resolve.
+    #[test]
+    fn rendered_unit_path_contains_the_resolved_gh_dir() {
+        let Some(gh_dir) = resolved_gh_dir() else {
+            eprintln!("skipping: gh not on PATH");
+            return;
+        };
+        let path = daemon_path_value();
+        assert!(
+            path.split(':').any(|d| d == gh_dir),
+            "daemon PATH must include the resolved gh dir {gh_dir}: {path}"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let inputs = LaunchdInputs {
+                binary: PathBuf::from("/Users/dev/bin/shelbi"),
+                state_root: PathBuf::from("/Users/dev/.shelbi"),
+                stdout_path: PathBuf::from("/Users/dev/.shelbi/logs/daemon.out"),
+                stderr_path: PathBuf::from("/Users/dev/.shelbi/logs/daemon.err"),
+                path: path.clone(),
+            };
+            let plist = render_launchd_plist(&inputs);
+            assert!(
+                plist.contains(&xml_escape(&gh_dir)),
+                "plist PATH must include the resolved gh dir: {plist}"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let inputs = SystemdInputs {
+                binary: PathBuf::from("/home/dev/bin/shelbi"),
+                state_root: PathBuf::from("/home/dev/.shelbi"),
+                log_path: PathBuf::from("/home/dev/.shelbi/logs/daemon.log"),
+                path: path.clone(),
+            };
+            let unit = render_systemd_unit(&inputs);
+            assert!(
+                unit.contains(&gh_dir),
+                "systemd PATH must include the resolved gh dir: {unit}"
+            );
+        }
     }
 }

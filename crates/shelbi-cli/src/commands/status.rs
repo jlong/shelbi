@@ -294,22 +294,44 @@ fn github_section(project: &str) -> Option<String> {
         now,
     );
 
+    // The daemon's last refresh failure for this project, if the most recent tick
+    // failed and no fresh index landed. Surfaced on the board-index line so a cold
+    // or aging board explains itself ("last error: no auth token found …").
+    let refresh_error = shelbi_state::read_board_refresh_error(project);
+
+    // Whether the daemon has ever published an index for this project. An
+    // aged/stale index still counts as published; only its absence is "never
+    // published", the state a failing token probe leaves the board in.
+    let index_published = shelbi_state::read_board_index(project).is_some();
+
     let mut out = String::new();
     // Read path + index age.
-    if let Some(f) = &freshness {
-        out.push_str(&format!("read path: {}\n", f.read_path.as_str()));
-        let age = f
-            .age_secs
-            .map(|s| format!("{s}s old"))
-            .unwrap_or_else(|| "age unknown".to_string());
-        let freshness_word = match f.source {
-            shelbi_state::BoardSource::CacheFallback => "cache fallback (no daemon)",
-            _ if f.stale => "stale",
-            _ => "warm",
-        };
-        out.push_str(&format!("board index: {age} ({freshness_word})\n"));
-    } else {
-        out.push_str("read path: unknown\nboard index: (no index published)\n");
+    match (&freshness, index_published) {
+        (Some(f), true) => {
+            out.push_str(&format!("read path: {}\n", f.read_path.as_str()));
+            let age = f
+                .age_secs
+                .map(|s| format!("{s}s old"))
+                .unwrap_or_else(|| "age unknown".to_string());
+            let freshness_word = match f.source {
+                shelbi_state::BoardSource::CacheFallback => "cache fallback (no daemon)",
+                _ if f.stale => "stale",
+                _ => "warm",
+            };
+            out.push_str(&format!("board index: {age} ({freshness_word})\n"));
+        }
+        // No index on disk. If the daemon recorded why (a failing refresh), say
+        // "never published" and let the last-error line below explain it;
+        // otherwise the daemon simply hasn't published its first index yet.
+        (_, false) if refresh_error.is_some() => {
+            out.push_str("read path: unknown\nboard index: never published\n");
+        }
+        _ => {
+            out.push_str("read path: unknown\nboard index: (no index published)\n");
+        }
+    }
+    if let Some(err) = &refresh_error {
+        out.push_str(&format!("last error: {} (at {})\n", err.error, err.at));
     }
     // The connection-level circuit breaker is per token, shared across both
     // budgets — a dead network parks all board reads. Surface it once (not per
@@ -888,6 +910,40 @@ issue_tracker:\n\
             github_section("p").is_none(),
             "a local backend has no API budget section"
         );
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn github_section_shows_the_last_refresh_error_when_no_index_published() {
+        // The daemon never published an index (its `gh auth token` probe failed),
+        // so the board is cold. The GitHub section must say so and name the last
+        // error the daemon recorded, rather than a bare "(no index published)".
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "g");
+        let prev_gh = std::env::var("GH_TOKEN").ok();
+        std::env::set_var("GH_TOKEN", "test-token");
+
+        // No board index written; only the recorded refresh error.
+        shelbi_state::record_board_refresh_error("g", "no auth token found for project `g`")
+            .unwrap();
+
+        let section = github_section("g").expect("remote project has a GitHub section");
+        assert!(
+            section.contains("board index: never published"),
+            "cold board reads as never published: {section}"
+        );
+        assert!(
+            section.contains("last error: no auth token found for project `g`"),
+            "the recorded error is surfaced: {section}"
+        );
+
+        match prev_gh {
+            Some(v) => std::env::set_var("GH_TOKEN", v),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
