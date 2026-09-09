@@ -3865,6 +3865,27 @@ esac
         run_git(&bump, &["push", "-q", "origin", "main"]);
     }
 
+    /// Push an unrelated commit onto the remote task branch, modelling a
+    /// genuine concurrent push by an actor outside the Zen flow (a commit the
+    /// probe never saw). Returns the new remote tip. Used to prove pr-create
+    /// still fails closed on an unknown remote head even when the probe rebased
+    /// and recorded a valid pre-rebase (`published_head_sha`) tip.
+    fn push_unrelated_remote_task_head(base: &Path, origin: &Path) -> String {
+        let bump = base.join("concurrent-task-push");
+        run_git(
+            base,
+            &["clone", "-q", origin.to_str().unwrap(), bump.to_str().unwrap()],
+        );
+        run_git(&bump, &["config", "user.email", "test@example.com"]);
+        run_git(&bump, &["config", "user.name", "Test"]);
+        run_git(&bump, &["checkout", "-q", TASK_BRANCH]);
+        std::fs::write(bump.join("stranger.txt"), "concurrent unrelated push\n").unwrap();
+        run_git(&bump, &["add", "stranger.txt"]);
+        run_git(&bump, &["commit", "-q", "-m", "concurrent unrelated push"]);
+        run_git(&bump, &["push", "-q", "--force", "origin", TASK_BRANCH]);
+        git_stdout(&bump, &["rev-parse", "HEAD"])
+    }
+
     /// Rewrite the reviewed task tip so the local and remote branches become
     /// siblings. A normal push must reject this rather than overwrite the
     /// stale remote PR branch.
@@ -4471,6 +4492,81 @@ esac
              integration commit"
         );
         assert!(gh_calls(&log).contains("pr create"), "should open a fresh PR");
+    }
+
+    #[test]
+    fn rebased_probe_still_refuses_a_remote_tip_the_probe_never_saw() {
+        // The complement of the accept case: the probe rebased the branch behind
+        // a moved base (so it recorded a valid pre-rebase `published_head_sha`),
+        // but *after* the probe an actor outside the flow force-pushed an
+        // unrelated commit to the remote task branch. That tip is none of the
+        // reviewed head, the published integration, or the pre-rebase tip, so
+        // pr-create must fail closed — and the refusal must name the actual
+        // pre-rebase tip, never `(none)`.
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(true);
+        let published_head = remote_head(&origin);
+        assert_eq!(task_branch_head(&worktree), published_head);
+        run_git(&worktree, &["checkout", "-q", "--detach"]);
+
+        advance_origin_main_with_base_fix(base.path(), &origin);
+
+        let project = project(base.path());
+        let stub = tempfile::tempdir().unwrap();
+        let log = install_gh_stub(stub.path(), &origin, None, None);
+        let (report, unknown_head, result) = {
+            let _env = EnvGuard::install(stub.path());
+            let report = probe_in_workflow(
+                &project,
+                None,
+                &task(),
+                TASK_BRANCH,
+                RebasePolicy::RebaseOntoDefault,
+            )
+            .unwrap();
+            // A genuine concurrent push lands on the remote task branch *after*
+            // the probe read it, moving the tip to a commit no probe recorded.
+            let unknown_head = push_unrelated_remote_task_head(base.path(), &origin);
+            let identity = report_identity(&report);
+            let result = pr_create_impl(
+                &project,
+                PROJECT_NAME,
+                &task(),
+                "body",
+                &identity,
+                fast_head_retry(),
+            );
+            (report, unknown_head, result)
+        };
+
+        // The probe rebased and pinned the pre-rebase remote tip.
+        assert_ne!(report.head_sha, published_head, "the branch must rebase");
+        assert_eq!(report.published_head_sha, published_head);
+        assert_ne!(unknown_head, published_head);
+        assert_ne!(unknown_head, report.head_sha);
+        assert_ne!(unknown_head, report.integration_sha);
+
+        let err = result.unwrap_err();
+        assert!(
+            !err.is_transient(),
+            "an unknown remote tip is a hard mismatch, not retry-safe: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("concurrent update"), "{msg}");
+        assert!(msg.contains(&unknown_head), "should name the offending tip: {msg}");
+        // Regression assertion: the refusal names the real pre-rebase tip, not
+        // `(none)`, because the probe recorded it as `published_head_sha`.
+        assert!(
+            msg.contains(&published_head),
+            "the refusal must name the actual pre-rebase tip: {msg}"
+        );
+        assert!(
+            !msg.contains("pre-rebase tip (none)"),
+            "the pre-rebase tip must not be reported as `(none)`: {msg}"
+        );
+        // Nothing was published over the concurrent update.
+        assert_eq!(remote_head(&origin), unknown_head);
+        assert!(!gh_calls(&log).contains("pr create"), "must not open a PR: {}", gh_calls(&log));
     }
 
     #[test]

@@ -437,6 +437,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_deprecated_task_command(entry, &text, out);
     } else if id.ends_with(".zenmode") {
         sniff_deprecated_task_command(entry, &text, out);
+        sniff_zen_pr_create_published_head(entry, &text, out);
     }
 }
 
@@ -1146,6 +1147,52 @@ fn sniff_deprecated_task_command(entry: &InventoryEntry, text: &str, out: &mut V
     ));
 }
 
+/// Flag a `zenmode.md` whose PR-flow finalize step drives `shelbi zen pr-create`
+/// but never passes `--match-published-head-commit`.
+///
+/// When a task branch has fallen behind `main` by the time its Zen probe runs (a
+/// sibling PR merged after the handoff push), the probe rebases the branch onto
+/// the moved base and reports the rebased head, but the remote task tip still
+/// points at the pre-rebase commit. Without the published-head pin, `pr-create`
+/// cannot match that remote tip against the probe's provenance: it records the
+/// pre-rebase tip as `(none)` and refuses to push, dead-ending the flow with a
+/// re-probe suggestion that does not help. The shipped default `zenmode.md`
+/// gained the `--match-published-head-commit <published_head_sha>` guidance, but
+/// a project that forked its copy before that never received it — its
+/// orchestrator faithfully omits the flag and hits the dead-end.
+///
+/// The fix is a prose refresh a user may have forked and customized, so it routes
+/// to [`Classification::NeedsJudgment`] for the orchestrator to repair its own
+/// copy rather than mechanically rewriting free-form instructions.
+fn sniff_zen_pr_create_published_head(
+    entry: &InventoryEntry,
+    text: &str,
+    out: &mut Vec<UpgradeFinding>,
+) {
+    // Only copies that actually drive the pr-create finalize step are in scope.
+    // A copy already carrying the published-head guidance is current and must
+    // not re-surface (idempotent), matching the shipped default.
+    if !text.contains("zen pr-create") || text.contains("match-published-head-commit") {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        "ZEN_PR_CREATE_PUBLISHED_HEAD_MISSING",
+        "the `zen pr-create` finalize step never passes `--match-published-head-commit`, so a \
+         task branch that fell behind `main` before its probe (a sibling PR merged after handoff) \
+         dead-ends the PR flow — the probe rebases and reports the rebased head, but pr-create \
+         records the pre-rebase remote tip as `(none)` and refuses to push",
+        "In the `pr-create` finalize step, also pass `--match-published-head-commit \
+         <published_head_sha>` from the probe report. When the probe rebased the branch onto a \
+         moved base, `head_sha` is a local-only commit while `published_head_sha` is the \
+         pre-rebase tip the remote branch still points at; that flag lets pr-create replace the \
+         tip it reviewed instead of refusing it as a concurrent update. Mirror the shipped \
+         default `zenmode.md`.",
+        locate_line_containing(text, "zen pr-create"),
+    ));
+}
+
 /// Location of the first line containing `needle` (substring match), for
 /// anchoring a finding to where the deprecated wording first appears. Falls back
 /// to `1:1`. Unlike [`locate_line`], which needs a whole-line match.
@@ -1733,6 +1780,12 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              find-replace without risking local edits (and without clobbering the still-valid \
              `tasks/` path, `task=` event field, and `task`/`subtask` workflow names) — the \
              orchestrator refreshes its own copy with judgment."
+        }
+        "ZEN_PR_CREATE_PUBLISHED_HEAD_MISSING" => {
+            "The PR-flow finalize prose is free-form and user-customizable, so the \
+             `--match-published-head-commit` guidance can't be merged in mechanically without \
+             risking loss of local edits — the orchestrator repairs its own copy with judgment, \
+             preserving customizations."
         }
         _ => "This form is ambiguous or potentially lossy, so a human should confirm the fix.",
     }
@@ -2572,6 +2625,67 @@ mod tests {
                 codes(&out),
             );
         }
+    }
+
+    // ---- zenmode pr-create published-head guidance ----------------------
+
+    #[test]
+    fn zenmode_without_published_head_flag_is_needs_judgment() {
+        // A forked pre-guidance copy: it drives `zen pr-create` with the full
+        // provenance flags but never mentions the published-head pin.
+        let text = "# Zen\n\nline\n\nRun `shelbi zen pr-create <task-id> --match-repository \
+                    <repository> --match-head-commit <head_sha>` to open the PR.\n";
+        let mut out = Vec::new();
+        sniff_zen_pr_create_published_head(&zen_entry(), text, &mut out);
+        let f = find(&out, "ZEN_PR_CREATE_PUBLISHED_HEAD_MISSING").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment findings carry a rationale");
+        // Anchored to where the pr-create command first appears, not 1:1.
+        assert_eq!(f.location.line, 5);
+    }
+
+    #[test]
+    fn zenmode_with_published_head_flag_is_clean() {
+        let text = "# Zen\n\nRun `shelbi zen pr-create <task-id> --match-head-commit <head_sha>`, \
+                    and also pass `--match-published-head-commit <published_head_sha>`.\n";
+        let mut out = Vec::new();
+        sniff_zen_pr_create_published_head(&zen_entry(), text, &mut out);
+        assert!(
+            find(&out, "ZEN_PR_CREATE_PUBLISHED_HEAD_MISSING").is_none(),
+            "a copy carrying the published-head guidance should be clean: {:?}",
+            codes(&out),
+        );
+    }
+
+    #[test]
+    fn zenmode_without_pr_create_step_is_not_flagged() {
+        // A heavily-customized copy that doesn't drive pr-create at all isn't
+        // hitting this dead-end, so it must not be surfaced.
+        let text = "# Zen\n\nWe merge by hand with `gh pr merge`.\n";
+        let mut out = Vec::new();
+        sniff_zen_pr_create_published_head(&zen_entry(), text, &mut out);
+        assert!(
+            find(&out, "ZEN_PR_CREATE_PUBLISHED_HEAD_MISSING").is_none(),
+            "a copy with no pr-create step must not be flagged: {:?}",
+            codes(&out),
+        );
+    }
+
+    /// Drift guard: the shipped default `zenmode.md` must carry the
+    /// published-head guidance, so a freshly-materialized project never trips
+    /// this sniffer. If this fails, the shipped template regressed to the
+    /// pre-guidance form and existing installs would be told to add a flag the
+    /// default no longer documents.
+    #[test]
+    fn shipped_zenmode_default_carries_the_published_head_guidance() {
+        let mut out = Vec::new();
+        sniff_zen_pr_create_published_head(&zen_entry(), shelbi_state::DEFAULT_ZENMODE, &mut out);
+        assert!(
+            find(&out, "ZEN_PR_CREATE_PUBLISHED_HEAD_MISSING").is_none(),
+            "the shipped default zenmode.md lost the `--match-published-head-commit` guidance: \
+             {:?}",
+            codes(&out),
+        );
     }
 
     // ---- detect + emit (home-scoped) ------------------------------------
