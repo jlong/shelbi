@@ -2,6 +2,35 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 /* ============================================================
+   Mono symbol supplement (box-drawing, arrows, block/geometry)
+   ============================================================
+   Source Code Pro is loaded via `next/font/google` with only the
+   `latin` subset, whose unicode-range stops short of the arrows
+   (U+2190–21FF) and box-drawing (U+2500–257F) glyphs. Those fall
+   back to `ui-monospace` at a different advance width, which breaks
+   the alignment of every ASCII `text` diagram on the site (closed
+   boxes drift, arrows and captions leave their columns).
+
+   This face patches only those ranges from a subset of the same
+   Source Code Pro already bundled for the OG cards
+   (`public/fonts/SourceCodePro-Symbols.woff2`, ~3.5 KB). Because it
+   IS Source Code Pro, its advance width matches the latin glyphs
+   exactly, so mixed rows line up. The restrictive `unicode-range`
+   means it is only consulted for these codepoints and is only
+   downloaded on pages that actually use them. Listed first in
+   `--font-mono` so it wins for its ranges; everything else falls
+   through to the next/font family unchanged. */
+@font-face {
+  font-family: "Source Code Pro Symbols";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("/fonts/SourceCodePro-Symbols.woff2") format("woff2");
+  unicode-range: U+2190-21FF, U+2261, U+2264-2265, U+2500-257F,
+    U+2580-259F, U+25A0-25FF;
+}
+
+/* ============================================================
    Theme — fonts, spacing, and strict-mono palette (light mode)
    ============================================================
    The palette commits to a strict gray ramp with no hue, so the
@@ -15,7 +44,8 @@
 @theme {
   /* ----- Fonts (Geist Sans via `geist`; Source Code Pro via next/font) ----- */
   --font-sans: var(--font-geist-sans), system-ui, sans-serif;
-  --font-mono: var(--font-source-code-pro), ui-monospace, monospace;
+  --font-mono: "Source Code Pro Symbols", var(--font-source-code-pro),
+    ui-monospace, monospace;
 
   /* ----- Palette (strict monochrome — light) ----- */
   --color-bg: #FFFFFF;
