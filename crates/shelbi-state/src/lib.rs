@@ -2733,19 +2733,25 @@ pub fn idle_workspace_count(project: &Project) -> Result<usize> {
     Ok(idle_workspace_count_from(&project.workspaces, &in_progress))
 }
 
-/// Like [`idle_workspace_count`], but read through the project's configured
-/// (cached) issue store and **gated on board freshness**. Returns `Some(count)`
-/// only when the whole-board read is [`BoardState::Warm`]; `None` when it is
-/// stale, cold, or the read failed. The heartbeat uses this so its
+/// Like [`idle_workspace_count`], but read from the daemon-published board
+/// index (`read_board_with_cfg`) and **gated on board freshness**. Returns
+/// `Some(count)` only when the whole-board read is [`BoardState::Warm`]; `None`
+/// when it is stale, cold, or the read failed. The heartbeat uses this so its
 /// `idle_workspaces=` number reflects a *trusted* board: `idle_workspace_count`
 /// reads the local `tasks/` directory, which for a `github` board is empty and
 /// so reports every workspace idle — the exact wrong signal during a rate-limit
 /// outage, when it would pull backlog work onto workers that are actually busy.
-/// A `file_system` board's read is always warm (its snapshot is authoritative),
-/// so this returns `Some` for it exactly as before.
+///
+/// Reads the same source every other poller path uses — the daemon-owned
+/// `board-index.json` — rather than this process's per-pane `CachedIssueStore`.
+/// In a `shelbi __sidebar` pane nothing else drives that per-process cache, so
+/// its in-memory snapshot is perpetually cold/stale and the warm gate never
+/// opened (each heartbeat also kicked a pointless background GraphQL refresh
+/// into a cache nobody read). The index the daemon keeps warm is the trusted
+/// board. A `file_system` board's read is always warm (its snapshot is
+/// authoritative), so this returns `Some` for it exactly as before.
 pub fn idle_workspace_count_warm(project: &Project) -> Result<Option<usize>> {
-    let store = issue_store_for_project(project)?;
-    let board = match store.list_state()? {
+    let board = match read_board_with_cfg(&project.name, &project.issue_tracker)? {
         BoardState::Warm(board) => board,
         BoardState::Stale(_) | BoardState::Cold => return Ok(None),
     };
@@ -6964,61 +6970,114 @@ workspaces:
         .unwrap();
     }
 
-    fn gh_issue_json(id: &str, status: &str) -> String {
-        format!(
-            r#"{{"number":7,"title":"{id}","body":"Prose for {id}.","state":"open","labels":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/{status}"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
+    /// A `github`-backed project with `workspaces` named workspaces, so the
+    /// warm-index idle count can be checked against a pool larger than one.
+    fn write_gh_project_ws(home: &std::path::Path, name: &str, workspaces: &[&str]) {
+        fs::create_dir_all(home.join("projects")).unwrap();
+        let ws_lines: String = workspaces
+            .iter()
+            .map(|w| format!("  - {{ name: {w}, machine: local, runner: claude }}\n"))
+            .collect();
+        fs::write(
+            home.join(format!("projects/{name}.yaml")),
+            format!(
+                r#"name: {name}
+repo: /tmp/{name}
+default_branch: main
+issue_tracker:
+  backend: github
+  github:
+    repo: owner/repo
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+machines:
+  - name: local
+    kind: local
+    work_dir: /tmp/{name}
+workspaces:
+{ws_lines}"#
+            ),
         )
+        .unwrap();
+    }
+
+    /// An `in_progress` [`IssueFile`] optionally assigned to a workspace, for
+    /// seeding a published board index.
+    fn in_progress_card(id: &str, assigned_to: Option<&str>) -> IssueFile {
+        let now = chrono::Utc::now();
+        IssueFile {
+            task: shelbi_core::Issue {
+                id: id.to_string(),
+                title: id.to_string(),
+                column: Column::in_progress(),
+                priority: 0,
+                assigned_to: assigned_to.map(str::to_string),
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                launch: None,
+                created_at: now,
+                updated_at: now,
+                params: std::collections::BTreeMap::new(),
+            },
+            body: String::new(),
+        }
     }
 
     #[test]
-    fn idle_workspace_count_warm_is_none_on_a_cold_or_failed_read() {
+    fn idle_workspace_count_warm_is_none_on_a_stale_or_cold_index() {
         let _g = LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        let name = "ghguard-idle-cold";
+        let name = "ghguard-idle-stale";
         write_gh_project(&home, name);
-        // A failing runner: the board never warms, so `list_state` stays Cold and
-        // the heartbeat must not report a (wrong, all-idle) count off it.
-        set_test_gh_runner(|_| Err(shelbi_core::Error::Other("boom".into())));
         let project = load_project(name).unwrap();
+        // No index published yet → Cold → the heartbeat must not report an
+        // (all-idle, off a directory that is empty for a github board) count.
         assert_eq!(
             idle_workspace_count_warm(&project).unwrap(),
             None,
-            "a cold/failed board must not yield an idle count"
+            "a cold board (no index yet) must not yield an idle count"
         );
-        clear_test_gh_runner();
+        // Publish an index the daemon flagged stale (a carried-forward board
+        // during a refresh failure). A stale index is still not trusted, so the
+        // gate stays closed and the poller reuses its last warm count instead.
+        let mut idx = BoardIndex::fresh(vec![in_progress_card("t", None)]);
+        idx.stale = true;
+        write_board_index(name, &idx).unwrap();
+        assert_eq!(
+            idle_workspace_count_warm(&project).unwrap(),
+            None,
+            "a stale index must not yield an idle count"
+        );
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn idle_workspace_count_warm_counts_from_a_warm_board() {
+    fn idle_workspace_count_warm_counts_from_a_warm_index() {
         let _g = LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let name = "ghguard-idle-warm";
-        write_gh_project(&home, name);
-        // One in-progress issue with no assignment overlay → the single `dev`
-        // workspace is idle, so a warm read reports exactly one idle workspace.
-        set_test_gh_runner(move |args: &[&str]| -> Result<String> {
-            let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
-            if path.ends_with("/labels") || path.contains("/comments") {
-                return Ok(String::new());
-            }
-            Ok(gh_issue_json("t", "in-progress"))
-        });
-        // Prime the process cache so `list_state` reports Warm. `list_open` is
-        // the cached render path that fills the open snapshot `list_state`
-        // serves (`list` is now a live, uncached pass-through and would not warm
-        // it); the one issue is in-progress, so it lands in the open board.
-        let _ = issue_store_for(name).unwrap().list_open().unwrap();
+        // A three-workspace pool with one in-progress card assigned to `alpha`.
+        write_gh_project_ws(&home, name, &["alpha", "bravo", "charlie"]);
+        // Publish a fresh (warm) index the daemon owns; the heartbeat reads this,
+        // not this process's per-pane cache. `alpha` is busy → two idle.
+        let idx = BoardIndex::fresh(vec![in_progress_card("t", Some("alpha"))]);
+        write_board_index(name, &idx).unwrap();
         let project = load_project(name).unwrap();
         assert_eq!(
             idle_workspace_count_warm(&project).unwrap(),
-            Some(1),
-            "warm board: `dev` is idle (no assignment)"
+            Some(2),
+            "warm index: `bravo` and `charlie` are idle, `alpha` is busy"
         );
-        clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
