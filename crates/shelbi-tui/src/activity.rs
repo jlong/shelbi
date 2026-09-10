@@ -170,6 +170,10 @@ pub enum SystemKind {
     Rebase,
     /// `worktree-detach task=… workspace=… status=…` — a worktree released.
     WorktreeDetach,
+    /// `merge task=… workspace=… base=… status=ok|failed detail=…` — an
+    /// accept-merge landing (`ok`) or refusal (`failed`, e.g. a non-mergeable
+    /// PR). The failing case is exactly the one the review panel now surfaces.
+    Merge,
     /// `project=… closed reason=…` — a project torn down.
     Closed,
     /// `project=… handoff outcome=…` — an orchestrator handoff attempt.
@@ -1022,6 +1026,26 @@ pub fn parse_event_line(line: &str) -> Event {
         });
     }
 
+    if let Some(body) = rest.strip_prefix("merge ") {
+        let kv = parse_kv(body);
+        // On failure the `detail=` field carries the reason (a `gh` stderr line);
+        // keep it as the row's dim tail so the feed shows *why* the merge was
+        // refused, not just that it was. A `-` placeholder collapses to None.
+        let detail = kv
+            .get("detail")
+            .filter(|d| d.as_str() != "-")
+            .map(|d| humanize_token(d));
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Merge,
+            project,
+            target: kv.get("task").cloned(),
+            status: kv.get("status").cloned(),
+            detail,
+            raw,
+        });
+    }
+
     // `send project=<p> workspace=<name> status=<s> detail=<d>` — the
     // `project=` here is a field, not the leading scope, so it survived the
     // prefix peel and we read it back out of the k=v tail.
@@ -1840,6 +1864,15 @@ fn render_system_event(
                 system_task_title(app, sys.target.as_deref()),
             )
         }
+        SystemKind::Merge => {
+            let ok = status == Some("ok");
+            (
+                system_chip("merge"),
+                "merged",
+                if ok { Color::Green } else { Color::LightRed },
+                system_task_title(app, sys.target.as_deref()),
+            )
+        }
         SystemKind::Send => {
             let (name, color) = agent_display(sys.target.as_deref());
             let stuck = status == Some("stuck");
@@ -1955,12 +1988,23 @@ fn render_system_event(
 }
 
 /// The dim second line for a system row, when its detail isn't already the
-/// title. Issue-scoped rows (dispatch/rebase/detach) show the status token
-/// under the task title; others fold their detail into the title.
+/// title. Issue-scoped rows (dispatch/rebase/detach/merge) show the status
+/// token under the task title; others fold their detail into the title.
 fn detail_secondary(sys: &SystemEvent) -> Option<String> {
     match sys.kind {
         SystemKind::Dispatch | SystemKind::Rebase | SystemKind::WorktreeDetach => {
             sys.status.as_deref().map(humanize_token)
+        }
+        SystemKind::Merge => {
+            // The status token, plus the refusal reason when the merge failed,
+            // so the feed shows *why* an accept-merge didn't land.
+            let status = sys.status.as_deref().map(humanize_token);
+            match (status, sys.detail.as_deref()) {
+                (Some(s), Some(reason)) => Some(format!("{s}: {reason}")),
+                (Some(s), None) => Some(s),
+                (None, Some(reason)) => Some(reason.to_string()),
+                (None, None) => None,
+            }
         }
         _ => None,
     }
@@ -1969,7 +2013,7 @@ fn detail_secondary(sys: &SystemEvent) -> Option<String> {
 /// The task id an event references for title resolution, or `None` for an event
 /// that names no task (or one whose subject isn't a task). Mirrors the renderers'
 /// own choice of which system kinds carry a task id in `target` (dispatch /
-/// rebase / worktree-detach / message), so [`ActivityApp::resolve_task_meta`]
+/// rebase / worktree-detach / merge / message), so [`ActivityApp::resolve_task_meta`]
 /// batch-resolves exactly the ids the feed will look up.
 fn event_task_id(ev: &Event) -> Option<&str> {
     match ev {
@@ -1979,6 +2023,7 @@ fn event_task_id(ev: &Event) -> Option<&str> {
             SystemKind::Dispatch
             | SystemKind::Rebase
             | SystemKind::WorktreeDetach
+            | SystemKind::Merge
             | SystemKind::Message => sys.target.as_deref(),
             _ => None,
         },
@@ -2932,6 +2977,12 @@ mod tests {
                 SystemKind::WorktreeDetach,
                 Some("t"),
                 Some("ok"),
+            ),
+            (
+                "2026-07-22T14:00:00+00:00 merge task=t workspace=alpha base=main status=failed detail=not_mergeable",
+                SystemKind::Merge,
+                Some("t"),
+                Some("failed"),
             ),
             (
                 "2026-07-22T14:00:00+00:00 project=shelbi closed reason=user:quit-shelbi",
