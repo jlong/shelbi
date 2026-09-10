@@ -5601,12 +5601,21 @@ pub(crate) fn release_branch_from_workspace_worktrees(
         if head.trim() != branch {
             continue;
         }
-        let dirty = shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "status", "--porcelain"])?;
-        if !dirty.trim().is_empty() {
+        // Ignore shelbi's own footprint (`.claude/` deploy files, `.shelbi/`
+        // runtime scratch) the same way the sibling clean-worktree checks do —
+        // a repo that commits `.claude/` leaves that untracked footprint here
+        // after every dispatch, and refusing to release the branch over it
+        // wedges a bounced review task's re-dispatch. Mirrors `sync_worktree`
+        // and `rebase_workspace_branch_onto_default`.
+        let dirty =
+            shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "status", "--porcelain", "-z"])?;
+        let user_dirty = user_dirty_porcelain_lines(&dirty);
+        if !user_dirty.is_empty() {
             return Err(Error::Other(format!(
                 "workspace `{}`'s worktree is on `{branch}` with uncommitted \
-                 changes — commit, stash, or discard first",
-                workspace.name
+                 changes — commit, stash, or discard first:\n{}",
+                workspace.name,
+                user_dirty.join("\n")
             )));
         }
         // Detach HEAD on the workspace's worktree — frees the branch ref so
@@ -10853,6 +10862,81 @@ mod sync_worktree_git_tests {
         assert!(
             err.is_err(),
             "user-authored change must still block the switch"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn release_branch_ignores_shelbi_scaffolding() {
+        // A bounced review task's re-dispatch must be able to free its branch
+        // from the review worktree even when shelbi's own `.claude/` deploy
+        // footprint is the only thing dirtying it — otherwise the first
+        // attempt refuses with a spurious "uncommitted changes".
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("release-scaffolding");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+
+        // Stand the workspace worktree up holding `shelbi/x`.
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+        assert_eq!(head_of(&wt), "shelbi/x");
+
+        // Only shelbi's own footprint dirties the worktree (the moduloscreensaver
+        // repro: `?? .claude/`, not gitignored in the target repo).
+        std::fs::create_dir_all(wt.join(".claude/skills")).unwrap();
+        std::fs::write(wt.join(".claude/settings.json"), "{}\n").unwrap();
+
+        // Releasing the branch must succeed and detach the worktree, freeing
+        // `shelbi/x` for another worktree to claim.
+        release_branch_from_workspace_worktrees(&Host::Local, &project, &machine, "shelbi/x")
+            .expect("scaffolding-only worktree must release cleanly");
+        assert_eq!(
+            head_of(&wt),
+            "HEAD",
+            "worktree must be detached so the branch ref is free"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn release_branch_refuses_genuine_user_change() {
+        // A worktree with real, uncommitted user work must still refuse the
+        // branch release (we'd silently lose the work), and the message must
+        // name the offending path.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("release-userwork");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+
+        // A genuinely modified tracked file — real work, not scaffolding.
+        std::fs::write(wt.join("README.md"), "# repo\nuser edit\n").unwrap();
+
+        let err = release_branch_from_workspace_worktrees(
+            &Host::Local,
+            &project,
+            &machine,
+            "shelbi/x",
+        )
+        .expect_err("a genuine user change must block the release");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("README.md"),
+            "refusal must name the offending path, got: {msg}"
+        );
+        assert_eq!(
+            head_of(&wt),
+            "shelbi/x",
+            "worktree must stay on its branch when the release refuses"
         );
         let _ = std::fs::remove_dir_all(&repo);
     }
