@@ -38,7 +38,7 @@ use ratatui::{
     layout::{Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{List, ListItem, ListState, Paragraph},
+    widgets::{List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use unicode_width::UnicodeWidthStr;
@@ -432,7 +432,106 @@ const BACK_BUTTON_LINE: usize = 1;
 /// of columns reads as roughly square; the arrow is centered within it.
 const BACK_BTN_WIDTH: usize = 5;
 
+/// Max rows the bottom status/error line may claim, so even a long wrapped
+/// `gh` error (`PR #9 is not mergeable: …`) can't crowd the panel body out.
+const STATUS_MAX_H: u16 = 6;
+
+/// Carve the bottom rows out of `area` for the status line when one is set.
+/// Returns `(body, Some(status))`, or `(area, None)` when there's no message or
+/// no room. Reserving from the *bottom* leaves the body's top-anchored layout —
+/// and the click-map line math keyed off it via `list_area` — untouched.
+fn reserve_status_area(app: &ReviewPanel, area: Rect) -> (Rect, Option<Rect>) {
+    if app.status_line.is_empty() || area.height < 2 {
+        return (area, None);
+    }
+    // The warning renders inside the shared 1-col indent (`LIST_INDENT`), so the
+    // wrap budget matches the width `render_status_line` draws into.
+    let inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let needed = wrapped_line_count(&app.status_line, inner_w) as u16;
+    // Always keep at least one body row; never exceed the cap.
+    let cap = STATUS_MAX_H.min(area.height - 1);
+    let h = needed.clamp(1, cap);
+    let body = Rect {
+        height: area.height - h,
+        ..area
+    };
+    let status = Rect {
+        y: area.y + area.height - h,
+        height: h,
+        ..area
+    };
+    (body, Some(status))
+}
+
+/// Render the panel's status line — a non-empty `status_line` (an Approve /
+/// merge failure, an opener error) painted red and word-wrapped so the whole
+/// message, including a `gh` stderr reason, is legible. Mirrors the dashboard
+/// sidebar's footer status (`sidebar::render_footer`), sitting at the bottom of
+/// the panel so the reviewer sees why an action was refused right where they
+/// clicked — the "Ready for review" header stays put above it, so the card
+/// visibly remains in review.
+fn render_status_line(f: &mut Frame, app: &ReviewPanel, area: Rect) {
+    if area.width == 0 || area.height == 0 || app.status_line.is_empty() {
+        return;
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            app.status_line.clone(),
+            Style::default().fg(Color::Red),
+        )))
+        .wrap(Wrap { trim: true }),
+        area.inner(LIST_INDENT),
+    );
+}
+
+/// Estimate how many rows `text` occupies when word-wrapped to `width` columns,
+/// matching ratatui's `Wrap { trim: true }` closely enough to size the status
+/// area: whitespace-separated words are packed greedily, and a word wider than
+/// `width` spills onto extra rows of its own.
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let mut lines = 1usize;
+    let mut col = 0usize;
+    for word in text.split_whitespace() {
+        let w = display_width(word);
+        if w > width {
+            // A word longer than the row: it starts on a fresh line and spills
+            // onto ceil(w / width) rows, the last of which leaves `col` at the
+            // remainder.
+            if col > 0 {
+                lines += 1;
+            }
+            lines += (w - 1) / width;
+            col = w % width;
+            if col == 0 {
+                col = width;
+            }
+            continue;
+        }
+        let need = if col == 0 { w } else { col + 1 + w };
+        if need > width {
+            lines += 1;
+            col = w;
+        } else {
+            col = need;
+        }
+    }
+    lines.max(1)
+}
+
 pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
+    // A non-empty `status_line` (an Approve / merge refusal, an opener error)
+    // claims the bottom rows of the panel as a red, wrapped warning — the
+    // panel's analogue of the dashboard sidebar's footer status line. Carve it
+    // off first so the body's top-anchored layout (and the click map keyed off
+    // `list_area`) is unaffected, and so a too-small early return below still
+    // leaves the warning painted.
+    let (area, status_area) = reserve_status_area(app, area);
+    if let Some(status_area) = status_area {
+        render_status_line(f, app, status_area);
+    }
     // The list spans the full pane width so the switch nav block's selection
     // fill and half-block bleed can paint edge to edge; the plain rows above
     // and below re-apply the 1-col indent themselves.
@@ -907,6 +1006,13 @@ fn handle_mouse(app: &mut ReviewPanel, mouse: MouseEvent) -> PanelEffect {
 /// on the status line (spec: "failures surface as a status-line warning, not
 /// a crash").
 fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect) {
+    // Any real action supersedes a previously shown warning: clear it up front,
+    // and a failing action re-sets its own message in the match arms below. A
+    // no-op (a navigation keystroke maps to `None`) leaves the current warning
+    // in place, so an Approve refusal stays visible while the reviewer looks.
+    if !matches!(effect, PanelEffect::None) {
+        app.status_line.clear();
+    }
     match effect {
         PanelEffect::None => {}
         // Back button: navigate focus to the dashboard without tearing the
@@ -1173,6 +1279,68 @@ mod tests {
         assert!(out.contains("Open Browser"), "browser switch when url set: {out}");
         assert!(out.contains("Approve"), "approve button: {out}");
         assert!(out.contains("Reject"), "reject button: {out}");
+    }
+
+    #[test]
+    fn failed_approve_status_line_renders_red_below_the_header() {
+        // Regression: an Approve refusal was stored in `status_line` but never
+        // drawn — the panel repainted the identical frame and the reviewer
+        // clicked Approve again. The warning must now show, in full, in red.
+        let mut app = panel(true);
+        app.status_line =
+            "approve failed: PR #9 is not mergeable: the merge commit cannot be cleanly created"
+                .to_string();
+        let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let out = rows.join("\n");
+
+        // The header still reads "Ready for review" — the card visibly stays in
+        // review — and the error is shown alongside it, not swallowed.
+        assert!(out.contains("Ready for review"), "header stays: {out}");
+        // The whole message survives wrapping, including the gh stderr reason.
+        for frag in ["approve", "mergeable", "cleanly", "created"] {
+            assert!(out.contains(frag), "status fragment {frag:?} missing:\n{out}");
+        }
+        // The warning is painted red. `cleanly` appears only in the status line
+        // (never in a button / switch label), so its row is the warning's row.
+        let y = rows
+            .iter()
+            .position(|r| r.contains("cleanly"))
+            .expect("status row present");
+        let red = (0..buf.area.width).any(|x| {
+            let c = &buf[(x, y as u16)];
+            c.fg == Color::Red && !c.symbol().trim().is_empty()
+        });
+        assert!(red, "status row should be red:\n{out}");
+    }
+
+    #[test]
+    fn cleared_status_line_leaves_no_warning() {
+        // The state after a successful action: an empty `status_line` shows only
+        // the constant header, with no leftover error text.
+        let mut app = panel(true);
+        assert!(app.status_line.is_empty());
+        let out = render(&mut app, 40, 24);
+        assert!(out.contains("Ready for review"));
+        assert!(!out.contains("failed"), "no stale warning: {out}");
+    }
+
+    #[test]
+    fn wrapped_line_count_matches_greedy_word_wrap() {
+        assert_eq!(wrapped_line_count("", 10), 1);
+        assert_eq!(wrapped_line_count("short", 10), 1);
+        // Two words that don't fit together wrap to two rows.
+        assert_eq!(wrapped_line_count("hello world", 8), 2);
+        // A single word wider than the row spills onto extra rows.
+        assert_eq!(wrapped_line_count("abcdefghij", 4), 3);
     }
 
     /// A selected Approve / Reject button reads as a pressed, reverse-video
