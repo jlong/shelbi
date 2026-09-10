@@ -855,8 +855,7 @@ pub fn approve_review_task(project_name: &str, task_id: &str) -> Result<()> {
         &from_status,
         &to_status,
         &ws_label,
-    )?
-    .is_some();
+    )?;
 
     if let Some(mv) = store.move_status(task_id, &target, "user:review")? {
         let _ = shelbi_state::append_task_event(
@@ -870,8 +869,9 @@ pub fn approve_review_task(project_name: &str, task_id: &str) -> Result<()> {
     }
 
     // Fire the edge's remaining actions (delete_branch, …) after the move,
-    // skipping `merge` so it isn't re-run. Best-effort — the move landed.
-    if merged {
+    // skipping the actions the gate already ran (the pre-merge prefix plus
+    // `merge`) so none is re-run. Best-effort — the move landed.
+    if let Some(gm) = &merged {
         if let Err(e) = crate::transition::execute_transition_except(
             &project,
             project_name,
@@ -880,7 +880,7 @@ pub fn approve_review_task(project_name: &str, task_id: &str) -> Result<()> {
             &workflow,
             &from_status,
             &to_status,
-            &[shelbi_core::TransitionAction::Merge],
+            &gm.ran,
         ) {
             tracing::warn!(task = %task_id, error = %e, "post-merge accept cleanup failed (merge already landed)");
         }

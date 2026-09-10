@@ -45,6 +45,22 @@ pub struct ActionOutcome {
     pub line: String,
 }
 
+/// The result of a successful [`run_gated_merge`]: the merged detail line
+/// (the same text the `merge … status=ok` event carries) plus the list of
+/// actions the gate already ran — the edge's pre-merge prefix (e.g.
+/// `push_branch`) followed by `Merge`.
+///
+/// The caller must pass [`GatedMerge::ran`] as the `skip` set to
+/// [`execute_transition_except`] when it fires the edge's remaining actions
+/// after the move, so neither the prefix nor the merge is run twice (a second
+/// `push_branch` is a no-op, but a second `merge` fails "no commits beyond
+/// target" and short-circuits the rest of the cleanup).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatedMerge {
+    pub detail: String,
+    pub ran: Vec<TransitionAction>,
+}
+
 /// Walk the `from -> to` transition's declared actions and fire each one
 /// in declaration order, returning one [`ActionOutcome`] per action.
 ///
@@ -131,16 +147,32 @@ pub fn execute_merge_action(
 /// PR stayed open and `main` never advanced (the silent-no-op incident this
 /// guards against). Gating the move on the merge here is the fix.
 ///
+/// The edge's actions that precede `merge` — its **pre-merge prefix** — run
+/// inside the gate, in declared order, immediately before the merge. So a
+/// `[push_branch, merge]` edge publishes the branch's current tip to origin
+/// *before* the PR is squash-merged, guaranteeing the merge integrates every
+/// commit on the branch at the moment of approval. Without this the merge ran
+/// on origin's stale head and the `push_branch` only fired *after* the card
+/// moved, pushing the newer commit onto an already-merged branch where nothing
+/// picks it up — a green merge with a change silently missing from `main`.
+///
+/// A prefix action that fails aborts the gate exactly as a failed merge does:
+/// a `merge … status=failed` event is emitted (its detail naming the failed
+/// action) and the caller MUST leave the card in review.
+///
 /// Returns:
-/// - `Ok(Some(detail))` — the edge declared `merge` and it succeeded; a
-///   `merge … status=ok` event carrying the integration SHA was emitted.
-///   The caller should proceed with the column move, then fire the edge's
-///   remaining actions with [`execute_transition_except`] skipping `merge`.
+/// - `Ok(Some(gm))` — the edge declared `merge` and the prefix + merge all
+///   succeeded; a `merge … status=ok` event carrying the integration SHA was
+///   emitted. The caller should proceed with the column move, then fire the
+///   edge's remaining actions with [`execute_transition_except`] skipping
+///   [`gm.ran`](GatedMerge::ran) (the prefix plus `merge`, so neither is
+///   re-run).
 /// - `Ok(None)` — the edge declares no `merge`; nothing ran and no event was
 ///   emitted. The caller proceeds with a plain move (unchanged behavior).
-/// - `Err(_)` — the merge failed; a `merge … status=failed` event was
-///   emitted and the caller MUST NOT advance the task to `done` (leaving a
-///   stranded PR reading as done is the exact failure we refuse).
+/// - `Err(_)` — a prefix action or the merge failed; a `merge … status=failed`
+///   event was emitted and the caller MUST NOT advance the task to `done`
+///   (leaving a stranded PR reading as done, or a lost commit, is the exact
+///   failure we refuse).
 ///
 /// `workspace_label` is the `workspace=` field on the emitted merge event —
 /// the task's assigned slot when it has one, else a caller-supplied fallback
@@ -155,18 +187,53 @@ pub fn run_gated_merge(
     from: &str,
     to: &str,
     workspace_label: &str,
-) -> Result<Option<String>> {
-    if !workflow
-        .actions_for_transition(from, to)
-        .contains(&TransitionAction::Merge)
+) -> Result<Option<GatedMerge>> {
+    let edge_actions = workflow.actions_for_transition(from, to);
+    let merge_pos = match edge_actions
+        .iter()
+        .position(|a| *a == TransitionAction::Merge)
     {
-        return Ok(None);
-    }
+        Some(pos) => pos,
+        None => return Ok(None),
+    };
+    // The actions declared before `merge`, run in order inside the gate.
+    let prefix: Vec<TransitionAction> = edge_actions[..merge_pos].to_vec();
+
     // `base=` for the event: the edge's effective target, falling back to the
     // project base when the edge names none. Resolved here (not inside the
-    // primitive) so both the ok and failed events carry a meaningful base.
-    let base = resolve_effective_target(workflow, task, from, to)?
+    // primitive) so both the ok and failed events carry a meaningful base;
+    // `target` (the same value pre-`unwrap_or`) is threaded into every action
+    // the same way [`execute_transition`] does.
+    let target = resolve_effective_target(workflow, task, from, to)?;
+    let base = target
+        .clone()
         .unwrap_or_else(|| project.base_branch().to_string());
+
+    // Fire the pre-merge prefix (e.g. `push_branch`) before the merge. A
+    // failure here aborts the gate — the branch's newer commit stays local and
+    // the card must stay in review — surfaced through the same failed merge
+    // event so the reason is visible.
+    for &action in &prefix {
+        match run_action(project, project_name, task, task_body, action, target.as_deref()) {
+            Ok(line) => {
+                tracing::info!(task = %task.id, action = %action, line = %line, "gated pre-merge action fired");
+            }
+            Err(e) => {
+                let detail = format!("pre-merge {action} failed: {e}");
+                if let Err(ev) = shelbi_state::append_merge_event(
+                    &task.id,
+                    workspace_label,
+                    &base,
+                    "failed",
+                    &detail,
+                ) {
+                    tracing::warn!(task = %task.id, error = %ev, "append_merge_event (failed) failed");
+                }
+                return Err(e);
+            }
+        }
+    }
+
     match execute_merge_action(project, project_name, task, task_body, workflow, from, to) {
         Ok(Some(outcome)) => {
             let detail = outcome.line.replace('\n', "; ");
@@ -175,11 +242,13 @@ pub fn run_gated_merge(
             {
                 tracing::warn!(task = %task.id, error = %e, "append_merge_event (ok) failed");
             }
-            Ok(Some(detail))
+            let mut ran = prefix;
+            ran.push(TransitionAction::Merge);
+            Ok(Some(GatedMerge { detail, ran }))
         }
-        // The `contains(Merge)` guard above already returned for the no-merge
-        // edge, so `execute_merge_action` returning `None` here would be a
-        // logic error; treat it as "nothing merged" rather than panicking.
+        // The `merge_pos` guard above already returned for the no-merge edge,
+        // so `execute_merge_action` returning `None` here would be a logic
+        // error; treat it as "nothing merged" rather than panicking.
         Ok(None) => Ok(None),
         Err(e) => {
             let detail = e.to_string();
@@ -1002,6 +1071,118 @@ transitions:
         assert!(
             err.to_string().contains("no assigned workspace"),
             "got: {err}"
+        );
+    }
+
+    // ---- gated pre-merge prefix: push before merge ------------------------
+
+    use std::process::Command;
+
+    fn run_git(cwd: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", cwd.display());
+    }
+
+    /// A bare `origin.git` plus a working clone with `main` and `feature`
+    /// both pushed, and a local workspace `alice` whose worktree
+    /// (`<work_dir>/.shelbi/wt/alice`) holds `feature`. Returns the tempdir
+    /// (kept alive for the test), the clone path, and a project pointed at it.
+    fn origin_clone_with_workspace() -> (tempfile::TempDir, std::path::PathBuf, Project) {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("origin.git");
+        let local = tmp.path().join("local");
+        run_git(tmp.path(), &["init", "-q", "--bare", "origin.git"]);
+
+        std::fs::create_dir_all(&local).unwrap();
+        run_git(&local, &["init", "-q", "-b", "main", "."]);
+        run_git(&local, &["config", "user.email", "test@example.com"]);
+        run_git(&local, &["config", "user.name", "Test"]);
+        run_git(&local, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        std::fs::write(local.join("README.md"), "hi\n").unwrap();
+        run_git(&local, &["add", "README.md"]);
+        run_git(&local, &["commit", "-q", "-m", "init"]);
+        run_git(&local, &["push", "-u", "origin", "main"]);
+        run_git(&local, &["branch", "feature"]);
+        run_git(&local, &["push", "-u", "origin", "feature"]);
+
+        // Materialize the review workspace worktree on `feature`.
+        let wt = local.join(".shelbi").join("wt").join("alice");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        run_git(&local, &["worktree", "add", wt.to_str().unwrap(), "feature"]);
+
+        let mut project = bare_project();
+        project.repo = local.to_string_lossy().into();
+        project.machines[0].work_dir = local.clone();
+        project.workspaces = vec![WorkspaceSpec {
+            name: "alice".into(),
+            machine: "hub".into(),
+            tags: Vec::new(),
+            slot: None,
+        }];
+        (tmp, local, project)
+    }
+
+    /// The regression this task fixes: a `[push_branch, merge]` accept edge
+    /// with a commit that the review agent made in the review worktree but
+    /// never pushed (the moduloscreensaver `f0ad07c` shape). The gate must
+    /// run `push_branch` — the edge's pre-merge prefix — *before* the merge,
+    /// so the branch tip on origin (what the merge integrates) includes the
+    /// review commit. Before the fix `push_branch` ran only after the card
+    /// moved, so the merge landed origin's stale head and the commit was lost.
+    ///
+    /// The merge step itself reaches `gh pr list`, which errors against this
+    /// plain (non-GitHub) bare origin — or is absent under CI — so the gate
+    /// returns `Err`. That is fine and expected: what the bug got wrong, and
+    /// what this asserts, is purely the *ordering* — that the review commit
+    /// reaches `origin/feature` inside the gate, before the merge is even
+    /// attempted. (The gh-backed merge itself is integration-tested against
+    /// real GitHub, mirroring the hub-side merge tests in `actions`.)
+    #[test]
+    fn gated_merge_pushes_unpushed_review_commit_before_merging() {
+        let (_tmp, local, project) = origin_clone_with_workspace();
+        let wt = local.join(".shelbi").join("wt").join("alice");
+
+        // The review agent commits in the review worktree WITHOUT pushing.
+        std::fs::write(wt.join("notes.md"), "notary key route\n").unwrap();
+        run_git(&wt, &["add", "notes.md"]);
+        run_git(&wt, &["commit", "-q", "-m", "Document the notary credentials route"]);
+
+        let rev = |refname: &str| -> String {
+            let out = Command::new("git")
+                .current_dir(&local)
+                .args(["rev-parse", refname])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let feature_tip = rev("refs/heads/feature");
+        // Precondition: the review commit is genuinely unpushed.
+        assert_ne!(
+            rev("refs/remotes/origin/feature"),
+            feature_tip,
+            "test precondition: the review commit must not yet be on origin"
+        );
+
+        // The moduloscreensaver edge shape: `[push_branch, merge]`, base `main`.
+        let wf = workflow_with_edge("push_branch, merge", Some("main"));
+        let mut task = bare_task("t-notary");
+        task.branch = Some("feature".into());
+        task.assigned_to = Some("alice".into());
+
+        // Ignore the return: the merge sub-step errors (no GitHub / no gh),
+        // but the pre-merge `push_branch` must already have run.
+        let _ = run_gated_merge(
+            &project, "fixture", &task, "body", &wf, "review", "done", "alice",
+        );
+
+        assert_eq!(
+            rev("refs/remotes/origin/feature"),
+            feature_tip,
+            "the pre-merge prefix must push the review commit to origin before merging"
         );
     }
 }

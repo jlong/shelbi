@@ -816,7 +816,7 @@ fn move_to(
             .assigned_to
             .clone()
             .unwrap_or_else(|| "cli".to_string());
-        shelbi_orchestrator::transition::run_gated_merge(
+        let gated = shelbi_orchestrator::transition::run_gated_merge(
             &project_yaml,
             project,
             &tf.task,
@@ -832,7 +832,14 @@ fn move_to(
                  (NOT advancing to `{to_status}`): {e}"
             )
         })?;
-        Some(project_yaml)
+        // The gate ran the pre-merge prefix (e.g. `push_branch`) plus `merge`;
+        // the post-move cleanup below must skip exactly those so none re-runs.
+        // `declares_merge` guarantees `Some` here, but fall back to skipping
+        // just `merge` rather than unwrapping.
+        let skip = gated
+            .map(|gm| gm.ran)
+            .unwrap_or_else(|| vec![shelbi_core::TransitionAction::Merge]);
+        Some((project_yaml, skip))
     } else {
         None
     };
@@ -876,10 +883,13 @@ fn move_to(
     }
 
     // Merge already landed and gated the move above; now fire the edge's
-    // remaining actions (`delete_branch`, `push_branch`, `run:`/`ready:`),
-    // skipping `merge` so it isn't re-run. Best-effort — the move already
-    // happened, so a cleanup failure warns rather than rolling it back.
-    if let (Some(project_yaml), Some(_)) = (project_yaml_for_actions.as_ref(), moved.as_ref()) {
+    // remaining actions (`delete_branch`, `run:`/`ready:`), skipping the ones
+    // the gate already ran (the pre-merge prefix plus `merge`) so none is
+    // re-run. Best-effort — the move already happened, so a cleanup failure
+    // warns rather than rolling it back.
+    if let (Some((project_yaml, skip)), Some(_)) =
+        (project_yaml_for_actions.as_ref(), moved.as_ref())
+    {
         match shelbi_orchestrator::transition::execute_transition_except(
             project_yaml,
             project,
@@ -888,7 +898,7 @@ fn move_to(
             &workflow,
             &from_status,
             &to_status,
-            &[shelbi_core::TransitionAction::Merge],
+            skip,
         ) {
             Ok(_) => {}
             Err(e) => {
