@@ -145,6 +145,16 @@ pub struct ReviewPanel {
     /// review slot's window on the way out.
     pub approved: bool,
     pub status_line: String,
+    /// Set while the gated review→done merge runs on a background thread. The
+    /// Approve row renders a busy spinner instead of the pressable button, and
+    /// [`ReviewPanel::activate_row`] declines a second Approve while it's set —
+    /// so the multi-second `gh` merge never freezes the panel and a replayed /
+    /// double press can't re-trigger it.
+    pub merging: bool,
+    /// Animation frame for the "merging…" spinner. Advanced once per loop tick
+    /// while [`merging`](Self::merging) so the reviewer sees the panel is still
+    /// alive and repainting during the merge.
+    pub spinner: usize,
     /// Screen rect of the rendered row list — written each frame, read by the
     /// mouse handler to map a click to a row.
     pub list_area: Rect,
@@ -167,6 +177,8 @@ impl ReviewPanel {
             should_quit: false,
             approved: false,
             status_line: String::new(),
+            merging: false,
+            spinner: 0,
             list_area: Rect::default(),
         };
         // Focus the Chat switch initially — it's the default middle-pane view
@@ -331,7 +343,20 @@ impl ReviewPanel {
                 PanelEffect::ShowVim
             }
             PanelRow::Switch(SwitchItem::Browser) => PanelEffect::OpenBrowser,
+            // Decline a second Approve while the gated merge is already in
+            // flight — the host loop runs it off-thread and sets `merging`, so
+            // a replayed or double press (Enter *or* click, both route here) is
+            // dropped, never queued behind the running merge.
+            PanelRow::Approve if self.merging => PanelEffect::None,
             PanelRow::Approve => PanelEffect::Approve,
+            // Decline Reject while the gated merge is in flight, the same way
+            // Approve is declined. A submitted reject reason would run the
+            // review-reject transition concurrently with the background `gh`
+            // merge — landing the card in `ready` while the PR merges, or
+            // failing the merge's `review -> done` move because the card already
+            // left `review`. The old frozen panel made this impossible; the
+            // off-thread merge reintroduces the race, so we close it here.
+            PanelRow::Reject if self.merging => PanelEffect::None,
             PanelRow::Reject => PanelEffect::RejectPrompt,
             PanelRow::Status | PanelRow::Blank | PanelRow::Section(_) => PanelEffect::None,
         }
@@ -362,6 +387,21 @@ impl ReviewPanel {
                 self.activate_row(r.clone())
             }
             _ => PanelEffect::None,
+        }
+    }
+
+    /// Handle a q / Esc quit request. While a gated merge is in flight, quitting
+    /// would tear the review window down and exit the process with the merge
+    /// worker's `gh` children still mid-flight, orphaning a half-finished merge
+    /// (PR merged, branch not deleted, card not moved). So while `merging` the
+    /// quit is ignored and a short note explains why the key did nothing;
+    /// otherwise it sets `should_quit`. Pure so the loop's key handler stays
+    /// unit-testable without a terminal.
+    pub fn request_quit(&mut self) {
+        if self.merging {
+            self.status_line = "merge in progress, wait for it to finish".into();
+        } else {
+            self.should_quit = true;
         }
     }
 
@@ -674,8 +714,17 @@ fn render_row_list(
     // over a per-item `bg = tint` and win. Only the single selected row is ever
     // highlighted, so keying off `app.selected` styles exactly that row.
     let highlight = match app.rows().get(app.selected) {
-        Some(PanelRow::Approve) => Style::default().fg(Color::Green).add_modifier(Modifier::REVERSED),
-        Some(PanelRow::Reject) => Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED),
+        // While merging, the Approve row is a busy indicator, not a pressable
+        // button — drop the pressed-button reverse so it doesn't read as
+        // clickable.
+        Some(PanelRow::Approve) if !app.merging => {
+            Style::default().fg(Color::Green).add_modifier(Modifier::REVERSED)
+        }
+        // While merging, Reject is declined (see `activate_row`), so drop its
+        // pressed-button reverse too — it must not read as clickable.
+        Some(PanelRow::Reject) if !app.merging => {
+            Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED)
+        }
         _ => Style::default().bg(crate::theme::SELECTION_BG),
     };
     let list = List::new(items).highlight_style(highlight);
@@ -802,9 +851,27 @@ fn render_row(app: &ReviewPanel, row: &PanelRow, selected: bool, width: usize) -
         // Switch rows are drawn by `render_switch_nav` as a full-width nav
         // block, never through this per-row list renderer.
         PanelRow::Switch(_) => unreachable!("switch rows render via the nav block"),
+        // While the gated merge runs off-thread the Approve button becomes a
+        // busy indicator: an animated spinner + "merging PR…" in place of the
+        // pressable label, giving the reviewer immediate feedback that the
+        // press landed and the panel is still alive.
+        PanelRow::Approve if app.merging => ListItem::new(Line::from(Span::styled(
+            format!("[ {} merging PR… ]", spinner_frame(app.spinner)),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))),
         PanelRow::Approve => button_item("✅ Approve", Color::Green, selected),
         PanelRow::Reject => button_item("❌ Reject", Color::Red, selected),
     }
+}
+
+/// One frame of the braille "merging…" spinner, indexed by the panel's
+/// `spinner` tick (advanced once per loop iteration while a merge is in
+/// flight). Pure so the busy-row render stays deterministic in tests.
+fn spinner_frame(tick: usize) -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    FRAMES[tick % FRAMES.len()]
 }
 
 fn button_item(label: &str, tint: Color, selected: bool) -> ListItem<'static> {
@@ -951,7 +1018,19 @@ fn review_panel_loop<B: Backend>(
     app: &mut ReviewPanel,
     project_name: &str,
 ) -> Result<()> {
+    // Receiver for a gated review→done merge running on a background thread.
+    // Approve spawns the merge off-thread (it shells out to `gh` three times,
+    // up to ~6 minutes worst case) so the loop keeps drawing and handling input
+    // instead of freezing until every `gh` child returns. `Some` while a merge
+    // is in flight; the outcome (Ok, or the failure reason) is delivered here.
+    let mut merge_rx: Option<std::sync::mpsc::Receiver<std::result::Result<(), String>>> = None;
+
     while !app.should_quit {
+        // Advance the busy spinner each tick while a merge runs, so the panel
+        // visibly keeps repainting rather than looking frozen.
+        if app.merging {
+            app.spinner = app.spinner.wrapping_add(1);
+        }
         term.draw(|f| render_full(f, app, f.area()))?;
         // Recover a dead middle content pane before waiting on input, on the
         // same cadence as the event poll below. When the mid view's `exec`'d
@@ -967,13 +1046,46 @@ fn review_panel_loop<B: Backend>(
             let effect = app.recover_to_chat();
             perform_effect(app, project_name, effect);
         }
+        // Apply a completed background merge. On success we accept + quit (the
+        // exit path closes the review window as before); on failure the busy
+        // spinner is replaced by the reason on the status line so the reviewer
+        // sees why it didn't land. `continue` so the next iteration redraws the
+        // outcome (and exits promptly on success) instead of waiting out the
+        // 200 ms poll below.
+        if let Some(rx) = merge_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    merge_rx = None;
+                    app.merging = false;
+                    app.approved = true;
+                    app.should_quit = true;
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    merge_rx = None;
+                    app.merging = false;
+                    app.status_line = format!("approve failed: {e}");
+                    continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // The worker dropped its sender without a result (a panic) —
+                    // clear the busy state and surface a generic failure rather
+                    // than spinning forever.
+                    merge_rx = None;
+                    app.merging = false;
+                    app.status_line = "approve failed: merge worker exited unexpectedly".into();
+                    continue;
+                }
+            }
+        }
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
         let effect = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Char('q') | KeyCode::Esc => {
-                    app.should_quit = true;
+                    app.request_quit();
                     PanelEffect::None
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -990,7 +1102,28 @@ fn review_panel_loop<B: Backend>(
             Event::Mouse(m) => handle_mouse(app, m),
             _ => PanelEffect::None,
         };
-        perform_effect(app, project_name, effect);
+        // Approve runs off-thread; every other effect is handled inline. The
+        // pure model already declines a second Approve while `merging`, so the
+        // `merge_rx.is_none()` guard is belt-and-suspenders.
+        if matches!(effect, PanelEffect::Approve) {
+            if merge_rx.is_none() {
+                app.status_line.clear();
+                app.merging = true;
+                app.spinner = 0;
+                let (tx, rx) = std::sync::mpsc::channel();
+                let project = project_name.to_string();
+                let task = app.task_id.clone();
+                std::thread::spawn(move || {
+                    let result =
+                        shelbi_orchestrator::review_ui::approve_review_task(&project, &task)
+                            .map_err(|e| e.to_string());
+                    let _ = tx.send(result);
+                });
+                merge_rx = Some(rx);
+            }
+        } else {
+            perform_effect(app, project_name, effect);
+        }
     }
     Ok(())
 }
@@ -1069,17 +1202,11 @@ fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect
                 }
             }
         }
-        // Approve / Reject mutate the board, then quit — the loop's exit path
-        // runs close_review_interface to restore the dashboard layout.
-        PanelEffect::Approve => {
-            match shelbi_orchestrator::review_ui::approve_review_task(project_name, &app.task_id) {
-                Ok(()) => {
-                    app.approved = true;
-                    app.should_quit = true;
-                }
-                Err(e) => app.status_line = format!("approve failed: {e}"),
-            }
-        }
+        // Approve is handled off-thread in `review_panel_loop` (it must keep the
+        // panel repainting while the multi-second gated `gh` merge runs), so the
+        // effect never reaches this inline dispatcher — see the loop's Approve
+        // branch and `merge_rx`.
+        PanelEffect::Approve => {}
         // Reject opens the reason popover (a centered tmux display-popup). A
         // submitted reason drives the same review-reject transition the old
         // inline prompt did; a cancel (or a failed popup launch) leaves the
@@ -1789,6 +1916,122 @@ mod tests {
             .unwrap();
         app.selected = idx;
         assert_eq!(app.activate(), PanelEffect::Approve);
+    }
+
+    /// A second Approve while the gated merge is already in flight is dropped,
+    /// not queued: with `merging` set, both the keyboard (`activate`) and mouse
+    /// (`click`) paths return `None` for the Approve row, so a replayed / double
+    /// press can't re-trigger the merge that froze the panel three times in the
+    /// field report.
+    #[test]
+    fn second_approve_while_merging_is_ignored() {
+        let mut app = panel(true);
+        // Render once so `list_area` / the click map is populated.
+        let rows = render_lines(&mut app, 44, 24);
+        let idx = app
+            .rows()
+            .iter()
+            .position(|r| matches!(r, PanelRow::Approve))
+            .unwrap();
+        app.selected = idx;
+        // Before a merge starts, Approve activates normally.
+        assert_eq!(app.activate(), PanelEffect::Approve);
+
+        // A merge is now in flight.
+        app.merging = true;
+        assert_eq!(app.activate(), PanelEffect::None, "Enter is dropped while merging");
+        let approve_y = row_y(&rows, "Approve") as u16;
+        assert_eq!(
+            app.click(2, approve_y),
+            PanelEffect::None,
+            "a click is dropped while merging too"
+        );
+    }
+
+    /// Reject is declined while a merge is in flight, exactly the way Approve
+    /// is: both the keyboard (`activate`) and mouse (`click`) paths return
+    /// `None` for the Reject row. Otherwise a submitted reject reason would run
+    /// the review-reject transition concurrently with the background `gh` merge
+    /// and race the card out of `review`.
+    #[test]
+    fn reject_while_merging_is_ignored() {
+        let mut app = panel(true);
+        // Render once so `list_area` / the click map is populated.
+        let rows = render_lines(&mut app, 44, 24);
+        let idx = app
+            .rows()
+            .iter()
+            .position(|r| matches!(r, PanelRow::Reject))
+            .unwrap();
+        app.selected = idx;
+        // Before a merge starts, Reject activates the reason popover.
+        assert_eq!(app.activate(), PanelEffect::RejectPrompt);
+
+        // A merge is now in flight — Reject is dropped, not queued.
+        app.merging = true;
+        assert_eq!(app.activate(), PanelEffect::None, "Enter is dropped while merging");
+        let reject_y = row_y(&rows, "Reject") as u16;
+        assert_eq!(
+            app.click(2, reject_y),
+            PanelEffect::None,
+            "a click is dropped while merging too"
+        );
+    }
+
+    /// A q / Esc quit request is ignored while a merge is in flight: quitting
+    /// would tear the window down and exit with the merge worker's `gh` children
+    /// still running, orphaning a half-finished merge. `request_quit` leaves
+    /// `should_quit` false and explains why on the status line; once the merge
+    /// clears it quits normally.
+    #[test]
+    fn quit_is_ignored_while_merging() {
+        let mut app = panel(true);
+        app.merging = true;
+        app.request_quit();
+        assert!(!app.should_quit, "q / Esc does not quit while merging");
+        assert!(
+            !app.status_line.is_empty(),
+            "the status line explains why the key did nothing: {:?}",
+            app.status_line
+        );
+
+        // Once the merge clears, q / Esc quits as usual.
+        app.merging = false;
+        app.request_quit();
+        assert!(app.should_quit, "q / Esc quits once the merge is done");
+    }
+
+    /// While merging, the Approve button is replaced by a spinner + "merging
+    /// PR…" busy indicator — immediate feedback that the press landed — and the
+    /// pressable "Approve" label is gone.
+    #[test]
+    fn merging_replaces_approve_button_with_a_busy_indicator() {
+        let mut app = panel(true);
+        // Not merging: the pressable Approve button shows.
+        let idle = render(&mut app, 44, 24);
+        assert!(idle.contains("Approve"), "idle panel shows the Approve button: {idle}");
+
+        app.merging = true;
+        let busy = render(&mut app, 44, 24);
+        assert!(busy.contains("merging PR"), "busy indicator shown while merging: {busy}");
+        assert!(
+            !busy.contains("Approve"),
+            "the pressable Approve label is gone while merging: {busy}"
+        );
+        // A spinner glyph from the animation set is present.
+        assert!(
+            busy.contains(spinner_frame(app.spinner)),
+            "spinner frame rendered on the busy row: {busy}"
+        );
+    }
+
+    /// The spinner cycles through its frames and wraps, so advancing the tick
+    /// each loop iteration animates it without ever indexing out of bounds.
+    #[test]
+    fn spinner_frame_cycles_and_wraps() {
+        assert_eq!(spinner_frame(0), '⠋');
+        assert_ne!(spinner_frame(0), spinner_frame(1), "consecutive ticks differ");
+        assert_eq!(spinner_frame(0), spinner_frame(10), "wraps after 10 frames");
     }
 
     #[test]
