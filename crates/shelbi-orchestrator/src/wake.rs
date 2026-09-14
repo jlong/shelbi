@@ -1570,7 +1570,7 @@ fn spawn_remote_tui(
 ) -> Result<Child> {
     let endpoint = format!("unix://{}", socket_path.to_string_lossy());
     Command::new(&runner.command)
-        .args(&runner.flags)
+        .args(remote_tui_flags(&runner.flags))
         .arg("resume")
         .arg(thread_id)
         .args(["--remote", &endpoint])
@@ -1580,6 +1580,95 @@ fn spawn_remote_tui(
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(Error::Io)
+}
+
+/// Remote resume inherits permissions from the bridge-owned thread and rejects
+/// explicit overrides. Profiles are omitted because they can contain the same
+/// permission keys even when the profile flag itself looks harmless.
+fn remote_tui_flags(flags: &[String]) -> Vec<String> {
+    let mut filtered = Vec::with_capacity(flags.len());
+    let mut index = 0;
+    while index < flags.len() {
+        let flag = &flags[index];
+        if matches!(
+            flag.as_str(),
+            "--approve-for-me"
+                | "--dangerously-bypass-approvals-and-sandbox"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(
+            flag.as_str(),
+            "-a"
+                | "--ask-for-approval"
+                | "-s"
+                | "--sandbox"
+                | "--add-dir"
+                | "-p"
+                | "--profile"
+        ) {
+            index += 2;
+            continue;
+        }
+        if flag
+            .split_once('=')
+            .is_some_and(|(name, _)| {
+                matches!(
+                    name,
+                    "-a"
+                        | "--ask-for-approval"
+                        | "-s"
+                        | "--sandbox"
+                        | "--add-dir"
+                        | "-p"
+                        | "--profile"
+                )
+            })
+        {
+            index += 1;
+            continue;
+        }
+        if matches!(flag.as_str(), "-c" | "--config") {
+            if let Some(value) = flags.get(index + 1) {
+                if is_permission_config(value) {
+                    index += 2;
+                    continue;
+                }
+            }
+        }
+        if flag
+            .strip_prefix("-c=")
+            .or_else(|| flag.strip_prefix("--config="))
+            .is_some_and(is_permission_config)
+        {
+            index += 1;
+            continue;
+        }
+        filtered.push(flag.clone());
+        index += 1;
+    }
+    filtered
+}
+
+fn is_permission_config(value: &str) -> bool {
+    value.split_once('=').is_some_and(|(name, _)| {
+        matches!(
+            name.trim().split('.').next(),
+            Some(
+                "approval_policy"
+                    | "approvals_reviewer"
+                    | "sandbox_mode"
+                    | "permission_profile"
+                    | "default_permissions"
+                    | "permissions"
+                    | "network"
+                    | "sandbox_workspace_write"
+                    | "additional_writable_roots"
+                    | "workspace_roots"
+            )
+        )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4353,6 +4442,8 @@ mod tests {
                 "gpt-x".into(),
                 "--profile".into(),
                 "shelbi".into(),
+                "--ask-for-approval".into(),
+                "never".into(),
                 "-c".into(),
                 "approval_policy=never".into(),
                 "--sandbox".into(),
@@ -4374,6 +4465,8 @@ mod tests {
                 "gpt-x",
                 "--profile",
                 "shelbi",
+                "--ask-for-approval",
+                "never",
                 "-c",
                 "approval_policy=never",
                 "--sandbox",
@@ -4382,6 +4475,44 @@ mod tests {
                 "--listen",
                 "unix:///tmp/shelbi-runtime/app.sock",
             ]
+        );
+    }
+
+    #[test]
+    fn remote_tui_launch_omits_permission_overrides_but_keeps_other_flags() {
+        let flags = vec![
+            "--model".into(),
+            "gpt-x".into(),
+            "--ask-for-approval".into(),
+            "never".into(),
+            "--sandbox=workspace-write".into(),
+            "-a".into(),
+            "on-request".into(),
+            "-s=read-only".into(),
+            "--profile".into(),
+            "shelbi".into(),
+            "--add-dir=/tmp/shared".into(),
+            "-c".into(),
+            "approval_policy=never".into(),
+            "--config=sandbox_mode=danger-full-access".into(),
+            "-c=network.enabled=true".into(),
+            "--config".into(),
+            "permissions=[\"disk-full-read-access\"]".into(),
+            "-c=model_reasoning_effort=high".into(),
+            "--approve-for-me".into(),
+            "--dangerously-bypass-approvals-and-sandbox".into(),
+        ];
+
+        assert_eq!(
+            remote_tui_flags(&flags),
+            vec![
+                "--model",
+                "gpt-x",
+                "-c=model_reasoning_effort=high"
+            ]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
         );
     }
 
