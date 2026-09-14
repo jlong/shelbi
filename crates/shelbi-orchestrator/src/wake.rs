@@ -2616,11 +2616,14 @@ impl DurableQueue {
     }
 
     fn next_pending(&mut self) -> Option<usize> {
-        if self
-            .batches
-            .iter()
-            .any(|batch| matches!(batch.status, DeliveryStatus::InFlight { .. }))
-        {
+        // RPC acceptance is not application. Wait for refresh to observe the
+        // cursor advance before steering another batch into the same turn.
+        if self.batches.iter().any(|batch| {
+            matches!(
+                batch.status,
+                DeliveryStatus::InFlight { .. } | DeliveryStatus::Delivered { .. }
+            )
+        }) {
             return None;
         }
         let pending = self
@@ -3450,6 +3453,19 @@ mod tests {
             0,
         );
         assert_eq!(queue.next_pending(), Some(0));
+    }
+
+    #[test]
+    fn delivered_batch_blocks_following_delivery_until_cursor_advances() {
+        let mut queue = DurableQueue {
+            project: "demo".into(),
+            batches: VecDeque::from([batch("demo", 4, 42), batch("demo", 42, 84)]),
+        };
+        queue.batches[0].status = DeliveryStatus::Delivered {
+            thread_id: "thread-1".into(),
+        };
+
+        assert_eq!(queue.next_pending(), None);
     }
 
     #[test]

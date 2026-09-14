@@ -80,15 +80,10 @@ fn offline_quiet_chunks_wait_then_flush_fifo_when_action_arrives() {
     let mut delivered = Vec::new();
     while let Some(index) = queue.next_pending() {
         delivered.push(queue.batches[index].message_id.clone());
-        queue.batches[index].status = DeliveryStatus::Delivered {
-            thread_id: "thread-1".into(),
-        };
+        queue.batches.pop_front();
     }
     assert_eq!(delivered, expected, "action must release every chunk FIFO");
-    assert!(queue
-        .batches
-        .iter()
-        .all(|batch| { matches!(batch.status, DeliveryStatus::Delivered { .. }) }));
+    assert!(queue.batches.is_empty());
 
     let trailing_quiet = scan_text_batch(
         PROJECT,

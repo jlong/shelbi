@@ -446,7 +446,7 @@ fn stale_steer_rejection_without_notification_rehydrates_idle_and_flushes_oldest
 }
 
 #[test]
-fn nonsteerable_rejection_ignores_stale_completion_then_flushes_fifo() {
+fn nonsteerable_rejection_ignores_stale_completion_then_flushes_fifo_after_cursor_advance() {
     let _lock = crate::test_lock::acquire();
     let temp = tempfile::tempdir().unwrap();
     let _home = HomeGuard::install(temp.path());
@@ -649,15 +649,15 @@ fn nonsteerable_rejection_ignores_stale_completion_then_flushes_fifo() {
 
     first_completion_rx.recv().unwrap();
     bridge.poll_notifications();
+    bridge.queue.batches.pop_front();
     bridge.maybe_deliver_event().unwrap();
     assert_eq!(
-        bridge.queue.batches[1].status,
+        bridge.queue.batches[0].status,
         DeliveryStatus::Delivered {
             thread_id: THREAD_ID.into()
         }
     );
-    assert_eq!(bridge.queue.batches[0].message_id, oldest_id);
-    assert_eq!(bridge.queue.batches[1].message_id, newer_id);
+    assert_eq!(bridge.queue.batches[0].message_id, newer_id);
     release_tx.send(()).unwrap();
     server.join().unwrap();
 }
