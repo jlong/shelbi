@@ -4576,9 +4576,19 @@ mod tests {
     /// window boundaries, so only a handful of live attempts spend a log line.
     #[test]
     fn a_60s_outage_logs_fewer_than_ten_requests() {
-        let _g = crate::test_lock::LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::LOCK.lock().unwrap();
+        // Hermetic env. `SHELBI_ROOT` outranks `SHELBI_HOME` in root
+        // resolution (see `root::resolve_with`), so a value another test leaked
+        // — set it, then panicked before its teardown ran — would silently
+        // redirect this test's park state and request log to a shared path
+        // where lines from other tests accumulate. That is what made this
+        // assertion read "37 requests" under CI load. Clear `SHELBI_ROOT` and
+        // pin `SHELBI_HOME` to a fresh dir we own; both are restored on the way
+        // out. We hold the test lock throughout, and no test mutates these env
+        // vars without it, so the resolution stays stable for the whole run.
+        let prev_root = std::env::var("SHELBI_ROOT").ok();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::remove_var("SHELBI_ROOT");
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         set_test_park_side_effects(true);
@@ -4587,8 +4597,12 @@ mod tests {
         let store =
             GitHubStore::with_governed_runner("owner/repo", "unreach-60s", conn_error_runner(calls.clone()));
 
-        // A reader ticks every 5s across a 60s outage (13 ticks). Most short-
-        // circuit on the park; only window-boundary reads go live.
+        // A reader ticks every 5s across a 60s outage (13 ticks) on a fully
+        // injected clock (`set_test_now`) — no wall-clock read, no sleeping —
+        // so the outcome is deterministic regardless of machine load. Most
+        // ticks short-circuit on the escalating park (15s → 30s → 60s
+        // windows); only a read at a window boundary goes live. Boundaries fall
+        // at t=1000, 1015 and 1045, so exactly three live attempts are made.
         let mut t = 1_000i64;
         while t <= 1_060 {
             set_test_now(t);
@@ -4596,13 +4610,24 @@ mod tests {
             t += 5;
         }
 
+        // Assert the count from the store's own in-memory call counter, not the
+        // on-disk log: the counter is process-local to this store and cannot be
+        // perturbed by any other test's paths, so the check is hermetic even
+        // under a loaded, parallel run. `conn_error_runner` bumps it once per
+        // *live* `gh` attempt (a parked read never reaches the runner).
+        let live = *calls.lock().unwrap();
+        assert!(live < 10, "a 60s outage made {live} live attempts (must be < 10)");
+        assert!(live >= 1, "but the outage does make live attempts (got {live})");
+
+        // The request log records those same attempts, each as a failed
+        // connection attempt that spent no budget. Our `SHELBI_HOME` is fixed
+        // under the test lock, so the log is exactly what this store wrote — one
+        // line per live attempt, nothing leaked in from elsewhere.
         let log =
             std::fs::read_to_string(crate::shelbi_home().unwrap().join(crate::gh_requests::REQUESTS_LOG_FILE))
                 .unwrap_or_default();
         let logged = log.lines().filter(|l| !l.trim().is_empty()).count();
-        assert!(logged < 10, "a 60s outage logged {logged} requests (must be < 10)");
-        assert!(logged >= 1, "but the live attempts are recorded (got {logged})");
-        // Every logged line is a connection-failure attempt, not spent budget.
+        assert_eq!(logged, live, "every live attempt appends exactly one request-log line: {log}");
         assert!(
             log.lines().filter(|l| !l.trim().is_empty()).all(|l| l.contains("outcome=err:conn")),
             "every logged request during the outage is a failed connection attempt: {log}"
@@ -4610,7 +4635,13 @@ mod tests {
 
         set_test_park_side_effects(false);
         set_test_now(0);
-        std::env::remove_var("SHELBI_HOME");
+        match prev_home {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        if let Some(v) = prev_root {
+            std::env::set_var("SHELBI_ROOT", v);
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
