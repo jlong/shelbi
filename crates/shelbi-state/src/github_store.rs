@@ -1101,7 +1101,7 @@ impl IssueStore for GitHubStore {
             return Err(Error::Other(format!("issue `{id}` not found in {}", self.repo)));
         };
         let body_raw = gh.body.clone().unwrap_or_default();
-        let (mut prose, mut meta) = split_shelbi_meta(&body_raw);
+        let (mut prose, mut meta) = split_shelbi_meta_for_write(id, &body_raw)?;
         // The GitHub issue title and the shelbi body prose are stored natively;
         // branch / depends_on / prefers_machine / workflow live in the meta
         // block folded into the issue body. Accumulate a single PATCH.
@@ -1247,7 +1247,7 @@ impl IssueStore for GitHubStore {
             )));
         };
         let body_raw = gh.body.clone().unwrap_or_default();
-        let (prose, meta) = split_shelbi_meta(&body_raw);
+        let (prose, meta) = split_shelbi_meta_for_write(id, &body_raw)?;
         let feedback = crate::format_review_feedback_section(reason, date);
         let new_prose = format!("{}{}", prose, feedback);
         let body = build_body(&new_prose, &meta);
@@ -1545,6 +1545,64 @@ impl GitHubStore {
         parse_graphql_board_response(&out)
     }
 
+    /// Map a GraphQL issue node onto [`GhIssue`], fetching the remainder of its
+    /// labels when the board node's `labels(first: 10)` page was truncated. The
+    /// common (≤10-label) issue costs nothing extra — the branch is skipped — so
+    /// the per-tick board request count is unchanged; only the rare overflowing
+    /// issue pays the follow-up request(s). This is why the board fragments stay
+    /// at `first: 10` rather than widening to dodge the fetch.
+    fn gh_issue_hydrating_labels(&self, node: GhIssueNode) -> Result<GhIssue> {
+        let more = node.labels.page_info.has_next_page;
+        let after = node.labels.page_info.end_cursor.clone();
+        let number = node.number;
+        let mut gh = node.into_gh_issue();
+        if more {
+            gh.labels.extend(self.fetch_remaining_labels(number, after)?);
+        }
+        Ok(gh)
+    }
+
+    /// Page through one issue's labels past the first 10 via [`ISSUE_LABELS_QUERY`],
+    /// following the label connection's own cursor until `hasNextPage` is false.
+    /// `after` is the cursor the truncated board node reported. A `hasNextPage`
+    /// with a null cursor is the same malformed response the board pagination
+    /// refuses — fail rather than loop or silently drop labels.
+    fn fetch_remaining_labels(
+        &self,
+        number: i64,
+        mut after: Option<String>,
+    ) -> Result<Vec<GhLabel>> {
+        let (owner, name) = self.owner_and_name()?;
+        let mut out: Vec<GhLabel> = Vec::new();
+        while let Some(cursor) = after {
+            let query_arg = format!("query={ISSUE_LABELS_QUERY}");
+            let owner_arg = format!("owner={owner}");
+            let name_arg = format!("name={name}");
+            // `number` is an `Int!` (typed `-F`); the rest are `String` scalars.
+            let number_arg = format!("number={number}");
+            let after_arg = format!("after={cursor}");
+            let args: Vec<&str> = vec![
+                "api", "graphql", "-f", &query_arg, "-f", &owner_arg, "-f", &name_arg,
+                "-F", &number_arg, "-f", &after_arg,
+            ];
+            let out_text = (self.graphql)(&args)?;
+            let conn = parse_issue_labels_response(&out_text)?;
+            out.extend(conn.nodes);
+            after = match (conn.page_info.has_next_page, conn.page_info.end_cursor) {
+                (true, Some(next)) => Some(next),
+                (false, _) => None,
+                (true, None) => {
+                    return Err(Error::Other(format!(
+                        "GitHub GraphQL label read for issue #{number} in {} reported \
+                         another page but no endCursor to advance on",
+                        self.repo
+                    )));
+                }
+            };
+        }
+        Ok(out)
+    }
+
     /// Drive `query` across every page, following `pageInfo.endCursor`, and
     /// collect the issue nodes (mapped onto the REST [`GhIssue`] shape so the one
     /// existing label/metadata mapping serves both backends). The token budget
@@ -1565,13 +1623,29 @@ impl GitHubStore {
         loop {
             let page = self.graphql_request(query, after.as_deref(), since_str.as_deref())?;
             budget = page.rate_limit;
-            issues.extend(page.connection.nodes.into_iter().map(GhIssueNode::into_gh_issue));
+            for node in page.connection.nodes {
+                issues.push(self.gh_issue_hydrating_labels(node)?);
+            }
 
-            match page.connection.page_info.end_cursor {
-                Some(cursor) if page.connection.page_info.has_next_page => after = Some(cursor),
-                // No next page — or `hasNextPage` with no cursor to advance on,
-                // which we stop on rather than loop forever.
-                _ => break,
+            match (
+                page.connection.page_info.has_next_page,
+                page.connection.page_info.end_cursor,
+            ) {
+                (true, Some(cursor)) => after = Some(cursor),
+                (false, _) => break,
+                // `hasNextPage: true` with a null `endCursor` is a malformed
+                // response: there is no cursor to advance on, so silently
+                // stopping would publish a *short* board as if it were complete.
+                // Fail the read instead — `refresh_board` routes this to the REST
+                // open list rather than a truncated GraphQL board.
+                (true, None) => {
+                    return Err(Error::Other(format!(
+                        "GitHub GraphQL board read for {} reported another page \
+                         (hasNextPage) but no endCursor to advance on; refusing to \
+                         publish a partial board",
+                        self.repo
+                    )));
+                }
             }
         }
         Ok(GraphQlBoardPage {
@@ -1601,7 +1675,7 @@ impl GitHubStore {
             self.forget_issue(number);
             return Ok(None);
         };
-        let mut tf = node.into_gh_issue().into_issue_file();
+        let mut tf = self.gh_issue_hydrating_labels(node)?.into_issue_file();
         // Fold the local assignment overlay so a caller reads the owning
         // workspace even though the tracker stores no assignment.
         tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
@@ -1647,7 +1721,7 @@ impl GitHubStore {
         let mut out = Vec::with_capacity(numbers.len());
         for chunk in numbers.chunks(CHUNK) {
             for (node, number) in self.graphql_issues_by_number(chunk)? {
-                let mut tf = node.into_gh_issue().into_issue_file();
+                let mut tf = self.gh_issue_hydrating_labels(node)?.into_issue_file();
                 tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
                 out.push((tf, number));
             }
@@ -1815,17 +1889,27 @@ impl GitHubStore {
     /// is needed.
     fn graphql_closed_page(&self, after: Option<&str>) -> Result<GraphQlClosedPage> {
         let page = self.graphql_request(BOARD_CLOSED_QUERY, after, None)?;
-        let next_cursor = if page.connection.page_info.has_next_page {
-            page.connection.page_info.end_cursor
-        } else {
-            None
+        let next_cursor = match (
+            page.connection.page_info.has_next_page,
+            page.connection.page_info.end_cursor,
+        ) {
+            (true, Some(cursor)) => Some(cursor),
+            (false, _) => None,
+            // A null cursor with `hasNextPage: true` is malformed — quietly
+            // returning `None` here would stop the "load more" history a page
+            // short. Fail the read (the same rule the board pagination applies).
+            (true, None) => {
+                return Err(Error::Other(format!(
+                    "GitHub GraphQL closed-history read for {} reported another page \
+                     (hasNextPage) but no endCursor to advance on",
+                    self.repo
+                )));
+            }
         };
-        let issues: Vec<GhIssue> = page
-            .connection
-            .nodes
-            .into_iter()
-            .map(GhIssueNode::into_gh_issue)
-            .collect();
+        let mut issues: Vec<GhIssue> = Vec::with_capacity(page.connection.nodes.len());
+        for node in page.connection.nodes {
+            issues.push(self.gh_issue_hydrating_labels(node)?);
+        }
         Ok(GraphQlClosedPage {
             issues,
             next_cursor,
@@ -2000,7 +2084,7 @@ impl GitHubStore {
             return Err(Error::Other(format!("issue `{id}` not found in {}", self.repo)));
         };
         let body_raw = gh.body.clone().unwrap_or_default();
-        let (prose, mut meta) = split_shelbi_meta(&body_raw);
+        let (prose, mut meta) = split_shelbi_meta_for_write(id, &body_raw)?;
         meta.priority = Some(priority);
         let body = build_body(&prose, &meta);
         self.api_send(
@@ -2635,7 +2719,7 @@ query BoardIndex($owner: String!, $name: String!, $after: String) {
       pageInfo { hasNextPage endCursor }
       nodes {
         number title state stateReason createdAt updatedAt body
-        labels(first: 10) { nodes { name } }
+        labels(first: 10) { pageInfo { hasNextPage endCursor } nodes { name } }
       }
     }
   }
@@ -2656,7 +2740,7 @@ query BoardIndexDelta($owner: String!, $name: String!, $after: String, $since: D
       pageInfo { hasNextPage endCursor }
       nodes {
         number title state stateReason createdAt updatedAt body
-        labels(first: 10) { nodes { name } }
+        labels(first: 10) { pageInfo { hasNextPage endCursor } nodes { name } }
       }
     }
   }
@@ -2676,7 +2760,7 @@ query BoardClosed($owner: String!, $name: String!, $after: String) {
       pageInfo { hasNextPage endCursor }
       nodes {
         number title state stateReason createdAt updatedAt body
-        labels(first: 10) { nodes { name } }
+        labels(first: 10) { pageInfo { hasNextPage endCursor } nodes { name } }
       }
     }
   }
@@ -2702,7 +2786,7 @@ query Issue($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       number title state stateReason createdAt updatedAt body
-      labels(first: 10) { nodes { name } }
+      labels(first: 10) { pageInfo { hasNextPage endCursor } nodes { name } }
     }
   }
 }
@@ -2730,7 +2814,8 @@ fn build_issues_by_number_query(numbers: &[i64]) -> String {
     for (k, n) in numbers.iter().enumerate() {
         aliases.push_str(&format!(
             "    i{k}: issue(number: {n}) {{ number title state stateReason createdAt \
-             updatedAt body labels(first: 10) {{ nodes {{ name }} }} }}\n"
+             updatedAt body labels(first: 10) {{ pageInfo {{ hasNextPage endCursor }} \
+             nodes {{ name }} }} }}\n"
         ));
     }
     format!(
@@ -2739,6 +2824,26 @@ fn build_issues_by_number_query(numbers: &[i64]) -> String {
          repository(owner: $owner, name: $name) {{\n{aliases}  }}\n}}\n"
     )
 }
+
+/// The label-overflow follow-up (one issue at a time). The board fragments cap
+/// labels at `first: 10` to keep the per-tick board cost flat (raising it to 100
+/// would multiply the board's node count by ~10 on every project); the rare issue
+/// that overflows pays one extra request per label page here instead. `after` is
+/// the label connection's cursor from the truncated board node, then each page's
+/// own cursor. One point per request.
+const ISSUE_LABELS_QUERY: &str = r#"
+query IssueLabels($owner: String!, $name: String!, $number: Int!, $after: String) {
+  rateLimit { remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      labels(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { name }
+      }
+    }
+  }
+}
+"#;
 
 /// `{ "data": { "rateLimit": …, "repository": { "issue": <node>|null } } }`.
 #[derive(Debug, Deserialize)]
@@ -2784,6 +2889,53 @@ fn parse_single_issue_response(text: &str) -> Result<Option<GhIssueNode>> {
         )
     })?;
     Ok(repository.issue)
+}
+
+/// `{ "data": { "rateLimit": …, "repository": { "issue": { "labels": <conn> } } } }`
+/// — the label-overflow follow-up response.
+#[derive(Debug, Deserialize)]
+struct IssueLabelsResponse {
+    #[serde(default)]
+    data: Option<IssueLabelsData>,
+    #[serde(default)]
+    errors: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueLabelsData {
+    repository: Option<IssueLabelsRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueLabelsRepo {
+    #[serde(default)]
+    issue: Option<IssueLabelsIssue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueLabelsIssue {
+    labels: GhLabelConnection,
+}
+
+/// Parse one page of the [`ISSUE_LABELS_QUERY`] follow-up into its label
+/// connection. A GraphQL `errors` array or a missing issue is a hard error, as on
+/// every other GraphQL read.
+fn parse_issue_labels_response(text: &str) -> Result<GhLabelConnection> {
+    let resp: IssueLabelsResponse = serde_json::from_str(text.trim())
+        .map_err(|e| Error::Other(format!("gh graphql returned unparseable JSON: {e}")))?;
+    if let Some(errors) = resp.errors.as_ref().filter(|e| !e.is_empty()) {
+        return Err(Error::Other(format!(
+            "GitHub GraphQL returned errors on the issue-labels read: {}",
+            summarize_graphql_errors(errors)
+        )));
+    }
+    resp.data
+        .and_then(|d| d.repository)
+        .and_then(|r| r.issue)
+        .map(|i| i.labels)
+        .ok_or_else(|| {
+            Error::Other("gh graphql issue-labels response has no issue".into())
+        })
 }
 
 /// `{ "data": { "rateLimit": …, "repository": { "i0": <node>|null, … } } }`.
@@ -2936,6 +3088,48 @@ pub fn clear_issue_caches_for_test() {
     }
 }
 
+/// Issues whose malformed metadata block has already been warned about, keyed by
+/// `(number, parse message)`. Process-global (the daemon is one process) so the
+/// board re-read every ~30s warns once per distinct break, not per tick —
+/// mirroring [`GRAPHQL_FALLBACK_REPOS`] here and `PARSE_WARN_CACHE` in the file
+/// backend. Keyed on the message too so a block that is broken, fixed, then
+/// broken *differently* warns each time.
+static MALFORMED_META_WARNED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<(i64, String)>>,
+> = std::sync::OnceLock::new();
+
+fn malformed_meta_warned() -> &'static std::sync::Mutex<std::collections::HashSet<(i64, String)>> {
+    MALFORMED_META_WARNED.get_or_init(Default::default)
+}
+
+/// True the first time `(number, detail)` is seen this process — the caller then
+/// warns. A repeat of the exact same break returns `false` (already warned).
+fn should_warn_meta(number: i64, detail: &str) -> bool {
+    malformed_meta_warned()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((number, detail.to_string()))
+}
+
+/// Forget every warning recorded for `number` — called when the issue next parses
+/// cleanly, so a later regression on the same issue warns again.
+fn forget_meta_warn(number: i64) {
+    malformed_meta_warned()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(n, _)| *n != number);
+}
+
+/// Clear the malformed-metadata warn dedupe set so a test's captured warnings
+/// can't be suppressed by another test's (the set is process-global). Test-only.
+#[cfg(test)]
+fn clear_meta_warn_cache_for_test() {
+    malformed_meta_warned()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
 /// One page of closed history from [`GitHubStore::graphql_closed_page`]: the
 /// mapped issue nodes, the cursor for the next page (`None` on the last), and the
 /// token budget the read reported.
@@ -2984,11 +3178,11 @@ struct GhIssuesConnection {
     nodes: Vec<GhIssueNode>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct GhPageInfo {
-    #[serde(rename = "hasNextPage")]
+    #[serde(rename = "hasNextPage", default)]
     has_next_page: bool,
-    #[serde(rename = "endCursor")]
+    #[serde(rename = "endCursor", default)]
     end_cursor: Option<String>,
 }
 
@@ -3014,6 +3208,13 @@ struct GhIssueNode {
 #[derive(Debug, Deserialize)]
 struct GhLabelConnection {
     nodes: Vec<GhLabel>,
+    /// The label page's cursor. `first: 10` on the board fragments means an issue
+    /// with more than ten labels reports `hasNextPage: true` here, and
+    /// [`GitHubStore::gh_issue_hydrating_labels`] fetches the remainder so the
+    /// `shelbi:id/*` / `shelbi:status/*` anchors are seen regardless of position.
+    /// Defaulted so a fixture (or a fragment without `pageInfo`) still parses.
+    #[serde(rename = "pageInfo", default)]
+    page_info: GhPageInfo,
 }
 
 impl GhIssueNode {
@@ -3150,6 +3351,43 @@ impl GhIssue {
             .unwrap_or_else(|| self.number.to_string())
     }
 
+    /// Split this issue's body for a *read*, warning once (deduped) on a
+    /// malformed hand-edited block and falling back to empty metadata so one
+    /// broken issue never blanks the board or breaks a refresh tick (decision 6,
+    /// 2026-09-14). The daemon re-reads the whole board every ~30s, so the
+    /// warning is deduped on `(number, parse message)`: the same break logs once,
+    /// a *different* break on the same issue logs again, and a clean parse forgets
+    /// the issue so a later regression warns afresh. A body with no block at all
+    /// is ordinary prose — no warning.
+    fn split_meta_or_warn(&self) -> (String, ShelbiMeta) {
+        let body = self.body.clone().unwrap_or_default();
+        match split_shelbi_meta(&body) {
+            (prose, Ok(meta)) => {
+                forget_meta_warn(self.number);
+                (prose, meta)
+            }
+            (prose, Err(detail)) => {
+                if should_warn_meta(self.number, &detail) {
+                    let id = self
+                        .labels
+                        .iter()
+                        .find_map(|l| l.name.strip_prefix(ID_LABEL_PREFIX))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| self.number.to_string());
+                    tracing::warn!(
+                        issue = %id,
+                        number = self.number,
+                        error = %detail,
+                        "GitHub issue has a malformed shelbi metadata block; \
+                         rendering it with empty metadata — fix the fenced block \
+                         on github.com",
+                    );
+                }
+                (prose, ShelbiMeta::default())
+            }
+        }
+    }
+
     /// The `shelbi:status/<id>` label value, if any.
     fn status_label(&self) -> Option<&str> {
         self.labels
@@ -3173,16 +3411,14 @@ impl GhIssue {
     /// requested id (and drop a stale cache/index mapping that no longer names
     /// it).
     fn resolved_id(&self) -> String {
-        let body = self.body.clone().unwrap_or_default();
-        let (_, meta) = split_shelbi_meta(&body);
+        let (_, meta) = self.split_meta_or_warn();
         self.resolve_id(&meta)
     }
 
     /// The workflow this issue runs under, parsed from its metadata block, or
     /// the canonical default when unset — the value a [`StatusMove`] carries.
     fn workflow_name(&self) -> String {
-        let body = self.body.clone().unwrap_or_default();
-        split_shelbi_meta(&body)
+        self.split_meta_or_warn()
             .1
             .workflow
             .unwrap_or_else(|| DEFAULT_WORKFLOW_NAME.to_string())
@@ -3221,8 +3457,7 @@ impl GhIssue {
     /// Full mapping onto an [`IssueFile`]: native fields plus the parsed fenced
     /// metadata block, with that block stripped from the body prose.
     fn into_issue_file(self) -> IssueFile {
-        let body_raw = self.body.clone().unwrap_or_default();
-        let (prose, meta) = split_shelbi_meta(&body_raw);
+        let (prose, meta) = self.split_meta_or_warn();
         let column = self.column();
         let id = self.resolve_id(&meta);
 
@@ -3459,18 +3694,32 @@ struct ShelbiMeta {
 }
 
 /// Split an issue body into `(prose, metadata)`: the fenced shelbi block is
-/// removed from the returned prose and parsed as YAML into [`ShelbiMeta`]. A
-/// body with no block yields the whole body as prose and a default (empty)
-/// metadata. A malformed block is treated as absent — read must never fail on a
-/// hand-edited body — so its fields simply default.
-fn split_shelbi_meta(body: &str) -> (String, ShelbiMeta) {
+/// removed from the returned prose and parsed as YAML into [`ShelbiMeta`]. The
+/// metadata half is a `Result` so the two callers can diverge on a broken
+/// hand-edit (decision 6, 2026-09-14): a body with **no** `<!-- shelbi:begin -->`
+/// marker at all is ordinary plain prose and yields `Ok(default)`; a body whose
+/// block is present but unrecoverable — unparseable inner YAML, or a marker with
+/// no matching `<!-- shelbi:end -->` — yields `Err(<parse detail>)`. Write paths
+/// `?` that `Err` into [`Error::MalformedIssueMetadata`] rather than clobbering
+/// the human's edit with defaults; read paths warn once and fall back to
+/// [`ShelbiMeta::default`]. Prose is always returned intact (the whole body when
+/// the block is unterminated), so a read still renders the card.
+fn split_shelbi_meta(body: &str) -> (String, std::result::Result<ShelbiMeta, String>) {
     let Some(begin) = body.find(META_BEGIN) else {
-        return (body.trim().to_string(), ShelbiMeta::default());
+        // No block at all: an ordinary plain-prose issue, never a failure.
+        return (body.trim().to_string(), Ok(ShelbiMeta::default()));
     };
     let after_begin = begin + META_BEGIN.len();
     let Some(end_rel) = body[after_begin..].find(META_END) else {
-        // Unterminated marker: leave the body untouched, no metadata.
-        return (body.trim().to_string(), ShelbiMeta::default());
+        // Unterminated marker: leave the body untouched, but report the failure
+        // so a write refuses rather than dropping the orphan begin marker into
+        // the prose and emitting a second block after it.
+        return (
+            body.trim().to_string(),
+            Err(format!(
+                "`{META_BEGIN}` marker with no matching `{META_END}`"
+            )),
+        );
     };
     let inner = &body[after_begin..after_begin + end_rel];
     let after_end = after_begin + end_rel + META_END.len();
@@ -3481,20 +3730,34 @@ fn split_shelbi_meta(body: &str) -> (String, ShelbiMeta) {
     let prose = format!("{}{}", &body[..begin], &body[after_end..]);
     let prose = prose.trim().to_string();
 
-    let meta = parse_meta_yaml(inner).unwrap_or_default();
-    (prose, meta)
+    (prose, parse_meta_yaml(inner))
+}
+
+/// Split a body a write path is about to rewrite, refusing an unparseable block
+/// with a typed [`Error::MalformedIssueMetadata`] rather than dropping the
+/// human's hand-edit and PATCHing default metadata over it. `set_fields`,
+/// `reject_review` and `rewrite_priority` all read-modify-write the fenced block,
+/// so they route through here; the id names the offending issue in the error.
+fn split_shelbi_meta_for_write(id: &str, body: &str) -> Result<(String, ShelbiMeta)> {
+    let (prose, meta) = split_shelbi_meta(body);
+    let meta = meta.map_err(|detail| Error::MalformedIssueMetadata {
+        id: id.to_string(),
+        detail,
+    })?;
+    Ok((prose, meta))
 }
 
 /// Parse the inner text of a fenced shelbi block into [`ShelbiMeta`]. The inner
 /// text is a fenced ```` ```yaml ```` code block; strip the fence lines and
-/// deserialize the YAML. Returns `None` on any parse failure so a malformed
-/// block reads as absent metadata rather than erroring the whole board.
-fn parse_meta_yaml(inner: &str) -> Option<ShelbiMeta> {
+/// deserialize the YAML. Returns `Err(<serde_yaml message>)` on a parse failure
+/// so the caller can surface the reason — a write refuses, a read warns and
+/// falls back to defaults. An empty block is a clean default, not a failure.
+fn parse_meta_yaml(inner: &str) -> std::result::Result<ShelbiMeta, String> {
     let yaml = strip_code_fence(inner);
     if yaml.trim().is_empty() {
-        return Some(ShelbiMeta::default());
+        return Ok(ShelbiMeta::default());
     }
-    serde_yaml::from_str(&yaml).ok()
+    serde_yaml::from_str(&yaml).map_err(|e| e.to_string())
 }
 
 /// Strip a leading ```` ```yaml ```` / ```` ``` ```` fence and its closing
@@ -3872,6 +4135,7 @@ mod tests {
 
     #[test]
     fn unreachable_tracker_surfaces_a_command_error_not_stale_data() {
+        let _home = HomeGuard::new("unreachable-tracker");
         let store = GitHubStore::with_runner("owner/repo", |args| {
             Err(Error::Command {
                 cmd: format!("gh {}", args.join(" ")),
@@ -3888,25 +4152,45 @@ mod tests {
 
     #[test]
     fn body_without_a_meta_block_is_all_prose() {
+        // No `<!-- shelbi:begin -->` marker at all: ordinary plain prose, a clean
+        // `Ok(default)` — never a failure, never a warning.
         let (prose, meta) = split_shelbi_meta("Just a plain description.\n");
         assert_eq!(prose, "Just a plain description.");
+        let meta = meta.expect("plain prose is not a parse failure");
         assert!(meta.workflow.is_none());
         assert_eq!(meta.priority, None);
     }
 
     #[test]
     fn malformed_meta_block_reads_as_absent_metadata() {
-        // An unterminated block leaves the body intact and yields no metadata.
-        let body = "Prose\n<!-- shelbi:begin -->\n```yaml\nworkflow: app\n";
-        let (prose, meta) = split_shelbi_meta(body);
+        // Under decision 6 an unrecoverable block is no longer silently absent:
+        // the prose is returned intact (so a read still renders the card), but the
+        // metadata half is an `Err` a write refuses on. Both unrecoverable shapes
+        // qualify — unparseable inner YAML, and an unterminated `begin` marker.
+        let unterminated = "Prose\n<!-- shelbi:begin -->\n```yaml\nworkflow: app\n";
+        let (prose, meta) = split_shelbi_meta(unterminated);
         assert!(prose.contains("Prose"));
-        assert!(meta.workflow.is_none());
+        let err = meta.expect_err("an unterminated marker must surface a parse error");
+        assert!(
+            err.contains(META_END),
+            "the detail names the missing end marker: {err}"
+        );
+
+        let bad_yaml =
+            "Prose\n\n<!-- shelbi:begin -->\n```yaml\n: not valid: : :\n```\n<!-- shelbi:end -->";
+        let (prose, meta) = split_shelbi_meta(bad_yaml);
+        assert!(prose.contains("Prose"));
+        assert!(
+            meta.is_err(),
+            "unparseable inner YAML must surface a parse error"
+        );
     }
 
     #[test]
     fn meta_block_carries_unknown_keys_into_params() {
         let body = "P\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: app\nfeature: auth-rewrite\n```\n<!-- shelbi:end -->";
         let (_prose, meta) = split_shelbi_meta(body);
+        let meta = meta.expect("a well-formed block parses");
         assert_eq!(meta.workflow.as_deref(), Some("app"));
         assert_eq!(
             meta.params.get("feature").and_then(|v| v.as_str()),
@@ -3916,6 +4200,7 @@ mod tests {
 
     #[test]
     fn poll_changes_watermark_surfaces_later_edits_and_comments() {
+        let _home = HomeGuard::new("poll-changes-watermark");
         // Issue updated_at 2026-08-02; a first poll from start reports nothing
         // and sets the high-water mark there.
         let issues = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
@@ -3954,6 +4239,7 @@ mod tests {
 
     #[test]
     fn poll_changes_scopes_the_query_with_the_since_watermark() {
+        let _home = HomeGuard::new("poll-changes-scopes");
         // A recording runner captures every `gh` call so we can assert the
         // `since=` watermark is (a) absent on a cold first poll and (b) present
         // on both the issues query and the per-touched-issue comments query on a
@@ -4198,6 +4484,7 @@ mod tests {
 
     #[test]
     fn list_under_the_primary_rate_limit_fails_fast_without_retrying() {
+        let _home = HomeGuard::new("list-primary-rate-limit");
         // A read (`GET`) under the exhausted primary limit — `API rate limit
         // exceeded`, which `gh` reports with no Retry-After — must return Err
         // after exactly one attempt and never sleep, so a board read is never
@@ -4541,6 +4828,75 @@ mod tests {
         assert!(patch.contains("title=New title"));
         assert!(patch.contains("Fresh prose."));
         assert!(patch.contains("workflow: app"));
+    }
+
+    // --- malformed metadata: write paths refuse (decision 6, 2026-09-14) ------
+
+    /// An issue whose fenced block holds unparseable YAML.
+    const MALFORMED_YAML_ISSUE: &str = r#"{"number":7,"title":"T","body":"Prose.\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: [oops\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+
+    /// An issue with a `begin` marker and no matching `end` marker.
+    const UNTERMINATED_MARKER_ISSUE: &str = r#"{"number":7,"title":"T","body":"Prose.\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: app\n","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+
+    /// Assert a write closure refuses a `body`-carrying malformed issue with the
+    /// typed [`Error::MalformedIssueMetadata`] variant — naming the issue and the
+    /// parse failure — and issues no PATCH, so the human's hand-edit is preserved.
+    fn assert_write_refuses(issue: &'static str, run: impl Fn(&GitHubStore) -> Error) {
+        let _home = HomeGuard::new("malformed-write");
+        let (store, calls) = recording_store(issue, issue, "", "{}");
+        let err = run(&store);
+        match &err {
+            Error::MalformedIssueMetadata { id, detail } => {
+                assert_eq!(id, "t", "the error names the issue id");
+                assert!(!detail.is_empty(), "the error carries the parse detail");
+            }
+            other => panic!("expected Error::MalformedIssueMetadata, got {other:?}"),
+        }
+        // The rendered message names the issue and points at the block.
+        let msg = err.to_string();
+        assert!(msg.contains("t"), "message names the issue: {msg}");
+        assert!(msg.contains("malformed"), "message describes the failure: {msg}");
+        // No PATCH to the issue — the body on GitHub is never rewritten.
+        let calls = calls.lock().unwrap();
+        assert!(
+            call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/7"]).is_none(),
+            "a refused write must issue no PATCH: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn set_fields_refuses_a_malformed_meta_block() {
+        for issue in [MALFORMED_YAML_ISSUE, UNTERMINATED_MARKER_ISSUE] {
+            assert_write_refuses(issue, |store| {
+                store
+                    .set_fields(
+                        "t",
+                        IssueFields {
+                            branch: Some(Some("jlong/t".into())),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap_err()
+            });
+        }
+    }
+
+    #[test]
+    fn reject_review_refuses_a_malformed_meta_block() {
+        for issue in [MALFORMED_YAML_ISSUE, UNTERMINATED_MARKER_ISSUE] {
+            assert_write_refuses(issue, |store| {
+                store
+                    .reject_review("t", &Column::todo(), "needs work", "2026-09-14")
+                    .unwrap_err()
+            });
+        }
+    }
+
+    #[test]
+    fn rewrite_priority_refuses_a_malformed_meta_block() {
+        for issue in [MALFORMED_YAML_ISSUE, UNTERMINATED_MARKER_ISSUE] {
+            assert_write_refuses(issue, |store| store.rewrite_priority("t", 3).unwrap_err());
+        }
     }
 
     #[test]
@@ -5271,6 +5627,7 @@ mod tests {
         let body = build_body("Human prose.", &meta);
         let (prose, parsed) = split_shelbi_meta(&body);
         assert_eq!(prose, "Human prose.");
+        let parsed = parsed.expect("a body built from build_body round-trips cleanly");
         assert_eq!(parsed.workflow.as_deref(), Some("app"));
         assert_eq!(parsed.branch.as_deref(), Some("jlong/x"));
         assert_eq!(parsed.priority, Some(4));
@@ -5598,6 +5955,239 @@ mod tests {
         assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
         // The budget from the last page wins.
         assert_eq!(read.remaining, Some(4989));
+    }
+
+    // --- malformed metadata: reads render loudly (decision 6, 2026-09-14) -----
+
+    /// A scoped `tracing` capture over `f`, returning everything it logged.
+    /// Reproduced from `event_log.rs`'s test helper (private to that module) so
+    /// the one-line malformed-block warning is assertable without a new
+    /// dependency — `tracing-subscriber` is already a dev-dependency.
+    fn capture_tracing<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        (out, logs)
+    }
+
+    #[test]
+    fn board_read_renders_a_malformed_issue_with_empty_metadata() {
+        let _iso = IsolatedHome::new("malformed-board");
+        // One open node whose fenced block holds unparseable YAML, with valid
+        // id/status labels. The read must succeed and the card must keep its
+        // title, number, column and id — only its metadata fields go empty.
+        let json = r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T09:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+{"number":71,"title":"Broken board","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-02T00:00:00Z","body":"Prose.\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: [oops\n```\n<!-- shelbi:end -->","labels":{"nodes":[{"name":"shelbi:id/brk-board"},{"name":"shelbi:status/in-progress"}]}}
+]}}}}"#;
+        let store = graphql_store(json);
+        let read = store.refresh_board(None, &[]).unwrap();
+        assert_eq!(read.board.len(), 1);
+        let card = &read.board[0];
+        assert_eq!(card.task.id, "brk-board");
+        assert_eq!(card.task.title, "Broken board");
+        assert_eq!(card.task.column, Column::in_progress());
+        // Metadata fields are empty — the broken block contributed nothing.
+        assert_eq!(card.task.priority, 0);
+        assert!(card.task.workflow.is_none());
+        assert!(card.task.branch.is_none());
+    }
+
+    #[test]
+    fn single_issue_read_renders_a_malformed_issue_with_empty_metadata() {
+        let _iso = IsolatedHome::new("malformed-get");
+        let issue = r#"{"number":72,"title":"Broken get","body":"Prose.\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: [oops\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/brk-get"},{"name":"shelbi:status/review"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let store = store_with(issue, "[]");
+        let tf = store.get("brk-get").unwrap().expect("issue renders");
+        assert_eq!(tf.task.id, "brk-get");
+        assert_eq!(tf.task.title, "Broken get");
+        assert_eq!(tf.task.column, Column::review());
+        assert_eq!(tf.task.priority, 0);
+        assert!(tf.task.workflow.is_none());
+    }
+
+    #[test]
+    fn closed_history_read_renders_a_malformed_issue_with_empty_metadata() {
+        let _iso = IsolatedHome::new("malformed-closed");
+        let json = r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T09:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+{"number":73,"title":"Broken closed","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-09-07T00:00:00Z","body":"Prose.\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: [oops\n```\n<!-- shelbi:end -->","labels":{"nodes":[{"name":"shelbi:id/brk-closed"},{"name":"shelbi:status/done"}]}}
+]}}}}"#;
+        let store = graphql_store(json);
+        let page = store.closed_page(None).unwrap();
+        assert_eq!(page.issues.len(), 1);
+        assert_eq!(page.issues[0].task.id, "brk-closed");
+        assert_eq!(page.issues[0].task.title, "Broken closed");
+        assert_eq!(page.issues[0].task.column, Column::done());
+        assert_eq!(page.issues[0].task.priority, 0);
+    }
+
+    #[test]
+    fn malformed_block_warns_once_per_distinct_failure() {
+        let _iso = IsolatedHome::new("malformed-warn");
+        clear_meta_warn_cache_for_test();
+
+        // Reading the *same* unterminated-marker body twice warns exactly once —
+        // the daemon re-reads the whole board every ~30s and must not flood.
+        let unterminated = r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T09:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+{"number":55,"title":"Broken","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-02T00:00:00Z","body":"Prose.\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: app\n","labels":{"nodes":[{"name":"shelbi:id/brk"},{"name":"shelbi:status/todo"}]}}
+]}}}}"#;
+        let store = graphql_store(unterminated);
+        let (_, logs) = capture_tracing(|| {
+            store.refresh_board(None, &[]).unwrap();
+            store.refresh_board(None, &[]).unwrap();
+        });
+        let count = logs.matches("malformed shelbi metadata block").count();
+        assert_eq!(count, 1, "the same body twice warns once: {logs}");
+        assert!(logs.contains("brk"), "the warning names the issue: {logs}");
+        assert!(
+            logs.contains(META_END),
+            "the warning names the parse failure: {logs}"
+        );
+
+        // The same issue (number 55) changed to a *different* malformed body — an
+        // unparseable-YAML block — warns again, so the user sees the new break.
+        let bad_yaml = r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T09:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+{"number":55,"title":"Broken","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-02T00:00:00Z","body":"Prose.\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: [oops\n```\n<!-- shelbi:end -->","labels":{"nodes":[{"name":"shelbi:id/brk"},{"name":"shelbi:status/todo"}]}}
+]}}}}"#;
+        let store = graphql_store(bad_yaml);
+        let (_, logs2) = capture_tracing(|| {
+            store.refresh_board(None, &[]).unwrap();
+        });
+        let count2 = logs2.matches("malformed shelbi metadata block").count();
+        assert_eq!(count2, 1, "a different break on the same issue warns again: {logs2}");
+    }
+
+    // --- label overflow: complete a truncated label page (F9) -----------------
+
+    #[test]
+    fn board_read_completes_a_truncated_label_page() {
+        let _iso = IsolatedHome::new("label-overflow");
+        // The board node reports 10 non-shelbi labels and `hasNextPage: true` on
+        // its label connection — the `shelbi:id/*` and `shelbi:status/*` anchors
+        // sit past position ten. The follow-up `IssueLabels` query returns them,
+        // so the card renders under its id in its column, not its bare number.
+        let board = r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T09:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+{"number":88,"title":"Many labels","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-02T00:00:00Z","body":"","labels":{"pageInfo":{"hasNextPage":true,"endCursor":"LC1"},"nodes":[{"name":"a1"},{"name":"a2"},{"name":"a3"},{"name":"a4"},{"name":"a5"},{"name":"a6"},{"name":"a7"},{"name":"a8"},{"name":"a9"},{"name":"a10"}]}}
+]}}}}"#;
+        let label_page = r#"{"data":{"rateLimit":{"remaining":4998},"repository":{"issue":{"labels":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"name":"shelbi:id/over"},{"name":"shelbi:status/in-progress"},{"name":"a11"}]}}}}}"#;
+        let saw_followup = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = saw_followup.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            let joined = args.join(" ");
+            if joined.contains("IssueLabels") {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                // The follow-up must target the truncated issue on its cursor.
+                assert!(joined.contains("number=88"), "labels for #88: {joined}");
+                assert!(joined.contains("after=LC1"), "on the label cursor: {joined}");
+                Ok(label_page.to_string())
+            } else {
+                Ok(board.to_string())
+            }
+        });
+
+        let read = store.refresh_board(None, &[]).unwrap();
+        assert!(
+            saw_followup.load(std::sync::atomic::Ordering::SeqCst),
+            "the label-overflow follow-up query must fire"
+        );
+        assert_eq!(read.board.len(), 1);
+        let card = &read.board[0];
+        assert_eq!(card.task.id, "over", "rendered under its shelbi id, not #88");
+        assert_eq!(card.task.column, Column::in_progress());
+    }
+
+    #[test]
+    fn board_read_issues_no_label_followup_when_labels_fit() {
+        let _iso = IsolatedHome::new("labels-fit");
+        // Ten-or-fewer labels: `hasNextPage: false`, so the common case pays no
+        // extra request — the runner is called exactly once (the board page).
+        let json = r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T09:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+{"number":91,"title":"Few labels","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-02T00:00:00Z","body":"","labels":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"name":"shelbi:id/few"},{"name":"shelbi:status/todo"}]}}
+]}}}}"#;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rec = calls.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                !args.join(" ").contains("IssueLabels"),
+                "no label follow-up for a fitting label set"
+            );
+            Ok(json.to_string())
+        });
+        let read = store.refresh_board(None, &[]).unwrap();
+        assert_eq!(read.board[0].task.id, "few");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no extra request in the common case"
+        );
+    }
+
+    // --- null cursor: a missing cursor is a malformed response ----------------
+
+    #[test]
+    fn board_read_null_cursor_falls_back_to_rest() {
+        let _iso = IsolatedHome::new("null-cursor-board");
+        // `hasNextPage: true` with a null `endCursor` must not be accepted as the
+        // last page — it fails the GraphQL read, which `refresh_board` routes to
+        // the REST open list with `rest_fallback: true` rather than publishing a
+        // short board.
+        let store = GitHubStore::with_runner("owner/repo", |args| {
+            if args.contains(&"graphql") {
+                Ok(r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T09:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":true,"endCursor":null},"nodes":[
+{"number":1,"title":"a","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-02T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/a"},{"name":"shelbi:status/todo"}]}}
+]}}}}"#.to_string())
+            } else {
+                Ok(r#"{"number":5,"title":"Rest one","state":"open","labels":[{"name":"shelbi:id/rest-one"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#.to_string())
+            }
+        });
+        let read = store.refresh_board(None, &[]).unwrap();
+        assert!(read.rest_fallback, "a null cursor falls back to REST");
+        assert_eq!(read.board.len(), 1);
+        assert_eq!(read.board[0].task.id, "rest-one");
+    }
+
+    #[test]
+    fn closed_page_null_cursor_fails_the_read() {
+        let _iso = IsolatedHome::new("null-cursor-closed");
+        // The same rule on the closed-history path: `graphql_closed_page` fails
+        // rather than reporting a short "last page".
+        let json = r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T09:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":true,"endCursor":null},"nodes":[
+{"number":40,"title":"shipped","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-09-07T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/shipped"},{"name":"shelbi:status/done"}]}}
+]}}}}"#;
+        let store = graphql_store(json);
+        let err = match store.graphql_closed_page(None) {
+            Ok(_) => panic!("a null cursor must fail the closed-history read"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("endCursor"),
+            "the closed-history read fails naming the missing cursor: {err}"
+        );
     }
 
     #[test]
