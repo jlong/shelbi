@@ -183,8 +183,41 @@ pub(crate) mod test_lock {
     //! Shared mutex for all tests that mutate the process-wide
     //! `SHELBI_HOME` env var. Per-module locks would race because the
     //! env var is global.
-    use std::sync::Mutex;
-    pub static LOCK: Mutex<()> = Mutex::new(());
+    //!
+    //! [`LOCK`] is a thin **poison-immune** facade over a private
+    //! `Mutex<()>`. A test that panics while holding the guard poisons the
+    //! inner mutex; a plain `std::sync::Mutex` would then hand every *other*
+    //! test that acquires the lock a `PoisonError`, so a single real failure
+    //! turns into a cascade of hundreds of unrelated `PoisonError` failures
+    //! and the CI signal for the PR that tripped it becomes useless. `lock()`
+    //! recovers the guard from a poisoned inner mutex ([`PoisonError::into_inner`]),
+    //! so one failing test reports exactly one failure. It returns a
+    //! `Result` (always `Ok`) so the existing `.lock().unwrap()` /
+    //! `.lock().unwrap_or_else(|p| p.into_inner())` call sites all keep
+    //! compiling unchanged.
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    static INNER: Mutex<()> = Mutex::new(());
+
+    /// The shared test lock. Poison-immune — see the module docs.
+    pub static LOCK: TestLock = TestLock;
+
+    /// Poison-immune facade over the shared env mutex.
+    pub struct TestLock;
+
+    /// The result [`TestLock::lock`] hands back. Always `Ok`; the `Err` arm
+    /// exists only so `.lock().unwrap_or_else(|p| p.into_inner())` call sites
+    /// still type-check. Aliased to keep the (never-triggered) `type_complexity`
+    /// lint off the public signature.
+    type Acquired = Result<MutexGuard<'static, ()>, PoisonError<MutexGuard<'static, ()>>>;
+
+    impl TestLock {
+        /// Acquire the shared lock, recovering from a prior panic's poison so
+        /// one failing test can never cascade `PoisonError` into the rest.
+        pub fn lock(&self) -> Acquired {
+            Ok(INNER.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+    }
 }
 
 /// Default contents of the per-project workspace settings template. Lives at
