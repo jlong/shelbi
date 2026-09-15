@@ -197,37 +197,139 @@ fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOu
         .as_ref()
         .and_then(|p| DateTime::parse_from_rfc3339(&p.fetched_at).ok())
         .map(|dt| dt.with_timezone(&Utc));
-    let prev_board: &[shelbi_state::IssueFile] =
-        previous.as_ref().map(|p| p.board.as_slice()).unwrap_or(&[]);
+    // The `prev_board` slice is the merge base: the board the store folds an
+    // incremental delta onto, and the base of the three-way merge below. Owned
+    // (not borrowed from `previous`) so it can move into the locked closure.
+    let prev_board: Vec<shelbi_state::IssueFile> =
+        previous.map(|p| p.board).unwrap_or_default();
 
     // Stamp `fetched_at` *before* the read so the next tick's `since` never skips
     // an update that lands while this read is in flight (see
-    // `BoardIndex::fresh_at`).
+    // `BoardIndex::fresh_at`). The read itself runs with **no lock held** — a
+    // daemon stalled inside this network call must never block a concurrent
+    // `shelbi issue move`, which takes the board-index lock, publishes and exits
+    // while we wait here.
     let fetched_at = Utc::now().to_rfc3339();
-    let read = store.refresh_board(since, prev_board).map_err(|e| anyhow!(e))?;
+    let read = store.refresh_board(since, &prev_board).map_err(|e| anyhow!(e))?;
 
-    let changed =
-        board_index::board_diff_count(previous.as_ref().map(|p| p.board.as_slice()), &read.board);
-    // Merge the numbers this read observed onto the prior index's id→number map,
-    // then retain only ids still on the board. An incremental tick only reports
-    // numbers for the issues it touched, so without the merge an untouched
-    // issue's number would drop out of the index every quiet tick and force a
-    // `get` back to the label search.
-    let numbers = merge_index_numbers(previous.as_ref(), &read.numbers, &read.board);
-    let mut index =
-        BoardIndex::fresh_at(read.board, numbers, fetched_at, read.remaining, read.reset);
-    // Record which read path produced this board so `shelbi status` can report
-    // whether the reader is on GraphQL or the REST fallback (Phase 3 §6).
-    index.rest_fallback = read.rest_fallback;
-    board_index::write_board_index(project, &index).map_err(|e| anyhow!(e))?;
+    // Which read actually ran decides how we reconcile against the current index.
+    // A cold read (`since` is None) and the REST fallback both return the *whole*
+    // open board rather than a delta folded onto `prev_board`, so they are
+    // authoritative and publish wholesale; a true incremental delta embeds the
+    // `prev_board` base and must be three-way merged so a CLI write-through that
+    // landed mid-read survives.
+    let authoritative = since.is_none() || read.rest_fallback;
+    let fetched_at_return = fetched_at.clone();
+    let remaining_return = read.remaining;
+
+    // Publish inside the board-index lock, reconciling the read against the index
+    // as re-read *under* the lock (`fresh`) rather than against the pre-call copy,
+    // so a write-through that landed while the read was in flight is not lost. The
+    // events append happens after the guard drops (below), never inside it.
+    let changed = board_index::update_board_index(project, move |fresh| {
+        let ours: &[shelbi_state::IssueFile] =
+            fresh.as_ref().map(|f| f.board.as_slice()).unwrap_or(&[]);
+        let published_board = if authoritative {
+            // The full open set is authoritative: publish it wholesale. An id it
+            // no longer returns is closed/deleted/transferred and must be dropped
+            // even if a write-through patched it in during the read.
+            read.board.clone()
+        } else {
+            three_way_merge_board(&prev_board, &read.board, ours)
+        };
+        // Fold the numbers this read observed onto the *fresh* index's map (so a
+        // concurrent `record_board_index_number` isn't dropped), then retain only
+        // ids still on the published board.
+        let numbers = merge_index_numbers(fresh.as_ref(), &read.numbers, &published_board);
+        // What this publish actually changed relative to what was on disk. A tick
+        // whose only difference was a CLI write-through already in the file reports
+        // zero — the daemon changed nothing, so it emits no line.
+        let changed = board_index::board_diff_count(Some(ours), &published_board);
+        let mut index =
+            BoardIndex::fresh_at(published_board, numbers, fetched_at, read.remaining, read.reset);
+        // Record which read path produced this board so `shelbi status` can report
+        // whether the reader is on GraphQL or the REST fallback (Phase 3 §6).
+        index.rest_fallback = read.rest_fallback;
+        Ok((index, changed))
+    })
+    .map_err(|e| anyhow!(e))?;
 
     if changed > 0 {
-        emit_board_refreshed(project, &index.fetched_at, changed, index.remaining);
+        emit_board_refreshed(project, &fetched_at_return, changed, remaining_return);
     }
     Ok(RefreshOutcome {
-        fetched_at: index.fetched_at,
+        fetched_at: fetched_at_return,
         changed,
     })
+}
+
+/// Three-way merge an incremental delta against an index that a CLI write-through
+/// may have updated during the network read.
+///
+/// * `base` — the `prev_board` slice the store folded the delta onto (the board
+///   as of the previous tick's watermark).
+/// * `theirs` — `read.board`, the store's board with the delta already folded in.
+/// * `ours` — the index as re-read under the board-index lock, which embeds any
+///   write-through that landed since `base`.
+///
+/// Per task id: an id whose `ours` entry is unchanged from `base` takes the
+/// daemon's outcome (present in `theirs`, or absent — that is how the delta's
+/// close still removes a card); an id whose `ours` entry differs from `base`, or
+/// that `ours` has and `base` does not, is a CLI write-through that read the
+/// issue directly after its own mutation and wins. `theirs` order (the store's
+/// canonical column-then-priority order) is preserved, with any write-through-only
+/// id appended after.
+fn three_way_merge_board(
+    base: &[shelbi_state::IssueFile],
+    theirs: &[shelbi_state::IssueFile],
+    ours: &[shelbi_state::IssueFile],
+) -> Vec<shelbi_state::IssueFile> {
+    let by_id = |board: &[shelbi_state::IssueFile]| -> HashMap<String, shelbi_state::IssueFile> {
+        board
+            .iter()
+            .map(|f| (f.task.id.clone(), f.clone()))
+            .collect()
+    };
+    let base_by = by_id(base);
+    let ours_by = by_id(ours);
+
+    // Whether `ours` left this id exactly as `base` had it (both absent counts as
+    // unchanged). An unchanged id defers to the daemon; a changed one is a
+    // write-through that wins.
+    let ours_unchanged = |id: &str| -> bool {
+        match (ours_by.get(id), base_by.get(id)) {
+            (None, None) => true,
+            (Some(o), Some(b)) => board_index::issue_files_eq(o, b),
+            _ => false,
+        }
+    };
+
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // The delta's ids first, in the store's canonical order.
+    for t in theirs {
+        let id = t.task.id.as_str();
+        seen.insert(id);
+        if ours_unchanged(id) {
+            out.push(t.clone()); // defer to the daemon's outcome
+        } else if let Some(o) = ours_by.get(id) {
+            out.push(o.clone()); // a write-through changed it: it wins
+        }
+        // else: `ours` removed it (a write-through drop) — honor that removal.
+    }
+    // Ids only `ours` carries (not mentioned by the delta). Keep the ones a
+    // write-through changed from base; drop the ones unchanged from base whose
+    // daemon outcome is "absent" (`theirs` didn't return them).
+    for o in ours {
+        let id = o.task.id.as_str();
+        if seen.contains(id) {
+            continue;
+        }
+        if !ours_unchanged(id) {
+            out.push(o.clone());
+        }
+    }
+    out
 }
 
 /// Merge the numbers a refresh observed onto the prior index's id→number map,
@@ -1127,5 +1229,296 @@ issue_tracker:\n\
             .filter(|l| l.contains("board refresh-failed"))
             .count();
         assert_eq!(failed_again, 2, "a fresh episode after recovery warns again");
+    }
+
+    // --- lock reconciliation: write-through during the board read ------------
+
+    /// A store whose `refresh_board` runs an arbitrary hook **before** returning
+    /// its board — the deterministic stand-in for a CLI write-through landing
+    /// inside the network window (`T2`). The hook runs with no board-index lock
+    /// held (`refresh_with_store` takes the lock only *after* the read returns),
+    /// so it can splice into the index exactly as a real concurrent
+    /// `shelbi issue move` would.
+    struct HookStore {
+        board: Vec<IssueFile>,
+        numbers: Vec<(String, i64)>,
+        rest_fallback: bool,
+        on_refresh: Box<dyn Fn()>,
+    }
+
+    impl IssueStore for HookStore {
+        fn list(&self) -> CoreResult<Vec<IssueFile>> {
+            Ok(self.board.clone())
+        }
+        fn list_open(&self) -> CoreResult<Vec<IssueFile>> {
+            Ok(self.board.clone())
+        }
+        fn refresh_board(
+            &self,
+            _since: Option<DateTime<Utc>>,
+            _previous: &[IssueFile],
+        ) -> CoreResult<shelbi_state::BoardRead> {
+            (self.on_refresh)();
+            Ok(shelbi_state::BoardRead {
+                board: self.board.clone(),
+                numbers: self.numbers.clone(),
+                remaining: None,
+                reset: None,
+                rest_fallback: self.rest_fallback,
+            })
+        }
+        fn list_in_status(&self, status: &Column) -> CoreResult<Vec<IssueFile>> {
+            Ok(self
+                .board
+                .iter()
+                .filter(|f| &f.task.column == status)
+                .cloned()
+                .collect())
+        }
+        fn get(&self, _id: &str) -> CoreResult<Option<IssueFile>> {
+            Ok(None)
+        }
+        fn add(&self, _s: NewIssue) -> CoreResult<Issue> {
+            unreachable!()
+        }
+        fn move_status(&self, _i: &str, _t: &Column, _r: &str) -> CoreResult<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn set_priority(&self, _i: &str, _p: PrioMove) -> CoreResult<()> {
+            Ok(())
+        }
+        fn set_fields(&self, _i: &str, _f: IssueFields) -> CoreResult<()> {
+            Ok(())
+        }
+        fn cancel(&self, _i: &str, _r: &str) -> CoreResult<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn move_status_and_unassign(
+            &self,
+            _i: &str,
+            _t: &Column,
+            _r: &str,
+        ) -> CoreResult<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn delete(&self, _id: &str) -> CoreResult<()> {
+            Ok(())
+        }
+        fn renumber(&self, _s: &Column) -> CoreResult<()> {
+            Ok(())
+        }
+        fn park_review(&self, _id: &str) -> CoreResult<Option<String>> {
+            Ok(None)
+        }
+        fn clear_parked(&self, _id: &str) -> CoreResult<()> {
+            Ok(())
+        }
+        fn reject_review(
+            &self,
+            _i: &str,
+            _r: &Column,
+            _s: &str,
+            _d: &str,
+        ) -> CoreResult<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn poll_changes(&self, _s: &Cursor) -> CoreResult<(Vec<IssueChange>, Cursor)> {
+            Ok((Vec::new(), Cursor::start()))
+        }
+        fn list_comments(&self, _id: &str) -> CoreResult<Vec<IssueComment>> {
+            Ok(Vec::new())
+        }
+        fn add_comment(&self, _id: &str, _b: &str) -> CoreResult<IssueComment> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn a_write_through_during_the_board_read_survives_and_holds_no_lock() {
+        // AC: a fake store performs a move-style write-through *while*
+        // `refresh_board` is in flight; the published index still contains the
+        // moved card in its new column and still carries its number. The
+        // write-through runs on another thread and must complete while the read is
+        // stalled — proving no board-index lock is held across the read (otherwise
+        // the write-through would deadlock on the lock the daemon would be holding,
+        // and this test would hang rather than pass).
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+        let _iso = IsolatedHome::new("refresh-race");
+
+        let mut seed = BoardIndex::fresh(vec![issue("a", "todo", 0), issue("b", "review", 0)]);
+        seed.numbers = [("a".to_string(), 1), ("b".to_string(), 2)]
+            .into_iter()
+            .collect();
+        shelbi_state::write_board_index("proj", &seed).unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+        let seq = Arc::new(AtomicUsize::new(0));
+        let read_order = Arc::new(AtomicUsize::new(usize::MAX));
+
+        // The incremental delta didn't touch the operator's card: it returns A and
+        // B unchanged from the previous tick's watermark.
+        let seq_hook = Arc::clone(&seq);
+        let read_order_hook = Arc::clone(&read_order);
+        let store = HookStore {
+            board: vec![issue("a", "todo", 0), issue("b", "review", 0)],
+            numbers: vec![("a".to_string(), 1), ("b".to_string(), 2)],
+            rest_fallback: false,
+            on_refresh: Box::new(move || {
+                started_tx.send(()).unwrap(); // the read is now in flight
+                proceed_rx.recv().unwrap(); // stall until the write-through is done
+                read_order_hook.store(seq_hook.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+            }),
+        };
+
+        // The concurrent CLI move: A → review, number 1, while the read is stalled.
+        let seq_wt = Arc::clone(&seq);
+        let wt_order = Arc::new(AtomicUsize::new(usize::MAX));
+        let wt_order_thr = Arc::clone(&wt_order);
+        let writer = std::thread::spawn(move || {
+            started_rx.recv().unwrap();
+            board_index::patch_board_index_issue_with_number(
+                "proj",
+                &issue("a", "review", 5),
+                Some(1),
+            )
+            .unwrap();
+            wt_order_thr.store(seq_wt.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+            proceed_tx.send(()).unwrap(); // let the stalled read return
+        });
+
+        refresh_with_store("proj", &store).unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(
+            wt_order.load(Ordering::SeqCst),
+            0,
+            "the write-through completed while the board read was still stalled"
+        );
+        assert_eq!(
+            read_order.load(Ordering::SeqCst),
+            1,
+            "the board read returned only after the write-through finished"
+        );
+
+        let idx = shelbi_state::read_board_index("proj").unwrap();
+        let a = idx.board.iter().find(|f| f.task.id == "a").expect("a present");
+        assert_eq!(a.task.column.as_str(), "review", "the write-through's move won");
+        assert_eq!(idx.numbers.get("a"), Some(&1), "its number is retained");
+    }
+
+    #[test]
+    fn an_authoritative_read_drops_a_write_through_the_full_board_omits() {
+        // AC: a card an authoritative full read (here the REST fallback, on an
+        // incremental tick) no longer returns is dropped from the board *and* the
+        // numbers map, even though a write-through patched it in mid-read.
+        let _iso = IsolatedHome::new("authoritative-drop");
+        let mut seed = BoardIndex::fresh(vec![issue("a", "todo", 0)]);
+        seed.numbers = [("a".to_string(), 1)].into_iter().collect();
+        shelbi_state::write_board_index("proj", &seed).unwrap();
+
+        let store = HookStore {
+            board: vec![issue("a", "todo", 0)], // the authoritative open set: no `c`
+            numbers: vec![("a".to_string(), 1)],
+            rest_fallback: true, // → authoritative, publish wholesale
+            on_refresh: Box::new(|| {
+                board_index::patch_board_index_issue_with_number(
+                    "proj",
+                    &issue("c", "review", 0),
+                    Some(9),
+                )
+                .unwrap();
+            }),
+        };
+        refresh_with_store("proj", &store).unwrap();
+
+        let idx = shelbi_state::read_board_index("proj").unwrap();
+        assert!(
+            idx.board.iter().all(|f| f.task.id != "c"),
+            "an id the full read omits is not resurrected"
+        );
+        assert_eq!(idx.numbers.get("c"), None, "and it leaves the numbers map");
+        assert!(idx.board.iter().any(|f| f.task.id == "a"), "the full board is published");
+    }
+
+    #[test]
+    fn an_incremental_tick_keeps_untouched_and_mid_read_write_through_cards() {
+        // AC: a card an incremental delta did not mention survives — whether it was
+        // untouched since the previous tick (`b`) or patched in by a write-through
+        // during the call (`c`) — while the delta's own change (`a` moved) applies.
+        let _iso = IsolatedHome::new("incremental-survive");
+        let mut seed = BoardIndex::fresh(vec![issue("a", "todo", 0), issue("b", "review", 0)]);
+        seed.numbers = [("a".to_string(), 1), ("b".to_string(), 2)]
+            .into_iter()
+            .collect();
+        shelbi_state::write_board_index("proj", &seed).unwrap();
+
+        let store = HookStore {
+            board: vec![issue("a", "in_progress", 0), issue("b", "review", 0)],
+            numbers: vec![("a".to_string(), 1)],
+            rest_fallback: false, // incremental → three-way merge
+            on_refresh: Box::new(|| {
+                board_index::patch_board_index_issue_with_number(
+                    "proj",
+                    &issue("c", "todo", 0),
+                    Some(3),
+                )
+                .unwrap();
+            }),
+        };
+        refresh_with_store("proj", &store).unwrap();
+
+        let idx = shelbi_state::read_board_index("proj").unwrap();
+        let by_id = |id: &str| idx.board.iter().find(|f| f.task.id == id);
+        assert_eq!(
+            by_id("a").expect("a present").task.column.as_str(),
+            "in-progress",
+            "the delta's move applied to the untouched card"
+        );
+        assert!(by_id("b").is_some(), "an untouched card the delta didn't mention survives");
+        let c = by_id("c").expect("the mid-read write-through survives");
+        assert_eq!(c.task.column.as_str(), "todo");
+        assert_eq!(idx.numbers.get("c"), Some(&3), "its number is kept");
+    }
+
+    #[test]
+    fn three_way_merge_defers_unchanged_ids_and_lets_write_throughs_win() {
+        // The merge rule in isolation: `base` = the previous tick's board; `theirs`
+        // = the store's delta-folded board; `ours` = the index a write-through
+        // updated. Unchanged ids take the daemon's outcome (present or absent); a
+        // changed/added id is the write-through and wins.
+        let base = vec![issue("keep", "todo", 0), issue("closed", "review", 0)];
+        // The delta moved `keep` and closed `closed` (dropped from theirs).
+        let theirs = vec![issue("keep", "done_review", 0)];
+        // A write-through moved `keep` differently and added `new`; it left
+        // `closed` exactly as base had it.
+        let ours = vec![
+            issue("keep", "in_progress", 0),
+            issue("closed", "review", 0),
+            issue("new", "todo", 0),
+        ];
+        let merged = three_way_merge_board(&base, &theirs, &ours);
+        let col = |id: &str| {
+            merged
+                .iter()
+                .find(|f| f.task.id == id)
+                .map(|f| f.task.column.as_str().to_string())
+        };
+        assert_eq!(
+            col("keep").as_deref(),
+            Some("in-progress"),
+            "a write-through that changed an id from base wins over the delta"
+        );
+        assert_eq!(
+            col("closed"),
+            None,
+            "an id unchanged in `ours` takes the daemon's outcome — the delta's close"
+        );
+        assert_eq!(
+            col("new").as_deref(),
+            Some("todo"),
+            "a write-through-only id the delta never mentioned survives"
+        );
     }
 }

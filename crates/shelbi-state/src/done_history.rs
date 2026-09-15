@@ -118,11 +118,65 @@ pub fn done_history_path(project: &str) -> Result<PathBuf> {
 /// Persist `history` for `project` atomically (temp file + rename), so a process
 /// killed mid-write leaves either the old page or the new one, never a truncated
 /// file.
+///
+/// Holds the sibling `done-history.json.lock` for the write — a full-snapshot,
+/// last-writer-wins publish. Reserve it for writing a page constructed from
+/// scratch (tests, seeding); a read-modify-replace mutator must route through
+/// [`update_done_history`] (or the in-module write-through helpers) so the read
+/// and the publish share one critical section and no concurrent update is lost.
 pub fn write_done_history(project: &str, history: &DoneHistory) -> Result<()> {
     let path = done_history_path(project)?;
+    let _lock = crate::acquire_file_lock(&crate::sibling_lock_path(&path))?;
+    write_done_history_to(&path, history)
+}
+
+/// Serialize and atomically write `history` at `path`. Callers must already hold
+/// the done-history lock — the unlocked inner writer the locked entry points
+/// delegate to from inside their critical section, so it never re-acquires the
+/// non-reentrant flock.
+fn write_done_history_to(path: &Path, history: &DoneHistory) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(history)
         .map_err(|e| shelbi_core::Error::Other(format!("serializing done history: {e}")))?;
-    crate::atomic_write(&path, &bytes)
+    crate::atomic_write(path, &bytes)
+}
+
+/// Locked read-modify-publish on `project`'s done-history page: acquires the
+/// sibling `done-history.json.lock`, reads the current page (via the lock-free
+/// [`read_done_history_at`]), hands it to `f`, and — when `f` returns
+/// `Some(page)` — publishes it through the unlocked inner writer, all inside one
+/// critical section so a concurrent write-through is never lost. `f` returning
+/// `None` writes nothing. `f` must not call another done-history mutator for the
+/// same project (the flock is not reentrant).
+fn with_done_history_lock<R>(
+    project: &str,
+    f: impl FnOnce(Option<DoneHistory>) -> Result<(Option<DoneHistory>, R)>,
+) -> Result<R> {
+    let path = done_history_path(project)?;
+    let _lock = crate::acquire_file_lock(&crate::sibling_lock_path(&path))?;
+    let current = read_done_history_at(&path);
+    let (updated, out) = f(current)?;
+    if let Some(history) = updated {
+        write_done_history_to(&path, &history)?;
+    }
+    Ok(out)
+}
+
+/// Locked read-modify-publish the on-demand cadence fetch publishes through —
+/// the done-history twin of [`crate::board_index::update_board_index`]. Acquires
+/// the sibling lock, reads the current page, hands it to `f`, publishes the
+/// [`DoneHistory`] `f` returns through the unlocked inner writer, drops the
+/// guard, and returns `f`'s `R`. The live page fetch happens **before** this
+/// call with no lock held; `f` reconciles the fetched page against the page as
+/// re-read under the lock (so a write-through that landed mid-fetch survives)
+/// and does no IO of its own beyond building the page it returns.
+pub fn update_done_history<R>(
+    project: &str,
+    f: impl FnOnce(Option<DoneHistory>) -> Result<(DoneHistory, R)>,
+) -> Result<R> {
+    with_done_history_lock(project, |current| {
+        let (history, out) = f(current)?;
+        Ok((Some(history), out))
+    })
 }
 
 /// Read and parse `project`'s done-history page. A missing, unreadable, or
@@ -149,27 +203,31 @@ pub fn read_done_history_at(path: &Path) -> Option<DoneHistory> {
 /// fetch advances freshness; this is a targeted splice. A no-op when no page has
 /// been cached yet (nothing to patch — the first fetch will include it).
 pub fn patch_done_history_issue(project: &str, issue: &IssueFile) -> Result<()> {
-    let Some(mut history) = read_done_history(project) else {
-        return Ok(());
-    };
-    history.issues.retain(|f| f.task.id != issue.task.id);
-    history.issues.insert(0, issue.clone());
-    write_done_history(project, &history)
+    with_done_history_lock(project, |current| {
+        let Some(mut history) = current else {
+            return Ok((None, ()));
+        };
+        history.issues.retain(|f| f.task.id != issue.task.id);
+        history.issues.insert(0, issue.clone());
+        Ok((Some(history), ()))
+    })
 }
 
 /// Drop an issue from the cached page — the write-through for a card that left
 /// the terminal history (a reopen, or a delete). A no-op when no page is cached
 /// or the id isn't in it.
 pub fn remove_done_history_issue(project: &str, id: &str) -> Result<()> {
-    let Some(mut history) = read_done_history(project) else {
-        return Ok(());
-    };
-    let before = history.issues.len();
-    history.issues.retain(|f| f.task.id != id);
-    if history.issues.len() == before {
-        return Ok(());
-    }
-    write_done_history(project, &history)
+    with_done_history_lock(project, |current| {
+        let Some(mut history) = current else {
+            return Ok((None, ()));
+        };
+        let before = history.issues.len();
+        history.issues.retain(|f| f.task.id != id);
+        if history.issues.len() == before {
+            return Ok((None, ()));
+        }
+        Ok((Some(history), ()))
+    })
 }
 
 /// The terminal cards from a cached page filtered to one `status` column — what
