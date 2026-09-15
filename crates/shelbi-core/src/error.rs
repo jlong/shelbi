@@ -188,6 +188,22 @@ pub enum Error {
         token_file: String,
     },
 
+    /// The `gh auth token` keychain probe kept failing across its retries, so a
+    /// token could not be read from `gh` — and neither the `GH_TOKEN` /
+    /// `GITHUB_TOKEN` env nor the out-of-repo `tokens.yml` supplied one either.
+    /// Distinct from [`Error::MissingIssueTrackerAuth`] so a transient keychain
+    /// stall (the macOS `security` / `securityd` throttle that gives up around
+    /// 6 s) is reported as what it is — a probe that timed out — instead of "no
+    /// token found", which sends the operator to `gh auth login` for a login
+    /// that is actually fine. Carries the probe's exit status, elapsed time, and
+    /// stderr tail so the real cause is legible. See
+    /// `Plans/pluggable-task-stores.md` §4 + D2.
+    /// Boxed so this diagnostic-heavy variant (five strings) does not bloat the
+    /// whole `Error` enum — and, through it, every `Result` in the workspace —
+    /// past clippy's `result_large_err` bound.
+    #[error("{0}")]
+    GhTokenProbeFailed(Box<GhTokenProbeFailure>),
+
     /// An out-of-repo `tokens.yml` exists but its filesystem permissions are
     /// looser than `0600`, so a secret is readable by group/other. Refusing to
     /// read it (rather than silently trusting a world-readable secret) mirrors
@@ -201,6 +217,40 @@ pub enum Error {
 
     #[error("{0}")]
     Other(String),
+}
+
+/// The diagnostic payload of [`Error::GhTokenProbeFailed`]: the exit status,
+/// elapsed time, and stderr tail of a `gh auth token` probe that exhausted its
+/// retries, plus the `tokens.yml` path that was also checked. Its `Display` is
+/// the operator-facing sentence — a transient macOS keychain stall reported as
+/// what it is, not as "no token found". Boxed inside the `Error` variant.
+#[derive(Debug, Clone)]
+pub struct GhTokenProbeFailure {
+    /// How many `gh auth token` spawns were attempted (first plus retries).
+    pub attempts: u32,
+    /// The last attempt's process exit status, e.g. `exit status: 1`.
+    pub exit_status: String,
+    /// The last attempt's wall-clock duration, pre-rendered (e.g. `6.0s`).
+    pub elapsed: String,
+    /// The tail of the last attempt's stderr, e.g. `no oauth token found for
+    /// github.com`.
+    pub stderr_tail: String,
+    /// The out-of-repo `tokens.yml` path that was also checked and missed.
+    pub token_file: String,
+}
+
+impl std::fmt::Display for GhTokenProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`gh auth token` failed after {} attempt(s) (exit {} in {}): {}; \
+             the token could not be read from the OS keychain — a transient \
+             macOS keychain stall clears on its own, and shelbi retries — and \
+             no $GH_TOKEN/$GITHUB_TOKEN or {} was set; \
+             if this persists, check `gh auth status`",
+            self.attempts, self.exit_status, self.elapsed, self.stderr_tail, self.token_file,
+        )
+    }
 }
 
 impl Error {
