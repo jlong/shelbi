@@ -2509,6 +2509,12 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
 
     #[test]
     fn agent_workspace_dir_rejects_traversal_names() {
+        // The accepted name resolves under the hub root, so mount a throwaway
+        // home rather than reading the live `~/.shelbi`.
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
         // Residual chokepoint hardening (Shelbi ContextStore
         // docs/planning:reviews/adversarial-2026-07/state-runtime.md F14): a `..`/absolute/
         // separator agent name must not escape the project's `agents/` dir.
@@ -2520,6 +2526,8 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
         }
         // A normal single-component name still resolves.
         assert!(agent_workspace_dir("p", "developer").is_ok());
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     /// `shelbi init` happy path for per-role settings.json: both default

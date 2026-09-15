@@ -70,7 +70,33 @@ pub fn set_root_override(path: PathBuf) {
 /// it. Errors only when *every* step fails — concretely, when the home
 /// directory can't be located and no other source was set.
 pub fn resolve() -> Result<(PathBuf, RootSource)> {
+    #[cfg(test)]
+    assert_test_home_is_isolated();
     resolve_with(ROOT_OVERRIDE.get().cloned(), COMPILE_TIME_DEFAULT)
+}
+
+/// Suite-wide guard against a test resolving the developer's **live** hub home.
+///
+/// A test that reaches [`resolve`] with no explicit root — no `--root`
+/// override, no `$SHELBI_ROOT`, no `$SHELBI_HOME` — would fall through to the
+/// `~/.shelbi` fallback and read/write the real hub state. That is exactly the
+/// leak this guard closes: it scribbled a fixture `projects/test-project/
+/// board-index.json` into a developer's `~/.shelbi` during `cargo test`. Every
+/// state test must mount a throwaway home first (the crate's `fresh_home()`
+/// helpers do this); the guard turns a silent leak into an immediate,
+/// self-describing panic.
+///
+/// Compiled only under `cfg(test)`, so it governs this crate's own test binary
+/// (where the leaking `github_store` fixtures live) and never the shipped
+/// resolution path. To exercise the fallback *logic* without tripping the
+/// guard, call the pure [`resolve_with`] directly.
+#[cfg(test)]
+fn assert_test_home_is_isolated() {
+    let has_override = ROOT_OVERRIDE.get().is_some();
+    let env_set = |k: &str| std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false);
+    if !has_override && !env_set("SHELBI_ROOT") && !env_set("SHELBI_HOME") {
+        panic!("tests must set SHELBI_HOME (use fresh_home())");
+    }
 }
 
 /// Pure-function form of [`resolve`] — the override + compile-time
@@ -282,15 +308,16 @@ mod tests {
 
     #[test]
     fn home_fallback_used_when_compile_time_default_empty() {
-        // The test binary is built without the install-script prompt, so
-        // COMPILE_TIME_DEFAULT is "" — assert resolution lands on the
-        // home fallback when no env var is set.
-        if !COMPILE_TIME_DEFAULT.is_empty() {
-            return;
-        }
+        // An empty compile-time default (passed explicitly here) means neither
+        // the install-time bake nor an env var supplied a root, so resolution
+        // must land on the `~/.shelbi` fallback.
         let _g = LOCK.lock().unwrap();
         clear_env();
-        let (path, source) = resolve().unwrap();
+        // Exercise the fallback *logic* through the pure resolver: `resolve()`
+        // itself is guarded under `cfg(test)` and would panic on an unset home
+        // (that guard is what keeps tests off the live `~/.shelbi`), so the
+        // fallback branch is only reachable via `resolve_with`.
+        let (path, source) = resolve_with(None, "").unwrap();
         assert_eq!(source, RootSource::HomeFallback);
         let expected = dirs::home_dir().unwrap().join(".shelbi");
         assert_eq!(path, expected);
@@ -353,6 +380,36 @@ mod tests {
         ensure_root_subdirs().unwrap();
         clear_env();
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn resolve_panics_when_no_home_is_set_under_test() {
+        // The suite-wide guard: a test that reaches `resolve()` with no explicit
+        // root would otherwise read/write the developer's live `~/.shelbi`.
+        // Under `cfg(test)` it must fail immediately with the fix instead — this
+        // is exactly what keeps a fixture `test-project/` out of the real hub.
+        //
+        // The panic is caught in-closure with `catch_unwind` (rather than
+        // `#[should_panic]`) so the lock guard unwinds normally and never
+        // poisons the shared `LOCK` for the rest of the suite. The panic hook is
+        // muted for the duration so the expected panic doesn't print a scary
+        // backtrace in an otherwise-green run.
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_env();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(resolve);
+        std::panic::set_hook(prev_hook);
+        let err = result.expect_err("resolve() must panic when no home is set under test");
+        let msg = err
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| err.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("tests must set SHELBI_HOME"),
+            "panic must name the fix, got: {msg:?}"
+        );
     }
 
     #[test]

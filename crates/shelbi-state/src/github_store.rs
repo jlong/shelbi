@@ -3420,6 +3420,7 @@ mod tests {
 
     #[test]
     fn list_maps_labels_body_and_orders_the_board() {
+        let _home = HomeGuard::new("list-maps-labels");
         // Two issues: one in-progress with a full metadata block, one closed.
         let issues = r#"{"number":7,"title":"Do the thing","body":"Prose here.\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: app\nbranch: jlong/do-thing\ndepends_on: [other]\nprefers_machine: hub\npriority: 3\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/do-thing"},{"name":"shelbi:status/in-progress"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}
 {"number":4,"title":"Old task","body":"done body","state":"closed","state_reason":"completed","labels":[{"name":"shelbi:id/old-task"}],"created_at":"2026-07-01T00:00:00Z","updated_at":"2026-07-02T00:00:00Z"}"#;
@@ -3452,6 +3453,7 @@ mod tests {
 
     #[test]
     fn closed_not_planned_is_canceled_and_overrides_a_stale_label() {
+        let _home = HomeGuard::new("closed-not-planned");
         // Closed with a stale non-terminal status label → terminal wins.
         let issues = r#"{"number":9,"title":"Abandoned","body":"","state":"closed","state_reason":"not_planned","labels":[{"name":"shelbi:id/abandoned"},{"name":"shelbi:status/in-progress"}],"created_at":"2026-07-01T00:00:00Z","updated_at":"2026-07-02T00:00:00Z"}"#;
         let store = store_with(issues, "[]");
@@ -3461,6 +3463,7 @@ mod tests {
 
     #[test]
     fn open_issue_without_status_label_defaults_to_todo() {
+        let _home = HomeGuard::new("open-issue-without");
         let issues = r#"{"number":1,"title":"Fresh","body":"hi","state":"open","labels":[{"name":"shelbi:id/fresh"}],"created_at":"2026-07-01T00:00:00Z","updated_at":"2026-07-02T00:00:00Z"}"#;
         let store = store_with(issues, "[]");
         let board = store.list().unwrap();
@@ -3469,6 +3472,7 @@ mod tests {
 
     #[test]
     fn issue_without_id_label_falls_back_to_number() {
+        let _home = HomeGuard::new("issue-without-id");
         let issues = r#"{"number":42,"title":"Unmigrated","body":"body","state":"open","labels":[],"created_at":"2026-07-01T00:00:00Z","updated_at":"2026-07-02T00:00:00Z"}"#;
         let store = store_with(issues, "[]");
         let board = store.list().unwrap();
@@ -3477,6 +3481,7 @@ mod tests {
 
     #[test]
     fn pull_requests_are_filtered_out() {
+        let _home = HomeGuard::new("pull-requests-are");
         let issues = r#"{"number":1,"title":"A real issue","body":"","state":"open","labels":[{"name":"shelbi:id/real"}],"created_at":"2026-07-01T00:00:00Z","updated_at":"2026-07-02T00:00:00Z"}
 {"number":2,"title":"A PR","body":"","state":"open","labels":[],"pull_request":{"url":"https://x"},"created_at":"2026-07-01T00:00:00Z","updated_at":"2026-07-02T00:00:00Z"}"#;
         let store = store_with(issues, "[]");
@@ -3518,6 +3523,7 @@ mod tests {
 
     #[test]
     fn list_in_status_requests_state_open_for_non_terminal() {
+        let _home = HomeGuard::new("list-in-status");
         // Every non-terminal status is served from the open issues alone — one
         // `state=open` list call, never the six-page `state=all` history.
         for col in [
@@ -3542,6 +3548,7 @@ mod tests {
 
     #[test]
     fn list_in_status_requests_state_closed_for_terminal() {
+        let _home = HomeGuard::new("list-in-status");
         // The terminal lanes (`done`/`canceled`) are history — they read the
         // closed issues, never `state=all`, never `state=open`.
         for col in [Column::done(), Column::canceled()] {
@@ -3561,6 +3568,7 @@ mod tests {
 
     #[test]
     fn list_open_requests_state_open() {
+        let _home = HomeGuard::new("list-open-requests");
         let (store, calls) = recording_reader("");
         store.list_open().unwrap();
         let list_calls = issues_list_calls(&calls);
@@ -3571,6 +3579,7 @@ mod tests {
 
     #[test]
     fn list_keeps_the_full_state_all_sweep() {
+        let _home = HomeGuard::new("list-keeps-the");
         // `list` still carries its full-history contract for migrate / reconcile
         // callers — the one path that requests every issue.
         let (store, calls) = recording_reader("");
@@ -3582,6 +3591,7 @@ mod tests {
 
     #[test]
     fn get_returns_the_matching_issue_and_none_for_missing() {
+        let _home = HomeGuard::new("get-returns-the");
         let issues = r#"{"number":7,"title":"Do the thing","body":"prose","state":"open","labels":[{"name":"shelbi:id/do-thing"},{"name":"shelbi:status/review"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         // The runner returns the issue for any issues query; for the "missing"
         // case we return an empty result. GraphQL reads (the reworked `get`) are
@@ -3829,6 +3839,7 @@ mod tests {
 
     #[test]
     fn add_creates_issue_with_anchor_labels_and_meta_block() {
+        let _home = HomeGuard::new("add-creates-issue");
         // Fresh repo: the id lookup and the column list are both empty, and no
         // labels exist yet.
         let created = r#"{"number":10,"title":"Do the thing","body":"","state":"open","labels":[],"created_at":"2026-08-03T00:00:00Z","updated_at":"2026-08-03T00:00:00Z"}"#;
@@ -3866,6 +3877,7 @@ mod tests {
 
     #[test]
     fn add_retries_a_secondary_rate_limit_on_the_create_and_completes() {
+        let _home = HomeGuard::new("add-retries-a");
         // The issue-create POST is rate-limited once (403 secondary limit with a
         // Retry-After), then succeeds. With a no-wait retry policy the `add`
         // still lands, exercising the store's retry seam end to end.
@@ -3913,6 +3925,7 @@ mod tests {
 
     #[test]
     fn add_does_not_retry_a_terminal_validation_error_on_the_create() {
+        let _home = HomeGuard::new("add-does-not");
         // A 422 validation failure on the create is terminal — `add` fails after
         // exactly one create attempt, never spinning on a permanent error.
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -4007,6 +4020,7 @@ mod tests {
 
     #[test]
     fn add_into_a_terminal_status_closes_the_issue() {
+        let _home = HomeGuard::new("add-into-a");
         let created = r#"{"number":11,"title":"Done thing","body":"","state":"open","labels":[],"created_at":"2026-08-03T00:00:00Z","updated_at":"2026-08-03T00:00:00Z"}"#;
         let (store, calls) = recording_store("", "", "", created);
         store
@@ -4074,6 +4088,7 @@ mod tests {
 
     #[test]
     fn cancel_closes_the_issue_as_not_planned() {
+        let _home = HomeGuard::new("cancel-closes-the");
         let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/in-progress"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         let (store, calls) = recording_store(issue, issue, "", "{}");
         let mv = store.cancel("t", "obsolete").unwrap().expect("moved");
@@ -4131,6 +4146,7 @@ mod tests {
 
     #[test]
     fn delete_closes_the_issue_as_not_planned() {
+        let _home = HomeGuard::new("delete-closes-the");
         let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         let (store, calls) = recording_store(issue, issue, "", "{}");
         store.delete("t").unwrap();
@@ -4663,6 +4679,7 @@ mod tests {
 
     #[test]
     fn set_priority_renumbers_the_column_contiguously() {
+        let _home = HomeGuard::new("set-priority-renumbers");
         // Three issues a(0) b(1) c(2) in todo; send c to the top.
         let list = r#"{"number":1,"title":"A","body":"<!-- shelbi:begin -->\n```yaml\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/a"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}
 {"number":2,"title":"B","body":"<!-- shelbi:begin -->\n```yaml\npriority: 1\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/b"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}
@@ -4749,6 +4766,7 @@ mod tests {
 
     #[test]
     fn existing_labels_are_not_recreated() {
+        let _home = HomeGuard::new("existing-labels-are");
         // Every label the create needs already exists → no label POSTs.
         let labels = r#"{"name":"shelbi:id/do-thing"}
 {"name":"shelbi:status/backlog"}
@@ -4767,6 +4785,7 @@ mod tests {
 
     #[test]
     fn create_label_tolerates_a_concurrent_already_exists() {
+        let _home = HomeGuard::new("create-label-tolerates");
         // The label list is stale (empty) so the store tries to create, but the
         // POST races and GitHub answers 422 already_exists — which must be
         // swallowed so `add` still succeeds.
@@ -4888,6 +4907,7 @@ mod tests {
 
     #[test]
     fn add_a_long_id_uses_a_truncated_label_and_carries_the_full_id_in_the_body() {
+        let _home = HomeGuard::new("add-a-long");
         let created = r#"{"number":10,"title":"T","body":"","state":"open","labels":[],"created_at":"2026-08-03T00:00:00Z","updated_at":"2026-08-03T00:00:00Z"}"#;
         let (store, calls) = recording_store("", "", "", created);
 
@@ -4914,6 +4934,7 @@ mod tests {
 
     #[test]
     fn a_long_id_round_trips_losslessly_through_read_back() {
+        let _home = HomeGuard::new("a-long-id");
         // Simulate the issue as `add` would have written it: truncated anchor
         // label + full id in the metadata block. Reading it back yields the full
         // id byte-for-byte, and never the number or the truncated slug.

@@ -886,6 +886,7 @@ mod tests {
 
     #[test]
     fn a_write_passes_through_and_keeps_serving_the_snapshot_without_blocking() {
+        let _home = HomeGuard::new("write-through");
         let (store, lists, writes) = cached("cache-t3", vec![issue("a", "todo")]);
         store.list_open().unwrap();
         store.set_priority("a", PrioMove::Up).unwrap();
@@ -1028,6 +1029,7 @@ mod tests {
 
     #[test]
     fn cached_list_open_sends_exactly_one_state_open() {
+        let _home = HomeGuard::new("gh-open");
         let (store, calls) = cached_github("cache-gh-open");
         store.list_open().unwrap();
         let list = recorded_list_calls(&calls);
@@ -1039,6 +1041,7 @@ mod tests {
 
     #[test]
     fn cached_list_in_status_non_terminal_sends_state_open() {
+        let _home = HomeGuard::new("gh-todo");
         let (store, calls) = cached_github("cache-gh-todo");
         store.list_in_status(&Column::todo()).unwrap();
         let list = recorded_list_calls(&calls);
@@ -1106,6 +1109,7 @@ mod tests {
     #[test]
     fn cached_list_still_sends_the_full_state_all_sweep() {
         // The one path that keeps the full contract, for migrate / reconcile.
+        let _home = HomeGuard::new("gh-all");
         let (store, calls) = cached_github("cache-gh-all");
         store.list().unwrap();
         let list = recorded_list_calls(&calls);
