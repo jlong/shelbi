@@ -228,6 +228,20 @@ pub enum Error {
     )]
     MalformedIssueMetadata { id: String, detail: String },
 
+    /// A replay-unsafe create (a GitHub issue or comment `POST`) whose outcome
+    /// is genuinely unknown: the request bytes went out but no usable response
+    /// came back — a connection drop, or a 5xx that may have landed *after*
+    /// GitHub committed the write. Such a create is deliberately attempted once
+    /// and never retried, because replaying it could create a duplicate issue or
+    /// a duplicate comment. Distinct from [`Error::Command`] (a clean failure the
+    /// caller may safely re-run) so callers can tell "may have committed, do not
+    /// blindly replay" apart from "did not commit". The message states that
+    /// GitHub may or may not have applied the write and names the exact recovery
+    /// command that settles it (`shelbi issue show <id>` for a create, the
+    /// issue's github.com URL for a comment).
+    #[error("{0}")]
+    UnknownWriteOutcome(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -273,6 +287,14 @@ impl Error {
     /// a hard "do not merge" failure.
     pub fn is_transient(&self) -> bool {
         matches!(self, Error::TransientVerification(_))
+    }
+
+    /// True for a replay-unsafe create whose outcome could not be determined
+    /// (see [`Error::UnknownWriteOutcome`]). Callers (the issue/comment create
+    /// paths) use this to catch the generic policy-level error and re-render it
+    /// with the specific recovery command before returning.
+    pub fn is_unknown_write_outcome(&self) -> bool {
+        matches!(self, Error::UnknownWriteOutcome(_))
     }
 }
 
