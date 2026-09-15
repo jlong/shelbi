@@ -380,56 +380,14 @@ impl CachedIssueStore {
         }
     }
 
-    /// Pass-through for a write: invalidate the **open** board, then kick its
-    /// refresh so the change lands in the snapshot (in memory *and* on disk)
-    /// without waiting out the TTL.
+    /// Pass-through for a write: mark the process-local **open** snapshot stale so
+    /// the next read refreshes it. It does *not* kick a whole-board REST sweep —
+    /// the backend now publishes the canonical post-write issue into
+    /// `board-index.json` / `done-history.json` itself (`GitHubStore::publish_write`),
+    /// so a `state=open` sweep whose result no renderer reads would be pure
+    /// duplicate work.
     fn invalidate(&self) {
         mark_stale(&self.project, TTL);
-        self.kick_refresh();
-    }
-
-    /// Write-through the just-mutated issue into the two on-disk caches every
-    /// list consumer now reads — the daemon-owned `board-index.json` (the open
-    /// board, §5) and `done-history.json` (the terminal history, §4) — so after
-    /// an operator's own write the sidebar, Issues board and terminal columns
-    /// reflect it on their next paint instead of waiting out the next daemon tick
-    /// or the ten-minute done-history TTL.
-    ///
-    /// The issue is re-read through the cheap **single-issue** path
-    /// ([`IssueStore::get`] — one request, never a board sweep) so the patched
-    /// entry carries every field correctly (including the true priority read back
-    /// from the metadata block). A single read then updates both files by where
-    /// the card now lives:
-    ///
-    /// * **terminal** (`done`/`canceled`) ⇒ dropped from the open index and
-    ///   spliced to the top of the done-history page (the just-merged task shows
-    ///   at the top of the column immediately);
-    /// * **non-terminal** ⇒ patched into the open index and dropped from the
-    ///   done-history page (a reopen leaves the history);
-    /// * **gone** ⇒ removed from both.
-    ///
-    /// Best-effort by design: if no index/page has been published yet, or the
-    /// single read fails, this leaves the files alone and the next daemon tick /
-    /// history fetch reconciles. The caches' freshness envelopes are never
-    /// touched here — only the daemon and the cadence fetch advance those.
-    fn write_through(&self, id: &str) {
-        match self.inner.get(id) {
-            Ok(Some(f)) if is_terminal(&f.task.column) => {
-                let _ = crate::board_index::remove_board_index_issue(&self.project, id);
-                let _ = done_history::patch_done_history_issue(&self.project, &f);
-            }
-            Ok(Some(f)) => {
-                let _ = crate::board_index::patch_board_index_issue(&self.project, &f);
-                let _ = done_history::remove_done_history_issue(&self.project, id);
-            }
-            // Gone from the backend ⇒ off both caches.
-            Ok(None) => {
-                let _ = crate::board_index::remove_board_index_issue(&self.project, id);
-                let _ = done_history::remove_done_history_issue(&self.project, id);
-            }
-            // A failed single read leaves the caches for the next tick to fix.
-            Err(_) => {}
-        }
     }
 }
 
@@ -535,43 +493,30 @@ impl IssueStore for CachedIssueStore {
     fn add(&self, spec: NewIssue) -> Result<Issue> {
         let out = self.inner.add(spec)?;
         self.invalidate();
-        // Splice the new card into the published index so the sidebar/board see
-        // it before the next daemon tick (write-through).
-        self.write_through(&out.id);
         Ok(out)
     }
 
     fn move_status(&self, id: &str, to: &Column, reason: &str) -> Result<Option<StatusMove>> {
         let out = self.inner.move_status(id, to, reason)?;
         self.invalidate();
-        // Write the move through to the open index and the done-history page: a
-        // move into a terminal column drops the card from the index and splices
-        // it to the top of the done column (`write_through` decides by where the
-        // card lands).
-        self.write_through(id);
         Ok(out)
     }
 
     fn set_priority(&self, id: &str, pos: PrioMove) -> Result<()> {
         self.inner.set_priority(id, pos)?;
         self.invalidate();
-        self.write_through(id);
         Ok(())
     }
 
     fn set_fields(&self, id: &str, fields: IssueFields) -> Result<()> {
         self.inner.set_fields(id, fields)?;
         self.invalidate();
-        self.write_through(id);
         Ok(())
     }
 
     fn cancel(&self, id: &str, reason: &str) -> Result<Option<StatusMove>> {
         let out = self.inner.cancel(id, reason)?;
         self.invalidate();
-        // Cancel lands the card in the terminal `canceled` column: dropped from
-        // the open index, spliced to the top of the done-history page.
-        self.write_through(id);
         Ok(out)
     }
 
@@ -583,7 +528,6 @@ impl IssueStore for CachedIssueStore {
     ) -> Result<Option<StatusMove>> {
         let out = self.inner.move_status_and_unassign(id, to, reason)?;
         self.invalidate();
-        self.write_through(id);
         Ok(out)
     }
 
@@ -1164,91 +1108,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ----- board-index write-through (§5) -----------------------------------
-
-    /// An inner store whose `get` returns a caller-chosen issue (or `None`), so
-    /// a write-through test can drive `CachedIssueStore`'s post-write single
-    /// read deterministically. Every mutation is an inert stub — the point is
-    /// what `write_through_index` splices into the file, not what the backend
-    /// does. Reuses the shared `issue` fixture's shape.
-    struct GetStore {
-        got: Option<IssueFile>,
-    }
-    impl IssueStore for GetStore {
-        fn list(&self) -> Result<Vec<IssueFile>> {
-            Ok(Vec::new())
-        }
-        fn list_in_status(&self, _s: &Column) -> Result<Vec<IssueFile>> {
-            Ok(Vec::new())
-        }
-        fn get(&self, _id: &str) -> Result<Option<IssueFile>> {
-            Ok(self.got.clone())
-        }
-        fn add(&self, _s: NewIssue) -> Result<Issue> {
-            unreachable!()
-        }
-        fn move_status(&self, _i: &str, _t: &Column, _r: &str) -> Result<Option<StatusMove>> {
-            Ok(None)
-        }
-        fn set_priority(&self, _i: &str, _p: PrioMove) -> Result<()> {
-            Ok(())
-        }
-        fn set_fields(&self, _i: &str, _f: IssueFields) -> Result<()> {
-            Ok(())
-        }
-        fn cancel(&self, _i: &str, _r: &str) -> Result<Option<StatusMove>> {
-            Ok(None)
-        }
-        fn move_status_and_unassign(
-            &self,
-            _i: &str,
-            _t: &Column,
-            _r: &str,
-        ) -> Result<Option<StatusMove>> {
-            Ok(None)
-        }
-        fn delete(&self, _id: &str) -> Result<()> {
-            Ok(())
-        }
-        fn renumber(&self, _s: &Column) -> Result<()> {
-            Ok(())
-        }
-        fn park_review(&self, _id: &str) -> Result<Option<String>> {
-            Ok(None)
-        }
-        fn clear_parked(&self, _id: &str) -> Result<()> {
-            Ok(())
-        }
-        fn reject_review(
-            &self,
-            _i: &str,
-            _r: &Column,
-            _s: &str,
-            _d: &str,
-        ) -> Result<Option<StatusMove>> {
-            Ok(None)
-        }
-        fn poll_changes(&self, _s: &Cursor) -> Result<(Vec<IssueChange>, Cursor)> {
-            Ok((Vec::new(), Cursor::start()))
-        }
-        fn list_comments(&self, _id: &str) -> Result<Vec<IssueComment>> {
-            Ok(Vec::new())
-        }
-        fn add_comment(&self, _id: &str, _b: &str) -> Result<IssueComment> {
-            unreachable!()
-        }
-    }
-
-    fn cached_over_get(project: &str, got: Option<IssueFile>) -> CachedIssueStore {
-        CachedIssueStore {
-            inner: Box::new(GetStore { got }),
-            project: project.to_string(),
-            cfg: offline_cfg(),
-            snapshot: None,
-        }
-    }
-
-    /// A `SHELBI_HOME`-isolating guard so the write-through's `board-index.json`
+    /// A `SHELBI_HOME`-isolating guard so a test's `board-index.json`
     /// writes land in a temp dir, never the developer's real `~/.shelbi`. Held
     /// under the crate test lock (`set_var` is process-global).
     struct HomeGuard {
@@ -1289,99 +1149,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_move_writes_through_to_the_board_index_before_the_next_tick() {
-        // §5 write-through: after a remote move the just-mutated issue is spliced
-        // into the daemon-owned `board-index.json` (re-read via the single-issue
-        // path), so the sidebar/board see the new column on their next paint.
-        let _home = HomeGuard::new("move");
-        // Seed the index as the daemon last published it: `a` in todo.
-        crate::write_board_index(
-            "cache-wt-move",
-            &crate::BoardIndex::fresh(vec![issue("a", "todo")]),
-        )
-        .unwrap();
-        // The post-write single read now shows `a` in review.
-        let store = cached_over_get("cache-wt-move", Some(issue("a", "review")));
-        store.move_status("a", &Column::review(), "handoff").unwrap();
-
-        let idx = crate::read_board_index("cache-wt-move").expect("index still present");
-        let a = idx.board.iter().find(|f| f.task.id == "a").expect("a present");
-        assert_eq!(a.task.column.as_str(), "review", "the move was written through");
-    }
-
-    #[test]
-    fn a_move_into_a_terminal_column_drops_the_card_from_the_index() {
-        // A move whose fresh read shows the card now terminal (done/canceled)
-        // takes it off the open index, since the open board omits history.
-        let _home = HomeGuard::new("term");
-        crate::write_board_index(
-            "cache-wt-term",
-            &crate::BoardIndex::fresh(vec![issue("a", "in-progress"), issue("b", "todo")]),
-        )
-        .unwrap();
-        // Fresh read shows `a` closed → done.
-        let store = cached_over_get("cache-wt-term", Some(issue("a", "done")));
-        store.cancel("a", "obsolete").unwrap();
-
-        let idx = crate::read_board_index("cache-wt-term").unwrap();
-        assert!(
-            !idx.board.iter().any(|f| f.task.id == "a"),
-            "a terminal card is dropped from the open index"
-        );
-        assert!(idx.board.iter().any(|f| f.task.id == "b"), "others untouched");
-    }
-
-    #[test]
-    fn a_completion_writes_through_to_the_top_of_the_done_history_page() {
-        // §4 write-through: a merge/cancel through shelbi splices the just-closed
-        // issue to the top of the cached done-history page, so it shows at the
-        // top of the done column immediately instead of waiting out the 10-minute
-        // TTL.
-        let _home = HomeGuard::new("wt-done");
-        // Seed a cached page as the last fetch left it (one older done card).
-        done_history::write_done_history(
-            "cache-wt-done",
-            &DoneHistory::from_page(&ClosedPage {
-                issues: vec![issue("older", "done")],
-                next_cursor: None,
-                remaining: None,
-                reset: None,
-            }),
-        )
-        .unwrap();
-        // The post-write single read shows `fresh` now done.
-        let store = cached_over_get("cache-wt-done", Some(issue("fresh", "done")));
-        store.move_status("fresh", &Column::done(), "merge").unwrap();
-
-        let page = done_history::read_done_history("cache-wt-done").unwrap();
-        assert_eq!(page.issues[0].task.id, "fresh", "the merge shows at the top");
-        assert!(page.issues.iter().any(|f| f.task.id == "older"));
-    }
-
-    #[test]
-    fn a_reopen_drops_the_card_from_the_done_history_page() {
-        // The complement: a card moved back out of a terminal column leaves the
-        // cached done-history page (and lands in the open index instead).
-        let _home = HomeGuard::new("wt-reopen");
-        done_history::write_done_history(
-            "cache-wt-reopen",
-            &DoneHistory::from_page(&ClosedPage {
-                issues: vec![issue("a", "done"), issue("b", "done")],
-                next_cursor: None,
-                remaining: None,
-                reset: None,
-            }),
-        )
-        .unwrap();
-        // Fresh read shows `a` reopened to todo.
-        let store = cached_over_get("cache-wt-reopen", Some(issue("a", "todo")));
-        store.move_status("a", &Column::todo(), "reopen").unwrap();
-
-        let page = done_history::read_done_history("cache-wt-reopen").unwrap();
-        assert!(!page.issues.iter().any(|f| f.task.id == "a"), "a left the history");
-        assert!(page.issues.iter().any(|f| f.task.id == "b"), "others untouched");
-    }
+    // The board-index / done-history write-through is now the backend's job
+    // (`GitHubStore::publish_write`), so its coverage lives in the `github_store`
+    // test module over a real `GitHubStore` with a recording runner — the
+    // `CachedIssueStore` no longer re-reads or publishes after a mutation.
 
     /// A store whose `closed_page` splices a freshly-completed card into the
     /// done-history file **before** returning the fetched page — the deterministic
