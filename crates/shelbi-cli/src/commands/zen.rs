@@ -779,11 +779,11 @@ fn format_duration(d: Duration) -> String {
         // without this guard a zero duration renders as the nonsensical
         // "0d" (largest unit) instead of the expected "0s".
         "0s".to_string()
-    } else if secs % 86_400 == 0 {
+    } else if secs.is_multiple_of(86_400) {
         format!("{}d", secs / 86_400)
-    } else if secs % 3600 == 0 {
+    } else if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")

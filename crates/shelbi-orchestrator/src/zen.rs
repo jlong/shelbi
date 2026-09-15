@@ -7419,7 +7419,7 @@ fn bootstrap_isolated_node_dependencies(
     let mut dependency_roots = discover_isolated_node_modules(host, probe_worktree)?;
     for dependency in dependency_candidates
         .into_iter()
-        .filter(|path| !path.file_name().is_some_and(|name| name == "node_modules"))
+        .filter(|path| path.file_name().is_none_or(|name| name != "node_modules"))
     {
         let dependency_text = dependency.to_string_lossy().into_owned();
         let exists =
@@ -7987,7 +7987,7 @@ done
         ));
     }
     let fields: Vec<&str> = stdout.split_terminator('\0').collect();
-    if fields.len() % 2 != 0 {
+    if !fields.len().is_multiple_of(2) {
         return Err(Error::Other(
             "installed dependency link scan returned an incomplete path/target pair".into(),
         ));
@@ -8011,7 +8011,7 @@ done
         })
         .collect::<Result<_>>()?;
     let mut links = std::collections::HashMap::new();
-    for pair in fields.chunks_exact(2) {
+    for pair in fields.as_chunks::<2>().0 {
         let path = normalize_absolute_path(std::path::Path::new(pair[0])).ok_or_else(|| {
             Error::Other(format!(
                 "installed dependency link `{}` is not a safe absolute path",

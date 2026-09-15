@@ -701,7 +701,7 @@ fn lint_inventory(
         .entries
         .iter()
         .filter(|entry| {
-            selected_projects.map_or(true, |projects| {
+            selected_projects.is_none_or(|projects| {
                 entry.scope == "global"
                     || entry
                         .scope

@@ -412,7 +412,7 @@ fn refresh_manager_loop(refresher: &BoardRefresher, stop: &AtomicBool) {
                     if paused.remove(project) {
                         tracing::info!(project, "shelbi daemon: board refresh resumed (budget recovered)");
                     }
-                    let due = last.get(project).map_or(true, |t| t.elapsed() >= interval);
+                    let due = last.get(project).is_none_or(|t| t.elapsed() >= interval);
                     if due {
                         refresher.tick(project, &tier);
                         last.insert(project.clone(), Instant::now());
