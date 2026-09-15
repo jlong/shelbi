@@ -1433,7 +1433,7 @@ fn matching_resume_response(
         return false;
     };
     value.get("method").is_none()
-        && value.get("error").map_or(true, Value::is_null)
+        && value.get("error").is_none_or(Value::is_null)
         && value
             .get("id")
             .is_some_and(|id| pending_resume_ids.contains(id))

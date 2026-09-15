@@ -418,7 +418,7 @@ fn run_workspace_poll_loop(
         // its own slow cadence (independent of the poll interval) so the
         // common case adds no per-poll cost. Failures are logged, not fatal
         // — a wedged forward shouldn't stop us observing pane state.
-        if next_forward_check.map_or(true, |t| Instant::now() >= t) {
+        if next_forward_check.is_none_or(|t| Instant::now() >= t) {
             if let Some(machine) = project.machine(&workspace.machine) {
                 let host = machine.host();
                 if let Err(e) = shelbi_ssh::ensure_reverse_forward(&host, machine.forward) {
@@ -1153,7 +1153,7 @@ fn zen_heartbeat_cue(
         return Some(ZenHeartbeatCue::Reread);
     }
 
-    if schedule.zen_heartbeats % ZEN_SUMMARY_EVERY_N_HEARTBEATS == 0 {
+    if schedule.zen_heartbeats.is_multiple_of(ZEN_SUMMARY_EVERY_N_HEARTBEATS) {
         return match read_zenmode_summary(&project.name) {
             Ok(Some(summary)) => Some(ZenHeartbeatCue::Summary(summary)),
             _ => Some(ZenHeartbeatCue::Plain),

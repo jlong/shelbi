@@ -2733,7 +2733,7 @@ fn kanban_columns_from(
         .filter(|st| {
             allowed
                 .as_ref()
-                .map_or(true, |set| set.contains(st.id.as_str()))
+                .is_none_or(|set| set.contains(st.id.as_str()))
         })
         .map(|st| KanbanColumn {
             status_id: st.id.clone(),

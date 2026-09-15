@@ -1908,7 +1908,7 @@ mod tests {
             .expect("missing ExitOnForwardFailure=yes");
         let no = args.iter().position(|a| a == "ExitOnForwardFailure=no");
         assert!(
-            no.map_or(true, |n| yes < n),
+            no.is_none_or(|n| yes < n),
             "=yes must precede =no so it wins: {args:?}"
         );
 

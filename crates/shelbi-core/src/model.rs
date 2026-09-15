@@ -442,9 +442,9 @@ fn format_heartbeat_duration(d: Duration) -> String {
     if secs == 0 {
         return "0s".to_string();
     }
-    if secs % 3600 == 0 {
+    if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")

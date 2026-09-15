@@ -2002,13 +2002,13 @@ where
 
     // Fallback: reconstruct from the parsed pairs in a stable order.
     let mut ops = Vec::new();
-    for pair in args.sub.chunks_exact(2) {
+    for pair in args.sub.as_chunks::<2>().0 {
         ops.push(SubOp::Literal {
             from: pair[0].clone(),
             to: pair[1].clone(),
         });
     }
-    for pair in args.sub_regex.chunks_exact(2) {
+    for pair in args.sub_regex.as_chunks::<2>().0 {
         ops.push(SubOp::Regex {
             pattern: pair[0].clone(),
             replacement: pair[1].clone(),
