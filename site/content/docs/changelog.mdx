@@ -9,6 +9,15 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### September 15, 2026
+
+**Codex orchestrator conversations stay quiet and bounded.** The native bridge
+consumes no-op heartbeats without starting model turns, limits resume hydration
+to the newest 250 turns, and rotates at a safe idle boundary once that limit is
+reached. Changing the configured Codex command or flags on reload also starts a
+fresh conversation so model and CLI switches take effect. Prior conversations
+are archived rather than deleted.
+
 ### August 25, 2026
 
 **v0.9.0. Multi-runner agents, plus review-slot and orchestrator hardening.**

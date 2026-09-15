@@ -55,6 +55,7 @@ const OVERLOAD_RETRY: Duration = Duration::from_secs(1);
 const TUI_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const EVENT_BATCH_MAX_SERIALIZED_INPUT_BYTES: usize = 32 * 1024;
 const EVENT_BATCH_MAX_EVENTS: usize = 64;
+const THREAD_TURN_LIMIT: usize = 250;
 const THREAD_INIT_ITEM: &str =
     "[SHELBI_NATIVE_THREAD] Project-owned thread initialized; await the first turn.";
 
@@ -75,27 +76,12 @@ impl SystemSkillInjection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum WakePriority {
-    /// A quiet-board heartbeat that carries no actionable work. Codex is
-    /// push-only, so it still needs the heartbeat typed into its prompt to run
-    /// a turn and drain/react; this keep-alive tier delivers exactly that. It
-    /// sits below every actionable tier and, unlike them, never advances
-    /// actionable wake state (runner-switch gating, coalesce direction), so a
-    /// quiet heartbeat can never mask or re-order a pending actionable batch.
-    HeartbeatKeepAlive,
     Heartbeat,
     WorkspaceFree,
     Ready,
     Handoff,
     ZenMode,
     SupervisionGaveUp,
-}
-
-impl WakePriority {
-    /// True for the low-priority keep-alive tier, which makes a batch
-    /// deliverable to Codex without counting as actionable.
-    fn is_keep_alive(self) -> bool {
-        matches!(self, WakePriority::HeartbeatKeepAlive)
-    }
 }
 
 /// Why the native Codex bridge disengaged and dropped to standalone
@@ -378,7 +364,8 @@ fn run_codex_bridge_until_shutdown(
             return Ok(());
         }
         match result {
-            Ok(()) => return Ok(()),
+            Ok(NativeRunOutcome::Stopped) => return Ok(()),
+            Ok(NativeRunOutcome::Rotated) => continue,
             Err(error) if protocol_unsupported => {
                 eprintln!(
                     "shelbi: Codex native event bridge unavailable ({error}); \
@@ -476,6 +463,12 @@ struct AwaitingNonSteerableCompletion {
     kind: NonSteerableTurnKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeRunOutcome {
+    Stopped,
+    Rotated,
+}
+
 struct NativeBridge {
     project: Project,
     workdir: PathBuf,
@@ -547,6 +540,7 @@ impl NativeBridge {
             &workdir,
             &developer_instructions,
             system_skill_injection,
+            &runner,
         )?;
 
         let mut runtime = ThreadRuntime::default();
@@ -614,13 +608,14 @@ impl NativeBridge {
         })
     }
 
-    fn run(&mut self, shutdown: &AtomicBool) -> Result<()> {
+    fn run(&mut self, shutdown: &AtomicBool) -> Result<NativeRunOutcome> {
         loop {
             if shutdown.load(Ordering::Acquire) {
-                return Ok(());
+                return Ok(NativeRunOutcome::Stopped);
             }
             if let Some(status) = self.tui.try_wait().map_err(Error::Io)? {
-                return exit_status(status, "Codex remote TUI");
+                return exit_status(status, "Codex remote TUI")
+                    .map(|()| NativeRunOutcome::Stopped);
             }
             if let Some(status) = self.server.child.try_wait().map_err(Error::Io)? {
                 let _ = self.tui.kill();
@@ -654,6 +649,7 @@ impl NativeBridge {
             self.maybe_reconnect();
             self.maybe_send_bootstrap()?;
 
+            let mut queue_refreshed = false;
             if Instant::now() >= self.next_scan {
                 if let Err(error) =
                     self.queue
@@ -664,19 +660,51 @@ impl NativeBridge {
                         %error,
                         "Codex event queue refresh failed; retaining prior queue"
                     );
-                } else if let Err(error) = self.queue.save(&self.queue_path) {
-                    tracing::warn!(
-                        project = %self.project.name,
-                        %error,
-                        "Codex event queue persistence failed"
-                    );
+                } else {
+                    match self.queue.save(&self.queue_path) {
+                        Ok(()) => queue_refreshed = true,
+                        Err(error) => tracing::warn!(
+                            project = %self.project.name,
+                            %error,
+                            "Codex event queue persistence failed"
+                        ),
+                    }
                 }
                 self.next_scan = Instant::now() + EVENT_SCAN_INTERVAL;
+            }
+
+            if queue_refreshed {
+                let cursor = read_applied_cursor(&self.project.name)?;
+                if should_rotate_thread(&self.runtime, &self.queue, cursor) {
+                    self.rotate_thread()?;
+                    return Ok(NativeRunOutcome::Rotated);
+                }
             }
 
             self.maybe_deliver_event()?;
             thread::sleep(LOOP_SLEEP);
         }
+    }
+
+    fn rotate_thread(&mut self) -> Result<()> {
+        self.queue.save(&self.queue_path)?;
+        self.rpc
+            .as_mut()
+            .ok_or_else(|| Error::Other("Codex event connection unavailable".into()))?
+            .request(
+                "thread/archive",
+                json!({"threadId": self.thread_id}),
+                RPC_TIMEOUT,
+            )
+            .map_err(rpc_error)?;
+        archive_persisted_codex_thread(&self.project.name)?;
+        tracing::info!(
+            project = %self.project.name,
+            thread_id = %self.thread_id,
+            turns = self.runtime.turn_ids.len(),
+            "rotating bounded Codex orchestrator thread"
+        );
+        Ok(())
     }
 
     fn poll_notifications(&mut self) {
@@ -789,11 +817,9 @@ impl NativeBridge {
         let ThreadPhase::Active(active_id) = &self.runtime.phase else {
             return;
         };
-        let active_turn = thread
-            .get("turns")
-            .and_then(Value::as_array)
+        let turns = response_turns(response);
+        let active_turn = turns
             .into_iter()
-            .flatten()
             .find(|turn| {
                 turn.get("id").and_then(Value::as_str) == Some(active_id)
                     && turn.get("status").and_then(Value::as_str) == Some("inProgress")
@@ -833,11 +859,11 @@ impl NativeBridge {
             let response = rpc
                 .request(
                     "thread/resume",
-                    json!({
-                        "threadId": self.thread_id,
-                        "cwd": self.workdir,
-                        "developerInstructions": self.developer_instructions,
-                    }),
+                    resume_params(
+                        &self.thread_id,
+                        &self.workdir,
+                        &self.developer_instructions,
+                    ),
                     RPC_TIMEOUT,
                 )
                 .map_err(rpc_error)?;
@@ -1330,9 +1356,14 @@ fn relay_tui_message(
     };
     match message {
         Message::Text(text) => {
-            if let Some(id) = matching_resume_request_id(text.as_str(), owned_thread_id) {
+            let text = if let Some((id, bounded)) =
+                bounded_resume_request(text.as_str(), owned_thread_id)
+            {
                 pending_resume_ids.push(id);
-            }
+                bounded.into()
+            } else {
+                text
+            };
             server
                 .send(Message::Text(text))
                 .map_err(|error| format!("failed to forward TUI request: {error}"))?;
@@ -1422,6 +1453,22 @@ fn matching_resume_request_id(text: &str, owned_thread_id: &str) -> Option<Value
     }
     let id = value.get("id")?;
     (id.is_number() || id.is_string()).then(|| id.clone())
+}
+
+fn bounded_resume_request(text: &str, owned_thread_id: &str) -> Option<(Value, String)> {
+    let mut value: Value = serde_json::from_str(text).ok()?;
+    let id = matching_resume_request_id(text, owned_thread_id)?;
+    let params = value.get_mut("params")?.as_object_mut()?;
+    params.insert("excludeTurns".into(), Value::Bool(true));
+    params.insert(
+        "initialTurnsPage".into(),
+        json!({
+            "limit": THREAD_TURN_LIMIT,
+            "sortDirection": "desc",
+            "itemsView": "notLoaded",
+        }),
+    );
+    Some((id, value.to_string()))
 }
 
 fn matching_resume_response(
@@ -1847,6 +1894,30 @@ struct PersistedThread {
     /// Session-scoped path used to load Shelbi's reserved system skill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     system_skill_injection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch: Option<CodexLaunchSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CodexLaunchSnapshot {
+    command: String,
+    flags: Vec<String>,
+}
+
+impl From<&shelbi_core::AgentRunnerSpec> for CodexLaunchSnapshot {
+    fn from(runner: &shelbi_core::AgentRunnerSpec) -> Self {
+        Self {
+            command: runner.command.clone(),
+            flags: runner.flags.clone(),
+        }
+    }
+}
+
+fn launch_config_changed(
+    recorded: Option<&CodexLaunchSnapshot>,
+    current: &CodexLaunchSnapshot,
+) -> bool {
+    recorded.is_some_and(|recorded| recorded != current)
 }
 
 fn configure_codex_system_skill(
@@ -1929,79 +2000,89 @@ fn open_owned_thread(
     workdir: &Path,
     developer_instructions: &str,
     system_skill_injection: SystemSkillInjection,
+    runner: &shelbi_core::AgentRunnerSpec,
 ) -> NativeStartupResult<(String, u64, Value)> {
     let path = workdir.join(THREAD_STATE_FILE);
+    let launch = CodexLaunchSnapshot::from(runner);
     let persisted =
         load_thread_state(&path, project).map_err(NativeStartupError::transient)?;
     if let Some(mut state) = persisted {
-        let response = rpc.request(
-            "thread/resume",
-            json!({
-                "threadId": state.thread_id,
-                "cwd": workdir,
-                "developerInstructions": developer_instructions,
-            }),
-            RPC_TIMEOUT,
-        );
-        match response {
-            Ok(response) => {
-                let was_disengaged = !state.native_active;
-                state.bootstrap_generation = state.bootstrap_generation.saturating_add(1);
-                state.native_active = true;
-                state.native_inactive_reason = None;
-                state.system_skill_injection =
-                    Some(system_skill_injection.as_token().to_string());
-                save_json_atomic(&path, &state).map_err(NativeStartupError::transient)?;
-                // Only a genuine degraded -> structured recovery is worth a
-                // transition event; a normal restart resumes an already-active
-                // thread and stays silent.
-                if was_disengaged {
-                    if let Err(error) = shelbi_state::append_integration_event(
-                        project,
-                        ORCHESTRATOR_AGENT_NAME,
-                        IntegrationMode::Structured,
-                        IntegrationMode::Structured,
-                        "native-bridge-reengaged",
-                    ) {
-                        tracing::warn!(
+        if launch_config_changed(state.launch.as_ref(), &launch) {
+            let thread_id = state.thread_id.clone();
+            rpc.request(
+                "thread/archive",
+                json!({"threadId": thread_id}),
+                RPC_TIMEOUT,
+            )
+            .map_err(NativeStartupError::from_rpc)?;
+            archive_persisted_codex_thread(project).map_err(NativeStartupError::transient)?;
+        } else {
+            let response = rpc.request(
+                "thread/resume",
+                resume_params(&state.thread_id, workdir, developer_instructions),
+                RPC_TIMEOUT,
+            );
+            match response {
+                Ok(response) => {
+                    let was_disengaged = !state.native_active;
+                    state.bootstrap_generation = state.bootstrap_generation.saturating_add(1);
+                    state.native_active = true;
+                    state.native_inactive_reason = None;
+                    state.system_skill_injection =
+                        Some(system_skill_injection.as_token().to_string());
+                    state.launch = Some(launch.clone());
+                    save_json_atomic(&path, &state).map_err(NativeStartupError::transient)?;
+                    // Only a genuine degraded -> structured recovery is worth a
+                    // transition event; a normal restart resumes an already-active
+                    // thread and stays silent.
+                    if was_disengaged {
+                        if let Err(error) = shelbi_state::append_integration_event(
                             project,
-                            %error,
-                            "failed to record Codex bridge re-engagement integration event"
-                        );
+                            ORCHESTRATOR_AGENT_NAME,
+                            IntegrationMode::Structured,
+                            IntegrationMode::Structured,
+                            "native-bridge-reengaged",
+                        ) {
+                            tracing::warn!(
+                                project,
+                                %error,
+                                "failed to record Codex bridge re-engagement integration event"
+                            );
+                        }
+                    }
+                    return Ok((state.thread_id, state.bootstrap_generation, response));
+                }
+                Err(error @ CodexRpcError::Remote { .. }) => {
+                    let CodexRpcError::Remote { code, message, .. } = &error else {
+                        unreachable!("matched remote error")
+                    };
+                    match classify_persisted_resume_rejection(
+                        state.native_active,
+                        *code,
+                        message,
+                    ) {
+                        PersistedResumeRejection::ReplaceInactiveMissing => {
+                            // A stale, inactive compatibility marker may be
+                            // replaced with a new project-owned thread.
+                        }
+                        PersistedResumeRejection::RetryTransient => {
+                            // A missing exact thread can be a transient rollout or
+                            // storage visibility failure. Once the visible TUI has
+                            // established native ownership, never turn that signal
+                            // into either an arbitrary replacement thread or a
+                            // standalone downgrade.
+                            return Err(NativeStartupError::transient(Error::Other(format!(
+                                "failed to resume persisted Codex thread `{}` ({code}): {message}",
+                                state.thread_id
+                            ))));
+                        }
+                        PersistedResumeRejection::Incompatible => {
+                            return Err(NativeStartupError::from_rpc(error));
+                        }
                     }
                 }
-                return Ok((state.thread_id, state.bootstrap_generation, response));
+                Err(error) => return Err(NativeStartupError::from_rpc(error)),
             }
-            Err(error @ CodexRpcError::Remote { .. }) => {
-                let CodexRpcError::Remote { code, message, .. } = &error else {
-                    unreachable!("matched remote error")
-                };
-                match classify_persisted_resume_rejection(
-                    state.native_active,
-                    *code,
-                    message,
-                ) {
-                    PersistedResumeRejection::ReplaceInactiveMissing => {
-                        // A stale, inactive compatibility marker may be
-                        // replaced with a new project-owned thread.
-                    }
-                    PersistedResumeRejection::RetryTransient => {
-                        // A missing exact thread can be a transient rollout or
-                        // storage visibility failure. Once the visible TUI has
-                        // established native ownership, never turn that signal
-                        // into either an arbitrary replacement thread or a
-                        // standalone downgrade.
-                        return Err(NativeStartupError::transient(Error::Other(format!(
-                            "failed to resume persisted Codex thread `{}` ({code}): {message}",
-                            state.thread_id
-                        ))));
-                    }
-                    PersistedResumeRejection::Incompatible => {
-                        return Err(NativeStartupError::from_rpc(error));
-                    }
-                }
-            }
-            Err(error) => return Err(NativeStartupError::from_rpc(error)),
         }
     }
 
@@ -2034,9 +2115,24 @@ fn open_owned_thread(
         native_active: true,
         native_inactive_reason: None,
         system_skill_injection: Some(system_skill_injection.as_token().to_string()),
+        launch: Some(launch),
     };
     save_json_atomic(&path, &state).map_err(NativeStartupError::transient)?;
     Ok((thread_id, 1, response))
+}
+
+fn resume_params(thread_id: &str, workdir: &Path, developer_instructions: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "cwd": workdir,
+        "developerInstructions": developer_instructions,
+        "excludeTurns": true,
+        "initialTurnsPage": {
+            "limit": THREAD_TURN_LIMIT,
+            "sortDirection": "desc",
+            "itemsView": "notLoaded",
+        },
+    })
 }
 
 fn materialize_thread(
@@ -2318,6 +2414,7 @@ struct ThreadRuntime {
     phase: ThreadPhase,
     generation: u64,
     seen_client_ids: HashSet<String>,
+    turn_ids: HashSet<String>,
 }
 
 impl ThreadRuntime {
@@ -2328,12 +2425,16 @@ impl ThreadRuntime {
         if thread.get("id").and_then(Value::as_str) != Some(thread_id) {
             return;
         }
-        collect_client_ids(thread, &mut self.seen_client_ids);
-        let in_progress = thread
-            .get("turns")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+        collect_client_ids(response, &mut self.seen_client_ids);
+        let turns = response_turns(response);
+        self.turn_ids.extend(
+            turns
+                .iter()
+                .filter_map(|turn| turn.get("id").and_then(Value::as_str))
+                .map(str::to_string),
+        );
+        let in_progress = turns
+            .iter()
             .filter(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
             .filter_map(|turn| turn.get("id").and_then(Value::as_str))
             .collect::<Vec<_>>();
@@ -2357,6 +2458,11 @@ impl ThreadRuntime {
             return;
         }
         collect_client_ids(params, &mut self.seen_client_ids);
+        if matches!(notification.method.as_str(), "turn/started" | "turn/completed") {
+            if let Some(turn_id) = params.pointer("/turn/id").and_then(Value::as_str) {
+                self.turn_ids.insert(turn_id.to_string());
+            }
+        }
         match notification.method.as_str() {
             "thread/started" => {
                 if let Some(status) = params
@@ -2409,6 +2515,26 @@ impl ThreadRuntime {
             self.generation = self.generation.saturating_add(1);
         }
     }
+
+    fn reached_turn_limit(&self) -> bool {
+        self.turn_ids.len() >= THREAD_TURN_LIMIT
+    }
+}
+
+fn response_turns(response: &Value) -> Vec<&Value> {
+    response
+        .pointer("/initialTurnsPage/data")
+        .and_then(Value::as_array)
+        .or_else(|| response.pointer("/thread/turns").and_then(Value::as_array))
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn should_rotate_thread(runtime: &ThreadRuntime, queue: &DurableQueue, cursor: u64) -> bool {
+    runtime.reached_turn_limit()
+        && runtime.phase == ThreadPhase::Idle
+        && queue.pending_delivery_ids(cursor).is_empty()
 }
 
 fn collect_client_ids(value: &Value, output: &mut HashSet<String>) {
@@ -2483,19 +2609,11 @@ struct QueuedBatch {
     events: Vec<NormalizedEvent>,
     input: String,
     /// Quiet chunks are retained to bound catch-up memory but become
-    /// deliverable only when this or a later queued chunk is actionable
-    /// (or keep-alive; see `keep_alive`). Older queue files contain only
+    /// deliverable only when this or a later queued chunk is actionable.
+    /// Older queue files contain only
     /// actionable batches, so missing values deliberately deserialize as true.
     #[serde(default = "default_true")]
     actionable: bool,
-    /// A quiet heartbeat carries no actionable work but must still nudge the
-    /// Codex push path so it runs a turn instead of stalling. Such a batch is
-    /// deliverable via `next_pending` yet, unlike an actionable batch, never
-    /// advances actionable wake state (`pending_delivery_ids`) or flips the
-    /// coalesce direction gate. Absent in older queue files, so it defaults
-    /// to false.
-    #[serde(default)]
-    keep_alive: bool,
     #[serde(default)]
     attempted: bool,
     #[serde(default)]
@@ -2505,7 +2623,7 @@ struct QueuedBatch {
 impl QueuedBatch {
     #[cfg(test)]
     fn new(project: &str, from: u64, through: u64, events: Vec<NormalizedEvent>) -> Self {
-        Self::new_with_flags(project, from, through, events, true, false)
+        Self::new_with_flags(project, from, through, events, true)
     }
 
     fn new_with_flags(
@@ -2514,7 +2632,6 @@ impl QueuedBatch {
         through: u64,
         events: Vec<NormalizedEvent>,
         actionable: bool,
-        keep_alive: bool,
     ) -> Self {
         let message_id = stable_message_id(project, from, through);
         let input = event_batch_input(project, from, through, &message_id, &events);
@@ -2527,7 +2644,6 @@ impl QueuedBatch {
             events,
             input,
             actionable,
-            keep_alive,
             attempted: false,
             status: DeliveryStatus::Pending,
         }
@@ -2536,6 +2652,10 @@ impl QueuedBatch {
     fn is_bounded(&self) -> bool {
         self.events.len() <= EVENT_BATCH_MAX_EVENTS
             && serialized_input_bytes(&self.input) <= EVENT_BATCH_MAX_SERIALIZED_INPUT_BYTES
+    }
+
+    fn is_quiet_heartbeat(&self) -> bool {
+        !self.actionable && self.events.iter().all(|event| event.kind == "heartbeat")
     }
 
     fn try_coalesce(&mut self, project: &str, newer: QueuedBatch) -> bool {
@@ -2560,7 +2680,6 @@ impl QueuedBatch {
         self.message_id = message_id;
         self.input = input;
         self.actionable |= newer.actionable;
-        self.keep_alive |= newer.keep_alive;
         true
     }
 }
@@ -2637,7 +2756,7 @@ impl DurableQueue {
     }
 
     fn refresh(&mut self, project: &Project, thread_id: &str, phase: &ThreadPhase) -> Result<()> {
-        let cursor = read_applied_cursor(&project.name)?;
+        let mut cursor = read_applied_cursor(&project.name)?;
         let logical_head = event_log_head()?;
 
         while self
@@ -2657,6 +2776,7 @@ impl DurableQueue {
             // which normalized items were consumed.
             self.batches.clear();
         }
+        self.ack_quiet_prefix(&mut cursor)?;
 
         if *phase == ThreadPhase::Idle {
             for batch in &mut self.batches {
@@ -2688,6 +2808,29 @@ impl DurableQueue {
             return Ok(());
         };
         self.enqueue(batch);
+        self.ack_quiet_prefix(&mut cursor)?;
+        Ok(())
+    }
+
+    fn ack_quiet_prefix(&mut self, applied_cursor: &mut u64) -> Result<()> {
+        let Some(through) = self
+            .batches
+            .iter()
+            .take_while(|batch| batch.is_quiet_heartbeat())
+            .map(|batch| batch.through)
+            .last()
+        else {
+            return Ok(());
+        };
+        shelbi_state::write_event_cursor(&self.project, through)?;
+        *applied_cursor = through;
+        while self
+            .batches
+            .front()
+            .is_some_and(|batch| batch.through <= through)
+        {
+            self.batches.pop_front();
+        }
         Ok(())
     }
 
@@ -2720,14 +2863,11 @@ impl DurableQueue {
             .iter()
             .position(|batch| batch.status == DeliveryStatus::Pending)?;
         // FIFO delivery: return the earliest pending batch when it, or a later
-        // queued batch, warrants a wake. A keep-alive (quiet heartbeat) batch
-        // counts here so Codex is nudged on a quiet board, but it is not
-        // actionable, so `pending_delivery_ids` still ignores it and a quiet
-        // heartbeat never advances actionable wake position.
+        // queued batch, warrants a wake.
         self.batches
             .iter()
             .skip(pending)
-            .any(|batch| batch.actionable || batch.keep_alive)
+            .any(|batch| batch.actionable)
             .then_some(pending)
     }
 
@@ -2855,7 +2995,6 @@ fn scan_text_batch(
     let mut through = start;
     let mut events = Vec::new();
     let mut actionable = false;
-    let mut keep_alive = false;
 
     for line_with_newline in text.split_inclusive('\n') {
         let line_start = offset;
@@ -2913,15 +3052,11 @@ fn scan_text_batch(
         }
         events = candidate_events;
         through = offset;
-        match priority {
-            Some(priority) if priority.is_keep_alive() => keep_alive = true,
-            Some(_) => actionable = true,
-            None => {}
-        }
+        actionable |= priority.is_some();
     }
 
     (through > start).then(|| {
-        QueuedBatch::new_with_flags(project, start, through, events, actionable, keep_alive)
+        QueuedBatch::new_with_flags(project, start, through, events, actionable)
     })
 }
 
@@ -3071,14 +3206,7 @@ fn line_priority(parsed: &ParsedLine, board_in_flight: bool) -> Option<WakePrior
         if board_in_flight || capacity_actionable {
             return Some(WakePriority::Heartbeat);
         }
-        // A quiet heartbeat still keeps the Codex push path live: without a
-        // wake typed into its prompt Codex stalls until the next user turn.
-        // Deliver it at the keep-alive tier so it nudges Codex to run a turn
-        // without advancing actionable wake state. This is naturally
-        // rate-limited by the hub's adaptive heartbeat cadence (standard
-        // ~3m in flight, exponential backoff to a 60m cap once quiescent), so
-        // no separate throttle is needed on a quiet board.
-        return Some(WakePriority::HeartbeatKeepAlive);
+        return None;
     }
     None
 }
@@ -3297,20 +3425,36 @@ mod tests {
         )
     }
 
-    #[test]
-    fn quiet_heartbeat_is_keep_alive_and_inflight_is_actionable() {
-        // A quiet heartbeat no longer returns None: it must keep the Codex push
-        // path live, so it wakes at the low-priority keep-alive tier. In-flight
-        // work still wakes it at the normal actionable Heartbeat tier.
-        let heartbeat = parsed("t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9");
+    fn read_websocket_json(socket: &mut WebSocket<UnixStream>) -> Value {
+        let Message::Text(text) = socket.read().unwrap() else {
+            panic!("expected JSON text frame");
+        };
+        serde_json::from_str(text.as_str()).unwrap()
+    }
+
+    fn accept_initialized_rpc(listener: &UnixListener) -> WebSocket<UnixStream> {
+        let (stream, _) = listener.accept().unwrap();
+        let mut socket = accept(stream).unwrap();
+        let initialize = read_websocket_json(&mut socket);
+        assert_eq!(initialize["method"], "initialize");
+        socket
+            .send(Message::Text(
+                json!({"id": initialize["id"], "result": {}})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
         assert_eq!(
-            line_priority(&heartbeat, false),
-            Some(WakePriority::HeartbeatKeepAlive)
+            read_websocket_json(&mut socket),
+            json!({"method": "initialized"})
         );
-        assert!(WakePriority::HeartbeatKeepAlive.is_keep_alive());
-        assert!(!WakePriority::Heartbeat.is_keep_alive());
-        // Keep-alive is the lowest tier, below every actionable tier.
-        assert!(WakePriority::HeartbeatKeepAlive < WakePriority::Heartbeat);
+        socket
+    }
+
+    #[test]
+    fn quiet_heartbeat_is_ignored_and_inflight_is_actionable() {
+        let heartbeat = parsed("t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9");
+        assert_eq!(line_priority(&heartbeat, false), None);
         assert_eq!(
             line_priority(&heartbeat, true),
             Some(WakePriority::Heartbeat)
@@ -3326,9 +3470,7 @@ mod tests {
             ),
             Some(WakePriority::Heartbeat)
         );
-        // Without both eligible work and idle capacity a heartbeat is not
-        // actionable, but it still keeps Codex alive at the keep-alive tier
-        // rather than falling through to None.
+        // Without both eligible work and idle capacity a heartbeat is quiet.
         for line in [
             "t project=demo heartbeat zen=on zen_eligible=2 idle_workspaces=0",
             "t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9",
@@ -3336,11 +3478,7 @@ mod tests {
             "t project=demo heartbeat zen=paused zen_eligible=2 idle_workspaces=9",
             "t project=demo heartbeat zen_eligible=2 idle_workspaces=9",
         ] {
-            assert_eq!(
-                line_priority(&parsed(line), false),
-                Some(WakePriority::HeartbeatKeepAlive),
-                "line: {line}"
-            );
+            assert_eq!(line_priority(&parsed(line), false), None, "line: {line}");
         }
     }
 
@@ -3619,32 +3757,26 @@ mod tests {
     }
 
     #[test]
-    fn scan_marks_quiet_heartbeat_keep_alive_and_capacity_heartbeat_actionable() {
-        // A quiet heartbeat is non-actionable but keep-alive: it never advances
-        // actionable wake state, yet it still makes the batch deliverable so
-        // Codex is nudged (see `keep_alive_heartbeat_batch_is_deliverable`).
+    fn scan_marks_quiet_heartbeat_non_actionable_and_capacity_heartbeat_actionable() {
         let quiet = "t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9\n";
         let quiet_batch = scan_text_batch("demo", 0, quiet, false).unwrap();
         assert!(!quiet_batch.actionable);
-        assert!(quiet_batch.keep_alive);
         assert_eq!(quiet_batch.events.len(), 1);
         assert_eq!(quiet_batch.events[0].kind, "heartbeat");
 
-        // Eligible work plus idle capacity is actionable, not merely keep-alive.
+        // Eligible work plus idle capacity is actionable.
         let capacity = "t project=demo heartbeat zen=on zen_eligible=2 idle_workspaces=1\n";
         let batch = scan_text_batch("demo", 0, capacity, false).unwrap();
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].kind, "heartbeat");
         assert_eq!(batch.through, capacity.len() as u64);
         assert!(batch.actionable);
-        assert!(!batch.keep_alive);
 
         // In-flight board work also makes a quiet heartbeat actionable.
         let inflight = scan_text_batch("demo", 0, quiet, true).unwrap();
         assert_eq!(inflight.events.len(), 1);
         assert_eq!(inflight.through, quiet.len() as u64);
         assert!(inflight.actionable);
-        assert!(!inflight.keep_alive);
     }
 
     #[test]
@@ -3865,6 +3997,15 @@ mod tests {
             let request: Value = serde_json::from_str(request.as_str()).unwrap();
             assert_eq!(request["method"], "thread/resume");
             assert_eq!(request["params"]["threadId"], "thread-owned");
+            assert_eq!(request["params"]["excludeTurns"], true);
+            assert_eq!(
+                request["params"]["initialTurnsPage"],
+                json!({
+                    "limit": THREAD_TURN_LIMIT,
+                    "sortDirection": "desc",
+                    "itemsView": "notLoaded"
+                })
+            );
 
             websocket
                 .send(Message::Text(
@@ -4029,6 +4170,57 @@ mod tests {
     }
 
     #[test]
+    fn runtime_counts_distinct_turns_from_the_bounded_page_and_notifications() {
+        let turns = (0..THREAD_TURN_LIMIT)
+            .map(|index| json!({"id": format!("turn-{index}"), "status": "completed"}))
+            .collect::<Vec<_>>();
+        let mut runtime = ThreadRuntime::default();
+        runtime.hydrate(
+            &json!({
+                "thread": {"id": "thread-1", "status": {"type": "idle"}, "turns": []},
+                "initialTurnsPage": {"data": turns}
+            }),
+            "thread-1",
+        );
+        assert!(runtime.reached_turn_limit());
+
+        runtime.observe(
+            &CodexRpcNotification {
+                method: "turn/started".into(),
+                params: Some(json!({
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-249"}
+                })),
+            },
+            "thread-1",
+        );
+        assert_eq!(runtime.turn_ids.len(), THREAD_TURN_LIMIT);
+    }
+
+    #[test]
+    fn turn_limit_rotation_waits_for_idle_and_no_actionable_delivery() {
+        let mut runtime = ThreadRuntime {
+            phase: ThreadPhase::Idle,
+            turn_ids: (0..THREAD_TURN_LIMIT)
+                .map(|index| format!("turn-{index}"))
+                .collect(),
+            ..ThreadRuntime::default()
+        };
+        let mut queue = DurableQueue {
+            project: "demo".into(),
+            batches: VecDeque::new(),
+        };
+        assert!(should_rotate_thread(&runtime, &queue, 0));
+
+        queue.batches.push_back(batch("demo", 0, 40));
+        assert!(!should_rotate_thread(&runtime, &queue, 0));
+        assert!(should_rotate_thread(&runtime, &queue, 40));
+
+        runtime.phase = ThreadPhase::Active("turn-249".into());
+        assert!(!should_rotate_thread(&runtime, &queue, 40));
+    }
+
+    #[test]
     fn completion_queued_with_rejection_unlocks_the_new_generation() {
         let mut runtime = ThreadRuntime::default();
         runtime.set_phase(ThreadPhase::Active("turn-1".into()));
@@ -4114,6 +4306,303 @@ mod tests {
     }
 
     #[test]
+    fn resume_requests_bound_returned_history() {
+        let params = resume_params("thread-1", Path::new("/tmp/demo"), "latest instructions");
+        assert_eq!(params["threadId"], "thread-1");
+        assert_eq!(params["developerInstructions"], "latest instructions");
+        assert_eq!(params["excludeTurns"], true);
+        assert_eq!(params["initialTurnsPage"]["limit"], THREAD_TURN_LIMIT);
+        assert_eq!(params["initialTurnsPage"]["sortDirection"], "desc");
+        assert_eq!(params["initialTurnsPage"]["itemsView"], "notLoaded");
+        assert_eq!(RPC_TIMEOUT, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn launch_snapshot_rotates_only_when_recorded_command_or_flags_change() {
+        let runner = shelbi_core::AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec!["--model".into(), "gpt-5.6".into()],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        };
+        let current = CodexLaunchSnapshot::from(&runner);
+        assert!(!launch_config_changed(None, &current));
+        assert!(!launch_config_changed(Some(&current), &current));
+
+        let mut changed = current.clone();
+        changed.flags.push("--search".into());
+        assert!(launch_config_changed(Some(&changed), &current));
+
+        changed = current.clone();
+        changed.command = "/opt/codex".into();
+        assert!(launch_config_changed(Some(&changed), &current));
+    }
+
+    #[test]
+    fn changed_launch_archives_the_old_thread_and_starts_a_new_one() {
+        let _guard = crate::test_lock::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", temp.path());
+        let workdir = shelbi_state::project_dir("demo").unwrap();
+        fs::create_dir_all(&workdir).unwrap();
+        let state_path = workdir.join(THREAD_STATE_FILE);
+        save_json_atomic(
+            &state_path,
+            &PersistedThread {
+                version: STATE_VERSION,
+                project: "demo".into(),
+                thread_id: "thread-old".into(),
+                bootstrap_generation: 4,
+                native_active: true,
+                native_inactive_reason: None,
+                system_skill_injection: None,
+                launch: Some(CodexLaunchSnapshot {
+                    command: "codex".into(),
+                    flags: vec!["--model".into(), "old".into()],
+                }),
+            },
+        )
+        .unwrap();
+
+        let socket_path = temp.path().join("app-server.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server_state_path = state_path.clone();
+        let server = thread::spawn(move || {
+            let mut socket = accept_initialized_rpc(&listener);
+            let archive = read_websocket_json(&mut socket);
+            assert_eq!(archive["method"], "thread/archive");
+            assert_eq!(archive["params"]["threadId"], "thread-old");
+            assert!(server_state_path.exists());
+            socket
+                .send(Message::Text(
+                    json!({"id": archive["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+
+            let start = read_websocket_json(&mut socket);
+            assert_eq!(start["method"], "thread/start");
+            socket
+                .send(Message::Text(
+                    json!({
+                        "id": start["id"],
+                        "result": {"thread": {"id": "thread-new", "status": {"type": "idle"}, "turns": []}}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+
+            let inject = read_websocket_json(&mut socket);
+            assert_eq!(inject["method"], "thread/inject_items");
+            socket
+                .send(Message::Text(
+                    json!({"id": inject["id"], "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+        });
+        let mut rpc = CodexRpcClient::connect(
+            &socket_path,
+            "shelbi-test",
+            env!("CARGO_PKG_VERSION"),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let runner = shelbi_core::AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec!["--model".into(), "new".into()],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        };
+
+        let (thread_id, generation, _) = open_owned_thread(
+            &mut rpc,
+            "demo",
+            &workdir,
+            "latest instructions",
+            SystemSkillInjection::NativeSkillRoot,
+            &runner,
+        )
+        .unwrap();
+        assert_eq!(thread_id, "thread-new");
+        assert_eq!(generation, 1);
+        let state = load_thread_state(&state_path, "demo").unwrap().unwrap();
+        assert_eq!(state.launch, Some(CodexLaunchSnapshot::from(&runner)));
+        assert!(fs::read_dir(&workdir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("codex-thread.json.archived-")
+        }));
+
+        server.join().unwrap();
+        match previous_home {
+            Some(home) => std::env::set_var("SHELBI_HOME", home),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+    }
+
+    #[test]
+    fn changed_launch_keeps_the_marker_when_remote_archive_fails() {
+        let _guard = crate::test_lock::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", temp.path());
+        let workdir = shelbi_state::project_dir("demo").unwrap();
+        fs::create_dir_all(&workdir).unwrap();
+        let state_path = workdir.join(THREAD_STATE_FILE);
+        save_json_atomic(
+            &state_path,
+            &PersistedThread {
+                version: STATE_VERSION,
+                project: "demo".into(),
+                thread_id: "thread-old".into(),
+                bootstrap_generation: 4,
+                native_active: true,
+                native_inactive_reason: None,
+                system_skill_injection: None,
+                launch: Some(CodexLaunchSnapshot {
+                    command: "codex".into(),
+                    flags: vec!["--model".into(), "old".into()],
+                }),
+            },
+        )
+        .unwrap();
+
+        let socket_path = temp.path().join("app-server.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let mut socket = accept_initialized_rpc(&listener);
+            let archive = read_websocket_json(&mut socket);
+            assert_eq!(archive["method"], "thread/archive");
+            socket
+                .send(Message::Text(
+                    json!({
+                        "id": archive["id"],
+                        "error": {"code": -32000, "message": "archive failed"}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+        });
+        let mut rpc = CodexRpcClient::connect(
+            &socket_path,
+            "shelbi-test",
+            env!("CARGO_PKG_VERSION"),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let runner = shelbi_core::AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec!["--model".into(), "new".into()],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        };
+
+        assert!(open_owned_thread(
+            &mut rpc,
+            "demo",
+            &workdir,
+            "latest instructions",
+            SystemSkillInjection::NativeSkillRoot,
+            &runner,
+        )
+        .is_err());
+        assert!(state_path.exists());
+        assert!(!fs::read_dir(&workdir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("codex-thread.json.archived-")
+        }));
+
+        server.join().unwrap();
+        match previous_home {
+            Some(home) => std::env::set_var("SHELBI_HOME", home),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+    }
+
+    #[test]
+    fn marker_without_launch_snapshot_resumes_once_and_records_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join(THREAD_STATE_FILE);
+        save_json_atomic(
+            &state_path,
+            &PersistedThread {
+                version: STATE_VERSION,
+                project: "demo".into(),
+                thread_id: "thread-old".into(),
+                bootstrap_generation: 2,
+                native_active: true,
+                native_inactive_reason: None,
+                system_skill_injection: None,
+                launch: None,
+            },
+        )
+        .unwrap();
+        let socket_path = temp.path().join("app-server.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let mut socket = accept_initialized_rpc(&listener);
+            let resume = read_websocket_json(&mut socket);
+            assert_eq!(resume["method"], "thread/resume");
+            assert_eq!(resume["params"]["excludeTurns"], true);
+            socket
+                .send(Message::Text(
+                    json!({
+                        "id": resume["id"],
+                        "result": {
+                            "thread": {"id": "thread-old", "status": {"type": "idle"}, "turns": []},
+                            "initialTurnsPage": {"data": []}
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+        });
+        let mut rpc = CodexRpcClient::connect(
+            &socket_path,
+            "shelbi-test",
+            env!("CARGO_PKG_VERSION"),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let runner = shelbi_core::AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec!["--model".into(), "gpt-5.6".into()],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        };
+
+        let (thread_id, generation, _) = open_owned_thread(
+            &mut rpc,
+            "demo",
+            temp.path(),
+            "changed instructions",
+            SystemSkillInjection::NativeSkillRoot,
+            &runner,
+        )
+        .unwrap();
+        assert_eq!((thread_id.as_str(), generation), ("thread-old", 3));
+        let state = load_thread_state(&state_path, "demo").unwrap().unwrap();
+        assert_eq!(state.launch, Some(CodexLaunchSnapshot::from(&runner)));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn codex_system_skill_capability_selects_native_or_fallback_path() {
         assert!(system_skill_root_unsupported(-32601, "method not found"));
         assert!(system_skill_root_unsupported(
@@ -4162,43 +4651,98 @@ mod tests {
     }
 
     #[test]
-    fn keep_alive_heartbeat_batch_is_deliverable_without_advancing_wake_position() {
+    fn quiet_heartbeat_batch_is_not_deliverable() {
         // A quiet-board heartbeat: no in-flight work, no eligible+idle capacity.
         let quiet = "t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9\n";
-        let keep_alive = scan_text_batch("demo", 0, quiet, false).unwrap();
-        assert!(keep_alive.keep_alive);
-        assert!(!keep_alive.actionable);
+        let quiet_batch = scan_text_batch("demo", 0, quiet, false).unwrap();
+        assert!(!quiet_batch.actionable);
 
         let mut queue = DurableQueue {
             project: "demo".into(),
-            batches: VecDeque::from([keep_alive]),
+            batches: VecDeque::from([quiet_batch]),
         };
-        // Deliverable: next_pending returns the keep-alive batch so Codex is
-        // nudged and runs a turn, and for_batch would inject it via turn/start.
-        assert_eq!(queue.next_pending(), Some(0));
-        let call =
-            DeliveryCall::for_batch(&ThreadPhase::Idle, "thread-1", &queue.batches[0]).unwrap();
-        assert_eq!(call.method, "turn/start");
-        // But it is not actionable: it never advances actionable wake position
-        // or blocks a native-to-legacy runner switch.
+        assert_eq!(queue.next_pending(), None);
         assert!(queue.pending_delivery_ids(0).is_empty());
     }
 
     #[test]
-    fn quiet_heartbeat_does_not_mask_or_advance_past_actionable_batch() {
-        // A keep-alive heartbeat queued ahead of a genuinely actionable batch.
+    fn quiet_prefix_advances_the_authoritative_cursor_without_delivery() {
+        let _guard = crate::test_lock::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", temp.path());
+
         let quiet = "t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9\n";
-        let keep_alive = scan_text_batch("demo", 0, quiet, false).unwrap();
-        let boundary = keep_alive.through;
+        let quiet_batch = scan_text_batch("demo", 0, quiet, false).unwrap();
+        let boundary = quiet_batch.through;
+        let action = "t project=demo task=x backlog -> ready to_category=ready\n";
+        fs::write(shelbi_state::events_log_path().unwrap(), format!("{quiet}{action}"))
+            .unwrap();
+        let actionable = scan_text_batch("demo", boundary, action, false).unwrap();
+        let mut queue = DurableQueue {
+            project: "demo".into(),
+            batches: VecDeque::from([quiet_batch, actionable]),
+        };
+        let mut cursor = 0;
+
+        queue.ack_quiet_prefix(&mut cursor).unwrap();
+
+        assert_eq!(cursor, boundary);
+        assert_eq!(shelbi_state::read_or_initialize_event_cursor("demo").unwrap(), boundary);
+        assert_eq!(queue.batches.len(), 1);
+        assert!(queue.batches[0].actionable);
+        assert_eq!(queue.next_pending(), Some(0));
+
+        match previous_home {
+            Some(home) => std::env::set_var("SHELBI_HOME", home),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+    }
+
+    #[test]
+    fn non_heartbeat_quiet_batch_waits_for_an_actionable_delivery() {
+        let _guard = crate::test_lock::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", temp.path());
+
+        let line = "t project=demo workspace=alpha pane_alive=false reason=exit:1\n";
+        fs::write(shelbi_state::events_log_path().unwrap(), line).unwrap();
+        let batch = scan_text_batch("demo", 0, line, false).unwrap();
+        assert!(!batch.actionable);
+        assert!(!batch.is_quiet_heartbeat());
+        let mut queue = DurableQueue {
+            project: "demo".into(),
+            batches: VecDeque::from([batch]),
+        };
+        let mut cursor = 0;
+
+        queue.ack_quiet_prefix(&mut cursor).unwrap();
+
+        assert_eq!(cursor, 0);
+        assert_eq!(queue.batches.len(), 1);
+
+        match previous_home {
+            Some(home) => std::env::set_var("SHELBI_HOME", home),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+    }
+
+    #[test]
+    fn quiet_heartbeat_does_not_mask_or_advance_past_actionable_batch() {
+        // A quiet heartbeat queued ahead of a genuinely actionable batch.
+        let quiet = "t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9\n";
+        let quiet_batch = scan_text_batch("demo", 0, quiet, false).unwrap();
+        let boundary = quiet_batch.through;
         let actionable = batch("demo", boundary, boundary + 40);
         let actionable_id = actionable.message_id.clone();
 
         let mut queue = DurableQueue {
             project: "demo".into(),
-            batches: VecDeque::from([keep_alive, actionable]),
+            batches: VecDeque::from([quiet_batch, actionable]),
         };
         // FIFO delivery: the earliest pending batch is delivered first, exactly
-        // as before. The keep-alive never re-orders the queue.
+        // as before. The quiet batch never re-orders the queue.
         assert_eq!(queue.next_pending(), Some(0));
         // Only the actionable batch advances actionable wake position; the quiet
         // heartbeat neither masks nor is reported alongside it.
@@ -4249,6 +4793,7 @@ mod tests {
                 native_active: true,
                 native_inactive_reason: None,
                 system_skill_injection: None,
+                launch: None,
             },
         )
         .unwrap();
@@ -4295,6 +4840,7 @@ mod tests {
                 native_active: false,
                 native_inactive_reason: Some("protocol-incompatible".into()),
                 system_skill_injection: Some("developer-instructions-fallback".into()),
+                launch: None,
             },
         )
         .unwrap();
@@ -4336,6 +4882,7 @@ mod tests {
                 native_active: true,
                 native_inactive_reason: None,
                 system_skill_injection: Some("codex-native-skill-root".into()),
+                launch: None,
             },
         )
         .unwrap();

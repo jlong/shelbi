@@ -138,6 +138,17 @@ put those arguments in `flags`. Shelbi does not translate Claude's
 `workspace_permissions_mode`, `--permission-mode`, `--continue`, or
 `--append-system-prompt` behavior to Codex.
 
+The native Codex bridge keeps its owned conversation bounded. Resume loads at
+most the newest 250 turns, and Shelbi starts a fresh conversation after the
+250th turn reaches an idle boundary. A reload also starts a fresh conversation
+when the configured Codex command or ordered `flags` changed, so model and CLI
+switches take effect. The previous conversation is archived, not deleted.
+
+Quiet heartbeats do not create Codex turns. Shelbi advances their durable event
+cursor in Rust when the board has no in-flight work and no Zen-eligible work
+with idle capacity. Heartbeats remain actionable while work is in flight or
+when Zen Mode can dispatch work.
+
 ## Bootstrap flow on session start
 
 The prompt instructs the orchestrator to do three things on the first
