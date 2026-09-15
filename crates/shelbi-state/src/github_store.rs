@@ -97,6 +97,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -118,6 +119,13 @@ const GITHUB_LABEL_MAX: usize = 50;
 /// Byte budget for the truncated slug in a long id's anchor label:
 /// `50 - 10 (prefix) - 1 (separator) - 8 (hash) = 31`.
 const ID_SLUG_BUDGET: usize = GITHUB_LABEL_MAX - ID_LABEL_PREFIX.len() - 1 - 8;
+/// The GitHub REST API version shelbi pins on every REST `gh api` call via
+/// `-H X-GitHub-Api-Version: …`, so a server-side default bump is never bundled
+/// into shelbi's behavior silently — evaluating a newer version is a separate,
+/// deliberate change. GitHub's GraphQL endpoint is unversioned, so the four
+/// `gh api graphql` sites deliberately omit this.
+const GH_REST_API_VERSION_HEADER: &str = "X-GitHub-Api-Version: 2022-11-28";
+
 /// Opening marker of the fenced shelbi-metadata block in an issue body.
 const META_BEGIN: &str = "<!-- shelbi:begin -->";
 /// Closing marker of the fenced shelbi-metadata block in an issue body.
@@ -343,12 +351,26 @@ impl GitHubStore {
         let write_policy = crate::gh_retry::RetryPolicy::production();
         let create_policy = crate::gh_retry::RetryPolicy::creates();
         let project_for_read = project.clone();
+        // Own clone for the mutating branch's once-per-operation token resolve:
+        // `base` (used by the replay-unsafe create path) already moved
+        // `project_for_write` into its own closure.
+        let project_for_write_token = project.clone();
         let gh: GhRunner = Arc::new(move |args: &[&str]| {
             if is_replay_unsafe_create(args) {
                 return create_policy.run(|| base(args));
             }
             if is_mutating_gh(args) {
-                return write_policy.run(|| base(args));
+                // Resolve the credential once per write operation and reuse it
+                // across every retry attempt, instead of re-resolving (and
+                // re-probing the keychain) on each attempt as a per-attempt
+                // `run_gh` would. `GH_TOKEN` still reaches every child through
+                // `run_gh_with_token`, and a 401 anywhere in the retry sequence
+                // still drops the cached token via `invalidate_token_on_401`.
+                let token = resolve_github_token_by_name(&project_for_write_token)?;
+                return invalidate_token_on_401(
+                    &project_for_write_token,
+                    write_policy.run(|| run_gh_with_token(&token, args)),
+                );
             }
             // Read path. The primary REST budget is per token and shared across
             // every shelbi process on the hub; when it is exhausted, retrying
@@ -361,8 +383,9 @@ impl GitHubStore {
             // last snapshot, marked stale, and no further request is made.
             park_aware_read(&project_for_read, &read_policy, args)
         });
-        // GraphQL board reads share the REST token resolution (`run_gh`: env →
-        // keychain → out-of-repo `tokens.yml`) and the fail-fast read retry
+        // GraphQL board reads share the REST token resolution
+        // (`resolve_github_token_by_name`: env → keychain → out-of-repo
+        // `tokens.yml`) and the fail-fast read retry
         // policy, but skip the REST read-park: GitHub prices GraphQL points on a
         // separate 5,000/hour budget, so a board read stays available even when
         // the REST hourly limit is exhausted. The Phase 3 governor adds a
@@ -501,7 +524,7 @@ impl GitHubStore {
                 args,
                 &|a| rest_base(a),
                 None,
-                None,
+                rest_read_caller(),
             )
         });
 
@@ -541,7 +564,14 @@ impl GitHubStore {
     /// `extra` carries additional `-f key=value` query params (e.g. a label
     /// filter or a `since=` watermark).
     fn api_issues(&self, path: &str, extra: &[&str]) -> Result<Vec<GhIssue>> {
-        let mut args: Vec<&str> = vec!["api", "-X", "GET", path, "--paginate"];
+        // `--include` prepends each page's HTTP status line + headers so the REST
+        // rate-limit budget can be recorded and the outcome classified from the
+        // status; the header blocks are split back off before parsing (see
+        // [`split_include_pages`]). The API version is pinned so a server default
+        // bump never rides along silently.
+        let mut args: Vec<&str> = vec![
+            "api", "--include", "-H", GH_REST_API_VERSION_HEADER, "-X", "GET", path, "--paginate",
+        ];
         args.extend_from_slice(extra);
         // One JSON object per line, so paginated arrays never concatenate into
         // invalid JSON — parse line by line.
@@ -2097,7 +2127,11 @@ impl GitHubStore {
     ) -> Result<Vec<GhComment>> {
         let path = format!("repos/{}/issues/{number}/comments", self.repo);
         let since_param = since.map(|w| format!("since={}", w.to_rfc3339()));
-        let mut args: Vec<&str> = vec!["api", "-X", "GET", &path, "--paginate"];
+        // `--include` + pinned API version (see [`GitHubStore::api_issues`]); the
+        // per-page header blocks are split off before `parse_jsonl`.
+        let mut args: Vec<&str> = vec![
+            "api", "--include", "-H", GH_REST_API_VERSION_HEADER, "-X", "GET", &path, "--paginate",
+        ];
         args.extend_from_slice(&["-f", "per_page=100"]);
         if let Some(param) = since_param.as_deref() {
             args.push("-f");
@@ -2145,8 +2179,15 @@ impl GitHubStore {
         // `--include` prepends the response's status line + headers so the REST
         // rate-limit budget (`x-ratelimit-*`) can be recorded; the body is split
         // back off before the caller parses it. See [`record_and_strip_rest`].
-        let mut args: Vec<String> =
-            vec!["api".into(), "--include".into(), "-X".into(), method.into(), path.into()];
+        let mut args: Vec<String> = vec![
+            "api".into(),
+            "--include".into(),
+            "-H".into(),
+            GH_REST_API_VERSION_HEADER.into(),
+            "-X".into(),
+            method.into(),
+            path.into(),
+        ];
         for (k, v) in fields {
             args.push("-f".into());
             args.push(format!("{k}={v}"));
@@ -2302,7 +2343,12 @@ impl GitHubStore {
     /// Every label name defined in the repo.
     fn list_label_names(&self) -> Result<Vec<String>> {
         let path = format!("repos/{}/labels", self.repo);
-        let args = ["api", "-X", "GET", &path, "--paginate", "--jq", ".[]"];
+        // `--include` + pinned API version (see [`GitHubStore::api_issues`]); the
+        // per-page header blocks are split off before `parse_jsonl`.
+        let args = [
+            "api", "--include", "-H", GH_REST_API_VERSION_HEADER, "-X", "GET", &path, "--paginate",
+            "--jq", ".[]",
+        ];
         let out = (self.gh)(&args)?;
         let labels: Vec<GhLabel> = parse_jsonl(&out)?;
         Ok(labels.into_iter().map(|l| l.name).collect())
@@ -2397,44 +2443,170 @@ fn invalidate_token_on_401<T>(project: &str, result: Result<T>) -> Result<T> {
     result
 }
 
-/// Run `gh` with an already-resolved token. Split from [`run_gh`] so the
-/// read-path park governor can resolve the token once (to key its per-token
-/// budget file) and reuse it for the call, and so the free `/rate_limit` probe
-/// can shell out without going back through the park check that would block it.
+/// Wall-clock bound on a single `gh` child, spawn through exit. It covers a
+/// whole `--paginate` run — that's one child issuing several sequential
+/// requests, so the bound is the total for the paginated read, not per page (a
+/// per-request timeout that reset each page would not have fired on the
+/// 2026-09-15 wedge, which hung mid-request after the host slept). Chosen in
+/// the 30–60s band: generous enough for a real multi-page board read against a
+/// slow network, short enough that a wedged child can't park the daemon's
+/// single board-refresh thread for minutes. It must be wall-clock (not CPU- or
+/// activity-based): a sleep/wake cycle silently orphans an in-flight request,
+/// and a timer that stopped counting while asleep would wake and keep waiting.
+/// The bound is on the child only; the retry policy's own backoff is separate.
+const GH_OP_DEADLINE: Duration = Duration::from_secs(45);
+
+/// How often [`run_gh_with_deadline`] polls the child for exit — small enough
+/// not to add noticeable latency, large enough not to spin the CPU.
+const GH_DEADLINE_POLL: Duration = Duration::from_millis(15);
+
+/// Run `gh` with an already-resolved token, under [`GH_OP_DEADLINE`]. Kept
+/// separate from token *resolution* so the read-path park governor can resolve
+/// the token once (to key its per-token budget file) and reuse it for the call,
+/// so the write path can resolve once per operation and reuse it across retry
+/// attempts, and so the free `/rate_limit` probe can shell out without going
+/// back through the park check that would block it. The resolved token is handed
+/// to the child as `GH_TOKEN`; a non-zero exit (network down, repo not found,
+/// not authed) becomes an [`Error::Command`] — never a stale render.
 fn run_gh_with_token(token: &SecretToken, args: &[&str]) -> Result<String> {
-    let output = std::process::Command::new("gh")
-        .args(args)
+    run_gh_with_deadline(token, args, GH_OP_DEADLINE)
+}
+
+/// The bounded core of [`run_gh_with_token`], with the deadline injected so a
+/// test can drive the timeout path with a few hundred milliseconds instead of
+/// waiting out the shipped bound. Every `gh` child spawned by this crate goes
+/// through here.
+///
+/// The child runs in its own process group with `stdin` nulled and both output
+/// pipes drained on their own threads, so it can neither prompt (a `gh` that
+/// decides to ask blocks on an inherited terminal otherwise) nor deadlock the
+/// waiter on a full pipe buffer. On the deadline the whole process group is
+/// SIGKILLed — killing only the direct child would leave a grandchild holding
+/// the pipe write ends, so the readers would never see EOF and the deadline
+/// path would block anyway. This mirrors [`shelbi_ssh::run_with_deadline`];
+/// `shelbi-state` deliberately does not depend on `shelbi-ssh`, so the pattern
+/// is reproduced rather than shared.
+fn run_gh_with_deadline(token: &SecretToken, args: &[&str], deadline: Duration) -> Result<String> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let cmd_str = || format!("gh {}", args.join(" "));
+
+    let mut cmd = std::process::Command::new("gh");
+    cmd.args(args)
         .env("GH_TOKEN", token.expose())
-        .output()
-        .map_err(|e| Error::Command {
-            cmd: format!("gh {}", args.join(" ")),
-            status: "failed to spawn".to_string(),
-            stderr: e.to_string(),
-        })?;
-    if !output.status.success() {
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Own process group so the deadline can SIGKILL the whole tree. See the
+    // fn doc; `process_group(0)` makes the child a group leader (pgid == pid),
+    // which the timeout signals as `-pid`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| Error::Command {
+        cmd: cmd_str(),
+        status: "failed to spawn".to_string(),
+        stderr: e.to_string(),
+    })?;
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                return Err(Error::Command {
+                    cmd: cmd_str(),
+                    status: "wait failed".to_string(),
+                    stderr: e.to_string(),
+                });
+            }
+        }
+        if start.elapsed() >= deadline {
+            // Deadline blown. Kill the whole process group (best-effort — the
+            // child may have exited in the gap), then reap so the long-lived hub
+            // daemon doesn't accumulate zombies.
+            #[cfg(unix)]
+            {
+                // Safety: `kill(2)` with a negative pid signals the process
+                // group and touches no memory; `child.id()` is the group leader.
+                unsafe {
+                    libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            // The kill closed the pipes, so the readers see EOF and finish.
+            let _ = stdout_reader.join();
+            let partial = stderr_reader.join().unwrap_or_default();
+            let partial = String::from_utf8_lossy(&partial);
+            let partial = partial.trim();
+            // Reuse `Error::Command` rather than adding an `Error` variant: the
+            // bound is named in `status` (e.g. `timed out after 45s`) and the
+            // pre-kill stderr rides along in `stderr`, so the failure isn't
+            // blank. The `timed out` phrasing lands it in `gh_retry::classify`'s
+            // transient bucket — the read policy gets one more attempt and then
+            // fails fast, instead of the caller spinning on a wedge or parking.
+            let stderr = if partial.is_empty() {
+                format!("gh did not finish within {deadline:?}")
+            } else {
+                format!("gh did not finish within {deadline:?}; stderr before kill: {partial}")
+            };
+            return Err(Error::Command {
+                cmd: cmd_str(),
+                status: format!("timed out after {deadline:?}"),
+                stderr,
+            });
+        }
+        std::thread::sleep(GH_DEADLINE_POLL);
+    };
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
         // `gh api` prints the API's JSON error body — the field-level reason,
         // e.g. `name is too long (maximum is 50 characters)` — to *stdout* and
         // only a terse one-liner to stderr. Capturing stderr alone drops the
         // actionable half, so combine both: the response body is what makes an
-        // `external command failed` self-diagnosing.
+        // `external command failed` self-diagnosing. With `--include` the status
+        // line and rate-limit headers are in that stdout too, so the classifier
+        // decides from the HTTP status rather than the human text.
         let detail = combine_gh_error_detail(
-            &String::from_utf8_lossy(&output.stderr),
-            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&stderr),
+            &String::from_utf8_lossy(&stdout),
         );
         return Err(Error::Command {
-            cmd: format!("gh {}", args.join(" ")),
-            status: output.status.to_string(),
+            cmd: cmd_str(),
+            status: status.to_string(),
             stderr: detail,
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
 /// Run a read (`GET`) call under the per-token rate-limit park (plan Phase 0,
 /// item 3) *and* the connection-level circuit breaker. Resolves the token, keys
 /// the shared per-token budget file off a hash of it, and delegates to
-/// [`governed_read`] on the REST tier (no request-log line — REST reads aren't
-/// attributed, matching the historical scope — but full park participation).
+/// [`governed_read`] on the REST tier — which strips the `--include` header
+/// blocks off the body, records the token's REST budget from them, and (via
+/// [`rest_read_caller`]) attributes the read in the request log.
 fn park_aware_read(
     project: &str,
     read_policy: &crate::gh_retry::RetryPolicy,
@@ -2452,9 +2624,23 @@ fn park_aware_read(
             args,
             &|a| run_gh_with_token(&token, a),
             Some(&token),
-            None,
+            rest_read_caller(),
         ),
     )
+}
+
+/// The request-log caller label for a REST `GET`, or `None` when governance is
+/// inert (a test build that has not opted into park side effects — see
+/// [`read_park_side_effects_enabled`]), so a test never appends to a real home's
+/// request log. Distinct from `write` and from every label [`graphql_caller`]
+/// returns, so `shelbi doctor` can attribute REST reads separately and a
+/// before/after request count can be measured against a real base.
+fn rest_read_caller() -> Option<&'static str> {
+    if read_park_side_effects_enabled() {
+        Some("rest-read")
+    } else {
+        None
+    }
 }
 
 /// The shared governed-read core behind both [`park_aware_read`] (REST) and
@@ -2489,7 +2675,106 @@ fn governed_read(
     }
     let result = read_policy.run(|| run(args));
     on_read_result(project, key, budget, args, now, &result, token, log_caller);
-    result
+    // A REST `GET` now carries `--include`, so the body arrives behind one HTTP
+    // header block per page. Strip those off and record the token's REST budget
+    // from the last block (the lowest `remaining`) before the caller parses the
+    // JSONL. GraphQL bodies are not `--include` and pass through untouched; an
+    // injected runner answering bare JSON (no `HTTP/` prefix) is untouched too.
+    match result {
+        Ok(raw) if budget == crate::gh_budget::Budget::Rest => {
+            Ok(strip_and_record_rest_read(key, &raw))
+        }
+        other => other,
+    }
+}
+
+/// Strip the per-page `HTTP/…` header blocks out of a REST `GET`'s
+/// `--include`/`--paginate` response and record the token's REST rate-limit
+/// budget from the **last** block (whose `x-ratelimit-remaining` is the lowest,
+/// hence the most recent quota). The recording rides the same "governance
+/// active" gate as the rest of the read-path park writes, so a test never
+/// scribbles the budget into whichever `SHELBI_HOME` is mounted; the body
+/// transform itself is unconditional so parsing always sees clean JSONL. A
+/// response that does not begin with `HTTP/` (a bare-JSON test fixture) is
+/// returned verbatim, the same escape hatch [`record_and_strip_rest`] keeps.
+fn strip_and_record_rest_read(key: &str, raw: &str) -> String {
+    let (body, last_header) = split_include_pages(raw);
+    if let Some(header) = last_header {
+        if read_park_side_effects_enabled() {
+            crate::gh_budget::record_rest_headers(
+                key,
+                &crate::gh_budget::parse_rate_limit_headers(&header),
+            );
+        }
+    }
+    body
+}
+
+/// Split a `gh api --include --paginate` GET stream into `(body, last_header)`:
+/// the concatenated JSONL body with every `HTTP/…` header block removed, and
+/// the text of the last header block (for rate-limit parsing) when one was
+/// present. `--paginate` emits one header block per page, each terminated by a
+/// blank line, followed by that page's JSONL, with a blank line between pages:
+///
+/// ```text
+/// HTTP/2.0 200 OK
+/// x-ratelimit-remaining: 3999
+///
+/// {"n":11}
+/// {"n":12}
+///
+/// HTTP/2.0 200 OK
+/// x-ratelimit-remaining: 3998
+///
+/// {"n":13}
+/// ```
+///
+/// A stream that does not start with `HTTP/` is returned verbatim with no
+/// header captured, so an injected runner answering bare JSON is untouched.
+/// Blank lines in the body are dropped, matching [`parse_jsonl`], which the
+/// caller runs next.
+fn split_include_pages(raw: &str) -> (String, Option<String>) {
+    if !raw.starts_with("HTTP/") {
+        return (raw.to_string(), None);
+    }
+    let mut body = String::new();
+    let mut last_header = String::new();
+    let mut cur_header = String::new();
+    let mut in_header = false;
+    for line in raw.lines() {
+        if line.starts_with("HTTP/") {
+            // A new page's header block begins.
+            in_header = true;
+            cur_header.clear();
+            cur_header.push_str(line);
+            cur_header.push('\n');
+            continue;
+        }
+        if in_header {
+            if line.trim().is_empty() {
+                // The blank line terminates this page's header block.
+                in_header = false;
+                last_header = std::mem::take(&mut cur_header);
+            } else {
+                cur_header.push_str(line);
+                cur_header.push('\n');
+            }
+            continue;
+        }
+        // Body (JSONL). Skip the blank line that separates pages.
+        if line.trim().is_empty() {
+            continue;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    // A header block that ran to EOF without a trailing blank line (unusual, but
+    // don't lose its rate-limit numbers).
+    if in_header && !cur_header.is_empty() {
+        last_header = cur_header;
+    }
+    let last = (!last_header.is_empty()).then_some(last_header);
+    (body, last)
 }
 
 /// The short-circuit decision shared by both read paths: an error to return
@@ -2778,7 +3063,11 @@ fn unreachable_park_error(project: &str, args: &[&str], until: i64) -> Error {
 /// to the per-token budget file for the Phase 3 governor. Returns the core reset
 /// from the JSON body — the value a bare, headerless 403 could not carry.
 fn probe_core_reset_and_record(token: &SecretToken, key: &str) -> Option<i64> {
-    let out = run_gh_with_token(token, &["api", "--include", "-X", "GET", "rate_limit"]).ok()?;
+    let out = run_gh_with_token(
+        token,
+        &["api", "--include", "-H", GH_REST_API_VERSION_HEADER, "-X", "GET", "rate_limit"],
+    )
+    .ok()?;
     // Best-effort budget snapshot from the header block (stops at the blank
     // line, so it never reads the body below).
     crate::gh_budget::record_rest_headers(key, &crate::gh_budget::parse_rate_limit_headers(&out));
@@ -8009,5 +8298,404 @@ mod tests {
             graphql_calls(&calls).is_empty(),
             "a just-created card resolves without a label search"
         );
+    }
+
+    // --- REST `--include` splitter + budget recording -------------------------
+
+    #[test]
+    fn split_include_pages_strips_a_single_page_header_block() {
+        let raw = "HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\
+                   X-RateLimit-Remaining: 4999\r\n\r\n{\"n\":1}\n{\"n\":2}\n";
+        let (body, header) = split_include_pages(raw);
+        assert_eq!(body, "{\"n\":1}\n{\"n\":2}\n", "the header block is stripped");
+        let rl = crate::gh_budget::parse_rate_limit_headers(&header.expect("a header block"));
+        assert_eq!(rl.remaining, Some(4999));
+    }
+
+    #[test]
+    fn split_include_pages_strips_every_pages_header_and_concatenates_the_body() {
+        // The exact shape `gh api --include --paginate -X GET … --jq '.[]'` prints:
+        // one header block per page, each followed by that page's JSONL.
+        let raw = "HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 4999\r\n\
+                   X-RateLimit-Reset: 1700000000\r\n\r\n{\"n\":11}\n{\"n\":12}\n\n\
+                   HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 4998\r\n\
+                   X-RateLimit-Reset: 1700000000\r\n\r\n{\"n\":13}\n";
+        let (body, header) = split_include_pages(raw);
+        assert_eq!(
+            body, "{\"n\":11}\n{\"n\":12}\n{\"n\":13}\n",
+            "both pages' rows survive, every header block gone"
+        );
+        // The last block (lowest remaining) is the one whose numbers are recorded.
+        let rl = crate::gh_budget::parse_rate_limit_headers(&header.expect("a header block"));
+        assert_eq!(rl.remaining, Some(4998), "the last page's remaining, not the first's");
+    }
+
+    #[test]
+    fn split_include_pages_passes_bare_json_through_untouched() {
+        // The escape hatch every injected fake-`gh` fixture relies on: a response
+        // that doesn't begin with `HTTP/` is returned verbatim, no header captured.
+        let raw = "{\"n\":1}\n{\"n\":2}\n";
+        let (body, header) = split_include_pages(raw);
+        assert_eq!(body, raw);
+        assert!(header.is_none());
+    }
+
+    #[test]
+    fn rest_get_records_budget_from_the_last_header_block_of_a_multipage_response() {
+        // Acceptance: the recorded REST budget is the second page's *lower*
+        // remaining, not the first page's.
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+
+        let key = crate::gh_budget::token_key("tok-budget-pages");
+        let raw = "HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 4999\r\n\
+                   X-RateLimit-Reset: 1700000000\r\n\r\n{\"n\":1}\n{\"n\":2}\n\n\
+                   HTTP/2.0 200 OK\r\nX-RateLimit-Remaining: 4998\r\n\
+                   X-RateLimit-Reset: 1700000000\r\n\r\n{\"n\":3}\n";
+        let body = strip_and_record_rest_read(&key, raw);
+        assert_eq!(body, "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n");
+        let state = crate::gh_budget::read_state(&key);
+        assert_eq!(
+            state.tier(crate::gh_budget::Budget::Rest).remaining,
+            Some(4998),
+            "the later, lower remaining is what the governor reads"
+        );
+
+        set_test_park_side_effects(false);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // --- REST GET argv: `--include` + pinned API version; GraphQL gets neither -
+
+    #[test]
+    fn rest_gets_carry_include_and_the_api_version_while_graphql_carries_neither() {
+        let _iso = IsolatedHome::new("rest-argv");
+        let calls: Calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            if args.contains(&"graphql") {
+                // A minimal board-index response so `refresh_board` parses.
+                Ok(r#"{"data":{"rateLimit":{"remaining":5000,"resetAt":"2026-09-08T06:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}"#.to_string())
+            } else {
+                // An empty REST issues page (`--jq '.[]'` on `[]` yields nothing).
+                Ok(String::new())
+            }
+        });
+        let _ = store.list_open().expect("REST list");
+        let _ = store.refresh_board(None, &[]).expect("GraphQL board");
+
+        let calls = calls.lock().unwrap();
+        let rest = calls
+            .iter()
+            .find(|c| c.contains("-X GET") && c.contains("repos/owner/repo/issues"))
+            .expect("a REST issues GET was recorded");
+        assert!(rest.contains("--include"), "REST GET carries --include: {rest}");
+        assert!(
+            rest.contains("X-GitHub-Api-Version: 2022-11-28"),
+            "REST GET pins the API version: {rest}"
+        );
+        let gql = calls
+            .iter()
+            .find(|c| c.contains("graphql"))
+            .expect("a GraphQL call was recorded");
+        assert!(!gql.contains("--include"), "GraphQL carries no --include: {gql}");
+        assert!(
+            !gql.contains("X-GitHub-Api-Version"),
+            "GraphQL pins no REST API version: {gql}"
+        );
+    }
+
+    // --- REST GET request-log attribution -------------------------------------
+
+    #[test]
+    fn rest_get_appends_one_rest_read_request_log_line_when_governance_is_active() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+
+        let store =
+            GitHubStore::with_governed_runner("owner/repo", "tok-rest-log", |_args| Ok(String::new()));
+        store.list_open().expect("REST list");
+
+        let log = std::fs::read_to_string(
+            crate::shelbi_home().unwrap().join(crate::gh_requests::REQUESTS_LOG_FILE),
+        )
+        .unwrap_or_default();
+        let rest_lines = log.lines().filter(|l| l.contains("caller=rest-read")).count();
+        assert_eq!(rest_lines, 1, "exactly one REST read is attributed: {log}");
+        assert!(!log.contains("caller=write"), "REST reads are not tagged `write`");
+        assert!(
+            !log.contains("caller=board-refresh") && !log.contains("caller=graphql-read"),
+            "REST reads use a label distinct from GraphQL callers: {log}"
+        );
+
+        set_test_park_side_effects(false);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn rest_get_appends_nothing_to_the_request_log_when_governance_is_inert() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // Default under test: park side effects off → attribution inert.
+        assert!(!read_park_side_effects_enabled());
+
+        let store =
+            GitHubStore::with_governed_runner("owner/repo", "tok-rest-inert", |_args| Ok(String::new()));
+        store.list_open().expect("REST list");
+
+        let log = std::fs::read_to_string(
+            crate::shelbi_home().unwrap().join(crate::gh_requests::REQUESTS_LOG_FILE),
+        )
+        .unwrap_or_default();
+        assert!(
+            log.lines().all(|l| !l.contains("caller=rest-read")),
+            "no REST read is attributed when governance is inert: {log}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // --- the `gh` child deadline + environment (PATH-stub harness) ------------
+    //
+    // These drive the real child-spawn path (`run_gh_with_deadline`) against a
+    // fake `gh` on `PATH`, so they exercise the deadline, the process-group kill,
+    // and the `GH_TOKEN` plumbing that an injected `GhRunner` sits above and
+    // cannot reach. Every one holds the shared test lock (PATH / `GH_TOKEN` are
+    // process-global) and restores the environment before dropping it.
+
+    #[cfg(unix)]
+    struct GhStub {
+        dir: std::path::PathBuf,
+        prev_path: Option<String>,
+        prev_gh: Option<String>,
+        prev_github: Option<String>,
+        prev_home: Option<String>,
+    }
+
+    #[cfg(unix)]
+    impl GhStub {
+        /// Create a throwaway dir, prepend it to `PATH` so its `gh` shadows the
+        /// real one, point `SHELBI_HOME` at it, and clear the `*_TOKEN` env so a
+        /// test controls resolution. The previous values are restored on drop.
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "shelbi-gh-stub-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let prev_path = std::env::var("PATH").ok();
+            let prev_gh = std::env::var("GH_TOKEN").ok();
+            let prev_github = std::env::var("GITHUB_TOKEN").ok();
+            let prev_home = std::env::var("SHELBI_HOME").ok();
+            let new_path = match &prev_path {
+                Some(p) => format!("{}:{}", dir.display(), p),
+                None => dir.display().to_string(),
+            };
+            std::env::set_var("PATH", new_path);
+            std::env::set_var("SHELBI_HOME", &dir);
+            std::env::remove_var("GH_TOKEN");
+            std::env::remove_var("GITHUB_TOKEN");
+            Self { dir, prev_path, prev_gh, prev_github, prev_home }
+        }
+
+        /// Install an executable `gh` shell script.
+        fn write_gh(&self, body: &str) {
+            use std::os::unix::fs::PermissionsExt;
+            let script = self.dir.join("gh");
+            std::fs::write(&script, body).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.dir.join(name)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for GhStub {
+        fn drop(&mut self) {
+            let restore = |k: &str, v: &Option<String>| match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            };
+            restore("PATH", &self.prev_path);
+            restore("GH_TOKEN", &self.prev_gh);
+            restore("GITHUB_TOKEN", &self.prev_github);
+            restore("SHELBI_HOME", &self.prev_home);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wedged_gh_child_is_killed_at_the_deadline_and_the_error_names_the_bound() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stub = GhStub::new("deadline");
+        stub.write_gh("#!/bin/sh\nsleep 300\n");
+        std::env::set_var("GH_TOKEN", "tok-deadline");
+        let token = resolve_github_token_by_name("proj").unwrap();
+
+        let start = std::time::Instant::now();
+        let err = run_gh_with_deadline(
+            &token,
+            &["api", "-X", "GET", "rate_limit"],
+            Duration::from_millis(250),
+        )
+        .expect_err("a child that never exits must be killed at the deadline");
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(1), "the deadline fired promptly: {elapsed:?}");
+        match err {
+            Error::Command { status, stderr, .. } => {
+                assert!(status.contains("timed out"), "status names the timeout: {status}");
+                assert!(stderr.contains("250ms"), "text carries the bound: {stderr}");
+            }
+            other => panic!("expected Error::Command, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_deadline_kills_the_whole_process_group_leaving_no_grandchild() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stub = GhStub::new("grandchild");
+        let pidfile = stub.path("grandchild.pid");
+        // Spawn a background grandchild that outlives the direct child, record its
+        // pid, then hang. Killing only the direct child would leave this sleep
+        // running (and holding our pipe write ends); the process-group kill reaps it.
+        stub.write_gh(&format!(
+            "#!/bin/sh\nsleep 300 &\necho $! > \"{}\"\nsleep 300\n",
+            pidfile.display()
+        ));
+        std::env::set_var("GH_TOKEN", "tok-grandchild");
+        let token = resolve_github_token_by_name("proj").unwrap();
+
+        // A generous bound: the child is killed regardless, but under parallel
+        // test load the shell needs time to start and record its grandchild's pid
+        // before the deadline fires — a short bound would race that write.
+        let err = run_gh_with_deadline(
+            &token,
+            &["api", "-X", "GET", "rate_limit"],
+            Duration::from_secs(2),
+        );
+        assert!(err.is_err(), "the wedged child times out");
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("the stub recorded its grandchild pid")
+            .trim()
+            .parse()
+            .expect("a numeric pid");
+        // Poll briefly for the group-kill (and init's reap) to land.
+        let gone = {
+            let start = std::time::Instant::now();
+            loop {
+                // Safety: `kill(pid, 0)` sends no signal; it probes existence.
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    break true;
+                }
+                if start.elapsed() > Duration::from_secs(2) {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        assert!(gone, "the process-group kill left no surviving grandchild (pid {pid})");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_gh_child_receives_gh_token_even_with_the_parents_removed() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stub = GhStub::new("gh-token");
+        let toklog = stub.path("gh_token.log");
+        stub.write_gh(&format!(
+            "#!/bin/sh\necho \"GH_TOKEN=$GH_TOKEN\" >> \"{}\"\nprintf 'HTTP/2.0 200 OK\\r\\n\\r\\n{{}}\\n'\nexit 0\n",
+            toklog.display()
+        ));
+        // Resolve from the env (source `Env`), then remove the parent's copies so
+        // only the runner's explicit `.env("GH_TOKEN", …)` can satisfy the child.
+        std::env::set_var("GH_TOKEN", "secret-abc");
+        let token = resolve_github_token_by_name("proj").unwrap();
+        std::env::remove_var("GH_TOKEN");
+        std::env::remove_var("GITHUB_TOKEN");
+
+        run_gh_with_deadline(&token, &["api", "-X", "GET", "rate_limit"], Duration::from_secs(5))
+            .expect("the stub exits 0");
+
+        let logged = std::fs::read_to_string(&toklog).unwrap_or_default();
+        assert!(
+            logged.contains("GH_TOKEN=secret-abc"),
+            "the child received GH_TOKEN despite the parent's being removed: {logged:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_that_retries_once_resolves_the_credential_once_and_spawns_gh_api_twice() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_test_gh_runner();
+        // A fresh keychain cache so the resolver actually shells `gh auth token`.
+        crate::invalidate_all_cached_tokens();
+        let stub = GhStub::new("write-retry");
+        let arglog = stub.path("argv.log");
+        let counter = stub.path("api.count");
+        // `gh auth token` answers the (uncached) resolution; the first `gh api`
+        // returns a retryable 429 (Retry-After: 0 → an immediate retry), the
+        // second succeeds. Every invocation appends its argv.
+        stub.write_gh(&format!(
+            "#!/bin/sh\n\
+             echo \"ARGS=$*\" >> \"{log}\"\n\
+             if [ \"$1\" = \"auth\" ]; then echo ghs_stubtoken; exit 0; fi\n\
+             n=$(cat \"{cnt}\" 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > \"{cnt}\"\n\
+             if [ \"$n\" -eq 1 ]; then\n\
+             printf 'HTTP/2.0 429 Too Many Requests\\r\\nx-ratelimit-remaining: 0\\r\\nretry-after: 0\\r\\n\\r\\n{{\"message\":\"slow\"}}\\n'\n\
+             exit 1\n\
+             fi\n\
+             printf 'HTTP/2.0 200 OK\\r\\nx-ratelimit-remaining: 4000\\r\\n\\r\\n{{\"ok\":true}}\\n'\n\
+             exit 0\n",
+            log = arglog.display(),
+            cnt = counter.display(),
+        ));
+        // GH_TOKEN unset (GhStub cleared it) so resolution falls to `gh auth token`.
+
+        let store = GitHubStore::new("test-proj", "owner/repo");
+        let fields: Vec<(&str, String)> = vec![("name", "x".to_string())];
+        store
+            .api_send("POST", "repos/owner/repo/labels", &fields)
+            .expect("the write succeeds on the retry");
+
+        let log = std::fs::read_to_string(&arglog).unwrap_or_default();
+        let auth = log.lines().filter(|l| l.starts_with("ARGS=auth")).count();
+        let api = log.lines().filter(|l| l.starts_with("ARGS=api")).count();
+        assert_eq!(auth, 1, "the credential is resolved once for the whole write: {log}");
+        assert_eq!(api, 2, "one write, retried once, is two `gh api` spawns: {log}");
+
+        crate::invalidate_all_cached_tokens();
     }
 }

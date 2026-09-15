@@ -71,8 +71,13 @@ struct RefreshOutcome {
 pub(super) struct BoardRefresher {
     /// Per-project single-flight locks, minted on first use. The outer map is
     /// only ever locked briefly to fetch (or create) a project's lock; the
-    /// actual refresh holds the inner per-project lock, so refreshes of
-    /// *different* projects still run concurrently.
+    /// actual refresh holds the inner per-project lock so a `refresh-board`
+    /// socket handler and a manager tick never double-read the *same* project.
+    /// This lock does **not** buy cross-project concurrency: the manager loop
+    /// ([`refresh_manager_loop`], the single `shelbi-board-refresh-mgr` thread)
+    /// drives every open project's tick sequentially, so a slow (or wedged)
+    /// refresh already serializes every other project — the per-project lock only
+    /// guards a tick against a concurrent socket refresh of that one project.
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
