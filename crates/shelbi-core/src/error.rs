@@ -215,6 +215,19 @@ pub enum Error {
     )]
     InsecureTokenFile { path: String, mode: u32 },
 
+    /// A GitHub issue's hand-edited fenced shelbi metadata block could not be
+    /// parsed (unparseable inner YAML, or a `<!-- shelbi:begin -->` marker with
+    /// no matching `<!-- shelbi:end -->`). A write path refuses with this rather
+    /// than clobbering the human's edit with default metadata; the issue body on
+    /// GitHub is left exactly as written. The message names the issue and the
+    /// parse detail so the user knows where to look. Read paths never raise this
+    /// — they render the issue with empty metadata and a warning instead.
+    #[error(
+        "issue `{id}` has a malformed shelbi metadata block ({detail}); \
+         fix the fenced `<!-- shelbi:begin -->` block on github.com and retry"
+    )]
+    MalformedIssueMetadata { id: String, detail: String },
+
     #[error("{0}")]
     Other(String),
 }
