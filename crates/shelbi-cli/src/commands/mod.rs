@@ -285,11 +285,10 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("SHELBI_HOME", &home);
         register_github_project(&home, "g");
-        shelbi_state::write_board_index(
-            "g",
-            &shelbi_state::BoardIndex::fresh(vec![ifile("sentinel-only-in-index", "todo")]),
-        )
-        .unwrap();
+        let mut idx =
+            shelbi_state::BoardIndex::fresh(vec![ifile("sentinel-only-in-index", "todo")]);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("g", &idx).unwrap();
 
         let board = super::read_open_board_for_cli("g").unwrap();
         assert_eq!(board.len(), 1);

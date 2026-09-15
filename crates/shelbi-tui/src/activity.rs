@@ -3891,7 +3891,9 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         // Seed the id→number map so resolution takes the index fast path (no
         // per-id search) and `fetch_many` is a single aliased request for all
         // three — the O(1) batch AC4 requires.
-        shelbi_state::write_board_index("actv", &shelbi_state::BoardIndex::fresh(Vec::new())).unwrap();
+        let mut idx = shelbi_state::BoardIndex::fresh(Vec::new());
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("actv", &idx).unwrap();
         for (id, n) in [("d1", 1), ("d2", 2), ("d3", 3)] {
             shelbi_state::record_board_index_number("actv", id, n).unwrap();
         }

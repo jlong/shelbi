@@ -2301,7 +2301,9 @@ mod tests {
             issue("work-1", Column::in_progress(), Some("alpha")),
         ];
         // Publish the board as the daemon would: the sidebar reads this file.
-        shelbi_state::write_board_index(name, &shelbi_state::BoardIndex::fresh(board)).unwrap();
+        let mut idx = shelbi_state::BoardIndex::fresh(board);
+        idx.repo = Some(shelbi_state::github_board_repo("shelbi-test/offline-only"));
+        shelbi_state::write_board_index(name, &idx).unwrap();
 
         let mut app = App::new_sidebar(name);
         app.refresh().unwrap();
@@ -2389,7 +2391,9 @@ mod tests {
         ];
         // Publish the index as the daemon would; the sidebar serves it straight
         // off disk (the live backend below is never contacted).
-        shelbi_state::write_board_index(name, &shelbi_state::BoardIndex::fresh(board)).unwrap();
+        let mut idx = shelbi_state::BoardIndex::fresh(board);
+        idx.repo = Some(shelbi_state::github_board_repo("shelbi-test/offline-only"));
+        shelbi_state::write_board_index(name, &idx).unwrap();
 
         // Any `gh` call is a failure of the "serves the index" contract: count and
         // error on every invocation.

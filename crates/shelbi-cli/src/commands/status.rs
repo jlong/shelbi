@@ -299,10 +299,14 @@ fn github_section(project: &str) -> Option<String> {
     // or aging board explains itself ("last error: no auth token found …").
     let refresh_error = shelbi_state::read_board_refresh_error(project);
 
-    // Whether the daemon has ever published an index for this project. An
-    // aged/stale index still counts as published; only its absence is "never
-    // published", the state a failing token probe leaves the board in.
-    let index_published = shelbi_state::read_board_index(project).is_some();
+    // Whether the daemon has published an index this project can serve. An
+    // aged/stale index still counts as published; its absence — or an index that
+    // cannot serve because it describes a different repository or a pre-identity
+    // shape — is "never published", the state a failing token probe or a retarget
+    // leaves the board in.
+    let index_published =
+        shelbi_state::read_valid_board_index(project, shelbi_state::expected_board_repo(&cfg).as_deref())
+            .is_some();
 
     let mut out = String::new();
     // Read path + index age.
@@ -838,16 +842,14 @@ issue_tracker:\n\
         std::env::set_var("SHELBI_HOME", &home);
         register_github_project(&home, "g");
 
-        shelbi_state::write_board_index(
-            "g",
-            &shelbi_state::BoardIndex::fresh(vec![
-                ifile("a", "backlog"),
-                ifile("b", "todo"),
-                ifile("c", "in-progress"),
-                ifile("d", "review"),
-            ]),
-        )
-        .unwrap();
+        let mut idx = shelbi_state::BoardIndex::fresh(vec![
+            ifile("a", "backlog"),
+            ifile("b", "todo"),
+            ifile("c", "in-progress"),
+            ifile("d", "review"),
+        ]);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("g", &idx).unwrap();
 
         let counts = category_counts("g").unwrap();
         assert_eq!(counts.backlog, 1);
@@ -876,6 +878,7 @@ issue_tracker:\n\
         let mut idx = shelbi_state::BoardIndex::fresh(vec![ifile("a", "review")]);
         idx.remaining = Some(4_989);
         idx.reset = Some(1_800_000_000);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
         shelbi_state::write_board_index("g", &idx).unwrap();
         // A logged GraphQL request so the "requests in the last hour" count is live.
         shelbi_state::gh_requests::record_request(

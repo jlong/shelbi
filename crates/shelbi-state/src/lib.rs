@@ -65,12 +65,13 @@ pub use issue_migrate::{
     PartialMigration,
 };
 pub use board_index::{
-    board_index_path, board_refresh_error_path, clear_board_refresh_error, mark_board_index_stale,
-    patch_board_index_issue, read_board, read_board_index, read_board_refresh_error,
-    read_board_report, read_board_report_with_cfg, read_board_with_cfg, record_board_index_number,
+    board_index_path, board_refresh_error_path, clear_board_refresh_error, expected_board_repo,
+    github_board_repo, mark_board_index_stale, patch_board_index_issue, read_board,
+    read_board_index, read_board_refresh_error, read_board_report, read_board_report_with_cfg,
+    read_board_with_cfg, read_valid_board_index, record_board_index_number,
     record_board_refresh_error, remove_board_index_issue, update_board_index, write_board_index,
     BoardFreshness, BoardIndex, BoardRefreshError, BoardReport, BoardSource, ReadPath,
-    BOARD_INDEX_FILE, BOARD_REFRESH_ERROR_FILE,
+    BOARD_INDEX_FILE, BOARD_INDEX_SCHEMA_VERSION, BOARD_REFRESH_ERROR_FILE,
 };
 pub use done_history::{
     done_history_path, patch_done_history_issue, read_done_history, remove_done_history_issue,
@@ -7085,6 +7086,7 @@ workspaces:
         // gate stays closed and the poller reuses its last warm count instead.
         let mut idx = BoardIndex::fresh(vec![in_progress_card("t", None)]);
         idx.stale = true;
+        idx.repo = Some(github_board_repo("owner/repo"));
         write_board_index(name, &idx).unwrap();
         assert_eq!(
             idle_workspace_count_warm(&project).unwrap(),
@@ -7105,7 +7107,8 @@ workspaces:
         write_gh_project_ws(&home, name, &["alpha", "bravo", "charlie"]);
         // Publish a fresh (warm) index the daemon owns; the heartbeat reads this,
         // not this process's per-pane cache. `alpha` is busy → two idle.
-        let idx = BoardIndex::fresh(vec![in_progress_card("t", Some("alpha"))]);
+        let mut idx = BoardIndex::fresh(vec![in_progress_card("t", Some("alpha"))]);
+        idx.repo = Some(github_board_repo("owner/repo"));
         write_board_index(name, &idx).unwrap();
         let project = load_project(name).unwrap();
         assert_eq!(
