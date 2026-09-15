@@ -324,6 +324,18 @@ fn classify(err: &Error) -> Disposition {
     };
     let hay = format!("{status}\n{stderr}").to_ascii_lowercase();
 
+    // Prefer the HTTP status line + rate-limit headers when the response carried
+    // them. Every REST `gh api` call now sends `--include`, so a REST failure's
+    // captured output begins with `HTTP/<ver> <code> …` and includes the
+    // `x-ratelimit-*` headers — the authoritative signal, decided independently
+    // of whatever the human error text or the JSON body happens to say. Text
+    // matching (below) survives only as the fallback for a failure that produced
+    // *no* HTTP response at all: a spawn failure, a deadline kill, DNS/TCP/TLS,
+    // or a synthetic park error — none of which carry an `HTTP/` status line.
+    if let Some(code) = parse_http_status(&hay) {
+        return classify_http_status(code, &hay);
+    }
+
     let rate_limited = hay.contains("secondary rate limit")
         || hay.contains("rate limit") // "API rate limit exceeded"
         || hay.contains("http 429")
@@ -358,6 +370,46 @@ fn classify(err: &Error) -> Disposition {
     }
 
     Disposition::Terminal
+}
+
+/// The HTTP status code from a `gh api --include` response captured in `hay`
+/// (already lowercased), or `None` when no `HTTP/…` status line is present —
+/// the case for a failure that never got an HTTP response (spawn failure,
+/// deadline kill, DNS/TCP/TLS) or a synthetic park error. On a paginated
+/// response the *last* status line wins: it is the page that failed, or the
+/// final page's status. The version token is skipped and the next whitespace
+/// token parsed as the code (`http/2.0 403 forbidden` → `403`).
+fn parse_http_status(hay: &str) -> Option<u16> {
+    hay.lines().rev().find_map(|line| {
+        let rest = line.trim_start().strip_prefix("http/")?;
+        rest.split_whitespace().nth(1)?.parse::<u16>().ok()
+    })
+}
+
+/// Classify a REST failure from its HTTP status code and (for the 403 split) the
+/// captured rate-limit headers in `hay`. This is authoritative over the response
+/// body: a 404/422 whose body happens to contain "timeout" is still terminal,
+/// and a 403/429 whose quota is spent is rate-limited even with no "rate limit"
+/// text anywhere.
+fn classify_http_status(code: u16, hay: &str) -> Disposition {
+    match code {
+        // 429 is always throttling. A 403 is throttling only when the quota is
+        // spent (`x-ratelimit-remaining: 0`) or it is the content-creation
+        // *secondary* limit (which does not decrement the primary counter, so it
+        // carries its own text and usually a `retry-after`); a 403 with quota
+        // left is a permission error and terminal.
+        429 => Disposition::RateLimited(parse_wait_hint(hay)),
+        403 if hay.contains("x-ratelimit-remaining: 0") || hay.contains("secondary rate limit") => {
+            Disposition::RateLimited(parse_wait_hint(hay))
+        }
+        403 => Disposition::Terminal,
+        // 5xx: GitHub answered, so the network is up and this may clear — retry
+        // as transient (never a connection park, which is for a dead network).
+        500..=599 => Disposition::Transient,
+        // Everything else — 404, 422, other 4xx, or a 2xx that still surfaced as
+        // an error — is terminal and never retried, regardless of the body.
+        _ => Disposition::Terminal,
+    }
 }
 
 /// Whether a lowercased `gh` error haystack names a connection-level failure —
@@ -837,6 +889,94 @@ mod tests {
             "other"
         );
         assert_eq!(error_class(&Error::Other("not a gh failure".into())), "other");
+    }
+
+    #[test]
+    fn rate_limit_decided_from_status_line_and_remaining_header_without_rate_limit_text() {
+        // With `--include`, a throttled REST GET carries `HTTP/2.0 403` and
+        // `x-ratelimit-remaining: 0` even when neither the terse stderr line nor
+        // the JSON body says "rate limit". The status path must still classify it
+        // as rate-limited (spent quota), not fall through to terminal.
+        let detail = "gh: forbidden\n\
+             HTTP/2.0 403 Forbidden\n\
+             x-ratelimit-remaining: 0\n\
+             x-ratelimit-reset: 1800000000\n\
+             \n\
+             {\"message\":\"nope\",\"documentation_url\":\"...\"}";
+        let err = command_err("exit status: 1", detail);
+        assert!(is_rate_limit_error(&err), "403 + remaining:0 is rate limited");
+        assert_eq!(error_class(&err), "ratelimit");
+    }
+
+    #[test]
+    fn http_429_status_line_is_rate_limited() {
+        let err = command_err(
+            "exit status: 1",
+            "gh: too many requests\nHTTP/2.0 429 Too Many Requests\nretry-after: 3\n\n{}",
+        );
+        assert!(is_rate_limit_error(&err));
+    }
+
+    #[test]
+    fn permission_403_with_quota_left_is_terminal_from_the_status_path() {
+        // A 403 whose header block shows quota remaining is a permission error,
+        // never a throttle — one attempt, no retry.
+        let (policy, _waits) = recording_policy(5);
+        let calls = Arc::new(Mutex::new(0u32));
+        let c = calls.clone();
+        let _ = policy.run(|| {
+            *c.lock().unwrap() += 1;
+            Err::<(), _>(command_err(
+                "exit status: 1",
+                "gh: forbidden\nHTTP/2.0 403 Forbidden\nx-ratelimit-remaining: 4999\n\n\
+                 {\"message\":\"Resource not accessible by integration\"}",
+            ))
+        });
+        assert_eq!(*calls.lock().unwrap(), 1, "permission 403 is terminal");
+    }
+
+    #[test]
+    fn status_404_and_422_are_terminal_even_when_the_body_contains_timeout() {
+        // The response body mentioning "timeout" must not steer a hard 404/422
+        // into the transient bucket — the status line is authoritative.
+        for detail in [
+            "gh: not found\nHTTP/2.0 404 Not Found\n\n{\"message\":\"timeout happened upstream\"}",
+            "gh: unprocessable\nHTTP/2.0 422 Unprocessable Entity\n\n\
+             {\"message\":\"Validation Failed: request timeout in field\"}",
+        ] {
+            let (policy, waits) = recording_policy(5);
+            let calls = Arc::new(Mutex::new(0u32));
+            let c = calls.clone();
+            let out: Result<()> = policy.run(|| {
+                *c.lock().unwrap() += 1;
+                Err(command_err("exit status: 1", detail))
+            });
+            assert!(out.is_err());
+            assert_eq!(*calls.lock().unwrap(), 1, "terminal, not retried: {detail}");
+            assert!(waits.lock().unwrap().is_empty(), "no backoff: {detail}");
+        }
+    }
+
+    #[test]
+    fn status_5xx_is_transient_from_the_status_path() {
+        let err = command_err(
+            "exit status: 1",
+            "gh: bad gateway\nHTTP/2.0 503 Service Unavailable\n\n{}",
+        );
+        assert!(!is_connection_error(&err), "5xx is not a connection failure");
+        assert_eq!(error_class(&err), "transient");
+    }
+
+    #[test]
+    fn a_deadline_timeout_is_transient() {
+        // The child-deadline kill returns `Error::Command { status: "timed out
+        // after 45s", .. }` with no HTTP status line, so it must land in the
+        // transient bucket via the text fallback — one more read attempt, then
+        // fail fast, rather than spinning on a wedge.
+        let err = command_err("timed out after 45s", "gh did not finish within 45s");
+        assert_eq!(error_class(&err), "transient");
+        assert!(!is_connection_error(&err));
+        assert!(!is_rate_limit_error(&err));
     }
 
     #[test]
