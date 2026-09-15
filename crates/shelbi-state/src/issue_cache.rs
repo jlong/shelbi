@@ -296,14 +296,46 @@ impl CachedIssueStore {
         if after.is_some() {
             return self.inner.closed_page(after);
         }
-        if let Some(history) = done_history::read_done_history(&self.project) {
+        // The TTL read doubles as the pre-fetch snapshot of the cached ids — an
+        // id present under the lock below but absent from *both* this snapshot and
+        // the fetched page was spliced in by `patch_done_history_issue` while the
+        // fetch was in flight, and is exactly the just-merged card to preserve.
+        let cached = done_history::read_done_history(&self.project);
+        if let Some(history) = &cached {
             if history.is_fresh() {
                 return Ok(history.to_page());
             }
         }
+        // TTL miss: fetch the live page with **no lock held**, then publish under
+        // the done-history lock, reconciling the fetched page against the page as
+        // re-read inside the critical section.
         let page = self.inner.closed_page(None)?;
-        let _ = done_history::write_done_history(&self.project, &DoneHistory::from_page(&page));
-        Ok(page)
+        let snapshot_ids: std::collections::HashSet<String> = cached
+            .map(|h| h.issues.into_iter().map(|f| f.task.id).collect())
+            .unwrap_or_default();
+        let published = done_history::update_done_history(&self.project, |current| {
+            let mut history = DoneHistory::from_page(&page);
+            if let Some(current) = current {
+                let page_ids: std::collections::HashSet<&str> =
+                    page.issues.iter().map(|f| f.task.id.as_str()).collect();
+                // Ids in the current file but in neither the pre-fetch snapshot nor
+                // the fetched page are write-throughs that landed mid-fetch. Prepend
+                // them (newest-closed first), preserving their order in the file.
+                let mut merged: Vec<IssueFile> = current
+                    .issues
+                    .into_iter()
+                    .filter(|f| {
+                        !snapshot_ids.contains(&f.task.id) && !page_ids.contains(f.task.id.as_str())
+                    })
+                    .collect();
+                merged.extend(history.issues);
+                history.issues = merged;
+            }
+            let out = history.to_page();
+            Ok((history, out))
+        });
+        // Best-effort: on a publish failure serve what we actually fetched.
+        Ok(published.unwrap_or(page))
     }
 
     /// Refresh the open snapshot on a background thread, at most one at a time.
@@ -1349,5 +1381,142 @@ mod tests {
         let page = done_history::read_done_history("cache-wt-reopen").unwrap();
         assert!(!page.issues.iter().any(|f| f.task.id == "a"), "a left the history");
         assert!(page.issues.iter().any(|f| f.task.id == "b"), "others untouched");
+    }
+
+    /// A store whose `closed_page` splices a freshly-completed card into the
+    /// done-history file **before** returning the fetched page — the deterministic
+    /// stand-in for an operator's merge landing (via `patch_done_history_issue`)
+    /// while the cadence fetch's "network" read is in flight. The patch runs with
+    /// no done-history lock held (the fetch happens before `serve_closed_page`
+    /// takes the lock), exactly as the real write-through would.
+    struct MidFetchPatchStore {
+        project: String,
+        page: ClosedPage,
+        mid_fetch: IssueFile,
+    }
+    impl IssueStore for MidFetchPatchStore {
+        fn list(&self) -> Result<Vec<IssueFile>> {
+            Ok(Vec::new())
+        }
+        fn list_in_status(&self, _s: &Column) -> Result<Vec<IssueFile>> {
+            Ok(Vec::new())
+        }
+        fn closed_page(&self, _after: Option<&str>) -> Result<ClosedPage> {
+            // The operator's merge lands mid-fetch.
+            done_history::patch_done_history_issue(&self.project, &self.mid_fetch).unwrap();
+            Ok(self.page.clone())
+        }
+        fn get(&self, _id: &str) -> Result<Option<IssueFile>> {
+            Ok(None)
+        }
+        fn add(&self, _s: NewIssue) -> Result<Issue> {
+            unreachable!()
+        }
+        fn move_status(&self, _i: &str, _t: &Column, _r: &str) -> Result<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn set_priority(&self, _i: &str, _p: PrioMove) -> Result<()> {
+            Ok(())
+        }
+        fn set_fields(&self, _i: &str, _f: IssueFields) -> Result<()> {
+            Ok(())
+        }
+        fn cancel(&self, _i: &str, _r: &str) -> Result<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn move_status_and_unassign(
+            &self,
+            _i: &str,
+            _t: &Column,
+            _r: &str,
+        ) -> Result<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn delete(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn renumber(&self, _s: &Column) -> Result<()> {
+            Ok(())
+        }
+        fn park_review(&self, _id: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn clear_parked(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn reject_review(
+            &self,
+            _i: &str,
+            _r: &Column,
+            _s: &str,
+            _d: &str,
+        ) -> Result<Option<StatusMove>> {
+            Ok(None)
+        }
+        fn poll_changes(&self, _s: &Cursor) -> Result<(Vec<IssueChange>, Cursor)> {
+            Ok((Vec::new(), Cursor::start()))
+        }
+        fn list_comments(&self, _id: &str) -> Result<Vec<IssueComment>> {
+            Ok(Vec::new())
+        }
+        fn add_comment(&self, _id: &str, _b: &str) -> Result<IssueComment> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn a_cadence_fetch_preserves_a_write_through_that_landed_mid_fetch() {
+        // §4 reconciliation: on a TTL miss the cadence fetch reads a fresh page
+        // with no lock held; a `patch_done_history_issue` that lands during that
+        // fetch must survive publication — the just-merged card stays at the top —
+        // and the published page must carry the fetch's own (new) `fetched_at`, not
+        // the stale one it replaced.
+        let _home = HomeGuard::new("cadence-race");
+
+        // Seed a stale cached page (older than the TTL → a TTL miss forces a fetch).
+        let mut stale = DoneHistory::from_page(&ClosedPage {
+            issues: vec![issue("older", "done")],
+            next_cursor: None,
+            remaining: None,
+            reset: None,
+        });
+        stale.fetched_at = (chrono::Utc::now() - chrono::Duration::seconds(601)).to_rfc3339();
+        let old_fetched_at = stale.fetched_at.clone();
+        done_history::write_done_history("cache-cadence", &stale).unwrap();
+
+        // The fetch returns a server page of one card, and splices `fresh` in
+        // mid-fetch (the operator's merge) before returning.
+        let store = CachedIssueStore {
+            inner: Box::new(MidFetchPatchStore {
+                project: "cache-cadence".to_string(),
+                page: ClosedPage {
+                    issues: vec![issue("server", "done")],
+                    next_cursor: None,
+                    remaining: None,
+                    reset: None,
+                },
+                mid_fetch: issue("fresh", "done"),
+            }),
+            project: "cache-cadence".to_string(),
+            cfg: offline_cfg(),
+            snapshot: None,
+        };
+
+        let served = store.serve_closed_page(None).unwrap();
+        assert_eq!(
+            served.issues[0].task.id, "fresh",
+            "the mid-fetch merge is preserved at the top of the page"
+        );
+        assert!(
+            served.issues.iter().any(|f| f.task.id == "server"),
+            "the fetched page's own card is present"
+        );
+
+        let published = done_history::read_done_history("cache-cadence").unwrap();
+        assert_eq!(published.issues[0].task.id, "fresh", "the file agrees");
+        assert_ne!(
+            published.fetched_at, old_fetched_at,
+            "the published page carries the fetch's fresh fetched_at, not the stale one"
+        );
     }
 }

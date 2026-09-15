@@ -230,11 +230,79 @@ pub fn clear_board_refresh_error(project: &str) -> Result<()> {
 /// Persist `index` to `project`'s board-index file atomically (temp file +
 /// rename via [`crate::atomic_write`]), so a daemon killed mid-write leaves
 /// either the old index or the new one, never a truncated file.
+///
+/// Holds the sibling `board-index.json.lock` for the duration of the write, so
+/// this is a full-snapshot, last-writer-wins publish: any concurrent writer's
+/// change is silently reverted. Reserve it for publishing an index constructed
+/// from scratch (tests, seeding); every read-modify-replace mutator must route
+/// through [`update_board_index`] (or the in-module locked helpers) so the read
+/// and the publish sit inside one critical section and no update is lost.
 pub fn write_board_index(project: &str, index: &BoardIndex) -> Result<()> {
     let path = board_index_path(project)?;
+    let _lock = crate::acquire_file_lock(&crate::sibling_lock_path(&path))?;
+    write_board_index_to(&path, index)
+}
+
+/// Serialize and atomically write `index` at `path`. Callers must already hold
+/// the board-index lock — this is the unlocked inner writer the locked entry
+/// points ([`write_board_index`], [`update_board_index`], the in-module
+/// helpers) delegate to from inside their critical section, so it never
+/// re-acquires the non-reentrant flock.
+fn write_board_index_to(path: &Path, index: &BoardIndex) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(index)
         .map_err(|e| shelbi_core::Error::Other(format!("serializing board index: {e}")))?;
-    crate::atomic_write(&path, &bytes)
+    crate::atomic_write(path, &bytes)
+}
+
+/// Locked read-modify-publish on `project`'s board index: acquires the sibling
+/// `board-index.json.lock`, reads the current index (via the lock-free
+/// [`read_board_index_at`]), hands it to `f`, and — when `f` returns
+/// `Some(index)` — publishes it through the unlocked inner writer, all inside
+/// one critical section so a concurrent writer's update is never lost. `f`
+/// returning `None` writes nothing (the read observed nothing to change).
+///
+/// The lock covers the read as well as the publish: a mutator that read outside
+/// this section would merge its delta onto a stale base and clobber the other
+/// writer's change under the lock, which is exactly the bug this serializes
+/// away. `f` must not call another board-index mutator for the same project —
+/// the flock is not reentrant and the nested acquire would deadlock.
+fn with_board_index_lock<R>(
+    project: &str,
+    f: impl FnOnce(Option<BoardIndex>) -> Result<(Option<BoardIndex>, R)>,
+) -> Result<R> {
+    let path = board_index_path(project)?;
+    let _lock = crate::acquire_file_lock(&crate::sibling_lock_path(&path))?;
+    let current = read_board_index_at(&path);
+    let (updated, out) = f(current)?;
+    if let Some(index) = updated {
+        write_board_index_to(&path, &index)?;
+    }
+    Ok(out)
+}
+
+/// Locked read-modify-publish the daemon's refresh publishes through — the
+/// board-index twin of [`crate::update_state`], for a caller (the daemon lives
+/// in `shelbi-cli` and can't see [`crate::acquire_file_lock`]) that must
+/// reconcile a just-read board against the *current* index and publish, without
+/// a lost update.
+///
+/// Acquires the sibling lock, reads the current index, hands it to `f`,
+/// publishes the [`BoardIndex`] `f` returns through the unlocked inner writer,
+/// drops the guard, and returns `f`'s `R`. `R` is what carries a change count
+/// (or any other summary) back out so the caller can append its events.log line
+/// **after** the guard has dropped — no lock is ever held across an events
+/// append, a network call, or a subprocess spawn. `f` runs entirely inside the
+/// critical section, so it must do none of those itself and must not call
+/// another board-index mutator for the same project (the flock is not
+/// reentrant).
+pub fn update_board_index<R>(
+    project: &str,
+    f: impl FnOnce(Option<BoardIndex>) -> Result<(BoardIndex, R)>,
+) -> Result<R> {
+    with_board_index_lock(project, |current| {
+        let (index, out) = f(current)?;
+        Ok((Some(index), out))
+    })
 }
 
 /// Read and parse `project`'s board index. A missing file, an unreadable file,
@@ -614,26 +682,28 @@ pub fn mark_board_index_stale(
     remaining: Option<u64>,
     reset: Option<i64>,
 ) -> Result<()> {
-    let Some(mut idx) = read_board_index(project) else {
-        return Ok(());
-    };
-    // Skip a rewrite when nothing would change — already stale and the budget
-    // numbers match — so a paused project doesn't churn the file every 2s tick.
-    let budget_unchanged = remaining
-        .map(|r| idx.remaining == Some(r))
-        .unwrap_or(true)
-        && reset.map(|r| idx.reset == Some(r)).unwrap_or(true);
-    if idx.stale && budget_unchanged {
-        return Ok(());
-    }
-    idx.stale = true;
-    if remaining.is_some() {
-        idx.remaining = remaining;
-    }
-    if reset.is_some() {
-        idx.reset = reset;
-    }
-    write_board_index(project, &idx)
+    with_board_index_lock(project, |current| {
+        let Some(mut idx) = current else {
+            return Ok((None, ()));
+        };
+        // Skip a rewrite when nothing would change — already stale and the budget
+        // numbers match — so a paused project doesn't churn the file every 2s tick.
+        let budget_unchanged = remaining
+            .map(|r| idx.remaining == Some(r))
+            .unwrap_or(true)
+            && reset.map(|r| idx.reset == Some(r)).unwrap_or(true);
+        if idx.stale && budget_unchanged {
+            return Ok((None, ()));
+        }
+        idx.stale = true;
+        if remaining.is_some() {
+            idx.remaining = remaining;
+        }
+        if reset.is_some() {
+            idx.reset = reset;
+        }
+        Ok((Some(idx), ()))
+    })
 }
 
 /// Splice a single freshly-mutated issue into the published index in place — the
@@ -654,14 +724,16 @@ pub fn mark_board_index_stale(
 /// tick will include the issue). Only meaningful for a remote project; a
 /// `file_system` project has no index and never calls this.
 pub fn patch_board_index_issue(project: &str, issue: &IssueFile) -> Result<()> {
-    let Some(mut idx) = read_board_index(project) else {
-        return Ok(());
-    };
-    match idx.board.iter_mut().find(|f| f.task.id == issue.task.id) {
-        Some(existing) => *existing = issue.clone(),
-        None => idx.board.push(issue.clone()),
-    }
-    write_board_index(project, &idx)
+    with_board_index_lock(project, |current| {
+        let Some(mut idx) = current else {
+            return Ok((None, ()));
+        };
+        match idx.board.iter_mut().find(|f| f.task.id == issue.task.id) {
+            Some(existing) => *existing = issue.clone(),
+            None => idx.board.push(issue.clone()),
+        }
+        Ok((Some(idx), ()))
+    })
 }
 
 /// [`patch_board_index_issue`] that also records the issue's backend `number` in
@@ -675,17 +747,19 @@ pub fn patch_board_index_issue_with_number(
     issue: &IssueFile,
     number: Option<i64>,
 ) -> Result<()> {
-    let Some(mut idx) = read_board_index(project) else {
-        return Ok(());
-    };
-    match idx.board.iter_mut().find(|f| f.task.id == issue.task.id) {
-        Some(existing) => *existing = issue.clone(),
-        None => idx.board.push(issue.clone()),
-    }
-    if let Some(number) = number {
-        idx.numbers.insert(issue.task.id.clone(), number);
-    }
-    write_board_index(project, &idx)
+    with_board_index_lock(project, |current| {
+        let Some(mut idx) = current else {
+            return Ok((None, ()));
+        };
+        match idx.board.iter_mut().find(|f| f.task.id == issue.task.id) {
+            Some(existing) => *existing = issue.clone(),
+            None => idx.board.push(issue.clone()),
+        }
+        if let Some(number) = number {
+            idx.numbers.insert(issue.task.id.clone(), number);
+        }
+        Ok((Some(idx), ()))
+    })
 }
 
 /// Drop an issue from the published index — the write-through for a mutation
@@ -694,16 +768,18 @@ pub fn patch_board_index_issue_with_number(
 /// the freshness envelope like [`patch_board_index_issue`]. A no-op when no
 /// index exists or the id isn't in it.
 pub fn remove_board_index_issue(project: &str, id: &str) -> Result<()> {
-    let Some(mut idx) = read_board_index(project) else {
-        return Ok(());
-    };
-    let before = idx.board.len();
-    idx.board.retain(|f| f.task.id != id);
-    let had_number = idx.numbers.remove(id).is_some();
-    if idx.board.len() == before && !had_number {
-        return Ok(());
-    }
-    write_board_index(project, &idx)
+    with_board_index_lock(project, |current| {
+        let Some(mut idx) = current else {
+            return Ok((None, ()));
+        };
+        let before = idx.board.len();
+        idx.board.retain(|f| f.task.id != id);
+        let had_number = idx.numbers.remove(id).is_some();
+        if idx.board.len() == before && !had_number {
+            return Ok((None, ()));
+        }
+        Ok((Some(idx), ()))
+    })
 }
 
 /// Record a remote backend's native issue `number` for `id` in the published
@@ -719,14 +795,16 @@ pub fn remove_board_index_issue(project: &str, id: &str) -> Result<()> {
 /// (the first tick will carry the number) or when the map already maps `id` to
 /// the same number.
 pub fn record_board_index_number(project: &str, id: &str, number: i64) -> Result<()> {
-    let Some(mut idx) = read_board_index(project) else {
-        return Ok(());
-    };
-    if idx.numbers.get(id) == Some(&number) {
-        return Ok(());
-    }
-    idx.numbers.insert(id.to_string(), number);
-    write_board_index(project, &idx)
+    with_board_index_lock(project, |current| {
+        let Some(mut idx) = current else {
+            return Ok((None, ()));
+        };
+        if idx.numbers.get(id) == Some(&number) {
+            return Ok((None, ()));
+        }
+        idx.numbers.insert(id.to_string(), number);
+        Ok((Some(idx), ()))
+    })
 }
 
 /// How many issues differ between an old and a new board — the `changed=<n>`
@@ -777,7 +855,7 @@ pub fn board_diff_count(old: Option<&[IssueFile]>, new: &[IssueFile]) -> usize {
 /// unreachable) conservatively reports "changed" so a real edit is never missed.
 ///
 /// [`Issue`]: shelbi_core::Issue
-fn issue_files_eq(a: &IssueFile, b: &IssueFile) -> bool {
+pub fn issue_files_eq(a: &IssueFile, b: &IssueFile) -> bool {
     match (serde_json::to_vec(a), serde_json::to_vec(b)) {
         (Ok(ja), Ok(jb)) => ja == jb,
         _ => false,
@@ -1088,6 +1166,58 @@ mod tests {
         let bytes = serde_json::to_vec(&idx).unwrap();
         let back: BoardIndex = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.numbers.get("a"), Some(&7));
+    }
+
+    #[test]
+    fn concurrent_patches_from_two_threads_both_survive() {
+        // Two writers each patch a *different* issue into one seeded index. With
+        // the read + publish serialized under the sibling lock, both survive; the
+        // pre-fix read-modify-replace loses whichever renamed second. Two flock
+        // descriptors in one process exclude each other exactly as two processes
+        // do, so two threads faithfully stand in for two `shelbi issue move`s.
+        //
+        // The spawned threads call the state helper only — never build their own
+        // `IsolatedHome`, which would deadlock on the process-global test lock the
+        // guard holds for its whole lifetime.
+        let _iso = IsolatedHome::new("concurrent-patch");
+        write_board_index("proj", &index_aged(vec![issue("base", "todo", 0)], 0, false)).unwrap();
+
+        let t1 = std::thread::spawn(|| {
+            for _ in 0..100 {
+                patch_board_index_issue("proj", &issue("x", "review", 0)).unwrap();
+            }
+        });
+        let t2 = std::thread::spawn(|| {
+            for _ in 0..100 {
+                patch_board_index_issue("proj", &issue("y", "review", 0)).unwrap();
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let back = read_board_index("proj").unwrap();
+        let ids: std::collections::HashSet<&str> =
+            back.board.iter().map(|f| f.task.id.as_str()).collect();
+        assert!(ids.contains("base"), "the seeded card is untouched");
+        assert!(ids.contains("x"), "thread 1's patch survived the race");
+        assert!(ids.contains("y"), "thread 2's patch survived the race");
+    }
+
+    #[test]
+    fn read_board_index_is_lock_free_while_the_write_lock_is_held() {
+        // A reader must acquire nothing: holding the sibling board-index lock (as a
+        // concurrent writer would) does not block `read_board_index`. If the read
+        // took the lock, this same-thread acquire-then-read would deadlock (flock
+        // is not reentrant across two descriptors).
+        let _iso = IsolatedHome::new("reader-lockfree");
+        write_board_index("proj", &index_aged(vec![issue("a", "todo", 0)], 0, false)).unwrap();
+
+        let path = board_index_path("proj").unwrap();
+        let _held = crate::acquire_file_lock(&crate::sibling_lock_path(&path)).unwrap();
+
+        let back = read_board_index("proj").expect("read returns while the write lock is held");
+        assert_eq!(back.board.len(), 1);
+        assert_eq!(back.board[0].task.id, "a");
     }
 
     #[test]

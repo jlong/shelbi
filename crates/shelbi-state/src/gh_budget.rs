@@ -261,6 +261,40 @@ fn park_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// The cross-process budget-file lock's state for one mutation. The process
+/// [`park_lock`] makes concurrent writers within a process exact; this flock
+/// (on the sibling `<key>.json.lock`) extends that across processes, so a `park`
+/// in one process and a `record` in another can't read the same state and
+/// clobber each other's tier.
+enum BudgetLock {
+    /// No budget root resolved — parking is disabled and the read-modify-write
+    /// is already a best-effort no-op ([`read_state`] returns the default,
+    /// [`write_state`] writes nothing). Run unlocked, exactly as before.
+    Disabled,
+    /// The flock is held; released when the guard drops at end of scope.
+    Held(#[allow(dead_code)] crate::FileLockGuard),
+    /// The flock couldn't be acquired (logged at debug). The caller skips the
+    /// read-modify-write and returns its already-parked value, staying
+    /// best-effort rather than propagating a new error.
+    Failed,
+}
+
+/// Acquire the cross-process budget-file lock for `key`, to be held *under* the
+/// already-held process [`park_lock`] (process mutex first, file lock second, in
+/// every caller — so two processes can never deadlock on opposite orderings).
+fn lock_budget_file(key: &str) -> BudgetLock {
+    let Some(path) = budget_path(key) else {
+        return BudgetLock::Disabled;
+    };
+    match crate::acquire_file_lock(&crate::sibling_lock_path(&path)) {
+        Ok(guard) => BudgetLock::Held(guard),
+        Err(e) => {
+            tracing::debug!(error = %e, "gh_budget: could not acquire budget file lock; skipping write");
+            BudgetLock::Failed
+        }
+    }
+}
+
 /// Park `budget` for `key` until `reset_at`. Returns `true` **iff this call
 /// transitioned the budget from not-parked to parked** — the signal the caller
 /// uses to log the `board rate-limited` line exactly once per window. A call
@@ -277,6 +311,10 @@ fn park_lock() -> &'static Mutex<()> {
 /// fresh `board rate-limited` line every tick for the rest of the window.
 pub fn park(key: &str, budget: Budget, reset_at: i64, now: i64) -> bool {
     let _guard = park_lock().lock();
+    let _file = match lock_budget_file(key) {
+        BudgetLock::Failed => return false, // couldn't lock: act as already-parked
+        held => held,
+    };
     let mut state = read_state(key);
     if park_verdict(state.tier(budget), now).is_some() {
         return false; // already parked this window
@@ -320,6 +358,10 @@ pub fn unreachable_parked_until(key: &str, now: i64) -> Option<i64> {
 /// starts short again.
 pub fn park_unreachable(key: &str, now: i64) -> Option<i64> {
     let _guard = park_lock().lock();
+    let _file = match lock_budget_file(key) {
+        BudgetLock::Failed => return None, // couldn't lock: act as already-parked
+        held => held,
+    };
     let mut state = read_state(key);
     if unreachable_verdict(&state.unreachable, now).is_some() {
         return None; // already parked this window
@@ -341,6 +383,10 @@ pub fn park_unreachable(key: &str, now: i64) -> Option<i64> {
 /// pays a write.
 pub fn clear_unreachable(key: &str) {
     let _guard = park_lock().lock();
+    let _file = match lock_budget_file(key) {
+        BudgetLock::Failed => return, // couldn't lock: leave the breaker as-is
+        held => held,
+    };
     let mut state = read_state(key);
     if state.unreachable == UnreachableState::default() {
         return; // nothing to clear — no write on the healthy path
@@ -357,6 +403,10 @@ pub fn record(key: &str, budget: Budget, remaining: Option<i64>, reset_at: Optio
         return;
     }
     let _guard = park_lock().lock();
+    let _file = match lock_budget_file(key) {
+        BudgetLock::Failed => return, // couldn't lock: skip the record this time
+        held => held,
+    };
     let mut state = read_state(key);
     let tier = state.tier_mut(budget);
     if remaining.is_some() {
@@ -390,6 +440,10 @@ pub fn record_rest_headers(key: &str, headers: &RateLimitHeaders) {
 #[cfg(any(test, feature = "test-support"))]
 pub fn clear(key: &str) {
     let _guard = park_lock().lock();
+    let _file = match lock_budget_file(key) {
+        BudgetLock::Failed => return, // couldn't lock: leave the state as-is
+        held => held,
+    };
     write_state(key, &RateLimitState::default());
 }
 
@@ -820,6 +874,58 @@ mod tests {
         assert_eq!(state.graphql.reset_at, Some(9_000));
         assert_eq!(state.rest.remaining, Some(42), "REST recorded independently");
         assert_eq!(state.rest.reset_at, Some(8_000));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A `park` on one thread and a `record` on another against the same budget
+    /// file both survive: the park window is not reverted by the record. Each
+    /// mutator now reads and writes the shared file inside one critical section
+    /// (the process mutex, then the sibling flock), so the record folds its REST
+    /// numbers onto a state that still carries the live GraphQL park rather than
+    /// onto a stale pre-park copy.
+    #[test]
+    fn a_concurrent_park_and_record_do_not_revert_each_other() {
+        let _g = crate::test_lock::LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-gh-budget-park-record-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let key = token_key("park-vs-record");
+        let reset = 5_000i64;
+        let now = 100i64;
+
+        // Park the GraphQL tier, then hammer REST records from another thread. The
+        // park must still read as live afterward, and the REST numbers must land.
+        assert!(park(&key, Budget::Graphql, reset, now), "the park transitions");
+        let k = key.clone();
+        let t = std::thread::spawn(move || {
+            for i in 0..200 {
+                record(&k, Budget::Rest, Some(i), Some(6_000));
+            }
+        });
+        // Concurrently keep asserting the park is intact from this thread.
+        for _ in 0..200 {
+            let _ = read_state(&key);
+        }
+        t.join().unwrap();
+
+        assert_eq!(
+            parked_until(&key, Budget::Graphql, now + 1),
+            Some(reset),
+            "the GraphQL park window survives the concurrent REST records"
+        );
+        let state = read_state(&key);
+        assert_eq!(state.rest.remaining, Some(199), "the last REST record landed");
+        assert_eq!(state.graphql.parked_until, Some(reset), "park not clobbered");
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
