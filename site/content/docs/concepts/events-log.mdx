@@ -120,6 +120,9 @@ When nothing's happening on the board, the watch sits idle for as long
 as it takes for *something* to happen, which can be hours, or never if
 a marker-emitting code path silently regresses. The recurring line is
 the orchestrator's fallback trigger to wake up and check active issues.
+Shelbi's native Codex bridge consumes a quiet-board heartbeat without starting
+a model turn. It wakes Codex only when work is in flight or Zen Mode has both
+eligible work and idle capacity.
 
 The TUI activity feed filters heartbeats out by design. They'd
 produce one "nothing happened" row every few minutes. Use

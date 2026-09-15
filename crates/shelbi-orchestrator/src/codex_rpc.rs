@@ -16,6 +16,17 @@ use serde_json::{json, Map, Value};
 use thiserror::Error;
 use tungstenite::{client, Message, WebSocket};
 
+const OPT_OUT_NOTIFICATION_METHODS: [&str; 8] = [
+    "item/agentMessage/delta",
+    "item/commandExecution/outputDelta",
+    "item/fileChange/outputDelta",
+    "item/mcpToolCall/progress",
+    "item/plan/delta",
+    "thread/tokenUsage/updated",
+    "turn/diff/updated",
+    "turn/plan/updated",
+];
+
 /// A server notification retained while a request is awaiting its response.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexRpcNotification {
@@ -108,6 +119,7 @@ impl CodexRpcClient {
                 },
                 "capabilities": {
                     "experimentalApi": true,
+                    "optOutNotificationMethods": OPT_OUT_NOTIFICATION_METHODS,
                 },
             }),
             timeout,
@@ -442,6 +454,19 @@ mod tests {
             assert_eq!(
                 initialize["params"]["capabilities"]["experimentalApi"],
                 true
+            );
+            assert_eq!(
+                initialize["params"]["capabilities"]["optOutNotificationMethods"],
+                json!([
+                    "item/agentMessage/delta",
+                    "item/commandExecution/outputDelta",
+                    "item/fileChange/outputDelta",
+                    "item/mcpToolCall/progress",
+                    "item/plan/delta",
+                    "thread/tokenUsage/updated",
+                    "turn/diff/updated",
+                    "turn/plan/updated",
+                ])
             );
             send_json(
                 &mut websocket,
