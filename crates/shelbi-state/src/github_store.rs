@@ -387,6 +387,9 @@ impl GitHubStore {
         policy: crate::gh_retry::RetryPolicy,
         runner: impl Fn(&[&str]) -> Result<String> + Send + Sync + 'static,
     ) -> Self {
+        // Clean process-global caches so a prior test's cached number/issue can't
+        // be served here (matches [`with_runner`]; `get_raw` now reads the cache).
+        clear_issue_caches_for_test();
         let base: GhRunner = Arc::new(runner);
         let gh: GhRunner = Arc::new(move |args: &[&str]| policy.run(|| base(args)));
         Self {
@@ -408,6 +411,9 @@ impl GitHubStore {
         write_policy: crate::gh_retry::RetryPolicy,
         runner: impl Fn(&[&str]) -> Result<String> + Send + Sync + 'static,
     ) -> Self {
+        // Clean process-global caches so a prior test's cached number/issue can't
+        // be served here (matches [`with_runner`]; `get_raw` now reads the cache).
+        clear_issue_caches_for_test();
         let base: GhRunner = Arc::new(runner);
         let gh: GhRunner = Arc::new(move |args: &[&str]| {
             let policy = if is_mutating_gh(args) {
@@ -1256,22 +1262,101 @@ impl IssueStore for GitHubStore {
 
 impl GitHubStore {
     /// Resolve a shelbi id to the raw GitHub issue (number + fields), or `None`.
+    ///
+    /// Number-first, mirroring [`GitHubStore::get`]: a number already known from
+    /// the process-local cache or the published index's id→number map is fetched
+    /// directly and verified against the request (a stale mapping is dropped and
+    /// falls through); an all-digit id is taken as a native GitHub issue number —
+    /// the inverse of [`GhIssue::resolve_id`]'s number-as-id fallback, which is
+    /// what makes an un-migrated issue (one carrying no `shelbi:id/*` label)
+    /// actionable through every write and comment path; only then does it fall
+    /// back to the `shelbi:id/*` label search. A label carried by more than one
+    /// non-PR issue is a hard error, never an arbitrary pick, and a pull request
+    /// is never returned on any of the three routes. Every successful resolution
+    /// remembers the number so the post-write `get` (the `CachedIssueStore`
+    /// write-through) resolves from the cache and never pays a search.
     fn get_raw(&self, id: &str) -> Result<Option<GhIssue>> {
         shelbi_core::validate_task_id(id)?;
+
+        // 1. A number the cache or index already resolved. It is fetched directly
+        //    and verified against the request, so a (practically impossible)
+        //    stale mapping can never return the wrong issue — it just falls
+        //    through to the authoritative routes.
+        if let Some(number) = self.cached_number(id).or_else(|| self.index_number(id)) {
+            if let Some(gh) = self.get_raw_by_number(number)? {
+                if gh.resolved_id() == id {
+                    self.remember_number(id, gh.number);
+                    return Ok(Some(gh));
+                }
+            }
+            self.forget_number(id);
+        }
+
+        // 2. An all-digit id names a native GitHub issue number, fetched directly
+        //    — the exact inverse of `resolve_id`'s number-as-id fallback. On a
+        //    miss (the number names no issue) fall through to the label search,
+        //    which still finds a labeled id that happens to be all digits.
+        if id.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(number) = id.parse::<i64>() {
+                if let Some(gh) = self.get_raw_by_number(number)? {
+                    self.remember_number(id, gh.number);
+                    return Ok(Some(gh));
+                }
+            }
+        }
+
+        // 3. The label search. The list already fetched up to per_page=100
+        //    matches, so counting the non-PR ones costs nothing — and more than
+        //    one means a duplicated identity label, which resolves to a hard
+        //    error (naming the id, repo and conflicting numbers) rather than
+        //    acting on whichever the API listed first.
         let path = format!("repos/{}/issues", self.repo);
         let label = format!("labels={}", id_label(id));
         let issues = self.api_issues(
             &path,
             &["-f", "state=all", "-f", &label, "-f", "per_page=100"],
         )?;
+        let mut numbers: Vec<i64> = issues
+            .iter()
+            .filter(|gh| !gh.is_pull_request())
+            .map(|gh| gh.number)
+            .collect();
+        if numbers.len() > 1 {
+            numbers.sort_unstable();
+            let list = numbers
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::Other(format!(
+                "id `{id}` resolves ambiguously in {}: issues {list} all carry the \
+                 `{}` label — remove the duplicate label so id resolution is \
+                 unambiguous",
+                self.repo,
+                id_label(id),
+            )));
+        }
         let found = issues.into_iter().find(|gh| !gh.is_pull_request());
         if let Some(gh) = &found {
-            // A write helper already fetched this issue's number; remember it so
-            // the post-write `get` (the CachedIssueStore write-through) resolves
-            // it from the cache and never pays a search.
             self.remember_number(id, gh.number);
         }
         Ok(found)
+    }
+
+    /// Fetch one issue by number as a raw [`GhIssue`] (the shape `get_raw` and
+    /// the write paths act on), via the single-issue GraphQL query. `None` when
+    /// the number names no issue. A pull request is never returned: GraphQL's
+    /// `issue(number:)` yields null for a PR, and the explicit `is_pull_request`
+    /// guard keeps the invariant even if that query's shape ever changes.
+    fn get_raw_by_number(&self, number: i64) -> Result<Option<GhIssue>> {
+        let Some(node) = self.graphql_single_issue(number)? else {
+            return Ok(None);
+        };
+        let gh = node.into_gh_issue();
+        if gh.is_pull_request() {
+            return Ok(None);
+        }
+        Ok(Some(gh))
     }
 
     /// Split `owner/repo` into its two halves for the GraphQL `owner`/`name`
@@ -2667,8 +2752,10 @@ struct SearchNode {
     number: Option<i64>,
 }
 
-/// The first issue number a label search returned, or `None` when nothing
-/// matched. A GraphQL `errors` array is a hard error.
+/// The issue number a label search resolved to, or `None` when nothing matched.
+/// A GraphQL `errors` array is a hard error — and so is more than one match: a
+/// duplicated `shelbi:id/*` label must never resolve to an arbitrary issue. The
+/// query asks for `first: 2`, exactly enough to detect the duplicate.
 fn parse_search_number_response(text: &str) -> Result<Option<i64>> {
     let resp: SearchResponse = serde_json::from_str(text.trim())
         .map_err(|e| Error::Other(format!("gh graphql returned unparseable JSON: {e}")))?;
@@ -2678,13 +2765,24 @@ fn parse_search_number_response(text: &str) -> Result<Option<i64>> {
             summarize_graphql_errors(errors)
         )));
     }
-    Ok(resp
+    let numbers: Vec<i64> = resp
         .data
         .and_then(|d| d.search)
         .map(|s| s.nodes)
         .unwrap_or_default()
         .into_iter()
-        .find_map(|n| n.number))
+        .filter_map(|n| n.number)
+        .collect();
+    match numbers.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(*only)),
+        many => Err(Error::Other(format!(
+            "id search resolves ambiguously: issues {} all carry the same \
+             `shelbi:id/*` label — remove the duplicate label so id resolution \
+             is unambiguous",
+            many.iter().map(i64::to_string).collect::<Vec<_>>().join(", ")
+        ))),
+    }
 }
 
 /// Process-local id→number resolution cache, keyed by `(repo, shelbi id)`. Small
@@ -2955,6 +3053,17 @@ impl GhIssue {
             .filter(|l| !l.name.starts_with(STATUS_LABEL_PREFIX))
             .map(|l| l.name.clone())
             .collect()
+    }
+
+    /// This issue's stable shelbi id: split the body's metadata block once and
+    /// delegate to [`GhIssue::resolve_id`] — the same resolution the board uses,
+    /// so a number-first `get_raw` can verify a fetched issue against the
+    /// requested id (and drop a stale cache/index mapping that no longer names
+    /// it).
+    fn resolved_id(&self) -> String {
+        let body = self.body.clone().unwrap_or_default();
+        let (_, meta) = split_shelbi_meta(&body);
+        self.resolve_id(&meta)
     }
 
     /// The workflow this issue runs under, parsed from its metadata block, or
@@ -3618,6 +3727,7 @@ mod tests {
 
     #[test]
     fn list_comments_reads_live_and_orders_by_creation() {
+        let _home = HomeGuard::new("list-comments-live");
         let issues = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         let comments = r#"{"id":100,"body":"first","created_at":"2026-08-01T01:00:00Z","user":{"login":"alice"}}
 {"id":101,"body":"second","created_at":"2026-08-01T02:00:00Z","user":{"login":"bob"}}"#;
@@ -3634,6 +3744,7 @@ mod tests {
 
     #[test]
     fn list_comments_for_missing_issue_is_empty() {
+        let _home = HomeGuard::new("list-comments-missing");
         let store = GitHubStore::with_runner("owner/repo", |_args| Ok(String::new()));
         assert!(store.list_comments("nope").unwrap().is_empty());
     }
@@ -4011,6 +4122,7 @@ mod tests {
 
     #[test]
     fn add_rejects_a_duplicate_id() {
+        let _home = HomeGuard::new("add-rejects-dup");
         let existing = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/do-thing"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         let (store, _calls) = recording_store(existing, existing, "", "{}");
         assert!(store
@@ -4036,6 +4148,7 @@ mod tests {
 
     #[test]
     fn move_status_swaps_the_label_and_closes_on_a_terminal_target() {
+        let _home = HomeGuard::new("move-swaps");
         // In-progress issue with a workflow in its meta block.
         let issue = r#"{"number":7,"title":"T","body":"P\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: app\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/in-progress"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         let (store, calls) = recording_store(issue, issue, "", "{}");
@@ -4065,6 +4178,7 @@ mod tests {
 
     #[test]
     fn move_status_is_a_noop_when_already_in_the_target() {
+        let _home = HomeGuard::new("move-noop");
         let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/review"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         let (store, calls) = recording_store(issue, issue, "", "{}");
         assert!(store.move_status("t", &Column::review(), "again").unwrap().is_none());
@@ -4074,6 +4188,7 @@ mod tests {
 
     #[test]
     fn move_status_reopens_a_closed_issue_for_a_non_terminal_target() {
+        let _home = HomeGuard::new("move-reopen");
         // A closed (done) issue moved back into an active lane must reopen.
         let issue = r#"{"number":7,"title":"T","body":"","state":"closed","state_reason":"completed","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/done"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         let (store, calls) = recording_store(issue, issue, "", "{}");
@@ -4102,6 +4217,7 @@ mod tests {
 
     #[test]
     fn set_fields_rewrites_only_the_meta_block() {
+        let _home = HomeGuard::new("set-fields-meta");
         let issue = r#"{"number":7,"title":"T","body":"Prose stays.\n\n<!-- shelbi:begin -->\n```yaml\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         let (store, calls) = recording_store(issue, issue, "", "{}");
         store
@@ -4123,6 +4239,7 @@ mod tests {
 
     #[test]
     fn set_fields_patches_title_and_body_prose() {
+        let _home = HomeGuard::new("set-fields-title");
         let issue = r#"{"number":7,"title":"Old","body":"Old prose.\n\n<!-- shelbi:begin -->\n```yaml\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         let (store, calls) = recording_store(issue, issue, "", "{}");
         store
@@ -4775,6 +4892,7 @@ mod tests {
 
     #[test]
     fn add_comment_posts_and_returns_the_created_comment() {
+        let _home = HomeGuard::new("add-comment-posts");
         let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         let comment = r#"{"id":555,"body":"hello there","created_at":"2026-08-03T00:00:00Z","user":{"login":"alice"}}"#;
         let (store, calls) = recording_store(issue, issue, "", comment);
@@ -4791,6 +4909,7 @@ mod tests {
 
     #[test]
     fn add_comment_on_a_missing_issue_errors() {
+        let _home = HomeGuard::new("add-comment-missing");
         let (store, _calls) = recording_store("", "", "", "{}");
         assert!(store.add_comment("nope", "hi").is_err());
     }
@@ -5627,6 +5746,257 @@ mod tests {
         let g = graphql_calls(&calls);
         assert_eq!(g.len(), 2, "one search + one fetch");
         assert!(g[0].contains("IdSearch"), "the first request is the search: {}", g[0]);
+    }
+
+    // --- get_raw number-first resolution -------------------------------------
+
+    #[test]
+    fn get_raw_uses_the_indexed_number_and_never_searches_by_label() {
+        // Acceptance: `get_raw` resolves via the published index's id→number map
+        // with a single by-number fetch and no label lookup at all.
+        let _home = HomeGuard::new("getraw-idx");
+        write_test_index(
+            "test-project",
+            &[("foo", 7)],
+            vec![idx_issue("foo", "todo", "2026-08-01T00:00:00Z")],
+        );
+        let node = gql_node(7, "foo", "in-progress", "OPEN", "", "body", "2026-08-03T00:00:00Z");
+        let (store, calls) = graphql_recorder(move |args| {
+            assert!(
+                !args.iter().any(|a| a.contains("labels=shelbi:id/")),
+                "the number is known, so no label list may be issued: {}",
+                args.join(" ")
+            );
+            Ok(gql_single(&node))
+        });
+
+        let gh = store.get_raw("foo").unwrap().expect("resolved");
+        assert_eq!(gh.number, 7);
+        let all = calls.lock().unwrap();
+        assert_eq!(all.len(), 1, "exactly one call: the by-number fetch");
+        assert!(
+            all[0].contains("graphql") && all[0].contains("query Issue"),
+            "and it is the single-issue GraphQL fetch: {}",
+            all[0]
+        );
+    }
+
+    #[test]
+    fn get_raw_resolving_twice_searches_by_label_at_most_once() {
+        // Acceptance: two resolutions of the same id in one process issue at most
+        // one label lookup — the second is served from the remembered number.
+        let _home = HomeGuard::new("getraw-twice");
+        let rest = r#"{"number":7,"title":"T foo","body":"","state":"open","labels":[{"name":"shelbi:id/foo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let node = gql_node(7, "foo", "todo", "OPEN", "", "body", "2026-08-02T00:00:00Z");
+        let (store, calls) = graphql_recorder(move |args| {
+            if args.contains(&"graphql") {
+                Ok(gql_single(&node))
+            } else {
+                Ok(rest.to_string())
+            }
+        });
+
+        let a = store.get_raw("foo").unwrap().expect("first resolution");
+        assert_eq!(a.number, 7);
+        let b = store.get_raw("foo").unwrap().expect("second resolution");
+        assert_eq!(b.number, 7);
+
+        let label_lists = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.contains("labels=shelbi:id/"))
+            .count();
+        assert_eq!(
+            label_lists, 1,
+            "the second resolution is served from the remembered number"
+        );
+    }
+
+    #[test]
+    fn get_raw_drops_a_stale_indexed_number_and_falls_through() {
+        // Acceptance: a cached/indexed number that no longer names the id does
+        // not return the wrong issue — the stale mapping is dropped and
+        // resolution falls through to the authoritative label search.
+        let _home = HomeGuard::new("getraw-stale");
+        write_test_index(
+            "test-project",
+            &[("foo", 7)],
+            vec![idx_issue("foo", "todo", "2026-08-01T00:00:00Z")],
+        );
+        // Issue #7 now carries the `bar` identity, not `foo`.
+        let stale = gql_node(7, "bar", "todo", "OPEN", "", "body", "2026-08-02T00:00:00Z");
+        let authoritative = r#"{"number":9,"title":"T foo","body":"","state":"open","labels":[{"name":"shelbi:id/foo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = graphql_recorder(move |args| {
+            if args.contains(&"graphql") {
+                Ok(gql_single(&stale))
+            } else {
+                Ok(authoritative.to_string())
+            }
+        });
+
+        let gh = store.get_raw("foo").unwrap().expect("resolved via the label search");
+        assert_eq!(gh.number, 9, "the stale #7 mapping is dropped; the label search wins");
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("labels=shelbi:id/foo")),
+            "resolution fell through to the authoritative label search"
+        );
+    }
+
+    /// A native, un-migrated GitHub issue node (no `shelbi:id/*` label), so the
+    /// board renders it under its number and `get_raw` reaches it by all-digit
+    /// id. Answers the by-number GraphQL fetch; write endpoints echo `write`.
+    fn native_issue_store(number: i64, write: &'static str) -> (GitHubStore, Calls) {
+        let node = format!(
+            r#"{{"number":{number},"title":"Native issue","state":"OPEN","stateReason":null,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-08-02T00:00:00Z","body":"Native body","labels":{{"nodes":[]}}}}"#
+        );
+        let calls: Calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            let method = args
+                .iter()
+                .position(|a| *a == "-X")
+                .and_then(|i| args.get(i + 1))
+                .copied()
+                .unwrap_or("GET");
+            if method != "GET" {
+                return Ok(write.to_string());
+            }
+            if args.contains(&"graphql") {
+                return Ok(gql_single(&node));
+            }
+            // A REST read (a label list, or the closed-status label ensure): the
+            // all-digit route resolves by number, so no label list should fire.
+            Ok(String::new())
+        });
+        (store, calls)
+    }
+
+    #[test]
+    fn move_status_acts_on_an_unmigrated_native_issue_by_number() {
+        // Acceptance: an un-migrated issue (rendered under its number) is moved
+        // through `get_raw`'s all-digit route.
+        let _home = HomeGuard::new("native-move");
+        let (store, calls) = native_issue_store(1234, "{}");
+        let mv = store
+            .move_status("1234", &Column::done(), "accept")
+            .unwrap()
+            .expect("status changed");
+        assert_eq!(mv.to, Column::done());
+        let calls = calls.lock().unwrap();
+        assert!(
+            call_containing(&calls, &["-X PUT", "repos/owner/repo/issues/1234/labels"]).is_some(),
+            "the label swap targets the native issue #1234"
+        );
+        assert!(
+            call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/1234", "state=closed"])
+                .is_some(),
+            "the terminal move closes the native issue"
+        );
+    }
+
+    #[test]
+    fn set_fields_acts_on_an_unmigrated_native_issue_by_number() {
+        let _home = HomeGuard::new("native-set");
+        let (store, calls) = native_issue_store(1234, "{}");
+        store
+            .set_fields(
+                "1234",
+                IssueFields {
+                    branch: Some(Some("jlong/native".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        let patch = call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/1234"])
+            .expect("body PATCH on the native issue");
+        assert!(patch.contains("branch: jlong/native"));
+    }
+
+    #[test]
+    fn add_comment_acts_on_an_unmigrated_native_issue_by_number() {
+        let _home = HomeGuard::new("native-comment");
+        let comment = r#"{"id":55,"body":"hi","created_at":"2026-08-02T00:00:00Z","user":{"login":"alice"}}"#;
+        let (store, calls) = native_issue_store(1234, comment);
+        let c = store.add_comment("1234", "hi").unwrap();
+        assert_eq!(c.id, "55");
+        assert!(
+            call_containing(
+                &calls.lock().unwrap(),
+                &["-X POST", "repos/owner/repo/issues/1234/comments"]
+            )
+            .is_some(),
+            "the comment is posted to the native issue #1234"
+        );
+    }
+
+    #[test]
+    fn get_raw_errors_when_two_issues_share_the_identity_label() {
+        // Acceptance: a duplicated `shelbi:id/*` label resolves to a hard error
+        // naming the id, the repo and the conflicting numbers — never an
+        // arbitrary pick.
+        let _home = HomeGuard::new("getraw-dup");
+        let dup = "{\"number\":9,\"title\":\"T\",\"body\":\"\",\"state\":\"open\",\"labels\":[{\"name\":\"shelbi:id/dup\"}],\"created_at\":\"2026-08-01T00:00:00Z\",\"updated_at\":\"2026-08-02T00:00:00Z\"}\n{\"number\":7,\"title\":\"T\",\"body\":\"\",\"state\":\"open\",\"labels\":[{\"name\":\"shelbi:id/dup\"}],\"created_at\":\"2026-08-01T00:00:00Z\",\"updated_at\":\"2026-08-02T00:00:00Z\"}";
+        let (store, _calls) = graphql_recorder(move |args| {
+            if args.contains(&"graphql") {
+                Ok(r#"{"data":{"repository":{"issue":null}}}"#.to_string())
+            } else {
+                Ok(dup.to_string())
+            }
+        });
+        let err = store.get_raw("dup").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("dup"), "names the id: {msg}");
+        assert!(msg.contains("owner/repo"), "names the repo: {msg}");
+        assert!(msg.contains('7') && msg.contains('9'), "names both numbers: {msg}");
+    }
+
+    #[test]
+    fn get_raw_never_returns_a_pull_request_on_any_route() {
+        // Acceptance: a PR is never returned as the resolved issue on the direct
+        // by-number route (GraphQL `issue(number:)` yields null for a PR) or on
+        // the label search route (a PR carrying the label is filtered out).
+        let _home = HomeGuard::new("getraw-pr");
+        // By-number route: `get_raw_by_number` returns None for a PR (null node).
+        let (store, _calls) =
+            graphql_recorder(|_args| Ok(r#"{"data":{"repository":{"issue":null}}}"#.to_string()));
+        assert!(store.get_raw_by_number(2).unwrap().is_none());
+
+        // Label search route: the list returns only a PR carrying the identity
+        // label — it must not resolve as the issue.
+        let pr = r#"{"number":5,"title":"A PR","body":"","state":"open","labels":[{"name":"shelbi:id/pr-only"}],"pull_request":{"url":"https://x"},"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, _calls) = graphql_recorder(move |args| {
+            if args.contains(&"graphql") {
+                Ok(r#"{"data":{"repository":{"issue":null}}}"#.to_string())
+            } else {
+                Ok(pr.to_string())
+            }
+        });
+        assert!(
+            store.get_raw("pr-only").unwrap().is_none(),
+            "a PR must never resolve as the issue"
+        );
+    }
+
+    #[test]
+    fn parse_search_number_response_errors_on_a_duplicated_label() {
+        // Acceptance: the GraphQL id search reports ambiguity instead of taking
+        // the first of the two nodes it already fetches.
+        let two = r#"{"data":{"rateLimit":{"remaining":4999},"search":{"nodes":[{"number":7},{"number":9}]}}}"#;
+        let err = parse_search_number_response(two).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains('7') && msg.contains('9'), "names the conflicting numbers: {msg}");
+        // A single match still resolves; an empty result is still `None`.
+        let one = r#"{"data":{"rateLimit":{"remaining":4999},"search":{"nodes":[{"number":7}]}}}"#;
+        assert_eq!(parse_search_number_response(one).unwrap(), Some(7));
+        let none = r#"{"data":{"rateLimit":{"remaining":4999},"search":{"nodes":[]}}}"#;
+        assert_eq!(parse_search_number_response(none).unwrap(), None);
     }
 
     #[test]
