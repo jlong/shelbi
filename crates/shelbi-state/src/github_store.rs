@@ -67,10 +67,16 @@
 //!   the label, then the issue number for an un-migrated issue. Because the
 //!   label stays a deterministic function of the id, `get(id)` still resolves
 //!   with a single server-side `labels=` query.
-//! * **status** — the `shelbi:status/<id>` label. A *closed* issue always maps
-//!   to a terminal status (`done`, or `canceled` when GitHub's `state_reason`
-//!   is `not_planned`), so closing an issue on github.com reads as a terminal
-//!   card regardless of a stale non-terminal label.
+//! * **status** — the `shelbi:status/<id>` label. GitHub's `state` and the
+//!   label must agree on terminality, in both directions. A *closed* issue
+//!   always maps to a terminal status (`done`, or `canceled` when GitHub's
+//!   `state_reason` is `not_planned`), so closing an issue on github.com reads
+//!   as a terminal card regardless of a stale non-terminal label. Symmetrically
+//!   an *open* issue never maps to a terminal status: an open issue carrying a
+//!   stale `shelbi:status/done`/`canceled` label (the shape a human makes by
+//!   reopening a done issue on github.com to comment) reads as `backlog` for
+//!   re-triage, not `done`. The stale label is repaired by the next
+//!   Shelbi-initiated status move.
 //! * **shelbi-only fields** (`workflow` / `branch` / `depends_on` /
 //!   `prefers_machine` / `priority` / `zen` / `launch`) — parsed from the fenced
 //!   `<!-- shelbi:begin -->` … `<!-- shelbi:end -->` YAML block in the issue
@@ -915,38 +921,124 @@ impl IssueStore for GitHubStore {
         let Some(gh) = self.get_raw(id)? else {
             return Err(Error::Other(format!("issue `{id}` not found in {}", self.repo)));
         };
+        // The interpreted column *before* the write, through the same state+label
+        // mapping the read path uses. A half-applied move (an issue left open on
+        // GitHub carrying a terminal label) reads as `backlog` here, so the
+        // recorded edge matches the lane the card was actually rendering in.
         let from = gh.column();
-        if from == *to {
-            // Already there — no label swap, no event. Mirrors the filesystem
-            // backend returning `None` for a no-op move.
-            return Ok(None);
-        }
         let workflow = gh.workflow_name();
 
-        // Ensure the destination status label exists before applying it.
         let to_label = status_label_name(to);
-        self.ensure_labels(std::slice::from_ref(&to_label))?;
+        // A terminal target closes the issue; a non-terminal one opens it.
+        let desired_state = if is_terminal(to) { "closed" } else { "open" };
+        // `Some("completed")` for `done`, `Some("not_planned")` for `canceled`,
+        // `None` otherwise. GitHub applies it only when `state` transitions.
+        let desired_reason = terminal_reason(to);
 
-        // Swap the status label: keep every non-status label (the id anchor and
-        // any human-added labels), replace the single `shelbi:status/*` one.
-        let mut labels = gh.non_status_labels();
-        labels.push(to_label);
-        self.set_labels(gh.number, &labels)?;
-
-        // Terminal target closes the issue (recording which terminal via
-        // `state_reason`); a non-terminal target reopens a closed issue so a
-        // reopened card leaves the terminal lane.
-        if is_terminal(to) {
-            self.set_state(gh.number, "closed", terminal_reason(to))?;
-        } else if gh.state == "closed" {
-            self.set_state(gh.number, "open", None)?;
+        // Skip with zero requests only when GitHub already agrees on *both*
+        // axes: the current status label maps to the destination column, and
+        // the state already matches. The label alone is not enough — a
+        // half-applied move whose label landed but whose close did not still
+        // needs the closing PATCH, and comparing only the interpreted column
+        // (as the old `from == *to` check did) let that retry return early
+        // forever. Compare through `from_status_id` so an aliased label (`wip`,
+        // `in_progress`) that already maps to `to` isn't rewritten just to
+        // canonicalise it.
+        let current = gh.status_label().map(Column::from_status_id);
+        if current.as_ref() == Some(to) && gh.state == desired_state {
+            // Already there on both axes — no request, no event. Mirrors the
+            // filesystem backend returning `None` for a no-op move.
+            return Ok(None);
         }
 
-        Ok(Some(StatusMove {
-            from,
-            to: to.clone(),
-            workflow,
-        }))
+        // Ensure the destination status label exists before applying it.
+        self.ensure_labels(std::slice::from_ref(&to_label))?;
+
+        // One verified PATCH replaces the whole label set (keeping the id anchor
+        // and any human labels, replacing the single `shelbi:status/*` one) and
+        // sets the state and close reason together. `PATCH /issues/{n}` replaces
+        // the entire label set exactly as `PUT .../labels` did, so this never
+        // leaves the issue open carrying a terminal label the way the old
+        // label-then-state pair could when the second write failed.
+        let mut labels = gh.non_status_labels();
+        labels.push(to_label.clone());
+        let mut fields: Vec<(&str, String)> =
+            labels.iter().map(|l| ("labels[]", l.clone())).collect();
+        fields.push(("state", desired_state.to_string()));
+        if let Some(r) = desired_reason {
+            fields.push(("state_reason", r.to_string()));
+        }
+        // Whether the PATCH actually transitions the open/closed state. GitHub
+        // applies `state_reason` only on a real transition, so a
+        // terminal-to-terminal move (`done` → `canceled`, decision 8) keeps the
+        // issue closed and returns the *old* reason. That is a single PATCH with
+        // the status label as the authority — never a reopen-then-close pair,
+        // which would open a transient window with a terminal label. So
+        // `state_reason` is verified only when the state moved; skipping the
+        // check on an unchanged state never turns a good move into an error.
+        let state_changed = gh.state != desired_state;
+
+        let out = self.api_send(
+            "PATCH",
+            &format!("repos/{}/issues/{}", self.repo, gh.number),
+            &fields,
+        )?;
+        // Parse and verify GitHub applied what was requested — a token that
+        // silently dropped a field (no label permission, say) must be an error,
+        // not a success. Bound to a named local: a later task feeds this parsed
+        // issue into the per-issue cache.
+        let after: GhIssue = parse_json_object(&out)?;
+
+        // Exactly one `shelbi:status/*` label, mapping to the destination.
+        let status_ids: Vec<&str> = after
+            .labels
+            .iter()
+            .filter_map(|l| l.name.strip_prefix(STATUS_LABEL_PREFIX))
+            .collect();
+        if status_ids.len() != 1 {
+            return Err(Error::Other(format!(
+                "issue `{id}` in {}: move did not apply — expected exactly one \
+                 shelbi:status/* label, found {} ({:?})",
+                self.repo,
+                status_ids.len(),
+                status_ids
+            )));
+        }
+        let applied = Column::from_status_id(status_ids[0]);
+        if applied != *to {
+            return Err(Error::Other(format!(
+                "issue `{id}` in {}: move did not apply — status label is `{}`, expected `{}`",
+                self.repo,
+                applied.as_str(),
+                to.as_str()
+            )));
+        }
+        if after.state != desired_state {
+            return Err(Error::Other(format!(
+                "issue `{id}` in {}: move did not apply — state is `{}`, expected `{}`",
+                self.repo, after.state, desired_state
+            )));
+        }
+        if state_changed && after.state_reason.as_deref() != desired_reason {
+            return Err(Error::Other(format!(
+                "issue `{id}` in {}: move did not apply — state_reason is `{:?}`, expected `{:?}`",
+                self.repo, after.state_reason, desired_reason
+            )));
+        }
+
+        // `Some` only on an actual column change (the `IssueStore` contract the
+        // poller and CLI rely on for events and transition actions). A write
+        // that only repaired a stale label without changing the interpreted
+        // column reports nothing moved — no event, no self-edge.
+        Ok(if from == *to {
+            None
+        } else {
+            Some(StatusMove {
+                from,
+                to: to.clone(),
+                workflow,
+            })
+        })
     }
 
     fn set_priority(&self, id: &str, pos: PrioMove) -> Result<()> {
@@ -1868,21 +1960,6 @@ impl GitHubStore {
             .unwrap_or_default()
     }
 
-
-    /// Replace an issue's entire label set (`PUT .../labels`). The caller
-    /// computes the full desired set — keeping the id anchor and any human
-    /// labels — so this is the atomic "these are the labels now" primitive the
-    /// status swap builds on.
-    fn set_labels(&self, number: i64, labels: &[String]) -> Result<()> {
-        let fields: Vec<(&str, String)> =
-            labels.iter().map(|l| ("labels[]", l.clone())).collect();
-        self.api_send(
-            "PUT",
-            &format!("repos/{}/issues/{number}/labels", self.repo),
-            &fields,
-        )?;
-        Ok(())
-    }
 
     /// Open or close an issue, optionally recording a close `state_reason`
     /// (`completed` for `done`, `not_planned` for `canceled`).
@@ -3086,8 +3163,17 @@ impl GhIssue {
                 let col = Column::from_status_id(id);
                 if closed && !is_terminal(&col) {
                     // A closed issue overrides a stale non-terminal label so it
-                    // can never render in an active lane.
+                    // can never render in an active lane. The status label stays
+                    // the authority for a closed *terminal* label (the `else`
+                    // arm), so a lagging `state_reason` never flips it back.
                     terminal_from_reason(self.state_reason.as_deref())
+                } else if !closed && is_terminal(&col) {
+                    // Symmetrically, an open issue overrides a stale terminal
+                    // label — the shape a human makes by reopening a done issue
+                    // on github.com. It reads as `backlog` for re-triage rather
+                    // than staying in a terminal lane; the next Shelbi-initiated
+                    // status move repairs the label.
+                    Column::backlog()
                 } else {
                     col
                 }
@@ -4151,7 +4237,10 @@ mod tests {
         let _home = HomeGuard::new("move-swaps");
         // In-progress issue with a workflow in its meta block.
         let issue = r#"{"number":7,"title":"T","body":"P\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: app\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/in-progress"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
-        let (store, calls) = recording_store(issue, issue, "", "{}");
+        // What the verified PATCH returns: label swapped to done, issue closed
+        // as completed, id anchor preserved.
+        let after = r#"{"number":7,"title":"T","body":"P","state":"closed","state_reason":"completed","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/done"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", after);
 
         let mv = store
             .move_status("t", &Column::done(), "accept")
@@ -4162,28 +4251,34 @@ mod tests {
         assert_eq!(mv.workflow, "app");
 
         let calls = calls.lock().unwrap();
-        let put = call_containing(&calls, &["-X PUT", "repos/owner/repo/issues/7/labels"])
-            .expect("PUT labels");
+        // One verified PATCH carries the full label set, state, and reason — not
+        // the old label-then-state pair.
+        let patch = call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/7"])
+            .expect("PATCH issue");
         // New status applied, old status dropped, id anchor preserved.
-        assert!(put.contains("labels[]=shelbi:status/done"));
-        assert!(put.contains("labels[]=shelbi:id/t"));
-        assert!(!put.contains("shelbi:status/in-progress"));
+        assert!(patch.contains("labels[]=shelbi:status/done"));
+        assert!(patch.contains("labels[]=shelbi:id/t"));
+        assert!(!patch.contains("shelbi:status/in-progress"));
         // Terminal target closes the issue as completed.
-        assert!(call_containing(
-            &calls,
-            &["-X PATCH", "state=closed", "state_reason=completed"]
-        )
-        .is_some());
+        assert!(patch.contains("state=closed"));
+        assert!(patch.contains("state_reason=completed"));
+        // No separate label PUT anywhere in the move path.
+        assert!(call_containing(&calls, &["-X PUT", "/labels"]).is_none());
     }
 
     #[test]
     fn move_status_is_a_noop_when_already_in_the_target() {
         let _home = HomeGuard::new("move-noop");
+        // Label and state both already match the destination (review, open), so
+        // the move is skipped with zero mutating requests.
         let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/review"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
         let (store, calls) = recording_store(issue, issue, "", "{}");
         assert!(store.move_status("t", &Column::review(), "again").unwrap().is_none());
-        // No label swap issued.
-        assert!(call_containing(&calls.lock().unwrap(), &["-X PUT", "/labels"]).is_none());
+        // No mutating request of any kind — not a label swap, not a state PATCH.
+        let calls = calls.lock().unwrap();
+        assert!(!calls
+            .iter()
+            .any(|c| c.contains("-X PUT") || c.contains("-X PATCH") || c.contains("-X POST")));
     }
 
     #[test]
@@ -4191,21 +4286,26 @@ mod tests {
         let _home = HomeGuard::new("move-reopen");
         // A closed (done) issue moved back into an active lane must reopen.
         let issue = r#"{"number":7,"title":"T","body":"","state":"closed","state_reason":"completed","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/done"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
-        let (store, calls) = recording_store(issue, issue, "", "{}");
+        // The verified PATCH reopens the issue and swaps in the in-progress label.
+        let after = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/in-progress"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", after);
         let mv = store
             .move_status("t", &Column::in_progress(), "reopen")
             .unwrap()
             .expect("moved");
         assert_eq!(mv.from, Column::done());
         assert_eq!(mv.to, Column::in_progress());
-        assert!(call_containing(&calls.lock().unwrap(), &["-X PATCH", "state=open"]).is_some());
+        let calls = calls.lock().unwrap();
+        let patch = call_containing(&calls, &["-X PATCH", "state=open"]).expect("reopen PATCH");
+        assert!(patch.contains("labels[]=shelbi:status/in-progress"));
     }
 
     #[test]
     fn cancel_closes_the_issue_as_not_planned() {
         let _home = HomeGuard::new("cancel-closes-the");
         let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/in-progress"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
-        let (store, calls) = recording_store(issue, issue, "", "{}");
+        let after = r#"{"number":7,"title":"T","body":"","state":"closed","state_reason":"not_planned","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/canceled"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", after);
         let mv = store.cancel("t", "obsolete").unwrap().expect("moved");
         assert_eq!(mv.to, Column::canceled());
         assert!(call_containing(
@@ -4213,6 +4313,153 @@ mod tests {
             &["-X PATCH", "state=closed", "state_reason=not_planned"]
         )
         .is_some());
+    }
+
+    #[test]
+    fn move_between_terminals_is_one_patch_and_tolerates_a_lagging_reason() {
+        let _home = HomeGuard::new("move-between-terminals");
+        // Decision 8: a terminal-to-terminal move (`done` → `canceled`) is one
+        // PATCH with the status label as the authority, never a reopen/close
+        // pair. The issue is already closed, so GitHub keeps it closed and
+        // ignores the new `state_reason`, returning the *old* `completed`. The
+        // move must still succeed — `state_reason` is verified only when the
+        // state actually changes.
+        let issue = r#"{"number":7,"title":"T","body":"","state":"closed","state_reason":"completed","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/done"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        // GitHub swapped the label but left the reason at its old value.
+        let after = r#"{"number":7,"title":"T","body":"","state":"closed","state_reason":"completed","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/canceled"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", after);
+        let mv = store
+            .move_status("t", &Column::canceled(), "cancel")
+            .unwrap()
+            .expect("moved");
+        assert_eq!(mv.from, Column::done());
+        assert_eq!(mv.to, Column::canceled());
+        let calls = calls.lock().unwrap();
+        let patch = call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/7"])
+            .expect("PATCH issue");
+        assert!(patch.contains("labels[]=shelbi:status/canceled"));
+        assert!(patch.contains("state=closed"));
+        assert!(patch.contains("state_reason=not_planned"));
+        // Never reopened as part of the move — no transient open+terminal window.
+        assert!(!calls.iter().any(|c| c.contains("state=open")));
+    }
+
+    #[test]
+    fn move_errors_when_github_drops_the_destination_label() {
+        let _home = HomeGuard::new("move-drops-label");
+        // A silently dropped field (a token without label permission) must be an
+        // error, not a success. The PATCH response omits the destination label.
+        let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let after = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, _calls) = recording_store(issue, issue, "", after);
+        let err = store
+            .move_status("t", &Column::in_progress(), "start")
+            .expect_err("dropped label must error");
+        let msg = err.to_string();
+        assert!(msg.contains("`t`"), "names the issue: {msg}");
+        assert!(msg.contains("owner/repo"), "names the repo: {msg}");
+        assert!(
+            msg.contains("shelbi:status/*"),
+            "names the disagreeing field: {msg}"
+        );
+    }
+
+    #[test]
+    fn move_errors_when_github_returns_two_status_labels() {
+        let _home = HomeGuard::new("move-two-labels");
+        // Two `shelbi:status/*` labels is an ambiguous, unverified state.
+        let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let after = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"},{"name":"shelbi:status/in-progress"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, _calls) = recording_store(issue, issue, "", after);
+        let err = store
+            .move_status("t", &Column::in_progress(), "start")
+            .expect_err("two status labels must error");
+        let msg = err.to_string();
+        assert!(msg.contains("`t`") && msg.contains("owner/repo"), "{msg}");
+        assert!(msg.contains("shelbi:status/*"), "{msg}");
+    }
+
+    #[test]
+    fn move_retries_a_half_applied_terminal_move() {
+        let _home = HomeGuard::new("move-retries-half-applied");
+        // The failure this task exists to fix: the label swap landed
+        // (`shelbi:status/done`) but the closing PATCH did not, so the issue is
+        // still open on GitHub. It now reads as `backlog`, and re-running
+        // `move --to done` issues the closing PATCH instead of returning early
+        // because the interpreted column already equalled the destination.
+        let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/done"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let after = r#"{"number":7,"title":"T","body":"","state":"closed","state_reason":"completed","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/done"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", after);
+        let mv = store
+            .move_status("t", &Column::done(), "accept")
+            .unwrap()
+            .expect("moved");
+        // The card was rendering in backlog, so the recorded edge is backlog -> done.
+        assert_eq!(mv.from, Column::backlog());
+        assert_eq!(mv.to, Column::done());
+        let calls = calls.lock().unwrap();
+        let patch = call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/7"])
+            .expect("closing PATCH");
+        assert!(patch.contains("state=closed"));
+        assert!(patch.contains("state_reason=completed"));
+    }
+
+    #[test]
+    fn column_maps_open_issue_with_terminal_label_to_backlog() {
+        let mk = |label: &str| GhIssue {
+            number: 1,
+            title: "T".into(),
+            body: None,
+            state: "open".into(),
+            state_reason: None,
+            labels: vec![GhLabel {
+                name: format!("shelbi:status/{label}"),
+            }],
+            created_at: "2026-08-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-08-01T00:00:00Z".parse().unwrap(),
+            pull_request: None,
+        };
+        // Open + a terminal label reads as backlog for re-triage.
+        assert_eq!(mk("done").column(), Column::backlog());
+        assert_eq!(mk("canceled").column(), Column::backlog());
+        // An open non-terminal label is unchanged.
+        assert_eq!(mk("in-progress").column(), Column::in_progress());
+    }
+
+    #[test]
+    fn column_closed_reads_terminal_label_over_state_reason() {
+        // A closed issue keeps the status label as the authority, so a lagging
+        // `state_reason: completed` never flips a `canceled` card back to `done`.
+        let gh = GhIssue {
+            number: 1,
+            title: "T".into(),
+            body: None,
+            state: "closed".into(),
+            state_reason: Some("completed".into()),
+            labels: vec![GhLabel {
+                name: "shelbi:status/canceled".into(),
+            }],
+            created_at: "2026-08-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-08-01T00:00:00Z".parse().unwrap(),
+            pull_request: None,
+        };
+        assert_eq!(gh.column(), Column::canceled());
+    }
+
+    #[test]
+    fn list_in_status_backlog_reaches_an_open_terminal_label_issue() {
+        let _home = HomeGuard::new("list-in-status-open-terminal");
+        // An issue open on GitHub carrying a terminal status label reads as
+        // backlog, so it is reachable through a backlog query and through
+        // neither terminal query.
+        let issues = r#"{"number":7,"title":"Reopened","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/done"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, _calls) = recording_reader(issues);
+        let backlog = store.list_in_status(&Column::backlog()).unwrap();
+        assert_eq!(backlog.len(), 1);
+        assert_eq!(backlog[0].task.id, "t");
+        assert_eq!(backlog[0].task.column, Column::backlog());
+        assert!(store.list_in_status(&Column::done()).unwrap().is_empty());
+        assert!(store.list_in_status(&Column::canceled()).unwrap().is_empty());
     }
 
     #[test]
@@ -4329,7 +4576,9 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         let review = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/review"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
-        let (store, _calls) = recording_store(review, review, "", "{}");
+        // The move PATCH returns the issue with the todo label applied.
+        let after = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, _calls) = recording_store(review, review, "", after);
 
         // Assign, then move-and-unassign back to todo: the overlay is cleared.
         store
@@ -4374,7 +4623,10 @@ mod tests {
         // A review-status issue with human prose and a fenced metadata block,
         // owned by the review slot via the local overlay.
         let review = r#"{"number":7,"title":"T","body":"Original prose.\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: app\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/review"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
-        let (store, calls) = recording_store(review, review, "", "{}");
+        // Every non-GET echoes this: the body PATCH ignores it, and the move
+        // PATCH parses it — so it must reflect the applied move (todo, open).
+        let after = r#"{"number":7,"title":"T","body":"Original prose.","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(review, review, "", after);
         store
             .set_fields(
                 "t",
@@ -4402,12 +4654,15 @@ mod tests {
         assert!(body_patch.contains("please restore the handler"));
         assert!(body_patch.contains("Original prose."));
         assert!(body_patch.contains(META_BEGIN));
-        // The status label was swapped to the ready column (todo).
+        // The status label was swapped to the ready column (todo) by the move
+        // PATCH (the body PATCH carries no labels[] field, so this matches only
+        // the move PATCH), and no separate label PUT is issued.
         assert!(call_containing(
             &calls,
-            &["-X PUT", "repos/owner/repo/issues/7/labels", "labels[]=shelbi:status/todo"]
+            &["-X PATCH", "repos/owner/repo/issues/7", "labels[]=shelbi:status/todo"]
         )
         .is_some());
+        assert!(call_containing(&calls, &["-X PUT", "/labels"]).is_none());
         // The owner overlay is cleared — the freed review slot has no stale owner.
         assert_eq!(crate::get_task_assignment("test-project", "t").unwrap(), None);
 
@@ -5880,24 +6135,32 @@ mod tests {
     #[test]
     fn move_status_acts_on_an_unmigrated_native_issue_by_number() {
         // Acceptance: an un-migrated issue (rendered under its number) is moved
-        // through `get_raw`'s all-digit route.
+        // through `get_raw`'s all-digit route. The single verified PATCH targets
+        // the native issue #1234, so it applies the status label and closes it in
+        // one write — no separate `PUT .../labels`.
         let _home = HomeGuard::new("native-move");
-        let (store, calls) = native_issue_store(1234, "{}");
+        // The verified PATCH returns the native issue now labeled `done` and
+        // closed (a native issue carries no id anchor, so the status label is the
+        // only one after the move).
+        let after = r#"{"number":1234,"title":"Native issue","body":"Native body","state":"closed","state_reason":"completed","labels":[{"name":"shelbi:status/done"}],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = native_issue_store(1234, after);
         let mv = store
             .move_status("1234", &Column::done(), "accept")
             .unwrap()
             .expect("status changed");
         assert_eq!(mv.to, Column::done());
         let calls = calls.lock().unwrap();
+        // One PATCH targeting the native issue carries the label swap and the
+        // close together.
+        let patch = call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/1234"])
+            .expect("the verified PATCH targets the native issue #1234");
         assert!(
-            call_containing(&calls, &["-X PUT", "repos/owner/repo/issues/1234/labels"]).is_some(),
-            "the label swap targets the native issue #1234"
+            patch.contains("labels[]=shelbi:status/done"),
+            "the status label is applied on the native issue's PATCH"
         );
-        assert!(
-            call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/1234", "state=closed"])
-                .is_some(),
-            "the terminal move closes the native issue"
-        );
+        assert!(patch.contains("state=closed"), "the terminal move closes the native issue");
+        // No separate label PUT — the move is a single write.
+        assert!(call_containing(&calls, &["-X PUT", "/labels"]).is_none());
     }
 
     #[test]
