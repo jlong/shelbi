@@ -101,7 +101,15 @@ fn report_budget(
     // 34k/hr burn rate (the 2026-09-08 misreport). Failed attempts are reported
     // on their own line.
     let spent: Vec<&RequestEntry> = mine.iter().copied().filter(|e| e.spent).collect();
-    let failed: Vec<&RequestEntry> = mine.iter().copied().filter(|e| !e.spent).collect();
+    // A 304 (`not_modified`) reached GitHub but spent no primary quota and is not
+    // an error — keep it out of the failed set so it never reads as a failed
+    // attempt, and count it on its own line.
+    let failed: Vec<&RequestEntry> = mine
+        .iter()
+        .copied()
+        .filter(|e| !e.spent && !e.not_modified)
+        .collect();
+    let not_modified = mine.iter().copied().filter(|e| e.not_modified).count();
     let count = spent.len();
     let remaining_str = remaining
         .map(|r| format!("{r} remaining"))
@@ -112,6 +120,7 @@ fn report_budget(
         // any failed attempts so a dead-network burst is visible.
         println!("  {label}: {count} requests in the last hour · {remaining_str} · idle");
         report_failed_attempts(&failed);
+        report_not_modified(not_modified);
         return;
     };
 
@@ -141,6 +150,18 @@ fn report_budget(
         }
     }
     report_failed_attempts(&failed);
+    report_not_modified(not_modified);
+}
+
+/// Print a line for REST conditional-`GET` 304s — requests that reached GitHub,
+/// proved a cached copy fresh, and spent no primary quota. Reported apart from
+/// both spend and failed attempts so an operator reads them as the freshness
+/// checks they are. No-op when there were none.
+fn report_not_modified(count: usize) {
+    if count == 0 {
+        return;
+    }
+    println!("    {count} not-modified (304) read(s), no budget spent");
 }
 
 /// Print a line summarizing failed attempts (requests that did not spend budget)
@@ -244,6 +265,7 @@ mod tests {
             budget,
             caller: caller.to_string(),
             spent: true,
+            not_modified: false,
             err_class: None,
         }
     }
@@ -254,6 +276,7 @@ mod tests {
             budget,
             caller: "issue-fetch".to_string(),
             spent: false,
+            not_modified: false,
             err_class: Some(class.to_string()),
         }
     }
@@ -370,6 +393,43 @@ mod tests {
         assert!(
             exhaust >= EXHAUSTION_WARN.as_secs_f64(),
             "no false exhaustion warning from a dead network ({exhaust}s)"
+        );
+    }
+
+    fn not_modified_entry(budget: Budget, at: DateTime<Utc>) -> RequestEntry {
+        RequestEntry {
+            at,
+            budget,
+            caller: "issue-fetch".to_string(),
+            spent: false,
+            not_modified: true,
+            err_class: None,
+        }
+    }
+
+    /// A 304 is neither spend nor a failed attempt: it stays out of the failed
+    /// set the doctor prints as "failed attempt(s)" and out of the spend rate.
+    #[test]
+    fn not_modified_reads_are_counted_apart_from_spend_and_failures() {
+        let now = Utc::now();
+        let mine = [
+            entry("issue-fetch", Budget::Rest, now),
+            not_modified_entry(Budget::Rest, now),
+            not_modified_entry(Budget::Rest, now),
+            failed_entry("conn", Budget::Rest, now),
+        ];
+        // Mirror `report_budget`'s bucketing.
+        let spent: Vec<&RequestEntry> = mine.iter().filter(|e| e.spent).collect();
+        let failed: Vec<&RequestEntry> =
+            mine.iter().filter(|e| !e.spent && !e.not_modified).collect();
+        let not_modified = mine.iter().filter(|e| e.not_modified).count();
+        assert_eq!(spent.len(), 1, "only the 200 spends");
+        assert_eq!(failed.len(), 1, "the 304s are not failed attempts");
+        assert_eq!(not_modified, 2, "the 304s are counted on their own");
+        // The failed-attempt line never names a 304.
+        assert!(
+            failed.iter().all(|e| e.err_class.as_deref() == Some("conn")),
+            "the failed set holds only real failures"
         );
     }
 }

@@ -86,6 +86,12 @@ fn parse_budget(tag: &str) -> Option<Budget> {
 pub enum Outcome {
     /// The request reached GitHub and spent budget.
     Ok,
+    /// A REST conditional `GET` that came back `304 Not Modified` — the request
+    /// reached GitHub and proved the cached copy fresh, but it is exempt from the
+    /// primary quota, so it is *neither* spend (`ok`) *nor* a failed attempt
+    /// (`err:*`). Recorded distinctly so the diagnostics can count these on their
+    /// own line and never fold them into either bucket.
+    NotModified,
     /// The request failed with the given class ([`crate::gh_retry::error_class`]
     /// — `conn` / `ratelimit` / `transient` / `other` / `unknown-outcome`). A
     /// `conn` failure spent nothing; a `ratelimit` / `transient` / `other` may
@@ -96,10 +102,11 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// The `outcome=` field token: `ok`, or `err:<class>`.
+    /// The `outcome=` field token: `ok`, `not-modified`, or `err:<class>`.
     fn tag(self) -> String {
         match self {
             Outcome::Ok => "ok".to_string(),
+            Outcome::NotModified => "not-modified".to_string(),
             Outcome::Err(class) => format!("err:{class}"),
         }
     }
@@ -184,10 +191,15 @@ pub struct RequestEntry {
     /// Whether the request reached GitHub and spent budget (`outcome=ok`). A
     /// failed attempt (`outcome=err:*`, or an old line with no field read as
     /// `ok`) that spent nothing is `false` — so a dead network never inflates
-    /// the observed spend rate.
+    /// the observed spend rate. A `not-modified` (304) entry is also `false`: it
+    /// reached GitHub but spent no primary quota.
     pub spent: bool,
+    /// A REST conditional `GET` that came back `304 Not Modified`
+    /// (`outcome=not-modified`) — neither spend nor a failed attempt, counted on
+    /// its own line by the diagnostics.
+    pub not_modified: bool,
     /// The error class for a failed attempt (`conn` / `ratelimit` / …), or
-    /// `None` when the request spent budget.
+    /// `None` when the request spent budget or was a 304.
     pub err_class: Option<String>,
 }
 
@@ -236,6 +248,7 @@ fn parse_line(line: &str) -> Option<RequestEntry> {
     // Default to spent for a line with no `outcome=` field — the format an older
     // shelbi wrote, where every recorded request had reached GitHub.
     let mut spent = true;
+    let mut not_modified = false;
     let mut err_class = None;
     for tok in tokens {
         if let Some(v) = tok.strip_prefix("budget=") {
@@ -245,6 +258,10 @@ fn parse_line(line: &str) -> Option<RequestEntry> {
         } else if let Some(v) = tok.strip_prefix("outcome=") {
             if v == "ok" {
                 spent = true;
+            } else if v == "not-modified" {
+                // A 304: reached GitHub, spent no primary quota, not an error.
+                spent = false;
+                not_modified = true;
             } else {
                 spent = false;
                 err_class = v.strip_prefix("err:").map(str::to_string);
@@ -256,6 +273,7 @@ fn parse_line(line: &str) -> Option<RequestEntry> {
         budget: budget?,
         caller: caller.unwrap_or_else(|| "unknown".to_string()),
         spent,
+        not_modified,
         err_class,
     })
 }
@@ -274,6 +292,10 @@ pub struct BudgetRate {
     /// How many requests in the window were **failed attempts** (`outcome=err:*`)
     /// that (for `conn`) spent nothing — reported separately from `count`.
     pub failed: usize,
+    /// How many requests in the window were REST conditional-`GET` **304s**
+    /// (`outcome=not-modified`) — reached GitHub, spent no primary quota, and are
+    /// not errors, so they are neither in `count` nor in `failed`.
+    pub not_modified: usize,
     /// The observation window, in seconds.
     pub window_secs: u64,
     /// Callers ordered by descending *spent* request count in the window.
@@ -308,11 +330,13 @@ impl BudgetRate {
 /// caller breakdown newest-independent (ordered by count desc, then name).
 pub fn summarize(entries: &[RequestEntry], window: Duration) -> Vec<BudgetRate> {
     use std::collections::HashMap;
-    /// Per-budget accumulator: spent count, failed count, and spent-caller tally.
+    /// Per-budget accumulator: spent count, failed count, 304 count, and
+    /// spent-caller tally.
     #[derive(Default)]
     struct Acc {
         spent: usize,
         failed: usize,
+        not_modified: usize,
         callers: HashMap<String, usize>,
     }
     let window_secs = window.as_secs();
@@ -325,6 +349,10 @@ pub fn summarize(entries: &[RequestEntry], window: Duration) -> Vec<BudgetRate> 
         if e.spent {
             slot.1.spent += 1;
             *slot.1.callers.entry(e.caller.clone()).or_insert(0) += 1;
+        } else if e.not_modified {
+            // A 304 reached GitHub but spent nothing — its own bucket, never
+            // folded into spend or into failed attempts.
+            slot.1.not_modified += 1;
         } else {
             slot.1.failed += 1;
         }
@@ -339,6 +367,7 @@ pub fn summarize(entries: &[RequestEntry], window: Duration) -> Vec<BudgetRate> 
                 budget,
                 count: acc.spent,
                 failed: acc.failed,
+                not_modified: acc.not_modified,
                 window_secs,
                 top_callers,
             }
@@ -438,6 +467,30 @@ mod tests {
     }
 
     #[test]
+    fn a_not_modified_outcome_is_its_own_category_neither_spend_nor_failure() {
+        let _iso = IsolatedHome::new("not-modified");
+        let now = Utc::now();
+        // One spent 200, one 304, one failed connection attempt on the REST tier.
+        record_request_at(Budget::Rest, "issue-fetch", Outcome::Ok, now);
+        record_request_at(Budget::Rest, "issue-fetch", Outcome::NotModified, now);
+        record_request_at(Budget::Rest, "issue-fetch", Outcome::Err("conn"), now);
+
+        let recent = recent_entries(Duration::from_secs(60), now);
+        let nm: Vec<&RequestEntry> = recent.iter().filter(|e| e.not_modified).collect();
+        assert_eq!(nm.len(), 1, "one 304 parsed");
+        assert!(!nm[0].spent, "a 304 spent nothing");
+        assert_eq!(nm[0].err_class, None, "a 304 carries no error class");
+
+        let rate = summarize(&recent, Duration::from_secs(60));
+        let rest = rate.iter().find(|r| r.budget == Budget::Rest).unwrap();
+        assert_eq!(rest.count, 1, "only the 200 spends");
+        assert_eq!(rest.failed, 1, "only the conn attempt is a failure");
+        assert_eq!(rest.not_modified, 1, "the 304 is counted on its own line");
+        // The 304 is not among the spent callers.
+        assert_eq!(rest.top_callers, vec![("issue-fetch".to_string(), 1)]);
+    }
+
+    #[test]
     fn an_old_line_with_no_outcome_reads_as_spent() {
         // Backward compatibility: a line written before the `outcome=` field
         // counts as spent, so historical logs still project correctly.
@@ -454,6 +507,7 @@ mod tests {
             budget,
             caller: caller.into(),
             spent: true,
+            not_modified: false,
             err_class: None,
         };
         let entries = vec![
@@ -478,6 +532,7 @@ mod tests {
             budget: Budget::Rest,
             count: 600,
             failed: 0,
+            not_modified: 0,
             window_secs: 60,
             top_callers: vec![("pollers".into(), 600)],
         };
@@ -495,6 +550,7 @@ mod tests {
             budget: Budget::Graphql,
             count: 0,
             failed: 0,
+            not_modified: 0,
             window_secs: 60,
             top_callers: Vec::new(),
         };

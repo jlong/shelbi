@@ -374,12 +374,18 @@ fn github_section(project: &str) -> Option<String> {
                 }
             });
         let rate = rates.iter().find(|r| r.budget == budget_kind);
-        // `count` is spent requests; failed attempts (a dead network) are shown
-        // separately so they never read as spend.
+        // `count` is spent requests; failed attempts (a dead network) and 304
+        // conditional-GET reads are shown separately so neither reads as spend.
         let count = rate.map(|r| r.count).unwrap_or(0);
         let failed = rate.map(|r| r.failed).unwrap_or(0);
+        let not_modified = rate.map(|r| r.not_modified).unwrap_or(0);
         let failed_str = if failed > 0 {
             format!(" ({failed} failed)")
+        } else {
+            String::new()
+        };
+        let not_modified_str = if not_modified > 0 {
+            format!(" ({not_modified} not-modified)")
         } else {
             String::new()
         };
@@ -396,7 +402,7 @@ fn github_section(project: &str) -> Option<String> {
             .is_some();
         let parked_str = if parked { " · parked" } else { "" };
         out.push_str(&format!(
-            "{label} budget: {remaining_str}{reset_str} · {count} request{} in the last hour{failed_str}{parked_str}\n",
+            "{label} budget: {remaining_str}{reset_str} · {count} request{} in the last hour{failed_str}{not_modified_str}{parked_str}\n",
             if count == 1 { "" } else { "s" },
         ));
     }
@@ -895,6 +901,56 @@ issue_tracker:\n\
             section.contains("1 request in the last hour"),
             "the logged request is counted: {section}"
         );
+
+        match prev_gh {
+            Some(v) => std::env::set_var("GH_TOKEN", v),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn github_section_reports_not_modified_reads_apart_from_spend_and_failures() {
+        // A 304 REST read renders on its own `(N not-modified)` suffix and is
+        // never folded into the `(N failed)` suffix or the spent count.
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "g");
+        let prev_gh = std::env::var("GH_TOKEN").ok();
+        std::env::set_var("GH_TOKEN", "test-token");
+
+        let mut idx = shelbi_state::BoardIndex::fresh(vec![ifile("a", "review")]);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("g", &idx).unwrap();
+        // One spent 200, two 304s, one failed connection attempt — all REST.
+        shelbi_state::gh_requests::record_request(
+            shelbi_state::gh_budget::Budget::Rest,
+            "issue-fetch",
+            shelbi_state::gh_requests::Outcome::Ok,
+        );
+        for _ in 0..2 {
+            shelbi_state::gh_requests::record_request(
+                shelbi_state::gh_budget::Budget::Rest,
+                "issue-fetch",
+                shelbi_state::gh_requests::Outcome::NotModified,
+            );
+        }
+        shelbi_state::gh_requests::record_request(
+            shelbi_state::gh_budget::Budget::Rest,
+            "issue-fetch",
+            shelbi_state::gh_requests::Outcome::Err("conn"),
+        );
+
+        let section = github_section("g").expect("remote project has a GitHub section");
+        let rest_line = section
+            .lines()
+            .find(|l| l.starts_with("rest budget:"))
+            .expect("a rest budget line");
+        assert!(rest_line.contains("1 request in the last hour"), "only the 200 spends: {rest_line}");
+        assert!(rest_line.contains("(1 failed)"), "only the conn attempt is failed: {rest_line}");
+        assert!(rest_line.contains("(2 not-modified)"), "the 304s render on their own: {rest_line}");
 
         match prev_gh {
             Some(v) => std::env::set_var("GH_TOKEN", v),
