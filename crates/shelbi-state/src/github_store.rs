@@ -2073,7 +2073,21 @@ fn is_mutating_gh(args: &[&str]) -> bool {
 /// found, not authed) becomes an [`Error::Command`] — never a stale render.
 fn run_gh(project: &str, args: &[&str]) -> Result<String> {
     let token = resolve_github_token_by_name(project)?;
-    run_gh_with_token(&token, args)
+    invalidate_token_on_401(project, run_gh_with_token(&token, args))
+}
+
+/// If a `gh` call came back a 401 (`Bad credentials`), the token shelbi is
+/// holding was revoked or rotated. Drop it from the in-process cache so the next
+/// resolution re-probes `gh` for the current one rather than replaying the dead
+/// credential for the rest of the process's TTL. Returns `result` untouched.
+fn invalidate_token_on_401<T>(project: &str, result: Result<T>) -> Result<T> {
+    if let Err(Error::Command { status, stderr, .. }) = &result {
+        let hay = format!("{status}\n{stderr}").to_ascii_lowercase();
+        if hay.contains("http 401") || hay.contains("bad credentials") {
+            crate::invalidate_cached_token(project);
+        }
+    }
+    result
 }
 
 /// Run `gh` with an already-resolved token. Split from [`run_gh`] so the
@@ -2121,15 +2135,18 @@ fn park_aware_read(
 ) -> Result<String> {
     let token = resolve_github_token_by_name(project)?;
     let key = crate::gh_budget::token_key(token.expose());
-    governed_read(
+    invalidate_token_on_401(
         project,
-        &key,
-        read_policy,
-        crate::gh_budget::Budget::Rest,
-        args,
-        &|a| run_gh_with_token(&token, a),
-        Some(&token),
-        None,
+        governed_read(
+            project,
+            &key,
+            read_policy,
+            crate::gh_budget::Budget::Rest,
+            args,
+            &|a| run_gh_with_token(&token, a),
+            Some(&token),
+            None,
+        ),
     )
 }
 
@@ -2331,15 +2348,18 @@ fn graphql_governed_read(
     let key = crate::gh_budget::token_key(token.expose());
     // Attributed in the request log (Phase 3 §6) with its outcome so `shelbi
     // doctor` can tell spent budget from a failed attempt (a dead network).
-    governed_read(
+    invalidate_token_on_401(
         project,
-        &key,
-        read_policy,
-        crate::gh_budget::Budget::Graphql,
-        args,
-        &|a| run_gh_with_token(&token, a),
-        None,
-        Some(graphql_caller(args)),
+        governed_read(
+            project,
+            &key,
+            read_policy,
+            crate::gh_budget::Budget::Graphql,
+            args,
+            &|a| run_gh_with_token(&token, a),
+            None,
+            Some(graphql_caller(args)),
+        ),
     )
 }
 

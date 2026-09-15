@@ -14,7 +14,7 @@ pub use agent_manifest::{
     clamp_permission_mode, resolve_agent_launch, AgentManifest, AgentRequires, ReasoningEffort,
     ResolvedAgentLaunch, RunnerManifestConfig,
 };
-pub use error::{Error, Result};
+pub use error::{Error, GhTokenProbeFailure, Result};
 pub use integration::{CapabilityLadder, IntegrationMode};
 pub use model::{
     checks_for_task, checks_for_task_in_workflow, ci_timeout_for_workflow,
