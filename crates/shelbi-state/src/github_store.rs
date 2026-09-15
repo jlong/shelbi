@@ -898,7 +898,7 @@ impl IssueStore for GitHubStore {
             self.set_state(created.number, "closed", terminal_reason(&spec.column))?;
         }
 
-        Ok(Issue {
+        let issue = Issue {
             id: spec.id,
             title: spec.title,
             column: spec.column,
@@ -914,7 +914,21 @@ impl IssueStore for GitHubStore {
             created_at: created.created_at,
             updated_at: created.updated_at,
             params: spec.params,
-        })
+        };
+
+        // Publish the canonical post-write copy into the render-path caches from
+        // the `Issue` we just built (it carries `spec.column`, the true
+        // destination), never `created.into_issue_file()`: a terminal create is a
+        // POST that returns the issue still open, followed by a separate close,
+        // so the create response would publish the wrong lane.
+        let mut tf = IssueFile {
+            task: issue.clone(),
+            body: spec.body,
+        };
+        tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
+        self.publish_write(&tf, created.number);
+
+        Ok(issue)
     }
 
     fn move_status(&self, id: &str, to: &Column, _reason: &str) -> Result<Option<StatusMove>> {
@@ -1026,6 +1040,17 @@ impl IssueStore for GitHubStore {
             )));
         }
 
+        // The verified PATCH response *is* the canonical post-write issue, so
+        // publish it into the render-path caches straight from here — never a
+        // follow-up `get`, which could serve a stale index copy and undo the
+        // move. Publish whether this call goes on to report a column change
+        // (`Some`) or a label-only repair (`Ok(None)`): the index entry changed
+        // either way. Only the zero-request early return above (already there on
+        // both axes) publishes nothing.
+        let mut tf = after.into_issue_file();
+        tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
+        self.publish_write(&tf, gh.number);
+
         // `Some` only on an actual column change (the `IssueStore` contract the
         // poller and CLI rely on for events and transition actions). A write
         // that only repaired a stale label without changing the interpreted
@@ -1094,7 +1119,11 @@ impl IssueStore for GitHubStore {
             && fields.body.is_none()
         {
             // `assigned_to` was the only field — the overlay write above is the
-            // whole operation; nothing to PATCH on the remote.
+            // whole operation; nothing to PATCH on the remote. But the published
+            // index folds the overlay onto every entry, so patch the new owner
+            // into this id's existing entry in place (no backend read) so
+            // `shelbi issue start` shows it before the next daemon tick.
+            self.publish_assignment_overlay(id)?;
             return Ok(());
         }
         let Some(gh) = self.get_raw(id)? else {
@@ -1148,11 +1177,18 @@ impl IssueStore for GitHubStore {
         if params.is_empty() {
             return Ok(());
         }
-        self.api_send(
+        let out = self.api_send(
             "PATCH",
             &format!("repos/{}/issues/{}", self.repo, gh.number),
             &params,
         )?;
+        // The PATCH response is the full updated issue — publish it into the
+        // render-path caches so the new title/body/fields show before the next
+        // daemon tick, sourced from the mutation's own response, not a re-read.
+        let after: GhIssue = parse_json_object(&out)?;
+        let mut tf = after.into_issue_file();
+        tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
+        self.publish_write(&tf, gh.number);
         Ok(())
     }
 
@@ -1657,20 +1693,16 @@ impl GitHubStore {
 
     // --- fresh single-issue fetch (plan §3) ----------------------------------
 
-    /// Fetch one issue by its GitHub `number`, fresh through GraphQL (one point),
-    /// with a small per-number cache keyed by `updatedAt`.
-    ///
-    /// The cache is served only when the published board index shows **no newer**
-    /// `updatedAt` for this issue than the cached copy — so a card that moved or
-    /// was edited (its `updatedAt` advanced in the index) is always re-read live,
-    /// while a repeat read of an unchanged issue in the same process costs no
-    /// request. An issue the index doesn't carry (a done task, or no index yet)
-    /// can't be proven fresh, so it is always fetched live. Returns `None` for a
+    /// Fetch one issue by its GitHub `number`, always live through GraphQL (one
+    /// point). "Render stale, never act stale" (decision 1): an action read
+    /// never depends on the age, `stale` flag, or contents of the published
+    /// board index — every call re-reads the issue authoritatively, so a move or
+    /// edit is never masked by an index the daemon has not ticked. The result is
+    /// memoed into the per-number [`ISSUE_CACHE`], a write-only post-write store
+    /// in this PR whose only reader arrives with the REST conditional-GET task
+    /// (which turns it into the `If-None-Match` ETag store). Returns `None` for a
     /// number that names no issue (deleted, or a pull request).
     fn fetch(&self, number: i64) -> Result<Option<IssueFile>> {
-        if let Some(tf) = self.cached_issue_if_fresh(number)? {
-            return Ok(Some(tf));
-        }
         let Some(node) = self.graphql_single_issue(number)? else {
             self.forget_issue(number);
             return Ok(None);
@@ -1681,34 +1713,6 @@ impl GitHubStore {
         tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
         self.cache_issue(number, &tf);
         self.remember_number(&tf.task.id, number);
-        Ok(Some(tf))
-    }
-
-    /// The cached full issue for `number` when the published index does not show
-    /// a newer `updatedAt` than the cached copy — the freshness gate the plan
-    /// calls for ("invalidated whenever the index shows a newer `updatedAt` for
-    /// that number"). `None` (a live fetch) on a cache miss, on an index that has
-    /// a strictly newer `updatedAt`, or on an issue the index doesn't carry.
-    fn cached_issue_if_fresh(&self, number: i64) -> Result<Option<IssueFile>> {
-        let Some((cached_updated, tf)) = issue_cache_get(&self.repo, number) else {
-            return Ok(None);
-        };
-        let Some(idx) = crate::board_index::read_valid_board_index(
-            &self.project,
-            Some(&self.board_repo_identity()),
-        ) else {
-            return Ok(None);
-        };
-        let Some(entry) = idx.board.iter().find(|f| f.task.id == tf.task.id) else {
-            return Ok(None);
-        };
-        if entry.task.updated_at > cached_updated {
-            return Ok(None);
-        }
-        // Not newer than what we cached — serve it, re-folding the owner overlay
-        // (which can change without bumping GitHub's `updatedAt`).
-        let mut tf = tf;
-        tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
         Ok(Some(tf))
     }
 
@@ -1826,6 +1830,51 @@ impl GitHubStore {
                 Some(number),
             );
         }
+    }
+
+    /// Publish a just-written issue into the two on-disk caches the render path
+    /// reads — the daemon-owned `board-index.json` (the open board) and
+    /// `done-history.json` (the terminal history) — so a mutation is visible on
+    /// the next paint without waiting out a daemon tick (decision 9). The
+    /// canonical copy comes from the mutation's own response, never a follow-up
+    /// read, so a stale index can't reintroduce the pre-write copy. A terminal
+    /// card is dropped from the open index and spliced to the top of the done
+    /// page; a non-terminal one is upserted with its number and dropped from the
+    /// done page. Best-effort: an absent index or page means the next daemon tick
+    /// reconciles, and a failure here must never fail a mutation that already
+    /// succeeded remotely.
+    fn publish_write(&self, tf: &IssueFile, number: i64) {
+        if is_terminal(&tf.task.column) {
+            let _ = crate::board_index::remove_board_index_issue(&self.project, &tf.task.id);
+            let _ = crate::done_history::patch_done_history_issue(&self.project, tf);
+        } else {
+            let _ = crate::board_index::patch_board_index_issue_with_number(
+                &self.project,
+                tf,
+                Some(number),
+            );
+            let _ = crate::done_history::remove_done_history_issue(&self.project, &tf.task.id);
+        }
+        self.cache_issue(number, tf);
+    }
+
+    /// Re-fold the local assignment overlay onto this id's *existing* published
+    /// index entry, in place — the publish for an `assigned_to`-only `set_fields`
+    /// that sends no PATCH. The daemon's `refresh_board` folds the overlay onto
+    /// every published entry, so `shelbi issue start`'s new owner would otherwise
+    /// not show until the next tick. A no-op (and no backend request) when the
+    /// index carries no entry for the id.
+    fn publish_assignment_overlay(&self, id: &str) -> Result<()> {
+        let Some(idx) = crate::board_index::read_board_index(&self.project) else {
+            return Ok(());
+        };
+        let Some(entry) = idx.board.iter().find(|f| f.task.id == id) else {
+            return Ok(());
+        };
+        let mut tf = entry.clone();
+        tf.task.assigned_to = crate::get_task_assignment(&self.project, id)?;
+        let _ = crate::board_index::patch_board_index_issue(&self.project, &tf);
+        Ok(())
     }
 
     /// Fetch one issue node by number via the single-issue GraphQL query, or
@@ -2087,11 +2136,20 @@ impl GitHubStore {
         let (prose, mut meta) = split_shelbi_meta_for_write(id, &body_raw)?;
         meta.priority = Some(priority);
         let body = build_body(&prose, &meta);
-        self.api_send(
+        let out = self.api_send(
             "PATCH",
             &format!("repos/{}/issues/{}", self.repo, gh.number),
             &[("body", body)],
         )?;
+        // The PATCH response carries the full updated issue, so the new priority
+        // reads back from the metadata block. Publish it into the render-path
+        // caches so the reorder shows before the next daemon tick. `set_priority`
+        // renumbers a whole column, so one `prio` command can publish several
+        // cards — intended.
+        let after: GhIssue = parse_json_object(&out)?;
+        let mut tf = after.into_issue_file();
+        tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
+        self.publish_write(&tf, gh.number);
         Ok(())
     }
 
@@ -3058,15 +3116,22 @@ fn id_number_cache() -> &'static IdNumberCache {
     ID_NUMBER_CACHE.get_or_init(Default::default)
 }
 
-/// Per-number full-issue cache keyed by `(repo, number)` → `(updatedAt, issue)`,
-/// invalidated when the published index shows a newer `updatedAt` (plan §3).
+/// Per-number full-issue cache keyed by `(repo, number)` → `(updatedAt, issue)`.
+/// A write-only post-write memo in this PR (the freshness gate that used to read
+/// it is gone); its reader arrives with the REST conditional-GET task, which
+/// turns it into the `If-None-Match` ETag store.
 type IssueCache = std::sync::Mutex<std::collections::HashMap<(String, i64), (DateTime<Utc>, IssueFile)>>;
 static ISSUE_CACHE: std::sync::OnceLock<IssueCache> = std::sync::OnceLock::new();
 fn issue_cache() -> &'static IssueCache {
     ISSUE_CACHE.get_or_init(Default::default)
 }
 
-/// The cached `(updatedAt, issue)` for `(repo, number)`, if any.
+/// The cached `(updatedAt, issue)` for `(repo, number)`, if any. No reader in
+/// this PR — the freshness gate that used to call it is gone and the cache is a
+/// write-only post-write memo. Its incoming reader is the REST conditional-GET
+/// task, which makes this cache the `If-None-Match` ETag store; deleting it here
+/// would only force that task to re-create it.
+#[allow(dead_code)]
 fn issue_cache_get(repo: &str, number: i64) -> Option<(DateTime<Utc>, IssueFile)> {
     issue_cache()
         .lock()
@@ -4788,7 +4853,9 @@ mod tests {
     fn set_fields_rewrites_only_the_meta_block() {
         let _home = HomeGuard::new("set-fields-meta");
         let issue = r#"{"number":7,"title":"T","body":"Prose stays.\n\n<!-- shelbi:begin -->\n```yaml\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
-        let (store, calls) = recording_store(issue, issue, "", "{}");
+        // The PATCH response is the canonical post-write issue `set_fields` now
+        // publishes, so it must parse as a `GhIssue`.
+        let (store, calls) = recording_store(issue, issue, "", issue);
         store
             .set_fields(
                 "t",
@@ -4810,7 +4877,9 @@ mod tests {
     fn set_fields_patches_title_and_body_prose() {
         let _home = HomeGuard::new("set-fields-title");
         let issue = r#"{"number":7,"title":"Old","body":"Old prose.\n\n<!-- shelbi:begin -->\n```yaml\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
-        let (store, calls) = recording_store(issue, issue, "", "{}");
+        // The PATCH response is the canonical post-write issue `set_fields` now
+        // publishes, so it must parse as a `GhIssue`.
+        let (store, calls) = recording_store(issue, issue, "", issue);
         store
             .set_fields(
                 "t",
@@ -5513,7 +5582,21 @@ mod tests {
                 .copied()
                 .unwrap_or("GET");
             if method != "GET" {
-                return Ok("{}".to_string());
+                // `rewrite_priority` now parses the PATCH response as the
+                // canonical post-write issue, so return the parseable issue for
+                // the number being patched.
+                let num = args
+                    .iter()
+                    .find_map(|a| a.strip_prefix("repos/owner/repo/issues/"))
+                    .and_then(|s| s.split('/').next())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(1);
+                let rest = table
+                    .iter()
+                    .find(|(_, n, _)| *n == num)
+                    .map(|(id, n, prio)| rest_line(id, *n, *prio))
+                    .unwrap_or_else(|| rest_line("a", 1, 0));
+                return Ok(rest);
             }
             let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
             if path.ends_with("/labels") {
@@ -6826,7 +6909,10 @@ mod tests {
     #[test]
     fn set_fields_acts_on_an_unmigrated_native_issue_by_number() {
         let _home = HomeGuard::new("native-set");
-        let (store, calls) = native_issue_store(1234, "{}");
+        // The PATCH response is the canonical post-write issue `set_fields` now
+        // publishes, so it must parse as a `GhIssue`.
+        let after = r#"{"number":1234,"title":"Native issue","body":"Native body","state":"open","labels":[],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = native_issue_store(1234, after);
         store
             .set_fields(
                 "1234",
@@ -6957,35 +7043,304 @@ mod tests {
     }
 
     #[test]
-    fn fetch_serves_the_cache_until_the_index_shows_a_newer_updated_at() {
-        // Acceptance: the per-number cache is invalidated by a newer index
-        // `updatedAt` for that number.
-        let _home = HomeGuard::new("cacheinv");
+    fn fetch_is_always_live_even_when_the_index_never_moves() {
+        // "Render stale, never act stale" (decision 1): the freshness gate is
+        // gone, so an action read never depends on the board index. Two fetches
+        // of the same number, against an index whose `updated_at` never moves,
+        // record two GraphQL requests — the cache never serves a read.
+        let _home = HomeGuard::new("fetch-live-unchanged");
         let t1 = "2026-08-01T00:00:00Z";
-        let t2 = "2026-08-05T00:00:00Z";
         write_test_index("test-project", &[("foo", 5)], vec![idx_issue("foo", "todo", t1)]);
         let node = gql_node(5, "foo", "todo", "OPEN", "", "body", t1);
         let (store, calls) = graphql_recorder(move |_a| Ok(gql_single(&node)));
 
-        // Cold: a live read that caches the issue at updatedAt T1.
         store.fetch(5).unwrap().expect("issue exists");
-        assert_eq!(graphql_calls(&calls).len(), 1);
-
-        // The index still shows T1 (not newer than the cache) — served from cache.
-        store.fetch(5).unwrap().expect("issue exists");
-        assert_eq!(
-            graphql_calls(&calls).len(),
-            1,
-            "an unchanged index serves the cached issue"
-        );
-
-        // Bump the index's updatedAt for this issue — the cache is now invalid.
-        write_test_index("test-project", &[("foo", 5)], vec![idx_issue("foo", "todo", t2)]);
         store.fetch(5).unwrap().expect("issue exists");
         assert_eq!(
             graphql_calls(&calls).len(),
             2,
-            "a newer index updatedAt forces a live re-read"
+            "an unchanged index no longer gates the read — both fetches are live"
+        );
+    }
+
+    #[test]
+    fn fetch_is_always_live_even_with_a_stale_flagged_index() {
+        // A `stale`-flagged index (a refresh failed, the previous board carried
+        // forward) must not serve a cached action read either.
+        let _home = HomeGuard::new("fetch-live-stale");
+        let t1 = "2026-08-01T00:00:00Z";
+        let mut idx = crate::board_index::BoardIndex::fresh_at(
+            vec![idx_issue("foo", "todo", t1)],
+            vec![("foo".to_string(), 5)],
+            Utc::now().to_rfc3339(),
+            None,
+            None,
+        );
+        idx.stale = true;
+        idx.repo = Some(crate::board_index::github_board_repo("owner/repo"));
+        crate::board_index::write_board_index("test-project", &idx).unwrap();
+        let node = gql_node(5, "foo", "todo", "OPEN", "", "body", t1);
+        let (store, calls) = graphql_recorder(move |_a| Ok(gql_single(&node)));
+
+        store.fetch(5).unwrap().expect("issue exists");
+        store.fetch(5).unwrap().expect("issue exists");
+        assert_eq!(
+            graphql_calls(&calls).len(),
+            2,
+            "a stale-flagged index never serves a cached action read"
+        );
+    }
+
+    #[test]
+    fn fetch_is_always_live_with_no_index_on_disk() {
+        // No index at all: the same guarantee holds — every fetch is live.
+        let _home = HomeGuard::new("fetch-live-noindex");
+        let t1 = "2026-08-01T00:00:00Z";
+        let node = gql_node(5, "foo", "todo", "OPEN", "", "body", t1);
+        let (store, calls) = graphql_recorder(move |_a| Ok(gql_single(&node)));
+
+        store.fetch(5).unwrap().expect("issue exists");
+        store.fetch(5).unwrap().expect("issue exists");
+        assert_eq!(
+            graphql_calls(&calls).len(),
+            2,
+            "with no index on disk both fetches are live"
+        );
+    }
+
+    // ----- write paths publish the canonical post-write issue ----------------
+    //
+    // Ported from the deleted `CachedIssueStore` write-through tests: the backend
+    // now publishes into `board-index.json` / `done-history.json` from the
+    // mutation's own response (`GitHubStore::publish_write`), so the coverage
+    // lives here over a real `GitHubStore` driven by `recording_store`, whose
+    // fake runner echoes `write_json` for every POST/PATCH/PUT.
+
+    /// The last recorded backend call — used to prove a mutation issues no
+    /// post-write `get` (the publish is a local file write, not a request).
+    fn last_call(calls: &Calls) -> String {
+        calls.lock().unwrap().last().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_terminal_move_drops_the_open_index_and_tops_the_done_history() {
+        let _home = HomeGuard::new("pub-terminal");
+        // Seed the open index (t in-progress) and a cached done page (one older).
+        write_test_index(
+            "test-project",
+            &[],
+            vec![idx_issue("t", "in-progress", "2026-08-01T00:00:00Z")],
+        );
+        crate::done_history::write_done_history(
+            "test-project",
+            &crate::done_history::DoneHistory {
+                issues: vec![idx_issue("older", "done", "2026-07-01T00:00:00Z")],
+                next_cursor: None,
+                fetched_at: Utc::now().to_rfc3339(),
+                remaining: None,
+                reset: None,
+            },
+        )
+        .unwrap();
+
+        let issue = r#"{"number":7,"title":"T","body":"P\n\n<!-- shelbi:begin -->\n```yaml\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/in-progress"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        // The verified PATCH response: t now labeled done and closed.
+        let after = r#"{"number":7,"title":"T","body":"P","state":"closed","state_reason":"completed","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/done"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", after);
+
+        store.move_status("t", &Column::done(), "accept").unwrap().expect("moved");
+
+        let idx = crate::board_index::read_board_index("test-project").expect("index present");
+        assert!(!idx.board.iter().any(|f| f.task.id == "t"), "t left the open index");
+        let page = crate::done_history::read_done_history("test-project").expect("page present");
+        assert_eq!(page.issues[0].task.id, "t", "the completion is at the top of the done page");
+        assert!(page.issues.iter().any(|f| f.task.id == "older"), "older card untouched");
+        assert!(
+            last_call(&calls).contains("-X PATCH"),
+            "the verified PATCH is the last backend call — no post-write read: {:?}",
+            calls.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_non_terminal_move_publishes_the_new_lane_to_the_open_index() {
+        let _home = HomeGuard::new("pub-nonterminal");
+        write_test_index(
+            "test-project",
+            &[],
+            vec![idx_issue("t", "todo", "2026-08-01T00:00:00Z")],
+        );
+        let issue = r#"{"number":7,"title":"T","body":"P\n\n<!-- shelbi:begin -->\n```yaml\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let after = r#"{"number":7,"title":"T","body":"P","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/review"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", after);
+
+        store.move_status("t", &Column::review(), "handoff").unwrap().expect("moved");
+
+        let idx = crate::board_index::read_board_index("test-project").expect("index present");
+        let t = idx.board.iter().find(|f| f.task.id == "t").expect("t present");
+        assert_eq!(t.task.column, Column::review(), "the new lane is published");
+        assert!(
+            last_call(&calls).contains("-X PATCH"),
+            "no post-write read after the move: {:?}",
+            calls.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_set_fields_title_edit_publishes_the_new_title_to_the_open_index() {
+        let _home = HomeGuard::new("pub-title");
+        write_test_index(
+            "test-project",
+            &[],
+            vec![idx_issue("t", "todo", "2026-08-01T00:00:00Z")],
+        );
+        let issue = r#"{"number":7,"title":"Old","body":"P\n\n<!-- shelbi:begin -->\n```yaml\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let after = r#"{"number":7,"title":"New title","body":"P\n\n<!-- shelbi:begin -->\n```yaml\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", after);
+
+        store
+            .set_fields("t", IssueFields { title: Some("New title".into()), ..Default::default() })
+            .unwrap();
+
+        let idx = crate::board_index::read_board_index("test-project").expect("index present");
+        let t = idx.board.iter().find(|f| f.task.id == "t").expect("t present");
+        assert_eq!(t.task.title, "New title", "the new title is published");
+        assert!(
+            last_call(&calls).contains("-X PATCH"),
+            "no post-write read after the edit: {:?}",
+            calls.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_set_fields_assigned_to_only_updates_the_index_and_sends_no_request() {
+        let _home = HomeGuard::new("pub-assign");
+        write_test_index(
+            "test-project",
+            &[],
+            vec![idx_issue("t", "todo", "2026-08-01T00:00:00Z")],
+        );
+        let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", "{}");
+
+        store
+            .set_fields(
+                "t",
+                IssueFields { assigned_to: Some(Some("alpha".into())), ..Default::default() },
+            )
+            .unwrap();
+
+        let idx = crate::board_index::read_board_index("test-project").expect("index present");
+        let t = idx.board.iter().find(|f| f.task.id == "t").expect("t present");
+        assert_eq!(
+            t.task.assigned_to.as_deref(),
+            Some("alpha"),
+            "the new owner is folded into the published entry"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "an assigned_to-only set_fields sends no backend request: {:?}",
+            calls.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_set_priority_change_publishes_the_new_order_to_the_open_index() {
+        let _home = HomeGuard::new("pub-prio");
+        // Two todo cards a(0), b(1) in the open index; send b to the top.
+        write_test_index(
+            "test-project",
+            &[("a", 1), ("b", 2)],
+            vec![
+                idx_issue("a", "todo", "2026-08-01T00:00:00Z"),
+                idx_issue("b", "todo", "2026-08-01T00:00:00Z"),
+            ],
+        );
+        let table = [("a", 1i64), ("b", 2i64)];
+        let cur_prio = |id: &str| if id == "a" { 0 } else { 1 };
+        let rest_line = |id: &str, num: i64, prio: i64| {
+            format!(
+                r#"{{"number":{num},"title":"{id}","body":"<!-- shelbi:begin -->\n```yaml\npriority: {prio}\n```\n<!-- shelbi:end -->","state":"open","labels":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/todo"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
+            )
+        };
+        let calls: Calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            let joined = args.join(" ");
+            // Single-issue GraphQL reads (get / get_raw) resolve by number.
+            if args.contains(&"graphql") {
+                let rest = table
+                    .iter()
+                    .find(|(_, n)| joined.contains(&format!("number={n}")))
+                    .map(|(id, n)| rest_line(id, *n, cur_prio(id)))
+                    .unwrap_or_default();
+                return Ok(rest_to_graphql(args, &rest));
+            }
+            let method = args
+                .iter()
+                .position(|a| *a == "-X")
+                .and_then(|i| args.get(i + 1))
+                .copied()
+                .unwrap_or("GET");
+            if method != "GET" {
+                // The PATCH response echoes the priority written into the body, so
+                // publish_write records the new order.
+                let prio = joined
+                    .split("priority: ")
+                    .nth(1)
+                    .and_then(|s| s.split_whitespace().next())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let num = args
+                    .iter()
+                    .find_map(|a| a.strip_prefix("repos/owner/repo/issues/"))
+                    .and_then(|s| s.split('/').next())
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(1);
+                let id = table.iter().find(|(_, n)| *n == num).map(|(id, _)| *id).unwrap_or("a");
+                return Ok(rest_line(id, num, prio));
+            }
+            let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+            if path.ends_with("/labels") {
+                return Ok(String::new());
+            }
+            // The open-status list (`list_in_status(todo)`): both cards as JSONL.
+            Ok(format!("{}\n{}", rest_line("a", 1, 0), rest_line("b", 2, 1)))
+        });
+
+        store.set_priority("b", PrioMove::Top).unwrap();
+
+        let idx = crate::board_index::read_board_index("test-project").expect("index present");
+        let prio = |id: &str| idx.board.iter().find(|f| f.task.id == id).map(|f| f.task.priority);
+        assert_eq!(prio("b"), Some(0), "b is published at the top");
+        assert_eq!(prio("a"), Some(1), "a is renumbered below it");
+        assert!(
+            last_call(&calls).contains("-X PATCH"),
+            "no post-write read after the reorder: {:?}",
+            calls.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_mutation_with_no_caches_present_succeeds_and_leaves_no_files() {
+        // A publish failure (here: nothing to patch) must never fail a mutation
+        // that already succeeded remotely, and must not create the cache files.
+        let _home = HomeGuard::new("pub-nocaches");
+        let issue = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let after = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/review"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, _calls) = recording_store(issue, issue, "", after);
+
+        // No board-index.json and no done-history.json on disk.
+        store.move_status("t", &Column::review(), "handoff").unwrap().expect("moved");
+
+        assert!(
+            crate::board_index::read_board_index("test-project").is_none(),
+            "no board index is created by a best-effort publish"
+        );
+        assert!(
+            crate::done_history::read_done_history("test-project").is_none(),
+            "no done-history page is created by a best-effort publish"
         );
     }
 
