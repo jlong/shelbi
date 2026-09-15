@@ -689,6 +689,10 @@ impl IssueStore for GitHubStore {
                     remaining: None,
                     reset: None,
                     rest_fallback: true,
+                    // The degraded REST list carries no raw labels or GitHub
+                    // state, so it cannot tell a reopened-with-terminal-label
+                    // issue from a backlog card — it reports no reopened pairs.
+                    reopened: Vec::new(),
                 });
             }
         };
@@ -699,11 +703,17 @@ impl IssueStore for GitHubStore {
                 // Cold read: capture every open issue's number alongside its
                 // mapped card, so the daemon can publish the full id→number map.
                 let mut numbers: Vec<(String, i64)> = Vec::with_capacity(page.issues.len());
+                // Reopened-with-terminal-label issues, captured before
+                // `into_issue_file` consumes the raw `GhIssue` and its labels.
+                let mut reopened: Vec<(String, String)> = Vec::new();
                 let mut board: Vec<IssueFile> = page
                     .issues
                     .into_iter()
                     .map(|gh| {
                         let number = gh.number;
+                        if let Some(pair) = gh.reopened_terminal() {
+                            reopened.push(pair);
+                        }
                         let tf = fold_assignment(gh.into_issue_file(), &assignments);
                         numbers.push((tf.task.id.clone(), number));
                         tf
@@ -716,6 +726,7 @@ impl IssueStore for GitHubStore {
                     remaining: page.remaining,
                     reset: page.reset,
                     rest_fallback: false,
+                    reopened,
                 })
             }
             Some(_) => {
@@ -727,12 +738,19 @@ impl IssueStore for GitHubStore {
                 // the daemon merges them onto the prior index's map, so untouched
                 // issues keep the number an earlier tick recorded.
                 let mut numbers: Vec<(String, i64)> = Vec::new();
+                // Reopened-with-terminal-label issues in the touched set — a
+                // reopen bumps `updatedAt`, so it lands in this delta. Captured
+                // before `into_issue_file` consumes the raw `GhIssue`.
+                let mut reopened: Vec<(String, String)> = Vec::new();
                 for gh in page.issues {
                     // The index is the GitHub-*open* set. A closed issue (however
                     // its stale status label reads) leaves the open board; every
                     // other touched issue is upserted in place.
                     let closed = gh.is_closed();
                     let number = gh.number;
+                    if let Some(pair) = gh.reopened_terminal() {
+                        reopened.push(pair);
+                    }
                     let tf = gh.into_issue_file();
                     if closed {
                         by_id.remove(&tf.task.id);
@@ -752,6 +770,7 @@ impl IssueStore for GitHubStore {
                     remaining: page.remaining,
                     reset: page.reset,
                     rest_fallback: false,
+                    reopened,
                 })
             }
         }
@@ -3899,6 +3918,28 @@ impl GhIssue {
             .find_map(|l| l.name.strip_prefix(STATUS_LABEL_PREFIX))
     }
 
+    /// If this issue is **open on GitHub while still carrying a terminal
+    /// `shelbi:status/*` label** — the shape a human makes by reopening a
+    /// `done`/`canceled` issue on github.com, or by commenting one back open —
+    /// return `(shelbi id, normalized terminal status id)`.
+    ///
+    /// [`GhIssue::column`] collapses such an issue onto `backlog`, erasing the
+    /// stale terminal status downstream, so the reopen has to be captured here
+    /// while the raw label is still in hand. The status id is normalized through
+    /// [`Column::from_status_id`] so an aliased label (`completed`) is recorded
+    /// as `done`. `None` for every other issue. Interpretation only: nothing
+    /// here writes to GitHub (decision 7).
+    fn reopened_terminal(&self) -> Option<(String, String)> {
+        if self.is_closed() {
+            return None;
+        }
+        let col = Column::from_status_id(self.status_label()?);
+        if !is_terminal(&col) {
+            return None;
+        }
+        Some((self.resolved_id(), col.into_string()))
+    }
+
     /// Every label name that is NOT a `shelbi:status/*` label — the set to keep
     /// when swapping the status label on a move.
     fn non_status_labels(&self) -> Vec<String> {
@@ -6854,6 +6895,10 @@ mod tests {
             .unwrap()
             .timestamp();
         assert_eq!(read.reset, Some(expected_reset));
+
+        // An ordinary open board (no open-plus-terminal-label issue) reports no
+        // reopened pairs.
+        assert!(read.reopened.is_empty(), "no reopened pairs on an ordinary board");
     }
 
     #[test]
@@ -6880,6 +6925,54 @@ mod tests {
         let a = read.board.iter().find(|f| f.task.id == "a").unwrap();
         assert_eq!(a.task.column, Column::in_progress());
         assert_eq!(read.remaining, Some(4999));
+        // None of these transitions is an open-plus-terminal-label reopen.
+        assert!(read.reopened.is_empty(), "no reopened pairs on an ordinary delta");
+    }
+
+    #[test]
+    fn refresh_board_cold_surfaces_a_reopened_terminal_issue() {
+        let _iso = IsolatedHome::new("cold-reopened");
+        // A cold page with two open issues: an ordinary `todo` card and one a
+        // human reopened on github.com — still open, still carrying its terminal
+        // `shelbi:status/completed` label (the alias for `done`).
+        let json = r#"{"data":{"rateLimit":{"remaining":4989,"resetAt":"2026-09-08T06:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"c"},"nodes":[
+{"number":3,"title":"Fresh","state":"OPEN","stateReason":null,"createdAt":"2026-08-03T00:00:00Z","updatedAt":"2026-08-03T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/fresh"},{"name":"shelbi:status/todo"}]}},
+{"number":7,"title":"Reopened","state":"OPEN","stateReason":"REOPENED","createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-09-08T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/reopened-one"},{"name":"shelbi:status/completed"}]}}
+]}}}}"#;
+        let store = graphql_store(json);
+
+        let read = store.refresh_board(None, &[]).unwrap();
+        // The board renders the reopened issue in backlog (the status-move task's
+        // mapping), so the stale terminal status survives only in `reopened`.
+        assert_eq!(
+            read.reopened,
+            vec![("reopened-one".to_string(), "done".to_string())],
+            "exactly the open-plus-terminal-label issue, normalized to `done`"
+        );
+        let reopened_card = read.board.iter().find(|f| f.task.id == "reopened-one").unwrap();
+        assert_eq!(reopened_card.task.column, Column::backlog());
+    }
+
+    #[test]
+    fn refresh_board_incremental_surfaces_a_reopened_terminal_issue() {
+        let _iso = IsolatedHome::new("delta-reopened");
+        // Previous open board holds an ordinary card. The delta since then: a
+        // human reopened issue `r` on github.com — a reopen bumps `updatedAt`, so
+        // it lands in the touched set, still open and still terminal-labelled.
+        let previous = vec![prev_issue("a", "todo", 0)];
+        let json = r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T07:00:00Z"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"z"},"nodes":[
+{"number":5,"title":"r","state":"OPEN","stateReason":"REOPENED","createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-09-08T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/r"},{"name":"shelbi:status/done"}]}}
+]}}}}"#;
+        let store = graphql_store(json);
+
+        let read = store.refresh_board(Some(Utc::now()), &previous).unwrap();
+        assert_eq!(
+            read.reopened,
+            vec![("r".to_string(), "done".to_string())],
+            "the reopened issue in the touched set is surfaced as a `done` pair"
+        );
+        let r = read.board.iter().find(|f| f.task.id == "r").unwrap();
+        assert_eq!(r.task.column, Column::backlog(), "and renders in backlog");
     }
 
     #[test]

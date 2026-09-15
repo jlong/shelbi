@@ -4930,6 +4930,18 @@ mod tests {
         );
     }
 
+    /// The daemon's `board reopened` line must classify as a project event, the
+    /// same bucket the `board refreshed=` line lands in — never as a task
+    /// transition. It uses `issue=` (not `task=`) precisely so the broad `task=`
+    /// branch in [`EventKind::from_body`] doesn't claim it and make it look like
+    /// a status move to the orchestrator drain and the TUIs.
+    #[test]
+    fn board_reopened_line_classifies_as_project_not_task() {
+        let body = "project=demo board reopened issue=fix-login status=done";
+        assert_eq!(EventKind::from_body(body), EventKind::Project);
+        assert_ne!(EventKind::from_body(body), EventKind::Task);
+    }
+
     /// Contract test binding the ready-marker handoff emitter to the
     /// orchestrator-facing fields the instruction template documents. Feeds
     /// *genuine* emitter output ([`task_event_body`], the exact body
