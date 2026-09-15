@@ -41,6 +41,17 @@ use shelbi_state::IssueStore;
 /// reads on the configured cadence, not on this slice.
 const MANAGER_TICK: Duration = Duration::from_secs(2);
 
+/// The longest a published board may go without a full **cold read** — the
+/// paginated open-board query that rebuilds the whole open set. Incremental
+/// deltas serve every tick between cold reads, but a delta (`filterBy: { since }`)
+/// can only add and update rows: an issue hard-deleted or transferred out of the
+/// repository never appears in one, so its card and id→number entry would survive
+/// forever. Forcing a cold read at least this often reconciles those vanished
+/// rows away within one period. Ten minutes is six cold reads per hour per open
+/// project against the GraphQL points budget — negligible next to a delta per
+/// tick — while bounding how long a ghost row can linger.
+const COLD_READ_INTERVAL: Duration = Duration::from_secs(600);
+
 /// Slice the manager sleeps in so a stop signal is noticed within ~250ms rather
 /// than up to a full [`MANAGER_TICK`].
 const STOP_POLL_SLICE: Duration = Duration::from_millis(250);
@@ -187,16 +198,35 @@ fn mark_index_stale_from_tier(project: &str, tier: &BudgetTier) {
 /// a quiet board produces no log noise. Split from the store construction so it
 /// is unit-testable with a fake [`IssueStore`].
 fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOutcome> {
-    let previous = board_index::read_board_index(project);
-    // The previous index's `fetched_at` is the incremental watermark: read only
-    // issues touched since it. `None` (no prior index, or a torn one) forces a
-    // cold full read. It parses as RFC3339 — a value we can't parse is treated as
-    // "no watermark" so a corrupt timestamp falls back to a safe cold read rather
-    // than an error.
-    let since = previous
-        .as_ref()
-        .and_then(|p| DateTime::parse_from_rfc3339(&p.fetched_at).ok())
-        .map(|dt| dt.with_timezone(&Utc));
+    // The repository identity to stamp on this publish, from the project's tracker
+    // config — the same config the store was built from. A read path validates a
+    // published index against this and treats a mismatch as no index. In
+    // production the store was just built from this config, so the load succeeds;
+    // a unit test driving `refresh_with_store` with a fake store and no registered
+    // project gets `None`, which is stamped and matches its own later ticks.
+    let expected_repo = shelbi_state::load_project(project)
+        .ok()
+        .and_then(|p| board_index::expected_board_repo(&p.issue_tracker));
+
+    // Only a previous index that still describes THIS repository (and the current
+    // schema) counts. A mismatched or pre-identity file (a retargeted project, an
+    // upgrade) is treated as "no prior index": a full cold read that then
+    // republishes with the correct identity.
+    let previous = board_index::read_board_index(project)
+        .filter(|p| p.identity_matches(expected_repo.as_deref()));
+
+    // The incremental watermark, or `None` to force a full cold read. Cold when
+    // there is no valid prior index, when the cold-read schedule is due (the last
+    // full read is missing, unparseable, or older than [`COLD_READ_INTERVAL`]), or
+    // when the previous `fetched_at` doesn't parse. Between cold reads the previous
+    // `fetched_at` is the delta watermark, so steady-state cost is one delta per
+    // tick plus a periodic full reconcile that drops any vanished issue.
+    let since = previous.as_ref().and_then(cold_read_watermark);
+
+    // The cold-read schedule timestamp an incremental tick carries forward
+    // untouched; a cold read resets it to this tick's `fetched_at` below.
+    let prev_cold_read = previous.as_ref().and_then(|p| p.last_cold_read.clone());
+
     // The `prev_board` slice is the merge base: the board the store folds an
     // incremental delta onto, and the base of the three-way merge below. Owned
     // (not borrowed from `previous`) so it can move into the locked closure.
@@ -219,6 +249,15 @@ fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOu
     // `prev_board` base and must be three-way merged so a CLI write-through that
     // landed mid-read survives.
     let authoritative = since.is_none() || read.rest_fallback;
+    // Both full-read paths (cold read and REST fallback) give an authoritative
+    // whole-open-board view that reconciles deletions, so either refreshes the
+    // cold-read schedule; a true incremental delta carries the previous timestamp
+    // forward so the ten-minute floor keeps advancing toward the next cold read.
+    let last_cold_read = if authoritative {
+        Some(fetched_at.clone())
+    } else {
+        prev_cold_read
+    };
     let fetched_at_return = fetched_at.clone();
     let remaining_return = read.remaining;
 
@@ -250,6 +289,12 @@ fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOu
         // Record which read path produced this board so `shelbi status` can report
         // whether the reader is on GraphQL or the REST fallback (Phase 3 §6).
         index.rest_fallback = read.rest_fallback;
+        // Stamp the repository identity on every publish so a reader can prove the
+        // file describes this project's configured repository, and carry the
+        // cold-read schedule so the ten-minute floor survives a daemon restart.
+        // `schema_version` is already the current constant (set by `fresh_at`).
+        index.repo = expected_repo;
+        index.last_cold_read = last_cold_read;
         Ok((index, changed))
     })
     .map_err(|e| anyhow!(e))?;
@@ -261,6 +306,28 @@ fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOu
         fetched_at: fetched_at_return,
         changed,
     })
+}
+
+/// The incremental `since` watermark to read from, or `None` to force a full
+/// cold read, derived from a *valid* previous index.
+///
+/// Returns `None` — a cold read — when the recorded last cold read is missing,
+/// unparseable, or older than [`COLD_READ_INTERVAL`], or when the previous
+/// `fetched_at` itself doesn't parse (a corrupt timestamp falls back to a safe
+/// cold read rather than an error). Otherwise the previous `fetched_at`, so the
+/// tick reads only issues touched since it. Deriving the schedule from a
+/// timestamp on the published index rather than from loop state means the
+/// ten-minute floor holds across the manager's variable cadence and across a
+/// daemon restart.
+fn cold_read_watermark(prev: &BoardIndex) -> Option<DateTime<Utc>> {
+    let last_cold = DateTime::parse_from_rfc3339(prev.last_cold_read.as_deref()?).ok()?;
+    let age = Utc::now().signed_duration_since(last_cold.with_timezone(&Utc));
+    if age.to_std().is_ok_and(|a| a >= COLD_READ_INTERVAL) {
+        return None; // the cold-read schedule is due
+    }
+    DateTime::parse_from_rfc3339(&prev.fetched_at)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Three-way merge an incremental delta against an index that a CLI write-through
@@ -962,6 +1029,134 @@ mod tests {
         assert_eq!(since, expected);
         // The second index advanced its own fetched_at.
         assert_ne!(second.fetched_at, first.fetched_at);
+    }
+
+    #[test]
+    fn an_overdue_cold_read_timestamp_forces_a_cold_tick() {
+        // A long-running daemon between cold reads: `fetched_at` is recent but the
+        // recorded last cold read is older than the ten-minute floor, so the next
+        // tick reads cold (since = None) to reconcile any vanished issue.
+        let _iso = IsolatedHome::new("cold-overdue");
+        let (store, seen_since) = fake_with_budget(vec![issue("a", "todo", 0)], (None, None));
+
+        let mut seed = BoardIndex::fresh(vec![issue("a", "todo", 0)]);
+        let now = Utc::now();
+        seed.fetched_at = (now - chrono::Duration::seconds(30)).to_rfc3339();
+        seed.last_cold_read = Some((now - chrono::Duration::minutes(11)).to_rfc3339());
+        shelbi_state::write_board_index("proj", &seed).unwrap();
+
+        refresh_with_store("proj", &store).unwrap();
+
+        let seen = seen_since.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].is_none(), "an overdue cold-read timestamp forces since=None");
+        drop(seen);
+        // The cold tick reset the schedule to its own fresh `fetched_at`.
+        let idx = board_index::read_board_index("proj").unwrap();
+        let cold = DateTime::parse_from_rfc3339(idx.last_cold_read.as_deref().unwrap()).unwrap();
+        assert!(
+            Utc::now().signed_duration_since(cold.with_timezone(&Utc)) < chrono::Duration::minutes(1),
+            "the cold read reset the schedule"
+        );
+    }
+
+    #[test]
+    fn a_recent_cold_read_timestamp_ticks_incrementally_and_carries_the_schedule() {
+        // The schedule lives on the published index, so a freshly constructed
+        // refresher reading a recent cold-read timestamp ticks incrementally
+        // (since = the previous fetched_at) and carries the cold-read timestamp
+        // forward unchanged rather than resetting it.
+        let _iso = IsolatedHome::new("cold-recent");
+        let (store, seen_since) = fake_with_budget(vec![issue("a", "todo", 0)], (None, None));
+
+        let mut seed = BoardIndex::fresh(vec![issue("a", "todo", 0)]);
+        let now = Utc::now();
+        seed.fetched_at = (now - chrono::Duration::seconds(30)).to_rfc3339();
+        let cold_read_ts = (now - chrono::Duration::minutes(2)).to_rfc3339();
+        seed.last_cold_read = Some(cold_read_ts.clone());
+        let expected_watermark = DateTime::parse_from_rfc3339(&seed.fetched_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        shelbi_state::write_board_index("proj", &seed).unwrap();
+
+        refresh_with_store("proj", &store).unwrap();
+
+        let seen = seen_since.lock().unwrap();
+        assert_eq!(
+            seen[0],
+            Some(expected_watermark),
+            "a recent cold read ⇒ incremental from the previous fetched_at"
+        );
+        drop(seen);
+        let idx = board_index::read_board_index("proj").unwrap();
+        assert_eq!(
+            idx.last_cold_read.as_deref(),
+            Some(cold_read_ts.as_str()),
+            "an incremental tick carries the cold-read schedule forward unchanged"
+        );
+    }
+
+    #[test]
+    fn a_mismatched_index_forces_a_cold_read_and_republishes_the_identity() {
+        // A retargeted project: the on-disk index is stamped for a different
+        // repository. The daemon treats it as no prior index (cold read) and
+        // republishes with the configured repository's identity, carrying none of
+        // the other repository's cards forward.
+        let _iso = IsolatedHome::new("mismatch-cold");
+        register_github_project("proj"); // configured for owner/repo
+        let (store, seen_since) = fake_with_budget(vec![issue("a", "todo", 0)], (None, None));
+
+        let mut seed = BoardIndex::fresh(vec![issue("ghost-from-other-repo", "todo", 0)]);
+        seed.repo = Some(shelbi_state::github_board_repo("other/repo"));
+        shelbi_state::write_board_index("proj", &seed).unwrap();
+
+        refresh_with_store("proj", &store).unwrap();
+
+        assert!(
+            seen_since.lock().unwrap()[0].is_none(),
+            "a mismatched prior index forces a cold read"
+        );
+        let idx = board_index::read_board_index("proj").unwrap();
+        assert_eq!(
+            idx.repo.as_deref(),
+            Some(shelbi_state::github_board_repo("owner/repo").as_str()),
+            "the republished index carries the configured repository"
+        );
+        assert!(
+            idx.board.iter().all(|f| f.task.id != "ghost-from-other-repo"),
+            "the other repository's card is not carried forward"
+        );
+        assert!(idx.board.iter().any(|f| f.task.id == "a"));
+    }
+
+    #[test]
+    fn a_scheduled_cold_read_drops_a_ghost_absent_from_the_full_board() {
+        // A hard delete or a transfer out: an issue on the published board that a
+        // full cold read no longer returns is gone from both the board and the
+        // numbers map after that cold read — the reconcile an incremental delta
+        // (add/update only) can never perform.
+        let _iso = IsolatedHome::new("ghost");
+        let mut seed =
+            BoardIndex::fresh(vec![issue("keep", "todo", 0), issue("ghost", "review", 0)]);
+        seed.numbers = [("keep".to_string(), 1), ("ghost".to_string(), 9)]
+            .into_iter()
+            .collect();
+        // Overdue schedule so the next tick is cold.
+        seed.last_cold_read = Some((Utc::now() - chrono::Duration::minutes(11)).to_rfc3339());
+        shelbi_state::write_board_index("proj", &seed).unwrap();
+
+        // The cold read returns only `keep`; `ghost` vanished from the repository.
+        let (store, seen_since) = fake_with_budget(vec![issue("keep", "todo", 0)], (None, None));
+        refresh_with_store("proj", &store).unwrap();
+        assert!(seen_since.lock().unwrap()[0].is_none(), "the tick was cold");
+
+        let idx = board_index::read_board_index("proj").unwrap();
+        assert!(
+            idx.board.iter().all(|f| f.task.id != "ghost"),
+            "the ghost is gone from the published board"
+        );
+        assert_eq!(idx.numbers.get("ghost"), None, "and from the numbers map");
+        assert!(idx.board.iter().any(|f| f.task.id == "keep"), "the live card survives");
     }
 
     #[test]

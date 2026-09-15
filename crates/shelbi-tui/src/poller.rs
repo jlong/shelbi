@@ -5825,7 +5825,12 @@ Intro prose.
 
     /// Publish a fresh (warm) board index for `name`, as the daemon would.
     fn seed_warm_index(name: &str, board: Vec<shelbi_state::IssueFile>) {
-        shelbi_state::write_board_index(name, &shelbi_state::BoardIndex::fresh(board)).unwrap();
+        let mut idx = shelbi_state::BoardIndex::fresh(board);
+        // Stamp the identity the `github`-backed test project (`owner/repo`)
+        // reads validate against, so the index reads Warm rather than being
+        // treated as another repository's board.
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index(name, &idx).unwrap();
     }
 
     /// Publish a **stale**-flagged index for `name` — the "not warm" state a
@@ -5833,14 +5838,20 @@ Intro prose.
     /// previous board forward). `warm_board` and the assigned-task gates must
     /// refuse to act on it.
     fn seed_stale_index(name: &str) {
+        let fetched_at = chrono::Utc::now().to_rfc3339();
         let idx = shelbi_state::BoardIndex {
             board: vec![idx_issue("t", "review", Some("alpha"))],
             numbers: std::collections::BTreeMap::new(),
-            fetched_at: chrono::Utc::now().to_rfc3339(),
+            last_cold_read: Some(fetched_at.clone()),
+            fetched_at,
             stale: true,
             remaining: None,
             reset: None,
             rest_fallback: false,
+            // Stamp the matching identity so this reads as genuinely Stale (the
+            // state under test), not Cold-by-identity-mismatch.
+            repo: Some(shelbi_state::github_board_repo("owner/repo")),
+            schema_version: shelbi_state::BOARD_INDEX_SCHEMA_VERSION,
         };
         shelbi_state::write_board_index(name, &idx).unwrap();
     }

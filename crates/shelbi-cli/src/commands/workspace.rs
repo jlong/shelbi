@@ -904,20 +904,18 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         register_github_project_with_slots(&home, "gw");
-        shelbi_state::write_board_index(
-            "gw",
-            &shelbi_state::BoardIndex::fresh(vec![
-                shelbi_state::IssueFile {
-                    task: make_task("work-1", Column::in_progress(), 0, Some("alpha")),
-                    body: String::new(),
-                },
-                shelbi_state::IssueFile {
-                    task: make_task("rev-1", Column::review(), 0, Some("review-1")),
-                    body: String::new(),
-                },
-            ]),
-        )
-        .unwrap();
+        let mut idx = shelbi_state::BoardIndex::fresh(vec![
+            shelbi_state::IssueFile {
+                task: make_task("work-1", Column::in_progress(), 0, Some("alpha")),
+                body: String::new(),
+            },
+            shelbi_state::IssueFile {
+                task: make_task("rev-1", Column::review(), 0, Some("review-1")),
+                body: String::new(),
+            },
+        ]);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("gw", &idx).unwrap();
 
         let calls = Arc::new(AtomicUsize::new(0));
         let rec = Arc::clone(&calls);

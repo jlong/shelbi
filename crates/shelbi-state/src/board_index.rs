@@ -41,7 +41,7 @@ use std::time::Duration;
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 
-use shelbi_core::{IssueTrackerConfig, Result};
+use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig, Result};
 
 use crate::issue_store::BoardState;
 use crate::IssueFile;
@@ -51,6 +51,40 @@ use crate::IssueFile;
 /// failure (→ treated as absent), not silently-valid garbage — the same
 /// discipline [`crate::issue_cache`] uses for `board-snapshot.json`.
 pub const BOARD_INDEX_FILE: &str = "board-index.json";
+
+/// The on-disk shape version of a [`BoardIndex`]. Bump this whenever the
+/// persisted format changes in a way an older reader would misinterpret: a
+/// published file whose `schema_version` is not this constant is treated as
+/// absent (a cold read replaces it), rather than read field-by-field against a
+/// changed struct with serde defaults papering over the difference. `0` is the
+/// value a pre-identity file deserializes to (the field is absent), so it never
+/// matches and every such file is re-read cold on the next tick.
+pub const BOARD_INDEX_SCHEMA_VERSION: u32 = 1;
+
+/// The host-qualified repository identity stamped on a board index for a GitHub
+/// `owner/repo` selector: `github.com/<owner>/<repo>`. github.com is the only
+/// supported host, so the host segment is a literal — there is no GHES host key.
+/// One place builds the string so the daemon (which stamps it) and every reader
+/// (which validates against it) can never drift.
+pub fn github_board_repo(repo: &str) -> String {
+    format!("github.com/{repo}")
+}
+
+/// The board-index repository identity a project's tracker config implies, or
+/// `None` for a backend that publishes no index (`file_system`, and the
+/// not-yet-resolvable `jira`/`linear` stubs). GitHub is the only backend that
+/// stamps identity today. Used by every config-holding read path to decide
+/// whether a published index describes the repository this project is now
+/// pointed at; a mismatch means the file is another repository's board and is
+/// treated as absent.
+pub fn expected_board_repo(cfg: &IssueTrackerConfig) -> Option<String> {
+    match cfg.backend {
+        IssueTrackerBackend::Github => cfg.github.as_ref().map(|g| github_board_repo(&g.repo)),
+        IssueTrackerBackend::FileSystem
+        | IssueTrackerBackend::Jira
+        | IssueTrackerBackend::Linear => None,
+    }
+}
 
 /// The hub-owned, on-disk board index for one project.
 ///
@@ -100,6 +134,30 @@ pub struct BoardIndex {
     /// index written by a pre-Phase-3 daemon.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rest_fallback: bool,
+    /// Host-qualified repository this index describes
+    /// (`github.com/<owner>/<repo>`), stamped by the daemon on every publish so a
+    /// reader can prove the file belongs to the repository the project is now
+    /// pointed at. `None` on a pre-identity file (the field is absent) and on a
+    /// test-built index that left the identity unset; either way it fails the
+    /// [`identity_matches`](Self::identity_matches) check and the file does not
+    /// serve. See [`expected_board_repo`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// On-disk format version — [`BOARD_INDEX_SCHEMA_VERSION`] for anything this
+    /// build wrote. A pre-identity file has no such field and deserializes to
+    /// `0`, which never matches, so it is treated as absent and re-read cold.
+    #[serde(default)]
+    pub schema_version: u32,
+    /// RFC3339 timestamp of the last **full cold read** (the paginated open-board
+    /// query that rebuilds the whole open set), as opposed to an incremental
+    /// delta tick. Carried forward unchanged by incremental ticks and reset to
+    /// `fetched_at` on a cold one, so the daemon can schedule a cold read at least
+    /// every ten minutes — the reconcile that drops a hard-deleted or transferred
+    /// issue an incremental delta can never surface. Survives a daemon restart
+    /// because it lives on the published file, not in loop state. `None` on a
+    /// pre-schedule file forces the next tick cold, which then stamps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cold_read: Option<String>,
 }
 
 impl BoardIndex {
@@ -131,12 +189,31 @@ impl BoardIndex {
         Self {
             board,
             numbers: numbers.into_iter().collect(),
+            last_cold_read: Some(fetched_at.clone()),
             fetched_at,
             stale: false,
             remaining,
             reset,
             rest_fallback: false,
+            // A freshly constructed index is by definition the current on-disk
+            // shape. The repository identity is left unset here — the daemon's
+            // publish path stamps it from the project's tracker config; a
+            // test-built index that wants to read as valid stamps it itself.
+            repo: None,
+            schema_version: BOARD_INDEX_SCHEMA_VERSION,
         }
+    }
+
+    /// Whether this index's stamped identity matches `expected_repo` and the
+    /// current [`BOARD_INDEX_SCHEMA_VERSION`] — the gate every rendering and
+    /// id-resolution read applies before trusting the file. A schema mismatch, a
+    /// `repo` that differs from `expected_repo`, or an unstamped index (a
+    /// pre-identity file, or a retargeted project) all fail, so the file is
+    /// treated exactly as absent. `expected_repo` is `None` only for a backend
+    /// that stamps no identity, which then matches only an equally unstamped
+    /// index.
+    pub fn identity_matches(&self, expected_repo: Option<&str>) -> bool {
+        self.schema_version == BOARD_INDEX_SCHEMA_VERSION && self.repo.as_deref() == expected_repo
     }
 }
 
@@ -321,6 +398,19 @@ pub fn read_board_index_at(path: &Path) -> Option<BoardIndex> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Read `project`'s board index **only when its stamped identity matches**
+/// `expected_repo` and the current [`BOARD_INDEX_SCHEMA_VERSION`]. A mismatched
+/// or unstamped index — a project retargeted to a different repository, a
+/// pre-identity file, or a future schema — reads as `None`, exactly as a missing
+/// file does, so no rendering or id-resolution path ever serves another
+/// repository's rows or a stale id→number map. Every read that renders a board
+/// or resolves an id routes through this; the unvalidated [`read_board_index`]
+/// stays for the daemon's own reconcile (which validates the identity itself as
+/// part of the publish) and the read-modify-write mutators.
+pub fn read_valid_board_index(project: &str, expected_repo: Option<&str>) -> Option<BoardIndex> {
+    read_board_index(project).filter(|idx| idx.identity_matches(expected_repo))
+}
+
 /// The shared read every **list** consumer uses instead of sweeping the backend
 /// itself: the board the daemon published, tagged with its freshness. This is
 /// the consumer-side half of `Plans/github-issue-caching-and-rate-limits.md` §5
@@ -355,17 +445,19 @@ pub fn read_board_with_cfg(project: &str, cfg: &IssueTrackerConfig) -> Result<Bo
         let store = crate::issue_store::build_store(project, cfg)?;
         return Ok(BoardState::Warm(store.list_open()?));
     }
-    Ok(board_state_from_index(project, cfg.refresh_interval_secs()))
+    Ok(board_state_from_index(project, cfg, cfg.refresh_interval_secs()))
 }
 
 /// Map the on-disk index to a [`BoardState`] from its `stale` flag and the age
 /// of its `fetched_at` relative to `interval_secs` (the project's refresh
-/// cadence). A missing or torn file is [`BoardState::Cold`]; an index the daemon
+/// cadence). A missing, torn, or identity-mismatched file (another repository's
+/// board, or a pre-identity one) is [`BoardState::Cold`]; an index the daemon
 /// flagged stale, or one older than [`index_stale_threshold`] (the daemon has
 /// missed several ticks — stopped, wedged, or rate-limited), is
 /// [`BoardState::Stale`]; anything fresher is [`BoardState::Warm`].
-fn board_state_from_index(project: &str, interval_secs: u64) -> BoardState {
-    let Some(idx) = read_board_index(project) else {
+fn board_state_from_index(project: &str, cfg: &IssueTrackerConfig, interval_secs: u64) -> BoardState {
+    let expected = expected_board_repo(cfg);
+    let Some(idx) = read_valid_board_index(project, expected.as_deref()) else {
         return BoardState::Cold;
     };
     if idx.stale || fetched_at_is_stale(&idx.fetched_at, interval_secs) {
@@ -566,7 +658,8 @@ pub fn read_board_report_with_cfg(project: &str, cfg: &IssueTrackerConfig) -> Re
 /// [`read_board_report_with_cfg`].
 fn remote_board_report(project: &str, cfg: &IssueTrackerConfig) -> BoardReport {
     let interval_secs = cfg.refresh_interval_secs();
-    if let Some(idx) = read_board_index(project) {
+    let expected = expected_board_repo(cfg);
+    if let Some(idx) = read_valid_board_index(project, expected.as_deref()) {
         let stale = idx.stale || fetched_at_is_stale(&idx.fetched_at, interval_secs);
         let age_secs = age_secs_of(&idx.fetched_at);
         let read_path = if idx.rest_fallback {
@@ -1023,14 +1116,20 @@ mod tests {
     /// Build an index with an explicit `fetched_at` age and `stale` flag, so the
     /// Warm/Stale mapping can be exercised without waiting real time.
     fn index_aged(board: Vec<IssueFile>, secs_ago: i64, stale: bool) -> BoardIndex {
+        let fetched_at = (Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339();
         BoardIndex {
             board,
             numbers: std::collections::BTreeMap::new(),
-            fetched_at: (Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339(),
+            last_cold_read: Some(fetched_at.clone()),
+            fetched_at,
             stale,
             remaining: None,
             reset: None,
             rest_fallback: false,
+            // Stamp the identity `github_cfg()` expects so the Warm/Stale mapping
+            // is exercised, not short-circuited by the identity gate.
+            repo: Some(github_board_repo("owner/repo")),
+            schema_version: BOARD_INDEX_SCHEMA_VERSION,
         }
     }
 
@@ -1089,6 +1188,112 @@ mod tests {
             read_board_with_cfg("proj", &github_cfg()).unwrap(),
             BoardState::Cold
         ));
+    }
+
+    #[test]
+    fn read_board_is_cold_for_an_index_stamped_for_another_repository() {
+        // Retarget: the file on disk describes `github.com/other/repo`, but the
+        // project is now configured for `owner/repo`. The old repository's cards
+        // must not be served — the read is Cold, exactly as with no file, until a
+        // daemon tick refills the board for the new repository.
+        let _iso = IsolatedHome::new("retarget");
+        let mut idx = index_aged(vec![issue("stale-other-repo-card", "todo", 0)], 0, false);
+        idx.repo = Some(github_board_repo("other/repo"));
+        write_board_index("proj", &idx).unwrap();
+
+        assert!(
+            matches!(
+                read_board_with_cfg("proj", &github_cfg()).unwrap(),
+                BoardState::Cold
+            ),
+            "a mismatched-repo index must read Cold, never serve the other repo's rows"
+        );
+        // The richer report path agrees: it takes the no-index branch, not a
+        // Warm/Stale board of the other repository's cards.
+        let report = read_board_report_with_cfg("proj", &github_cfg()).unwrap();
+        assert!(matches!(report.state, BoardState::Cold));
+    }
+
+    #[test]
+    fn read_board_is_cold_for_a_mismatched_schema_version() {
+        // A file whose repo matches but whose on-disk shape is a version this
+        // build does not understand is treated as absent, so an older reader never
+        // parses a changed struct field-by-field against serde defaults.
+        let _iso = IsolatedHome::new("schema");
+        let mut idx = index_aged(vec![issue("a", "todo", 0)], 0, false);
+        idx.schema_version = BOARD_INDEX_SCHEMA_VERSION + 99;
+        write_board_index("proj", &idx).unwrap();
+
+        assert!(matches!(
+            read_board_with_cfg("proj", &github_cfg()).unwrap(),
+            BoardState::Cold
+        ));
+    }
+
+    #[test]
+    fn read_board_is_cold_for_a_pre_identity_index_carrying_neither_field() {
+        // Every index published before this change carries neither `repo` nor
+        // `schema_version`. Deserializing fills them with defaults (`None`, `0`),
+        // both of which fail the identity check, so the file does not serve and
+        // the next daemon refresh replaces it.
+        let _iso = IsolatedHome::new("preidentity");
+        let path = board_index_path("proj").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A hand-written legacy file: valid JSON, no identity fields at all.
+        std::fs::write(
+            &path,
+            br#"{"board":[{"task":{"id":"legacy","title":"legacy","column":"todo","priority":0,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},"body":""}],"fetched_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        // It still deserializes (so it is not merely "torn"), but its identity is
+        // unset, so it does not serve.
+        let raw = read_board_index("proj").expect("a pre-identity file still parses");
+        assert_eq!(raw.repo, None);
+        assert_eq!(raw.schema_version, 0);
+        assert!(matches!(
+            read_board_with_cfg("proj", &github_cfg()).unwrap(),
+            BoardState::Cold
+        ));
+    }
+
+    #[test]
+    fn a_matching_repo_and_schema_reads_warm() {
+        // The positive case bracketing the mismatch tests: identity stamped to
+        // match the config reads Warm, so the gate is not simply refusing
+        // everything.
+        let _iso = IsolatedHome::new("match");
+        write_board_index("proj", &index_aged(vec![issue("a", "todo", 0)], 0, false)).unwrap();
+        assert!(matches!(
+            read_board_with_cfg("proj", &github_cfg()).unwrap(),
+            BoardState::Warm(_)
+        ));
+    }
+
+    #[test]
+    fn read_write_mutators_preserve_the_stamped_identity() {
+        // The read-modify-write helpers must not drop or reset `repo` /
+        // `schema_version`; an index they touch still reads as valid.
+        let _iso = IsolatedHome::new("mutators-identity");
+        let mut seed = index_aged(vec![issue("a", "todo", 0)], 0, false);
+        seed.numbers.insert("a".into(), 1);
+        write_board_index("proj", &seed).unwrap();
+
+        patch_board_index_issue("proj", &issue("b", "review", 0)).unwrap();
+        patch_board_index_issue_with_number("proj", &issue("c", "todo", 0), Some(3)).unwrap();
+        record_board_index_number("proj", "a", 7).unwrap();
+        mark_board_index_stale("proj", Some(9), Some(1_800_000_000)).unwrap();
+        remove_board_index_issue("proj", "b").unwrap();
+
+        let back = read_board_index("proj").unwrap();
+        assert_eq!(
+            back.repo.as_deref(),
+            Some(github_board_repo("owner/repo").as_str()),
+            "repo survives every mutator"
+        );
+        assert_eq!(back.schema_version, BOARD_INDEX_SCHEMA_VERSION);
+        // And the index still validates against the configured repository.
+        assert!(back.identity_matches(expected_board_repo(&github_cfg()).as_deref()));
     }
 
     #[test]

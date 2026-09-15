@@ -3058,14 +3058,12 @@ mod pr_create_tests {
         let mut t = task();
         t.id = "sentinel-open".into();
         t.column = Column::in_progress();
-        shelbi_state::write_board_index(
-            "zen-open",
-            &shelbi_state::BoardIndex::fresh(vec![shelbi_state::IssueFile {
-                task: t,
-                body: String::new(),
-            }]),
-        )
-        .unwrap();
+        let mut idx = shelbi_state::BoardIndex::fresh(vec![shelbi_state::IssueFile {
+            task: t,
+            body: String::new(),
+        }]);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("zen-open", &idx).unwrap();
 
         let board = open_board(&proj).unwrap();
         assert!(

@@ -1066,17 +1066,15 @@ mod tests {
         let mut inprog = todo_task("sentinel-active", &[]);
         inprog.column = Column::in_progress();
         inprog.assigned_to = Some("alpha".into());
-        shelbi_state::write_board_index(
-            "demo",
-            &shelbi_state::BoardIndex::fresh(vec![
-                ifile(inprog),
-                ifile(review_task("sentinel-review", "review-1")),
-                // A todo card must be excluded from the active (in-progress +
-                // review) scan.
-                ifile(todo_task("sentinel-todo", &[])),
-            ]),
-        )
-        .unwrap();
+        let mut idx = shelbi_state::BoardIndex::fresh(vec![
+            ifile(inprog),
+            ifile(review_task("sentinel-review", "review-1")),
+            // A todo card must be excluded from the active (in-progress +
+            // review) scan.
+            ifile(todo_task("sentinel-todo", &[])),
+        ]);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("demo", &idx).unwrap();
 
         let active = active_board(&project).unwrap();
         let ids: Vec<&str> = active.iter().map(|t| t.task.id.as_str()).collect();

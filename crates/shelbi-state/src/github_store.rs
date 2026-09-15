@@ -1619,7 +1619,10 @@ impl GitHubStore {
         let Some((cached_updated, tf)) = issue_cache_get(&self.repo, number) else {
             return Ok(None);
         };
-        let Some(idx) = crate::board_index::read_board_index(&self.project) else {
+        let Some(idx) = crate::board_index::read_valid_board_index(
+            &self.project,
+            Some(&self.board_repo_identity()),
+        ) else {
             return Ok(None);
         };
         let Some(entry) = idx.board.iter().find(|f| f.task.id == tf.task.id) else {
@@ -1680,10 +1683,22 @@ impl GitHubStore {
             .copied()
     }
 
+    /// The host-qualified board-index identity for this store's repository
+    /// (`github.com/<owner>/<repo>`). A published index that does not carry a
+    /// matching identity describes a different repository (a retargeted project)
+    /// or a pre-identity shape, and must not resolve numbers or serve cached
+    /// issues for this store.
+    fn board_repo_identity(&self) -> String {
+        crate::board_index::github_board_repo(&self.repo)
+    }
+
     /// The number for `id` from the published board index's id→number map, if the
-    /// open index carries it.
+    /// open index carries it **and** describes this store's repository. A
+    /// mismatched or pre-identity index resolves nothing here, so `resolve_number`
+    /// falls through to its label-search path rather than trusting another
+    /// repository's map.
     fn index_number(&self, id: &str) -> Option<i64> {
-        crate::board_index::read_board_index(&self.project)?
+        crate::board_index::read_valid_board_index(&self.project, Some(&self.board_repo_identity()))?
             .numbers
             .get(id)
             .copied()
@@ -5941,14 +5956,49 @@ mod tests {
 
     /// Publish a board index for `project` with an explicit id→number map.
     fn write_test_index(project: &str, numbers: &[(&str, i64)], board: Vec<IssueFile>) {
-        let idx = crate::board_index::BoardIndex::fresh_at(
+        let mut idx = crate::board_index::BoardIndex::fresh_at(
             board,
             numbers.iter().map(|(id, n)| (id.to_string(), *n)).collect(),
             Utc::now().to_rfc3339(),
             None,
             None,
         );
+        // Every test store is bound to `owner/repo`, so stamp the identity its
+        // reads validate against — otherwise the identity gate would treat the
+        // seeded index as another repository's board and resolve nothing from it.
+        idx.repo = Some(crate::board_index::github_board_repo("owner/repo"));
         crate::board_index::write_board_index(project, &idx).unwrap();
+    }
+
+    #[test]
+    fn index_number_ignores_an_index_stamped_for_another_repository() {
+        // AC: with an index stamped for one repository and the store bound to
+        // another, `index_number` resolves no id — the retargeted project's stale
+        // id→number map must never resolve a write target for the new repository.
+        let _home = HomeGuard::new("idxnum-mismatch");
+        let mut idx = crate::board_index::BoardIndex::fresh_at(
+            vec![idx_issue("foo", "todo", "2026-08-01T00:00:00Z")],
+            vec![("foo".to_string(), 7)],
+            Utc::now().to_rfc3339(),
+            None,
+            None,
+        );
+        idx.repo = Some(crate::board_index::github_board_repo("other/repo"));
+        crate::board_index::write_board_index("test-project", &idx).unwrap();
+
+        // The store is bound to `owner/repo`; the on-disk index describes
+        // `other/repo`, so it resolves nothing.
+        let (store, _calls) = graphql_recorder(|_args| Ok(String::new()));
+        assert_eq!(
+            store.index_number("foo"),
+            None,
+            "a mismatched-repo index resolves no number"
+        );
+
+        // Bracket the negative: re-stamped for the store's own repo, it resolves.
+        idx.repo = Some(crate::board_index::github_board_repo("owner/repo"));
+        crate::board_index::write_board_index("test-project", &idx).unwrap();
+        assert_eq!(store.index_number("foo"), Some(7));
     }
 
     #[test]

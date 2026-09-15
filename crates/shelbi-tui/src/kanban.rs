@@ -3267,13 +3267,14 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let env = IsolatedKanbanEnv::new("index-open");
         register_github_project(&env.home, "demo");
-        shelbi_state::write_board_index(
-            "demo",
-            &shelbi_state::BoardIndex::fresh(vec![
-                task_file("sentinel-open", Column::in_progress(), 0, "2026-07-13T12:00:00Z"),
-            ]),
-        )
-        .unwrap();
+        let mut idx = shelbi_state::BoardIndex::fresh(vec![task_file(
+            "sentinel-open",
+            Column::in_progress(),
+            0,
+            "2026-07-13T12:00:00Z",
+        )]);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("demo", &idx).unwrap();
         // The done/canceled lanes stay on their own lazy store path; keep it
         // offline with an empty `gh` so the test never touches the network.
         shelbi_state::set_test_gh_runner(|_| Ok(String::new()));
