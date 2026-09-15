@@ -162,8 +162,10 @@ pub struct AddArgs {
     /// Override the auto-generated id (slugified from the title).
     #[arg(long)]
     pub id: Option<String>,
-    /// Initial status. Defaults to `backlog`. `--column` accepted as a
-    /// hidden alias for one release while older scripts catch up.
+    /// Initial status. Defaults to `backlog`. Creating directly in a
+    /// ready status (e.g. `--status todo`) skips triage and wakes the
+    /// orchestrator just like moving a card into it. `--column` accepted
+    /// as a hidden alias for one release while older scripts catch up.
     #[arg(
         long = "status",
         alias = "column",
@@ -511,6 +513,40 @@ fn add_with_stdin(project: &str, args: AddArgs, stdin_body: Option<String>) -> R
         priority: None,
     };
     let created = store.add(spec).map_err(|e| anyhow!(e))?;
+
+    // Wake the orchestrator when a card is created DIRECTLY into an
+    // agent-owned status. `move` appends a transition event (which carries
+    // `to_category=` — the orchestrator's start signal for `ready`); `add`
+    // used to append nothing, so `issue add --status todo` created the card
+    // but never woke the orchestrator, unlike moving into `todo`. We now
+    // emit a creation event so the two paths behave identically.
+    //
+    // The backlog inbox stays quiet: it's the triage stage, has no reaction
+    // rule, and firing on every `issue add "title"` (the default) would wake
+    // the orchestrator for work that isn't ready. A creation is not a move,
+    // so `from == to == <created status>` — the line reports the card came
+    // into existence in that status rather than fabricating a source column.
+    // A failed append only loses the wake signal (the card itself is already
+    // persisted), so we warn rather than roll back the creation — matching
+    // `start` / `resume`, not `move`'s rollback-on-append-failure.
+    if column.category() != StatusCategory::Backlog {
+        let project_yaml = shelbi_state::load_project(project).ok();
+        let workflow_name = project_yaml
+            .as_ref()
+            .map(|p| shelbi_state::resolve_task_workflow_name(p, &created).to_string())
+            .unwrap_or_else(|| created.workflow_or_default().to_string());
+        if let Err(e) = shelbi_state::append_task_event(
+            project,
+            &created.id,
+            &workflow_name,
+            column.clone(),
+            column.clone(),
+            "user:cli:add",
+        ) {
+            eprintln!("warning: append_task_event failed: {e}");
+        }
+    }
+
     println!(
         "✓ {} created in {column} (priority {})",
         created.id, created.priority
@@ -2446,6 +2482,56 @@ mod tests {
         assert_eq!(
             tf.body,
             "# Task\n\nShip the thing.\n\n## Acceptance Criteria\n- [ ] it ships\n"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn add_into_ready_status_wakes_the_orchestrator() {
+        // `shelbi issue add --status todo` must append the same
+        // `to_category=ready reason=user:*` signal `move` does, so creating a
+        // card directly in an agent-owned ready status wakes the orchestrator
+        // exactly like promoting one into it.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut args = add_args("Wake test");
+        args.id = Some("wake-test".into());
+        args.status = "todo".into();
+        add_with_stdin("p", args, None).unwrap();
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one creation event: {log}");
+        let line = lines[0];
+        assert!(line.contains(" task=wake-test "), "line: {line}");
+        assert!(line.contains(" todo -> todo "), "line: {line}");
+        assert!(line.contains(" reason=user:cli:add "), "line: {line}");
+        assert!(line.ends_with(" to_category=ready"), "line: {line}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn add_into_backlog_stays_quiet() {
+        // The default `issue add` lands in the backlog inbox (triage stage,
+        // no reaction rule). It must NOT append a task event — firing on every
+        // filed issue would wake the orchestrator for work that isn't ready.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        add_with_stdin("p", add_args("Just triage"), None).unwrap();
+
+        let log =
+            std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
+        assert!(
+            !log.contains(" task=just-triage "),
+            "backlog creation must emit no task event: {log}"
         );
 
         std::env::remove_var("SHELBI_HOME");
