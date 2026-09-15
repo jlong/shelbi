@@ -134,6 +134,18 @@ pub struct BoardIndex {
     /// index written by a pre-Phase-3 daemon.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rest_fallback: bool,
+    /// The effective refresh cadence, in seconds, the daemon was actually ticking
+    /// at when it published this index. Readers derive their staleness threshold
+    /// from this rather than the project's *configured* cadence, so a healthy hub
+    /// the budget governor has throttled (ticking at `slow_refresh_secs`, four
+    /// times the configured default) never renders stale for the gap between the
+    /// two. Stamped by the daemon's successful refresh only; a manual
+    /// `refresh-board` carries the last governed value forward rather than resetting
+    /// it. `None` on an index written by a pre-change daemon and on a test-built
+    /// index, both of which fall back to the configured cadence — exactly today's
+    /// behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
     /// Host-qualified repository this index describes
     /// (`github.com/<owner>/<repo>`), stamped by the daemon on every publish so a
     /// reader can prove the file belongs to the repository the project is now
@@ -195,6 +207,10 @@ impl BoardIndex {
             remaining,
             reset,
             rest_fallback: false,
+            // The refresh cadence is a governor decision the daemon's publish path
+            // stamps; a freshly constructed index (a test, a seed) records none and
+            // reads back through the configured-cadence fallback.
+            interval_secs: None,
             // A freshly constructed index is by definition the current on-disk
             // shape. The repository identity is left unset here — the daemon's
             // publish path stamps it from the project's tracker config; a
@@ -460,6 +476,12 @@ fn board_state_from_index(project: &str, cfg: &IssueTrackerConfig, interval_secs
     let Some(idx) = read_valid_board_index(project, expected.as_deref()) else {
         return BoardState::Cold;
     };
+    // Prefer the cadence the daemon was actually ticking at when it wrote this
+    // index over the project's configured cadence: a governor-throttled hub ticks
+    // slower than configured, so the configured value would call a perfectly fresh
+    // index stale. An index from a pre-change daemon carries none and falls back to
+    // the configured value, exactly as before.
+    let interval_secs = idx.interval_secs.unwrap_or(interval_secs);
     if idx.stale || fetched_at_is_stale(&idx.fetched_at, interval_secs) {
         BoardState::Stale(idx.board)
     } else {
@@ -660,6 +682,9 @@ fn remote_board_report(project: &str, cfg: &IssueTrackerConfig) -> BoardReport {
     let interval_secs = cfg.refresh_interval_secs();
     let expected = expected_board_repo(cfg);
     if let Some(idx) = read_valid_board_index(project, expected.as_deref()) {
+        // The recorded cadence the daemon ticked at wins over the configured one
+        // (see `board_state_from_index`); a pre-change index falls back to configured.
+        let interval_secs = idx.interval_secs.unwrap_or(interval_secs);
         let stale = idx.stale || fetched_at_is_stale(&idx.fetched_at, interval_secs);
         let age_secs = age_secs_of(&idx.fetched_at);
         let read_path = if idx.rest_fallback {
@@ -1126,6 +1151,10 @@ mod tests {
             remaining: None,
             reset: None,
             rest_fallback: false,
+            // No recorded cadence by default, so the Warm/Stale mapping runs
+            // through the configured-cadence fallback exactly as a pre-change index
+            // does; tests that exercise the recorded-cadence path set it explicitly.
+            interval_secs: None,
             // Stamp the identity `github_cfg()` expects so the Warm/Stale mapping
             // is exercised, not short-circuited by the identity gate.
             repo: Some(github_board_repo("owner/repo")),
@@ -1177,6 +1206,66 @@ mod tests {
             read_board_with_cfg("proj", &github_cfg()).unwrap(),
             BoardState::Stale(_)
         ));
+    }
+
+    #[test]
+    fn a_recorded_interval_widens_the_threshold_past_the_configured_cadence() {
+        // A governor-throttled hub ticks at 120s while the project is *configured*
+        // for the 30s default. An index 100s old is well inside 3 × 120s = 360s,
+        // but crosses the configured 90s floor. It must read Warm — the whole point
+        // of recording the cadence — from both reader entry points. Before this
+        // change the same file, judged against the configured 30s, read Stale.
+        let _iso = IsolatedHome::new("recorded-interval-warm");
+        let mut idx = index_aged(vec![issue("a", "todo", 0)], 100, false);
+        idx.interval_secs = Some(120);
+        write_board_index("proj", &idx).unwrap();
+
+        match read_board_with_cfg("proj", &github_cfg()).unwrap() {
+            BoardState::Warm(board) => assert_eq!(board.len(), 1),
+            other => panic!("expected Warm from a throttled-but-fresh index, got {other:?}"),
+        }
+        // The richer report path agrees.
+        let report = read_board_report_with_cfg("proj", &github_cfg()).unwrap();
+        assert!(
+            matches!(report.state, BoardState::Warm(_)) && !report.freshness.stale,
+            "the report path must also read a throttled-but-fresh index as Warm"
+        );
+    }
+
+    #[test]
+    fn a_recorded_interval_still_reads_stale_once_it_genuinely_lags() {
+        // Recording the cadence widens the window; it does not disable staleness.
+        // An index older than 3 × its own recorded interval (400s > 3 × 120s) is a
+        // daemon that has missed several of its *own* ticks, so it still reads Stale
+        // from both entry points.
+        let _iso = IsolatedHome::new("recorded-interval-stale");
+        let mut idx = index_aged(vec![issue("a", "todo", 0)], 400, false);
+        idx.interval_secs = Some(120);
+        write_board_index("proj", &idx).unwrap();
+
+        assert!(matches!(
+            read_board_with_cfg("proj", &github_cfg()).unwrap(),
+            BoardState::Stale(_)
+        ));
+        let report = read_board_report_with_cfg("proj", &github_cfg()).unwrap();
+        assert!(matches!(report.state, BoardState::Stale(_)) && report.freshness.stale);
+    }
+
+    #[test]
+    fn a_flagged_index_reads_stale_even_with_a_forgiving_recorded_interval() {
+        // The explicit `stale` flag wins over any age computation, recorded cadence
+        // or not: a fresh, throttled index the daemon flagged stale stays Stale.
+        let _iso = IsolatedHome::new("recorded-interval-flagged");
+        let mut idx = index_aged(vec![issue("a", "todo", 0)], 0, true);
+        idx.interval_secs = Some(120);
+        write_board_index("proj", &idx).unwrap();
+
+        assert!(matches!(
+            read_board_with_cfg("proj", &github_cfg()).unwrap(),
+            BoardState::Stale(_)
+        ));
+        let report = read_board_report_with_cfg("proj", &github_cfg()).unwrap();
+        assert!(matches!(report.state, BoardState::Stale(_)) && report.freshness.stale);
     }
 
     #[test]
