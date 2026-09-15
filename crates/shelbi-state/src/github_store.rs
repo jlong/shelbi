@@ -524,7 +524,7 @@ impl GitHubStore {
                 args,
                 &|a| rest_base(a),
                 None,
-                rest_read_caller(),
+                rest_read_caller(args),
             )
         });
 
@@ -1828,27 +1828,99 @@ impl GitHubStore {
 
     // --- fresh single-issue fetch (plan §3) ----------------------------------
 
-    /// Fetch one issue by its GitHub `number`, always live through GraphQL (one
-    /// point). "Render stale, never act stale" (decision 1): an action read
-    /// never depends on the age, `stale` flag, or contents of the published
-    /// board index — every call re-reads the issue authoritatively, so a move or
-    /// edit is never masked by an index the daemon has not ticked. The result is
-    /// memoed into the per-number [`ISSUE_CACHE`], a write-only post-write store
-    /// in this PR whose only reader arrives with the REST conditional-GET task
-    /// (which turns it into the `If-None-Match` ETag store). Returns `None` for a
-    /// number that names no issue (deleted, or a pull request).
+    /// Fetch one issue by its GitHub `number` as a **REST conditional `GET`** on
+    /// the REST budget (decision 9). "Render stale, never act stale" (decision 1):
+    /// an action read never depends on the age, `stale` flag, or contents of the
+    /// published board index. The request is
+    /// `gh api --include -X GET repos/<owner>/<repo>/issues/<number>`, with an
+    /// `If-None-Match: <etag>` header when this process already holds a cached
+    /// copy of that number *with its validator* (a fresh CLI process holds none
+    /// and pays one full `200`; the `304`s accrue in the long-lived TUI, poller
+    /// and daemon, which is where the volume came from). The dispositions, each
+    /// exactly what the old GraphQL path produced:
+    ///
+    /// * `304 Not Modified` — the cached copy is remotely verified, so it is by
+    ///   definition not stale. Return it as a normal success; no index age check
+    ///   is involved any more.
+    /// * `200` — parse the body into [`GhIssue`], fold the local assignment
+    ///   overlay, and replace both the cached issue *and* its validator. REST
+    ///   returns the full `labels` array, so the old `labels(first: 10)` cutoff is
+    ///   gone on this path.
+    /// * `404` — "no such issue"; drop any cached entry (the GraphQL null node's
+    ///   result).
+    /// * a number that names a **pull request** — REST `/issues/<n>` returns the
+    ///   PR where GraphQL `issue(number:)` returned null, so the explicit
+    ///   `is_pull_request` guard reproduces "no such issue".
+    ///
+    /// The conditional `GET` is accounted on `Budget::Rest` and participates in
+    /// the REST read park: a parked budget fails with the typed rate-limit error
+    /// (decision 1 — never serve the unverified cache to an action).
     fn fetch(&self, number: i64) -> Result<Option<IssueFile>> {
-        let Some(node) = self.graphql_single_issue(number)? else {
-            self.forget_issue(number);
-            return Ok(None);
-        };
-        let mut tf = self.gh_issue_hydrating_labels(node)?.into_issue_file();
-        // Fold the local assignment overlay so a caller reads the owning
-        // workspace even though the tracker stores no assignment.
-        tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
-        self.cache_issue(number, &tf);
-        self.remember_number(&tf.task.id, number);
-        Ok(Some(tf))
+        let cached = self.cached_issue_entry(number);
+        let etag = cached.as_ref().and_then(|(_, v)| v.clone());
+        let path = format!("repos/{}/issues/{number}", self.repo);
+        // `--include` (status line + headers, so the `ETag` and the HTTP status
+        // are visible) and the pinned API version arrive from `runner-hygiene`;
+        // this call adds only `-X GET`, the path, and the conditional header.
+        let mut args: Vec<String> = vec![
+            "api".into(),
+            "--include".into(),
+            "-H".into(),
+            GH_REST_API_VERSION_HEADER.into(),
+            "-X".into(),
+            "GET".into(),
+            path,
+        ];
+        let inm;
+        if let Some(tag) = &etag {
+            inm = format!("If-None-Match: {tag}");
+            args.push("-H".into());
+            args.push(inm);
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        // The single-issue read path (`park_aware_read` → `governed_read` on the
+        // REST tier) returns the *raw* `--include` response unstripped, so this
+        // caller can read the status line and `ETag` itself; a parked budget
+        // short-circuits into the typed rate-limit error before any `gh` spawns.
+        let raw = (self.gh)(&refs)?;
+        match http_status_code(&raw) {
+            // Remotely verified: hand back the cached copy. We only sent
+            // `If-None-Match` when we held one, so a `304` implies a cached entry.
+            Some(304) => {
+                let Some((tf, _)) = cached else {
+                    return Err(Error::Other(format!(
+                        "GitHub returned 304 for issue #{number} in {} but no cached \
+                         copy is held to return",
+                        self.repo
+                    )));
+                };
+                Ok(Some(tf))
+            }
+            // Gone: drop the cache, same as the GraphQL null node.
+            Some(404) => {
+                self.forget_issue(number);
+                Ok(None)
+            }
+            // `200` (or a bare-JSON test fixture with no header block, whose
+            // status is `None`) — parse the body.
+            _ => {
+                let body = http_response_body(&raw);
+                let validator = extract_response_etag(&raw);
+                let gh: GhIssue = parse_json_object(body)?;
+                // A number that names a pull request is "no such issue".
+                if gh.is_pull_request() {
+                    self.forget_issue(number);
+                    return Ok(None);
+                }
+                let mut tf = gh.into_issue_file();
+                // Fold the local assignment overlay so a caller reads the owning
+                // workspace even though the tracker stores no assignment.
+                tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
+                self.cache_issue_with_validator(number, &tf, validator);
+                self.remember_number(&tf.task.id, number);
+                Ok(Some(tf))
+            }
+        }
     }
 
     /// Fetch several issues by number in one aliased GraphQL request
@@ -1933,14 +2005,42 @@ impl GitHubStore {
         }
     }
 
-    /// Cache the full issue for `number`, keyed by its `updatedAt`.
+    /// Cache the full issue for `number`, keyed by its `updatedAt`, **with no
+    /// validator**. The publish path for a write's mutation response
+    /// ([`GitHubStore::publish_write`]) and the aliased batch read
+    /// ([`IssueStore::fetch_many`]) both come through here: neither carries the
+    /// per-issue `ETag`, so storing `None` keeps the invariant that a validator
+    /// only ever sits beside the exact body it came with. The next
+    /// [`GitHubStore::fetch`] then pays one full `200` (no `If-None-Match`) and
+    /// learns the validator from that response.
     fn cache_issue(&self, number: i64, tf: &IssueFile) {
         if let Ok(mut guard) = issue_cache().lock() {
             guard.insert(
                 (self.repo.clone(), number),
-                (tf.task.updated_at, tf.clone()),
+                (tf.task.updated_at, tf.clone(), None),
             );
         }
+    }
+
+    /// Cache the full issue for `number` **together with the `ETag` validator
+    /// that came with its body**. Only the `200` branch of [`GitHubStore::fetch`]
+    /// calls this, so a stored validator always names the exact body beside it —
+    /// the invariant a `304` (`If-None-Match: <validator>`) relies on to prove
+    /// *that* body fresh.
+    fn cache_issue_with_validator(&self, number: i64, tf: &IssueFile, validator: Option<String>) {
+        if let Ok(mut guard) = issue_cache().lock() {
+            guard.insert(
+                (self.repo.clone(), number),
+                (tf.task.updated_at, tf.clone(), validator),
+            );
+        }
+    }
+
+    /// The cached `(issue, validator)` for `number` in this store's repo, if any.
+    /// [`GitHubStore::fetch`] reads it to decide whether to send `If-None-Match`
+    /// and what to return on a `304`.
+    fn cached_issue_entry(&self, number: i64) -> Option<(IssueFile, Option<String>)> {
+        issue_cache_get(&self.repo, number).map(|(_, tf, validator)| (tf, validator))
     }
 
     /// Drop any cached full issue for `number` (a fetch found it gone).
@@ -2491,6 +2591,17 @@ fn run_gh_with_token(token: &SecretToken, args: &[&str]) -> Result<String> {
     run_gh_with_deadline(token, args, GH_OP_DEADLINE)
 }
 
+/// The captured result of one bounded `gh` child: its `stdout`, `stderr`, and
+/// exit `status`. A non-zero `status` is *not* an error here — the caller
+/// decides, because the single-issue conditional `GET` treats a `304`/`404`
+/// (both non-zero exits) as a definitive success carried on stdout, while every
+/// other call maps a non-zero exit to [`Error::Command`].
+struct GhRawOutput {
+    stdout: String,
+    stderr: String,
+    status: std::process::ExitStatus,
+}
+
 /// The bounded core of [`run_gh_with_token`], with the deadline injected so a
 /// test can drive the timeout path with a few hundred milliseconds instead of
 /// waiting out the shipped bound. Every `gh` child spawned by this crate goes
@@ -2505,7 +2616,11 @@ fn run_gh_with_token(token: &SecretToken, args: &[&str]) -> Result<String> {
 /// path would block anyway. This mirrors [`shelbi_ssh::run_with_deadline`];
 /// `shelbi-state` deliberately does not depend on `shelbi-ssh`, so the pattern
 /// is reproduced rather than shared.
-fn run_gh_with_deadline(token: &SecretToken, args: &[&str], deadline: Duration) -> Result<String> {
+///
+/// `Err` only for a failure to *run* the child (spawn, wait, or the deadline);
+/// a completed child — success or non-zero exit — comes back as `Ok` so the two
+/// callers can diverge on how they treat a non-zero exit.
+fn run_gh_raw(token: &SecretToken, args: &[&str], deadline: Duration) -> Result<GhRawOutput> {
     use std::io::Read;
     use std::process::Stdio;
 
@@ -2599,25 +2714,58 @@ fn run_gh_with_deadline(token: &SecretToken, args: &[&str], deadline: Duration) 
 
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
-    if !status.success() {
-        // `gh api` prints the API's JSON error body — the field-level reason,
-        // e.g. `name is too long (maximum is 50 characters)` — to *stdout* and
-        // only a terse one-liner to stderr. Capturing stderr alone drops the
-        // actionable half, so combine both: the response body is what makes an
-        // `external command failed` self-diagnosing. With `--include` the status
-        // line and rate-limit headers are in that stdout too, so the classifier
-        // decides from the HTTP status rather than the human text.
-        let detail = combine_gh_error_detail(
-            &String::from_utf8_lossy(&stderr),
-            &String::from_utf8_lossy(&stdout),
-        );
-        return Err(Error::Command {
-            cmd: cmd_str(),
-            status: status.to_string(),
-            stderr: detail,
-        });
+    Ok(GhRawOutput {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        status,
+    })
+}
+
+/// Build the [`Error::Command`] for a completed-but-non-zero `gh` child, folding
+/// the API's JSON error body (which `gh` prints to *stdout*, not stderr) into the
+/// detail so an `external command failed` is self-diagnosing — and, with
+/// `--include`, so [`crate::gh_retry::classify`] decides from the HTTP status
+/// line rather than the human text.
+fn gh_command_error(args: &[&str], out: &GhRawOutput) -> Error {
+    Error::Command {
+        cmd: format!("gh {}", args.join(" ")),
+        status: out.status.to_string(),
+        stderr: combine_gh_error_detail(&out.stderr, &out.stdout),
     }
-    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// The bounded core of [`run_gh_with_token`]: run `gh`, return its stdout on a
+/// success and an [`Error::Command`] on a non-zero exit (or a run failure). Every
+/// non-conditional `gh` child goes through here.
+fn run_gh_with_deadline(token: &SecretToken, args: &[&str], deadline: Duration) -> Result<String> {
+    let out = run_gh_raw(token, args, deadline)?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err(gh_command_error(args, &out))
+    }
+}
+
+/// Run the single-issue conditional `GET`, recognizing the two definitive
+/// non-2xx answers it must not treat as failures. `gh` exits non-zero on any
+/// non-2xx status, so a `304 Not Modified` (the conditional-GET hit) and a `404`
+/// (no such issue) would otherwise become an [`Error::Command`] that the retry
+/// policy and the park logic misread — a `304` in particular could be
+/// misclassified as a rate limit when `x-ratelimit-remaining: 0` happens to be in
+/// the `--include` headers. Recognize the `HTTP/… 304`/`404` status line on
+/// stdout and return the raw response as a success, so [`GitHubStore::fetch`]
+/// reads its status and `ETag` while the retry and park paths never see it. Every
+/// other non-zero exit stays a real error. Scoped to this one request shape, so a
+/// mutation is never told a `404` means success.
+fn run_gh_conditional(token: &SecretToken, args: &[&str]) -> Result<String> {
+    let out = run_gh_raw(token, args, GH_OP_DEADLINE)?;
+    if out.status.success() {
+        return Ok(out.stdout);
+    }
+    match http_status_code(&out.stdout) {
+        Some(304) | Some(404) => Ok(out.stdout),
+        _ => Err(gh_command_error(args, &out)),
+    }
 }
 
 /// Run a read (`GET`) call under the per-token rate-limit park (plan Phase 0,
@@ -2633,8 +2781,26 @@ fn park_aware_read(
 ) -> Result<String> {
     let token = resolve_github_token_by_name(project)?;
     let key = crate::gh_budget::token_key(token.expose());
-    invalidate_token_on_401(
-        project,
+    // The single-issue conditional `GET` runs through [`run_gh_conditional`],
+    // which recognizes a `304`/`404` status line on stdout and returns it as a
+    // success *before* the non-zero exit becomes an [`Error::Command`] — so the
+    // retry policy and the park logic never mistake a conditional-GET hit or a
+    // "no such issue" for a failure. Every other REST read keeps the plain
+    // [`run_gh_with_token`] mapping (a non-zero exit is a real failure there).
+    // The two branches differ only in the run closure, so the surrounding park /
+    // budget / attribution wiring is shared through [`governed_read`].
+    let result = if is_single_issue_get(args) {
+        governed_read(
+            project,
+            &key,
+            read_policy,
+            crate::gh_budget::Budget::Rest,
+            args,
+            &|a| run_gh_conditional(&token, a),
+            Some(&token),
+            rest_read_caller(args),
+        )
+    } else {
         governed_read(
             project,
             &key,
@@ -2643,23 +2809,96 @@ fn park_aware_read(
             args,
             &|a| run_gh_with_token(&token, a),
             Some(&token),
-            rest_read_caller(),
-        ),
-    )
+            rest_read_caller(args),
+        )
+    };
+    invalidate_token_on_401(project, result)
 }
 
 /// The request-log caller label for a REST `GET`, or `None` when governance is
 /// inert (a test build that has not opted into park side effects — see
 /// [`read_park_side_effects_enabled`]), so a test never appends to a real home's
-/// request log. Distinct from `write` and from every label [`graphql_caller`]
-/// returns, so `shelbi doctor` can attribute REST reads separately and a
-/// before/after request count can be measured against a real base.
-fn rest_read_caller() -> Option<&'static str> {
-    if read_park_side_effects_enabled() {
-        Some("rest-read")
-    } else {
-        None
+/// request log. The single-issue conditional `GET`
+/// (`repos/<owner>/<repo>/issues/<number>`) is `issue-fetch`, mirroring the
+/// GraphQL [`graphql_caller`] label of the same name so the before/after
+/// comparison is direct and — being exactly one HTTP request, never a
+/// `--paginate` run — an *exact* per-request count (decision 13). Every other
+/// REST read stays `rest-read`; those pass `--paginate`, so one `gh` invocation
+/// can be several HTTP requests and one log line is a lower bound.
+fn rest_read_caller(args: &[&str]) -> Option<&'static str> {
+    if !read_park_side_effects_enabled() {
+        return None;
     }
+    if is_single_issue_get(args) {
+        Some("issue-fetch")
+    } else {
+        Some("rest-read")
+    }
+}
+
+/// Whether `args` is the single-issue conditional `GET`:
+/// `-X GET repos/<owner>/<repo>/issues/<number>` with no `--paginate` (so it is
+/// exactly one HTTP response, and its header block is read whole rather than
+/// through the multi-page splitter). Keyed off the request shape so both the
+/// production runner and `governed_read` classify it identically.
+fn is_single_issue_get(args: &[&str]) -> bool {
+    let is_get = args.windows(2).any(|w| w == ["-X", "GET"]);
+    if !is_get || args.contains(&"--paginate") {
+        return false;
+    }
+    args.iter().any(|a| is_single_issue_path(a))
+}
+
+/// Whether `path` is `repos/<owner>/<repo>/issues/<number>` (a bare issue number,
+/// no `/comments` or `/labels` sub-resource, no trailing segment).
+fn is_single_issue_path(path: &str) -> bool {
+    let segs: Vec<&str> = path.split('/').collect();
+    segs.len() == 5
+        && segs[0] == "repos"
+        && !segs[1].is_empty()
+        && !segs[2].is_empty()
+        && segs[3] == "issues"
+        && !segs[4].is_empty()
+        && segs[4].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The HTTP status code from a `gh api --include` response's first status line
+/// (`HTTP/2.0 304 Not Modified` → `304`), or `None` when the output carries no
+/// `HTTP/…` line — a bare-JSON test fixture, which the single-issue read then
+/// treats as a `200` body. This request sends no `--paginate`, so there is
+/// exactly one status line.
+fn http_status_code(raw: &str) -> Option<u16> {
+    raw.lines()
+        .find(|l| l.starts_with("HTTP/"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+}
+
+/// Whether a raw `--include` response is a `304 Not Modified` — the signal that
+/// records the request-log line with the non-spending `not-modified` outcome
+/// rather than `ok`. Only a conditional `GET` ever produces a `304`, so this is
+/// safe to consult for every governed read.
+fn is_not_modified(raw: &str) -> bool {
+    http_status_code(raw) == Some(304)
+}
+
+/// The `ETag` validator from a `gh api --include` response's header block, or
+/// `None` when absent (a bare-JSON fixture, or a response GitHub sent without
+/// one). Case-insensitive; stops at the blank line so a body that happens to
+/// contain `etag:` can't be misread. Stored beside the exact body it came with,
+/// then replayed as the next read's `If-None-Match`.
+fn extract_response_etag(raw: &str) -> Option<String> {
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("etag") {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// The shared governed-read core behind both [`park_aware_read`] (REST) and
@@ -2695,15 +2934,45 @@ fn governed_read(
     let result = read_policy.run(|| run(args));
     on_read_result(project, key, budget, args, now, &result, token, log_caller);
     // A REST `GET` now carries `--include`, so the body arrives behind one HTTP
-    // header block per page. Strip those off and record the token's REST budget
-    // from the last block (the lowest `remaining`) before the caller parses the
-    // JSONL. GraphQL bodies are not `--include` and pass through untouched; an
-    // injected runner answering bare JSON (no `HTTP/` prefix) is untouched too.
+    // header block per page. GraphQL bodies are not `--include` and pass through
+    // untouched; an injected runner answering bare JSON (no `HTTP/` prefix) is
+    // untouched too.
     match result {
         Ok(raw) if budget == crate::gh_budget::Budget::Rest => {
-            Ok(strip_and_record_rest_read(key, &raw))
+            if is_single_issue_get(args) {
+                // The single-issue conditional `GET` returns the *raw* response
+                // unstripped: `GitHubStore::fetch` reads the status line (`304`/
+                // `404`/`200`) and the `ETag` itself, so the header block must
+                // survive. Record the REST budget from it, but do not strip.
+                record_rest_read_headers(key, &raw);
+                Ok(raw)
+            } else {
+                // A list/comments/labels read: strip the per-page header blocks
+                // and record the token's REST budget from the last one (the
+                // lowest `remaining`) before the caller parses the JSONL.
+                Ok(strip_and_record_rest_read(key, &raw))
+            }
         }
         other => other,
+    }
+}
+
+/// Record the token's REST rate-limit budget from a single-issue conditional
+/// `GET`'s raw `--include` response (its one header block, read from the top),
+/// without stripping the body — the caller keeps the raw to read the status line
+/// and `ETag`. Both a `200` and a `304` carry the `x-ratelimit-*` headers, so
+/// both update the tier. Gated on the "governance active" opt-in (like the rest
+/// of the read-path park writes) and on the `HTTP/` prefix, so a bare-JSON test
+/// fixture records nothing.
+fn record_rest_read_headers(key: &str, raw: &str) {
+    if !raw.starts_with("HTTP/") {
+        return;
+    }
+    if read_park_side_effects_enabled() {
+        crate::gh_budget::record_rest_headers(
+            key,
+            &crate::gh_budget::parse_rate_limit_headers(raw),
+        );
     }
 }
 
@@ -2835,7 +3104,17 @@ fn on_read_result(
     match result {
         Ok(body) => {
             if let Some(caller) = log_caller {
-                crate::gh_requests::record_request(budget, caller, crate::gh_requests::Outcome::Ok);
+                // A conditional `GET` that came back `304` reached GitHub and
+                // proved the cached copy fresh but spent no primary quota — record
+                // it as `not-modified`, neither spend (`ok`) nor a failed attempt.
+                // Only a conditional `GET` ever produces a `304`, so this check is
+                // inert for every other read.
+                let outcome = if is_not_modified(body) {
+                    crate::gh_requests::Outcome::NotModified
+                } else {
+                    crate::gh_requests::Outcome::Ok
+                };
+                crate::gh_requests::record_request(budget, caller, outcome);
             }
             // Fold the GraphQL response's `rateLimit` into the governor's tier.
             if budget == crate::gh_budget::Budget::Graphql {
@@ -3574,23 +3853,24 @@ fn id_number_cache() -> &'static IdNumberCache {
     ID_NUMBER_CACHE.get_or_init(Default::default)
 }
 
-/// Per-number full-issue cache keyed by `(repo, number)` → `(updatedAt, issue)`.
-/// A write-only post-write memo in this PR (the freshness gate that used to read
-/// it is gone); its reader arrives with the REST conditional-GET task, which
-/// turns it into the `If-None-Match` ETag store.
-type IssueCache = std::sync::Mutex<std::collections::HashMap<(String, i64), (DateTime<Utc>, IssueFile)>>;
+/// Per-number full-issue cache keyed by `(repo, number)` →
+/// `(updatedAt, issue, validator)`. The `If-None-Match` ETag store the REST
+/// conditional-GET single-issue read (`GitHubStore::fetch`) reads and writes: the
+/// `validator` is the `ETag` that came with the exact body stored beside it, or
+/// `None` for an entry a write path published (which must not inherit a prior
+/// validator — a `304` proves *that* body fresh, not another).
+type IssueCache =
+    std::sync::Mutex<std::collections::HashMap<(String, i64), (DateTime<Utc>, IssueFile, Option<String>)>>;
 static ISSUE_CACHE: std::sync::OnceLock<IssueCache> = std::sync::OnceLock::new();
 fn issue_cache() -> &'static IssueCache {
     ISSUE_CACHE.get_or_init(Default::default)
 }
 
-/// The cached `(updatedAt, issue)` for `(repo, number)`, if any. No reader in
-/// this PR — the freshness gate that used to call it is gone and the cache is a
-/// write-only post-write memo. Its incoming reader is the REST conditional-GET
-/// task, which makes this cache the `If-None-Match` ETag store; deleting it here
-/// would only force that task to re-create it.
-#[allow(dead_code)]
-fn issue_cache_get(repo: &str, number: i64) -> Option<(DateTime<Utc>, IssueFile)> {
+/// The cached `(updatedAt, issue, validator)` for `(repo, number)`, if any. The
+/// reader is [`GitHubStore::fetch`], which uses the stored `validator` to build
+/// the conditional `GET`'s `If-None-Match` header and returns the cached issue on
+/// a `304`.
+fn issue_cache_get(repo: &str, number: i64) -> Option<(DateTime<Utc>, IssueFile, Option<String>)> {
     issue_cache()
         .lock()
         .ok()?
@@ -4917,8 +5197,9 @@ mod tests {
         let rec = calls.clone();
         let store = GitHubStore::with_runner("owner/repo", move |args| {
             rec.lock().unwrap().push(args.join(" "));
-            // The reworked `get` reads through GraphQL; answer it from the same
-            // single-issue JSON the REST `get_raw` path returns.
+            // The id→number resolution half (`search_number` / `get_raw_by_number`)
+            // stays GraphQL; answer it from the same single-issue JSON the REST
+            // `get_raw` path returns.
             if args.contains(&"graphql") {
                 return Ok(rest_to_graphql(args, by_id_json));
             }
@@ -4941,6 +5222,16 @@ mod tests {
             }
             if path.contains("/comments") {
                 return Ok(String::new());
+            }
+            // `get`'s REST single-issue conditional GET (`.../issues/<n>`, a bare
+            // number, no `labels=` filter): answer with the single issue.
+            let segs: Vec<&str> = path.split('/').collect();
+            let is_single_issue = segs.len() >= 2
+                && segs[segs.len() - 2] == "issues"
+                && !segs[segs.len() - 1].is_empty()
+                && segs[segs.len() - 1].bytes().all(|b| b.is_ascii_digit());
+            if is_single_issue {
+                return Ok(by_id_json.to_string());
             }
             let by_id = args.iter().any(|a| a.contains("labels=shelbi:id/"));
             Ok(if by_id { by_id_json } else { list_json }.to_string())
@@ -6133,6 +6424,162 @@ mod tests {
         }
     }
 
+    /// A runner that answers every call with a REST primary-limit exhaustion
+    /// (`403` + `x-ratelimit-remaining: 0`), so [`governed_read`] classifies it as
+    /// a rate limit and parks the REST tier. Counts live calls.
+    fn rest_rate_limit_runner(
+        calls: std::sync::Arc<std::sync::Mutex<usize>>,
+    ) -> impl Fn(&[&str]) -> Result<String> + Send + Sync + 'static {
+        move |_args: &[&str]| {
+            *calls.lock().unwrap() += 1;
+            Err(Error::Command {
+                cmd: "gh api".to_string(),
+                status: "exit status: 1".to_string(),
+                stderr: "HTTP/2.0 403 Forbidden\nx-ratelimit-remaining: 0\nx-ratelimit-reset: 9999999999"
+                    .to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_single_issue_get_is_accounted_on_rest_and_logs_issue_fetch_ok() {
+        // AC: the conditional GET is on `Budget::Rest`, never GraphQL, and appends
+        // one `budget=rest caller=issue-fetch outcome=ok` line for a 200.
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+
+        let issue = rest_issue_json(7, "foo", "todo", "open", "", "b", "2026-08-02T00:00:00Z", false);
+        let raw = rest_200_raw(&issue, Some(r#""v1""#));
+        let store = GitHubStore::with_governed_runner("owner/repo", "tok-fetch-rest", move |_a| Ok(raw.clone()));
+
+        store.fetch(7).unwrap().expect("issue exists");
+
+        let log = std::fs::read_to_string(
+            crate::shelbi_home().unwrap().join(crate::gh_requests::REQUESTS_LOG_FILE),
+        )
+        .unwrap_or_default();
+        let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1, "one request-log line for the single fetch: {log}");
+        assert!(lines[0].contains("budget=rest"), "accounted on REST: {log}");
+        assert!(lines[0].contains("caller=issue-fetch"), "attributed as issue-fetch: {log}");
+        assert!(lines[0].contains("outcome=ok"), "a 200 spends: {log}");
+        assert!(!log.contains("budget=graphql"), "never on the GraphQL budget: {log}");
+
+        set_test_park_side_effects(false);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_304_logs_a_non_spending_not_modified_outcome() {
+        // AC: a 304 records an outcome that is neither spend nor a failed attempt.
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+
+        let raw304 = rest_304_raw(r#""v1""#);
+        let store = GitHubStore::with_governed_runner("owner/repo", "tok-304", move |_a| Ok(raw304.clone()));
+        // Pre-seed the per-number cache with a body and its validator (as a prior
+        // 200 would have), so the fetch sends If-None-Match and a 304 has a copy
+        // to return.
+        let cached = rest_issue_json(9, "foo", "todo", "open", "", "cached body", "2026-08-02T00:00:00Z", false);
+        let tf: GhIssue = parse_json_object(&cached).unwrap();
+        store.cache_issue_with_validator(9, &tf.into_issue_file(), Some(r#""v1""#.to_string()));
+
+        let got = store.fetch(9).unwrap().expect("304 returns the cached copy");
+        assert_eq!(got.body, "cached body");
+
+        let log = std::fs::read_to_string(
+            crate::shelbi_home().unwrap().join(crate::gh_requests::REQUESTS_LOG_FILE),
+        )
+        .unwrap_or_default();
+        assert!(log.contains("caller=issue-fetch"), "the 304 is attributed: {log}");
+        assert!(log.contains("outcome=not-modified"), "the 304 outcome is not-modified: {log}");
+        assert!(!log.contains("outcome=ok"), "a 304 is not spend: {log}");
+        assert!(!log.contains("outcome=err"), "a 304 is not a failed attempt: {log}");
+
+        set_test_park_side_effects(false);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_parked_rest_budget_fails_a_fetch_without_serving_the_cache() {
+        // AC: while the REST budget is parked, an action read fails with the typed
+        // rate-limit error instead of returning an unverified cached copy.
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+        set_test_now(1_000);
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let store =
+            GitHubStore::with_governed_runner("owner/repo", "tok-rest-park", rest_rate_limit_runner(calls.clone()));
+        // A cached copy is present; the park must NOT serve it (decision 1).
+        let cached = rest_issue_json(3, "foo", "todo", "open", "", "stale cached body", "2026-08-01T00:00:00Z", false);
+        let tf: GhIssue = parse_json_object(&cached).unwrap();
+        store.cache_issue_with_validator(3, &tf.into_issue_file(), Some(r#""v0""#.to_string()));
+
+        // First fetch: goes live, the rate limit fails and parks the REST tier.
+        let first = store.fetch(3);
+        assert!(first.is_err(), "a rate limit surfaces an error, not the cache");
+        assert!(
+            crate::gh_retry::is_rate_limit_error(first.as_ref().unwrap_err()),
+            "the error is the typed rate-limit error naming the reset"
+        );
+        let after_first = *calls.lock().unwrap();
+        assert_eq!(after_first, 1, "the first fetch spawns exactly one gh call");
+
+        // Second fetch within the window: short-circuits before spawning gh, and
+        // still errors rather than serving the unverified cache.
+        let second = store.fetch(3);
+        assert!(second.is_err(), "still parked → still an error, never the cache");
+        assert_eq!(*calls.lock().unwrap(), after_first, "a parked read spawns no gh");
+
+        set_test_park_side_effects(false);
+        set_test_now(0);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_write_path_publish_then_read_carries_no_inherited_validator() {
+        // AC: a cached entry never carries a validator from another response. A
+        // write publishes via `cache_issue` (validator-free), so the next fetch
+        // sends no If-None-Match and pays one full 200.
+        let _home = HomeGuard::new("publish-then-read");
+        let published = rest_issue_json(4, "foo", "in-progress", "open", "", "published body", "2026-08-02T00:00:00Z", false);
+        let pub_tf: GhIssue = parse_json_object(&published).unwrap();
+
+        let issue = rest_issue_json(4, "foo", "in-progress", "open", "", "read body", "2026-08-03T00:00:00Z", false);
+        let raw = rest_200_raw(&issue, Some(r#""after""#));
+        let (store, calls) = graphql_recorder(move |_a| Ok(raw.clone()));
+
+        // A write path publishes the mutation response into the per-number cache.
+        store.publish_write(&pub_tf.into_issue_file(), 4);
+
+        // The next action read carries no If-None-Match — the published entry held
+        // no validator to replay.
+        store.fetch(4).unwrap().expect("issue exists");
+        let rest = rest_calls(&calls);
+        assert_eq!(rest.len(), 1, "one live REST read after the publish");
+        assert!(
+            !rest[0].contains("If-None-Match"),
+            "a write-published entry lends no validator to the next read: {}",
+            rest[0]
+        );
+    }
+
     /// AC1: a connection failure parks reads through the store — a second `get`
     /// within the window makes no `gh` call, and exactly one `board unreachable`
     /// event is appended.
@@ -6334,9 +6781,9 @@ mod tests {
         };
         let store = GitHubStore::with_runner("owner/repo", move |args| {
             rec.lock().unwrap().push(args.join(" "));
-            // The reworked `get` (which set_priority uses to read the target)
-            // reads through GraphQL: answer the search and single-issue queries
-            // for whichever id/number they name.
+            // `set_priority` reads its target through `get` → the REST single-issue
+            // conditional GET; the id→number search half stays GraphQL. Answer the
+            // GraphQL search for whichever id it names.
             if args.contains(&"graphql") {
                 let joined = args.join(" ");
                 let rest = table
@@ -6373,6 +6820,19 @@ mod tests {
                 return Ok(rest);
             }
             let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+            // The single-issue conditional GET (`.../issues/<n>`, no `labels=`
+            // filter): `get`'s REST read of the target.
+            if let Some(num) = path
+                .strip_prefix("repos/owner/repo/issues/")
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                let rest = table
+                    .iter()
+                    .find(|(_, n, _)| *n == num)
+                    .map(|(id, n, prio)| rest_line(id, *n, *prio))
+                    .unwrap_or_default();
+                return Ok(rest);
+            }
             if path.ends_with("/labels") {
                 return Ok(String::new());
             }
@@ -7581,6 +8041,69 @@ mod tests {
             .collect()
     }
 
+    /// The recorded REST `gh api -X GET` calls (never a GraphQL call).
+    fn rest_calls(calls: &Calls) -> Vec<String> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.contains("-X GET") && !c.contains("graphql"))
+            .cloned()
+            .collect()
+    }
+
+    /// One REST issue object (the [`GhIssue`] wire shape — snake_case, a flat
+    /// `labels` array). `reason` empty → `null`. `pr` marks it a pull request.
+    #[allow(clippy::too_many_arguments)]
+    fn rest_issue_json(
+        number: i64,
+        id: &str,
+        status: &str,
+        state: &str,
+        reason: &str,
+        body: &str,
+        updated: &str,
+        pr: bool,
+    ) -> String {
+        let reason_json = if reason.is_empty() {
+            "null".to_string()
+        } else {
+            format!("\"{reason}\"")
+        };
+        let pr_field = if pr {
+            r#","pull_request":{"url":"https://api.github.com/repos/owner/repo/pulls/1"}"#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{"number":{number},"title":"T {id}","state":"{state}","state_reason":{reason_json},"created_at":"2026-01-01T00:00:00Z","updated_at":"{updated}","body":"{body}","labels":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/{status}"}}]{pr_field}}}"#
+        )
+    }
+
+    /// A raw `gh api --include` `200` response: status line, an optional `Etag`,
+    /// the REST rate-limit headers, a blank line, then the issue body.
+    fn rest_200_raw(issue_json: &str, etag: Option<&str>) -> String {
+        let etag_line = etag.map(|e| format!("Etag: {e}\r\n")).unwrap_or_default();
+        format!(
+            "HTTP/2.0 200 OK\r\n{etag_line}x-ratelimit-remaining: 4999\r\nx-ratelimit-reset: 9999999999\r\n\r\n{issue_json}\n"
+        )
+    }
+
+    /// A raw `--include` `304 Not Modified` response: status line, echoed `Etag`,
+    /// REST rate-limit headers, and an empty body — exactly the shape
+    /// [`run_gh_conditional`] hands back for a conditional-GET hit.
+    fn rest_304_raw(etag: &str) -> String {
+        format!(
+            "HTTP/2.0 304 Not Modified\r\nEtag: {etag}\r\nx-ratelimit-remaining: 4999\r\nx-ratelimit-reset: 9999999999\r\n\r\n"
+        )
+    }
+
+    /// A raw `--include` `404 Not Found` response with the API's JSON error body.
+    fn rest_404_raw() -> String {
+        "HTTP/2.0 404 Not Found\r\nx-ratelimit-remaining: 4998\r\n\r\n{\"message\":\"Not Found\"}\n"
+            .to_string()
+    }
+
     /// One GraphQL issue node (the shape [`GhIssueNode`] parses). `reason` empty
     /// → `null`.
     fn gql_node(
@@ -7682,25 +8205,77 @@ mod tests {
     }
 
     #[test]
-    fn fetch_reads_one_issue_via_a_single_graphql_request() {
+    fn fetch_reads_one_issue_via_a_single_rest_get_and_no_graphql() {
+        // AC: an action read of a resolved number sends one REST
+        // `GET repos/<owner>/<repo>/issues/<number>` and records no GraphQL.
         let _home = HomeGuard::new("fetch");
-        let node = gql_node(7, "foo", "in-progress", "OPEN", "", "Fresh body", "2026-08-02T00:00:00Z");
-        let (store, calls) = graphql_recorder(move |_args| Ok(gql_single(&node)));
+        let issue = rest_issue_json(7, "foo", "in-progress", "open", "", "Fresh body", "2026-08-02T00:00:00Z", false);
+        let raw = rest_200_raw(&issue, Some(r#"W/"abc""#));
+        let (store, calls) = graphql_recorder(move |_args| Ok(raw.clone()));
 
         let tf = store.fetch(7).unwrap().expect("issue exists");
         assert_eq!(tf.task.id, "foo");
         assert_eq!(tf.task.column, Column::in_progress());
         assert_eq!(tf.body, "Fresh body");
-        assert_eq!(graphql_calls(&calls).len(), 1, "one single-issue request");
+        let rest = rest_calls(&calls);
+        assert_eq!(rest.len(), 1, "one single-issue REST GET");
+        assert!(
+            rest[0].contains("repos/owner/repo/issues/7") && !rest[0].contains("--paginate"),
+            "the one call is the by-number issue GET, not a paginated list: {}",
+            rest[0]
+        );
+        assert!(graphql_calls(&calls).is_empty(), "no GraphQL request");
+        // The first read of a number in a fresh process carries no If-None-Match.
+        assert!(!rest[0].contains("If-None-Match"), "first read is unconditional: {}", rest[0]);
     }
 
     #[test]
-    fn fetch_returns_none_for_a_number_that_is_not_an_issue() {
-        let _home = HomeGuard::new("fetch-none");
-        let (store, _calls) = graphql_recorder(|_args| {
-            Ok(r#"{"data":{"repository":{"issue":null}}}"#.to_string())
+    fn fetch_returns_none_for_a_404() {
+        let _home = HomeGuard::new("fetch-404");
+        let (store, _calls) = graphql_recorder(|_args| Ok(rest_404_raw()));
+        assert!(store.fetch(404).unwrap().is_none(), "a 404 is no such issue");
+    }
+
+    #[test]
+    fn fetch_returns_none_for_a_number_that_names_a_pull_request() {
+        // AC: REST `/issues/<n>` returns the PR where GraphQL returned null; the
+        // `is_pull_request` guard reproduces "no such issue".
+        let _home = HomeGuard::new("fetch-pr");
+        let issue = rest_issue_json(1, "pr", "todo", "open", "", "a PR", "2026-08-02T00:00:00Z", true);
+        let raw = rest_200_raw(&issue, None);
+        let (store, _calls) = graphql_recorder(move |_args| Ok(raw.clone()));
+        assert!(store.fetch(1).unwrap().is_none(), "a pull request is not an issue");
+    }
+
+    #[test]
+    fn fetch_sends_if_none_match_after_a_200_and_a_304_returns_the_cached_issue() {
+        // AC: once the process holds a cached copy with its validator, the read
+        // carries `If-None-Match`; a 304 returns the cached issue as a success.
+        let _home = HomeGuard::new("fetch-304");
+        let issue = rest_issue_json(9, "foo", "in-progress", "open", "", "First body", "2026-08-02T00:00:00Z", false);
+        let raw200 = rest_200_raw(&issue, Some(r#""etag-v1""#));
+        let raw304 = rest_304_raw(r#""etag-v1""#);
+        let n = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let nn = n.clone();
+        let (store, calls) = graphql_recorder(move |_args| {
+            let mut g = nn.lock().unwrap();
+            *g += 1;
+            if *g == 1 { Ok(raw200.clone()) } else { Ok(raw304.clone()) }
         });
-        assert!(store.fetch(404).unwrap().is_none());
+
+        let first = store.fetch(9).unwrap().expect("issue exists");
+        assert_eq!(first.body, "First body");
+        let second = store.fetch(9).unwrap().expect("304 returns the cached copy");
+        assert_eq!(second.body, "First body", "a 304 hands back the cached body");
+
+        let rest = rest_calls(&calls);
+        assert_eq!(rest.len(), 2, "each read is one live REST request");
+        assert!(!rest[0].contains("If-None-Match"), "first read is unconditional: {}", rest[0]);
+        assert!(
+            rest[1].contains(r#"If-None-Match: "etag-v1""#),
+            "the second read replays the stored validator: {}",
+            rest[1]
+        );
     }
 
     #[test]
@@ -7714,20 +8289,25 @@ mod tests {
             &[("foo", 7)],
             vec![idx_issue("foo", "todo", "2026-08-01T00:00:00Z")],
         );
-        let node = gql_node(7, "foo", "in-progress", "OPEN", "", "Edited on GitHub", "2026-08-03T00:00:00Z");
+        let issue = rest_issue_json(7, "foo", "in-progress", "open", "", "Edited on GitHub", "2026-08-03T00:00:00Z", false);
+        let raw = rest_200_raw(&issue, Some(r#"W/"e""#));
         let (store, calls) = graphql_recorder(move |args| {
             let joined = args.join(" ");
-            assert!(joined.contains("query Issue"), "expected the single-issue query: {joined}");
-            Ok(gql_single(&node))
+            assert!(
+                joined.contains("-X GET") && joined.contains("repos/owner/repo/issues/7"),
+                "expected the by-number REST issue GET: {joined}"
+            );
+            Ok(raw.clone())
         });
 
         let tf = store.get("foo").unwrap().expect("issue exists");
         assert_eq!(tf.body, "Edited on GitHub");
         assert_eq!(tf.task.column, Column::in_progress());
+        assert!(graphql_calls(&calls).is_empty(), "the index carried the number, so no GraphQL search");
         assert_eq!(
-            graphql_calls(&calls).len(),
+            rest_calls(&calls).len(),
             1,
-            "the index carried the number, so no search — exactly one request"
+            "exactly one REST request — the single-issue fetch"
         );
     }
 
@@ -7736,21 +8316,24 @@ mod tests {
         // Acceptance: `get` for a done task (absent from the open index) succeeds
         // via the search fallback.
         let _home = HomeGuard::new("getsearch");
-        let node = gql_node(42, "done-task", "done", "CLOSED", "completed", "done body", "2026-07-02T00:00:00Z");
+        let issue = rest_issue_json(42, "done-task", "done", "closed", "completed", "done body", "2026-07-02T00:00:00Z", false);
+        let raw = rest_200_raw(&issue, None);
         let (store, calls) = graphql_recorder(move |args| {
             if args.join(" ").contains("IdSearch") {
                 Ok(gql_search(42))
             } else {
-                Ok(gql_single(&node))
+                Ok(raw.clone())
             }
         });
 
         let tf = store.get("done-task").unwrap().expect("found via search");
         assert_eq!(tf.task.id, "done-task");
         assert_eq!(tf.task.column, Column::done());
+        // The id→number resolution stays on GraphQL; only the fetch half is REST.
         let g = graphql_calls(&calls);
-        assert_eq!(g.len(), 2, "one search + one fetch");
-        assert!(g[0].contains("IdSearch"), "the first request is the search: {}", g[0]);
+        assert_eq!(g.len(), 1, "one GraphQL search resolves the number");
+        assert!(g[0].contains("IdSearch"), "the resolution is the search: {}", g[0]);
+        assert_eq!(rest_calls(&calls).len(), 1, "one REST fetch reads the issue");
     }
 
     // --- get_raw number-first resolution -------------------------------------
@@ -8054,20 +8637,22 @@ mod tests {
         // "Render stale, never act stale" (decision 1): the freshness gate is
         // gone, so an action read never depends on the board index. Two fetches
         // of the same number, against an index whose `updated_at` never moves,
-        // record two GraphQL requests — the cache never serves a read.
+        // each send a live REST request — the index never gates the read.
         let _home = HomeGuard::new("fetch-live-unchanged");
         let t1 = "2026-08-01T00:00:00Z";
         write_test_index("test-project", &[("foo", 5)], vec![idx_issue("foo", "todo", t1)]);
-        let node = gql_node(5, "foo", "todo", "OPEN", "", "body", t1);
-        let (store, calls) = graphql_recorder(move |_a| Ok(gql_single(&node)));
+        let issue = rest_issue_json(5, "foo", "todo", "open", "", "body", t1, false);
+        let raw = rest_200_raw(&issue, None);
+        let (store, calls) = graphql_recorder(move |_a| Ok(raw.clone()));
 
         store.fetch(5).unwrap().expect("issue exists");
         store.fetch(5).unwrap().expect("issue exists");
         assert_eq!(
-            graphql_calls(&calls).len(),
+            rest_calls(&calls).len(),
             2,
             "an unchanged index no longer gates the read — both fetches are live"
         );
+        assert!(graphql_calls(&calls).is_empty(), "the fetch is REST, never GraphQL");
     }
 
     #[test]
@@ -8086,13 +8671,14 @@ mod tests {
         idx.stale = true;
         idx.repo = Some(crate::board_index::github_board_repo("owner/repo"));
         crate::board_index::write_board_index("test-project", &idx).unwrap();
-        let node = gql_node(5, "foo", "todo", "OPEN", "", "body", t1);
-        let (store, calls) = graphql_recorder(move |_a| Ok(gql_single(&node)));
+        let issue = rest_issue_json(5, "foo", "todo", "open", "", "body", t1, false);
+        let raw = rest_200_raw(&issue, None);
+        let (store, calls) = graphql_recorder(move |_a| Ok(raw.clone()));
 
         store.fetch(5).unwrap().expect("issue exists");
         store.fetch(5).unwrap().expect("issue exists");
         assert_eq!(
-            graphql_calls(&calls).len(),
+            rest_calls(&calls).len(),
             2,
             "a stale-flagged index never serves a cached action read"
         );
@@ -8103,13 +8689,14 @@ mod tests {
         // No index at all: the same guarantee holds — every fetch is live.
         let _home = HomeGuard::new("fetch-live-noindex");
         let t1 = "2026-08-01T00:00:00Z";
-        let node = gql_node(5, "foo", "todo", "OPEN", "", "body", t1);
-        let (store, calls) = graphql_recorder(move |_a| Ok(gql_single(&node)));
+        let issue = rest_issue_json(5, "foo", "todo", "open", "", "body", t1, false);
+        let raw = rest_200_raw(&issue, None);
+        let (store, calls) = graphql_recorder(move |_a| Ok(raw.clone()));
 
         store.fetch(5).unwrap().expect("issue exists");
         store.fetch(5).unwrap().expect("issue exists");
         assert_eq!(
-            graphql_calls(&calls).len(),
+            rest_calls(&calls).len(),
             2,
             "with no index on disk both fetches are live"
         );
@@ -8309,6 +8896,15 @@ mod tests {
                 return Ok(rest_line(id, num, prio));
             }
             let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+            // The single-issue conditional GET (`get`'s REST read of the target):
+            // `.../issues/<n>` with no `labels=` filter.
+            if let Some(num) = path
+                .strip_prefix("repos/owner/repo/issues/")
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                let id = table.iter().find(|(_, n)| *n == num).map(|(id, _)| *id).unwrap_or("a");
+                return Ok(rest_line(id, num, cur_prio(id)));
+            }
             if path.ends_with("/labels") {
                 return Ok(String::new());
             }
@@ -8431,6 +9027,41 @@ mod tests {
         let (body, header) = split_include_pages(raw);
         assert_eq!(body, raw);
         assert!(header.is_none());
+    }
+
+    #[test]
+    fn is_single_issue_get_recognizes_only_the_by_number_issue_get() {
+        // The conditional-GET shape: -X GET, no --paginate, a bare issue number.
+        assert!(is_single_issue_get(&[
+            "api", "--include", "-X", "GET", "repos/owner/repo/issues/7"
+        ]));
+        // A weak-ETag If-None-Match arg carries a slash but is not the path.
+        assert!(is_single_issue_get(&[
+            "api", "--include", "-X", "GET", "repos/owner/repo/issues/7", "-H", "If-None-Match: W/\"abc\"",
+        ]));
+        // Not the single-issue GET: a paginated list, a sub-resource, a write.
+        assert!(!is_single_issue_get(&["api", "-X", "GET", "repos/owner/repo/issues", "--paginate"]));
+        assert!(!is_single_issue_get(&["api", "-X", "GET", "repos/owner/repo/issues/7/comments"]));
+        assert!(!is_single_issue_get(&["api", "-X", "GET", "repos/owner/repo/labels", "--paginate"]));
+        assert!(!is_single_issue_get(&["api", "-X", "PATCH", "repos/owner/repo/issues/7"]));
+        // A non-numeric last segment is not a bare number.
+        assert!(!is_single_issue_get(&["api", "-X", "GET", "repos/owner/repo/issues/x"]));
+    }
+
+    #[test]
+    fn http_status_code_and_etag_read_the_include_header_block() {
+        let raw = "HTTP/2.0 304 Not Modified\r\nEtag: \"strong\"\r\nx-ratelimit-remaining: 9\r\n\r\n";
+        assert_eq!(http_status_code(raw), Some(304));
+        assert!(is_not_modified(raw));
+        assert_eq!(extract_response_etag(raw).as_deref(), Some("\"strong\""));
+        // A bare-JSON fixture has no status line and no etag.
+        assert_eq!(http_status_code("{\"number\":1}"), None);
+        assert!(!is_not_modified("{\"number\":1}"));
+        assert_eq!(extract_response_etag("{\"number\":1}"), None);
+        // 200 with a weak validator.
+        let ok = "HTTP/2.0 200 OK\r\nEtag: W/\"weak\"\r\n\r\n{\"number\":1}\n";
+        assert_eq!(http_status_code(ok), Some(200));
+        assert_eq!(extract_response_etag(ok).as_deref(), Some("W/\"weak\""));
     }
 
     #[test]
@@ -8790,5 +9421,44 @@ mod tests {
         assert_eq!(api, 2, "one write, retried once, is two `gh api` spawns: {log}");
 
         crate::invalidate_all_cached_tokens();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_gh_conditional_turns_a_304_or_404_into_a_success_but_a_500_into_an_error() {
+        // The gh 304 trap: gh exits non-zero on any non-2xx, including 304. The
+        // conditional runner must recognize the 304/404 status line on stdout and
+        // return the raw response as a success (so the retry/park path never sees
+        // it), while a genuine 5xx stays an error.
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stub = GhStub::new("conditional");
+        std::env::set_var("GH_TOKEN", "tok-conditional");
+        let token = resolve_github_token_by_name("proj").unwrap();
+
+        // 304: status + Etag on stdout, empty body, exit 1.
+        stub.write_gh(
+            "#!/bin/sh\nprintf 'HTTP/2.0 304 Not Modified\\r\\nEtag: \"v1\"\\r\\n\\r\\n'\nexit 1\n",
+        );
+        let raw = run_gh_conditional(&token, &["api", "--include", "-X", "GET", "repos/owner/repo/issues/1"])
+            .expect("a 304 is a success carried on stdout");
+        assert_eq!(http_status_code(&raw), Some(304), "the raw 304 reaches the caller: {raw}");
+
+        // 404: status + JSON error body on stdout, exit 1.
+        stub.write_gh(
+            "#!/bin/sh\nprintf 'HTTP/2.0 404 Not Found\\r\\n\\r\\n{\"message\":\"Not Found\"}\\n'\nexit 1\n",
+        );
+        let raw = run_gh_conditional(&token, &["api", "--include", "-X", "GET", "repos/owner/repo/issues/2"])
+            .expect("a 404 is a definitive success carried on stdout");
+        assert_eq!(http_status_code(&raw), Some(404), "the raw 404 reaches the caller: {raw}");
+
+        // 500: a real failure stays an error.
+        stub.write_gh(
+            "#!/bin/sh\nprintf 'HTTP/2.0 500 Internal Server Error\\r\\n\\r\\n{\"message\":\"boom\"}\\n'\nexit 1\n",
+        );
+        let err = run_gh_conditional(&token, &["api", "--include", "-X", "GET", "repos/owner/repo/issues/3"])
+            .expect_err("a 5xx is not swallowed as a success");
+        assert!(matches!(err, Error::Command { .. }), "a 500 surfaces as a command error: {err:?}");
     }
 }
