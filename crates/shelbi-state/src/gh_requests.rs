@@ -87,8 +87,11 @@ pub enum Outcome {
     /// The request reached GitHub and spent budget.
     Ok,
     /// The request failed with the given class ([`crate::gh_retry::error_class`]
-    /// — `conn` / `ratelimit` / `transient` / `other`). A `conn` failure spent
-    /// nothing; the others may have. Either way it is an *attempt*, not spend.
+    /// — `conn` / `ratelimit` / `transient` / `other` / `unknown-outcome`). A
+    /// `conn` failure spent nothing; a `ratelimit` / `transient` / `other` may
+    /// have; an `unknown-outcome` (a create whose response was lost) may well
+    /// have *committed*, which is exactly why it is recorded distinctly rather
+    /// than as `conn`. Either way it is an *attempt*, not confirmed spend.
     Err(&'static str),
 }
 

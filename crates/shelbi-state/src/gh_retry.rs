@@ -91,6 +91,16 @@ pub struct RetryPolicy {
     /// a `Retry-After`) doesn't block a board read for minutes; the mutating
     /// policy leaves it clear so a bulk write can wait out a rolling window.
     hintless_rate_limit_is_terminal: bool,
+    /// When set, a failure whose disposition is [`Disposition::Connection`] or
+    /// [`Disposition::Transient`] — the request went out but no usable response
+    /// came back, so GitHub may already have applied it — is *not* retried;
+    /// instead the policy returns a typed [`Error::UnknownWriteOutcome`]. The
+    /// create policy ([`RetryPolicy::creates`]) sets this so a replay-unsafe
+    /// `POST` (issue or comment create) can never be duplicated by a blind
+    /// replay. A rate limit stays retryable (it is returned *before* the write is
+    /// applied) and a terminal error stays terminal. Every other policy leaves it
+    /// clear, so desired-state writes and reads retry exactly as before.
+    unknown_outcome_is_terminal: bool,
 }
 
 impl RetryPolicy {
@@ -108,6 +118,26 @@ impl RetryPolicy {
             jitter: Arc::new(equal_jitter),
             notify: Arc::new(default_notify),
             hintless_rate_limit_is_terminal: false,
+            unknown_outcome_is_terminal: false,
+        }
+    }
+
+    /// The policy for the two replay-unsafe creates (issue `POST`, comment
+    /// `POST`): identical to [`RetryPolicy::production`] — a rate limit (primary,
+    /// 429, or the secondary content-creation limit) is still waited out with the
+    /// generous ceiling, because it is returned *before* GitHub applies the write
+    /// — except that a connection drop or a post-send 5xx (a genuinely unknown
+    /// outcome) is *not* replayed. Replaying such a create could produce a
+    /// duplicate issue or comment, so the policy surfaces a typed
+    /// [`Error::UnknownWriteOutcome`] the caller re-renders with an exact recovery
+    /// command. Only the two creates route through this; every desired-state
+    /// `PATCH`/`PUT` and the idempotent `POST .../labels` keep [`production`].
+    ///
+    /// [`production`]: RetryPolicy::production
+    pub fn creates() -> Self {
+        Self {
+            unknown_outcome_is_terminal: true,
+            ..Self::production()
         }
     }
 
@@ -128,6 +158,7 @@ impl RetryPolicy {
             jitter: Arc::new(equal_jitter),
             notify: Arc::new(default_notify),
             hintless_rate_limit_is_terminal: true,
+            unknown_outcome_is_terminal: false,
         }
     }
 
@@ -143,6 +174,7 @@ impl RetryPolicy {
             jitter: Arc::new(|c| c),
             notify,
             hintless_rate_limit_is_terminal: false,
+            unknown_outcome_is_terminal: false,
         }
     }
 
@@ -153,6 +185,18 @@ impl RetryPolicy {
     pub fn for_test_reads(max_attempts: u32, sleep: SleepFn, notify: NotifyFn) -> Self {
         Self {
             hintless_rate_limit_is_terminal: true,
+            ..Self::for_test(max_attempts, sleep, notify)
+        }
+    }
+
+    /// Like [`RetryPolicy::for_test`] but with the create policy's replay-unsafe
+    /// classification (an unknown outcome is terminal, surfacing
+    /// [`Error::UnknownWriteOutcome`]), so the create-path behavior is asserted
+    /// deterministically with no real waiting.
+    #[cfg(test)]
+    pub fn for_test_creates(max_attempts: u32, sleep: SleepFn, notify: NotifyFn) -> Self {
+        Self {
+            unknown_outcome_is_terminal: true,
             ..Self::for_test(max_attempts, sleep, notify)
         }
     }
@@ -177,6 +221,17 @@ impl RetryPolicy {
                     return Err(err)
                 }
                 Disposition::RateLimited(hint) => (RetryKind::RateLimited, hint),
+                // A create whose outcome is unknown (the request went out but no
+                // usable response came back — a connection drop or a post-send
+                // 5xx) must never be replayed: GitHub may already have applied it,
+                // and a second attempt would duplicate the issue or comment.
+                // Surface a typed unknown-outcome error the caller re-renders with
+                // the exact recovery command. Only the create policy sets this.
+                Disposition::Connection | Disposition::Transient
+                    if self.unknown_outcome_is_terminal =>
+                {
+                    return Err(Error::UnknownWriteOutcome(unknown_outcome_message(&err)))
+                }
                 // A connection failure retries like a transient blip (a single
                 // packet may have dropped); the read-path circuit breaker handles
                 // a *persistent* outage by parking, so the retry here stays short.
@@ -376,12 +431,44 @@ pub fn is_connection_error(err: &Error) -> bool {
     matches!(classify(err), Disposition::Connection)
 }
 
+/// The generic, endpoint-agnostic body of an [`Error::UnknownWriteOutcome`] the
+/// create policy raises when it declines to replay a create whose outcome is
+/// unknown. It does not name a recovery command — the policy does not know the
+/// shelbi id — so the create paths ([`crate::GitHubStore::add`] /
+/// `add_comment`) catch it and re-render it with the exact command. The
+/// underlying `gh` detail is folded in so the generic form is still legible if
+/// it ever surfaces directly.
+fn unknown_outcome_message(err: &Error) -> String {
+    let detail = match err {
+        Error::Command { status, stderr, .. } => {
+            let first = stderr.lines().next().unwrap_or("").trim();
+            if first.is_empty() {
+                status.clone()
+            } else {
+                format!("{status}: {first}")
+            }
+        }
+        other => other.to_string(),
+    };
+    format!(
+        "the create request was sent but no usable response came back ({detail}), \
+         so GitHub may or may not have applied it; it was not retried to avoid \
+         creating a duplicate — confirm on GitHub before retrying"
+    )
+}
+
 /// A short, stable class tag for a `gh` failure, for the request log's `outcome`
 /// field (`err:<class>`) so `shelbi doctor` can tell attempted-but-unspent
 /// requests (a dead network, `conn`) from spent-then-throttled ones
 /// (`ratelimit`). A non-[`Error::Command`] error — never a real `gh` invocation
-/// — is `other`.
+/// — is `other`, except an [`Error::UnknownWriteOutcome`], which gets its own
+/// `unknown-outcome` class: unlike `conn` (documented as "spent nothing") such a
+/// write may well have committed, and unlike the bare `unknown` token `shelbi
+/// doctor` uses for a *missing* class, this names a real disposition.
 pub fn error_class(err: &Error) -> &'static str {
+    if err.is_unknown_write_outcome() {
+        return "unknown-outcome";
+    }
     match classify(err) {
         Disposition::RateLimited(_) => "ratelimit",
         Disposition::Connection => "conn",
@@ -643,6 +730,100 @@ mod tests {
         let err = command_err("exit status: 1", "HTTP 502: Bad Gateway");
         assert!(!is_connection_error(&err));
         assert_eq!(error_class(&err), "transient");
+    }
+
+    /// A creates policy that records its waits, never sleeping in real time.
+    fn recording_creates_policy(max_attempts: u32) -> (RetryPolicy, Arc<Mutex<Vec<u64>>>) {
+        let waits: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec = waits.clone();
+        let sleep: SleepFn = Arc::new(move |d: Duration| rec.lock().unwrap().push(d.as_secs()));
+        (
+            RetryPolicy::for_test_creates(max_attempts, sleep, Arc::new(|_| {})),
+            waits,
+        )
+    }
+
+    #[test]
+    fn creates_policy_does_not_replay_a_connection_failure_and_returns_unknown_outcome() {
+        // A connection drop on a create is a genuinely unknown outcome: one
+        // attempt, no waits, and a typed unknown-outcome error (never replayed).
+        let (policy, waits) = recording_creates_policy(5);
+        let calls = Arc::new(Mutex::new(0u32));
+        let c = calls.clone();
+        let out: Result<()> = policy.run(|| {
+            *c.lock().unwrap() += 1;
+            Err(command_err("exit status: 1", "error connecting to api.github.com:443"))
+        });
+        let err = out.unwrap_err();
+        assert!(err.is_unknown_write_outcome(), "got {err:?}");
+        assert_eq!(*calls.lock().unwrap(), 1, "a create is never replayed on an unknown outcome");
+        assert!(waits.lock().unwrap().is_empty(), "no backoff before giving up");
+    }
+
+    #[test]
+    fn creates_policy_does_not_replay_a_post_send_5xx_and_returns_unknown_outcome() {
+        // A 502 that may have arrived *after* GitHub committed the write is also
+        // an unknown outcome — one attempt, unknown-outcome error.
+        let (policy, _waits) = recording_creates_policy(5);
+        let calls = Arc::new(Mutex::new(0u32));
+        let c = calls.clone();
+        let out: Result<()> = policy.run(|| {
+            *c.lock().unwrap() += 1;
+            Err(command_err("exit status: 1", "HTTP 502: Bad Gateway"))
+        });
+        assert!(out.unwrap_err().is_unknown_write_outcome());
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn creates_policy_still_retries_a_rate_limit_and_completes() {
+        // A rate limit is returned *before* the write is applied, so it stays
+        // retryable on a create: the secondary limit here backs off then succeeds.
+        let (policy, waits) = recording_creates_policy(5);
+        let calls = Arc::new(Mutex::new(0u32));
+        let c = calls.clone();
+        let out: Result<&str> = policy.run(|| {
+            let mut n = c.lock().unwrap();
+            *n += 1;
+            if *n < 3 {
+                Err(command_err(
+                    "exit status: 1",
+                    "HTTP 403: You have exceeded a secondary rate limit.",
+                ))
+            } else {
+                Ok("ok")
+            }
+        });
+        assert_eq!(out.unwrap(), "ok");
+        assert_eq!(*waits.lock().unwrap(), vec![1, 2], "rate limit still backs off on a create");
+    }
+
+    #[test]
+    fn creates_policy_keeps_a_422_terminal_and_not_an_unknown_outcome() {
+        // A 422 is a clean, permanent failure — the write did not land — so it
+        // stays a terminal `Command` error, distinct from an unknown outcome.
+        let (policy, _waits) = recording_creates_policy(5);
+        let calls = Arc::new(Mutex::new(0u32));
+        let c = calls.clone();
+        let out: Result<()> = policy.run(|| {
+            *c.lock().unwrap() += 1;
+            Err(command_err("exit status: 1", "HTTP 422: Validation Failed"))
+        });
+        let err = out.unwrap_err();
+        assert!(!err.is_unknown_write_outcome(), "a 422 is not an unknown outcome");
+        assert!(matches!(err, Error::Command { .. }));
+        assert_eq!(*calls.lock().unwrap(), 1, "terminal, one attempt");
+    }
+
+    #[test]
+    fn error_class_tags_an_unknown_write_outcome_distinctly() {
+        // Its own token — not `conn` (which claims "spent nothing"), not `other`,
+        // and not the bare `unknown` bucket `shelbi doctor` uses for a missing
+        // class.
+        assert_eq!(
+            error_class(&Error::UnknownWriteOutcome("may or may not have applied".into())),
+            "unknown-outcome"
+        );
     }
 
     #[test]

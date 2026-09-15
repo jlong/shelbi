@@ -122,6 +122,13 @@ const ID_SLUG_BUDGET: usize = GITHUB_LABEL_MAX - ID_LABEL_PREFIX.len() - 1 - 8;
 const META_BEGIN: &str = "<!-- shelbi:begin -->";
 /// Closing marker of the fenced shelbi-metadata block in an issue body.
 const META_END: &str = "<!-- shelbi:end -->";
+/// Prefix of the hidden per-comment marker shelbi appends to a comment it posts
+/// (`<!-- shelbi:comment/<16 hex> -->`), following the same `<!-- shelbi:... -->`
+/// convention as [`META_BEGIN`] / [`META_END`]. It lets a lost-response create
+/// retry recognize its own already-posted comment on reconcile so it never
+/// duplicates it, and is stripped on every read-back ([`GhComment::into_comment`])
+/// so it never reaches the UI or a `CommentAdded` event.
+const COMMENT_MARKER_PREFIX: &str = "<!-- shelbi:comment/";
 
 /// A `gh` invocation: given the args that follow `gh`, yield stdout on success
 /// or a typed [`Error`] on failure. Boxed so the production runner (real `gh`
@@ -311,13 +318,20 @@ impl GitHubStore {
         }
         let project_for_write = project.clone();
         let base: GhRunner = Arc::new(move |args: &[&str]| run_gh(&project_for_write, args));
-        // Two retry policies, chosen per call by HTTP method:
+        // Three retry policies, chosen per call by HTTP method *and* replay
+        // safety:
         //
-        // * Mutating calls (`POST`/`PATCH`/`PUT`/`DELETE` — create, move, edit,
-        //   comment, labels, and so the whole `issue-store migrate` loop) get the
-        //   long production policy: a rate limit (esp. the secondary
-        //   content-creation limit a bulk migration trips) or a transient blip is
-        //   waited out with backoff, honoring any `Retry-After`.
+        // * A replay-unsafe create (`POST .../issues` or `POST .../comments`) gets
+        //   the create policy: a rate limit still waits out the generous ceiling
+        //   (it is returned before the write is applied), but a connection drop or
+        //   a post-send 5xx is NOT replayed — GitHub may already have committed
+        //   it, and a blind retry would duplicate the issue or comment — so the
+        //   policy surfaces a typed unknown-outcome error the caller reconciles.
+        // * Every other mutating call (the desired-state `PATCH`/`PUT`, and the
+        //   idempotent `POST .../labels` that treats `422 already_exists` as
+        //   success) gets the long production policy: a rate limit (esp. the
+        //   secondary content-creation limit a bulk migration trips) or a
+        //   transient blip is waited out with backoff, honoring any `Retry-After`.
         // * Read calls (`GET`) get the fail-fast read policy: when the *primary*
         //   hourly limit is exhausted `gh` reports `API rate limit exceeded` with
         //   no `Retry-After`, and blocking every board read for minutes behind
@@ -327,8 +341,12 @@ impl GitHubStore {
         // See [`crate::gh_retry`].
         let read_policy = crate::gh_retry::RetryPolicy::reads();
         let write_policy = crate::gh_retry::RetryPolicy::production();
+        let create_policy = crate::gh_retry::RetryPolicy::creates();
         let project_for_read = project.clone();
         let gh: GhRunner = Arc::new(move |args: &[&str]| {
+            if is_replay_unsafe_create(args) {
+                return create_policy.run(|| base(args));
+            }
             if is_mutating_gh(args) {
                 return write_policy.run(|| base(args));
             }
@@ -406,15 +424,19 @@ impl GitHubStore {
         }
     }
 
-    /// Like [`GitHubStore::with_runner_and_policy`] but selects between a read
-    /// and a write policy per call by HTTP method, exactly as [`GitHubStore::new`]
-    /// does — so a test can assert that the `GET` path fails fast while the
-    /// mutating path still retries.
+    /// Like [`GitHubStore::with_runner_and_policy`] but selects between a read, a
+    /// write, and a create policy per call by HTTP method and replay safety,
+    /// exactly as [`GitHubStore::new`] does — so a test can assert that the `GET`
+    /// path fails fast, a desired-state write still retries, and a replay-unsafe
+    /// create is handled by the create policy. The routing predicate is shared
+    /// with `new()` ([`is_replay_unsafe_create`] / [`is_mutating_gh`]) so these
+    /// tests exercise the same disposition production does.
     #[cfg(test)]
     fn with_runner_and_policies(
         repo: impl Into<String>,
         read_policy: crate::gh_retry::RetryPolicy,
         write_policy: crate::gh_retry::RetryPolicy,
+        create_policy: crate::gh_retry::RetryPolicy,
         runner: impl Fn(&[&str]) -> Result<String> + Send + Sync + 'static,
     ) -> Self {
         // Clean process-global caches so a prior test's cached number/issue can't
@@ -422,7 +444,9 @@ impl GitHubStore {
         clear_issue_caches_for_test();
         let base: GhRunner = Arc::new(runner);
         let gh: GhRunner = Arc::new(move |args: &[&str]| {
-            let policy = if is_mutating_gh(args) {
+            let policy = if is_replay_unsafe_create(args) {
+                &create_policy
+            } else if is_mutating_gh(args) {
                 &write_policy
             } else {
                 &read_policy
@@ -874,8 +898,38 @@ impl IssueStore for GitHubStore {
             ("labels[]", id_anchor),
             ("labels[]", status_label),
         ];
-        let out = self.api_send("POST", &format!("repos/{}/issues", self.repo), &fields)?;
-        let created: GhIssue = parse_json_object(&out)?;
+        let created: GhIssue = match self.api_send(
+            "POST",
+            &format!("repos/{}/issues", self.repo),
+            &fields,
+        ) {
+            Ok(out) => parse_json_object(&out)?,
+            // The create's outcome is unknown: the request went out but no usable
+            // response came back (a connection drop or a post-send 5xx), so it was
+            // not retried. The POST stamps the `shelbi:id/<id>` anchor label
+            // (`get_raw` resolves by exactly that label), so a single reconcile
+            // read settles whether GitHub applied it. If it landed, continue as if
+            // the POST had returned; if it did not — or the reconcile read itself
+            // fails — surface a typed unknown-outcome error naming the exact
+            // recovery command. (A later *manual* retry is also safe: the
+            // create-exclusive pre-check above returns "already exists" rather than
+            // creating a second issue.)
+            Err(e) if e.is_unknown_write_outcome() => match self.get_raw(&spec.id) {
+                Ok(Some(gh)) => gh,
+                _ => {
+                    return Err(Error::UnknownWriteOutcome(format!(
+                        "creating issue `{id}` in {repo}: the request reached GitHub \
+                         but no usable response came back, so the issue may or may \
+                         not have been created; it was not retried to avoid a \
+                         duplicate. Run `shelbi issue show {id}` to check, then retry \
+                         only if it is absent.",
+                        id = spec.id,
+                        repo = self.repo,
+                    )))
+                }
+            },
+            Err(e) => return Err(e),
+        };
 
         // Record the number the create returned so an immediate `get(id)` after
         // `add` resolves it directly (plan open question: "`add` followed by an
@@ -1378,13 +1432,45 @@ impl IssueStore for GitHubStore {
         let Some(gh) = self.get_raw(id)? else {
             return Err(Error::Other(format!("issue `{id}` not found in {}", self.repo)));
         };
-        let out = self.api_send(
+        // Append a hidden per-call marker so a lost-response retry can recognize
+        // its own already-posted comment on reconcile and never post a duplicate.
+        // Two identical `("body", body)` comments are otherwise indistinguishable.
+        // The marker is stripped on every read-back (`GhComment::into_comment`),
+        // so it never reaches `list_comments`, the review pane, or a
+        // `CommentAdded` event.
+        let marker = comment_marker();
+        let posted = format!("{body}\n\n{marker}");
+        match self.api_send(
             "POST",
             &format!("repos/{}/issues/{}/comments", self.repo, gh.number),
-            &[("body", body.to_string())],
-        )?;
-        let created: GhComment = parse_json_object(&out)?;
-        Ok(created.into_comment())
+            &[("body", posted)],
+        ) {
+            Ok(out) => {
+                let created: GhComment = parse_json_object(&out)?;
+                Ok(created.into_comment())
+            }
+            // Unknown outcome: the comment may or may not have posted. A single
+            // reconcile read of this issue's comments looks for the marker on the
+            // raw bodies; if it is there the comment landed, otherwise (or if the
+            // reconcile read fails) surface a typed unknown-outcome error. No CLI
+            // command lists comments today, so the honest recovery is the issue's
+            // github.com page.
+            Err(e) if e.is_unknown_write_outcome() => {
+                match self.find_raw_comment_with_marker(gh.number, &marker) {
+                    Ok(Some(raw)) => Ok(raw.into_comment()),
+                    _ => Err(Error::UnknownWriteOutcome(format!(
+                        "commenting on issue `{id}` in {repo}: the request reached \
+                         GitHub but no usable response came back, so the comment may \
+                         or may not have been posted; it was not retried to avoid a \
+                         duplicate. Check https://github.com/{repo}/issues/{number} \
+                         to see whether it is there before retrying.",
+                        repo = self.repo,
+                        number = gh.number,
+                    ))),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1987,6 +2073,28 @@ impl GitHubStore {
         number: i64,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<IssueComment>> {
+        let raw = self.raw_comments_for_number(number, since)?;
+        // Map each raw comment to the public shape, which strips the hidden
+        // shelbi marker (see [`GhComment::into_comment`]). This is the single
+        // choke point both `list_comments` and the change-detection comment
+        // scan pass through, so the marker never reaches a caller.
+        let mut comments: Vec<IssueComment> = raw.into_iter().map(GhComment::into_comment).collect();
+        // The API returns comments in creation order already; sort defensively
+        // on the id so the ordering contract holds regardless.
+        comments.sort_by_key(|c| c.created_at);
+        Ok(comments)
+    }
+
+    /// Live-read a GitHub issue's comments as raw [`GhComment`]s (bodies still
+    /// carrying any hidden shelbi marker), optionally scoped with `since=`. The
+    /// unstripped bodies are what the create reconcile matches its marker
+    /// against; [`GitHubStore::comments_for_number_since`] maps these through
+    /// [`GhComment::into_comment`] for every rendering caller.
+    fn raw_comments_for_number(
+        &self,
+        number: i64,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<GhComment>> {
         let path = format!("repos/{}/issues/{number}/comments", self.repo);
         let since_param = since.map(|w| format!("since={}", w.to_rfc3339()));
         let mut args: Vec<&str> = vec!["api", "-X", "GET", &path, "--paginate"];
@@ -1997,12 +2105,23 @@ impl GitHubStore {
         }
         args.extend_from_slice(&["--jq", ".[]"]);
         let out = (self.gh)(&args)?;
-        let raw: Vec<GhComment> = parse_jsonl(&out)?;
-        let mut comments: Vec<IssueComment> = raw.into_iter().map(GhComment::into_comment).collect();
-        // The API returns comments in creation order already; sort defensively
-        // on the id so the ordering contract holds regardless.
-        comments.sort_by_key(|c| c.created_at);
-        Ok(comments)
+        parse_jsonl(&out)
+    }
+
+    /// One bounded reconcile read after a comment create whose outcome was
+    /// unknown: read this issue's comments and return the one whose *raw* body
+    /// still carries `marker`, if any. `None` means the create did not land (so
+    /// the caller surfaces the unknown-outcome error); an `Err` bubbles up and is
+    /// likewise treated as unsettled.
+    fn find_raw_comment_with_marker(
+        &self,
+        number: i64,
+        marker: &str,
+    ) -> Result<Option<GhComment>> {
+        let raw = self.raw_comments_for_number(number, None)?;
+        Ok(raw
+            .into_iter()
+            .find(|c| c.body.as_deref().is_some_and(|b| b.contains(marker))))
     }
 
     // --- write helpers -------------------------------------------------------
@@ -2221,6 +2340,37 @@ fn is_mutating_gh(args: &[&str]) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// Whether a `gh api` invocation is one of the two *replay-unsafe* creates: a
+/// `POST` to an issue-create endpoint (path ends `/issues`) or a comment-create
+/// endpoint (path ends `/comments`). These are the only mutations GitHub can
+/// commit without shelbi ever seeing the response, so a blind replay would risk
+/// a duplicate — they route through the create policy in [`GitHubStore::new`],
+/// which declines to replay an unknown outcome.
+///
+/// The method must be exactly `POST`: the idempotent label bootstrap is also a
+/// `POST` but targets `.../labels` (excluded by the path suffix), and the comment
+/// *read* path builds `.../issues/<n>/comments` with `-X GET` (excluded by the
+/// method). The path is read as the argv token immediately after `-X <method>`
+/// (every call site places it there), never a `-f key=value` field value, so a
+/// title or body that happens to end in `/issues` can never trip it.
+fn is_replay_unsafe_create(args: &[&str]) -> bool {
+    let Some(i) = args.iter().position(|a| *a == "-X") else {
+        return false;
+    };
+    let method_is_post = args
+        .get(i + 1)
+        .map(|m| m.eq_ignore_ascii_case("POST"))
+        .unwrap_or(false);
+    if !method_is_post {
+        return false;
+    }
+    let Some(path) = args.get(i + 2) else {
+        return false;
+    };
+    let path = path.trim_end_matches('/');
+    path.ends_with("/issues") || path.ends_with("/comments")
 }
 
 /// Run the real `gh` CLI with resolved auth. The token is resolved through the
@@ -3569,9 +3719,65 @@ impl GhComment {
             id: self.id.to_string(),
             author: self.user.map(|u| u.login),
             created_at: self.created_at,
-            body: self.body.unwrap_or_default(),
+            // The single choke point every rendered comment passes through, so
+            // the hidden shelbi marker is stripped here and reaches no caller.
+            body: strip_comment_marker(&self.body.unwrap_or_default()),
         }
     }
+}
+
+/// A fresh hidden marker line for a comment shelbi is about to post
+/// (`<!-- shelbi:comment/<16 lowercase hex> -->`). Lets a lost-response create
+/// retry recognize its own already-posted comment so it never duplicates it.
+fn comment_marker() -> String {
+    format!("{COMMENT_MARKER_PREFIX}{:016x} -->", comment_marker_token())
+}
+
+/// A 64-bit token for a comment marker, unique enough that two markers never
+/// collide within one issue's comment list. Seeded from the sub-second clock and
+/// a process-lifetime counter, then run through a SplitMix64 finalizer (the same
+/// time-seeded mix pattern [`crate::gh_retry`] uses for jitter) — no new
+/// dependency, and no security requirement (a collision only ever risks a
+/// missed reconcile, never a wrong match, because the caller also holds the exact
+/// marker string it generated).
+fn comment_marker_token() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut x = nanos
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(seq.wrapping_mul(0x2545_F491_4F6C_DD1D))
+        .wrapping_add(0x1234_5678_9ABC_DEF0);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x
+}
+
+/// Remove any hidden `<!-- shelbi:comment/<hex> -->` marker line from a comment
+/// body read back from GitHub. A body carrying no marker is returned unchanged
+/// (byte-identical), so a human's comment is never reshaped; only a shelbi-posted
+/// body — whose marker line, and the blank line separating it, are dropped — is
+/// trimmed back to the text shelbi was asked to post.
+fn strip_comment_marker(body: &str) -> String {
+    if !body.contains(COMMENT_MARKER_PREFIX) {
+        return body.to_string();
+    }
+    let kept: Vec<&str> = body
+        .lines()
+        .filter(|line| !is_comment_marker_line(line))
+        .collect();
+    kept.join("\n").trim_end().to_string()
+}
+
+/// Whether a single body line is a hidden shelbi comment marker.
+fn is_comment_marker_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with(COMMENT_MARKER_PREFIX) && trimmed.ends_with("-->")
 }
 
 /// True for the terminal columns (`done` / `canceled`).
@@ -4547,6 +4753,240 @@ mod tests {
         assert_eq!(create_posts.load(Ordering::SeqCst), 1, "no retry on a 422");
     }
 
+    /// The full label set a fresh `add("do-thing", todo)` needs, as JSONL, so the
+    /// label bootstrap issues no `POST .../labels` and the create tests can count
+    /// the create POST alone.
+    const CREATE_TEST_LABELS: &str = r#"{"name":"shelbi:id/do-thing"}
+{"name":"shelbi:status/backlog"}
+{"name":"shelbi:status/todo"}
+{"name":"shelbi:status/in-progress"}
+{"name":"shelbi:status/review"}
+{"name":"shelbi:status/done"}
+{"name":"shelbi:status/canceled"}"#;
+
+    /// A `(read, write, create)` policy triple wired the way `new()` routes them,
+    /// with no real waiting: reads and creates fail fast (one attempt), writes
+    /// retry. The create policy classifies an unknown outcome as terminal.
+    fn create_test_policies() -> (
+        crate::gh_retry::RetryPolicy,
+        crate::gh_retry::RetryPolicy,
+        crate::gh_retry::RetryPolicy,
+    ) {
+        let noop_sleep: std::sync::Arc<dyn Fn(std::time::Duration) + Send + Sync> =
+            std::sync::Arc::new(|_| {});
+        let notify: std::sync::Arc<dyn Fn(&crate::gh_retry::RetryNotice) + Send + Sync> =
+            std::sync::Arc::new(|_| {});
+        let read = crate::gh_retry::RetryPolicy::for_test_reads(1, noop_sleep.clone(), notify.clone());
+        let write = crate::gh_retry::RetryPolicy::for_test(5, noop_sleep.clone(), notify.clone());
+        let create = crate::gh_retry::RetryPolicy::for_test_creates(5, noop_sleep, notify);
+        (read, write, create)
+    }
+
+    #[test]
+    fn add_does_not_replay_a_create_on_a_connection_error_and_surfaces_unknown_outcome() {
+        let _home = HomeGuard::new("add-create-conn-unknown");
+        // A connection-level failure on the issue-create POST is a genuinely
+        // unknown outcome: the create is attempted exactly once (never replayed),
+        // and when the reconcile read shows the write did not land the caller sees
+        // a typed unknown-outcome error naming `shelbi issue show <id>`.
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let posts = std::sync::Arc::new(AtomicU32::new(0));
+        let posted = std::sync::Arc::new(AtomicBool::new(false));
+        let (pc, pf) = (posts.clone(), posted.clone());
+        let (read, write, create) = create_test_policies();
+        let store = GitHubStore::with_runner_and_policies(
+            "owner/repo",
+            read,
+            write,
+            create,
+            move |args| {
+                let method = args
+                    .iter()
+                    .position(|a| *a == "-X")
+                    .and_then(|i| args.get(i + 1))
+                    .copied()
+                    .unwrap_or("GET");
+                let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+                if path.ends_with("/labels") {
+                    return Ok(if method == "GET" { CREATE_TEST_LABELS } else { "{}" }.to_string());
+                }
+                if method == "POST" && path.ends_with("/issues") {
+                    pc.fetch_add(1, Ordering::SeqCst);
+                    pf.store(true, Ordering::SeqCst);
+                    return Err(Error::Command {
+                        cmd: "gh api ...".into(),
+                        status: "exit status: 1".into(),
+                        stderr: "error connecting to api.github.com:443".into(),
+                    });
+                }
+                // Every read (dup check, priority list, reconcile label search)
+                // comes back empty → the create is seen as not landed.
+                Ok(String::new())
+            },
+        );
+
+        let err = store
+            .add(NewIssue::new("do-thing", "Do the thing", Column::todo(), "b"))
+            .unwrap_err();
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "create attempted exactly once, never replayed");
+        assert!(err.is_unknown_write_outcome(), "typed unknown-outcome, not Command: {err:?}");
+        assert!(!matches!(err, Error::Command { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("shelbi issue show do-thing"), "names the recovery command: {msg}");
+        assert!(msg.contains("may or may not"), "states the outcome is unknown: {msg}");
+    }
+
+    #[test]
+    fn add_reconciles_a_landed_create_after_an_unknown_outcome() {
+        let _home = HomeGuard::new("add-create-landed");
+        // An HTTP 502 after the request went out is an unknown outcome, but the
+        // reconcile read finds the `shelbi:id/*`-anchored issue → the create is
+        // treated as having landed and `add` returns it, with no second POST.
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let posts = std::sync::Arc::new(AtomicU32::new(0));
+        let posted = std::sync::Arc::new(AtomicBool::new(false));
+        let (pc, pf) = (posts.clone(), posted.clone());
+        let landed = r#"{"number":42,"title":"Do the thing","body":"","state":"open","labels":[{"name":"shelbi:id/do-thing"}],"created_at":"2026-08-03T00:00:00Z","updated_at":"2026-08-03T00:00:00Z"}"#;
+        let (read, write, create) = create_test_policies();
+        let store = GitHubStore::with_runner_and_policies(
+            "owner/repo",
+            read,
+            write,
+            create,
+            move |args| {
+                let method = args
+                    .iter()
+                    .position(|a| *a == "-X")
+                    .and_then(|i| args.get(i + 1))
+                    .copied()
+                    .unwrap_or("GET");
+                let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+                if path.ends_with("/labels") {
+                    return Ok(if method == "GET" { CREATE_TEST_LABELS } else { "{}" }.to_string());
+                }
+                if method == "POST" && path.ends_with("/issues") {
+                    pc.fetch_add(1, Ordering::SeqCst);
+                    pf.store(true, Ordering::SeqCst);
+                    return Err(Error::Command {
+                        cmd: "gh api ...".into(),
+                        status: "exit status: 1".into(),
+                        stderr: "HTTP 502: Bad Gateway".into(),
+                    });
+                }
+                // The reconcile id-label search finds the issue once the POST has
+                // (unknowably) landed; every earlier read is empty.
+                let is_id_search = args.iter().any(|a| a.contains("labels=shelbi:id/"));
+                if is_id_search && pf.load(Ordering::SeqCst) {
+                    return Ok(landed.to_string());
+                }
+                Ok(String::new())
+            },
+        );
+
+        let issue = store
+            .add(NewIssue::new("do-thing", "Do the thing", Column::todo(), "b"))
+            .expect("reconcile found the landed create");
+        assert_eq!(issue.id, "do-thing");
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "no second create attempt");
+    }
+
+    #[test]
+    fn add_returns_unknown_outcome_when_the_reconcile_read_also_fails() {
+        let _home = HomeGuard::new("add-create-reconcile-fails");
+        // The create's outcome is unknown AND the single reconcile read itself
+        // fails, so the question stays unsettled: a typed unknown-outcome error,
+        // still after exactly one create POST.
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let posts = std::sync::Arc::new(AtomicU32::new(0));
+        let posted = std::sync::Arc::new(AtomicBool::new(false));
+        let (pc, pf) = (posts.clone(), posted.clone());
+        let (read, write, create) = create_test_policies();
+        let store = GitHubStore::with_runner_and_policies(
+            "owner/repo",
+            read,
+            write,
+            create,
+            move |args| {
+                let method = args
+                    .iter()
+                    .position(|a| *a == "-X")
+                    .and_then(|i| args.get(i + 1))
+                    .copied()
+                    .unwrap_or("GET");
+                let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+                if path.ends_with("/labels") {
+                    return Ok(if method == "GET" { CREATE_TEST_LABELS } else { "{}" }.to_string());
+                }
+                if method == "POST" && path.ends_with("/issues") {
+                    pc.fetch_add(1, Ordering::SeqCst);
+                    pf.store(true, Ordering::SeqCst);
+                    return Err(Error::Command {
+                        cmd: "gh api ...".into(),
+                        status: "exit status: 1".into(),
+                        stderr: "error connecting to api.github.com:443".into(),
+                    });
+                }
+                let is_id_search = args.iter().any(|a| a.contains("labels=shelbi:id/"));
+                if is_id_search && pf.load(Ordering::SeqCst) {
+                    // The reconcile read fails too.
+                    return Err(Error::Command {
+                        cmd: "gh api ...".into(),
+                        status: "exit status: 1".into(),
+                        stderr: "error connecting to api.github.com:443".into(),
+                    });
+                }
+                Ok(String::new())
+            },
+        );
+
+        let err = store
+            .add(NewIssue::new("do-thing", "Do the thing", Column::todo(), "b"))
+            .unwrap_err();
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "create attempted exactly once");
+        assert!(err.is_unknown_write_outcome(), "unsettled reconcile → unknown-outcome: {err:?}");
+    }
+
+    #[test]
+    fn a_transient_patch_still_retries_under_the_write_policy() {
+        let _home = HomeGuard::new("patch-retries");
+        // A replay-safe desired-state write (a `PATCH`, here `set_state`) that
+        // fails transiently still retries under the production write policy — the
+        // create knob touches only the two replay-unsafe creates. Routed through
+        // the same three-policy set `new()` uses, so a misroute onto the create
+        // policy (which would surface unknown-outcome after one attempt) fails it.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let patches = std::sync::Arc::new(AtomicU32::new(0));
+        let pc = patches.clone();
+        let (read, write, create) = create_test_policies();
+        let store = GitHubStore::with_runner_and_policies(
+            "owner/repo",
+            read,
+            write,
+            create,
+            move |args| {
+                let method = args
+                    .iter()
+                    .position(|a| *a == "-X")
+                    .and_then(|i| args.get(i + 1))
+                    .copied()
+                    .unwrap_or("GET");
+                if method == "PATCH" {
+                    if pc.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(Error::Command {
+                            cmd: "gh api ...".into(),
+                            status: "exit status: 1".into(),
+                            stderr: "HTTP 502: Bad Gateway".into(),
+                        });
+                    }
+                    return Ok("{}".to_string());
+                }
+                Ok(String::new())
+            },
+        );
+        store.set_state(10, "closed", Some("completed")).unwrap();
+        assert_eq!(patches.load(Ordering::SeqCst), 2, "the PATCH retried once and completed");
+    }
+
     #[test]
     fn list_under_the_primary_rate_limit_fails_fast_without_retrying() {
         let _home = HomeGuard::new("list-primary-rate-limit");
@@ -4566,11 +5006,15 @@ mod tests {
         let notify: std::sync::Arc<dyn Fn(&crate::gh_retry::RetryNotice) + Send + Sync> =
             std::sync::Arc::new(|_| {});
         let read_policy = crate::gh_retry::RetryPolicy::for_test_reads(2, read_sleep, notify.clone());
-        let write_policy = crate::gh_retry::RetryPolicy::for_test(5, std::sync::Arc::new(|_| {}), notify);
+        let write_policy =
+            crate::gh_retry::RetryPolicy::for_test(5, std::sync::Arc::new(|_| {}), notify.clone());
+        let create_policy =
+            crate::gh_retry::RetryPolicy::for_test_creates(5, std::sync::Arc::new(|_| {}), notify);
         let store = GitHubStore::with_runner_and_policies(
             "owner/repo",
             read_policy,
             write_policy,
+            create_policy,
             move |args| {
                 let method = args
                     .iter()
@@ -5641,6 +6085,187 @@ mod tests {
         let _home = HomeGuard::new("add-comment-missing");
         let (store, _calls) = recording_store("", "", "", "{}");
         assert!(store.add_comment("nope", "hi").is_err());
+    }
+
+    /// The `shelbi:id/t` issue every comment test resolves `add_comment("t", …)`
+    /// against, as the JSONL the label search returns.
+    const COMMENT_TEST_ISSUE: &str = r#"{"number":7,"title":"T","body":"","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+
+    /// Pull the hidden comment marker out of a recorded `-f body=…` argv entry.
+    fn marker_in(args: &[&str]) -> Option<String> {
+        let body = args.iter().find(|a| a.starts_with("body="))?;
+        let idx = body.find(COMMENT_MARKER_PREFIX)?;
+        Some(body[idx..].to_string())
+    }
+
+    #[test]
+    fn add_comment_does_not_replay_on_a_connection_error_and_surfaces_unknown_outcome() {
+        let _home = HomeGuard::new("add-comment-conn-unknown");
+        // A connection failure on the comment POST is a genuinely unknown outcome:
+        // the comment is attempted exactly once, and when the reconcile read finds
+        // no comment carrying the marker the caller sees a typed unknown-outcome
+        // error naming the issue's github.com page as the recovery.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let posts = std::sync::Arc::new(AtomicU32::new(0));
+        let pc = posts.clone();
+        let (read, write, create) = create_test_policies();
+        let store = GitHubStore::with_runner_and_policies(
+            "owner/repo",
+            read,
+            write,
+            create,
+            move |args| {
+                let method = args
+                    .iter()
+                    .position(|a| *a == "-X")
+                    .and_then(|i| args.get(i + 1))
+                    .copied()
+                    .unwrap_or("GET");
+                let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+                if method == "POST" && path.ends_with("/comments") {
+                    pc.fetch_add(1, Ordering::SeqCst);
+                    return Err(Error::Command {
+                        cmd: "gh api ...".into(),
+                        status: "exit status: 1".into(),
+                        stderr: "error connecting to api.github.com:443".into(),
+                    });
+                }
+                if path.contains("/comments") {
+                    // Reconcile read: no comment landed.
+                    return Ok(String::new());
+                }
+                // Resolve `t` to its issue.
+                Ok(COMMENT_TEST_ISSUE.to_string())
+            },
+        );
+
+        let err = store.add_comment("t", "the reply").unwrap_err();
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "comment attempted exactly once, never replayed");
+        assert!(err.is_unknown_write_outcome(), "typed unknown-outcome, not Command: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("https://github.com/owner/repo/issues/7"),
+            "names the issue page as recovery: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_comment_reconciles_a_landed_comment_after_an_unknown_outcome() {
+        let _home = HomeGuard::new("add-comment-landed");
+        // The comment POST's outcome is unknown, but the reconcile read finds a
+        // comment carrying this call's marker → the comment is treated as posted,
+        // returned with the marker stripped, and no second POST is made.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let posts = std::sync::Arc::new(AtomicU32::new(0));
+        let pc = posts.clone();
+        let seen_marker: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sm = seen_marker.clone();
+        let (read, write, create) = create_test_policies();
+        let store = GitHubStore::with_runner_and_policies(
+            "owner/repo",
+            read,
+            write,
+            create,
+            move |args| {
+                let method = args
+                    .iter()
+                    .position(|a| *a == "-X")
+                    .and_then(|i| args.get(i + 1))
+                    .copied()
+                    .unwrap_or("GET");
+                let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+                if method == "POST" && path.ends_with("/comments") {
+                    pc.fetch_add(1, Ordering::SeqCst);
+                    *sm.lock().unwrap() = marker_in(args);
+                    return Err(Error::Command {
+                        cmd: "gh api ...".into(),
+                        status: "exit status: 1".into(),
+                        stderr: "error connecting to api.github.com:443".into(),
+                    });
+                }
+                if path.contains("/comments") {
+                    // Reconcile read: the comment landed, carrying its marker on
+                    // its own line exactly as GitHub would return it.
+                    let m = sm.lock().unwrap().clone().expect("POST captured the marker");
+                    return Ok(format!(
+                        r#"{{"id":88,"body":"the reply\n\n{m}","created_at":"2026-08-05T00:00:00Z","user":{{"login":"bot"}}}}"#
+                    ));
+                }
+                Ok(COMMENT_TEST_ISSUE.to_string())
+            },
+        );
+
+        let c = store.add_comment("t", "the reply").expect("reconcile found the landed comment");
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "no second comment attempt");
+        assert_eq!(c.id, "88");
+        assert_eq!(c.body, "the reply", "the marker is stripped from the reconciled comment");
+        assert!(!c.body.contains(COMMENT_MARKER_PREFIX));
+    }
+
+    #[test]
+    fn add_comment_marks_the_sent_body_and_strips_it_from_every_read_back() {
+        let _home = HomeGuard::new("comment-marker-roundtrip");
+        // The body shelbi sends carries a hidden `<!-- shelbi:comment/<hex> -->`
+        // marker; that marker is absent from the `IssueComment` returned by
+        // `add_comment`, `list_comments`, and `comments_for_number_since`, so it
+        // can never reach the review pane or a `CommentAdded` event.
+        let calls: Calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            // A cached number makes a later `get_raw` resolve through GraphQL;
+            // answer it from the same single-issue JSON the REST path returns.
+            if args.contains(&"graphql") {
+                return Ok(rest_to_graphql(args, COMMENT_TEST_ISSUE));
+            }
+            let method = args
+                .iter()
+                .position(|a| *a == "-X")
+                .and_then(|i| args.get(i + 1))
+                .copied()
+                .unwrap_or("GET");
+            let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+            if method == "POST" && path.ends_with("/comments") {
+                // Echo the posted marker back on its own line, as GitHub would.
+                let m = marker_in(args).expect("the sent body carries a marker");
+                return Ok(format!(
+                    r#"{{"id":100,"body":"the reply\n\n{m}","created_at":"2026-08-05T00:00:00Z","user":{{"login":"bot"}}}}"#
+                ));
+            }
+            if path.contains("/comments") {
+                // The live comment list carries the marker too (as stored on
+                // GitHub); every read-back must strip it.
+                return Ok(r#"{"id":100,"body":"the reply\n\n<!-- shelbi:comment/deadbeefdeadbeef -->","created_at":"2026-08-05T00:00:00Z","user":{"login":"bot"}}"#.to_string());
+            }
+            Ok(COMMENT_TEST_ISSUE.to_string())
+        });
+
+        let created = store.add_comment("t", "the reply").unwrap();
+        // The sent body carried the marker...
+        let sent = call_containing(&calls.lock().unwrap(), &["-X POST", "/comments", "body=the reply"])
+            .expect("comment POST recorded")
+            .clone();
+        assert!(sent.contains(COMMENT_MARKER_PREFIX), "the sent body carries the hidden marker");
+        // ...but no read-back exposes it.
+        assert_eq!(created.body, "the reply");
+        assert!(!created.body.contains(COMMENT_MARKER_PREFIX));
+        for c in store.list_comments("t").unwrap() {
+            assert!(!c.body.contains(COMMENT_MARKER_PREFIX), "list_comments strips the marker");
+            assert_eq!(c.body, "the reply");
+        }
+        for c in store.comments_for_number_since(7, None).unwrap() {
+            assert!(!c.body.contains(COMMENT_MARKER_PREFIX), "comments_for_number_since strips the marker");
+        }
+    }
+
+    #[test]
+    fn strip_comment_marker_leaves_a_markerless_body_untouched() {
+        // A human comment (no marker) round-trips byte-identical — the strip only
+        // touches shelbi-posted bodies.
+        assert_eq!(strip_comment_marker("plain body"), "plain body");
+        let multi = "line one\nline two\n\nline three";
+        assert_eq!(strip_comment_marker(multi), multi);
     }
 
     #[test]
