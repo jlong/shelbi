@@ -343,6 +343,12 @@ mod tests {
 
     #[test]
     fn supervision_marker_uses_an_independent_key_from_the_wrapper_teardown() {
+        // `expected_teardown_marker_path` resolves a per-project state path, so
+        // mount a throwaway home rather than reading the live `~/.shelbi`.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
         // The supervisor's no-restart marker must land in its own file so it
         // never races the pane wrapper's expected-teardown consume.
         assert_eq!(supervision_shutdown_key("alpha"), "alpha.supervision");
@@ -350,6 +356,8 @@ mod tests {
             expected_teardown_marker_path("alpha").unwrap(),
             expected_teardown_marker_path(&supervision_shutdown_key("alpha")).unwrap(),
         );
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
@@ -546,6 +554,12 @@ mod tests {
 
     #[test]
     fn workspace_status_path_rejects_traversal_names() {
+        // The accepted name resolves under the hub root, so mount a throwaway
+        // home rather than reading the live `~/.shelbi`.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
         // Residual chokepoint hardening (Shelbi ContextStore
         // docs/planning:reviews/adversarial-2026-07/state-runtime.md F14): a `..`/absolute/
         // separator workspace name must not escape `~/.shelbi/workspaces/`.
@@ -557,6 +571,8 @@ mod tests {
         }
         // A normal single-component name still resolves.
         assert!(workspace_status_path("review-1").is_ok());
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     /// Round-trip: `mark_expected_teardown` writes the marker,

@@ -1478,6 +1478,12 @@ mod tests {
     fn resolve_github_returns_a_live_store() {
         use shelbi_core::{GithubConnection, IssueTrackerConfig};
 
+        // Resolution touches per-project state paths, so mount a throwaway home
+        // rather than reading the developer's live `~/.shelbi`.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
         // A valid github config now resolves to a live [`GitHubStore`] (the
         // write path landed) rather than a typed "unimplemented" error.
         let cfg = IssueTrackerConfig {
@@ -1490,6 +1496,8 @@ mod tests {
         // No network / gh call happens at construction — the store is a cheap
         // handle that resolves auth lazily per API call.
         assert!(resolve_issue_store("p", &cfg).is_ok());
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
