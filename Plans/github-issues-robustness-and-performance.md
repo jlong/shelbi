@@ -342,3 +342,44 @@ Direction from jlong on the thirteen questions in [[github-issues-robustness-and
 
 Tier 1 from the review §6 is filed as small independent tasks on the `app` track on 2026-09-14, plus the MSRV raise, the `SHELBI_HOME` test guard as a prerequisite, and a `cstore` task for the plan text fixes. Tier 2 (sidebar reconcile into the daemon) waits for the request log to be re-read after Tier 1 has run.
 
+
+
+### Measured baseline, 2026-09-14T02 to 2026-09-15T02 (before any Tier 1 change)
+
+Taken from the live hub request log `~/.shelbi/gh-requests.log` over one full 24-hour
+window, on a board holding four backlog cards with nothing active, no dispatches, and no
+human interaction for most of the window. This is the "before" side of the decision 13
+acceptance gate. Note that REST GETs are not logged at all today, so every number here is
+GraphQL only and the true total is higher.
+
+| Caller | Requests / 24 h | Requests / h | Share |
+| --- | --- | --- | --- |
+| `id-search` | 13,725 | 572 | 77 % |
+| `board-refresh` | 2,493 | 104 | 14 % |
+| `issue-fetch` | 1,527 | 64 | 9 % |
+| `done-page` | 139 | 6 | under 1 % |
+| **total** | **17,884** | **745** | |
+
+All 17,884 were on the `graphql` budget; 12 errored. A single quiet hour (2026-09-15T01)
+breaks down identically: 625 `id-search`, 116 `board-refresh`, 72 `issue-fetch`, 6
+`done-page`.
+
+Three things follow, and they change the plan's priorities:
+
+1. **`id-search` is the hub's dominant GitHub cost, at roughly 77 percent of all traffic
+   on an idle board.** Every id resolution runs a GraphQL `search` for a label. F6's fix
+   (resolve through the cached or index number first, fall back to the label search) is
+   therefore the single largest traffic reduction available, not the P2 afterthought both
+   the plan and the review treat it as. It should ship early.
+2. **`board-refresh` at 104 per hour is close to the plan's modelled 120,** so the daemon
+   refresh is behaving as designed and is not where the waste is. The plan's section 9
+   models the refresh loop and has no row at all for `id-search`, which is the number that
+   actually matters.
+3. **`issue-fetch` at 64 per hour on a board nobody is touching** is the action-read path
+   spending the read budget, which is what decision 9 moves to REST conditional GETs.
+
+The success gate for Tier 1, stated in measurable terms: re-read this log over an
+equivalent idle 24-hour window after the Tier 1 tasks land, and expect total GraphQL
+traffic to fall by roughly three quarters, driven almost entirely by `id-search` going to
+near zero. Add REST GET logging first or the comparison will be misleading.
+
