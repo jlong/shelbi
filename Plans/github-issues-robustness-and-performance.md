@@ -311,3 +311,34 @@ Phases B and C can be prepared in parallel behind narrow interfaces, but enable 
 Preserve old aliases and unknown metadata; never rewrite existing customized prose automatically. If implementation changes shipped defaults, instructions, workflows, or config templates, pair them with the repository-required config-upgrade sniffer. Use AutoHeal only for deterministic non-lossy rewrites, and NeedsJudgment for ambiguous or customized prose. Version local cache data separately from user configuration.
 
 The completion condition is fewer independent mechanisms: one owner, one synchronizer, one publisher, explicit freshness, and one transport policy. Better API use should make the architecture smaller as well as faster.
+
+
+## Decisions recorded 2026-09-14
+
+Direction from jlong on the thirteen questions in [[github-issues-robustness-and-performance-review]] §7. Items marked *(orchestrator)* were delegated with the instruction "pick the robust solution"; the pick and its reason are recorded so they can be reversed deliberately.
+
+1. **Stale policy: "Render stale, never act stale."** Retires pluggable-task-stores D3 (dated note added there). The daemon index renders and may be marked stale; every action fetches the issue fresh first; destructive poller decisions require a warm index.
+2. **Transport: keep `gh`.** Writes stay REST via `gh api`. Phase C (in-process HTTP client) is deferred behind the `GhRunner` seam with a measured trigger and its own plan.
+3. **MSRV: raise `rust-version`** to what `Cargo.lock` already requires and add an MSRV CI job that builds with exactly that toolchain. Ships independently of this plan.
+4. *(orchestrator)* **Write ownership: caller-side writes serialized by the existing cross-process file lock** (`acquire_file_lock`), never held across a network call; the daemon re-reads the index under the lock after its GraphQL call and merges its delta. No daemon-owned mutation socket and no "busy" refusal. Reason: a wedged daemon must not be able to block `shelbi issue move` (the 2026-09-08 launchd PATH incident would have), and scripts keep working without a daemon.
+5. **Un-migrated native GitHub issues are actionable.** `get_raw` resolves by cached or index number first, accepts all-digit ids, and errors when more than one label matches.
+6. **Hand-editing the fenced metadata block on github.com is supported.** Write paths refuse an unparseable block with a typed error; read paths render the issue with a visible warning instead of silently substituting defaults.
+7. *(orchestrator)* **Reopen policy: the sync loop interprets and never writes.** An issue open on GitHub that carries a terminal status label renders in `backlog` and emits a reopened event. The stale label is repaired on the next Shelbi-initiated write to that issue. Reason: an autonomous write from the sync loop can fight a human who reopened to comment and re-close, and it spends write budget on a cosmetic repair; rendering in backlog forces re-triage without acting.
+8. *(orchestrator)* **Terminal-to-terminal moves are one PATCH** with the status label as authority; GitHub's `state_reason` may lag and is excluded from verification when `state` is unchanged. Reason: a reopen-then-close pair creates a transient open state and a new half-done failure mode, which is the F4 hazard.
+9. *(orchestrator)* **Action reads use a REST conditional GET** (`If-None-Match`, 304 exempt from the budget) on the write budget, and write paths publish the returned issue into cache and index. Board snapshots and deltas stay on GraphQL. REST GETs are logged so before-and-after counts exist. Reason: action reads leave the read budget entirely, so they can never again flap the board index stale as they did overnight on 2026-09-08. **Reverses** the caching plan's "reads move to GraphQL" for the single-issue action path only.
+10. **State placement stays per project** under `~/.shelbi/projects/<name>/`. Several Shelbi projects on one repository is not a supported configuration.
+11. **github.com only.** No GHES host key; GHES stays out of scope.
+12. *(orchestrator)* **`events.log` keeps its exactly-once contract.** The emitter advances its cursor only after a successful append and scans the log tail before appending so a crash between append and cursor advance cannot duplicate a line. No event ids and no consumer-side dedup. Reason: producer and log are on the same machine, so exactly-once is achievable without changing the orchestrator drain or the TUIs.
+13. *(orchestrator)* **Acceptance gates on the solo hub as it runs.** Correctness scenarios are proven with existing fixtures or a named harness; request counts are measured on the live `~/.shelbi/gh-requests.log` before and after. The modelled shared hub is a documented ceiling, not a gate. Reason: a gate that cannot be measured cannot be passed.
+
+### Decisions reversed or reaffirmed by the above
+
+- Retired: pluggable-task-stores D3 (no local cache, no stale data) by decision 1.
+- Reversed: caching plan "reads move to GraphQL" for the single-issue action path only, by decision 9.
+- Reaffirmed: "writes stay REST via `gh api`" (decision 2); "nothing regresses for scripts" and the daemon as a soft dependency (decision 4); per-project state placement (decision 10); "anything that acts on an issue fetches it fresh first" (decisions 1 and 9).
+- Not adopted: Phase D schema changes (sparse ordering, backend-allocated aliases, identity-label removal), the ownership lock and socket command protocol, the durable operation journal, the pending-event queue, credential epochs, and the per-host state file. Each needs its own plan if revisited.
+
+### Delivery shape adopted
+
+Tier 1 from the review §6 is filed as small independent tasks on the `app` track on 2026-09-14, plus the MSRV raise, the `SHELBI_HOME` test guard as a prerequisite, and a `cstore` task for the plan text fixes. Tier 2 (sidebar reconcile into the daemon) waits for the request log to be re-read after Tier 1 has run.
+

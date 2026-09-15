@@ -306,3 +306,16 @@ task before the rename lands.
   `shelbi issue …`, TUI, docs, site). `shelbi task` retained as a thin
   deprecated alias for muscle memory unless dropped later.
 
+
+
+### D3 retired — 2026-09-14 (direction from jlong)
+
+**"Render stale, never act stale."** The 2026-08-31 D3 text ("no local cache, no stale
+data, no board when the tracker is unreachable") no longer describes the product and
+is retired as of 2026-09-14. The daemon-published open-board index is the render
+source; when a refresh fails the last index is served and marked stale rather than
+replaced by an error. The rule that survives is the acting half: anything that acts on
+an issue fetches that issue fresh first, and destructive poller decisions require a
+warm index. Recorded in [[github-issues-robustness-and-performance]] under "Decisions
+recorded 2026-09-14".
+
