@@ -96,17 +96,23 @@ impl BoardRefresher {
     /// Refresh `project` now, blocking on its single-flight lock so a concurrent
     /// tick can't double-read: build the uncached store, publish the index, and
     /// return the outcome (the new `fetched_at` and the change count).
-    fn refresh(&self, project: &str) -> Result<RefreshOutcome> {
+    /// `interval_secs` is the cadence the governor chose for this tick, stamped
+    /// onto the published index so readers compute freshness against the interval
+    /// the daemon was actually ticking at. `None` — a manual `refresh-board` with
+    /// no governor decision in hand — carries the previous index's recorded cadence
+    /// forward rather than resetting it (see [`refresh_with_store`]).
+    fn refresh(&self, project: &str, interval_secs: Option<u64>) -> Result<RefreshOutcome> {
         let lock = self.lock_for(project);
         let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let store = shelbi_state::raw_issue_store_for(project).map_err(|e| anyhow!(e))?;
-        refresh_with_store(project, store.as_ref())
+        refresh_with_store(project, store.as_ref(), interval_secs)
     }
 
     /// Refresh now and return just the new `fetched_at` — the `refresh-board`
-    /// hub verb's reply. The caller waits at most two seconds for it.
+    /// hub verb's reply. The caller waits at most two seconds for it. Carries no
+    /// governor decision, so it passes `None` and the recorded cadence is preserved.
     pub(super) fn refresh_now(&self, project: &str) -> Result<String> {
-        Ok(self.refresh(project)?.fetched_at)
+        Ok(self.refresh(project, None)?.fetched_at)
     }
 
     /// A tick-driven refresh: errors are logged and swallowed, since a single
@@ -121,8 +127,8 @@ impl BoardRefresher {
     /// banner would have no reset time to show until then. `tier` is the token's
     /// last-seen GraphQL budget, resolved once by the manager loop and threaded
     /// in so the tick doesn't re-shell to the keychain.
-    fn tick(&self, project: &str, tier: &BudgetTier) {
-        handle_tick_result(project, self.refresh(project), tier);
+    fn tick(&self, project: &str, tier: &BudgetTier, interval_secs: u64) {
+        handle_tick_result(project, self.refresh(project, Some(interval_secs)), tier);
     }
 }
 
@@ -202,7 +208,11 @@ fn mark_index_stale_from_tier(project: &str, tier: &BudgetTier) {
 /// live freshness signal), but the events.log line is gated on a real change so
 /// a quiet board produces no log noise. Split from the store construction so it
 /// is unit-testable with a fake [`IssueStore`].
-fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOutcome> {
+fn refresh_with_store(
+    project: &str,
+    store: &dyn IssueStore,
+    interval_secs: Option<u64>,
+) -> Result<RefreshOutcome> {
     // The repository identity to stamp on this publish, from the project's tracker
     // config — the same config the store was built from. A read path validates a
     // published index against this and treats a mismatch as no index. In
@@ -231,6 +241,12 @@ fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOu
     // The cold-read schedule timestamp an incremental tick carries forward
     // untouched; a cold read resets it to this tick's `fetched_at` below.
     let prev_cold_read = previous.as_ref().and_then(|p| p.last_cold_read.clone());
+
+    // The refresh cadence to record on this publish. A governed tick passes the
+    // interval the governor chose; a manual `refresh-board` passes `None` and we
+    // carry forward whatever the last governed tick recorded, so a manual refresh
+    // never un-throttles the cadence a reader judges freshness against.
+    let interval_secs = interval_secs.or_else(|| previous.as_ref().and_then(|p| p.interval_secs));
 
     // The `prev_board` slice is the merge base: the board the store folds an
     // incremental delta onto, and the base of the three-way merge below. Owned
@@ -300,6 +316,10 @@ fn refresh_with_store(project: &str, store: &dyn IssueStore) -> Result<RefreshOu
         // `schema_version` is already the current constant (set by `fresh_at`).
         index.repo = expected_repo;
         index.last_cold_read = last_cold_read;
+        // Record the cadence this tick ran at (or the carried-forward value) so
+        // readers derive their staleness threshold from the interval the daemon is
+        // actually ticking at, not the project's configured cadence.
+        index.interval_secs = interval_secs;
         Ok((index, changed))
     })
     .map_err(|e| anyhow!(e))?;
@@ -486,7 +506,10 @@ fn refresh_manager_loop(refresher: &BoardRefresher, stop: &AtomicBool) {
                     }
                     let due = last.get(project).is_none_or(|t| t.elapsed() >= interval);
                     if due {
-                        refresher.tick(project, &tier);
+                        // Stamp the governor's chosen cadence onto the published
+                        // index so readers judge freshness against the interval the
+                        // daemon is actually ticking at, not the configured one.
+                        refresher.tick(project, &tier, interval.as_secs());
                         last.insert(project.clone(), Instant::now());
                     }
                 }
@@ -939,7 +962,7 @@ mod tests {
     fn first_refresh_writes_the_index_and_emits_one_changed_line() {
         let _iso = IsolatedHome::new("first");
         let (store, opens) = fake(vec![issue("a", "todo", 0), issue("b", "review", 0)]);
-        let out = refresh_with_store("proj", &store).unwrap();
+        let out = refresh_with_store("proj", &store, None).unwrap();
         assert_eq!(opens.load(Ordering::SeqCst), 1, "one backend read");
         assert_eq!(out.changed, 2, "a cold first tick counts every issue new");
 
@@ -960,17 +983,56 @@ mod tests {
     }
 
     #[test]
+    fn a_governed_tick_records_the_interval_it_ran_at() {
+        // AC: the published index records the refresh interval the daemon was
+        // actually ticking at when it wrote the file. A governed tick passes the
+        // governor's chosen cadence; it lands on the index verbatim.
+        let _iso = IsolatedHome::new("records-interval");
+        let (store, _) = fake(vec![issue("a", "todo", 0)]);
+        refresh_with_store("proj", &store, Some(120)).unwrap();
+
+        let idx = board_index::read_board_index("proj").expect("index written");
+        assert_eq!(
+            idx.interval_secs,
+            Some(120),
+            "the governed cadence is stamped on the published index"
+        );
+    }
+
+    #[test]
+    fn a_manual_refresh_carries_the_recorded_interval_forward() {
+        // AC: a `refresh-board` request holds no governor decision (interval None),
+        // so it must leave the recorded cadence at the value the last governed tick
+        // wrote rather than resetting it to the configured default. Without the
+        // carry-forward the throttled hub's flicker would return until the next
+        // governed tick.
+        let _iso = IsolatedHome::new("carry-interval");
+        let (store, _) = fake(vec![issue("a", "todo", 0)]);
+        // A governed tick throttled to 120s.
+        refresh_with_store("proj", &store, Some(120)).unwrap();
+        // A manual refresh with no governor decision.
+        refresh_with_store("proj", &store, None).unwrap();
+
+        let idx = board_index::read_board_index("proj").expect("index written");
+        assert_eq!(
+            idx.interval_secs,
+            Some(120),
+            "a manual refresh preserves the last governed cadence, not the configured one"
+        );
+    }
+
+    #[test]
     fn a_quiet_tick_rewrites_the_file_but_emits_no_line() {
         let _iso = IsolatedHome::new("quiet");
         let (store, _) = fake(vec![issue("a", "todo", 0)]);
         // Prime the index.
-        let first = refresh_with_store("proj", &store).unwrap();
+        let first = refresh_with_store("proj", &store, None).unwrap();
         assert_eq!(first.changed, 1);
 
         // Second tick over an unchanged board: no new event, but fetched_at
         // advances so the file stays a live freshness signal.
         std::thread::sleep(Duration::from_millis(5));
-        let second = refresh_with_store("proj", &store).unwrap();
+        let second = refresh_with_store("proj", &store, None).unwrap();
         assert_eq!(second.changed, 0, "an unchanged board reports no change");
         assert_ne!(
             second.fetched_at, first.fetched_at,
@@ -979,7 +1041,7 @@ mod tests {
 
         // A third quiet tick, then assert still exactly one refreshed line
         // total (only the first, changed tick emitted).
-        let third = refresh_with_store("proj", &store).unwrap();
+        let third = refresh_with_store("proj", &store, None).unwrap();
         assert_eq!(third.changed, 0);
         let refreshed = events_lines()
             .into_iter()
@@ -993,12 +1055,12 @@ mod tests {
         let _iso = IsolatedHome::new("changed");
         // Prime with one board.
         let (store, _) = fake(vec![issue("a", "todo", 0)]);
-        refresh_with_store("proj", &store).unwrap();
+        refresh_with_store("proj", &store, None).unwrap();
 
         // Now the board moves: `a` changes column. A fresh store models the
         // next tick reading the moved board.
         let (moved, _) = fake(vec![issue("a", "in_progress", 0)]);
-        let out = refresh_with_store("proj", &moved).unwrap();
+        let out = refresh_with_store("proj", &moved, None).unwrap();
         assert_eq!(out.changed, 1, "one issue moved");
 
         let refreshed = events_lines()
@@ -1017,10 +1079,10 @@ mod tests {
         let (store, seen_since) = fake_with_budget(vec![issue("a", "todo", 0)], (None, None));
 
         // First tick: no prior index ⇒ cold read (`since` is None).
-        let first = refresh_with_store("proj", &store).unwrap();
+        let first = refresh_with_store("proj", &store, None).unwrap();
         // Second tick: the prior index's `fetched_at` becomes the incremental
         // watermark.
-        let second = refresh_with_store("proj", &store).unwrap();
+        let second = refresh_with_store("proj", &store, None).unwrap();
 
         let seen = seen_since.lock().unwrap();
         assert_eq!(seen.len(), 2);
@@ -1050,7 +1112,7 @@ mod tests {
         seed.last_cold_read = Some((now - chrono::Duration::minutes(11)).to_rfc3339());
         shelbi_state::write_board_index("proj", &seed).unwrap();
 
-        refresh_with_store("proj", &store).unwrap();
+        refresh_with_store("proj", &store, None).unwrap();
 
         let seen = seen_since.lock().unwrap();
         assert_eq!(seen.len(), 1);
@@ -1084,7 +1146,7 @@ mod tests {
             .with_timezone(&Utc);
         shelbi_state::write_board_index("proj", &seed).unwrap();
 
-        refresh_with_store("proj", &store).unwrap();
+        refresh_with_store("proj", &store, None).unwrap();
 
         let seen = seen_since.lock().unwrap();
         assert_eq!(
@@ -1115,7 +1177,7 @@ mod tests {
         seed.repo = Some(shelbi_state::github_board_repo("other/repo"));
         shelbi_state::write_board_index("proj", &seed).unwrap();
 
-        refresh_with_store("proj", &store).unwrap();
+        refresh_with_store("proj", &store, None).unwrap();
 
         assert!(
             seen_since.lock().unwrap()[0].is_none(),
@@ -1152,7 +1214,7 @@ mod tests {
 
         // The cold read returns only `keep`; `ghost` vanished from the repository.
         let (store, seen_since) = fake_with_budget(vec![issue("keep", "todo", 0)], (None, None));
-        refresh_with_store("proj", &store).unwrap();
+        refresh_with_store("proj", &store, None).unwrap();
         assert!(seen_since.lock().unwrap()[0].is_none(), "the tick was cold");
 
         let idx = board_index::read_board_index("proj").unwrap();
@@ -1169,7 +1231,7 @@ mod tests {
         let _iso = IsolatedHome::new("budget");
         let (store, _) = fake_with_budget(vec![issue("a", "todo", 0)], (Some(4989), Some(1_800_000_000)));
 
-        refresh_with_store("proj", &store).unwrap();
+        refresh_with_store("proj", &store, None).unwrap();
 
         // The index carries the GraphQL budget the read reported.
         let idx = board_index::read_board_index("proj").expect("index written");
@@ -1191,9 +1253,9 @@ mod tests {
         // Several ticks (cold then incremental) must issue zero closed reads.
         let _iso = IsolatedHome::new("no-closed");
         let (store, closeds) = fake_with_closed_counter(vec![issue("a", "todo", 0)]);
-        refresh_with_store("proj", &store).unwrap();
-        refresh_with_store("proj", &store).unwrap();
-        refresh_with_store("proj", &store).unwrap();
+        refresh_with_store("proj", &store, None).unwrap();
+        refresh_with_store("proj", &store, None).unwrap();
+        refresh_with_store("proj", &store, None).unwrap();
         assert_eq!(
             closeds.load(Ordering::SeqCst),
             0,
@@ -1297,7 +1359,7 @@ issue_tracker:\n\
 
         // (1) WARM: a good tick publishes the index; the board reads Warm with a
         // plain `board …` banner and no stale/quota clause.
-        handle_tick_result("proj", refresh_with_store("proj", &store), &healthy);
+        handle_tick_result("proj", refresh_with_store("proj", &store, None), &healthy);
         let report = shelbi_state::read_board_report("proj").unwrap();
         assert!(
             matches!(report.state, shelbi_state::BoardState::Warm(_)),
@@ -1312,7 +1374,7 @@ issue_tracker:\n\
         // `quota resets HH:MM` instead of collapsing.
         fail.store(true, Ordering::SeqCst);
         let parked = tier(Some(50), Some(reset), Some(reset));
-        handle_tick_result("proj", refresh_with_store("proj", &store), &parked);
+        handle_tick_result("proj", refresh_with_store("proj", &store, None), &parked);
         let report = shelbi_state::read_board_report("proj").unwrap();
         match &report.state {
             shelbi_state::BoardState::Stale(board) => {
@@ -1354,7 +1416,7 @@ issue_tracker:\n\
             matches!(governor_plan_from_tier("proj", &healthy, now), TickPlan::Refresh(_)),
             "a healthy budget refreshes"
         );
-        handle_tick_result("proj", refresh_with_store("proj", &store), &healthy);
+        handle_tick_result("proj", refresh_with_store("proj", &store, None), &healthy);
         let report = shelbi_state::read_board_report("proj").unwrap();
         assert!(
             matches!(report.state, shelbi_state::BoardState::Warm(_)),
@@ -1387,7 +1449,7 @@ issue_tracker:\n\
         let healthy = tier(Some(4_000), Some(reset), None);
 
         // Prime a good index — a healthy tick records no error.
-        handle_tick_result("proj", refresh_with_store("proj", &store), &healthy);
+        handle_tick_result("proj", refresh_with_store("proj", &store, None), &healthy);
         assert!(
             shelbi_state::read_board_refresh_error("proj").is_none(),
             "a healthy tick leaves no recorded error"
@@ -1396,7 +1458,7 @@ issue_tracker:\n\
         // Three consecutive failing ticks = one episode.
         fail.store(true, Ordering::SeqCst);
         for _ in 0..3 {
-            handle_tick_result("proj", refresh_with_store("proj", &store), &healthy);
+            handle_tick_result("proj", refresh_with_store("proj", &store, None), &healthy);
         }
         let err = shelbi_state::read_board_refresh_error("proj").expect("error recorded");
         assert!(!err.error.is_empty(), "error text is recorded: {err:?}");
@@ -1415,7 +1477,7 @@ issue_tracker:\n\
 
         // Recovery clears the recorded error.
         fail.store(false, Ordering::SeqCst);
-        handle_tick_result("proj", refresh_with_store("proj", &store), &healthy);
+        handle_tick_result("proj", refresh_with_store("proj", &store, None), &healthy);
         assert!(
             shelbi_state::read_board_refresh_error("proj").is_none(),
             "a successful tick clears the recorded error"
@@ -1423,7 +1485,7 @@ issue_tracker:\n\
 
         // A new failure after recovery is a new episode → warns again.
         fail.store(true, Ordering::SeqCst);
-        handle_tick_result("proj", refresh_with_store("proj", &store), &healthy);
+        handle_tick_result("proj", refresh_with_store("proj", &store, None), &healthy);
         let failed_again = events_lines()
             .into_iter()
             .filter(|l| l.contains("board refresh-failed"))
@@ -1588,7 +1650,7 @@ issue_tracker:\n\
             proceed_tx.send(()).unwrap(); // let the stalled read return
         });
 
-        refresh_with_store("proj", &store).unwrap();
+        refresh_with_store("proj", &store, None).unwrap();
         writer.join().unwrap();
 
         assert_eq!(
@@ -1631,7 +1693,7 @@ issue_tracker:\n\
                 .unwrap();
             }),
         };
-        refresh_with_store("proj", &store).unwrap();
+        refresh_with_store("proj", &store, None).unwrap();
 
         let idx = shelbi_state::read_board_index("proj").unwrap();
         assert!(
@@ -1667,7 +1729,7 @@ issue_tracker:\n\
                 .unwrap();
             }),
         };
-        refresh_with_store("proj", &store).unwrap();
+        refresh_with_store("proj", &store, None).unwrap();
 
         let idx = shelbi_state::read_board_index("proj").unwrap();
         let by_id = |id: &str| idx.board.iter().find(|f| f.task.id == id);

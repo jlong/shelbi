@@ -5848,6 +5848,9 @@ Intro prose.
             remaining: None,
             reset: None,
             rest_fallback: false,
+            // No recorded cadence: freshness falls back to the configured interval,
+            // but this index is explicitly flagged stale so age never matters here.
+            interval_secs: None,
             // Stamp the matching identity so this reads as genuinely Stale (the
             // state under test), not Cold-by-identity-mismatch.
             repo: Some(shelbi_state::github_board_repo("owner/repo")),
