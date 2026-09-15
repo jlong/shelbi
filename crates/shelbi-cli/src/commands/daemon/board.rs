@@ -282,6 +282,23 @@ fn refresh_with_store(
     let fetched_at_return = fetched_at.clone();
     let remaining_return = read.remaining;
 
+    // The reopened issues to announce on this tick: those the read observed open
+    // on GitHub while still carrying a terminal `shelbi:status/*` label, minus
+    // any already on the previous open index. Computed *before* the publish
+    // closure moves `read` and `prev_board`. Interpretation only — no write, no
+    // label repair, no `gh` mutation (decision 7). The dedup key is presence on
+    // the previous open index, so two known gaps re-announce once: an issue that
+    // was already open when the terminal label appeared (a human labeling an
+    // open backlog card) is never announced, and a cold read with no prior index
+    // (a daemon restart with a deleted `board-index.json`) re-announces. Closing
+    // either needs persistent per-id state, out of scope here.
+    let reopened_to_emit: Vec<(String, String)> = read
+        .reopened
+        .iter()
+        .filter(|(id, _)| !prev_board.iter().any(|tf| tf.task.id == *id))
+        .cloned()
+        .collect();
+
     // Publish inside the board-index lock, reconciling the read against the index
     // as re-read *under* the lock (`fresh`) rather than against the pre-call copy,
     // so a write-through that landed while the read was in flight is not lost. The
@@ -326,6 +343,11 @@ fn refresh_with_store(
 
     if changed > 0 {
         emit_board_refreshed(project, &fetched_at_return, changed, remaining_return);
+    }
+    // Announce each newly-observed reopen, independent of `changed`. Best-effort,
+    // and no store call — the loop stays read-only against GitHub.
+    for (id, status) in &reopened_to_emit {
+        emit_board_reopened(project, id, status);
     }
     Ok(RefreshOutcome {
         fetched_at: fetched_at_return,
@@ -462,6 +484,22 @@ fn emit_board_refreshed(project: &str, fetched_at: &str, changed: usize, remaini
     }
     if let Err(e) = shelbi_state::append_external_event(&body) {
         tracing::debug!(project, error = %e, "shelbi daemon: failed to append board-refreshed event");
+    }
+}
+
+/// Append the `board reopened issue=<id> status=<stale-terminal-status>` line
+/// for `project` — a human pulled a terminal issue back open on github.com and
+/// the board renders it in `backlog`, so this line is the only signal the
+/// orchestrator gets that a reopen happened (decision 7). `issue=` and not
+/// `task=` so [`shelbi_state::EventKind::from_body`] classifies it as
+/// `Project` (the bucket the `board refreshed=` line also lands in) rather than
+/// a task transition. Best-effort: a failed append is logged, never propagated
+/// — the index file is the durable artifact, the event is the orchestrator's
+/// nudge. Emits no `gh` mutation and no label repair.
+fn emit_board_reopened(project: &str, id: &str, status: &str) {
+    let body = format!("project={project} board reopened issue={id} status={status}");
+    if let Err(e) = shelbi_state::append_external_event(&body) {
+        tracing::debug!(project, error = %e, "shelbi daemon: failed to append board-reopened event");
     }
 }
 
@@ -684,6 +722,10 @@ mod tests {
         /// board — the integration test's stand-in for a live 403/429 from the
         /// GraphQL reader, so the daemon's failed-tick path can be driven.
         fail: Arc<AtomicBool>,
+        /// The `(shelbi id, stale terminal status id)` pairs `refresh_board`
+        /// surfaces as [`shelbi_state::BoardRead::reopened`], so a test can drive
+        /// the daemon's reopened-event path. Empty by default.
+        reopened: Vec<(String, String)>,
     }
 
     fn issue(id: &str, column: &str, priority: u32) -> IssueFile {
@@ -771,6 +813,7 @@ mod tests {
                 remaining: self.budget.0,
                 reset: self.budget.1,
                 rest_fallback: false,
+                reopened: self.reopened.clone(),
             })
         }
         fn list_in_status(&self, status: &Column) -> CoreResult<Vec<IssueFile>> {
@@ -891,6 +934,7 @@ mod tests {
                 seen_since: Arc::new(Mutex::new(Vec::new())),
                 budget: (None, None),
                 fail: Arc::new(AtomicBool::new(false)),
+                reopened: Vec::new(),
             },
             opens,
         )
@@ -908,6 +952,7 @@ mod tests {
                 seen_since: Arc::new(Mutex::new(Vec::new())),
                 budget: (Some(4_000), Some(1_800_000_000)),
                 fail: Arc::clone(&fail),
+                reopened: Vec::new(),
             },
             fail,
         )
@@ -925,7 +970,32 @@ mod tests {
                 seen_since: Arc::new(Mutex::new(Vec::new())),
                 budget: (None, None),
                 fail: Arc::new(AtomicBool::new(false)),
+                reopened: Vec::new(),
             },
+            closeds,
+        )
+    }
+
+    /// A fake reporting a fixed set of reopened-with-terminal-label pairs, plus
+    /// its `opens` and `closeds` counters, so a test can drive the daemon's
+    /// reopened-event path and prove the tick makes no extra backend call.
+    fn fake_reopened(
+        board: Vec<IssueFile>,
+        reopened: Vec<(String, String)>,
+    ) -> (FakeStore, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let closeds = Arc::new(AtomicUsize::new(0));
+        (
+            FakeStore {
+                board,
+                opens: Arc::clone(&opens),
+                closeds: Arc::clone(&closeds),
+                seen_since: Arc::new(Mutex::new(Vec::new())),
+                budget: (None, None),
+                fail: Arc::new(AtomicBool::new(false)),
+                reopened,
+            },
+            opens,
             closeds,
         )
     }
@@ -947,6 +1017,7 @@ mod tests {
                 seen_since: Arc::clone(&seen_since),
                 budget,
                 fail: Arc::new(AtomicBool::new(false)),
+                reopened: Vec::new(),
             },
             seen_since,
         )
@@ -956,6 +1027,43 @@ mod tests {
         std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
             .map(|s| s.lines().map(str::to_string).collect())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn refresh_emits_one_reopened_line_once_and_makes_no_extra_backend_call() {
+        let _iso = IsolatedHome::new("reopened");
+        // The reopened issue renders in `backlog` (the status-move mapping);
+        // `b` is an ordinary card. The store surfaces the one reopened pair.
+        let board = vec![issue("r", "backlog", 0), issue("b", "todo", 0)];
+        let (store, opens, closeds) =
+            fake_reopened(board, vec![("r".to_string(), "done".to_string())]);
+
+        // First tick: exactly one reopened line, carrying the project, the id and
+        // the stale terminal status.
+        refresh_with_store("proj", &store, None).unwrap();
+        let lines: Vec<String> = events_lines()
+            .into_iter()
+            .filter(|l| l.contains("board reopened issue="))
+            .collect();
+        assert_eq!(lines.len(), 1, "one reopened line on the first tick");
+        let line = &lines[0];
+        assert!(line.contains("project=proj"), "carries the project: {line}");
+        assert!(line.contains("issue=r"), "carries the id: {line}");
+        assert!(line.contains("status=done"), "carries the stale status: {line}");
+
+        // Second tick over the same board and now-primed index: `r` is on the
+        // previous open board, so the dedup suppresses a second line.
+        refresh_with_store("proj", &store, None).unwrap();
+        let after = events_lines()
+            .into_iter()
+            .filter(|l| l.contains("board reopened issue="))
+            .count();
+        assert_eq!(after, 1, "the primed index suppresses a second reopened line");
+
+        // Read-only against the backend: one open read per tick, never a
+        // closed-history read.
+        assert_eq!(opens.load(Ordering::SeqCst), 2, "one backend open read per tick");
+        assert_eq!(closeds.load(Ordering::SeqCst), 0, "no closed-history read");
     }
 
     #[test]
@@ -1527,6 +1635,7 @@ issue_tracker:\n\
                 remaining: None,
                 reset: None,
                 rest_fallback: self.rest_fallback,
+                reopened: Vec::new(),
             })
         }
         fn list_in_status(&self, status: &Column) -> CoreResult<Vec<IssueFile>> {

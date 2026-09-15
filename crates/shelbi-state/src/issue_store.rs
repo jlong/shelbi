@@ -361,6 +361,13 @@ pub struct BoardRead {
     /// report which read path is active (Phase 3 §6). `false` on the GraphQL
     /// path, and on backends with no notion of a fallback (filesystem, cache).
     pub rest_fallback: bool,
+    /// Issues observed **open on GitHub while carrying a terminal
+    /// `shelbi:status/*` label** during this read, as `(shelbi id, stale
+    /// terminal status id)` pairs. Interpretation only: the sync loop emits a
+    /// `reopened` event for these and never writes to GitHub (decision 7).
+    /// Empty for every backend that cannot see GitHub state (the filesystem
+    /// board, the process cache) and on the REST fallback path.
+    pub reopened: Vec<(String, String)>,
 }
 
 /// One lazily-fetched page of the terminal `done`/`canceled` history
@@ -542,6 +549,8 @@ pub trait IssueStore {
             remaining: None,
             reset: None,
             rest_fallback: false,
+            // A backend with no view of GitHub state cannot observe a reopen.
+            reopened: Vec::new(),
         })
     }
 
