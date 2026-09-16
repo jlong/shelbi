@@ -1025,33 +1025,45 @@ fn resolve_move_target(workflow: &Workflow, to: &str) -> Result<Column> {
 /// be loaded or has no active-category status (legacy workflows without
 /// the two-field design); the worktree's agent context still deploys so
 /// the bundled developer prompt + skills are wired up correctly.
-/// The required workspace tags of the issue's workflow active status — the
-/// set a workspace's effective tags must be a superset of to take this issue
-/// (see the tag-routing check in [`start`]). Empty when the workflow has no
-/// active status or that status declares no `tags:`.
+/// The workflow status `shelbi issue start` lands a card in: the canonical
+/// `in-progress`, resolved by **exact id**, with a fallback to the workflow's
+/// first active-category status for a legacy/renamed workflow that doesn't
+/// declare `in-progress`. `start` always moves the card to
+/// [`Column::in_progress`], so this status's `agent:` / `tags:` are the ones
+/// that govern the spawned pane — resolving by exact id keeps a workflow that
+/// declares a custom active status *before* `in-progress` from mis-resolving
+/// to that earlier status.
+fn start_destination_status(workflow: &Workflow) -> Option<&shelbi_core::WorkflowStatus> {
+    workflow
+        .status(Column::in_progress().as_str())
+        .or_else(|| {
+            workflow
+                .statuses
+                .iter()
+                .find(|s| s.category == StatusCategory::Active)
+        })
+}
+
+/// The required workspace tags of the status `issue start` lands the card in —
+/// the set a workspace's effective tags must be a superset of to take this
+/// issue (see the tag-routing check in [`start`]). Empty when the workflow has
+/// no such status or it declares no `tags:`.
 fn required_active_tags(project: &str, issue: &Issue) -> Result<std::collections::BTreeSet<String>> {
-    use shelbi_core::StatusCategory;
     let workflow = resolve_task_workflow(project, issue)?;
-    Ok(workflow
-        .statuses
-        .iter()
-        .find(|s| s.category == StatusCategory::Active)
+    Ok(start_destination_status(&workflow)
         .map(|s| s.tags.iter().cloned().collect())
         .unwrap_or_default())
 }
 
 fn resolve_active_agent_for_dispatch(project: &str, issue: &Issue) -> Result<String> {
-    use shelbi_core::StatusCategory;
     use shelbi_orchestrator::dispatch::{resolve_dispatch_agent, DispatchDecision};
     use shelbi_state::DEVELOPER_AGENT;
 
     let workflow = resolve_task_workflow(project, issue)?;
-    // The active-category status is what the issue lands in after `issue
-    // start` — its `agent:` field is the runner we want spawned.
-    let active = workflow
-        .statuses
-        .iter()
-        .find(|s| s.category == StatusCategory::Active);
+    // The status `issue start` lands the card in (canonical `in-progress`,
+    // resolved by exact id) is what governs the spawned pane — its `agent:`
+    // field is the runner we want.
+    let active = start_destination_status(&workflow);
 
     let zen_on = matches!(
         shelbi_state::read_state(project).map(|s| s.zen_mode),

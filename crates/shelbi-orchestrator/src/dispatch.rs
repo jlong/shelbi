@@ -91,12 +91,22 @@ pub fn resolve_dispatch_agent(status: &WorkflowStatus, zen_on: bool) -> Dispatch
     }
 }
 
-/// Resolve which agent should drive `task` in its active (in-progress)
-/// status, for a re-dispatch that isn't an explicit CLI invocation (the
-/// supervisor's automatic pane relaunch). Infallible: any failure to load
-/// the workflow, a workflow with no active-category status, or a status the
-/// resolver would `Skip` all fall back to the bundled `developer` agent so
-/// the relaunch still deploys *some* agent context into the worktree.
+/// Resolve which agent should drive `task` in the active status it is
+/// **currently** sitting in, for a re-dispatch that isn't an explicit CLI
+/// invocation (the supervisor's automatic pane relaunch). Infallible: any
+/// failure to load the workflow, a workflow with no active-category status, or
+/// a status the resolver would `Skip` all fall back to the bundled `developer`
+/// agent so the relaunch still deploys *some* agent context into the worktree.
+///
+/// The card is resolved by its **exact status id** first: a task parked in a
+/// custom agent-owned active status (e.g. a `review-app` gate declared between
+/// `in-progress` and `review`) must re-dispatch as *that* status's agent, not
+/// the workflow's first active status. Only when the current status isn't
+/// declared in the workflow, or resolves to no dispatchable agent, do we fall
+/// back to the first active-category status (the canonical `in-progress` in the
+/// default workflow) and then to the bundled developer. Keying off the first
+/// active status alone was the dispatch half of the custom-active-status bug:
+/// a relaunch of a `review-app` pane would silently come back as the developer.
 ///
 /// Mirrors the CLI's `resolve_active_agent_for_dispatch` but stays quiet
 /// (no stderr diagnostics — there's no human at a prompt) and reads the
@@ -110,6 +120,26 @@ pub fn resolve_active_agent(project_name: &str, task: &Issue) -> String {
         shelbi_state::read_state(project_name).map(|s| s.zen_mode),
         Ok(shelbi_state::ZenModeState::On),
     );
+    resolve_active_agent_in(&workflow, task.column.as_str(), zen_on)
+}
+
+/// The pure re-dispatch decision behind [`resolve_active_agent`]: given a
+/// resolved workflow, the id of the status the card is currently in, and the
+/// project's Zen state, pick the agent to relaunch as. Split out with no I/O so
+/// the exact-id-then-first-active fallback ladder is unit-testable without a
+/// `SHELBI_HOME` fixture (matching this module's testability contract).
+fn resolve_active_agent_in(
+    workflow: &shelbi_core::Workflow,
+    current_status_id: &str,
+    zen_on: bool,
+) -> String {
+    // Exact-id first: the status the card is actually in wins over the
+    // workflow's first active status.
+    if let Some(status) = workflow.status(current_status_id) {
+        if let DispatchDecision::Dispatch { agent } = resolve_dispatch_agent(status, zen_on) {
+            return agent;
+        }
+    }
     let active = workflow
         .statuses
         .iter()
@@ -289,6 +319,84 @@ statuses:
             Some(v) => std::env::set_var("SHELBI_HOME", v),
             None => std::env::remove_var("SHELBI_HOME"),
         }
+    }
+
+    /// A workflow with two active statuses: the canonical `in-progress` and a
+    /// custom agent-owned `review-app` gate, mirroring the documented
+    /// intermediate-agent workflow (statuses.yaml + workflow reference form).
+    fn two_active_workflow() -> shelbi_core::Workflow {
+        shelbi_core::Workflow::from_yaml_str(
+            r#"
+name: task
+statuses:
+  - { id: backlog,     name: Backlog,    category: backlog, owner: user,  agent: orchestrator }
+  - { id: todo,        name: Todo,       category: ready,   owner: agent, agent: orchestrator }
+  - { id: in-progress, name: InProgress, category: active,  owner: agent, agent: developer    }
+  - { id: review-app,  name: ReviewApp,  category: active,  owner: agent, agent: review-app   }
+  - { id: review,      name: Review,     category: handoff, owner: user,  agent: review       }
+  - { id: done,        name: Done,       category: done,    owner: user                       }
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn re_dispatch_resolves_custom_active_status_by_exact_id() {
+        // A card parked in the custom `review-app` gate must re-dispatch as the
+        // `review-app` agent — NOT the workflow's first active status
+        // (`in-progress` → developer). This is the dispatch half of the
+        // custom-active-status bug.
+        let wf = two_active_workflow();
+        assert_eq!(
+            resolve_active_agent_in(&wf, "review-app", false),
+            "review-app",
+        );
+        // Zen state doesn't change an owner:agent status's answer.
+        assert_eq!(
+            resolve_active_agent_in(&wf, "review-app", true),
+            "review-app",
+        );
+    }
+
+    #[test]
+    fn re_dispatch_resolves_in_progress_to_developer() {
+        // The canonical active status still resolves to its own agent by exact
+        // id — the first-active fallback is not what answers here.
+        let wf = two_active_workflow();
+        assert_eq!(
+            resolve_active_agent_in(&wf, "in-progress", false),
+            "developer",
+        );
+    }
+
+    #[test]
+    fn re_dispatch_falls_back_to_first_active_for_unknown_status() {
+        // A status id the workflow doesn't declare (stale board state) falls
+        // back to the first active status (`in-progress` → developer).
+        let wf = two_active_workflow();
+        assert_eq!(resolve_active_agent_in(&wf, "ghost", false), "developer");
+    }
+
+    #[test]
+    fn re_dispatch_falls_back_when_current_status_is_not_dispatchable() {
+        // Sitting in a terminal / non-dispatchable status (owner:user, no
+        // agent) falls back to the first active status rather than returning
+        // no agent.
+        let wf = two_active_workflow();
+        assert_eq!(resolve_active_agent_in(&wf, "done", false), "developer");
+    }
+
+    #[test]
+    fn exact_id_forward_and_bounce_transitions_stay_valid() {
+        // Acceptance criterion (5): a custom active status's exact-id forward
+        // (`review-app -> review`) and bounce (`review-app -> in-progress`)
+        // transitions remain legal moves (any-to-any among declared ids).
+        let wf = two_active_workflow();
+        assert!(wf.transition_allowed("review-app", "review"));
+        assert!(wf.transition_allowed("review-app", "in-progress"));
+        assert!(wf.transition_allowed("in-progress", "review-app"));
+        // An undeclared id is still rejected.
+        assert!(!wf.transition_allowed("review-app", "ghost"));
     }
 
     #[test]

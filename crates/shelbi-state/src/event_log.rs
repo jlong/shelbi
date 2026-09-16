@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use shelbi_core::{Column, IntegrationMode, Result, DEFAULT_WORKFLOW_NAME};
+use shelbi_core::{Column, IntegrationMode, Result, StatusCategory, DEFAULT_WORKFLOW_NAME};
 
 use crate::workspace_status::WorkspaceState;
 use crate::{
@@ -1498,7 +1498,17 @@ pub fn append_task_event(
     to: Column,
     reason: &str,
 ) -> Result<()> {
-    write_task_event_line(&task_event_body(project, task_id, workflow, from, to, reason))
+    let (from_category, to_category) = resolve_move_categories(project, &from, &to);
+    write_task_event_line(&task_event_body(
+        project,
+        task_id,
+        workflow,
+        from,
+        to,
+        reason,
+        from_category,
+        to_category,
+    ))
 }
 
 /// The marker token appended to a task-move event line when the move
@@ -1522,9 +1532,19 @@ pub fn append_task_event_actions_skipped(
     to: Column,
     reason: &str,
 ) -> Result<()> {
+    let (from_category, to_category) = resolve_move_categories(project, &from, &to);
     let body = format!(
         "{} {ACTIONS_SKIPPED_MARKER}",
-        task_event_body(project, task_id, workflow, from, to, reason)
+        task_event_body(
+            project,
+            task_id,
+            workflow,
+            from,
+            to,
+            reason,
+            from_category,
+            to_category,
+        )
     );
     write_task_event_line(&body)
 }
@@ -1567,7 +1587,17 @@ pub fn append_github_merge_reconcile_event(
     merge_sha: Option<&str>,
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
-    let base = task_event_body(project, task_id, workflow, from, to, GITHUB_MERGE_RECONCILE_CAUSE);
+    let (from_category, to_category) = resolve_move_categories(project, &from, &to);
+    let base = task_event_body(
+        project,
+        task_id,
+        workflow,
+        from,
+        to,
+        GITHUB_MERGE_RECONCILE_CAUSE,
+        from_category,
+        to_category,
+    );
     let sha = sanitize_field(merge_sha.unwrap_or("-"));
     let body = format!("{base} pr={pr} sha={sha}");
     let line = format!("{ts} {body}");
@@ -1708,6 +1738,18 @@ pub fn append_task_edit_event(
 /// through [`EventEnvelope::from_log_line`] rather than a hand-typed
 /// approximation. Every interpolated field is sanitized the same way the
 /// append path always has.
+///
+/// The `from_category` / `to_category` annotations are supplied by the caller
+/// rather than derived from the columns here: the authoritative category for a
+/// *custom* status lives in `workflows/statuses.yaml`, not in the stock-id
+/// fallback [`Column::category`] knows about. Keeping this function free of the
+/// catalog lookup keeps it a pure formatter (no filesystem I/O), so the append
+/// path resolves the pair via [`resolve_move_categories`] and the contract
+/// tests can pass the categories they intend to pin.
+// Eight flat fields, one per token of the wire line — grouping them into a
+// struct would only obscure the one-to-one mapping this formatter exists to
+// make obvious.
+#[allow(clippy::too_many_arguments)]
 pub fn task_event_body(
     project: &str,
     task_id: &str,
@@ -1715,6 +1757,8 @@ pub fn task_event_body(
     from: Column,
     to: Column,
     reason: &str,
+    from_category: StatusCategory,
+    to_category: StatusCategory,
 ) -> String {
     let project = sanitize_field(project);
     let task_id = sanitize_field(task_id);
@@ -1724,12 +1768,42 @@ pub fn task_event_body(
     } else {
         sanitize_field(workflow)
     };
-    let from_category = from.category();
-    let to_category = to.category();
     format!(
         "project={project} task={task_id} workflow={workflow_name} {from} -> {to} \
          reason={reason} from_category={from_category} to_category={to_category}"
     )
+}
+
+/// Resolve the semantic [`StatusCategory`] pair for a `from -> to` task move,
+/// consulting the project's `workflows/statuses.yaml` catalog — the single
+/// source of truth for a custom status's category.
+///
+/// A task's board position is its exact status id, and a custom id (e.g. an
+/// agent-owned `review-app` gate declared with `category: active`) is known
+/// only to `statuses.yaml`; the stock-id fallback in [`Column::category`]
+/// deliberately maps every unrecognized id to `backlog`. Categorizing the
+/// event with that fallback loses the custom status's real category — the
+/// symptom this resolver exists to fix (`to_category=backlog` for a move into
+/// an `active` gate).
+///
+/// Best-effort: any id the catalog doesn't declare, and the case where the
+/// catalog can't be loaded at all, fall back to [`Column::category`] so a
+/// well-known stock move is still categorized correctly even before a project
+/// materializes its statuses file.
+fn resolve_move_categories(
+    project: &str,
+    from: &Column,
+    to: &Column,
+) -> (StatusCategory, StatusCategory) {
+    let catalog = crate::load_project_statuses(project).ok();
+    let resolve = |col: &Column| {
+        catalog
+            .as_ref()
+            .and_then(|ps| ps.get(col.as_str()))
+            .map(|s| s.category)
+            .unwrap_or_else(|| col.category())
+    };
+    (resolve(from), resolve(to))
 }
 
 /// Append `<rfc3339> project=<name> <action> reason=<reason>` to
@@ -3428,6 +3502,111 @@ mod tests {
     }
 
     #[test]
+    fn task_event_categorizes_custom_active_status_from_the_catalog() {
+        use shelbi_core::{ProjectStatus, ProjectStatuses};
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // The documented intermediate-agent set: a custom `review-app` gate
+        // carrying `category: active`, declared between `in-progress` and
+        // `review`.
+        let statuses = ProjectStatuses {
+            statuses: vec![
+                ProjectStatus {
+                    id: "backlog".into(),
+                    name: "Backlog".into(),
+                    category: StatusCategory::Backlog,
+                },
+                ProjectStatus {
+                    id: "todo".into(),
+                    name: "Todo".into(),
+                    category: StatusCategory::Ready,
+                },
+                ProjectStatus {
+                    id: "in-progress".into(),
+                    name: "In Progress".into(),
+                    category: StatusCategory::Active,
+                },
+                ProjectStatus {
+                    id: "review-app".into(),
+                    name: "Review App".into(),
+                    category: StatusCategory::Active,
+                },
+                ProjectStatus {
+                    id: "review".into(),
+                    name: "Review".into(),
+                    category: StatusCategory::Handoff,
+                },
+                ProjectStatus {
+                    id: "done".into(),
+                    name: "Done".into(),
+                    category: StatusCategory::Done,
+                },
+            ],
+        };
+        crate::save_project_statuses("demo", &statuses).unwrap();
+
+        // Move a card `review -> review-app` (a bounce left into the custom
+        // active gate) — the exact reproduction from the bug report.
+        append_task_event(
+            "demo",
+            "web-8895",
+            "task",
+            Column::review(),
+            Column::from_status_id("review-app"),
+            "user:tui",
+        )
+        .unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        assert!(log.contains("review -> review-app"), "log: {log}");
+        assert!(
+            log.contains(" from_category=handoff "),
+            "from_category should resolve `review` -> handoff from the catalog; log: {log}"
+        );
+        // Regression: this used to read `to_category=backlog` because the
+        // custom id fell through Column::category()'s stock-only fallback,
+        // losing the gate's real `active` category while writing the event.
+        assert!(
+            log.contains(" to_category=active"),
+            "to_category should resolve the custom `review-app` -> active from \
+             the catalog, not fall back to backlog; log: {log}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn task_event_categories_fall_back_to_stock_mapping_without_a_catalog() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // No statuses.yaml written: load_project_statuses returns the default
+        // catalog, so a stock move still categorizes correctly.
+        append_task_event(
+            "demo",
+            "t1",
+            "task",
+            Column::in_progress(),
+            Column::review(),
+            "user:tui",
+        )
+        .unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        assert!(
+            log.contains(" from_category=active ") && log.contains(" to_category=handoff"),
+            "stock in-progress -> review must categorize active -> handoff; log: {log}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn events_log_rotates_when_over_size() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
@@ -4963,6 +5142,8 @@ mod tests {
             Column::in_progress(),
             Column::review(),
             READY_MARKER_HANDOFF_CAUSE,
+            StatusCategory::Active,
+            StatusCategory::Handoff,
         );
         // Prefix a timestamp exactly as the append path does, then parse the
         // whole record back through the shipping parser.
