@@ -1166,6 +1166,63 @@ workspaces:
     }
 
     #[test]
+    fn un_upgraded_orchestrator_instructions_surface_the_active_dispatch_finding() {
+        // An existing project whose forked orchestrator `instructions.md`
+        // predates the agent-owned active dispatch rule: the boot `detect` pass
+        // must route it through `sniff_orchestrator_active_dispatch` and surface
+        // a NeedsJudgment finding, so the orchestrator refreshes its own copy
+        // (the shipped-template edit alone reaches only NEW projects). Proves the
+        // sniffer is wired into `sniff_entry`, not just callable in isolation.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        std::fs::write(home.join("projects/demo.yaml"), "repo: /tmp/demo\n").unwrap();
+        let orch_dir = home.join("projects/demo/agents/orchestrator");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        // A pre-fix orchestrator prompt: `Reaction rules` present, but the
+        // section never keys on an `active` move.
+        std::fs::write(
+            orch_dir.join("instructions.md"),
+            "# Orchestrator\n\n## Reaction rules\n\n- `task=<id> ... to_category=ready \
+             reason=user:*` → dispatch a free workspace.\n- `task=<id> ... to_category=handoff` \
+             → reload the freed slot.\n",
+        )
+        .unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.code == "ORCH_AGENT_OWNED_ACTIVE_DISPATCH_MISSING")
+            .expect("un-upgraded orchestrator instructions should surface the finding");
+        assert_eq!(finding.classification, super::Classification::NeedsJudgment);
+        assert!(
+            !finding.rationale.is_empty(),
+            "a needs-judgment finding needs a rationale for the orchestrator to act on",
+        );
+
+        // The current shipped default carries the rule, so refreshing the file
+        // to it clears the finding (idempotent, no re-surfacing).
+        std::fs::write(
+            orch_dir.join("instructions.md"),
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+        )
+        .unwrap();
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report2
+                .findings
+                .iter()
+                .any(|f| f.code == "ORCH_AGENT_OWNED_ACTIVE_DISPATCH_MISSING"),
+            "shipped default still trips the sniffer: {:?}",
+            report2.findings.iter().map(|f| &f.code).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
     fn workflow_default_and_statuses_ids_heal_on_start() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = fresh_home();

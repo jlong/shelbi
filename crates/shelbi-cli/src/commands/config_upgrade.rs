@@ -434,6 +434,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_developer_instructions(entry, &text, out);
     } else if id.ends_with(".agent.orchestrator.instructions") {
         sniff_orchestrator_instructions(entry, &text, out);
+        sniff_orchestrator_active_dispatch(entry, &text, out);
         sniff_deprecated_task_command(entry, &text, out);
     } else if id.ends_with(".zenmode") {
         sniff_deprecated_task_command(entry, &text, out);
@@ -1108,6 +1109,64 @@ fn sniff_orchestrator_instructions(
             "Refresh the section to exclude `review`-tagged workspaces from auto-dispatch (an \
              idle review slot is not dev capacity) — mirror the shipped default template.",
             locate_line(text, FREE_WORKSPACE_SECTION_HEADING),
+        ));
+    }
+}
+
+/// The reaction-rules section whose body must cover dispatching an agent-owned
+/// active status. Shared with the drift-guard test so the sniff and the shipped
+/// default can never disagree about the heading it keys on.
+pub(crate) const REACTION_RULES_SECTION_HEADING: &str = "## Reaction rules";
+
+/// Marker the agent-owned-active dispatch rule necessarily carries: the `active`
+/// move it keys on. Absent from every pre-fix reaction-rules section (which only
+/// covered `ready`/`handoff`/`ci`/workspace lines), present in the shipped
+/// default once the rule lands. Kept in sync with the template by the drift
+/// guard in this module's tests.
+const ORCH_ACTIVE_DISPATCH_MARKER: &str = "to_category=active";
+
+/// Sniff an orchestrator `instructions.md` for the reaction rule that
+/// auto-dispatches an agent-owned **active** status — an intermediate gate like
+/// `adversarial-review` (declared `owner: agent` + `category: active` between
+/// `in-progress` and `review`) that a card reaches from `handoff`/`in-progress`.
+///
+/// A default change (a card entering an `owner: agent` active status launches
+/// that status's agent, the same way a `ready` issue does, and the prior
+/// workspace is released rather than orphaned) only reaches NEW projects via the
+/// shipped template; existing projects carry their own copy of the instructions,
+/// so this sniffer hands the orchestrator a boot finding to refresh it (per the
+/// AGENTS.md "Changing shipped defaults" guardrail — a default change needs a
+/// sniffer to reach existing installs).
+///
+/// An **absence** sniff: it fires only when the `Reaction rules` section is
+/// present but its body never keys on `to_category=active`. A prompt without the
+/// section at all is too heavily customized to reason about — we don't
+/// synthesize a rule, we only flag a section that predates it. Routed to
+/// [`Classification::NeedsJudgment`] because the correct rewrite of a
+/// user-customized prompt is a judgment call, not a mechanical patch.
+fn sniff_orchestrator_active_dispatch(
+    entry: &InventoryEntry,
+    text: &str,
+    out: &mut Vec<UpgradeFinding>,
+) {
+    let Some(section) = markdown_section(text, REACTION_RULES_SECTION_HEADING) else {
+        return;
+    };
+    if !section.contains(ORCH_ACTIVE_DISPATCH_MARKER) {
+        out.push(finding(
+            entry,
+            Classification::NeedsJudgment,
+            "ORCH_AGENT_OWNED_ACTIVE_DISPATCH_MISSING",
+            "orchestrator `Reaction rules` don't dispatch an agent-owned active status — a card \
+             entering a custom `owner: agent` + `category: active` gate (e.g. `adversarial-review` \
+             reached from `handoff`) never launches that gate's agent, so it sits parked and the \
+             workspace that previously held it is left orphaned",
+            "Add a reaction rule for a `to_category=active` line with no `agent=` in its reason: \
+             when the status is `owner: agent`, dispatch its declared agent with `shelbi issue \
+             start <id> --workspace <name>` (which keeps the card in the gate and releases the \
+             prior workspace); when `owner: user`, do nothing; and ignore lines already carrying an \
+             `agent=` segment (a dispatch you already made). Mirror the shipped default template.",
+            locate_line(text, REACTION_RULES_SECTION_HEADING),
         ));
     }
 }
@@ -2557,6 +2616,77 @@ mod tests {
             )
             .is_some(),
             "shipped default template no longer has a `{FREE_WORKSPACE_SECTION_HEADING}` \
+             section — the sniffer's absence check is now dead",
+        );
+    }
+
+    // ---- orchestrator agent-owned active dispatch -----------------------
+
+    #[test]
+    fn reaction_rules_without_active_dispatch_are_needs_judgment() {
+        // A pre-fix reaction-rules section: covers `ready` and `handoff` but
+        // never keys on an `active` move, so it predates the agent-owned active
+        // gate dispatch rule.
+        let text = "# Orchestrator\n\n## Reaction rules\n\n- `to_category=ready` → dispatch a \
+                    free workspace.\n- `to_category=handoff` → reload the freed slot.\n\n\
+                    ## Next section\n";
+        let mut out = Vec::new();
+        sniff_orchestrator_active_dispatch(&orch_entry(), text, &mut out);
+        let f = find(&out, "ORCH_AGENT_OWNED_ACTIVE_DISPATCH_MISSING").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+    }
+
+    #[test]
+    fn reaction_rules_with_active_dispatch_are_clean() {
+        let text = "## Reaction rules\n\n- `task=<id> ... to_category=active` with no `agent=` \
+                    → launch the agent-owned gate's agent.\n\n## Next\n";
+        let mut out = Vec::new();
+        sniff_orchestrator_active_dispatch(&orch_entry(), text, &mut out);
+        assert!(
+            find(&out, "ORCH_AGENT_OWNED_ACTIVE_DISPATCH_MISSING").is_none(),
+            "a section that dispatches an active gate should not be flagged: {:?}",
+            codes(&out),
+        );
+    }
+
+    #[test]
+    fn reaction_rules_absent_is_not_flagged() {
+        // A heavily-customized prompt with no such section: the absence sniff
+        // fires only when the header is present but silent on active moves.
+        let text = "# Custom orchestrator\n\n## My own scheduling notes\n\nno mention here\n";
+        let mut out = Vec::new();
+        sniff_orchestrator_active_dispatch(&orch_entry(), text, &mut out);
+        assert!(find(&out, "ORCH_AGENT_OWNED_ACTIVE_DISPATCH_MISSING").is_none());
+    }
+
+    /// Drift guard: the shipped default orchestrator template must carry the
+    /// agent-owned active dispatch rule, so a freshly-materialized project never
+    /// trips this sniffer. If this fails, the template's `Reaction rules`
+    /// section lost (or never had) the `to_category=active` dispatch bullet.
+    #[test]
+    fn shipped_default_template_does_not_trip_the_active_dispatch_sniffer() {
+        let mut out = Vec::new();
+        sniff_orchestrator_active_dispatch(
+            &orch_entry(),
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+            &mut out,
+        );
+        assert!(
+            find(&out, "ORCH_AGENT_OWNED_ACTIVE_DISPATCH_MISSING").is_none(),
+            "shipped default template trips the active-dispatch sniffer: {:?}",
+            codes(&out),
+        );
+        // Guard the sniffer's own precondition: if the heading is ever renamed
+        // in the template the sniff silently stops firing, so assert the section
+        // it keys on is present in the shipped default.
+        assert!(
+            markdown_section(
+                shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+                REACTION_RULES_SECTION_HEADING,
+            )
+            .is_some(),
+            "shipped default template no longer has a `{REACTION_RULES_SECTION_HEADING}` \
              section — the sniffer's absence check is now dead",
         );
     }
