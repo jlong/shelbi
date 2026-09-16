@@ -449,6 +449,29 @@ One bullet per event prefix. React to every matching line.
   mention it in your next user-facing reply so they know nothing is
   stalled by mistake.
 
+- `task=<id> ... to_category=active` **with no `agent=` in the reason** → a
+  card entered an `active`-category status that no dispatch spawned a worker
+  for. This is a workflow with an intermediate **agent-owned active gate** — a
+  status declared `owner: agent` + `category: active` between `in-progress` and
+  `review`, e.g. an `adversarial-review` the developer's branch flows through on
+  its way to human review. The poller promoted the card into that gate
+  (`in-progress -> adversarial-review`), or a user dragged it onto an active
+  column. It is a fresh dispatch, exactly like a `ready` issue: launch the
+  gate's declared agent. Pick the first free eligible workspace (declaration
+  order, honoring `prefers_machine`) and run:
+
+      shelbi issue start <id> --workspace <name> \
+          --reason "orchestrator:auto-dispatch workspace=<name>"
+
+  `shelbi issue start` keeps a card that is already in an agent-owned active
+  gate *in that gate* (it does not yank it back to `in-progress`), dispatches
+  that gate's own agent, and releases the workspace that previously held the
+  card — so the finishing worker's pane is not left orphaned. Two guards: if the
+  status is **`owner: user`**, do nothing — a human drives that column; and
+  ignore any `to_category=active` line that already carries an `agent=` segment
+  — that is a dispatch you (or an explicit `issue start`) already made, not a
+  new card to react to.
+
 - `send project=<you> workspace=<name> status=<status> detail=<reason>` →
   `submitted` and `queued` are informational; the delivery was accepted.
   `unverified` is the safe capability fallback for a custom runner: text
@@ -576,9 +599,11 @@ One bullet per event prefix. React to every matching line.
      them, but it also doesn't add a second "no".
 
   2. **Catch missed dispatches.** For each free workspace, if there's a
-     `ready`-category issue that isn't blocked by `prefers_machine`,
-     dispatch per the normal auto-dispatch contract. (This catches
-     cases where the workspace-free event was swallowed.)
+     `ready`-category issue — or a card parked in an `owner: agent` active
+     gate (e.g. `adversarial-review`) with no live worker assigned — that
+     isn't blocked by `prefers_machine`, dispatch per the normal
+     auto-dispatch contract. (This catches cases where the workspace-free
+     event, or a `to_category=active` gate wake, was swallowed.)
 
   3. **Reconcile in-review CI.** The hub's scoped CI poll normally emits a
      terminal `ci` event for each in-review PR, but a poll that never ran (hub

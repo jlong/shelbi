@@ -85,6 +85,16 @@ enum WakePriority {
     Heartbeat,
     WorkspaceFree,
     Ready,
+    /// A card entered an `active`-category status that this move did not itself
+    /// dispatch a worker for — a parked agent-owned gate (e.g. the poller
+    /// promoting a card `in-progress -> adversarial-review`, or a user drag onto
+    /// a custom active column). Like `Ready`, it is a dispatch trigger: the
+    /// orchestrator must launch the status's declared agent. A move that already
+    /// spawned the pane carries an `agent=<name>` token (see
+    /// `dispatch_reason_with_agent`) and is deliberately *not* classified here,
+    /// so the orchestrator's own `ready -> in-progress` dispatch never re-wakes
+    /// itself into a loop.
+    Active,
     Handoff,
     ZenMode,
     SupervisionGaveUp,
@@ -2958,6 +2968,19 @@ fn line_priority(parsed: &ParsedLine, board_in_flight: bool) -> Option<WakePrior
     match parsed.fields.get("to_category").map(String::as_str) {
         Some("handoff") => return Some(WakePriority::Handoff),
         Some("ready") => return Some(WakePriority::Ready),
+        // A card entering an `active` status that this move did not itself
+        // dispatch a worker for is a parked agent-owned gate needing a fresh
+        // auto-dispatch (the second half of the custom-active-status fix). A
+        // move that *did* spawn the pane — the orchestrator's `ready ->
+        // in-progress` dispatch, or any explicit `issue start` — stamps an
+        // `agent=<name>` token onto its reason (`dispatch_reason_with_agent`),
+        // so excluding those is what keeps a dispatch from re-waking itself.
+        // Owner (agent vs user) isn't on the wire, so the wake is deliberately
+        // coarse: the orchestrator's reaction rules gate the actual launch on
+        // `owner: agent`, and an `owner: user` active park just no-ops.
+        Some("active") if !parsed.fields.contains_key("agent") => {
+            return Some(WakePriority::Active)
+        }
         _ => {}
     }
     if parsed.fields.contains_key("workspace")
@@ -3280,6 +3303,48 @@ mod tests {
                     false,
                 ),
                 Some(WakePriority::WorkspaceFree)
+            );
+        }
+    }
+
+    #[test]
+    fn parked_agent_owned_active_status_is_a_dispatch_wake() {
+        // A card promoted into a custom active gate (the poller moving it
+        // `in-progress -> adversarial-review`) carries no `agent=` token, so it
+        // is an actionable dispatch wake — the second half of the
+        // custom-active-status fix. A bare user drag onto an active column
+        // (from any origin, `ready` included) is the same signal.
+        for line in [
+            "t project=demo task=x in-progress -> adversarial-review to_category=active",
+            "t project=demo task=x from_category=active to_category=active in-progress -> adversarial-review",
+            "t project=demo task=x todo -> in-progress to_category=active reason=user:cli",
+        ] {
+            assert_eq!(
+                line_priority(&parsed(line), false),
+                Some(WakePriority::Active),
+                "line: {line}"
+            );
+        }
+        // The dispatch trigger tier sits between Ready and Handoff.
+        assert!(WakePriority::Ready < WakePriority::Active);
+        assert!(WakePriority::Active < WakePriority::Handoff);
+    }
+
+    #[test]
+    fn a_dispatch_that_spawned_the_pane_does_not_re_wake() {
+        // The orchestrator's own `ready -> in-progress` dispatch — and any
+        // explicit `issue start` — stamps `agent=<name>` onto the move reason
+        // (`dispatch_reason_with_agent`). Classifying that as a dispatch wake
+        // would loop the orchestrator against its own action, so it stays None
+        // (and is only carried in the batch as context).
+        for line in [
+            "t project=demo task=x todo -> in-progress to_category=active reason=orchestrator:auto-dispatch workspace=alpha agent=developer",
+            "t project=demo task=x review -> in-progress to_category=active reason=user:cli:start agent=developer",
+        ] {
+            assert_eq!(
+                line_priority(&parsed(line), false),
+                None,
+                "line: {line}"
             );
         }
     }

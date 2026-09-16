@@ -16,7 +16,7 @@ use clap::{Args as ClapArgs, Subcommand};
 use shelbi_state::IssueStore;
 use shelbi_core::{
     default_workflow, validate_branch, validate_task_id, validate_workflow_name, Column,
-    StatusCategory, Issue, Workflow, MAX_TASK_ID_LEN,
+    Owner, StatusCategory, Issue, Workflow, MAX_TASK_ID_LEN,
 };
 
 use super::require_project;
@@ -1044,13 +1044,41 @@ fn start_destination_status(workflow: &Workflow) -> Option<&shelbi_core::Workflo
         })
 }
 
+/// Where a dispatch lands the card, and thus which status's `agent:` / `tags:`
+/// govern the spawned pane. Normally the canonical `in-progress` (see
+/// [`start_destination_status`]) — but when the card is **already** parked in a
+/// custom **agent-owned active** status (an intermediate gate like
+/// `adversarial-review`, declared `owner: agent` + `category: active` between
+/// `in-progress` and `review`), *that* status is the destination: the card
+/// stays in the gate and the gate's own agent is dispatched onto it. Resolving
+/// to `in-progress` instead would yank an `adversarial-review` card back out of
+/// its gate and launch the developer rather than the gate's agent — the dispatch
+/// half of the custom-active-status bug this fix closes.
+///
+/// Only an **agent-owned** active status short-circuits here. An `owner: user`
+/// active status (or any non-active status) falls through to the canonical
+/// resolution, so a human-driven column never auto-keeps a card in place — the
+/// board reads exactly as it does for a single-active-status workflow, where the
+/// card's current column is never a non-`in-progress` agent-owned active status.
+fn dispatch_destination_status<'a>(
+    workflow: &'a Workflow,
+    current_column: &Column,
+) -> Option<&'a shelbi_core::WorkflowStatus> {
+    if let Some(status) = workflow.status(current_column.as_str()) {
+        if status.category == StatusCategory::Active && status.owner == Owner::Agent {
+            return Some(status);
+        }
+    }
+    start_destination_status(workflow)
+}
+
 /// The required workspace tags of the status `issue start` lands the card in —
 /// the set a workspace's effective tags must be a superset of to take this
 /// issue (see the tag-routing check in [`start`]). Empty when the workflow has
 /// no such status or it declares no `tags:`.
 fn required_active_tags(project: &str, issue: &Issue) -> Result<std::collections::BTreeSet<String>> {
     let workflow = resolve_task_workflow(project, issue)?;
-    Ok(start_destination_status(&workflow)
+    Ok(dispatch_destination_status(&workflow, &issue.column)
         .map(|s| s.tags.iter().cloned().collect())
         .unwrap_or_default())
 }
@@ -1060,10 +1088,13 @@ fn resolve_active_agent_for_dispatch(project: &str, issue: &Issue) -> Result<Str
     use shelbi_state::DEVELOPER_AGENT;
 
     let workflow = resolve_task_workflow(project, issue)?;
-    // The status `issue start` lands the card in (canonical `in-progress`,
-    // resolved by exact id) is what governs the spawned pane — its `agent:`
-    // field is the runner we want.
-    let active = start_destination_status(&workflow);
+    // The status the dispatch lands the card in governs the spawned pane — its
+    // `agent:` field is the runner we want. Normally the canonical `in-progress`
+    // (resolved by exact id); but a card already parked in a custom agent-owned
+    // active gate keeps that gate as its destination, so the gate's own agent is
+    // dispatched onto it rather than the developer (see
+    // [`dispatch_destination_status`]).
+    let active = dispatch_destination_status(&workflow, &issue.column);
 
     let zen_on = matches!(
         shelbi_state::read_state(project).map(|s| s.zen_mode),
@@ -1378,6 +1409,21 @@ fn start(
     let agent_name =
         resolve_active_agent_for_dispatch(project, &tf.task).map_err(|e| anyhow!(e))?;
 
+    // Where the dispatch lands the card. Normally `in-progress`; but a card
+    // already parked in a custom agent-owned active gate (e.g.
+    // `adversarial-review`) stays in that gate — the `move_status` below is then
+    // a no-op and the gate's own agent (resolved just above from the same
+    // destination status) takes over in place, instead of the card being yanked
+    // back to `in-progress` under the developer. Resolved from the same workflow
+    // + current column as the agent, so the two can never disagree.
+    let dest_column = {
+        let workflow =
+            resolve_task_workflow(project, &tf.task).unwrap_or_else(|_| default_workflow());
+        dispatch_destination_status(&workflow, &tf.task.column)
+            .map(|s| Column::from_status_id(&s.id))
+            .unwrap_or_else(Column::in_progress)
+    };
+
     // Persist the in_progress move BEFORE spawning the pane (F7). Ordering
     // is load-bearing: if we spawned first and the process died before the
     // save, an agent would be running against a card still sitting in
@@ -1392,13 +1438,15 @@ fn start(
     let original = tf.task.clone();
     let prev_column = tf.task.column.clone();
     let store = cached_issue_store(project)?;
-    // `move_status` appends the card to `in_progress` and renumbers both the
+    // `move_status` appends the card to `dest_column` and renumbers both the
     // source and destination columns; the follow-up `set_fields` records the
     // workspace + branch. Two locked writes through the store replace the old
-    // whole-task save + manual renumber.
-    if prev_column != Column::in_progress() {
+    // whole-task save + manual renumber. When the card is already in its
+    // destination (a dispatch onto the agent-owned active gate it is parked in),
+    // this is a no-op and only the assignment below changes.
+    if prev_column != dest_column {
         store
-            .move_status(id, &Column::in_progress(), reason.unwrap_or("user:cli"))
+            .move_status(id, &dest_column, reason.unwrap_or("user:cli"))
             .map_err(|e| anyhow!(e))?;
     }
     store
@@ -1559,7 +1607,7 @@ fn start(
     // Spawn succeeded (possibly late) — record the dispatch event now (only
     // successful starts get an events.log line; a rolled-back start leaves no
     // misleading dispatch record).
-    if prev_column != Column::in_progress() {
+    if prev_column != dest_column {
         let base_reason = reason.unwrap_or("user:cli:start");
         let dispatched_reason = dispatch_reason_with_agent(base_reason, &agent_name);
         let workflow = shelbi_state::resolve_task_workflow_name(&project_yaml, &tf.task);
@@ -1568,10 +1616,39 @@ fn start(
             id,
             workflow,
             prev_column.clone(),
-            Column::in_progress(),
+            dest_column.clone(),
             &dispatched_reason,
         ) {
             eprintln!("warning: append_task_event failed: {e}");
+        }
+    }
+
+    // Release the workspace this card was previously assigned to, when a
+    // *different* one is now taking over. A card moved from one agent-owned
+    // active gate to another (`in-progress -> adversarial-review`) leaves its
+    // prior dev pane running against a card it no longer owns; supplanting its
+    // assignment above without this leaves that pane orphaned. Fires only once
+    // the new pane is confirmed up (this block runs after a successful launch),
+    // so a failed dispatch that rolls the card back never strands the prior
+    // worker. Best-effort: a dead/absent pane must not undo the authoritative
+    // reassignment already persisted.
+    if let Some(prev_ws_name) =
+        supplanted_workspace(original.assigned_to.as_deref(), &workspace_name)
+    {
+        if let Some(prev_ws) = project_yaml.workspace(prev_ws_name) {
+            if let Err(e) = teardown_workspace_pane(&project_yaml, prev_ws) {
+                eprintln!(
+                    "warning: releasing the supplanted workspace pane on `{prev_ws_name}` \
+                     failed ({e}) — check it and kill a stale worker by hand if one is left"
+                );
+            } else if let Err(e) = shelbi_state::append_dispatch_event(
+                id,
+                prev_ws_name,
+                "released",
+                "supplanted by a new workspace taking over the card's active status",
+            ) {
+                eprintln!("warning: append_dispatch_event failed: {e}");
+            }
         }
     }
 
@@ -1814,6 +1891,20 @@ fn count_dispatch_events(log: &str, task_id: &str, workspace: &str, statuses: &[
 /// the activity-feed parser without breaking the single-token contract.
 fn dispatch_reason_with_agent(base: &str, agent: &str) -> String {
     format!("{base} agent={agent}")
+}
+
+/// The workspace, if any, whose pane a dispatch supplants: the card's previous
+/// assignee, but only when a *different* workspace is taking over. `None` when
+/// the card had no prior assignee (a fresh dispatch) or the same workspace is
+/// re-dispatched (a resume / same-slot restart releases nothing). Split out so
+/// the release decision behind criterion (b) — "the previous workspace's pane is
+/// released rather than orphaned when the card moves to a different agent-owned
+/// status" — is unit-testable without spawning a live pane.
+fn supplanted_workspace<'a>(prev_assigned: Option<&'a str>, new_workspace: &str) -> Option<&'a str> {
+    match prev_assigned {
+        Some(prev) if prev != new_workspace => Some(prev),
+        _ => None,
+    }
 }
 
 /// `shelbi issue resume` — relaunch the assigned workspace on the issue it is
@@ -3550,6 +3641,130 @@ statuses:
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A workflow with a custom agent-owned active gate (`adversarial-review`)
+    /// between `in-progress` and `review`, plus an `owner: user` active status
+    /// (`staging`) to prove that only *agent*-owned active gates auto-keep a
+    /// card in place. This is the [add-to-workflow] topology the fix targets.
+    const GATED_WORKFLOW: &str = r#"
+name: default
+statuses:
+  - { id: backlog,            name: Backlog,           category: backlog, owner: user }
+  - { id: todo,               name: Todo,              category: ready,   owner: agent, agent: orchestrator }
+  - { id: in-progress,        name: InProgress,        category: active,  owner: agent, agent: developer }
+  - { id: adversarial-review, name: AdversarialReview, category: active,  owner: agent, agent: adversarial-review }
+  - { id: staging,            name: Staging,           category: active,  owner: user,  agent: qa }
+  - { id: review,             name: Review,            category: handoff, owner: user }
+  - { id: done,               name: Done,              category: done,    owner: user }
+"#;
+
+    #[test]
+    fn dispatch_destination_keeps_agent_owned_active_gates_and_falls_through_otherwise() {
+        // Pure resolver — the "dispatch path test harness" for criterion (a),
+        // asserted without a live pane. No SHELBI_HOME needed.
+        let wf = Workflow::from_yaml_str(GATED_WORKFLOW).unwrap();
+
+        // A card parked in the agent-owned `adversarial-review` gate stays in
+        // the gate: that status IS the destination, so the gate's own agent is
+        // dispatched onto it in place.
+        assert_eq!(
+            dispatch_destination_status(&wf, &Column::from_status_id("adversarial-review"))
+                .map(|s| s.id.as_str()),
+            Some("adversarial-review"),
+        );
+
+        // A card in `todo` (or any non-active status) resolves to the canonical
+        // `in-progress` — a single-active-status dispatch is unchanged (d).
+        assert_eq!(
+            dispatch_destination_status(&wf, &Column::todo()).map(|s| s.id.as_str()),
+            Some("in-progress"),
+        );
+
+        // An `owner: user` active status must NOT short-circuit: a human-driven
+        // column falls through to the canonical resolution, so it never
+        // auto-keeps a card in place (criterion c — nothing auto-launches there).
+        assert_eq!(
+            dispatch_destination_status(&wf, &Column::from_status_id("staging"))
+                .map(|s| s.id.as_str()),
+            Some("in-progress"),
+        );
+    }
+
+    /// The `statuses.yaml` catalog for the gated topology — the identity half
+    /// (id/name/category) the workflow file below references. `load_workflow`
+    /// requires it to exist and resolves the workflow's categories against it.
+    const GATED_STATUSES: &str = r#"
+statuses:
+  - { id: backlog,            name: Backlog,           category: backlog }
+  - { id: todo,               name: Todo,              category: ready }
+  - { id: in-progress,        name: InProgress,        category: active }
+  - { id: adversarial-review, name: AdversarialReview, category: active }
+  - { id: review,             name: Review,            category: handoff }
+  - { id: done,               name: Done,              category: done }
+"#;
+
+    /// The workflow file for the gated topology: references only (id + owner +
+    /// agent), no repeated name/category. `adversarial` and `developer` are
+    /// materialized by `materialize_default_agents`, so the agent references
+    /// validate.
+    const GATED_WORKFLOW_REFS: &str = r#"
+name: default
+statuses:
+  - { id: backlog,            owner: user }
+  - { id: todo,               owner: agent, agent: orchestrator }
+  - { id: in-progress,        owner: agent, agent: developer }
+  - { id: adversarial-review, owner: agent, agent: adversarial }
+  - { id: review,             owner: user }
+  - { id: done,               owner: user }
+"#;
+
+    fn write_statuses(project: &str, yaml: &str) {
+        let dir = shelbi_state::workflows_dir(project).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("statuses.yaml"), yaml).unwrap();
+    }
+
+    #[test]
+    fn resolve_active_agent_dispatches_the_gate_agent_for_a_parked_custom_active_status() {
+        // Criterion (a), end to end through the real workflow loader: a card
+        // already sitting in the agent-owned `adversarial-review` gate resolves
+        // to that gate's agent, not the developer of `in-progress`. Asserted
+        // through the dispatch resolver, not a spawned pane.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        materialize_default_agents_for_test("p");
+        write_statuses("p", GATED_STATUSES);
+        write_workflow("p", "default", GATED_WORKFLOW_REFS);
+
+        let parked = task_in(Column::from_status_id("adversarial-review"), "t-gate");
+        assert_eq!(
+            resolve_active_agent_for_dispatch("p", &parked).unwrap(),
+            "adversarial",
+        );
+
+        // Criterion (d): a card still in `todo` dispatches the canonical
+        // developer, exactly as a single-active-status workflow does.
+        let queued = task_in(Column::todo(), "t-queued");
+        assert_eq!(
+            resolve_active_agent_for_dispatch("p", &queued).unwrap(),
+            "developer",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn supplanted_workspace_releases_only_a_different_prior_assignee() {
+        // Criterion (b): a card moving to a different agent-owned status hands
+        // off to a new workspace, so the prior one is released (returned here so
+        // `start` tears its pane down). A fresh dispatch (no prior) or a
+        // same-slot re-dispatch (resume) releases nothing.
+        assert_eq!(supplanted_workspace(Some("bravo"), "charlie"), Some("bravo"));
+        assert_eq!(supplanted_workspace(Some("bravo"), "bravo"), None);
+        assert_eq!(supplanted_workspace(None, "charlie"), None);
     }
 
     #[test]
