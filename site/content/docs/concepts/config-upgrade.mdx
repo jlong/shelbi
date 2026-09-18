@@ -78,11 +78,12 @@ mechanically.
 
 ## Needs-judgment findings and the orchestrator
 
-The `needs_judgment` half of the findings file is the channel the
+The `needs_judgment` findings are the channel the
 [orchestrator](/docs/concepts/orchestrator) surfaces to you. When it sees a
-`needs_judgment > 0` line, it reads the channel and folds the findings into its
-next reply: the surface, the legacy form, the proposed fix, and the rationale,
-then asks how you want to proceed. It never applies a needs-judgment finding you
+`needs_judgment > 0` line, it reads the live channel (`shelbi config upgrade
+--needs-judgment`) and folds the findings into its next reply: the surface, the
+legacy form, the proposed fix, and the rationale, then asks how you want to
+proceed. It never applies a needs-judgment finding you
 have not approved. Once you approve one, it applies exactly that finding by its
 `id`, reusing the same atomic write-back the auto-heal pass uses.
 
@@ -93,6 +94,13 @@ The same detector is exposed through
 what the boot pass would act on, `--needs-judgment` to read just the human-
 decision channel, `--apply` to perform the auto-heals on demand, or
 `--apply-finding <id>` to resolve a single approved finding.
+
+Both the bare report and `--needs-judgment` detect live against the files on
+disk, so they always agree for the same on-disk state. Neither replays the
+`config-upgrade-findings.json` snapshot the boot pass wrote: a fix you apply by
+hand (or with `--apply-finding`) drops off the `--needs-judgment` list on the
+next run with no hub restart, and reintroducing a legacy form brings its finding
+back.
 
 ## See also
 

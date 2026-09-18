@@ -68,9 +68,11 @@ pub enum ConfigCmd {
         #[arg(long, conflicts_with_all = ["needs_judgment", "apply_finding"])]
         apply: bool,
         /// Show only the needs-judgment findings — the channel the orchestrator
-        /// ingests at boot to surface to you. Each carries a stable id, the
-        /// surface + location, the legacy form, the proposed fix, and why it
-        /// needs judgment. Read-only.
+        /// ingests to surface to you. Each carries a stable id, the surface +
+        /// location, the legacy form, the proposed fix, and why it needs
+        /// judgment. Read-only, and detected live against the files on disk
+        /// (same basis as the bare report), so a fix you apply disappears on the
+        /// next run without a hub restart.
         #[arg(long, conflicts_with = "apply_finding")]
         needs_judgment: bool,
         /// Apply exactly ONE finding by its stable id (from `--needs-judgment`),
@@ -245,16 +247,17 @@ fn upgrade(
     }
 
     // Read-only needs-judgment channel view — the half the orchestrator surfaces.
-    // Ingest the persisted channel the on-start pass wrote (the literal boot
-    // channel), scoped to the selected project(s); if no channel file exists yet
-    // (invoked outside an on-start pass), derive it fresh so the command still
-    // answers. Either way the finding ids match `--apply-finding` (they're
-    // content-stable), so an id read here resolves the same finding on apply.
+    // Detect live against the files on disk (exactly the basis the bare report
+    // uses) and project down to the needs-judgment findings. This deliberately
+    // does NOT replay the persisted findings file the on-start pass wrote: that
+    // snapshot is frozen at hub start, so replaying it keeps listing a finding
+    // the user (or `--apply-finding`) has since resolved, making a successful fix
+    // look like a failed one. Detecting live means an applied fix disappears on
+    // the next run with no hub restart, and the two reports never disagree for
+    // the same on-disk state. The finding ids still match `--apply-finding` —
+    // they're content-stable, so an id read here resolves the same finding.
     if needs_judgment {
-        let report = match super::config_upgrade::load_findings()? {
-            Some(r) => super::config_upgrade::filter_to_projects(&r, &projects),
-            None => super::config_upgrade::detect(&projects)?,
-        };
+        let report = super::config_upgrade::detect(&projects)?;
         let nj = super::config_upgrade::needs_judgment_report(&report);
         match format {
             LintFormat::Human => print!("{}", super::config_upgrade::render_needs_judgment(&nj)),
