@@ -5054,7 +5054,7 @@ mod tests {
         let now = "2026-06-19T00:00:00Z";
         let suspect = format!(
             "---\nid: numeric\ntitle: Numeric\ncolumn: todo\npriority: 1\n\
-             created_at: {now}\nupdated_at: {now}\nretries: 2\n---\n# Task\n"
+             created_at: {now}\nupdated_at: {now}\nretries: 2\n---\nbody\n"
         );
         std::fs::write(dir.join("numeric.md"), suspect).unwrap();
 

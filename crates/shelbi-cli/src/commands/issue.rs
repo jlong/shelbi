@@ -489,9 +489,9 @@ fn add_with_stdin(project: &str, args: AddArgs, stdin_body: Option<String>) -> R
             "both --description and piped stdin were given — pass the body one way \
              (drop -d, or close stdin)"
         ),
-        (Some(d), None) => format!("# Task\n\n{d}\n"),
-        (None, Some(s)) => format!("# Task\n\n{}\n", s.trim_end()),
-        (None, None) => format!("# Task\n\n{}\n", args.title),
+        (Some(d), None) => format!("{d}\n"),
+        (None, Some(s)) => format!("{}\n", s.trim_end()),
+        (None, None) => format!("{}\n", args.title),
     };
     // Route creation through the board seam. `add` appends to the column
     // (priority = current length), validates deps (self-ref / unknown id /
@@ -2584,7 +2584,7 @@ mod tests {
         let tf = shelbi_state::load_task("p", "piped-body").unwrap();
         assert_eq!(
             tf.body,
-            "# Task\n\nShip the thing.\n\n## Acceptance Criteria\n- [ ] it ships\n"
+            "Ship the thing.\n\n## Acceptance Criteria\n- [ ] it ships\n"
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -2687,11 +2687,11 @@ mod tests {
         args.description = Some("flag body".into());
         add_with_stdin("p", args, None).unwrap();
         let tf = shelbi_state::load_task("p", "with-flag").unwrap();
-        assert_eq!(tf.body, "# Task\n\nflag body\n");
+        assert_eq!(tf.body, "flag body\n");
 
         add_with_stdin("p", add_args("Bare title"), None).unwrap();
         let tf = shelbi_state::load_task("p", "bare-title").unwrap();
-        assert_eq!(tf.body, "# Task\n\nBare title\n");
+        assert_eq!(tf.body, "Bare title\n");
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -3864,7 +3864,7 @@ statuses:
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        seed_task("p", "issue-one", Column::backlog(), "# Task\n\nbody\n");
+        seed_task("p", "issue-one", Column::backlog(), "body\n");
         let mut args = edit_args("issue-one");
         args.title = Some("A brand new title".into());
         edit_non_interactive("p", args, None, Vec::new()).unwrap();
@@ -3872,7 +3872,7 @@ statuses:
         let tf = shelbi_state::load_task("p", "issue-one").unwrap();
         assert_eq!(tf.task.id, "issue-one", "id must never be re-slugged");
         assert_eq!(tf.task.title, "A brand new title");
-        assert_eq!(tf.body, "# Task\n\nbody\n", "title-only edit leaves body");
+        assert_eq!(tf.body, "body\n", "title-only edit leaves body");
         assert!(
             tf.task.updated_at > "2000-01-01T00:00:00Z".parse::<chrono::DateTime<Utc>>().unwrap(),
             "updated_at must be bumped",
@@ -3957,13 +3957,13 @@ statuses:
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        seed_task("p", "app", Column::backlog(), "# Task\n\nOriginal.\n");
+        seed_task("p", "app", Column::backlog(), "Original.\n");
         let mut a = edit_args("app");
         a.append = true;
         edit_non_interactive("p", a, Some("- [ ] new criterion\n".into()), Vec::new()).unwrap();
 
         let body = shelbi_state::load_task("p", "app").unwrap().body;
-        assert!(body.starts_with("# Task\n\nOriginal.\n"), "prior kept: {body:?}");
+        assert!(body.starts_with("Original.\n"), "prior kept: {body:?}");
         assert!(body.contains("- [ ] new criterion"), "appended: {body:?}");
 
         // --append with no body source is an error.
