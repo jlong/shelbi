@@ -2586,6 +2586,35 @@ pub fn append_marker_deferred_event(
     ))
 }
 
+/// Append a **ready-marker skipped** line to `~/.shelbi/events.log`. Emitted by
+/// the poller's ready-marker handoff when it reads a `.claude/shelbi-ready`
+/// marker it will NOT advance and instead clears — the task loaded fine but is
+/// no longer `in_progress`-and-assigned-to-this-workspace (an out-of-band board
+/// move / relabel / reassignment raced the worker's marker write), the task is
+/// genuinely gone, or the workflow declares no handoff status and no merge edge.
+///
+/// This is the counterpart to [`append_marker_deferred_event`]: a deferral leaves
+/// the marker in place to retry (a transient load error), whereas a skip clears
+/// the marker (the signal is stale or unactionable). Both exist so a written
+/// marker that doesn't move its task is never *silently* dropped — the reason a
+/// handoff didn't happen is always on the event stream.
+///
+/// `<rfc3339> marker-skipped task=<id> workspace=<name> reason=marker-skipped:<reason>`
+///
+/// `reason` is a short internal token (`not-in-progress` / `task-gone` /
+/// `no-forward-target`); same task-scoped, `project=`-less shape as
+/// [`append_marker_deferred_event`], with both id fields pinned to the identifier
+/// allowlist so the line stays a single parseable record.
+pub fn append_marker_skipped_event(task_id: &str, workspace: &str, reason: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let task_id = sanitize_field(task_id);
+    let workspace = sanitize_field(workspace);
+    let reason = sanitize_field(reason);
+    append_event_line(&format!(
+        "{ts} marker-skipped task={task_id} workspace={workspace} reason=marker-skipped:{reason}"
+    ))
+}
+
 /// Append a **ready-handoff transition-action failure** line to
 /// `~/.shelbi/events.log`. Emitted by the poller's ready-marker handoff when a
 /// review edge's action (`push_branch` / `open_pr`) errors: the card is left in
@@ -4439,6 +4468,39 @@ mod tests {
             ),
             "line: {}",
             lines[2]
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_marker_skipped_event_writes_a_task_scoped_reason_line() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_marker_skipped_event("fix-login", "alpha", "not-in-progress").unwrap();
+        append_marker_skipped_event("gone-task", "bravo", "task-gone").unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "log: {log}");
+        for line in &lines {
+            let ts = line.split_whitespace().next().unwrap();
+            DateTime::parse_from_rfc3339(ts).unwrap();
+        }
+        assert!(
+            lines[0].ends_with(
+                " marker-skipped task=fix-login workspace=alpha reason=marker-skipped:not-in-progress"
+            ),
+            "line: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1]
+                .ends_with(" marker-skipped task=gone-task workspace=bravo reason=marker-skipped:task-gone"),
+            "line: {}",
+            lines[1]
         );
 
         std::env::remove_var("SHELBI_HOME");
