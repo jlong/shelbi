@@ -2008,7 +2008,13 @@ pub fn append_zen_dryrun_event(task_id: &str, action: &str, detail: &str) -> Res
 /// The two trailing counts are computed fresh at emit time:
 /// - `zen_eligible` — how many `backlog`-category tasks `shelbi zen scan`
 ///   would return right now (mechanical eligibility only).
-/// - `idle_workspaces` — workspaces with no active-category task assigned.
+/// - `idle_workspaces` — declared workspaces that can absorb a fresh dispatch:
+///   those *not* holding a task whose workflow-resolved status category is
+///   active or handoff. It is `N - K` (total workspaces minus occupied ones)
+///   and agrees with `shelbi workspace list`; a `review`-tagged slot counts
+///   like any other slot (busy while it serves a review task, idle when free).
+///   Computed only off a *warm* board — a stale/cold read reuses the last warm
+///   count rather than reporting a fresh, misleading full pool.
 ///
 /// Together they're the safety net for a skipped post-merge scan: a heartbeat
 /// with `zen_eligible > 0` and `idle_workspaces > 0` forces the orchestrator
