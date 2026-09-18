@@ -262,6 +262,18 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
                 // by the project-scoped lock inside the loader.
                 maybe_autoload_review_queue(&project);
 
+                // Deterministically dispatch any task parked in an agent-owned
+                // active *gate* (e.g. `adversarial-review`) with no live worker.
+                // A card promoted into a gate by the ready-marker handoff emits a
+                // `to_category=active` wake, but the launch used to be left to the
+                // orchestrator's prose reaction rules — a wake the model acked
+                // without dispatching left the card parked with every eligible
+                // workspace idle. This project-wide pass closes that gap on every
+                // supervisor tick, re-deriving from disk, so it serves as both the
+                // immediate dispatch after a promotion and the heartbeat
+                // reconciliation backstop for a swallowed/ignored gate wake.
+                maybe_dispatch_parked_active_gates(&project);
+
                 // Resume a review slot whose task is assigned on disk but whose
                 // pane is dead — the `quit`+restart / crash case the auto-loader
                 // above deliberately skips (it treats a review-slot assignment
@@ -3614,6 +3626,119 @@ fn maybe_autoload_review_queue(project: &Project) {
             "auto review-load pass skipped",
         ),
     }
+}
+
+/// Deterministically dispatch the declared agent of any task parked in an
+/// agent-owned active **gate** (e.g. `adversarial-review`) with no live worker.
+///
+/// The daemon-side replacement for relying on the orchestrator model to act on
+/// a [`WakePriority::Active`](shelbi_orchestrator) wake. A card promoted into a
+/// gate by the ready-marker handoff (or dragged onto an active column) is a
+/// fresh dispatch, exactly like a `ready` issue — but the launch had been left
+/// to the orchestrator's prose reaction rules, so a wake it acked without
+/// dispatching left the card parked with every eligible workspace idle. This
+/// pass re-derives from disk each tick, so it fires both as the immediate
+/// dispatch after a promotion and as the heartbeat reconciliation backstop.
+///
+/// A gate is "parked" (needs dispatch) when it has no live worker: its
+/// `assigned_to` slot's pane is dead and no dispatch just confirmed it busy
+/// ([`gate_task_is_served`]). A stale `assigned_to` still naming the released
+/// developer workspace does **not** suppress the dispatch — the dev pane is
+/// dead, so the served check fails and the gate launches onto a fresh slot.
+/// Warm-board gated (no dispatch off an untrusted stale/cold snapshot, matching
+/// every other dispatching poller path) and operator-park aware. The actual
+/// launch, workspace selection, and prior-slot release live in
+/// [`shelbi_orchestrator::load::dispatch_active_gate`]; a re-dispatch of an
+/// already-served gate is prevented by the served check here plus the
+/// dispatch-confirm grace, so the pass is idempotent across ticks.
+fn maybe_dispatch_parked_active_gates(project: &Project) {
+    let board = match shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker) {
+        Ok(shelbi_state::BoardState::Warm(board)) => board,
+        // Stale / cold: can't prove a card is still parked in a gate; retry when
+        // the index is warm again (the "no destructive action on a stale read"
+        // rule the reapers and the review auto-loader follow).
+        Ok(_) => return,
+        Err(e) => {
+            tracing::debug!(project = %project.name, error = %e, "active-gate dispatch pass skipped: board read failed");
+            return;
+        }
+    };
+
+    for tf in board {
+        let status_id = tf.task.column.as_str();
+        let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
+            .unwrap_or_else(|_| default_workflow());
+        if !workflow.is_agent_active_gate(status_id) {
+            continue;
+        }
+        // An operator-parked task stays down — dispatching it is the churn loop
+        // (matches the dev-resume / review auto-load passes).
+        if shelbi_state::is_task_parked(&project.name, &tf.task.id).unwrap_or(false) {
+            continue;
+        }
+        // Already served (a live worker, or a dispatch that just confirmed the
+        // slot busy): leave it alone so the pass never clobbers a running gate.
+        if gate_task_is_served(project, &tf.task) {
+            continue;
+        }
+
+        match shelbi_orchestrator::load::dispatch_active_gate(&project.name, &tf.task.id) {
+            Ok(g) => tracing::info!(
+                project = %project.name,
+                task = %g.task_id,
+                workspace = %g.workspace,
+                "auto-dispatched a parked agent-owned active gate",
+            ),
+            Err(e) => {
+                // Surface the failure in events.log, not just the tracing logs —
+                // a gate that can't be dispatched (no free workspace) is
+                // otherwise invisible, the same gap the review auto-loader closed.
+                let _ = shelbi_state::append_dispatch_event(
+                    &tf.task.id,
+                    "-",
+                    "active-gate-failed",
+                    &e.to_string(),
+                );
+                tracing::warn!(
+                    project = %project.name,
+                    task = %tf.task.id,
+                    error = %e,
+                    "auto-dispatch of a parked active gate failed",
+                );
+            }
+        }
+    }
+}
+
+/// Whether a task parked in an agent-owned active gate already has a live
+/// worker, so the active-gate pass must leave it alone.
+///
+/// Served = its `assigned_to` slot's pane is alive, OR a dispatch just confirmed
+/// that slot busy ([`DISPATCH_CONFIRM_GRACE`], authoritative over a momentary
+/// dead read of a freshly launched pane). A gate with **no** assignment, or one
+/// whose assigned developer slot is dead (killed by the ready handoff), is NOT
+/// served — the parked case this pass dispatches. A probe *error* reads as
+/// served (alive) so a transient tmux hiccup never re-dispatches — and thereby
+/// clobbers — a genuinely serving gate; the dead developer pane returns a clean
+/// `false`, so a real park is still picked up.
+fn gate_task_is_served(project: &Project, task: &shelbi_core::Issue) -> bool {
+    let Some(ws_name) = task.assigned_to.as_deref() else {
+        return false;
+    };
+    if shelbi_state::recent_dispatch_confirmed(ws_name, DISPATCH_CONFIRM_GRACE) {
+        return true;
+    }
+    let Some(ws) = project.workspace(ws_name) else {
+        return false;
+    };
+    let Some(machine) = project.machine(&ws.machine) else {
+        return false;
+    };
+    let host = machine.host();
+    let Ok(addr) = shelbi_orchestrator::workspace::workspace_tmux_addr(project, ws) else {
+        return false;
+    };
+    shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true)
 }
 
 /// What the resume pass should do for one stranded review slot this tick.
@@ -9732,6 +9857,90 @@ transitions:
                 reason: "target-is-current-status"
             }
         );
+    }
+
+    /// A gate task in the `adversarial-review` column, pinned to `assignee`.
+    fn adversarial_gate_task(id: &str, assignee: Option<&str>) -> Issue {
+        let mut t = in_progress_task(id, "alpha");
+        t.column = Column::from_status_id("adversarial-review");
+        t.assigned_to = assignee.map(str::to_string);
+        t
+    }
+
+    #[test]
+    fn gate_task_is_served_is_false_for_an_unassigned_gate() {
+        // A gate with no assignment has no worker — the parked case the pass
+        // dispatches. Deterministic: no assignment, so no pane is probed.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let work_dir = std::env::temp_dir();
+        let project = local_project(&work_dir);
+        assert!(!gate_task_is_served(
+            &project,
+            &adversarial_gate_task("t-gate", None)
+        ));
+    }
+
+    #[test]
+    fn gate_task_is_served_is_false_for_an_unknown_released_slot() {
+        // A stale `assigned_to` naming a slot no longer declared (e.g. a
+        // released developer workspace) is treated as parked, not served — the
+        // stale value must never suppress the gate dispatch. Deterministic: an
+        // unknown workspace resolves to no machine/addr, so no pane is probed.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-gate-ghost-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        assert!(!gate_task_is_served(
+            &project,
+            &adversarial_gate_task("t-gate", Some("ghost-slot"))
+        ));
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn gate_task_is_served_honors_a_recent_dispatch_confirmation() {
+        // A dispatch that just confirmed the assigned slot busy is authoritative:
+        // the gate is served (its agent is booting/running), so the pass leaves
+        // it alone and never re-dispatches it. Deterministic: the confirmation
+        // short-circuits before any pane probe.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-gate-served-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+
+        // The launch path's `status=confirmed` line for `alpha`.
+        shelbi_state::append_dispatch_event("t-gate", "alpha", "confirmed", "busy pane observed")
+            .unwrap();
+
+        assert!(gate_task_is_served(
+            &project,
+            &adversarial_gate_task("t-gate", Some("alpha"))
+        ));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 

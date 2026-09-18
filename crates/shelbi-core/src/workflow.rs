@@ -360,16 +360,32 @@ impl Workflow {
         Some(first)
     }
 
-    /// True iff `status_id` names an **agent-owned active gate** — a
-    /// `category: active`, `owner: agent` status that is *not* the workflow's
-    /// canonical (first) active status.
+    /// The workflow's **primary** active status — where a fresh dispatch of a
+    /// `ready` task lands: the canonical `in-progress` if declared, else the
+    /// first active-category status in declaration order. Mirrors the CLI's
+    /// `start_destination_status` so the two can never disagree on which active
+    /// status is the developer's and which are downstream gates.
+    pub fn primary_active_status(&self) -> Option<&Status> {
+        self.status(crate::Column::in_progress().as_str()).or_else(|| {
+            self.statuses
+                .iter()
+                .find(|s| s.category == StatusCategory::Active)
+        })
+    }
+
+    /// True iff `status_id` names an agent-owned active **gate** — an
+    /// `owner: agent` + `category: active` status that is NOT the workflow's
+    /// primary active dispatch target ([`Workflow::primary_active_status`]).
     ///
-    /// The first active status is the developer's working column (`in-progress`
-    /// in the default workflow); any *later* agent-owned active status (e.g.
-    /// `adversarial-review`) is an automated review stage a developer's finished
-    /// work routes *through* before human handoff — see
-    /// [`Workflow::forward_agent_active_gate`], which the developer's ready
-    /// handoff follows into this gate.
+    /// A task parked in such a gate (e.g. an `adversarial-review` between
+    /// `in-progress` and the human `review` handoff) with no live worker is
+    /// auto-dispatched by the daemon's active-gate pass — the deterministic
+    /// replacement for relying on the orchestrator model to act on a
+    /// `to_category=active` wake. The **primary** active status (the
+    /// developer's `in-progress`) is deliberately excluded: it is owned by the
+    /// ready-dispatch and pane-supervisor paths, so treating it as a gate here
+    /// would double-drive the developer slot. A `user`-owned active status is
+    /// never a gate — a human drives that column.
     ///
     /// A dispatch onto a gate status is a *reviewer*, not a developer: the
     /// prompt composer in `shelbi-orchestrator` keys off this to give the gate
@@ -380,15 +396,12 @@ impl Workflow {
         let Some(status) = self.status(status_id) else {
             return false;
         };
-        if status.category != StatusCategory::Active || !matches!(status.owner, Owner::Agent) {
+        if status.category != StatusCategory::Active || status.owner != Owner::Agent {
             return false;
         }
-        // The workflow's first active status is the developer's column, never a
-        // gate. Only a *distinct* agent-owned active status qualifies.
-        self.statuses
-            .iter()
-            .find(|s| s.category == StatusCategory::Active)
-            .is_some_and(|first| first.id != status_id)
+        self.primary_active_status()
+            .map(|primary| primary.id != status_id)
+            .unwrap_or(true)
     }
 
     /// The status an agent-owned active gate in `from` **passes** a task to on a
@@ -2058,18 +2071,62 @@ transitions:
     }
 
     #[test]
+    fn is_agent_active_gate_classifies_only_downstream_agent_active_statuses() {
+        let wf = Workflow::from_yaml_str(GATED_YAML).unwrap();
+        // The downstream agent-owned active status IS a gate.
+        assert!(wf.is_agent_active_gate("adversarial-review"));
+        // The primary active status (the developer's) is NOT a gate — it is the
+        // ready-dispatch / pane-supervisor's slot, not the active-gate pass's.
+        assert!(!wf.is_agent_active_gate("in-progress"));
+        assert_eq!(
+            wf.primary_active_status().map(|s| s.id.as_str()),
+            Some("in-progress"),
+        );
+        // Non-active and user-owned statuses are never gates.
+        assert!(!wf.is_agent_active_gate("review")); // handoff, user-owned
+        assert!(!wf.is_agent_active_gate("todo")); // ready
+        assert!(!wf.is_agent_active_gate("done")); // done, user-owned
+        assert!(!wf.is_agent_active_gate("nonexistent"));
+    }
+
+    #[test]
     fn is_agent_active_gate_ignores_a_user_owned_active_status() {
-        // A `category: active` status owned by the *user* (a manual staging
-        // lane) is not an agent gate — nothing auto-dispatches to it.
+        // A `staging` active column owned by the *user* is a human-driven gate,
+        // never auto-dispatched. Only agent-owned downstream active statuses are.
         let yaml = r#"
 name: default
 statuses:
-  - { id: in-progress, name: InProgress, category: active,  owner: agent, agent: developer }
-  - { id: staging,     name: Staging,    category: active,  owner: user }
-  - { id: review,      name: Review,     category: handoff, owner: user }
+  - { id: in-progress,        name: InProgress,        category: active,  owner: agent, agent: developer }
+  - { id: staging,            name: Staging,           category: active,  owner: user }
+  - { id: adversarial-review, name: AdversarialReview, category: active,  owner: agent, agent: adversarial-review }
+  - { id: review,             name: Review,            category: handoff, owner: user }
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
         assert!(!wf.is_agent_active_gate("staging"));
+        assert!(wf.is_agent_active_gate("adversarial-review"));
+        assert!(!wf.is_agent_active_gate("in-progress"));
+    }
+
+    #[test]
+    fn is_agent_active_gate_falls_back_to_first_active_when_no_in_progress() {
+        // A workflow whose primary active status isn't the canonical
+        // `in-progress`: the first active status in declaration order is the
+        // primary (not a gate); a later agent-owned active status still is.
+        let yaml = r#"
+name: default
+statuses:
+  - { id: todo,     name: Todo,     category: ready,   owner: agent, agent: orchestrator }
+  - { id: building, name: Building, category: active,  owner: agent, agent: developer }
+  - { id: gate,     name: Gate,     category: active,  owner: agent, agent: adversarial-review }
+  - { id: review,   name: Review,   category: handoff, owner: user }
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        assert_eq!(
+            wf.primary_active_status().map(|s| s.id.as_str()),
+            Some("building"),
+        );
+        assert!(!wf.is_agent_active_gate("building"));
+        assert!(wf.is_agent_active_gate("gate"));
     }
 
     #[test]
