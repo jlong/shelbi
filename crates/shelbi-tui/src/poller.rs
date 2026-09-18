@@ -392,6 +392,14 @@ fn run_workspace_poll_loop(
     // takes one extra interval to surface after a restart.
     let mut unknown_dialog_streak: u32 = 0;
 
+    // How many consecutive polls this workspace has read as idle
+    // (`AwaitingInput`) while its last committed state was `Working` — the
+    // false-idle debounce (`working -> awaiting_input`). Per-thread and in-memory
+    // like `unknown_dialog_streak`; a hub restart re-seeds it to 0, so at worst a
+    // genuine turn-end that straddles the restart takes one extra interval to
+    // surface. See [`debounce_idle_edge`].
+    let mut idle_debounce_streak: u32 = 0;
+
     // Whether this workspace's pane is currently parked on the agent-exited
     // chrome (`supervision=agent-exited` dedupe). Per-thread and in-memory like
     // `last_dialog`; a hub restart re-seeds it to false, so at worst a
@@ -463,6 +471,7 @@ fn run_workspace_poll_loop(
             &mut last_known,
             &mut last_dialog,
             &mut unknown_dialog_streak,
+            &mut idle_debounce_streak,
             &mut last_agent_exited,
             &mut supervision,
             &mut limit_resume,
@@ -1304,6 +1313,7 @@ fn poll_one(
     last_known: &mut Option<WorkspaceState>,
     last_dialog: &mut Option<String>,
     unknown_dialog_streak: &mut u32,
+    idle_debounce_streak: &mut u32,
     last_agent_exited: &mut bool,
     supervision: &mut SupervisionState,
     limit_resume: &mut LimitResumeState,
@@ -1386,6 +1396,7 @@ fn poll_one(
         // a stale one from before the pane died.
         *last_dialog = None;
         *unknown_dialog_streak = 0;
+        *idle_debounce_streak = 0;
         *last_agent_exited = false;
         *limit_resume = LimitResumeState::Idle;
         *orphan_since = None;
@@ -1406,6 +1417,7 @@ fn poll_one(
     if maybe_reconcile_orphaned_pane(project, workspace, &host, &addr, orphan_since) {
         *last_dialog = None;
         *unknown_dialog_streak = 0;
+        *idle_debounce_streak = 0;
         *last_agent_exited = false;
         *limit_resume = LimitResumeState::Idle;
         return;
@@ -1474,6 +1486,7 @@ fn poll_one(
                     *last_agent_exited = true;
                     *last_dialog = None;
                     *unknown_dialog_streak = 0;
+                    *idle_debounce_streak = 0;
                     let prior = load_prior(&workspace.name, last_known);
                     let outcome = decide(
                         &workspace.name,
@@ -1677,6 +1690,16 @@ fn poll_one(
     // restart doesn't emit a bogus `none -> X` event for state we've
     // already recorded.
     let prior = load_prior(&workspace.name, last_known);
+
+    // Debounce the false-idle `working -> awaiting_input` edge: a lone
+    // mid-repaint capture that misses the live spinner row would otherwise flip a
+    // busy pane to AwaitingInput for one tick and log a spurious workspace-free
+    // signal. Require the idle observation to persist for
+    // `IDLE_DEBOUNCE_MIN_STREAK` polls; a real turn-end still commits one
+    // interval later at most, and any other edge is unaffected.
+    let (new_state, streak) =
+        debounce_idle_edge(prior.map(|p| p.state), new_state, *idle_debounce_streak);
+    *idle_debounce_streak = streak;
 
     let current_task = current_task_for(project, &workspace.name);
     let outcome = decide(
@@ -3596,6 +3619,62 @@ fn decide(
             last_transition,
             last_seen: now,
         },
+    }
+}
+
+/// Consecutive polls a `Working -> AwaitingInput` observation must persist
+/// before the poller commits that idle edge.
+///
+/// Current Claude builds draw the input-box footer *even mid-turn* (see
+/// [`live_workspace_state`]), so [`ready::is_input_ready`] is true throughout a
+/// live turn and the live spinner row is the *sole* thing keeping a busy pane
+/// out of `AwaitingInput`. That spinner row is a conjunction evaluated against a
+/// single instantaneous capture, so any one mis-sampled tick — a mid-repaint
+/// frame, a frame where the row isn't drawn yet — makes it false while the
+/// footer stays true, and the classifier reports `AwaitingInput` for exactly one
+/// poll. With `decide` emitting on any change, that one bad sample becomes a
+/// spurious `working -> awaiting_input` edge (a workspace-free signal the
+/// orchestrator can act on by dispatching a second task onto a mid-turn pane).
+///
+/// A dwell of `2` means the idle observation must hold for two consecutive polls
+/// before it commits: a single-frame miss is absorbed (the pane is held at
+/// `Working` for that one tick), while a genuine turn-end still lands the
+/// `awaiting_input` edge on the very next poll — one interval later at most.
+const IDLE_DEBOUNCE_MIN_STREAK: u32 = 2;
+
+/// Debounce the false-idle `Working -> AwaitingInput` edge against a single
+/// mis-sampled poll tick.
+///
+/// Only that one direction is held. Every other observation commits immediately
+/// and resets the streak: a spinner row that keeps the pane `Working`, a
+/// `Blocked` modal, `Paused`, a real turn-end reached from a non-`Working` prior,
+/// or the first sighting (`prior` is `None`). A genuine dialog / permission
+/// prompt is classified `Blocked` upstream (via `maybe_emit_dialog_event`), not
+/// `AwaitingInput`, so it is never delayed by this dwell.
+///
+/// Returns the state to commit this tick and the updated consecutive-idle
+/// streak. The streak lives per workspace thread alongside `last_known`, so a
+/// held `Working` on this tick feeds the next tick a `Working` prior and lets the
+/// count advance until either the idle observation persists to
+/// [`IDLE_DEBOUNCE_MIN_STREAK`] (commit `AwaitingInput`) or a busy frame returns
+/// (reset).
+fn debounce_idle_edge(
+    prior: Option<WorkspaceState>,
+    observed: WorkspaceState,
+    idle_streak: u32,
+) -> (WorkspaceState, u32) {
+    match (prior, observed) {
+        (Some(WorkspaceState::Working), WorkspaceState::AwaitingInput) => {
+            let streak = idle_streak + 1;
+            if streak >= IDLE_DEBOUNCE_MIN_STREAK {
+                (WorkspaceState::AwaitingInput, 0)
+            } else {
+                // One mid-turn frame dropped the spinner row: hold `Working` and
+                // wait for the observation to repeat before trusting it.
+                (WorkspaceState::Working, streak)
+            }
+        }
+        _ => (observed, 0),
     }
 }
 
@@ -5645,6 +5724,123 @@ Auto mode works better when it knows your environment. Takes about a minute.
     }
 
     #[test]
+    fn idle_debounce_absorbs_a_single_mis_sampled_mid_turn_frame() {
+        // THE REGRESSION (captured live 2026-09-18 on alpha/bravo/golf): current
+        // Claude draws the input-box footer even mid-turn, so `is_input_ready`
+        // stays true for a whole turn and the live spinner row is the sole busy
+        // discriminator. A lone mid-repaint capture that misses the spinner row
+        // flips a busy pane to AwaitingInput for exactly one poll, and `decide`
+        // logs a spurious `working -> awaiting_input` edge (a documented
+        // workspace-free signal). The debounce must hold `Working` on that frame.
+        //
+        // Feed a sequence of captures for a multi-minute turn: spinner, spinner,
+        // one dropped-spinner frame (input box only), spinner. Only the third
+        // frame reads idle, and it must be absorbed.
+        let spinner = "\
+✻ Deliberating… (12m 25s · ↓ 30.8k tokens)
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+        // Mid-repaint: the spinner row hasn't been drawn yet, only the input box.
+        let dropped_spinner = "\
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+
+        let frames = [spinner, spinner, dropped_spinner, spinner];
+        let mut prior: Option<WorkspaceState> = None;
+        let mut streak = 0u32;
+        let mut t = 0i64;
+        for frame in frames {
+            let observed = live_workspace_state(frame)
+                .expect("every frame here carries a live busy or ready signal");
+            let (state, next_streak) = debounce_idle_edge(prior, observed, streak);
+            streak = next_streak;
+            let prior_st = prior.map(|s| PriorState {
+                state: s,
+                last_transition: Some(ts(t)),
+            });
+            let out = decide("alpha", Some("task-1".into()), prior_st, state, ts(t));
+            assert!(
+                !(prior == Some(WorkspaceState::Working)
+                    && out.status.state == WorkspaceState::AwaitingInput),
+                "a single mis-sampled mid-turn frame must not emit working -> awaiting_input",
+            );
+            prior = Some(out.status.state);
+            t += 100;
+        }
+        // The pane never left Working across the whole turn.
+        assert_eq!(prior, Some(WorkspaceState::Working));
+    }
+
+    #[test]
+    fn idle_debounce_commits_a_real_turn_end_one_poll_later() {
+        // A genuine turn-end shows the ready input box with no spinner row on
+        // consecutive polls. The first idle sample is held (a possible one-frame
+        // miss), the second commits `awaiting_input` — one interval later at
+        // most, so the badge still clears and a real dialog/prompt is not
+        // starved. This is the "stays fast when it is real" half of the spec.
+        let mut prior = Some(WorkspaceState::Working);
+        let mut streak = 0u32;
+
+        // Poll 1: first idle observation is debounced — held at Working.
+        let (s1, streak1) = debounce_idle_edge(prior, WorkspaceState::AwaitingInput, streak);
+        assert_eq!(s1, WorkspaceState::Working);
+        assert_eq!(streak1, 1);
+        streak = streak1;
+        prior = Some(s1);
+
+        // Poll 2: the idle observation persisted — commit AwaitingInput.
+        let (s2, streak2) = debounce_idle_edge(prior, WorkspaceState::AwaitingInput, streak);
+        assert_eq!(s2, WorkspaceState::AwaitingInput);
+        assert_eq!(streak2, 0, "the streak resets once the edge commits");
+        let prior_st = prior.map(|s| PriorState {
+            state: s,
+            last_transition: Some(ts(50)),
+        });
+        let out = decide("alpha", Some("task-1".into()), prior_st, s2, ts(200));
+        assert!(out.transitioned);
+        assert_eq!(out.status.state, WorkspaceState::AwaitingInput);
+    }
+
+    #[test]
+    fn idle_debounce_leaves_non_idle_edges_immediate() {
+        // The dwell is scoped to the false-idle direction only. A recovery edge
+        // (AwaitingInput -> Working) and the first sighting both commit at once,
+        // and any streak carried in is cleared.
+        let (state, streak) = debounce_idle_edge(
+            Some(WorkspaceState::AwaitingInput),
+            WorkspaceState::Working,
+            1,
+        );
+        assert_eq!(state, WorkspaceState::Working);
+        assert_eq!(streak, 0);
+
+        let (state, streak) = debounce_idle_edge(None, WorkspaceState::AwaitingInput, 0);
+        assert_eq!(
+            state,
+            WorkspaceState::AwaitingInput,
+            "first sighting is not a working -> awaiting_input edge",
+        );
+        assert_eq!(streak, 0);
+
+        // A busy frame between two idle samples resets the count, so a later
+        // one-frame miss is fully re-debounced rather than committing early.
+        let (_, streak) = debounce_idle_edge(
+            Some(WorkspaceState::Working),
+            WorkspaceState::AwaitingInput,
+            0,
+        );
+        assert_eq!(streak, 1);
+        let (state, streak) =
+            debounce_idle_edge(Some(WorkspaceState::Working), WorkspaceState::Working, streak);
+        assert_eq!(state, WorkspaceState::Working);
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
     fn live_context_tip_row_under_spinner_reads_working() {
         // THE REGRESSION (captured live 2026-09-08 on golf): a large-context
         // pane draws its context-pressure tip row (`⎿  Tip: …`) between the
@@ -6806,6 +7002,7 @@ while :; do sleep 60; done
             &mut last_known,
             &mut last_dialog,
             &mut 0,
+            &mut 0,
             &mut false,
             &mut supervision,
             &mut limit_resume,
@@ -6867,6 +7064,7 @@ while :; do sleep 60; done
             &mut last_known,
             &mut last_dialog,
             &mut 0,
+            &mut 0,
             &mut false,
             &mut supervision,
             &mut limit_resume,
@@ -6914,6 +7112,7 @@ while :; do sleep 60; done
             workspace,
             &mut last_known,
             &mut last_dialog,
+            &mut 0,
             &mut 0,
             &mut false,
             &mut supervision,
@@ -7038,6 +7237,7 @@ while :; do sleep 60; done
             &project.workspaces[0],
             &mut last_known,
             &mut last_dialog,
+            &mut 0,
             &mut 0,
             &mut false,
             &mut supervision,
@@ -9711,6 +9911,7 @@ transitions:
             &mut last_known,
             &mut last_dialog,
             &mut unknown_streak,
+            &mut 0,
             &mut last_agent_exited,
             &mut supervision,
             &mut limit_resume,
@@ -9747,6 +9948,7 @@ transitions:
             &mut last_known,
             &mut last_dialog,
             &mut unknown_streak,
+            &mut 0,
             &mut last_agent_exited,
             &mut supervision,
             &mut limit_resume,
