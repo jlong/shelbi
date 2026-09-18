@@ -127,14 +127,17 @@ without touching a file.
 | --- | --- | --- | --- |
 | `--all` | flag | off | Include every locally registered project instead of just the resolved one. |
 | `--apply` | flag | off | Perform every auto-heal write-back (as hub start and `shelbi reload` do), disclosing each on `events.log`, then print the residual. Needs-judgment findings are still left for you. Conflicts with `--needs-judgment` and `--apply-finding`. |
-| `--needs-judgment` | flag | off | Show only the needs-judgment findings, the channel the orchestrator ingests at boot. Each carries a stable `id`, the surface and location, the legacy form, the proposed fix, and why it needs judgment. Read-only. |
+| `--needs-judgment` | flag | off | Show only the needs-judgment findings, the channel the orchestrator surfaces to you. Each carries a stable `id`, the surface and location, the legacy form, the proposed fix, and why it needs judgment. Read-only, and detected live against the files on disk (the same basis as the bare report), so a fix you apply drops off the list on the next run with no hub restart. |
 | `--apply-finding <ID>` | string | none | Apply exactly one finding by its stable `id` (from `--needs-judgment`), reusing the auto-heal write-back for a single approved fix and leaving every other finding untouched. |
 | `--format human\|json` | enum | `human` | Diagnostic output format. |
 
-Findings persist to `~/.shelbi/config-upgrade-findings.json` for the orchestrator
-to surface; the pass removes that file once the config set is clean. A finding
-with no mechanical resolution (an unknown key that might be a typo or real data)
-is refused by `--apply-finding` with a pointer to edit the file directly.
+The boot pass persists its residual to `~/.shelbi/config-upgrade-findings.json`
+as the record behind the `events.log` disclosure, and removes that file once the
+config set is clean. The orchestrator does not replay that snapshot; it reads the
+live channel with `--needs-judgment`, so what it surfaces always matches the
+files on disk. A finding with no mechanical resolution (an unknown key that might
+be a typo or real data) is refused by `--apply-finding` with a pointer to edit
+the file directly.
 
 ## list-actions
 

@@ -142,11 +142,17 @@ pub fn findings_path() -> Result<PathBuf> {
     Ok(shelbi_state::shelbi_home()?.join(FINDINGS_FILE))
 }
 
-/// Read the persisted orchestrator-handoff channel written by the on-start pass
-/// ([`emit`]). Returns `Ok(None)` when no channel is present (a clean config
-/// left no file), and errors only on a present-but-unreadable / schema-mismatched
-/// file so a stale format never silently mis-parses. This is the boot-ingestion
-/// entry point: the same JSON [`emit`] wrote is read back verbatim.
+/// Read the persisted findings file written by the on-start pass ([`emit`]).
+/// Returns `Ok(None)` when no file is present (a clean config left none), and
+/// errors only on a present-but-unreadable / schema-mismatched file so a stale
+/// format never silently mis-parses.
+///
+/// Test-only: the CLI's `--needs-judgment` view detects live rather than
+/// replaying this frozen snapshot (a replayed snapshot keeps listing a finding
+/// the user has since fixed). The file itself is still written by [`emit`] as
+/// the boot-time record behind the `events.log` disclosure; this reader exists
+/// so tests can assert what that pass persisted.
+#[cfg(test)]
 pub fn load_findings() -> Result<Option<UpgradeReport>> {
     let path = findings_path()?;
     let bytes = match std::fs::read(&path) {
@@ -166,27 +172,6 @@ pub fn load_findings() -> Result<Option<UpgradeReport>> {
         );
     }
     Ok(Some(report))
-}
-
-/// Retain only findings in scope for `projects`: the shared `global` surfaces
-/// plus any `project:<name>` whose `<name>` is selected. The channel file is
-/// hub-global (one file for every scanned project), so a single project's
-/// orchestrator filters it down to what's actually its own.
-pub fn filter_to_projects(report: &UpgradeReport, projects: &[String]) -> UpgradeReport {
-    let selected: BTreeSet<&str> = projects.iter().map(String::as_str).collect();
-    UpgradeReport {
-        schema_version: report.schema_version,
-        shelbi_version: report.shelbi_version.clone(),
-        findings: report
-            .findings
-            .iter()
-            .filter(|f| match f.scope.strip_prefix("project:") {
-                Some(p) => selected.contains(p),
-                None => f.scope == "global",
-            })
-            .cloned()
-            .collect(),
-    }
 }
 
 /// Project a report down to only its [`Classification::NeedsJudgment`] findings —
@@ -3076,6 +3061,96 @@ workspaces:
             .map(|r| needs_judgment_report(&r))
             .unwrap_or_else(empty_report);
         assert!(nj.findings.is_empty(), "clean config surfaced needs-judgment");
+    }
+
+    #[test]
+    fn needs_judgment_view_detects_live_not_the_frozen_snapshot() {
+        // Regression: `--needs-judgment` used to replay the findings-file
+        // snapshot the on-start pass wrote, which is frozen at hub start. A fix
+        // applied afterward never cleared, so a successful fix looked like a
+        // failed one. The view now detects live against disk, exactly as the
+        // bare report does.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        // A config carrying one needs-judgment form (an unknown project key —
+        // a typo vs. real data the pass can't disambiguate).
+        let with_finding = "\
+name: demo
+repo: /tmp/demo
+machines:
+- name: hub
+  kind: local
+  work_dir: /tmp/demo
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+workspaces:
+- name: w1
+  machine: hub
+mystery_field: 3
+";
+        let fixed = "\
+name: demo
+repo: /tmp/demo
+machines:
+- name: hub
+  kind: local
+  work_dir: /tmp/demo
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+workspaces:
+- name: w1
+  machine: hub
+";
+        let path = home.join("projects/demo.yaml");
+        std::fs::write(&path, with_finding).unwrap();
+
+        // The on-start pass writes the frozen findings-file snapshot.
+        run_for_project("demo");
+        let snapshot = load_findings().unwrap().expect("channel written on start");
+        assert!(
+            find(&needs_judgment_report(&snapshot).findings, "PROJECT_UNKNOWN_KEY").is_some(),
+            "boot snapshot should carry the finding"
+        );
+
+        // The user fixes it by hand — no hub restart, so the snapshot is stale.
+        std::fs::write(&path, fixed).unwrap();
+
+        // The frozen snapshot still lists it (this is the stale-cache trap the
+        // old `--needs-judgment` path fell into)...
+        assert!(
+            find(
+                &needs_judgment_report(&load_findings().unwrap().unwrap()).findings,
+                "PROJECT_UNKNOWN_KEY",
+            )
+            .is_some(),
+            "snapshot is frozen at boot and still lists the fixed finding"
+        );
+
+        // ...but the live detection the `--needs-judgment` view now uses does
+        // not — and it matches the basis the bare report uses (both `detect`).
+        let live = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            find(&needs_judgment_report(&live).findings, "PROJECT_UNKNOWN_KEY").is_none(),
+            "live needs-judgment view still reports a resolved finding"
+        );
+
+        // Reintroducing the legacy form makes it reappear on the next live read.
+        std::fs::write(&path, with_finding).unwrap();
+        let live_again = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            find(&needs_judgment_report(&live_again).findings, "PROJECT_UNKNOWN_KEY").is_some(),
+            "reintroduced legacy form did not reappear on a live read"
+        );
     }
 
     // ---- zen finalize (review->done) double-merge ------------------------
