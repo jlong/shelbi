@@ -5249,8 +5249,13 @@ fn compose_resume_prompt(
 /// starts at 1 (read from the top), and after each poll advances to
 /// `<line count> + 1` so the following `tail -n +$CURSOR` begins past the
 /// last line already read — re-reading is what an off-by-one here would
-/// cause, so the `+ 1` is load-bearing. The `2>/dev/null` guards keep a
-/// cold start (no log yet) from erroring before the hub's first write.
+/// cause, so the `+ 1` is load-bearing. Cold-start (no log yet) noise is
+/// kept off the pane two ways: the `cat`/`tail` reads let those tools
+/// swallow their own open error via `2>/dev/null`, while the `wc` count
+/// is fronted by an `[ -f ]` test — `wc -l < missing` fails at the
+/// shell's stdin redirect, *before* `2>/dev/null` can apply, so a bare
+/// redirect there would print a `No such file` diagnostic every poll
+/// until the hub's first write.
 fn message_polling_section(task_id: &str, project: &str, id_esc: &str) -> String {
     format!(
         "\n\n\
@@ -5262,7 +5267,7 @@ fn message_polling_section(task_id: &str, project: &str, id_esc: &str) -> String
          \n\
          CURSOR=$(cat .shelbi/messages/{id_esc}.cursor 2>/dev/null || echo 1)\n\
          tail -n +\"$CURSOR\" .shelbi/messages/{id_esc}.log 2>/dev/null\n\
-         echo $(($(wc -l < .shelbi/messages/{id_esc}.log 2>/dev/null || echo 0) + 1)) > .shelbi/messages/{id_esc}.cursor\n\
+         echo $(($([ -f .shelbi/messages/{id_esc}.log ] && wc -l < .shelbi/messages/{id_esc}.log || echo 0) + 1)) > .shelbi/messages/{id_esc}.cursor\n\
          \n\
          Act on any new messages before continuing your current work. Each \
          line is one JSON message with a `msg_id`; for every new message, ack \
@@ -6467,6 +6472,13 @@ mod tests {
         // Cursor advances past the last-read line (the +1 that avoids a
         // re-delivery off-by-one).
         assert!(prompt.contains("wc -l < .shelbi/messages/fix-login.log"));
+        // The `wc` count is fronted by an `[ -f ]` test: `wc -l < missing`
+        // fails at the shell's stdin redirect before `2>/dev/null` applies,
+        // so a bare redirect would print a `No such file` diagnostic every
+        // poll until the hub's first write.
+        assert!(prompt.contains(
+            "$([ -f .shelbi/messages/fix-login.log ] && wc -l < .shelbi/messages/fix-login.log || echo 0)"
+        ));
         assert!(prompt.contains(") + 1)) > .shelbi/messages/fix-login.cursor"));
         assert!(prompt.contains("tail -n +\"$CURSOR\" .shelbi/messages/fix-login.log"));
         // Ack carries the project + task id and goes to the hub socket.
