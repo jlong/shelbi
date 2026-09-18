@@ -2932,7 +2932,16 @@ fn governed_read(
         return Err(err);
     }
     let result = read_policy.run(|| run(args));
-    on_read_result(project, key, budget, args, now, &result, token, log_caller);
+    // Re-read the clock now the (retried, possibly slow-timing-out) call has
+    // returned. The connection breaker anchors its window to *this* observation
+    // time, not the pre-call `now`: a connect timeout that outlasts the 15s
+    // starting window would otherwise write a `parked_until` already in the past,
+    // parking nothing and sending the next caller straight back over the dead
+    // network. The rate-limit branch still uses `now` (see `on_read_result`).
+    let observed_now = read_now();
+    on_read_result(
+        project, key, budget, args, now, observed_now, &result, token, log_caller,
+    );
     // A REST `GET` now carries `--include`, so the body arrives behind one HTTP
     // header block per page. GraphQL bodies are not `--include` and pass through
     // untouched; an injected runner answering bare JSON (no `HTTP/` prefix) is
@@ -3090,6 +3099,13 @@ fn read_park_short_circuit(
 /// `log_caller` is set) is *not* gated — it mirrors the historical unconditional
 /// GraphQL recording, and is only reached from the production wrappers and the
 /// governed test constructor, never a raced background refresh.
+///
+/// Two clocks: `now` was captured *before* the (retried) call and is the frame
+/// the rate-limit branch interprets a server-supplied reset epoch against;
+/// `observed_now` was re-read *after* the call returned and is when a connection
+/// failure was actually observed. The unreachable breaker anchors its window to
+/// `observed_now` so a slow connect timeout can't record a window that already
+/// expired.
 #[allow(clippy::too_many_arguments)]
 fn on_read_result(
     project: &str,
@@ -3097,6 +3113,7 @@ fn on_read_result(
     budget: crate::gh_budget::Budget,
     _args: &[&str],
     now: i64,
+    observed_now: i64,
     result: &Result<String>,
     token: Option<&SecretToken>,
     log_caller: Option<&str>,
@@ -3143,6 +3160,9 @@ fn on_read_result(
                 return;
             }
             if crate::gh_retry::is_rate_limit_error(e) {
+                // The reset epoch is server-supplied (or a probe/recorded value),
+                // interpreted against the pre-call `now`, so this branch keeps
+                // `now` — not the observation-time clock.
                 let reset = crate::gh_retry::rate_limit_reset_epoch(e, now)
                     .or_else(|| token.and_then(|t| probe_core_reset_and_record(t, key)))
                     .or_else(|| crate::gh_budget::recorded_reset_after(key, budget, now))
@@ -3151,7 +3171,11 @@ fn on_read_result(
             } else if crate::gh_retry::is_connection_error(e) {
                 // The network is down — park (escalating) so a dead network costs
                 // a handful of attempts per window, not one per caller per tick.
-                record_read_unreachable(project, key, now);
+                // Anchor the window to `observed_now` (the clock re-read after the
+                // call returned), not the pre-call `now`: a connect timeout longer
+                // than the 15s starting window would otherwise write a window that
+                // already expired, parking nothing.
+                record_read_unreachable(project, key, observed_now);
             }
         }
     }
@@ -6387,6 +6411,7 @@ mod tests {
             crate::gh_budget::Budget::Graphql,
             &[],
             now,
+            now,
             &err,
             None,
             None,
@@ -6617,6 +6642,79 @@ mod tests {
             .filter(|l| l.contains("project=test-project") && l.contains("board unreachable"))
             .count();
         assert_eq!(hits, 1, "exactly one board unreachable line per window");
+
+        set_test_park_side_effects(false);
+        set_test_now(0);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Regression: a connection failure whose call outlasts the 15s starting
+    /// window parks a window that is still in the *future* relative to when the
+    /// failure was observed — so the very next caller short-circuits instead of
+    /// running the full connect timeout again. Before the fix the breaker anchored
+    /// to the pre-call clock, so `parked_until = <pre-call now> + 15` landed in the
+    /// past when the call blocked longer than the window, and the next read went
+    /// straight back over the dead network.
+    #[test]
+    fn a_slow_timeout_parks_a_window_still_in_the_future() {
+        let _g = crate::test_lock::LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        set_test_park_side_effects(true);
+
+        // Pre-call clock. The failing call will "block" past the 15s starting
+        // window before returning, modeled by the runner advancing the injected
+        // clock — the deterministic stand-in for a slow connect timeout.
+        let pre_call_now = 1_000i64;
+        let observed_now =
+            pre_call_now + crate::gh_budget::UNREACHABLE_WINDOW_START_SECS + 6; // 1_021
+        set_test_now(pre_call_now);
+
+        let key = crate::gh_budget::token_key("unreach-slow");
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let calls_run = calls.clone();
+        let store = GitHubStore::with_governed_runner("owner/repo", "unreach-slow", move |_args| {
+            *calls_run.lock().unwrap() += 1;
+            // The call took long enough to outlast the starting window before the
+            // connection error surfaced.
+            set_test_now(observed_now);
+            Err(Error::Command {
+                cmd: "gh api graphql".to_string(),
+                status: "exit status: 1".to_string(),
+                stderr: "error connecting to api.github.com:443".to_string(),
+            })
+        });
+
+        // First `get`: goes live, the slow connection error parks the token.
+        assert!(store.get("task-slow").is_err(), "a dead network surfaces an error");
+        assert_eq!(*calls.lock().unwrap(), 1, "the first get spawns exactly one gh call");
+
+        // The recorded window is anchored to the observation time, so it is still
+        // in the future — not the already-expired `pre_call_now + 15`.
+        let parked_until = crate::gh_budget::read_state(&key).unreachable.parked_until;
+        assert_eq!(
+            parked_until,
+            Some(observed_now + crate::gh_budget::UNREACHABLE_WINDOW_START_SECS),
+            "the window is anchored to the observation time, not the pre-call clock"
+        );
+        assert!(
+            parked_until.unwrap() > observed_now,
+            "the parked_until must be strictly in the future relative to the observation time \
+             (got {parked_until:?} vs observed {observed_now})"
+        );
+
+        // The next caller within the window short-circuits before spawning `gh` —
+        // the whole point of the breaker, which the pre-fix already-expired window
+        // defeated.
+        assert!(store.get("task-slow").is_err(), "still parked → still an error");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "a read inside the (future) window must not spawn gh"
+        );
 
         set_test_park_side_effects(false);
         set_test_now(0);
