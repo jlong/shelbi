@@ -322,6 +322,44 @@ impl Workflow {
             .collect()
     }
 
+    /// The declared forward edge that routes a task in `from` *through* an
+    /// agent-owned active **gate** — an intermediate automated review stage
+    /// (e.g. `adversarial-review`) declared `owner: agent` + `category:
+    /// active` — before the workflow's human handoff status.
+    ///
+    /// The ready-marker handoff calls this so a finished task follows the
+    /// workflow's declared `in-progress -> adversarial-review` edge (running
+    /// its `push_branch` / `open_pr` actions and letting the gate's agent
+    /// auto-dispatch) instead of skipping straight to the first handoff
+    /// status. See `Plans/workflows.md` and the [add-to-workflow] docs.
+    ///
+    /// Resolution is deliberately strict: it fires only when there is
+    /// **exactly one** declared outgoing transition from `from` whose target
+    /// is an agent-owned active status distinct from `from`. Zero such edges —
+    /// the default `in-progress -> review` shape, where the only forward edge
+    /// lands on a handoff status — returns `None` so existing workflows keep
+    /// their current behavior. More than one (an ambiguous fan-out the author
+    /// must disambiguate) also returns `None`, so we never guess which gate to
+    /// route through. A workflow with no `transitions:` block declares no
+    /// forward edge to follow and so returns `None` as well.
+    pub fn forward_agent_active_gate(&self, from: &str) -> Option<&Transition> {
+        let ts = self.transitions.as_ref()?;
+        let mut gates = ts.iter().filter(|t| {
+            t.from == from
+                && t.to != from
+                && self.status(&t.to).is_some_and(|s| {
+                    s.category == StatusCategory::Active && matches!(s.owner, Owner::Agent)
+                })
+        });
+        let first = gates.next()?;
+        // Uniqueness: a second matching edge makes the gate ambiguous — refuse
+        // to guess and fall back to the handoff status.
+        if gates.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
     /// True iff a task in `from` is on a transition that fires `merge` —
     /// i.e., Zen Mode's confidence bar should apply.
     ///
@@ -1807,6 +1845,119 @@ statuses:
         assert!(wf.statuses[5].agent.is_none());
         assert!(wf.initial_status.is_none());
         assert!(wf.transitions.is_none());
+    }
+
+    /// The documented [add-to-workflow] gated topology: an agent-owned active
+    /// `adversarial-review` gate between `in-progress` and the human `review`
+    /// handoff, wired with the declared transitions the fix routes through.
+    const GATED_YAML: &str = r#"
+name: default
+statuses:
+  - { id: backlog,            name: Backlog,           category: backlog, owner: user }
+  - { id: todo,               name: Todo,              category: ready,   owner: agent, agent: orchestrator }
+  - { id: in-progress,        name: InProgress,        category: active,  owner: agent, agent: developer }
+  - { id: adversarial-review, name: AdversarialReview, category: active,  owner: agent, agent: adversarial-review }
+  - { id: review,             name: Review,            category: handoff, owner: user }
+  - { id: done,               name: Done,              category: done,    owner: user }
+transitions:
+  - { from: in-progress,        to: adversarial-review, actions: [push_branch, open_pr] }
+  - { from: adversarial-review, to: review,             actions: [] }
+  - { from: adversarial-review, to: in-progress,        actions: [] }
+  - { from: review,             to: done,               actions: [merge, delete_branch] }
+"#;
+
+    #[test]
+    fn forward_agent_active_gate_follows_the_declared_gate_edge() {
+        let wf = Workflow::from_yaml_str(GATED_YAML).unwrap();
+        // A finished `in-progress` task follows its declared forward edge into
+        // the agent-owned active gate, with the edge's actions attached.
+        let gate = wf
+            .forward_agent_active_gate("in-progress")
+            .expect("gate edge");
+        assert_eq!(gate.to, "adversarial-review");
+        assert_eq!(
+            gate.actions,
+            vec![TransitionAction::PushBranch, TransitionAction::OpenPr]
+        );
+    }
+
+    #[test]
+    fn forward_agent_active_gate_is_none_for_the_default_direct_shape() {
+        // The default six-status workflow (no transitions block, no gate) has
+        // nothing to route through — the caller must fall back to the handoff
+        // status so `in-progress -> review` stays unchanged.
+        let wf = Workflow::from_yaml_str(DEFAULT_YAML).unwrap();
+        assert!(wf.forward_agent_active_gate("in-progress").is_none());
+
+        // Even a workflow that *declares* the direct edge but no agent-owned
+        // active gate must not resolve one: the only forward edge lands on the
+        // handoff status, which is user-owned handoff, not an agent gate.
+        let direct = r#"
+name: default
+statuses:
+  - { id: in-progress, name: InProgress, category: active,  owner: agent, agent: developer }
+  - { id: review,      name: Review,     category: handoff, owner: user }
+  - { id: done,        name: Done,       category: done,    owner: user }
+transitions:
+  - { from: in-progress, to: review, actions: [push_branch, open_pr] }
+  - { from: review,      to: done,   actions: [merge, delete_branch] }
+"#;
+        let wf = Workflow::from_yaml_str(direct).unwrap();
+        assert!(wf.forward_agent_active_gate("in-progress").is_none());
+    }
+
+    #[test]
+    fn forward_agent_active_gate_ignores_user_owned_active_and_backward_edges() {
+        // A `staging` active status owned by the *user* is not a gate: only
+        // agent-owned active targets short-circuit. And the gate's own
+        // backward edge (`adversarial-review -> in-progress`) must never be
+        // mistaken for a forward gate when resolving from the gate.
+        let yaml = r#"
+name: default
+statuses:
+  - { id: in-progress,        name: InProgress,        category: active,  owner: agent, agent: developer }
+  - { id: staging,            name: Staging,           category: active,  owner: user }
+  - { id: adversarial-review, name: AdversarialReview, category: active,  owner: agent, agent: adversarial-review }
+  - { id: review,             name: Review,            category: handoff, owner: user }
+transitions:
+  - { from: in-progress,        to: staging, actions: [] }
+  - { from: staging,            to: adversarial-review, actions: [] }
+  - { from: adversarial-review, to: in-progress, actions: [] }
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        // From `in-progress` the only outgoing edge lands on the user-owned
+        // `staging` — no agent gate to follow.
+        assert!(wf.forward_agent_active_gate("in-progress").is_none());
+        // From the gate, its only outgoing edge is the backward bounce to
+        // `in-progress` (agent-owned active, but that's `from` itself, so the
+        // `to != from` guard doesn't even apply — the edge targets a *different*
+        // active status). It is still not resolved as a gate because
+        // `in-progress` is where we came from, not a forward gate.
+        assert_eq!(
+            wf.forward_agent_active_gate("adversarial-review")
+                .map(|t| t.to.as_str()),
+            Some("in-progress"),
+        );
+    }
+
+    #[test]
+    fn forward_agent_active_gate_refuses_an_ambiguous_fan_out() {
+        // Two declared forward edges to agent-owned active gates — the author
+        // must disambiguate. We refuse to guess and return None so the caller
+        // falls back to the handoff status.
+        let yaml = r#"
+name: default
+statuses:
+  - { id: in-progress, name: InProgress, category: active,  owner: agent, agent: developer }
+  - { id: gate-a,      name: GateA,      category: active,  owner: agent, agent: adversarial-review }
+  - { id: gate-b,      name: GateB,      category: active,  owner: agent, agent: qa }
+  - { id: review,      name: Review,     category: handoff, owner: user }
+transitions:
+  - { from: in-progress, to: gate-a, actions: [] }
+  - { from: in-progress, to: gate-b, actions: [] }
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        assert!(wf.forward_agent_active_gate("in-progress").is_none());
     }
 
     #[test]
