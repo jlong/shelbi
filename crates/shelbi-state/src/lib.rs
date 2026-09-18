@@ -2759,24 +2759,29 @@ pub fn list_ready(project: &str) -> Result<Vec<IssueFile>> {
         .collect())
 }
 
-/// Count workspaces with no `active`-category (in-progress) task assigned to
-/// them. A workspace is "idle" when nothing in [`Column::in_progress()`] names it
-/// in `assigned_to` — the same predicate the poller uses to decide a workspace
-/// is free. Surfaced in the heartbeat payload so the orchestrator can tell, at
-/// emit time, whether there's spare capacity to absorb eligible backlog work.
+/// Count workspaces that can absorb a fresh dispatch: those with no task
+/// **holding** them. A workspace is held when a task on the open board names it
+/// in `assigned_to` and that task's *workflow-resolved* status category is
+/// [`StatusCategory::Active`] or [`StatusCategory::Handoff`]
+/// ([`occupied_workspaces_on_board`]) — the same predicate dispatch
+/// (`occupied_workspaces`) and `shelbi workspace list` use, so the heartbeat's
+/// `idle_workspaces=` agrees with both. Surfaced in the heartbeat payload so
+/// the orchestrator can tell, at emit time, whether there's spare capacity to
+/// absorb eligible backlog work.
 pub fn idle_workspace_count(project: &Project) -> Result<usize> {
-    let in_progress = list_column(&project.name, Column::in_progress())?;
-    Ok(idle_workspace_count_from(&project.workspaces, &in_progress))
+    let board = read_board(&project.name)?.into_issues();
+    let busy = occupied_workspaces_on_board(&project.name, project, &board);
+    Ok(idle_workspace_count_from(&project.workspaces, &busy))
 }
 
 /// Like [`idle_workspace_count`], but read from the daemon-published board
 /// index (`read_board_with_cfg`) and **gated on board freshness**. Returns
 /// `Some(count)` only when the whole-board read is [`BoardState::Warm`]; `None`
-/// when it is stale, cold, or the read failed. The heartbeat uses this so its
-/// `idle_workspaces=` number reflects a *trusted* board: `idle_workspace_count`
-/// reads the local `tasks/` directory, which for a `github` board is empty and
-/// so reports every workspace idle — the exact wrong signal during a rate-limit
-/// outage, when it would pull backlog work onto workers that are actually busy.
+/// when it is stale, cold, or the read failed — the heartbeat then reuses its
+/// last warm count rather than trusting a board it can't vouch for. Emitting a
+/// `None` here (surfaced as the last-known count, not a fresh 0) is how the
+/// count stays *accurate or last-known* through a rate-limit outage instead of
+/// silently claiming every worker is free while work is in flight.
 ///
 /// Reads the same source every other poller path uses — the daemon-owned
 /// `board-index.json` — rather than this process's per-pane `CachedIssueStore`.
@@ -2791,23 +2796,87 @@ pub fn idle_workspace_count_warm(project: &Project) -> Result<Option<usize>> {
         BoardState::Warm(board) => board,
         BoardState::Stale(_) | BoardState::Cold => return Ok(None),
     };
-    let in_progress: Vec<IssueFile> = board
-        .into_iter()
-        .filter(|tf| tf.task.column == Column::in_progress())
-        .collect();
-    Ok(Some(idle_workspace_count_from(&project.workspaces, &in_progress)))
+    let busy = occupied_workspaces_on_board(&project.name, project, &board);
+    Ok(Some(idle_workspace_count_from(&project.workspaces, &busy)))
 }
 
-/// Pure core of [`idle_workspace_count`]. Split out so unit tests can drive it
-/// with in-memory fixtures without touching disk or `SHELBI_HOME`.
+/// Names of the workspaces on `board` that are **occupied** — the set the
+/// heartbeat subtracts from the pool. A workspace is occupied when a task names
+/// it in `assigned_to` and, by that task's *workflow-resolved* status category:
+///
+/// - the status is [`StatusCategory::Active`] — an in-progress dev task or any
+///   agent-owned active gate, on *any* workspace; or
+/// - the status is [`StatusCategory::Handoff`] (a review task) **and** the
+///   named slot is `review`-tagged — a review slot actually serving the task.
+///
+/// The handoff case is tag-gated to match `shelbi workspace list`, which marks a
+/// review-column task as occupying only a `review`-tagged slot (`review: <id>`).
+/// A handoff task still pointing at the finishing developer slot — before the
+/// review slot picks it up — does *not* occupy that dev slot: its pane was torn
+/// down at the ready handoff, and `workspace list` probes it as free. Counting
+/// it busy would understate capacity, the mirror of the bug this fixes.
+///
+/// Resolving the category through each task's workflow — rather than a fixed
+/// `column == Column::in_progress()` equality — is the fix for the count
+/// reporting the full pool while work is in flight: any active-category status
+/// that isn't spelled `in-progress` was invisible to the id check and left its
+/// holder counted idle.
+///
+/// The category lookup is cached by resolved workflow name so a large board
+/// doesn't re-read the same `workflows/*.yaml` once per card. A workflow that
+/// can't be loaded (a project that hasn't materialized its files yet) falls
+/// back to the built-in [`shelbi_core::default_workflow`], matching every other
+/// workflow-resolution call site.
+pub fn occupied_workspaces_on_board(
+    project_name: &str,
+    project: &Project,
+    board: &[IssueFile],
+) -> HashSet<String> {
+    let mut workflow_cache: HashMap<String, shelbi_core::Workflow> = HashMap::new();
+    let mut busy: HashSet<String> = HashSet::new();
+    for tf in board {
+        let Some(ws) = tf.task.assigned_to.as_deref() else {
+            continue;
+        };
+        if busy.contains(ws) {
+            continue;
+        }
+        let wf_name = resolve_task_workflow_name(project, &tf.task).to_string();
+        let workflow = workflow_cache.entry(wf_name.clone()).or_insert_with(|| {
+            load_workflow(project_name, &wf_name).unwrap_or_else(|_| shelbi_core::default_workflow())
+        });
+        let Some(category) = workflow.status(tf.task.column.as_str()).map(|s| s.category) else {
+            continue;
+        };
+        let occupies = match category {
+            shelbi_core::StatusCategory::Active => true,
+            shelbi_core::StatusCategory::Handoff => project
+                .workspace(ws)
+                .is_some_and(|spec| project.effective_tags(spec).contains("review")),
+            _ => false,
+        };
+        if occupies {
+            busy.insert(ws.to_string());
+        }
+    }
+    busy
+}
+
+/// Pure core of [`idle_workspace_count`]: the pool arithmetic once occupancy is
+/// known. Counts declared workspaces whose name is not in `busy` (the occupied
+/// set from [`occupied_workspaces_on_board`]). Split out so unit tests can drive
+/// it with in-memory fixtures without touching disk or `SHELBI_HOME`.
+///
+/// A `review`-tagged slot is *not* filtered out of the pool here: the pool is
+/// every declared workspace, so an idle review slot counts as idle and a review
+/// slot serving a handoff task counts as busy (it lands in `busy`). This keeps
+/// the number equal to `N - K` (total workspaces minus occupied ones) and in
+/// step with `shelbi workspace list`, which renders that same slot as `idle` or
+/// `review: <id>` respectively.
 pub fn idle_workspace_count_from(
     workspaces: &[shelbi_core::WorkspaceSpec],
-    in_progress: &[IssueFile],
+    busy: &HashSet<String>,
 ) -> usize {
-    let busy: HashSet<&str> = in_progress
-        .iter()
-        .filter_map(|tf| tf.task.assigned_to.as_deref())
-        .collect();
     workspaces
         .iter()
         .filter(|w| !busy.contains(w.name.as_str()))
@@ -4200,38 +4269,29 @@ mod tests {
         }
     }
 
-    fn assigned(id: &str, to: &str) -> IssueFile {
-        let mut task = make_task(id, Column::in_progress(), 0);
-        task.assigned_to = Some(to.to_string());
-        IssueFile {
-            task,
-            body: String::new(),
-        }
+    fn busy_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn idle_workspace_count_excludes_only_assigned_workspaces() {
+    fn idle_workspace_count_excludes_only_occupied_workspaces() {
         // Four workspaces, two of which hold an active-category task. The
-        // other two are idle. An InProgress task whose `assigned_to` names a
-        // workspace not in the pool doesn't suppress any real workspace.
+        // other two are idle. An occupied name with no matching workspace
+        // (a stale assignment to `ghost`) doesn't suppress any real workspace.
         let workspaces = [
             workspace("alpha"),
             workspace("bravo"),
             workspace("charlie"),
             workspace("delta"),
         ];
-        let in_progress = [
-            assigned("t1", "alpha"),
-            assigned("t2", "charlie"),
-            assigned("t3", "ghost"), // stale assignment, no such workspace
-        ];
-        assert_eq!(idle_workspace_count_from(&workspaces, &in_progress), 2);
+        let busy = busy_set(&["alpha", "charlie", "ghost"]);
+        assert_eq!(idle_workspace_count_from(&workspaces, &busy), 2);
     }
 
     #[test]
-    fn idle_workspace_count_all_idle_when_nothing_in_progress() {
+    fn idle_workspace_count_all_idle_when_nothing_occupied() {
         let workspaces = [workspace("alpha"), workspace("bravo")];
-        assert_eq!(idle_workspace_count_from(&workspaces, &[]), 2);
+        assert_eq!(idle_workspace_count_from(&workspaces, &HashSet::new()), 2);
     }
 
     #[test]
@@ -7044,15 +7104,27 @@ workspaces:
     /// An `in_progress` [`IssueFile`] optionally assigned to a workspace, for
     /// seeding a published board index.
     fn in_progress_card(id: &str, assigned_to: Option<&str>) -> IssueFile {
+        card_in(id, Column::in_progress(), assigned_to, None)
+    }
+
+    /// An [`IssueFile`] parked in an arbitrary status/column, optionally
+    /// assigned to a workspace and optionally carrying an explicit `workflow:`,
+    /// for seeding a published board index with active gates and handoff cards.
+    fn card_in(
+        id: &str,
+        column: Column,
+        assigned_to: Option<&str>,
+        workflow: Option<&str>,
+    ) -> IssueFile {
         let now = chrono::Utc::now();
         IssueFile {
             task: shelbi_core::Issue {
                 id: id.to_string(),
                 title: id.to_string(),
-                column: Column::in_progress(),
+                column,
                 priority: 0,
                 assigned_to: assigned_to.map(str::to_string),
-                workflow: None,
+                workflow: workflow.map(str::to_string),
                 branch: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
@@ -7064,6 +7136,87 @@ workspaces:
             },
             body: String::new(),
         }
+    }
+
+    /// A `github`-backed project whose workspaces carry `tags:`, so a
+    /// `review`-tagged slot can be placed in the pool. Each `(name, tags)`
+    /// renders a `workspaces:` entry; an empty tag list renders a plain slot.
+    fn write_gh_project_ws_tagged(
+        home: &std::path::Path,
+        name: &str,
+        workspaces: &[(&str, &[&str])],
+    ) {
+        fs::create_dir_all(home.join("projects")).unwrap();
+        let ws_lines: String = workspaces
+            .iter()
+            .map(|(w, tags)| {
+                let tags = if tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(", tags: [{}]", tags.join(", "))
+                };
+                format!("  - {{ name: {w}, machine: local, runner: claude{tags} }}\n")
+            })
+            .collect();
+        fs::write(
+            home.join(format!("projects/{name}.yaml")),
+            format!(
+                r#"name: {name}
+repo: /tmp/{name}
+default_branch: main
+issue_tracker:
+  backend: github
+  github:
+    repo: owner/repo
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+machines:
+  - name: local
+    kind: local
+    work_dir: /tmp/{name}
+workspaces:
+{ws_lines}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Scaffold a minimal but valid `app` workflow with a custom agent-owned
+    /// active **gate** (`review-app`, `category: active`) so the warm-index
+    /// count can be checked against an active status whose id is *not* the stock
+    /// `in-progress`. Every status is `owner: user` here purely to keep the
+    /// fixture free of the agents-directory existence check — the count keys off
+    /// the resolved `category`, which comes from `statuses.yaml`, not `owner`.
+    fn write_app_gate_workflow(name: &str) {
+        let dir = workflows_dir(name).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            statuses_path(name).unwrap(),
+            r#"statuses:
+- { id: backlog,     name: Backlog,     category: backlog  }
+- { id: in-progress, name: In Progress, category: active   }
+- { id: review-app,  name: Review App,  category: active   }
+- { id: review,      name: Review,      category: handoff  }
+- { id: done,        name: Done,        category: done     }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            workflow_path(name, "app").unwrap(),
+            r#"name: app
+statuses:
+- { id: backlog,     owner: user }
+- { id: in-progress, owner: user }
+- { id: review-app,  owner: user }
+- { id: review,      owner: user }
+- { id: done,        owner: user }
+"#,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -7116,6 +7269,140 @@ workspaces:
             Some(2),
             "warm index: `bravo` and `charlie` are idle, `alpha` is busy"
         );
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn idle_workspace_count_warm_tracks_a_pool_from_busy_to_idle() {
+        // Regression for the heartbeat counting a busy pool as fully idle. Drive
+        // a four-slot pool (three dev slots + one `review`-tagged slot) through
+        // busy -> idle and assert the emitted count at each step. The count is
+        // `N - K`: total workspaces minus those holding an active- or
+        // handoff-category task, resolved through the workflow — so an
+        // in-progress (active) dev task and a review (handoff) slot both count
+        // as busy, and the review slot returns to the idle pool once free.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let name = "ghguard-idle-busy-to-idle";
+        write_gh_project_ws_tagged(
+            &home,
+            name,
+            &[
+                ("alpha", &[]),
+                ("bravo", &[]),
+                ("charlie", &[]),
+                ("review", &["review"]),
+            ],
+        );
+        let project = load_project(name).unwrap();
+
+        let publish = |board: Vec<IssueFile>| {
+            let mut idx = BoardIndex::fresh(board);
+            idx.repo = Some(github_board_repo("owner/repo"));
+            write_board_index(name, &idx).unwrap();
+        };
+
+        // Step 1: `alpha` holds an in-progress (active) task and the `review`
+        // slot is serving a review (handoff) task. Two of four busy → 2 idle.
+        publish(vec![
+            in_progress_card("a", Some("alpha")),
+            card_in("r", Column::review(), Some("review"), None),
+        ]);
+        assert_eq!(
+            idle_workspace_count_warm(&project).unwrap(),
+            Some(2),
+            "alpha (active) + review (handoff) busy → bravo, charlie idle"
+        );
+
+        // Step 2: `a` reaches done and drops off the open board; the review
+        // slot is still serving. One of four busy → 3 idle.
+        publish(vec![card_in("r", Column::review(), Some("review"), None)]);
+        assert_eq!(
+            idle_workspace_count_warm(&project).unwrap(),
+            Some(3),
+            "only the review slot remains busy"
+        );
+
+        // Step 3: the review task is accepted and leaves the open board. The
+        // review slot rejoins the idle pool → all 4 idle.
+        publish(vec![]);
+        assert_eq!(
+            idle_workspace_count_warm(&project).unwrap(),
+            Some(4),
+            "fully idle pool counts every slot, review slot included"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn idle_workspace_count_warm_ignores_a_handoff_task_still_on_a_dev_slot() {
+        // A review (handoff) task whose `assigned_to` still names the finishing
+        // *developer* slot (before the review slot picks it up) must not count
+        // that dev slot as busy: its pane is torn down and `workspace list`
+        // probes it free. Only a `review`-tagged slot serving the task occupies.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let name = "ghguard-idle-handoff-dev";
+        write_gh_project_ws_tagged(
+            &home,
+            name,
+            &[("alpha", &[]), ("bravo", &[]), ("review", &["review"])],
+        );
+        let project = load_project(name).unwrap();
+        // `alpha` (a dev slot) still holds the review-column card. No slot is
+        // occupied by it → all three idle.
+        let mut idx = BoardIndex::fresh(vec![card_in(
+            "r",
+            Column::review(),
+            Some("alpha"),
+            None,
+        )]);
+        idx.repo = Some(github_board_repo("owner/repo"));
+        write_board_index(name, &idx).unwrap();
+        assert_eq!(
+            idle_workspace_count_warm(&project).unwrap(),
+            Some(3),
+            "a handoff task on a non-review slot leaves the whole pool idle"
+        );
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn idle_workspace_count_warm_counts_a_custom_active_gate_holder_as_busy() {
+        // The core defect: an active-category status whose id is not the stock
+        // `in-progress` (here an agent-owned `review-app` gate) was invisible to
+        // the old `column == Column::in_progress()` check, so its holder was
+        // miscounted idle. Resolving the category through the task's workflow
+        // fixes it — `bravo`, parked in the gate, counts as busy.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let name = "ghguard-idle-gate";
+        write_gh_project_ws(&home, name, &["alpha", "bravo", "charlie"]);
+        write_app_gate_workflow(name);
+        let project = load_project(name).unwrap();
+
+        let mut idx = BoardIndex::fresh(vec![card_in(
+            "g",
+            Column::from_status_id("review-app"),
+            Some("bravo"),
+            Some("app"),
+        )]);
+        idx.repo = Some(github_board_repo("owner/repo"));
+        write_board_index(name, &idx).unwrap();
+
+        assert_eq!(
+            idle_workspace_count_warm(&project).unwrap(),
+            Some(2),
+            "bravo holds the custom active gate → alpha, charlie idle"
+        );
+
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
