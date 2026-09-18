@@ -212,13 +212,11 @@ pub fn run(
     // scope.
     let _ = shelbi_state::clear_expected_teardown(&workspace.name);
 
-    // Conditional --append-system-prompt: only when the agent context has
-    // been deployed (which task start does) and we're launching claude.
-    // Bare `shelbi open` from sidebar click on a workspace that's
-    // never run a task yet won't have the file — no flag in that case.
-    let has_agent_instructions = worktree
-        .join(orch_workspace::WORKTREE_AGENT_INSTRUCTIONS_REL)
-        .exists();
+    // The selected agent's instructions are inlined into the startup prompt at
+    // dispatch time (see `render_startup_prompt`), so a worker launch no longer
+    // wires `--append-system-prompt` — the startup prompt file, when present, is
+    // the only per-dispatch prompt this wrapper seeds. Bare `shelbi open` from a
+    // sidebar click on a workspace that never ran a task has no startup prompt.
     let startup_prompt_rel = worktree
         .join(orch_workspace::WORKTREE_STARTUP_PROMPT_REL)
         .exists()
@@ -229,7 +227,6 @@ pub fn run(
     let launch_full = orch_workspace::workspace_launch_command_with_startup_prompt(
         &runner,
         permission_mode.as_deref(),
-        has_agent_instructions,
         resume,
         startup_prompt_rel,
     );

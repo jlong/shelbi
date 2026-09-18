@@ -2401,23 +2401,38 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         &format!("mode={} runner={}", channel.as_str(), runner_name),
     );
 
-    // 2b. Deploy the dispatched agent's `instructions.md` + skills into the
-    //     worktree's `.claude/` footprint. The instructions file becomes the
-    //     runner's `--append-system-prompt` source (see step 4); the skills
+    // 2b. Compose the dispatched agent's `instructions.md` (+ preamble) and
+    //     mount its skills into the worktree's `.claude/` footprint. The skills
     //     directory is wiped and re-mounted from `agents/<agent>/skills/` so
     //     consecutive dispatches with different agents on the same workspace
-    //     don't accumulate skills from earlier runs. Skipped when `agent` is
-    //     `None` (e.g. an embed test that exercises the spawn path without
-    //     resolving an agent).
-    if let Some(agent) = a.agent {
-        deploy_agent_context(a.host, a.worktree, &a.project.name, agent)?;
-    }
+    //     don't accumulate skills from earlier runs. Unlike the orchestrator
+    //     path, a worker does NOT stage `.claude/agent-instructions.md`: the
+    //     composed body is inlined at the top of the startup prompt below (see
+    //     `render_startup_prompt`) so every runner receives the selected agent's
+    //     charter exactly once, marked authoritative, ahead of the generated
+    //     task/workflow context (task #1315). Skipped when `agent` is `None`
+    //     (e.g. an embed test that exercises the spawn path without resolving an
+    //     agent), which preserves the historical no-agent task prompt.
+    let composed_instructions = match a.agent {
+        Some(agent) => Some(compose_and_mount_agent_context(
+            a.host,
+            a.worktree,
+            &a.project.name,
+            agent,
+        )?),
+        None => None,
+    };
+    // The single startup prompt for this dispatch — composed agent instructions
+    // (when an agent is selected) inlined ahead of the task/workflow context.
+    // Both delivery paths use it: the launch-seeded file below AND the
+    // paste/fallback submits, so a runner can never receive a different prompt
+    // hierarchy depending on how the seed lands.
+    let startup_prompt = render_startup_prompt(composed_instructions.as_deref(), a.agent, a.prompt);
 
     let prompt_injection = effective_prompt_injection_for_spawn(a.runner, a.resume);
     let submit_profile = crate::submit::SubmitProfile::for_runner(a.runner);
     let launch_seed = prompt_injection.kind != PromptInjectionKind::Paste;
     let startup_prompt_rel = if launch_seed {
-        let startup_prompt = render_startup_prompt(a.prompt, a.agent, a.runner);
         deploy_startup_prompt(a.host, a.worktree, &startup_prompt)?;
         Some(WORKTREE_STARTUP_PROMPT_REL)
     } else {
@@ -2513,7 +2528,6 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
             let launch = workspace_launch_command_with_startup_prompt(
                 a.runner,
                 a.permission_mode,
-                a.agent.is_some(),
                 a.resume,
                 startup_prompt_rel,
             );
@@ -2586,7 +2600,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         if shelbi_agent::RunnerAdapter::for_spec(a.runner).needs_claude_readiness_probe()
             && crate::ready::wait_for_claude_ready(a.host, a.addr, crate::ready::READY_TIMEOUT)?
         {
-            match crate::submit::send_verified(a.host, a.addr, a.prompt, &baseline)? {
+            match crate::submit::send_verified(a.host, a.addr, &startup_prompt, &baseline)? {
                 crate::submit::SubmitStatus::Submitted { detail } => {
                     append_dispatch_status(a.task_id, &a.workspace.name, "confirmed", detail);
                     return Ok(());
@@ -2682,7 +2696,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     //    event; we then return an error so the caller leaves the task in its
     //    ready-category column, exactly like a readiness timeout, instead of
     //    moving it to `in_progress` on a workspace that never got the prompt.
-    let status = crate::submit::send_verified(a.host, a.addr, a.prompt, &baseline)?;
+    let status = crate::submit::send_verified(a.host, a.addr, &startup_prompt, &baseline)?;
     if !record_dispatch_submit(a.addr, a.task_id, &a.workspace.name, status) {
         return Err(Error::Other(format!(
             "prompt was not accepted on {} — no submission signal after a retry \
@@ -3527,11 +3541,13 @@ fn write_worktree_text(
     }
 }
 
-/// Relative path (from the worktree root) where the dispatched agent's
-/// `instructions.md` is deployed. Kept in `.claude/` alongside the
-/// settings + review marker so the whole shelbi deploy footprint is
-/// gitignored together and there's exactly one place to look when
-/// debugging an agent that loaded the wrong prompt.
+/// Canonical relative path (from a worktree/workdir root) for a staged agent
+/// `instructions.md`, kept in `.claude/` alongside the settings + review marker
+/// so the whole shelbi deploy footprint is gitignored together. Only the
+/// orchestrator pane stages and reads this file now (via
+/// [`deploy_agent_context`] / `--append-system-prompt`); worker dispatch inlines
+/// the composed charter into the startup prompt instead of emitting it (see
+/// [`render_startup_prompt`], task #1315).
 pub const WORKTREE_AGENT_INSTRUCTIONS_REL: &str = ".claude/agent-instructions.md";
 /// Shelbi-owned, session-scoped plugin bundle staged for built-in
 /// orchestrators. It is deliberately separate from runner registries.
@@ -3774,12 +3790,27 @@ fn set_executable(_path: &Path) -> Result<()> {
 /// context reflects the *current* agent while any user-authored
 /// `.claude/skills/` content is left untouched — the same
 /// own-only-what-you-own discipline [`wire_settings_local`] uses.
-pub fn deploy_agent_context(
+/// Compose the agent's instruction body (preamble + `instructions.md`, plus the
+/// orchestrator handoff splice for the orchestrator) and mount its skills into
+/// the worktree. Returns the composed body **without** writing
+/// `.claude/agent-instructions.md`, so each caller decides how the body is
+/// delivered:
+///
+/// - **Workers** ([`deploy_and_spawn`]) inline the returned body at the top of
+///   the startup prompt (see [`render_startup_prompt`]) — no file is emitted,
+///   because no worker launch path reads one any more (task #1315).
+/// - **The orchestrator** ([`deploy_agent_context`]) stages the body as
+///   `.claude/agent-instructions.md`, whose launch/reload paths still `cat` it
+///   through `--append-system-prompt`.
+///
+/// Sharing this composition keeps the two paths from drifting without forcing a
+/// worker to emit an otherwise-unused file.
+fn compose_and_mount_agent_context(
     host: &Host,
     worktree: &Path,
     project_name: &str,
     agent: &str,
-) -> Result<()> {
+) -> Result<String> {
     // Compose preamble (`agents/_shared/preamble.md`, if present) + the
     // agent's `instructions.md` into one body. `compose_agent_prompt`
     // handles the missing-preamble case (just the agent's prompt). Any
@@ -3813,7 +3844,6 @@ pub fn deploy_agent_context(
             }
         }
     }
-    deploy_agent_instructions(host, worktree, &composed)?;
 
     let skills_src = shelbi_state::agent_skills_dir(project_name, agent)?;
     refresh_agent_skills(host, worktree, &skills_src)?;
@@ -3827,6 +3857,22 @@ pub fn deploy_agent_context(
     // session (state-flag gated). Don't fail the dispatch on a hint
     // write error — the user can still hand-migrate.
     let _ = shelbi_state::maybe_emit_claude_md_migration_hint(project_name);
+    Ok(composed)
+}
+
+/// Compose + mount the agent context (see [`compose_and_mount_agent_context`])
+/// **and** stage the composed body as `.claude/agent-instructions.md`. This is
+/// the orchestrator's file-staging path: its launch and reload paths still
+/// `cat` that file through `--append-system-prompt`. Worker dispatch does not
+/// call this — it inlines the composed body into the startup prompt instead.
+pub fn deploy_agent_context(
+    host: &Host,
+    worktree: &Path,
+    project_name: &str,
+    agent: &str,
+) -> Result<()> {
+    let composed = compose_and_mount_agent_context(host, worktree, project_name, agent)?;
+    deploy_agent_instructions(host, worktree, &composed)?;
     Ok(())
 }
 
@@ -3964,8 +4010,9 @@ fn splice_orchestrator_handoff(composed: &str, handoff: &str) -> String {
     out
 }
 
-/// Write `instructions` to `<worktree>/.claude/agent-instructions.md` so
-/// the runner can `--append-system-prompt "$(cat …)"` from it on launch.
+/// Write `instructions` to `<root>/.claude/agent-instructions.md` so the
+/// orchestrator's claude launch can `--append-system-prompt "$(cat …)"` from it
+/// (the worker path no longer stages this file — see [`deploy_agent_context`]).
 /// Mirrors [`write_worktree_text`]'s local-vs-remote split.
 pub fn deploy_agent_instructions(host: &Host, worktree: &Path, instructions: &str) -> Result<()> {
     let claude_dir = worktree.join(".claude");
@@ -3986,27 +4033,40 @@ pub fn deploy_agent_instructions(host: &Host, worktree: &Path, instructions: &st
     }
 }
 
-fn render_startup_prompt(
-    prompt: &str,
-    agent: Option<&str>,
-    runner: &shelbi_core::AgentRunnerSpec,
-) -> String {
+/// Assemble the canonical startup prompt every worker runner receives: the
+/// selected agent's composed instructions inlined at the very top and marked
+/// authoritative, followed by the generated task/workflow context.
+///
+/// This is the single prompt hierarchy for *all* runners and *both* delivery
+/// paths (launch-seeded file and paste/fallback). Claude no longer gets a
+/// separate `--append-system-prompt` copy and non-Claude runners no longer read
+/// their role out of `.claude/agent-instructions.md`, so the selected agent's
+/// charter is delivered exactly once and identically everywhere (task #1315).
+/// The selected agent — not the generated task/gate wording — defines the
+/// worker's role, required work, and completion criteria; the authoritative
+/// framing keeps a generic gate/task prompt from steering a specialized agent
+/// off its charter.
+///
+/// `instructions` is `None` only when no agent was selected (embed tests); the
+/// startup prompt is then just the task `prompt`, byte-identical to the old
+/// no-agent path.
+fn render_startup_prompt(instructions: Option<&str>, agent: Option<&str>, prompt: &str) -> String {
     let mut out = String::new();
-    // A non-Claude runner has no `--append-system-prompt` seam, so its role
-    // instructions are deployed to `.claude/agent-instructions.md` and pointed
-    // at from the startup prompt. The wording must name the *selected* agent —
-    // hardcoding "developer-agent" here mislabels a custom gate agent (e.g.
-    // `adversarial-review`) as a developer and pushes it toward implementation
-    // work (task #1311). Claude reads its role via the system prompt, so it
-    // gets no preamble either way.
-    if let Some(agent) = agent {
-        if !shelbi_agent::RunnerAdapter::for_spec(runner).is_claude() {
-            out.push_str("Read `.claude/agent-instructions.md` first. ");
-            out.push_str(&format!(
-                "Treat it as your instructions as the `{agent}` agent for this \
-                 Shelbi workspace.\n\n"
-            ));
-        }
+    if let Some(instructions) = instructions {
+        let role = match agent {
+            Some(agent) => format!("You are the `{agent}` agent for this Shelbi workspace. "),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "{role}The instructions in the AGENT INSTRUCTIONS block below are \
+             authoritative: they define your role, the work required of you, and \
+             what counts as completion. Where the task and workflow context that \
+             follows the block appears to ask for a different role, a different \
+             scope, or a different bar for completion, these instructions win.\n\n"
+        ));
+        out.push_str("===== BEGIN AGENT INSTRUCTIONS =====\n\n");
+        out.push_str(instructions.trim_end());
+        out.push_str("\n\n===== END AGENT INSTRUCTIONS =====\n\n---\n\n");
     }
     out.push_str(prompt);
     if !out.ends_with('\n') {
@@ -4566,28 +4626,25 @@ pub fn remote_hub_env_prefix(host: &Host) -> String {
 /// `.claude/settings.json`: settings-based mode is fragile (silent fallback to
 /// interactive on any I/O race or version regression), so the CLI flag is
 /// authoritative and belongs to the spawn path where we already know the
-/// project's mode. When `include_agent_instructions` is set and the runner is
-/// `claude`, the deployed `instructions.md` is wired in as
-/// `--append-system-prompt "$(cat …)"` (see [`with_agent_system_prompt`]).
+/// project's mode.
+///
+/// A worker no longer receives `--append-system-prompt`: the selected agent's
+/// instructions are inlined at the top of the startup prompt for every runner
+/// (see [`render_startup_prompt`]) so the charter is delivered exactly once and
+/// no runner gets a duplicate copy (task #1315). The orchestrator's own launch
+/// path keeps its `--append-system-prompt` wiring (see
+/// `orchestrator_launch_command`); it is unrelated to this worker builder.
 pub fn workspace_launch_command(
     runner: &shelbi_core::AgentRunnerSpec,
     permissions_mode: Option<&str>,
-    include_agent_instructions: bool,
     resume: bool,
 ) -> String {
-    workspace_launch_command_with_startup_prompt(
-        runner,
-        permissions_mode,
-        include_agent_instructions,
-        resume,
-        None,
-    )
+    workspace_launch_command_with_startup_prompt(runner, permissions_mode, resume, None)
 }
 
 pub fn workspace_launch_command_with_startup_prompt(
     runner: &shelbi_core::AgentRunnerSpec,
     permissions_mode: Option<&str>,
-    include_agent_instructions: bool,
     resume: bool,
     startup_prompt_rel: Option<&str>,
 ) -> String {
@@ -4597,42 +4654,8 @@ pub fn workspace_launch_command_with_startup_prompt(
     // and for non-claude runners.
     let runner_with_mode = shelbi_agent::with_permission_mode(runner, permissions_mode);
     let runner_resolved = shelbi_agent::with_continue(&runner_with_mode, resume);
-    let launch = with_agent_system_prompt(
-        &shelbi_agent::launch_command(&runner_resolved),
-        include_agent_instructions.then_some(WORKTREE_AGENT_INSTRUCTIONS_REL),
-        runner,
-    );
+    let launch = shelbi_agent::launch_command(&runner_resolved);
     with_startup_prompt(&launch, startup_prompt_rel, runner, resume)
-}
-
-/// Append the `--append-system-prompt "$(cat .claude/agent-instructions.md)"`
-/// flag to the runner's launch command when an agent is being dispatched
-/// AND the runner is `claude` (the only CLI that understands the flag).
-/// Returns `launch` unchanged for non-claude runners or when no agent
-/// instructions are being deployed.
-///
-/// The `$(cat …)` substitution is intentional: keeping the prompt body
-/// out of the command line means the launched line stays human-readable
-/// in the pane (no 10 KB of `# Task …\n\n` scrollback noise) and avoids
-/// the per-platform ARG_MAX risk of inlining a large prompt.
-fn with_agent_system_prompt(
-    launch: &str,
-    instructions_rel: Option<&str>,
-    runner: &shelbi_core::AgentRunnerSpec,
-) -> String {
-    let Some(rel) = instructions_rel else {
-        return launch.to_string();
-    };
-    if !shelbi_agent::RunnerAdapter::for_spec(runner).is_claude() {
-        // Other runners (codex etc.) don't understand the flag; leave
-        // them alone. The agent's instructions.md is still deployed to
-        // the worktree for callers that want to read it manually.
-        return launch.to_string();
-    }
-    format!(
-        "{launch} --append-system-prompt \"$(cat {rel})\"",
-        rel = shelbi_agent::shell_escape(rel),
-    )
 }
 
 fn effective_prompt_injection_for_spawn(
@@ -4994,13 +5017,19 @@ fn compose_prompt(
 }
 
 /// The completion section for an agent-owned active **gate** (e.g.
-/// `adversarial-review`) — see [`HandoffPlan::Gate`]. The gate reviews the
-/// finished branch and records a pass / reject verdict with the **transition
-/// marker** (`<worktree>/.claude/shelbi-transition`, derived here as the ready
-/// marker's sibling): a pass advances to the human handoff status, a rejection
-/// bounces back to the developer's active status. Deliberately says nothing
-/// about rebasing or resuming development — the gate inspects someone else's
-/// work, it does not produce it.
+/// `adversarial-review`) — see [`HandoffPlan::Gate`]. The gate records a pass /
+/// reject verdict with the **transition marker**
+/// (`<worktree>/.claude/shelbi-transition`, derived here as the ready marker's
+/// sibling): a pass advances to the configured next status, a rejection returns
+/// to the configured previous status.
+///
+/// This section is deliberately **runner-neutral and role-agnostic**: it does
+/// NOT define what to inspect or the bar the work must clear — the selected
+/// agent's instructions (inlined ahead of this by [`render_startup_prompt`])
+/// own the inspection scope and completion criteria (task #1315). It keeps only
+/// the safety language every gate shares (inspect, never modify/rebase/resume)
+/// and the dynamic pass/reject transition commands, and it never assumes what
+/// either adjacent status represents beyond its configured name.
 ///
 /// Both markers are written torn-write-safe (sibling `.tmp` + atomic `mv`),
 /// exactly as the developer's ready-marker handoff is.
@@ -5031,23 +5060,24 @@ fn compose_gate_prompt(
     format!(
         "{body_section}\n\n\
          ---\n\
-         You are the **review gate** for task `{task_id}` on branch `{branch}`. \
-         The branch is already checked out in this worktree with a completed \
-         change on it. Review that change against the task above — you are \
-         inspecting someone else's work, not producing it. Do NOT rebase the \
-         branch, resume implementation, or run a build/test loop as if the task \
-         were yours.\n\
+         You are running as a review gate for task `{task_id}` on branch \
+         `{branch}`. The branch is already checked out in this worktree with a \
+         completed change on it. Follow your agent instructions for what to \
+         inspect and the bar the work must clear — this section covers only the \
+         safety rules every gate shares and how to record your verdict.\n\
+         \n\
+         Safety: a gate inspects existing work. Do NOT modify code, rebase the \
+         branch, resume implementation, or enter a build/test loop as if the \
+         task were yours.\n\
          \n\
          When your review is complete, record your verdict by writing the \
          transition marker exactly once — do ONE of:\n\
          \n\
-         1. **Pass** — the work clears the bar. Advance it to `{pass_name}` for \
-         human review:\n\
+         1. **Pass** — advance the task to `{pass_name}`:\n\
          \n\
          printf '%s\\n%s\\n' {id_esc} {pass_esc} > {trans_tmp_esc} && mv {trans_tmp_esc} {trans_esc}\n\
          \n\
-         2. **Reject** — the work needs more changes. Send it back to \
-         `{reject_name}` to be reworked:\n\
+         2. **Reject** — send the task back to `{reject_name}`:\n\
          \n\
          printf '%s\\n%s\\n' {id_esc} {reject_esc} > {trans_tmp_esc} && mv {trans_tmp_esc} {trans_esc}\n\
          \n\
@@ -6581,20 +6611,14 @@ mod tests {
     }
 
     #[test]
-    fn non_claude_gate_launch_injects_no_developer_role_wording() {
-        // Acceptance criterion for #1311: a non-Claude runner launched in the
-        // `adversarial-review` gate must see neither the hardcoded
-        // "developer-agent" startup label nor the developer completion handoff.
-        // Exercise the full injected prompt a codex gate would receive — the
-        // startup preamble (`render_startup_prompt`) wrapped around the composed
-        // gate body (`compose_prompt`).
-        let codex = AgentRunnerSpec {
-            command: "codex".into(),
-            flags: vec![],
-            prompt_injection: None,
-            dialog_signatures: vec![],
-            integration: None,
-        };
+    fn gate_launch_inlines_agent_charter_ahead_of_role_neutral_gate_wording() {
+        // Acceptance criteria for #1315 (and #1311): a gate launch inlines the
+        // SELECTED agent's charter, marked authoritative, ahead of the generated
+        // gate context. The gate context itself delegates the inspection scope
+        // and completion bar to that charter — carrying only runner-neutral
+        // safety language and the dynamic pass/reject transitions, with no
+        // developer-role wording. Exercise the full prompt a worker would
+        // receive: composed agent instructions + the gate body (`compose_prompt`).
         let marker = PathBuf::from("/work/myapp/.shelbi/wt/adv-1/.claude/shelbi-ready");
         let body = compose_prompt(
             "fix-login",
@@ -6611,19 +6635,35 @@ mod tests {
                 reject_name: "In Progress".into(),
             },
         );
-        let full = render_startup_prompt(&body, Some("adversarial-review"), &codex);
-        // The startup preamble names the gate agent, not "developer-agent".
+        // The custom gate agent's charter defines a specialized validation that
+        // a generic source review would skip — it must reach the worker inline.
+        let charter = "# adversarial-review\nRun the external prerequisite \
+                       validation before passing.\n";
+        let full = render_startup_prompt(Some(charter), Some("adversarial-review"), &body);
+        // The charter is inlined, named for the gate agent, and marked
+        // authoritative — never a "developer-agent" label.
         assert!(
             full.contains("`adversarial-review` agent"),
             "startup prompt must name the gate agent: {full}"
         );
         assert!(
-            !full.contains("developer-agent"),
-            "no `developer-agent` label anywhere in a gate launch: {full}"
+            full.contains("Run the external prerequisite validation"),
+            "the gate agent's charter must be inlined: {full}"
         );
         assert!(
-            !full.contains("developer"),
+            full.contains("authoritative"),
+            "the inlined charter must be marked authoritative: {full}"
+        );
+        assert!(
+            !full.contains("developer-agent") && !full.contains("developer"),
             "no developer-role wording anywhere in a gate launch: {full}"
+        );
+        // The charter appears BEFORE the generated gate context.
+        let charter_at = full.find("Run the external prerequisite validation").unwrap();
+        let gate_at = full.find("running as a review gate").unwrap();
+        assert!(
+            charter_at < gate_at,
+            "agent charter must precede the gate context: {full}"
         );
         // And no developer completion contract leaked through.
         assert!(
@@ -6848,7 +6888,7 @@ mod tests {
         // non-claude runner has no such flag shelbi drives.
         let p = fixture_project();
         let claude = p.runner("claude").unwrap();
-        let launch = workspace_launch_command(claude, p.workspace_permissions_mode.as_deref(), false, true);
+        let launch = workspace_launch_command(claude, p.workspace_permissions_mode.as_deref(), true);
         assert!(
             launch.contains("--continue"),
             "claude resume must add --continue: {launch}"
@@ -6861,7 +6901,7 @@ mod tests {
             dialog_signatures: vec![],
             integration: None,
         };
-        let launch = workspace_launch_command(&codex, p.workspace_permissions_mode.as_deref(), false, true);
+        let launch = workspace_launch_command(&codex, p.workspace_permissions_mode.as_deref(), true);
         assert!(
             !launch.contains("--continue"),
             "non-claude runner must not get --continue: {launch}"
@@ -6874,7 +6914,7 @@ mod tests {
         );
 
         // A normal (non-resume) dispatch never adds --continue, even for claude.
-        let launch = workspace_launch_command(claude, p.workspace_permissions_mode.as_deref(), false, false);
+        let launch = workspace_launch_command(claude, p.workspace_permissions_mode.as_deref(), false);
         assert!(
             !launch.contains("--continue"),
             "non-resume must not add --continue: {launch}"
@@ -6893,7 +6933,6 @@ mod tests {
         let launch = workspace_launch_command_with_startup_prompt(
             &codex,
             Some("auto"),
-            true,
             true,
             Some(WORKTREE_STARTUP_PROMPT_REL),
         );
@@ -6916,7 +6955,11 @@ mod tests {
     }
 
     #[test]
-    fn claude_cold_launch_uses_initial_prompt_file_and_keeps_system_prompt() {
+    fn claude_cold_launch_seeds_startup_prompt_without_appended_system_prompt() {
+        // Task #1315: a worker's selected-agent instructions are inlined into
+        // the startup prompt, so the launch no longer carries a duplicate
+        // `--append-system-prompt` copy. The cold launch seeds only the startup
+        // prompt file.
         let claude = AgentRunnerSpec {
             command: "claude".into(),
             flags: vec![],
@@ -6927,20 +6970,24 @@ mod tests {
         let launch = workspace_launch_command_with_startup_prompt(
             &claude,
             Some("auto"),
-            true,
             false,
             Some(WORKTREE_STARTUP_PROMPT_REL),
         );
         assert_eq!(
             launch,
-            "claude --permission-mode auto \
-             --append-system-prompt \"$(cat .claude/agent-instructions.md)\" \
-             \"$(cat .shelbi/startup-prompt.md)\"",
+            "claude --permission-mode auto \"$(cat .shelbi/startup-prompt.md)\"",
+        );
+        assert!(
+            !launch.contains("--append-system-prompt"),
+            "a worker launch must not carry a duplicate system-prompt copy: {launch}"
         );
     }
 
     #[test]
     fn claude_resume_uses_continue_without_launch_seed_prompt() {
+        // On a claude resume the injection is Paste (no launch seed), and the
+        // worker launch carries no `--append-system-prompt` — the composed
+        // startup prompt is delivered by the paste path instead.
         let claude = AgentRunnerSpec {
             command: "claude".into(),
             flags: vec![],
@@ -6952,41 +6999,61 @@ mod tests {
             &claude,
             Some("auto"),
             true,
-            true,
             Some(WORKTREE_STARTUP_PROMPT_REL),
         );
-        assert_eq!(
-            launch,
-            "claude --permission-mode auto --continue \
-             --append-system-prompt \"$(cat .claude/agent-instructions.md)\"",
+        assert_eq!(launch, "claude --permission-mode auto --continue");
+        assert!(
+            !launch.contains("--append-system-prompt"),
+            "a worker resume must not carry a duplicate system-prompt copy: {launch}"
         );
     }
 
     #[test]
-    fn render_and_deploy_startup_prompt_points_non_claude_at_agent_instructions() {
-        let codex = AgentRunnerSpec {
-            command: "codex".into(),
-            flags: vec![],
-            prompt_injection: None,
-            dialog_signatures: vec![],
-            integration: None,
-        };
-        let rendered = render_startup_prompt("Do the task.\n", Some("developer"), &codex);
-        assert!(
-            rendered.starts_with("Read `.claude/agent-instructions.md` first."),
-            "non-claude startup prompt must point at deployed agent instructions: {rendered}"
+    fn render_startup_prompt_inlines_authoritative_agent_instructions_first() {
+        // Task #1315: every runner receives the selected agent's composed
+        // instructions inlined at the top of the startup prompt, marked
+        // authoritative, ahead of the generated task/workflow context — no
+        // runner branch, no "read this file first" pointer.
+        let rendered = render_startup_prompt(
+            Some("# developer\nfix the bug\n"),
+            Some("developer"),
+            "Do the task.\n",
         );
-        // The prompt names the *selected* agent and never hardcodes the
-        // "developer-agent" label that mislabeled custom gate agents (#1311).
+        // Names the selected agent and frames the block as authoritative.
         assert!(
             rendered.contains("`developer` agent"),
             "startup prompt should name the selected agent: {rendered}"
+        );
+        assert!(
+            rendered.contains("authoritative"),
+            "the inlined instructions must be marked authoritative: {rendered}"
+        );
+        // The agent instructions appear BEFORE the generated task context.
+        let instr_at = rendered
+            .find("fix the bug")
+            .expect("composed instructions must be inlined");
+        let task_at = rendered
+            .find("Do the task.")
+            .expect("task context must follow");
+        assert!(
+            instr_at < task_at,
+            "agent instructions must precede the task context: {rendered}"
+        );
+        // No leftover file pointer or hardcoded developer-agent label (#1311).
+        assert!(
+            !rendered.contains("Read `.claude/agent-instructions.md` first."),
+            "instructions are inlined, not pointed at a file: {rendered}"
         );
         assert!(
             !rendered.contains("developer-agent"),
             "startup prompt must not hardcode the `developer-agent` label: {rendered}"
         );
         assert!(rendered.ends_with("Do the task.\n"));
+
+        // With no agent selected the startup prompt is just the task context —
+        // byte-identical to the historical no-agent path.
+        let bare = render_startup_prompt(None, None, "Do the task.\n");
+        assert_eq!(bare, "Do the task.\n");
 
         let tmp = agent_test_tmpdir("startup-prompt");
         let worktree = tmp.join("wt");
@@ -7853,7 +7920,7 @@ mod tests {
             },
         );
         let runner = p.runner("codex").unwrap().clone();
-        let launch = workspace_launch_command(&runner, p.workspace_permissions_mode.as_deref(), false, false);
+        let launch = workspace_launch_command(&runner, p.workspace_permissions_mode.as_deref(), false);
         assert_eq!(launch, "codex --print");
         assert!(!launch.contains("--permission-mode"));
         assert!(!launch.contains("core.hooksPath"));
@@ -7876,17 +7943,18 @@ mod tests {
         let local_runner = p.default_runner_spec().unwrap();
         let remote_runner = p.default_runner_spec().unwrap();
 
-        // With an agent deployed: claude gets --permission-mode + the
-        // instructions system-prompt. Both hosts produce the same shape.
+        // Both hosts produce the same shape: claude gets --permission-mode and,
+        // since a worker's agent instructions are inlined into the startup
+        // prompt (not the launch command), no --append-system-prompt on either.
         let local_launch =
-            workspace_launch_command(local_runner, p.workspace_permissions_mode.as_deref(), true, false);
+            workspace_launch_command(local_runner, p.workspace_permissions_mode.as_deref(), false);
         let remote_launch =
-            workspace_launch_command(remote_runner, p.workspace_permissions_mode.as_deref(), true, false);
+            workspace_launch_command(remote_runner, p.workspace_permissions_mode.as_deref(), false);
         assert_eq!(local_launch, remote_launch);
-        assert_eq!(
-            local_launch,
-            "claude --permission-mode auto \
-             --append-system-prompt \"$(cat .claude/agent-instructions.md)\"",
+        assert_eq!(local_launch, "claude --permission-mode auto");
+        assert!(
+            !local_launch.contains("--append-system-prompt"),
+            "a worker launch must not carry a duplicate system-prompt copy: {local_launch}"
         );
 
         // The remote wrapper embeds exactly that shared launch, so the SSH
@@ -7904,14 +7972,13 @@ mod tests {
             "remote cd-launch must carry the shared launch verbatim: {cd_launch}"
         );
 
-        // Bare pane (no agent): both hosts still agree — no
-        // --append-system-prompt on either.
-        let local_bare =
-            workspace_launch_command(local_runner, p.workspace_permissions_mode.as_deref(), false, false);
-        let remote_bare =
-            workspace_launch_command(remote_runner, p.workspace_permissions_mode.as_deref(), false, false);
-        assert_eq!(local_bare, remote_bare);
-        assert_eq!(local_bare, "claude --permission-mode auto");
+        // A resume adds --continue and still carries no --append-system-prompt.
+        let local_resume =
+            workspace_launch_command(local_runner, p.workspace_permissions_mode.as_deref(), true);
+        let remote_resume =
+            workspace_launch_command(remote_runner, p.workspace_permissions_mode.as_deref(), true);
+        assert_eq!(local_resume, remote_resume);
+        assert_eq!(local_resume, "claude --permission-mode auto --continue");
     }
 
     #[test]
@@ -8623,65 +8690,6 @@ mod tests {
         assert!(port_at < exec_at, "PORT must come BEFORE exec: {line}");
     }
 
-    #[test]
-    fn with_agent_system_prompt_appends_claude_flag_when_agent_set() {
-        let runner = AgentRunnerSpec {
-            command: "claude".into(),
-            flags: vec![],
-            prompt_injection: None,
-            dialog_signatures: vec![],
-            integration: None,
-        };
-        let launch = "claude --permission-mode auto";
-        let out = with_agent_system_prompt(launch, Some(WORKTREE_AGENT_INSTRUCTIONS_REL), &runner);
-        // The flag reads from the worktree-relative file so it works
-        // identically on local and remote hosts (cwd is the worktree).
-        assert!(
-            out.contains("--append-system-prompt"),
-            "missing flag: {out}"
-        );
-        assert!(
-            out.contains("$(cat .claude/agent-instructions.md)"),
-            "expected cat substitution in launch line: {out}"
-        );
-        // The pre-existing flags must survive the append.
-        assert!(
-            out.starts_with("claude --permission-mode auto"),
-            "got: {out}"
-        );
-    }
-
-    #[test]
-    fn with_agent_system_prompt_noop_when_no_agent_or_non_claude() {
-        let claude = AgentRunnerSpec {
-            command: "claude".into(),
-            flags: vec![],
-            prompt_injection: None,
-            dialog_signatures: vec![],
-            integration: None,
-        };
-        let codex = AgentRunnerSpec {
-            command: "codex".into(),
-            flags: vec![],
-            prompt_injection: None,
-            dialog_signatures: vec![],
-            integration: None,
-        };
-        let base = "claude --permission-mode auto";
-
-        // No agent → no flag injection (e.g. a test or non-CLI caller
-        // that omits the agent context).
-        assert_eq!(with_agent_system_prompt(base, None, &claude), base,);
-
-        // Codex doesn't understand the flag; injecting would crash the
-        // runner. The agent's instructions.md is still on disk for any
-        // future runner-specific loader to pick up.
-        assert_eq!(
-            with_agent_system_prompt("codex", Some(WORKTREE_AGENT_INSTRUCTIONS_REL), &codex,),
-            "codex",
-        );
-    }
-
     /// Hub-side fixture: lays out `<SHELBI_HOME>/projects/<p>/agents/
     /// <developer,orchestrator>/{instructions.md,skills/}` so the
     /// deploy_agent_context happy path has something real to read from.
@@ -8819,10 +8827,12 @@ mod tests {
 
     #[test]
     fn deploy_agent_context_loads_named_agent_into_worktree() {
-        // Acceptance criterion (a): the developer agent's instructions.md
-        // lands at `.claude/agent-instructions.md` and its skills/ dir
-        // mirrors into `.claude/skills/`. Exercises the full hub-side
-        // path that the spawn function calls in step 2b.
+        // The orchestrator's file-staging path: the agent's instructions.md
+        // lands at `.claude/agent-instructions.md` (consumed via
+        // `--append-system-prompt`) and its skills/ dir mirrors into
+        // `.claude/skills/`. Worker dispatch instead calls
+        // `compose_and_mount_agent_context` and inlines the body (see the
+        // companion test below).
         let _g = crate::test_lock::acquire();
         let tmp = agent_test_tmpdir("ctx-developer");
         let home = tmp.join("home");
@@ -8852,11 +8862,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn compose_and_mount_agent_context_returns_body_without_staging_instructions_file() {
+        // Task #1315: worker dispatch composes the agent's charter and mounts
+        // its skills, but never stages `.claude/agent-instructions.md` — the
+        // returned body is inlined into the startup prompt instead. Only the
+        // orchestrator's `deploy_agent_context` still writes the file.
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("ctx-worker-nofile");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        install_default_agents_under_home(&home, "p");
+
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let composed =
+            compose_and_mount_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
+
+        // The composed charter is returned for inlining.
+        assert_eq!(composed, "# developer\nfix the bug\n");
+        // Skills still mount.
+        assert!(
+            worktree.join(".claude/skills/debug.md").exists(),
+            "skills must still mount for a worker",
+        );
+        // But no instructions file is emitted into the worktree.
+        assert!(
+            !worktree.join(".claude/agent-instructions.md").exists(),
+            "worker dispatch must not stage .claude/agent-instructions.md",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// End-to-end at the deploy layer for a review-slot load: materializing a
-    /// project's default agents and deploying the review dispatch onto a
-    /// worktree lands the *Review agent's* charter (load-and-serve, no coding)
-    /// and wires hooks that point at scripts that actually exist — never a
-    /// `.shelbi/hooks/claude.*: No such file or directory`. This is the
+    /// project's default agents and preparing the review dispatch onto a
+    /// worktree composes the *Review agent's* charter (load-and-serve, no
+    /// coding) and wires hooks that point at scripts that actually exist — never
+    /// a `.shelbi/hooks/claude.*: No such file or directory`. This is the
     /// deterministic stand-in for the runtime review click-through: it proves
     /// the fix at the exact layer a review load touches, short of driving tmux
     /// and a real claude binary (which CI covers). Guards acceptance criteria
@@ -8875,18 +8921,25 @@ mod tests {
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        // Deploy the runner hooks (the neutral scripts) + the review context —
-        // the same two steps the spawn path runs for a review load.
+        // Deploy the runner hooks (the neutral scripts) + prepare the review
+        // context — the same two steps the worker spawn path runs for a review
+        // load. The charter is returned for inlining, not staged as a file
+        // (task #1315).
         deploy_runner_hooks(&Host::Local, &worktree).unwrap();
-        deploy_agent_context(&Host::Local, &worktree, "myapp", shelbi_state::REVIEW_AGENT).unwrap();
-
-        // The Review charter landed — not the developer's. It serves; it does
-        // not code, so this pane never rebases or opens a PR.
         let instructions =
-            std::fs::read_to_string(worktree.join(".claude/agent-instructions.md")).unwrap();
+            compose_and_mount_agent_context(&Host::Local, &worktree, "myapp", shelbi_state::REVIEW_AGENT)
+                .unwrap();
+
+        // The Review charter is composed — not the developer's. It serves; it
+        // does not code, so this pane never rebases or opens a PR. And a worker
+        // never stages the instructions file.
         assert!(
             instructions.contains("Review agent") && instructions.contains("do **not** keep coding"),
-            "review worktree must carry the Review charter: {instructions}",
+            "review dispatch must compose the Review charter: {instructions}",
+        );
+        assert!(
+            !worktree.join(".claude/agent-instructions.md").exists(),
+            "a worker review load must not stage .claude/agent-instructions.md",
         );
 
         // Wire the review settings block the dispatch would deploy, then assert
