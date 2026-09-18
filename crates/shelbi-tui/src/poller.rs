@@ -2857,10 +2857,13 @@ fn resolve_current_status_id(workflow: &Workflow, current_column: Column) -> Str
 ///
 /// Validation, in order:
 ///
-/// 1. **Verb expansion.** `reject` / `bounce` resolve to the workflow's
-///    designated active (`active`-category) status — the "send it back to be
-///    reworked" target. A workflow with no active status can't be bounced into,
-///    so the request is refused.
+/// 1. **Verb expansion.** `reject` / `bounce` resolve through
+///    [`Workflow::gate_reject_status`] to the target of the current status's
+///    declared `-> active` edge (the developer's working column), falling back
+///    to the first active status other than the current one — the "send it back
+///    to be reworked" target, and the mirror of the pass path's
+///    [`Workflow::gate_pass_status`]. A workflow with no other active status
+///    can't be bounced into, so the request is refused.
 /// 2. **Target must be declared.** The resolved target must be a status id the
 ///    workflow declares.
 /// 3. **Edge must be permitted.** If the workflow declares a `transitions:`
@@ -2879,11 +2882,15 @@ fn decide_transition(
     let from_status = resolve_current_status_id(workflow, current_column);
 
     let to_status = match raw_target {
-        "reject" | "bounce" => match workflow
-            .statuses
-            .iter()
-            .find(|s| s.category == StatusCategory::Active)
-        {
+        // The `reject` / `bounce` sugar sends the task back to the developer's
+        // working column. Resolve it through `Workflow::gate_reject_status`,
+        // the same helper the pass path uses via `gate_pass_status`, so a gate's
+        // reject target follows the workflow's declared `gate -> active` edge
+        // rather than blindly picking the first active status. The two agree in
+        // the canonical ordering but diverge when `in-progress` is not declared
+        // first — a bare "first active" scan would then bounce to the wrong
+        // active status (or to the gate itself).
+        "reject" | "bounce" => match workflow.gate_reject_status(&from_status) {
             Some(s) => s.id.clone(),
             None => {
                 return TransitionDecision::Reject {
@@ -9857,6 +9864,50 @@ transitions:
                 reason: "target-is-current-status"
             }
         );
+    }
+
+    /// A gated workflow whose developer column (`in-progress`) is declared
+    /// *after* the `adversarial-review` gate, with the gate's declared reject
+    /// edge `adversarial-review -> in-progress`. Exercises `gate_reject_status`
+    /// resolution over a naive "first active status in declaration order" scan,
+    /// which here would pick the gate itself.
+    fn gate_before_in_progress_workflow() -> Workflow {
+        let yaml = r#"
+name: gated
+statuses:
+  - { id: backlog,            name: Backlog,          category: backlog, owner: user,  agent: orchestrator      }
+  - { id: adversarial-review, name: AdversarialReview, category: active, owner: agent, agent: adversarial-review }
+  - { id: in-progress,        name: In Progress,      category: active,  owner: agent, agent: developer         }
+  - { id: review,             name: Review,           category: handoff, owner: user,  agent: reviewer          }
+  - { id: done,               name: Done,             category: done,    owner: user                            }
+transitions:
+  - { from: in-progress,        to: adversarial-review }
+  - { from: adversarial-review, to: review }
+  - { from: adversarial-review, to: in-progress }
+"#;
+        Workflow::from_yaml_str(yaml).expect("workflow parses")
+    }
+
+    #[test]
+    fn decide_transition_bounce_follows_declared_reject_edge_past_a_leading_gate() {
+        // Regression (acceptance criterion 4, bounce half): a gate whose
+        // developer column (`in-progress`) is declared *after* the gate must
+        // still bounce a rejected card to `in-progress`, following the declared
+        // `adversarial-review -> in-progress` edge (via `gate_reject_status`).
+        // A bare "first active" scan would pick `adversarial-review` — the gate
+        // itself — which is a no-op bounce that would strand the reject.
+        let wf = gate_before_in_progress_workflow();
+        for verb in ["reject", "bounce"] {
+            assert_eq!(
+                decide_transition(&wf, Column::from_status_id("adversarial-review"), verb),
+                TransitionDecision::Apply {
+                    from_status: "adversarial-review".into(),
+                    to_status: "in-progress".into(),
+                    to_column: Column::in_progress(),
+                },
+                "verb {verb} should follow the declared reject edge to in-progress",
+            );
+        }
     }
 
     /// A gate task in the `adversarial-review` column, pinned to `assignee`.

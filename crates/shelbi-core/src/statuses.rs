@@ -103,14 +103,26 @@ impl ProjectStatuses {
     /// the loader (`tracing::warn!`) rather than blocking project load.
     /// Returns an empty vector for a coherent set.
     ///
-    /// Generic code assumes a single-instance mapping for the positional
+    /// Generic code assumes a single-instance mapping for the still-positional
     /// categories: Zen's merge probe and the TUI's `Handoff → Review`
     /// column mapping expect a `handoff` to exist, and the category→column
     /// fallback resolves to the *first* status of a category, so a second
-    /// `backlog`/`ready`/`active`/`handoff` status is unreachable by that
-    /// path. We warn — not error — because the any-to-any transition policy
+    /// `backlog`/`ready`/`handoff` status is unreachable by that path. We warn
+    /// — not error — because the any-to-any transition policy
     /// (`Plans/workflows.md` §11) deliberately permits non-canonical sets;
     /// this is a guardrail, not a straitjacket.
+    ///
+    /// `active` is deliberately **not** in that set. A downstream active status
+    /// (e.g. an `adversarial-review` gate declared between `in-progress` and
+    /// `review`, per the documented gate topology) is a first-class position:
+    /// it is categorized by catalog identity, auto-dispatched from the wake
+    /// path, and reached by its declared transitions rather than only by its
+    /// exact id. The two former first-active call sites —
+    /// `shelbi-orchestrator`'s re-dispatch fallback and the poller's
+    /// reject/bounce resolution — now use [`crate::Workflow::primary_active_status`]
+    /// and [`crate::Workflow::gate_reject_status`] respectively, so a second
+    /// active status no longer has an "only reachable by exact id" limitation to
+    /// warn about.
     pub fn category_warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
 
@@ -122,13 +134,14 @@ impl ProjectStatuses {
             );
         }
 
-        // Positional categories the UI/orchestrator resolve to a single
+        // Positional categories the UI/orchestrator still resolve to a single
         // status. Duplicates aren't illegal but the second instance is
-        // unreachable by the category→column fallback, so flag it.
+        // unreachable by the category→column fallback, so flag it. `active` is
+        // intentionally excluded — downstream active gates are first-class
+        // (see the doc comment above).
         for cat in [
             StatusCategory::Backlog,
             StatusCategory::Ready,
-            StatusCategory::Active,
             StatusCategory::Handoff,
         ] {
             if self.count_category(cat) > 1 {
@@ -348,6 +361,29 @@ statuses:
         assert!(
             warnings.iter().any(|w| w.contains("no `handoff`")),
             "got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn no_warning_for_documented_active_gate_topology() {
+        // The documented `in-progress -> adversarial-review -> review` gate
+        // declares two `active` statuses. Downstream active gates are
+        // first-class (categorized by catalog identity, auto-dispatched from
+        // the wake path, reached by their declared transitions), so a second
+        // active status is no longer "only reachable by exact id" — this set
+        // must load with no category warning.
+        let yaml = r#"
+statuses:
+  - { id: in-progress,        name: In Progress,        category: active  }
+  - { id: adversarial-review, name: Adversarial Review, category: active  }
+  - { id: review,             name: Review,             category: handoff }
+  - { id: done,               name: Done,               category: done    }
+"#;
+        let ps = ProjectStatuses::from_yaml_str(yaml).unwrap();
+        assert!(
+            ps.category_warnings().is_empty(),
+            "documented active-gate topology should not warn; got: {:?}",
+            ps.category_warnings()
         );
     }
 
