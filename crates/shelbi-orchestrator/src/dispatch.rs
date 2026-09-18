@@ -12,7 +12,7 @@
 //! values, what do I do?" Splitting it out keeps the rule table unit-
 //! testable without spinning up a SHELBI_HOME fixture.
 
-use shelbi_core::{Owner, StatusCategory, Issue, WorkflowStatus};
+use shelbi_core::{Issue, Owner, WorkflowStatus};
 
 /// The outcome of resolving a status against the current automation
 /// state. Either spawn this agent, or skip with a structured reason.
@@ -101,12 +101,17 @@ pub fn resolve_dispatch_agent(status: &WorkflowStatus, zen_on: bool) -> Dispatch
 /// The card is resolved by its **exact status id** first: a task parked in a
 /// custom agent-owned active status (e.g. a `review-app` gate declared between
 /// `in-progress` and `review`) must re-dispatch as *that* status's agent, not
-/// the workflow's first active status. Only when the current status isn't
+/// the workflow's primary active status. Only when the current status isn't
 /// declared in the workflow, or resolves to no dispatchable agent, do we fall
-/// back to the first active-category status (the canonical `in-progress` in the
-/// default workflow) and then to the bundled developer. Keying off the first
-/// active status alone was the dispatch half of the custom-active-status bug:
-/// a relaunch of a `review-app` pane would silently come back as the developer.
+/// back to the workflow's **primary** active status
+/// ([`Workflow::primary_active_status`] — the canonical `in-progress`, or the
+/// first active-category status when that id is absent) and then to the bundled
+/// developer. Keying off the first active status alone was the dispatch half of
+/// the custom-active-status bug: a relaunch of a `review-app` pane would
+/// silently come back as the developer. Using `primary_active_status()` for the
+/// fallback (rather than a bare "first active" scan) keeps this in step with the
+/// ready-dispatch path even when a downstream gate is declared before
+/// `in-progress`.
 ///
 /// Mirrors the CLI's `resolve_active_agent_for_dispatch` but stays quiet
 /// (no stderr diagnostics — there's no human at a prompt) and reads the
@@ -134,17 +139,20 @@ fn resolve_active_agent_in(
     zen_on: bool,
 ) -> String {
     // Exact-id first: the status the card is actually in wins over the
-    // workflow's first active status.
+    // workflow's primary active status.
     if let Some(status) = workflow.status(current_status_id) {
         if let DispatchDecision::Dispatch { agent } = resolve_dispatch_agent(status, zen_on) {
             return agent;
         }
     }
-    let active = workflow
-        .statuses
-        .iter()
-        .find(|s| s.category == StatusCategory::Active);
-    match active {
+    // Fallback: the *primary* active status — the developer's column
+    // (`in-progress` if declared, else the first active-category status),
+    // never a downstream gate that merely happens to be declared first.
+    // `Workflow::primary_active_status` is the shared helper for "the
+    // developer's column"; using it keeps this fallback in step with the
+    // ready-dispatch and Zen-probe paths instead of re-deriving "first
+    // active" here.
+    match workflow.primary_active_status() {
         Some(status) => match resolve_dispatch_agent(status, zen_on) {
             DispatchDecision::Dispatch { agent } => agent,
             DispatchDecision::Skip(_) => shelbi_state::DEVELOPER_AGENT.to_string(),
@@ -156,6 +164,7 @@ fn resolve_active_agent_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shelbi_core::StatusCategory;
 
     fn status(id: &str, owner: Owner, agent: Option<&str>) -> WorkflowStatus {
         WorkflowStatus {
@@ -384,6 +393,41 @@ statuses:
         // no agent.
         let wf = two_active_workflow();
         assert_eq!(resolve_active_agent_in(&wf, "done", false), "developer");
+    }
+
+    /// Same two active statuses, but with the developer's `in-progress`
+    /// declared *after* the `review-app` gate. Exercises the fallback's use of
+    /// `primary_active_status()` (which prefers the `in-progress` id) over a
+    /// naive "first active status in declaration order" scan, which would pick
+    /// the gate here.
+    fn gate_before_in_progress_workflow() -> shelbi_core::Workflow {
+        shelbi_core::Workflow::from_yaml_str(
+            r#"
+name: task
+statuses:
+  - { id: backlog,     name: Backlog,    category: backlog, owner: user,  agent: orchestrator }
+  - { id: todo,        name: Todo,       category: ready,   owner: agent, agent: orchestrator }
+  - { id: review-app,  name: ReviewApp,  category: active,  owner: agent, agent: review-app   }
+  - { id: in-progress, name: InProgress, category: active,  owner: agent, agent: developer    }
+  - { id: review,      name: Review,     category: handoff, owner: user,  agent: review       }
+  - { id: done,        name: Done,       category: done,    owner: user                       }
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn re_dispatch_fallback_prefers_in_progress_even_when_declared_after_a_gate() {
+        // Regression (acceptance criterion 4, dispatch half): a non-dispatchable
+        // current status must fall back to the *developer's* column
+        // (`in-progress`), not merely the first active status in declaration
+        // order. Here the `review-app` gate is declared before `in-progress`,
+        // so a naive "first active" scan would wrongly re-dispatch a stranded
+        // card as the reviewer. `primary_active_status()` keys off the
+        // `in-progress` id, so the fallback still lands on the developer.
+        let wf = gate_before_in_progress_workflow();
+        assert_eq!(resolve_active_agent_in(&wf, "done", false), "developer");
+        assert_eq!(resolve_active_agent_in(&wf, "ghost", false), "developer");
     }
 
     #[test]
