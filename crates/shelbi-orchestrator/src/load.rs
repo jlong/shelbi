@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use shelbi_core::{Column, Error, Project, Result, Issue, WorkspaceSpec, Workflow};
+use shelbi_core::{Column, Error, Project, Result, Issue, StatusCategory, WorkspaceSpec, Workflow};
 use shelbi_state::{IssueFile, ReviewLoadFailure};
 
 use crate::branch;
@@ -874,6 +874,185 @@ fn dispatch_task_onto(
     let _ = shelbi_state::clear_review_load_failures_for_task(project_name, &tf.task.id);
 
     Ok(addr.target())
+}
+
+/// One task auto-dispatched onto a workspace by [`dispatch_active_gate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchedGate {
+    pub task_id: String,
+    pub workspace: String,
+}
+
+/// Workspaces currently occupied by some *other* task that has a live worker:
+/// any task (except `task_id`) whose current status is an **active** or
+/// **handoff** category on the open board.
+///
+/// Unlike [`active_board`]'s canonical in-progress + review scan, this counts
+/// custom agent-owned active **gates** (e.g. another `adversarial-review` card)
+/// too, so two parked gates can never be dispatched onto the same slot. A
+/// pre-assigned `ready`/`backlog` card is *not* counted — it has no live pane —
+/// so a stale pre-assignment never falsely blocks a gate dispatch.
+fn occupied_workspaces(
+    project: &Project,
+    project_name: &str,
+    task_id: &str,
+) -> Result<HashSet<String>> {
+    let mut busy = HashSet::new();
+    for tf in shelbi_state::read_board(project_name)?.into_issues() {
+        if tf.task.id == task_id {
+            continue;
+        }
+        let Some(ws) = tf.task.assigned_to.clone() else {
+            continue;
+        };
+        let workflow = shelbi_state::load_task_workflow(project_name, project, &tf.task)
+            .unwrap_or_else(|_| shelbi_core::default_workflow());
+        let occupies = workflow
+            .status(tf.task.column.as_str())
+            .map(|s| matches!(s.category, StatusCategory::Active | StatusCategory::Handoff))
+            .unwrap_or(false);
+        if occupies {
+            busy.insert(ws);
+        }
+    }
+    Ok(busy)
+}
+
+/// Pick the workspace an agent-owned active **gate** should launch on: the
+/// first *free eligible* workspace in declaration order — tag-matched to the
+/// gate status's `tags:`, not a `review`-tagged slot (a gate agent is not the
+/// reviewer), and not already `busy` ([`occupied_workspaces`]).
+///
+/// Deliberately **does not** reuse the gate task's `assigned_to`, which after a
+/// ready-marker handoff still names the finishing developer workspace that has
+/// just been released. Reusing it (as [`load_task_by_id`] does for a resume)
+/// would pin the gate back onto the released dev slot; the gate is a *fresh*
+/// dispatch, so it takes the next free slot and the stale prior assignee is
+/// torn down by the caller. Pure (no I/O) so the selection policy is unit
+/// testable without a live pane.
+fn plan_active_gate_workspace<'a>(
+    project: &'a Project,
+    required: &BTreeSet<String>,
+    busy: &HashSet<String>,
+) -> Option<&'a WorkspaceSpec> {
+    project
+        .workspaces_matching(required)
+        .into_iter()
+        .find(|w| {
+            !project.effective_tags(w).contains("review") && !busy.contains(w.name.as_str())
+        })
+}
+
+/// Dispatch the declared agent of an agent-owned active **gate** onto a free
+/// eligible workspace, for a task parked in that gate with no live worker.
+///
+/// The deterministic counterpart to the orchestrator's prose reaction rule for
+/// a `to_category=active` wake: the daemon's active-gate pass
+/// (`maybe_dispatch_parked_active_gates`) calls this so a card promoted into an
+/// `adversarial-review` gate launches that gate's own agent without depending on
+/// the orchestrator model to run `shelbi issue start`. The card stays in the
+/// gate (this never moves the board); only a worker is spawned onto it.
+///
+/// Selection is "first free eligible in declaration order"
+/// ([`plan_active_gate_workspace`]) — it ignores the card's stale `assigned_to`
+/// (the released developer slot), so that value never suppresses the dispatch.
+/// After the new pane is confirmed up, the finishing developer workspace — if a
+/// *different* slot — is released with a best-effort pane teardown, so it is not
+/// left orphaned (the ready handoff normally already killed it; this covers the
+/// swallowed-wake / manual-drag paths). Returns the `(task, workspace)` pair.
+pub fn dispatch_active_gate(project_name: &str, task_id: &str) -> Result<DispatchedGate> {
+    shelbi_state::ensure_daemon_matches_for_mutation()?;
+    let project = shelbi_state::load_project(project_name)?;
+    let store = shelbi_state::issue_store_for_project(&project)?;
+    let tf = store
+        .get(task_id)?
+        .ok_or_else(|| Error::Other(format!("issue `{task_id}` not found")))?;
+
+    let workflow = shelbi_state::load_task_workflow(project_name, &project, &tf.task)
+        .unwrap_or_else(|_| shelbi_core::default_workflow());
+    let status_id = tf.task.column.as_str();
+    // Guard: only an agent-owned active gate is dispatchable here. A caller
+    // racing the card out of the gate (a human accepted it, or the gate's agent
+    // already finished and advanced it) must not trigger a spurious dispatch.
+    if !workflow.is_agent_active_gate(status_id) {
+        return Err(Error::Other(format!(
+            "issue `{task_id}` is not parked in an agent-owned active gate (status `{status_id}`)"
+        )));
+    }
+    let status = workflow.status(status_id);
+    let required: BTreeSet<String> = status
+        .map(|s| s.tags.iter().cloned().collect())
+        .unwrap_or_default();
+    let agent = status.and_then(|s| s.agent.clone());
+
+    let busy = occupied_workspaces(&project, project_name, task_id)?;
+    let chosen = plan_active_gate_workspace(&project, &required, &busy)
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "no free eligible workspace to dispatch the `{status_id}` gate for `{task_id}` \
+                 (required tags {required:?})"
+            ))
+        })?
+        .clone();
+    let prior = tf.task.assigned_to.clone();
+
+    // Mirror the review auto-loader's observable event so a headless gate
+    // dispatch is visible in `events.log` (not just the tracing logs) and the
+    // orchestrator sees the same `dispatch task=… workspace=…` line a manual
+    // `issue start` would emit.
+    let _ = shelbi_state::append_dispatch_event(
+        task_id,
+        &chosen.name,
+        "active-gate",
+        "auto-dispatching the gate's agent onto a free workspace",
+    );
+
+    let target = dispatch_task_onto(project_name, &project, &workflow, tf, &chosen, agent)?;
+
+    // Release the finishing developer workspace when the gate landed on a
+    // *different* slot — best-effort, so a stale/dead prior pane never blocks
+    // the dispatch that already succeeded.
+    if let Some(prev) = prior {
+        if prev != chosen.name {
+            release_supplanted_workspace(&project, &prev);
+        }
+    }
+
+    tracing::info!(
+        project = %project_name,
+        task = %task_id,
+        workspace = %chosen.name,
+        target = %target,
+        "auto-dispatched an agent-owned active gate",
+    );
+    Ok(DispatchedGate {
+        task_id: task_id.to_string(),
+        workspace: chosen.name,
+    })
+}
+
+/// Best-effort teardown of a workspace pane supplanted by a gate dispatch (the
+/// released developer slot). A missing machine/workspace or a failed kill is
+/// logged and swallowed — the authoritative gate dispatch has already landed.
+fn release_supplanted_workspace(project: &Project, workspace_name: &str) {
+    let Some(ws) = project.workspace(workspace_name) else {
+        return;
+    };
+    let Some(machine) = project.machine(&ws.machine) else {
+        return;
+    };
+    let host = machine.host();
+    let Ok(addr) = crate::workspace::workspace_tmux_addr(project, ws) else {
+        return;
+    };
+    if let Err(e) = crate::workspace::kill_workspace_pane(&host, &addr, workspace_name) {
+        tracing::warn!(
+            project = %project.name,
+            workspace = %workspace_name,
+            error = %e,
+            "active-gate dispatch: releasing the supplanted developer workspace failed",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1912,6 +2091,214 @@ mod tests {
         assert_eq!(
             after_second["t-doomed"]["review-1"].attempts, 1,
             "a within-backoff tick must not re-attempt the same pair"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A project with three dev slots (`alpha`, `beta`, `gamma`, no tags) plus a
+    /// `review`-tagged slot declared *first*, so the tests can prove the gate
+    /// picker skips review slots and honors declaration order among dev slots.
+    fn gate_project() -> Project {
+        let mut project = tagged_project();
+        project.workspaces = vec![
+            WorkspaceSpec {
+                name: "review-1".into(),
+                machine: "hub".into(),
+                tags: vec!["review".into()],
+                slot: None,
+            },
+            WorkspaceSpec {
+                name: "alpha".into(),
+                machine: "hub".into(),
+                tags: Vec::new(),
+                slot: None,
+            },
+            WorkspaceSpec {
+                name: "beta".into(),
+                machine: "hub".into(),
+                tags: Vec::new(),
+                slot: None,
+            },
+            WorkspaceSpec {
+                name: "gamma".into(),
+                machine: "hub".into(),
+                tags: Vec::new(),
+                slot: None,
+            },
+        ];
+        project
+    }
+
+    /// A task parked in the `adversarial-review` gate, still pinned to the
+    /// developer slot that built it (the stale assignment the fix must not let
+    /// suppress the gate dispatch).
+    fn gate_task(id: &str, stale_assignee: Option<&str>) -> Issue {
+        let now = chrono::Utc::now();
+        Issue {
+            id: id.into(),
+            title: id.into(),
+            column: Column::from_status_id("adversarial-review"),
+            priority: 0,
+            assigned_to: stale_assignee.map(str::to_string),
+            workflow: None,
+            branch: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            launch: None,
+            params: BTreeMap::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn busy_set(slots: &[&str]) -> HashSet<String> {
+        slots.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn plan_active_gate_workspace_takes_the_first_free_dev_slot_skipping_review() {
+        // No required tags, nothing busy: the picker takes the first free slot in
+        // declaration order, skipping the `review`-tagged one declared ahead of
+        // the dev slots (a gate agent is not the reviewer).
+        let project = gate_project();
+        let required = BTreeSet::new();
+        let chosen = plan_active_gate_workspace(&project, &required, &busy_set(&[]));
+        assert_eq!(chosen.map(|w| w.name.as_str()), Some("alpha"));
+    }
+
+    #[test]
+    fn plan_active_gate_workspace_ignores_the_stale_dev_assignment() {
+        // The gate card still names `gamma` in `assigned_to` (the released dev
+        // slot) — but the released dev slot is NOT busy (its worker is gone), so
+        // the busy set is empty. The picker must NOT reuse the stale assignee; a
+        // gate is a fresh dispatch, so it takes the first free slot (`alpha`).
+        let project = gate_project();
+        let required = BTreeSet::new();
+        // The stale `assigned_to=gamma` is deliberately absent from `busy`:
+        // `occupied_workspaces` never counts the released dev slot (its worker is
+        // gone) nor the gate task's own assignment — see
+        // `occupied_workspaces_counts_active_gates_but_not_a_ready_preassignment`.
+        let chosen = plan_active_gate_workspace(&project, &required, &busy_set(&[]));
+        assert_eq!(
+            chosen.map(|w| w.name.as_str()),
+            Some("alpha"),
+            "a stale assigned_to must not be reused (nor suppress) the gate dispatch",
+        );
+    }
+
+    #[test]
+    fn plan_active_gate_workspace_skips_slots_busy_with_other_tasks() {
+        // `alpha` is busy with a different task (an in-progress card or another
+        // gate), so the picker walks to the next free dev slot (`beta`).
+        let project = gate_project();
+        let required = BTreeSet::new();
+        let chosen = plan_active_gate_workspace(&project, &required, &busy_set(&["alpha"]));
+        assert_eq!(chosen.map(|w| w.name.as_str()), Some("beta"));
+    }
+
+    #[test]
+    fn plan_active_gate_workspace_is_none_when_every_dev_slot_is_busy() {
+        // Every dev slot holds another active task; only review slots remain, and
+        // those are never gate candidates — so there is nowhere to dispatch.
+        let project = gate_project();
+        let required = BTreeSet::new();
+        let busy = busy_set(&["alpha", "beta", "gamma"]);
+        assert!(plan_active_gate_workspace(&project, &required, &busy).is_none());
+    }
+
+    /// Write a `default` workflow (plus its `statuses.yaml` catalog) declaring
+    /// an `adversarial-review` agent-owned active gate between `in-progress` and
+    /// the human `review` handoff, so on-disk tasks resolve its category.
+    fn write_gated_workflow() {
+        let wf_dir = shelbi_state::workflows_dir("demo").unwrap();
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("statuses.yaml"),
+            r#"
+statuses:
+  - { id: backlog,            name: Backlog,           category: backlog }
+  - { id: todo,               name: Todo,              category: ready }
+  - { id: in-progress,        name: InProgress,        category: active }
+  - { id: adversarial-review, name: AdversarialReview, category: active }
+  - { id: review,             name: Review,            category: handoff }
+  - { id: done,               name: Done,              category: done }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            wf_dir.join("default.yaml"),
+            r#"
+name: default
+statuses:
+  - { id: backlog,            owner: user }
+  - { id: todo,               owner: agent, agent: orchestrator }
+  - { id: in-progress,        owner: agent, agent: developer }
+  - { id: adversarial-review, owner: agent, agent: adversarial-review }
+  - { id: review,             owner: user }
+  - { id: done,               owner: user }
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn occupied_workspaces_counts_active_gates_but_not_a_ready_preassignment() {
+        // The double-booking guard: a workspace serving another agent-owned
+        // active gate must count as busy (so two parked gates never land on one
+        // slot), while a pre-assigned `ready` card — which has no live worker —
+        // must NOT, and the dispatched task's own (stale) assignment is excluded.
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+        write_gated_workflow();
+
+        // Another gate card serving on `alpha`.
+        shelbi_state::save_task("demo", &gate_task("t-busy-gate", Some("alpha")), "body").unwrap();
+        // A ready card pre-assigned to `review-1` (no live worker yet).
+        let mut preassigned = todo_task("t-ready", &[]);
+        preassigned.assigned_to = Some("review-1".into());
+        shelbi_state::save_task("demo", &preassigned, "body").unwrap();
+        // The gate we're about to dispatch, still pinned to its released dev slot.
+        shelbi_state::save_task("demo", &gate_task("t-self", Some("review-2")), "body").unwrap();
+
+        let busy = occupied_workspaces(&tagged_project(), "demo", "t-self").unwrap();
+        assert!(busy.contains("alpha"), "an active gate must count as busy: {busy:?}");
+        assert!(
+            !busy.contains("review-1"),
+            "a ready pre-assignment must not count as busy: {busy:?}",
+        );
+        assert!(
+            !busy.contains("review-2"),
+            "the dispatched task's own assignment must be excluded: {busy:?}",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn dispatch_active_gate_refuses_a_non_gate_status() {
+        // A task that isn't parked in an agent-owned active gate (here a plain
+        // `in-progress` card — the primary active status, owned by the
+        // ready-dispatch / supervisor paths) is not dispatchable by this path.
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let project = tagged_project();
+        shelbi_state::save_project(&project).unwrap();
+        let mut inprog = todo_task("t-dev", &[]);
+        inprog.column = Column::in_progress();
+        inprog.assigned_to = Some("alpha".into());
+        shelbi_state::save_task("demo", &inprog, "body").unwrap();
+
+        let err = dispatch_active_gate("demo", "t-dev").unwrap_err();
+        assert!(
+            err.to_string().contains("not parked in an agent-owned active gate"),
+            "unexpected error: {err}",
         );
 
         std::env::remove_var("SHELBI_HOME");
