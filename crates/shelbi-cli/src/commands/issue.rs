@@ -37,8 +37,9 @@ pub enum IssueCmd {
         #[arg(long, conflicts_with = "status")]
         ready: bool,
         /// Restrict to issues pinned to the named workflow. Issues with no
-        /// explicit `workflow:` field are treated as the canonical
-        /// `default` workflow. Composes with `--column` and `--ready`.
+        /// explicit `workflow:` field are resolved through the project's
+        /// configured `default_workflow:` (the canonical `default` only when
+        /// the project sets none). Composes with `--column` and `--ready`.
         #[arg(long, value_name = "NAME")]
         workflow: Option<String>,
     },
@@ -191,7 +192,9 @@ pub struct AddArgs {
     #[arg(long = "prefers-machine", value_name = "NAME")]
     pub prefers_machine: Option<String>,
     /// Workflow this issue runs under. Names a file in `workflows/<NAME>.yaml`.
-    /// Omit to inherit the project's default workflow.
+    /// Omit to leave `workflow:` unset, which resolves at read time to the
+    /// project's configured `default_workflow:` (the canonical `default` only
+    /// when the project sets none).
     #[arg(long = "workflow", value_name = "NAME")]
     pub workflow: Option<String>,
     /// Pre-fill the issue's `branch:` frontmatter field. Omit to let the

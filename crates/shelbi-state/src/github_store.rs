@@ -1043,7 +1043,7 @@ impl IssueStore for GitHubStore {
         // GitHub carrying a terminal label) reads as `backlog` here, so the
         // recorded edge matches the lane the card was actually rendering in.
         let from = gh.column();
-        let workflow = gh.workflow_name();
+        let workflow = self.move_workflow_name(&gh);
 
         let to_label = status_label_name(to);
         // A terminal target closes the issue; a non-terminal one opens it.
@@ -1524,6 +1524,29 @@ impl IssueStore for GitHubStore {
 }
 
 impl GitHubStore {
+    /// The workflow name a [`StatusMove`] (and the move event it feeds) should
+    /// record for `gh`: its explicit `workflow:` when the metadata block sets
+    /// one, otherwise the project's configured `default_workflow:`, falling back
+    /// to the canonical [`DEFAULT_WORKFLOW_NAME`] only when the project config is
+    /// unavailable or names no default.
+    ///
+    /// Mirrors the filesystem backend's `resolved_task_workflow_name_for_project`
+    /// so a github-backed board logs the same `workflow=` on its move events as a
+    /// local one. Without the project lookup a card that omits `workflow:` logged
+    /// `workflow=default` even under a project whose `default_workflow:` was
+    /// something else (e.g. `app`), which silently stripped that workflow's Zen
+    /// local checks from the merge gate. The `load_project` failure is soft — the
+    /// move itself already succeeded and the canonical default keeps the event
+    /// well-formed — matching every other workflow-resolution call site.
+    fn move_workflow_name(&self, gh: &GhIssue) -> String {
+        match gh.explicit_workflow() {
+            Some(explicit) => explicit,
+            None => crate::load_project(&self.project)
+                .map(|p| p.default_workflow_name().to_string())
+                .unwrap_or_else(|_| DEFAULT_WORKFLOW_NAME.to_string()),
+        }
+    }
+
     /// Resolve a shelbi id to the raw GitHub issue (number + fields), or `None`.
     ///
     /// Number-first, mirroring [`GitHubStore::get`]: a number already known from
@@ -4264,13 +4287,14 @@ impl GhIssue {
         self.resolve_id(&meta)
     }
 
-    /// The workflow this issue runs under, parsed from its metadata block, or
-    /// the canonical default when unset — the value a [`StatusMove`] carries.
-    fn workflow_name(&self) -> String {
-        self.split_meta_or_warn()
-            .1
-            .workflow
-            .unwrap_or_else(|| DEFAULT_WORKFLOW_NAME.to_string())
+    /// The issue's explicit `workflow:` from its metadata block, or `None`
+    /// when the block omits it. This is the raw value *before* any default is
+    /// applied: a caller that can reach the project config resolves the unset
+    /// case through its `default_workflow:` (see
+    /// [`GitHubStore::move_workflow_name`]), so the canonical `default` is only
+    /// the last-resort fallback rather than the answer for every unset card.
+    fn explicit_workflow(&self) -> Option<String> {
+        self.split_meta_or_warn().1.workflow
     }
 
     /// Map GitHub state + labels onto a shelbi [`Column`]. A closed issue is
@@ -5263,6 +5287,35 @@ mod tests {
         (store, calls)
     }
 
+    /// Seed a global project YAML for `test-project` (the name every
+    /// `recording_store` binds to) under the active `SHELBI_HOME`, so
+    /// `move_workflow_name`'s `load_project` can resolve `default_workflow:`.
+    /// When `default_workflow` is `Some`, scaffold that workflow too — else
+    /// `load_project` rejects a configured default whose YAML is missing.
+    fn seed_test_project(default_workflow: Option<&str>) {
+        let dir = crate::projects_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let dw = default_workflow
+            .map(|w| format!("default_workflow: {w}\n"))
+            .unwrap_or_default();
+        let yaml = format!(
+            "repo: /tmp/test-project\n\
+             {dw}\
+             orchestrator:\n  runner: claude\n\
+             agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+             machines:\n  - name: hub\n    kind: local\n    work_dir: /tmp\n"
+        );
+        std::fs::write(dir.join("test-project.yaml"), yaml).unwrap();
+        if let Some(w) = default_workflow {
+            let path = crate::workflow_path("test-project", w).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let wf_yaml = shelbi_core::scaffold::default_workflow_yaml()
+                .unwrap()
+                .replacen("name: default", &format!("name: {w}"), 1);
+            std::fs::write(path, wf_yaml).unwrap();
+        }
+    }
+
     /// Every call that swaps a status label or opens/closes the issue. Used by
     /// the terminal / reopen assertions.
     fn call_containing<'a>(calls: &'a [String], needles: &[&str]) -> Option<&'a String> {
@@ -5740,6 +5793,60 @@ mod tests {
         assert!(patch.contains("state_reason=completed"));
         // No separate label PUT anywhere in the move path.
         assert!(call_containing(&calls, &["-X PUT", "/labels"]).is_none());
+    }
+
+    #[test]
+    fn move_status_resolves_unset_workflow_through_project_default() {
+        // A card that omits `workflow:` must pick up the project's configured
+        // `default_workflow:` (here `app`) in the emitted `StatusMove`, not the
+        // canonical `default` — otherwise its move events would drop the app
+        // workflow's Zen local checks from the merge gate.
+        let _home = HomeGuard::new("move-wf-project-default");
+        seed_test_project(Some("app"));
+        let issue = r#"{"number":7,"title":"T","body":"P (no workflow field)","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/backlog"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let after = r#"{"number":7,"title":"T","body":"P (no workflow field)","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, _calls) = recording_store(issue, issue, "", after);
+
+        let mv = store
+            .move_status("t", &Column::todo(), "orchestrator:zen-promote")
+            .unwrap()
+            .expect("status changed");
+        assert_eq!(mv.workflow, "app");
+    }
+
+    #[test]
+    fn move_status_unset_workflow_falls_back_to_canonical_default_without_project_default() {
+        // With no project `default_workflow:` configured, an unset card still
+        // resolves to the canonical `default` — the historical fallback.
+        let _home = HomeGuard::new("move-wf-canonical-default");
+        seed_test_project(None);
+        let issue = r#"{"number":7,"title":"T","body":"P (no workflow field)","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/backlog"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let after = r#"{"number":7,"title":"T","body":"P (no workflow field)","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, _calls) = recording_store(issue, issue, "", after);
+
+        let mv = store
+            .move_status("t", &Column::todo(), "orchestrator:zen-promote")
+            .unwrap()
+            .expect("status changed");
+        assert_eq!(mv.workflow, shelbi_core::DEFAULT_WORKFLOW_NAME);
+    }
+
+    #[test]
+    fn move_status_explicit_workflow_wins_over_project_default() {
+        // An explicit `workflow:` on the card is authoritative even when the
+        // project configures a different default — the move records the card's
+        // own workflow, unchanged.
+        let _home = HomeGuard::new("move-wf-explicit");
+        seed_test_project(Some("app"));
+        let issue = r#"{"number":7,"title":"T","body":"P\n\n<!-- shelbi:begin -->\n```yaml\nworkflow: site\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/backlog"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let after = r#"{"number":7,"title":"T","body":"P","state":"open","labels":[{"name":"shelbi:id/t"},{"name":"shelbi:status/todo"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, _calls) = recording_store(issue, issue, "", after);
+
+        let mv = store
+            .move_status("t", &Column::todo(), "orchestrator:zen-promote")
+            .unwrap()
+            .expect("status changed");
+        assert_eq!(mv.workflow, "site");
     }
 
     #[test]
