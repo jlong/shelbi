@@ -2404,16 +2404,31 @@ fn maybe_apply_ready_handoff(
             if tf.task.column == Column::in_progress()
                 && tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()) =>
         {
-            // Resolve the forward target from the task's workflow: the first
-            // handoff-category status. A workflow may legitimately declare no
-            // handoff status (e.g. a subtask flow that merges straight to
-            // done) — then fall back to the active status's outgoing
-            // merge-firing edge and auto-advance along it, so the finished
-            // task isn't stranded in-progress. That edge lands the task
-            // directly in its (done) target — it is NOT a handoff, so it can
-            // never be routed to a review workspace, which only receives
-            // tasks sitting in a handoff-category status. Neither a handoff
-            // status nor a merge edge → nothing to advance to; clear the
+            // Resolve the forward target from the task's workflow, in order:
+            //
+            //   1. A declared forward edge to an agent-owned active **gate**
+            //      (e.g. `in-progress -> adversarial-review`). When the
+            //      workflow routes finished work *through* an automated review
+            //      stage before the human handoff, the ready marker must
+            //      follow that declared edge — running its `push_branch` /
+            //      `open_pr` actions and landing the card in the gate so its
+            //      agent auto-dispatches — rather than skipping the gate and
+            //      jumping straight to the handoff status. Resolved strictly
+            //      (see `Workflow::forward_agent_active_gate`): a unique
+            //      agent-owned active target, else we fall through so the
+            //      default direct `in-progress -> review` shape is unchanged.
+            //   2. The first handoff-category status (the common shape — the
+            //      developer hands a review card to a human).
+            //   3. A workflow with no handoff status (e.g. a subtask flow that
+            //      merges straight to done): fall back to the active status's
+            //      outgoing merge-firing edge and auto-advance along it, so the
+            //      finished task isn't stranded in-progress. That edge lands
+            //      the task directly in its (done) target — it is NOT a
+            //      handoff, so it can never be routed to a review workspace,
+            //      which only receives tasks sitting in a handoff-category
+            //      status.
+            //
+            // None of the three → nothing to advance to; clear the
             // (misconfigured) marker below.
             let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
                 .unwrap_or_else(|_| default_workflow());
@@ -2422,9 +2437,16 @@ fn maybe_apply_ready_handoff(
             // status and we're auto-advancing straight to a terminal status
             // along a `merge`-firing edge. In that case the merge is
             // load-bearing and must land BEFORE the task is marked done (see
-            // below); a handoff to a review status instead runs its edge
-            // (serving) AFTER the move, best-effort.
-            let (to_status, is_merge_edge_advance) = if let Some(handoff) = workflow
+            // below); a handoff to a review status — and, likewise, a move into
+            // an agent-owned active gate — instead runs its edge actions
+            // (serving) BEFORE the move (gated), then finishes AFTER,
+            // best-effort.
+            let (to_status, is_merge_edge_advance) = if let Some(gate) =
+                workflow.forward_agent_active_gate(&from_status)
+            {
+                tracing::info!(workspace = %workspace.name, task = %task_id, from = %from_status, to = %gate.to, "workflow declares an agent-owned active gate; routing ready handoff through it");
+                (gate.to.clone(), false)
+            } else if let Some(handoff) = workflow
                 .statuses
                 .iter()
                 .find(|s| s.category == StatusCategory::Handoff)
@@ -6754,6 +6776,168 @@ while :; do sleep 60; done
             "task already in review must not be pulled back out"
         );
         assert!(!marker.exists(), "stale marker should be cleared");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The documented [add-to-workflow] gated topology, end to end: a ready
+    /// marker must route the finished work through the agent-owned active
+    /// `adversarial-review` gate (running the declared edge's side-effects and
+    /// releasing the developer) *before* the human `review` handoff — not
+    /// straight to `review`, which silently skips the gate (the #1308 bug).
+    /// Then the gate's agent completing (via its transition marker) advances
+    /// the card the rest of the way to `review`.
+    #[test]
+    fn ready_marker_routes_through_an_agent_owned_active_gate_then_to_review() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+
+        // The identity catalog (`statuses.yaml`) + the workflow file that
+        // references it, declaring the `in-progress -> adversarial-review`
+        // gate edge. The gate edge's side-effect is expressed as a `run:`
+        // sentinel rather than `push_branch`/`open_pr` so the test asserts
+        // "actions on that transition execute" deterministically, without a
+        // git remote or `gh`.
+        let wf_dir = shelbi_state::workflows_dir("demo").unwrap();
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("statuses.yaml"),
+            r#"
+statuses:
+  - { id: backlog,            name: Backlog,           category: backlog }
+  - { id: todo,               name: Todo,              category: ready }
+  - { id: in-progress,        name: InProgress,        category: active }
+  - { id: adversarial-review, name: AdversarialReview, category: active }
+  - { id: review,             name: Review,            category: handoff }
+  - { id: done,               name: Done,              category: done }
+"#,
+        )
+        .unwrap();
+        // The gate edge writes its sentinel into the worktree (the `run:`
+        // command `cd`s there first), so create the worktree dir. It is not a
+        // git repo, so the pre-handoff push resolves to `NoRemote` (local-only,
+        // nothing to hand off) and does not block the move.
+        let worktree = shelbi_orchestrator::workspace::workspace_worktree(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(&worktree).unwrap();
+        let sentinel = worktree.join("gate-actions-ran");
+        std::fs::write(
+            wf_dir.join("default.yaml"),
+            format!(
+                r#"
+name: default
+statuses:
+  - {{ id: backlog,            owner: user }}
+  - {{ id: todo,               owner: agent, agent: orchestrator }}
+  - {{ id: in-progress,        owner: agent, agent: developer }}
+  - {{ id: adversarial-review, owner: agent, agent: adversarial-review }}
+  - {{ id: review,             owner: user }}
+  - {{ id: done,               owner: user }}
+transitions:
+  - {{ from: in-progress,        to: adversarial-review, run: ["touch {sentinel}"] }}
+  - {{ from: adversarial-review, to: review }}
+  - {{ from: adversarial-review, to: in-progress }}
+  - {{ from: review,             to: done, actions: [merge, delete_branch] }}
+"#,
+                sentinel = sentinel.display(),
+            ),
+        )
+        .unwrap();
+
+        shelbi_state::save_task("demo", &in_progress_task("t-gate", "alpha"), "body").unwrap();
+        let marker = write_marker(&project, "t-gate\n");
+
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
+        );
+
+        // The card lands in the gate, NOT the handoff status.
+        assert_eq!(
+            shelbi_state::load_task("demo", "t-gate")
+                .unwrap()
+                .task
+                .column,
+            Column::from_status_id("adversarial-review"),
+            "ready marker must route through the agent-owned active gate, not skip to review",
+        );
+        assert!(!marker.exists(), "ready marker should be consumed");
+        assert!(
+            sentinel.exists(),
+            "the gate edge's declared `run:` action must have executed",
+        );
+
+        // The move event is stamped `to_category=active` and carries no
+        // `agent=` token — exactly the shape the orchestrator's wake path
+        // (`WakePriority::Active`) keys off to auto-dispatch the gate's agent.
+        let log =
+            std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let gate_line = log
+            .lines()
+            .find(|l| l.contains(" project=demo task=t-gate ") && l.contains(" in_progress -> adversarial-review "))
+            .unwrap_or_else(|| panic!("no gate move line in log: {log:?}"));
+        assert!(
+            gate_line.contains(" reason=workspace:ready-marker "),
+            "line: {gate_line}",
+        );
+        assert!(
+            gate_line.ends_with(" to_category=active"),
+            "line: {gate_line}",
+        );
+        assert!(
+            !gate_line.contains(" agent="),
+            "a ready-marker gate move must not carry an agent= token (would suppress the dispatch wake): {gate_line}",
+        );
+
+        // The gate's agent completing writes a transition marker requesting the
+        // human `review` handoff. `move_status` above left the card assigned to
+        // `alpha` (it does not unassign), so the transition applies in place.
+        let transition_marker = shelbi_orchestrator::workspace::workspace_transition_marker(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::write(&transition_marker, "t-gate\nreview\n").unwrap();
+        maybe_apply_transition(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
+        );
+
+        assert_eq!(
+            shelbi_state::load_task("demo", "t-gate")
+                .unwrap()
+                .task
+                .column,
+            Column::review(),
+            "the gate's declared `adversarial-review -> review` edge must advance the card to human review",
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
