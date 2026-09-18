@@ -262,10 +262,11 @@ pub enum PaneReloadStatus {
 }
 
 /// Relative path (from the orchestrator's workdir) where the composed
-/// orchestrator system prompt is staged for claude's
-/// `--append-system-prompt` flag. Mirrors the workspace-side
-/// [`crate::workspace::WORKTREE_AGENT_INSTRUCTIONS_REL`] so both panes
-/// load their agent context from the same conventional location.
+/// orchestrator system prompt is staged for claude's `--append-system-prompt`
+/// flag. Shares its conventional location with the worker-side
+/// [`crate::workspace::WORKTREE_AGENT_INSTRUCTIONS_REL`], but only the
+/// orchestrator pane still consumes a staged file: a worker inlines its agent
+/// charter into the startup prompt instead (task #1315).
 pub const ORCH_AGENT_INSTRUCTIONS_REL: &str = ".claude/agent-instructions.md";
 
 /// The dashboard window's tmux address (orchestrator's session).
