@@ -182,7 +182,9 @@ fn derive_pr_text(
     transcript: Option<&str>,
 ) -> (String, String) {
     let mut lines = body_md.lines();
-    // First "# Task" h1 is shelbi-emitted; the next non-blank line is the prompt.
+    // The first non-blank, non-heading line is the prompt. A body may legitimately
+    // open with its own heading (e.g. `## Summary`, or a legacy `# Task` h1), which
+    // this loop skips to reach the author's first prose line.
     let mut title = format!("shelbi: {id}");
     for line in &mut lines {
         let t = line.trim();
@@ -407,20 +409,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pr_body_with_no_extras_matches_legacy_shape() {
-        let (title, body) = derive_pr_text("# Task\n\nFix login.\n", "fix-login", None, None);
+    fn pr_body_with_no_extras_preserves_body_and_footer() {
+        let (title, body) = derive_pr_text("Fix login.\n", "fix-login", None, None);
         assert_eq!(title, "Fix login.");
-        assert!(body.starts_with("# Task\n\nFix login.\n"));
+        assert!(body.starts_with("Fix login.\n"));
         assert!(body.contains("— opened by [shelbi]"));
         assert!(!body.contains("## Files changed"));
         assert!(!body.contains("Workspace transcript"));
     }
 
     #[test]
+    fn pr_title_is_first_prose_line_across_body_shapes() {
+        // No heading: the very first line is the prose title.
+        let (title, _) = derive_pr_text("Fix login.\n", "fix-login", None, None);
+        assert_eq!(title, "Fix login.");
+
+        // Body that opens with its own heading: the loop skips the `## Summary`
+        // heading and takes the first prose line beneath it.
+        let (title, _) =
+            derive_pr_text("## Summary\n\nFix login.\n", "fix-login", None, None);
+        assert_eq!(title, "Fix login.");
+
+        // Legacy body still carrying the old shelbi-emitted `# Task` h1: the same
+        // skip-any-heading rule finds the author's first prose line.
+        let (title, _) =
+            derive_pr_text("# Task\n\nFix login.\n", "fix-login", None, None);
+        assert_eq!(title, "Fix login.");
+    }
+
+    #[test]
     fn pr_body_includes_diff_stat_when_provided() {
         let stat =
             " src/foo.rs | 12 +++++++-----\n 1 file changed, 7 insertions(+), 5 deletions(-)";
-        let (_, body) = derive_pr_text("# Task\n\nFix.\n", "fix", Some(stat), None);
+        let (_, body) = derive_pr_text("Fix.\n", "fix", Some(stat), None);
         assert!(body.contains("## Files changed"));
         assert!(body.contains("src/foo.rs | 12 +++++++-----"));
         assert!(body.contains("1 file changed, 7 insertions(+), 5 deletions(-)"));
@@ -431,7 +452,7 @@ mod tests {
     #[test]
     fn pr_body_includes_transcript_in_collapsed_details() {
         let transcript = "claude> done\nshelbi task move fix --to review\n";
-        let (_, body) = derive_pr_text("# Task\n\nFix.\n", "fix", None, Some(transcript));
+        let (_, body) = derive_pr_text("Fix.\n", "fix", None, Some(transcript));
         assert!(body.contains("<details>"));
         assert!(body.contains("<summary>Workspace transcript</summary>"));
         assert!(body.contains("claude> done"));
@@ -440,7 +461,7 @@ mod tests {
 
     #[test]
     fn pr_body_omits_sections_for_empty_or_whitespace_inputs() {
-        let (_, body) = derive_pr_text("# Task\n\nFix.\n", "fix", Some("   \n\n"), Some(""));
+        let (_, body) = derive_pr_text("Fix.\n", "fix", Some("   \n\n"), Some(""));
         assert!(!body.contains("## Files changed"));
         assert!(!body.contains("Workspace transcript"));
     }
@@ -448,7 +469,7 @@ mod tests {
     #[test]
     fn pr_body_orders_sections_diff_then_transcript_then_footer() {
         let (_, body) = derive_pr_text(
-            "# Task\n\nFix.\n",
+            "Fix.\n",
             "fix",
             Some(" a | 1 +\n"),
             Some("the transcript"),

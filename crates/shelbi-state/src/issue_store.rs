@@ -1054,7 +1054,7 @@ mod tests {
     }
 
     fn spec(id: &str, column: Column) -> NewIssue {
-        NewIssue::new(id, id.replace('-', " "), column, "# Task\n\nbody\n")
+        NewIssue::new(id, id.replace('-', " "), column, "body\n")
     }
 
     #[test]
@@ -1070,7 +1070,7 @@ mod tests {
 
         let got = store.get("a").unwrap().expect("issue exists");
         assert_eq!(got.task.id, "a");
-        assert_eq!(got.body, "# Task\n\nbody\n");
+        assert_eq!(got.body, "body\n");
         assert!(store.get("missing").unwrap().is_none());
 
         // A second add appends after the first.
