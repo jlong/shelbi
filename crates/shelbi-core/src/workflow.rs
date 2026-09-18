@@ -360,6 +360,85 @@ impl Workflow {
         Some(first)
     }
 
+    /// True iff `status_id` names an **agent-owned active gate** — a
+    /// `category: active`, `owner: agent` status that is *not* the workflow's
+    /// canonical (first) active status.
+    ///
+    /// The first active status is the developer's working column (`in-progress`
+    /// in the default workflow); any *later* agent-owned active status (e.g.
+    /// `adversarial-review`) is an automated review stage a developer's finished
+    /// work routes *through* before human handoff — see
+    /// [`Workflow::forward_agent_active_gate`], which the developer's ready
+    /// handoff follows into this gate.
+    ///
+    /// A dispatch onto a gate status is a *reviewer*, not a developer: the
+    /// prompt composer in `shelbi-orchestrator` keys off this to give the gate
+    /// review-completion guidance (pass forward / bounce back — see
+    /// [`Workflow::gate_pass_status`] / [`Workflow::gate_reject_status`])
+    /// instead of the developer's rebase + ready-marker handoff.
+    pub fn is_agent_active_gate(&self, status_id: &str) -> bool {
+        let Some(status) = self.status(status_id) else {
+            return false;
+        };
+        if status.category != StatusCategory::Active || !matches!(status.owner, Owner::Agent) {
+            return false;
+        }
+        // The workflow's first active status is the developer's column, never a
+        // gate. Only a *distinct* agent-owned active status qualifies.
+        self.statuses
+            .iter()
+            .find(|s| s.category == StatusCategory::Active)
+            .is_some_and(|first| first.id != status_id)
+    }
+
+    /// The status an agent-owned active gate in `from` **passes** a task to on a
+    /// clean verdict: the target of `from`'s declared outgoing transition into a
+    /// [`StatusCategory::Handoff`] status (the human review stage). Falls back to
+    /// the workflow's first handoff status when `from` declares no such edge, and
+    /// returns `None` only when the workflow has no handoff status at all.
+    pub fn gate_pass_status(&self, from: &str) -> Option<&Status> {
+        if let Some(ts) = &self.transitions {
+            if let Some(to) = ts
+                .iter()
+                .filter(|t| t.from == from)
+                .map(|t| t.to.as_str())
+                .find(|to| {
+                    self.status(to)
+                        .is_some_and(|s| s.category == StatusCategory::Handoff)
+                })
+            {
+                return self.status(to);
+            }
+        }
+        self.statuses
+            .iter()
+            .find(|s| s.category == StatusCategory::Handoff)
+    }
+
+    /// The status an agent-owned active gate in `from` **bounces** a rejected
+    /// task back to: the target of `from`'s declared outgoing transition into an
+    /// [`StatusCategory::Active`] status distinct from `from` (the developer's
+    /// working column). Falls back to the workflow's first active status other
+    /// than `from`, and returns `None` when there is none.
+    pub fn gate_reject_status(&self, from: &str) -> Option<&Status> {
+        if let Some(ts) = &self.transitions {
+            if let Some(to) = ts
+                .iter()
+                .filter(|t| t.from == from && t.to != from)
+                .map(|t| t.to.as_str())
+                .find(|to| {
+                    self.status(to)
+                        .is_some_and(|s| s.category == StatusCategory::Active)
+                })
+            {
+                return self.status(to);
+            }
+        }
+        self.statuses
+            .iter()
+            .find(|s| s.category == StatusCategory::Active && s.id != from)
+    }
+
     /// True iff a task in `from` is on a transition that fires `merge` —
     /// i.e., Zen Mode's confidence bar should apply.
     ///
@@ -1958,6 +2037,81 @@ transitions:
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
         assert!(wf.forward_agent_active_gate("in-progress").is_none());
+    }
+
+    #[test]
+    fn is_agent_active_gate_distinguishes_the_gate_from_the_developer_column() {
+        let wf = Workflow::from_yaml_str(GATED_YAML).unwrap();
+        // The gate itself is an agent-owned active status that is not the
+        // workflow's first active status.
+        assert!(wf.is_agent_active_gate("adversarial-review"));
+        // The developer's own working column (the first active status) is never
+        // a gate, even though it is also `owner: agent` + `category: active`.
+        assert!(!wf.is_agent_active_gate("in-progress"));
+        // Non-active statuses and unknown ids are never gates.
+        assert!(!wf.is_agent_active_gate("review"));
+        assert!(!wf.is_agent_active_gate("done"));
+        assert!(!wf.is_agent_active_gate("nonexistent"));
+        // The default direct workflow has no gate at all.
+        let default = Workflow::from_yaml_str(DEFAULT_YAML).unwrap();
+        assert!(!default.is_agent_active_gate("in-progress"));
+    }
+
+    #[test]
+    fn is_agent_active_gate_ignores_a_user_owned_active_status() {
+        // A `category: active` status owned by the *user* (a manual staging
+        // lane) is not an agent gate — nothing auto-dispatches to it.
+        let yaml = r#"
+name: default
+statuses:
+  - { id: in-progress, name: InProgress, category: active,  owner: agent, agent: developer }
+  - { id: staging,     name: Staging,    category: active,  owner: user }
+  - { id: review,      name: Review,     category: handoff, owner: user }
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        assert!(!wf.is_agent_active_gate("staging"));
+    }
+
+    #[test]
+    fn gate_pass_and_reject_follow_the_declared_gate_edges() {
+        let wf = Workflow::from_yaml_str(GATED_YAML).unwrap();
+        // A pass advances along the declared `adversarial-review -> review`
+        // edge into the human handoff status.
+        assert_eq!(
+            wf.gate_pass_status("adversarial-review").map(|s| s.id.as_str()),
+            Some("review"),
+        );
+        // A rejection bounces along the declared `adversarial-review ->
+        // in-progress` edge back to the developer's active status.
+        assert_eq!(
+            wf.gate_reject_status("adversarial-review")
+                .map(|s| s.id.as_str()),
+            Some("in-progress"),
+        );
+    }
+
+    #[test]
+    fn gate_pass_and_reject_fall_back_to_categories_without_declared_edges() {
+        // A gate with no outgoing transitions declared still resolves its
+        // pass/reject targets by category: the first handoff status and the
+        // first active status other than itself.
+        let yaml = r#"
+name: default
+statuses:
+  - { id: in-progress,        name: InProgress,        category: active,  owner: agent, agent: developer }
+  - { id: adversarial-review, name: AdversarialReview, category: active,  owner: agent, agent: adversarial-review }
+  - { id: qa,                 name: QA,                category: handoff, owner: user }
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        assert_eq!(
+            wf.gate_pass_status("adversarial-review").map(|s| s.id.as_str()),
+            Some("qa"),
+        );
+        assert_eq!(
+            wf.gate_reject_status("adversarial-review")
+                .map(|s| s.id.as_str()),
+            Some("in-progress"),
+        );
     }
 
     #[test]

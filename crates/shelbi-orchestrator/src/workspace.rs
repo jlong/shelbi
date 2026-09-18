@@ -2133,11 +2133,12 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // before Shelbi can deliver its startup prompt.
     require_runner_available(&host, &runner)?;
 
-    // A dispatch onto a `review`-tagged slot is a review dispatch: the slot
-    // serves the branch for inspection and must never receive the developer's
-    // rebase + ready-marker handoff (see `compose_prompt` — that handoff on an
-    // already-handed-off task is the review-resume churn loop).
-    let is_review = spec.project.effective_tags(spec.workspace).contains("review");
+    // Classify the completion contract this dispatch's prompt carries. A
+    // `review`-tagged slot serves the branch (no handoff — that handoff on an
+    // already-handed-off task is the review-resume churn loop); an agent-owned
+    // active gate (e.g. `adversarial-review`) gets review-gate guidance; every
+    // other dispatch gets the default developer rebase + ready-marker handoff.
+    let handoff = classify_handoff(spec.project, spec.workspace, spec.task_id);
 
     // 2–7. Deploy the agent context, reset the pane, launch the runner, wait
     //       for readiness, and send the loop-closing dev prompt. Dev
@@ -2151,7 +2152,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         &handoff_base,
         &spec.project.name,
         shelbi_agent::polls_for_messages(&runner),
-        !is_review,
+        &handoff,
     );
     // Review dispatch: pin the review slot's port into the pane env (finally
     // wiring the long-stubbed `SpawnArgs.port`) and append the workflow's
@@ -2275,7 +2276,7 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         shelbi_agent::RunnerAdapter::for_spec(&runner).resume_strategy(),
         shelbi_agent::ResumeStrategy::Transcript
     );
-    let is_review = spec.project.effective_tags(spec.workspace).contains("review");
+    let handoff = classify_handoff(spec.project, spec.workspace, spec.task_id);
     let handoff_base = resolve_handoff_base_branch(spec.project, spec.task_id);
     let prompt = compose_resume_prompt(
         spec.task_id,
@@ -2286,7 +2287,7 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         &spec.project.name,
         shelbi_agent::polls_for_messages(&runner),
         resume,
-        !is_review,
+        &handoff,
     );
     deploy_and_spawn(SpawnArgs {
         project: spec.project,
@@ -2416,7 +2417,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     let submit_profile = crate::submit::SubmitProfile::for_runner(a.runner);
     let launch_seed = prompt_injection.kind != PromptInjectionKind::Paste;
     let startup_prompt_rel = if launch_seed {
-        let startup_prompt = render_startup_prompt(a.prompt, a.agent.is_some(), a.runner);
+        let startup_prompt = render_startup_prompt(a.prompt, a.agent, a.runner);
         deploy_startup_prompt(a.host, a.worktree, &startup_prompt)?;
         Some(WORKTREE_STARTUP_PROMPT_REL)
     } else {
@@ -3987,15 +3988,25 @@ pub fn deploy_agent_instructions(host: &Host, worktree: &Path, instructions: &st
 
 fn render_startup_prompt(
     prompt: &str,
-    include_agent_instructions: bool,
+    agent: Option<&str>,
     runner: &shelbi_core::AgentRunnerSpec,
 ) -> String {
     let mut out = String::new();
-    if include_agent_instructions && !shelbi_agent::RunnerAdapter::for_spec(runner).is_claude() {
-        out.push_str("Read `.claude/agent-instructions.md` first. ");
-        out.push_str(
-            "Treat it as your developer-agent instructions for this Shelbi workspace.\n\n",
-        );
+    // A non-Claude runner has no `--append-system-prompt` seam, so its role
+    // instructions are deployed to `.claude/agent-instructions.md` and pointed
+    // at from the startup prompt. The wording must name the *selected* agent —
+    // hardcoding "developer-agent" here mislabels a custom gate agent (e.g.
+    // `adversarial-review`) as a developer and pushes it toward implementation
+    // work (task #1311). Claude reads its role via the system prompt, so it
+    // gets no preamble either way.
+    if let Some(agent) = agent {
+        if !shelbi_agent::RunnerAdapter::for_spec(runner).is_claude() {
+            out.push_str("Read `.claude/agent-instructions.md` first. ");
+            out.push_str(&format!(
+                "Treat it as your instructions as the `{agent}` agent for this \
+                 Shelbi workspace.\n\n"
+            ));
+        }
     }
     out.push_str(prompt);
     if !out.ends_with('\n') {
@@ -4791,6 +4802,94 @@ fn resolve_workflow_base_branch(project: &Project, task_id: &str) -> Option<Stri
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Which completion contract a dispatch's prompt carries — the "how do I
+/// signal I'm done" section appended after the task body.
+///
+/// Owned (not borrowed) so the classifier can build a [`HandoffPlan::Gate`]
+/// from a loaded workflow and hand it to [`compose_prompt`] by reference,
+/// without the workflow having to outlive the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HandoffPlan {
+    /// The default developer flow: rebase onto the base branch, then write the
+    /// ready marker to hand off forward. The overwhelming common case.
+    Developer,
+    /// A custom agent-owned active **gate** (e.g. `adversarial-review`) sitting
+    /// between the developer's active status and the human handoff status. It
+    /// *reviews* the branch — it never rebases or resumes development — and
+    /// records its verdict with the transition marker: a pass advances to the
+    /// human handoff status, a rejection bounces back to the developer's active
+    /// status. Both targets are derived from the status's declared outgoing
+    /// transitions (see [`shelbi_core::Workflow::gate_pass_status`] /
+    /// [`shelbi_core::Workflow::gate_reject_status`]).
+    Gate {
+        /// Status id a pass advances to (a handoff status, e.g. `review`).
+        pass_id: String,
+        /// Human-facing name of the pass target, for the prompt prose.
+        pass_name: String,
+        /// Status id a rejection bounces back to (the developer's active
+        /// status, e.g. `in-progress`).
+        reject_id: String,
+        /// Human-facing name of the reject target, for the prompt prose.
+        reject_name: String,
+    },
+    /// No forward handoff: a `review`-tagged human-serve slot (the serve recipe
+    /// is appended by the caller), or a gate we couldn't resolve targets for.
+    /// The prompt is the task body plus the message-polling contract only.
+    Serve,
+}
+
+/// Classify the completion contract for a dispatch onto `workspace` for
+/// `task_id`.
+///
+/// - A `review`-tagged slot serves the branch for a human — no handoff
+///   ([`HandoffPlan::Serve`]); its serve recipe is appended by the caller.
+/// - Otherwise the task's **current status** decides: an agent-owned active
+///   *gate* (e.g. `adversarial-review` — see
+///   [`shelbi_core::Workflow::is_agent_active_gate`]) gets the review-gate
+///   contract ([`HandoffPlan::Gate`]); everything else — and any failure to
+///   load the task or its workflow — gets the default developer handoff
+///   ([`HandoffPlan::Developer`]), so the common path is byte-identical and
+///   degradations are safe.
+fn classify_handoff(project: &Project, workspace: &WorkspaceSpec, task_id: &str) -> HandoffPlan {
+    if project.effective_tags(workspace).contains("review") {
+        return HandoffPlan::Serve;
+    }
+    // Load the task + its workflow to read the status the card is sitting in.
+    // Any read failure degrades to the developer contract (the historical
+    // behavior for every non-review dispatch), so a transient store hiccup
+    // never blocks or mis-shapes a normal dev handoff.
+    let Some(tf) = shelbi_state::issue_store_for_project(project)
+        .ok()
+        .and_then(|store| store.get(task_id).ok().flatten())
+    else {
+        return HandoffPlan::Developer;
+    };
+    let Ok(workflow) = shelbi_state::load_task_workflow(&project.name, project, &tf.task) else {
+        return HandoffPlan::Developer;
+    };
+    let current = tf.task.column.as_str();
+    if !workflow.is_agent_active_gate(current) {
+        return HandoffPlan::Developer;
+    }
+    match (
+        workflow.gate_pass_status(current),
+        workflow.gate_reject_status(current),
+    ) {
+        (Some(pass), Some(reject)) => HandoffPlan::Gate {
+            pass_id: pass.id.clone(),
+            pass_name: pass.name.clone(),
+            reject_id: reject.id.clone(),
+            reject_name: reject.name.clone(),
+        },
+        // A recognized gate we can't resolve a forward/back target for is a
+        // misconfigured workflow. Fall back to a no-handoff prompt (body +
+        // polling) rather than inject the developer's rebase + ready-marker
+        // contract onto a reviewer — never mislabel a gate as a developer.
+        _ => HandoffPlan::Serve,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compose_prompt(
     task_id: &str,
     branch: &str,
@@ -4799,7 +4898,7 @@ fn compose_prompt(
     base_branch: &str,
     project: &str,
     polls_messages: bool,
-    include_handoff: bool,
+    handoff: &HandoffPlan,
 ) -> String {
     let trimmed = body.trim();
     let body_section = if trimmed.is_empty() {
@@ -4813,17 +4912,45 @@ fn compose_prompt(
     } else {
         String::new()
     };
-    // Review dispatches (a `review`-tagged slot) exist to *serve* the branch
-    // for human inspection — the Review agent installs/builds/boots it and
+    // A `review`-tagged serve slot (or an unresolvable gate) gets no forward
+    // handoff — the Review agent installs/builds/boots the branch and
     // explicitly does NOT rebase or open a PR. Handing it the developer's
     // rebase-then-write-the-ready-marker handoff is the churn bug this guards:
     // on an already-handed-off task the agent dutifully re-writes the marker,
     // which bounces the card `review -> in_progress -> review` and re-triggers
-    // the stranded-review-slot resume, looping. So a review dispatch gets the
-    // task body (what it's reviewing) plus its message-polling contract, and
-    // nothing else — the serve recipe is appended by the caller.
-    if !include_handoff {
+    // the stranded-review-slot resume, looping. So it gets the task body (what
+    // it's reviewing) plus its message-polling contract, and nothing else — the
+    // serve recipe is appended by the caller.
+    if matches!(handoff, HandoffPlan::Serve) {
         return format!("{body_section}{polling_section}");
+    }
+    // An agent-owned active gate (e.g. `adversarial-review`) is a *reviewer*,
+    // not a developer: it inspects the finished branch and records a pass /
+    // reject verdict via the transition marker. It must NOT be told to rebase
+    // or run the developer's build loop — doing so is the exact confusion task
+    // #1311 fixes (the gate started resuming implementation work). Both edges
+    // go through the transition marker, which the poller honors from any status
+    // (`maybe_apply_transition`); the forward ready-marker handoff only fires
+    // from `in-progress`, so it is the wrong signal for a gate.
+    if let HandoffPlan::Gate {
+        pass_id,
+        pass_name,
+        reject_id,
+        reject_name,
+    } = handoff
+    {
+        return compose_gate_prompt(
+            task_id,
+            branch,
+            &body_section,
+            marker,
+            &id_esc,
+            pass_id,
+            pass_name,
+            reject_id,
+            reject_name,
+            &polling_section,
+        );
     }
     let marker_esc = shelbi_agent::shell_escape(&marker.to_string_lossy());
     // Write to a sibling temp file and `mv` it into place so the poller
@@ -4863,6 +4990,70 @@ fn compose_prompt(
          column on its next poll. Write the marker once; you can keep \
          working in this pane and talk to the user afterward without \
          affecting the handoff.{polling_section}"
+    )
+}
+
+/// The completion section for an agent-owned active **gate** (e.g.
+/// `adversarial-review`) — see [`HandoffPlan::Gate`]. The gate reviews the
+/// finished branch and records a pass / reject verdict with the **transition
+/// marker** (`<worktree>/.claude/shelbi-transition`, derived here as the ready
+/// marker's sibling): a pass advances to the human handoff status, a rejection
+/// bounces back to the developer's active status. Deliberately says nothing
+/// about rebasing or resuming development — the gate inspects someone else's
+/// work, it does not produce it.
+///
+/// Both markers are written torn-write-safe (sibling `.tmp` + atomic `mv`),
+/// exactly as the developer's ready-marker handoff is.
+#[allow(clippy::too_many_arguments)]
+fn compose_gate_prompt(
+    task_id: &str,
+    branch: &str,
+    body_section: &str,
+    marker: &Path,
+    id_esc: &str,
+    pass_id: &str,
+    pass_name: &str,
+    reject_id: &str,
+    reject_name: &str,
+    polling_section: &str,
+) -> String {
+    // The transition marker is the ready marker's sibling under `.claude/`.
+    let trans = marker.with_file_name("shelbi-transition");
+    let trans_esc = shelbi_agent::shell_escape(&trans.to_string_lossy());
+    let trans_tmp = {
+        let mut s = trans.as_os_str().to_owned();
+        s.push(".tmp");
+        PathBuf::from(s)
+    };
+    let trans_tmp_esc = shelbi_agent::shell_escape(&trans_tmp.to_string_lossy());
+    let pass_esc = shelbi_agent::shell_escape(pass_id);
+    let reject_esc = shelbi_agent::shell_escape(reject_id);
+    format!(
+        "{body_section}\n\n\
+         ---\n\
+         You are the **review gate** for task `{task_id}` on branch `{branch}`. \
+         The branch is already checked out in this worktree with a completed \
+         change on it. Review that change against the task above — you are \
+         inspecting someone else's work, not producing it. Do NOT rebase the \
+         branch, resume implementation, or run a build/test loop as if the task \
+         were yours.\n\
+         \n\
+         When your review is complete, record your verdict by writing the \
+         transition marker exactly once — do ONE of:\n\
+         \n\
+         1. **Pass** — the work clears the bar. Advance it to `{pass_name}` for \
+         human review:\n\
+         \n\
+         printf '%s\\n%s\\n' {id_esc} {pass_esc} > {trans_tmp_esc} && mv {trans_tmp_esc} {trans_esc}\n\
+         \n\
+         2. **Reject** — the work needs more changes. Send it back to \
+         `{reject_name}` to be reworked:\n\
+         \n\
+         printf '%s\\n%s\\n' {id_esc} {reject_esc} > {trans_tmp_esc} && mv {trans_tmp_esc} {trans_esc}\n\
+         \n\
+         The hub watches for this file and moves your task on its next poll. \
+         Write exactly one marker, once — do not write both, and do not write a \
+         ready marker.{polling_section}"
     )
 }
 
@@ -4981,7 +5172,7 @@ fn compose_resume_prompt(
     project: &str,
     polls_messages: bool,
     conversation_resumed: bool,
-    include_handoff: bool,
+    handoff: &HandoffPlan,
 ) -> String {
     let banner = if conversation_resumed {
         format!(
@@ -5009,7 +5200,7 @@ fn compose_resume_prompt(
         base_branch,
         project,
         polls_messages,
-        include_handoff,
+        handoff,
     );
     format!("{banner}{base}")
 }
@@ -6191,7 +6382,7 @@ mod tests {
             "main",
             "myapp",
             false,
-            true,
+            &HandoffPlan::Developer,
         );
         assert!(prompt.contains("Fix the Safari SSO bug."));
         assert!(prompt.contains("fix-login"));
@@ -6217,7 +6408,7 @@ mod tests {
             "main",
             "myapp",
             false,
-            true,
+            &HandoffPlan::Developer,
         );
         assert!(prompt.contains("# Task fix-login"));
         assert!(prompt.contains(".claude/shelbi-ready"));
@@ -6234,7 +6425,7 @@ mod tests {
             "main",
             "myapp",
             true,
-            true,
+            &HandoffPlan::Developer,
         );
         // Still hands off the same way, and still rebases first.
         assert!(prompt.contains(".claude/shelbi-ready"));
@@ -6272,7 +6463,7 @@ mod tests {
             "main",
             "myapp",
             false,
-            true,
+            &HandoffPlan::Developer,
         );
         assert!(
             prompt.contains("git fetch origin main && git rebase origin/main"),
@@ -6308,7 +6499,7 @@ mod tests {
             "main",
             "myapp",
             true, // polls: keep the message-delivery contract for the reviewer
-            false, // include_handoff: review slots never produce a handoff marker
+            &HandoffPlan::Serve, // review slots never produce a handoff marker
         );
         assert!(
             prompt.contains("Fix the Safari SSO bug."),
@@ -6334,6 +6525,114 @@ mod tests {
     }
 
     #[test]
+    fn gate_prompt_reviews_and_records_a_verdict_without_developer_wording() {
+        // A custom agent-owned active gate (e.g. `adversarial-review`) reviews
+        // the finished branch and records a pass/reject verdict via the
+        // transition marker. It must NOT be handed the developer's rebase +
+        // ready-marker handoff — that is exactly what made a gate agent resume
+        // implementation work (#1311).
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/adv-1/.claude/shelbi-ready");
+        let prompt = compose_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "Fix the Safari SSO bug.",
+            &marker,
+            "main",
+            "myapp",
+            false,
+            &HandoffPlan::Gate {
+                pass_id: "review".into(),
+                pass_name: "Review".into(),
+                reject_id: "in-progress".into(),
+                reject_name: "In Progress".into(),
+            },
+        );
+        // The task body (the change under review) still rides along.
+        assert!(prompt.contains("Fix the Safari SSO bug."), "prompt: {prompt}");
+        // Framed as a reviewer, never a developer.
+        assert!(prompt.contains("review gate"), "prompt: {prompt}");
+        assert!(
+            !prompt.contains("developer") && !prompt.contains("developer-agent"),
+            "gate prompt must not carry developer-role wording: {prompt}"
+        );
+        // No rebase and no developer ready-marker handoff.
+        assert!(
+            !prompt.contains("git rebase") && !prompt.contains("git fetch origin"),
+            "gate must not be told to rebase: {prompt}"
+        );
+        assert!(
+            !prompt.contains("shelbi-ready"),
+            "gate must not write the developer ready marker: {prompt}"
+        );
+        // Both verdicts go through the transition marker (its `.claude/`
+        // sibling), targeting the derived pass/reject status ids.
+        assert!(
+            prompt.contains("/work/myapp/.shelbi/wt/adv-1/.claude/shelbi-transition"),
+            "gate must write the transition marker: {prompt}"
+        );
+        assert!(
+            prompt.contains("printf '%s\\n%s\\n' fix-login review >"),
+            "pass must transition to the handoff status id: {prompt}"
+        );
+        assert!(
+            prompt.contains("printf '%s\\n%s\\n' fix-login in-progress >"),
+            "reject must transition back to the active status id: {prompt}"
+        );
+    }
+
+    #[test]
+    fn non_claude_gate_launch_injects_no_developer_role_wording() {
+        // Acceptance criterion for #1311: a non-Claude runner launched in the
+        // `adversarial-review` gate must see neither the hardcoded
+        // "developer-agent" startup label nor the developer completion handoff.
+        // Exercise the full injected prompt a codex gate would receive — the
+        // startup preamble (`render_startup_prompt`) wrapped around the composed
+        // gate body (`compose_prompt`).
+        let codex = AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        };
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/adv-1/.claude/shelbi-ready");
+        let body = compose_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "Fix the Safari SSO bug.",
+            &marker,
+            "main",
+            "myapp",
+            false,
+            &HandoffPlan::Gate {
+                pass_id: "review".into(),
+                pass_name: "Review".into(),
+                reject_id: "in-progress".into(),
+                reject_name: "In Progress".into(),
+            },
+        );
+        let full = render_startup_prompt(&body, Some("adversarial-review"), &codex);
+        // The startup preamble names the gate agent, not "developer-agent".
+        assert!(
+            full.contains("`adversarial-review` agent"),
+            "startup prompt must name the gate agent: {full}"
+        );
+        assert!(
+            !full.contains("developer-agent"),
+            "no `developer-agent` label anywhere in a gate launch: {full}"
+        );
+        assert!(
+            !full.contains("developer"),
+            "no developer-role wording anywhere in a gate launch: {full}"
+        );
+        // And no developer completion contract leaked through.
+        assert!(
+            !full.contains("git rebase") && !full.contains("shelbi-ready"),
+            "no developer handoff in a gate launch: {full}"
+        );
+    }
+
+    #[test]
     fn prompt_uses_projects_default_branch_for_rebase_target() {
         // Not every project's main branch is named `main` — verify the
         // command picks up `default_branch` rather than hard-coding it.
@@ -6346,7 +6645,7 @@ mod tests {
             "trunk",
             "myapp",
             false,
-            true,
+            &HandoffPlan::Developer,
         );
         assert!(
             prompt.contains("git fetch origin trunk && git rebase origin/trunk"),
@@ -6431,7 +6730,7 @@ mod tests {
             &base,
             "myapp",
             false,
-            true,
+            &HandoffPlan::Developer,
         );
         assert!(
             prompt.contains(
@@ -6487,7 +6786,7 @@ mod tests {
             "myapp",
             false,
             true,
-            true,
+            &HandoffPlan::Developer,
         );
         assert!(
             prompt.contains("Resumed."),
@@ -6520,7 +6819,8 @@ mod tests {
         // conversation_resumed = true (claude --continue): point at the
         // conversation above.
         let resumed = compose_resume_prompt(
-            "t", "shelbi/t", "body", &marker, "main", "myapp", false, true, true,
+            "t", "shelbi/t", "body", &marker, "main", "myapp", false, true,
+            &HandoffPlan::Developer,
         );
         assert!(
             resumed.contains("conversation above"),
@@ -6528,7 +6828,8 @@ mod tests {
         );
         // conversation_resumed = false (cold relaunch): point at the worktree.
         let cold = compose_resume_prompt(
-            "t", "shelbi/t", "body", &marker, "main", "myapp", false, false, true,
+            "t", "shelbi/t", "body", &marker, "main", "myapp", false, false,
+            &HandoffPlan::Developer,
         );
         assert!(
             cold.contains("git log") && cold.contains("git status"),
@@ -6670,10 +6971,20 @@ mod tests {
             dialog_signatures: vec![],
             integration: None,
         };
-        let rendered = render_startup_prompt("Do the task.\n", true, &codex);
+        let rendered = render_startup_prompt("Do the task.\n", Some("developer"), &codex);
         assert!(
             rendered.starts_with("Read `.claude/agent-instructions.md` first."),
             "non-claude startup prompt must point at deployed agent instructions: {rendered}"
+        );
+        // The prompt names the *selected* agent and never hardcodes the
+        // "developer-agent" label that mislabeled custom gate agents (#1311).
+        assert!(
+            rendered.contains("`developer` agent"),
+            "startup prompt should name the selected agent: {rendered}"
+        );
+        assert!(
+            !rendered.contains("developer-agent"),
+            "startup prompt must not hardcode the `developer-agent` label: {rendered}"
         );
         assert!(rendered.ends_with("Do the task.\n"));
 
@@ -7027,7 +7338,7 @@ mod tests {
             "main",
             "myapp",
             false,
-            true,
+            &HandoffPlan::Developer,
         );
         assert!(
             prompt.contains(
