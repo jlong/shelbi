@@ -386,6 +386,19 @@ fn run_workspace_poll_loop(
     // restart — acceptable for an advisory heads-up.
     let mut last_dialog: Option<String> = None;
 
+    // How many consecutive polls this workspace has shown an unrecognized
+    // selection menu (`dialog:unknown` debounce). Per-thread and in-memory like
+    // `last_dialog`; a hub restart re-seeds it to 0, so at worst an unknown menu
+    // takes one extra interval to surface after a restart.
+    let mut unknown_dialog_streak: u32 = 0;
+
+    // Whether this workspace's pane is currently parked on the agent-exited
+    // chrome (`supervision=agent-exited` dedupe). Per-thread and in-memory like
+    // `last_dialog`; a hub restart re-seeds it to false, so at worst a
+    // still-exited pane re-emits one supervision line after a restart —
+    // acceptable for a heads-up the orchestrator reconciles idempotently.
+    let mut last_agent_exited = false;
+
     // Auto-restart supervision bookkeeping for this workspace's pane. Same
     // per-thread lifetime as `last_dialog` / `last_known`: a poller restart
     // re-seeds it, which at worst re-arms one restart for a pane that was
@@ -449,6 +462,8 @@ fn run_workspace_poll_loop(
             workspace,
             &mut last_known,
             &mut last_dialog,
+            &mut unknown_dialog_streak,
+            &mut last_agent_exited,
             &mut supervision,
             &mut limit_resume,
             &mut orphan_since,
@@ -1282,11 +1297,14 @@ fn events_log_mtime() -> Option<SystemTime> {
     std::fs::metadata(&path).and_then(|m| m.modified()).ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn poll_one(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     last_known: &mut Option<WorkspaceState>,
     last_dialog: &mut Option<String>,
+    unknown_dialog_streak: &mut u32,
+    last_agent_exited: &mut bool,
     supervision: &mut SupervisionState,
     limit_resume: &mut LimitResumeState,
     orphan_since: &mut Option<Instant>,
@@ -1367,6 +1385,8 @@ fn poll_one(
         // dispatch onto this slot) must start its own grace window, not inherit
         // a stale one from before the pane died.
         *last_dialog = None;
+        *unknown_dialog_streak = 0;
+        *last_agent_exited = false;
         *limit_resume = LimitResumeState::Idle;
         *orphan_since = None;
         return;
@@ -1385,6 +1405,8 @@ fn poll_one(
     // lives in `handle_review_slot` above, not here.)
     if maybe_reconcile_orphaned_pane(project, workspace, &host, &addr, orphan_since) {
         *last_dialog = None;
+        *unknown_dialog_streak = 0;
+        *last_agent_exited = false;
         *limit_resume = LimitResumeState::Idle;
         return;
     }
@@ -1411,6 +1433,78 @@ fn poll_one(
     let runner_is_claude = project
         .default_runner_spec()
         .is_some_and(|runner| shelbi_agent::RunnerAdapter::for_spec(runner).is_claude());
+
+    // Agent-exited-in-a-live-pane detection. The tmux pane is alive (its wrapper
+    // respawned it, or it was never the thing that died) but the agent PROCESS
+    // inside it has exited — a SIGTERM, a crash, or a clean exit — leaving
+    // Claude Code's `Resume this session with:` / `[agent exited — press enter to
+    // close]` chrome on screen. No hook fires and the stale `shelbi:working`
+    // pane title keeps the slot reading as a healthy working agent forever (the
+    // title path below would record `Working` off that stale marker). Surface it
+    // as a distinct `supervision=agent-exited` line — deduped per incident like
+    // the dialog path — so the orchestrator can `shelbi issue resume` it (which
+    // continues the prior conversation with `--continue`, preserving the branch,
+    // commits and uncommitted work) without reading panes. We deliberately do
+    // NOT auto-restart here: the crash supervisor's fresh re-dispatch would
+    // destroy uncommitted work, and the exit may have been a deliberate kill; the
+    // event is the signal, the repair is a human/orchestrator decision. Gated on
+    // a Claude runner (the chrome is Claude Code's) and an active task (an idle
+    // slot showing resume chrome is not a stranded worker). Recording Blocked
+    // keeps `status.yaml` advancing off the true state instead of freezing at the
+    // stale `working` title.
+    if runner_is_claude {
+        if let Some(screen) = screen.as_deref() {
+            if shelbi_orchestrator::ready::detect_agent_exited(screen) {
+                if let Some(task_id) = current_task_for(project, &workspace.name) {
+                    if !*last_agent_exited {
+                        if let Err(e) = shelbi_state::append_supervision_event(
+                            &project.name,
+                            Some(&workspace.name),
+                            "agent-exited",
+                            "pane-alive",
+                        ) {
+                            tracing::warn!(workspace = %workspace.name, error = %e, "append_supervision_event failed");
+                        }
+                        tracing::warn!(
+                            workspace = %workspace.name,
+                            task = %task_id,
+                            "agent process exited inside a live pane; emitted supervision=agent-exited (resume with `shelbi issue resume`)",
+                        );
+                    }
+                    *last_agent_exited = true;
+                    *last_dialog = None;
+                    *unknown_dialog_streak = 0;
+                    let prior = load_prior(&workspace.name, last_known);
+                    let outcome = decide(
+                        &workspace.name,
+                        Some(task_id),
+                        prior,
+                        WorkspaceState::Blocked,
+                        Utc::now(),
+                    );
+                    if let Err(e) = save_workspace_status(&outcome.status) {
+                        tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status failed");
+                    }
+                    if outcome.transitioned {
+                        if let Err(e) = append_workspace_event(
+                            &project.name,
+                            &workspace.name,
+                            outcome.prev_state,
+                            outcome.status.state,
+                        ) {
+                            tracing::warn!(workspace = %workspace.name, error = %e, "append_workspace_event failed");
+                        }
+                    }
+                    *last_known = Some(outcome.status.state);
+                    return;
+                }
+            }
+        }
+    }
+    // Not (or no longer) parked on the exit chrome — re-arm so a later exit
+    // re-emits.
+    *last_agent_exited = false;
+
     if !runner_is_claude && *limit_resume != LimitResumeState::Idle {
         if limit_resume.tracked_task().is_some() {
             if let Err(e) = append_limit_resume_event(
@@ -1532,7 +1626,13 @@ fn poll_one(
     // Generic blocking-dialog advisory (trust / permission / question), deduped
     // via `last_dialog` so a still-open modal produces one event per incident.
     // The detected kind is also folded into the persisted state below.
-    let dialog = maybe_emit_dialog_event(project, workspace, screen.as_deref(), last_dialog);
+    let dialog = maybe_emit_dialog_event(
+        project,
+        workspace,
+        screen.as_deref(),
+        last_dialog,
+        unknown_dialog_streak,
+    );
 
     // Resolve this tick's workspace state. For a Claude runner the live pane
     // *content* is the primary signal, not the `shelbi:<state>` pane-title
@@ -1613,6 +1713,17 @@ fn poll_one(
     *last_known = Some(outcome.status.state);
 }
 
+/// Consecutive polls an *unrecognized* selection menu must persist before the
+/// poller reports it as `dialog:unknown`. A known modal (trust / permission /
+/// question) is reported on the first sample; the generic unknown-menu shape is
+/// debounced because a menu can flash for a single sample — a mid-repaint, or an
+/// onboarding/resume dialog that Claude Code or the dispatch path auto-answers
+/// within a tick. Two consecutive detections means the menu was on screen for at
+/// least one full poll interval — the "more than a short interval" the spec asks
+/// for — which is also well clear of any ordinary pause between tool batches
+/// (those draw no menu at all).
+const UNKNOWN_DIALOG_MIN_STREAK: u32 = 2;
+
 /// One dialog transition the poller should emit this tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DialogEvent {
@@ -1684,21 +1795,37 @@ fn decide_dialog(prev: Option<&str>, detected: Option<&str>) -> (Vec<DialogEvent
 /// persisted state: a detected modal means the slot is [`WorkspaceState::Blocked`]
 /// even when the live footer / title path can't see it, so `status.yaml` keeps
 /// advancing instead of freezing at the pre-dialog state for the modal's life.
+///
+/// Beyond the curated signature allowlist, this also catches an *unrecognized*
+/// selection menu (a numbered-option prompt with no live-work signal — a Claude
+/// Code onboarding prompt, a new product dialog) and reports it as the kind
+/// `"unknown"` (`reason=dialog:unknown`). Because a menu can flash for a single
+/// sample (mid-repaint, an auto-answered resume dialog), the unknown case is
+/// debounced: it must persist for [`UNKNOWN_DIALOG_MIN_STREAK`] consecutive polls
+/// (`unknown_dialog_streak`) before it's reported, which also keeps it from
+/// firing on an ordinary pause between tool batches (which draws no menu at all).
 fn maybe_emit_dialog_event(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     screen: Option<&str>,
     last_dialog: &mut Option<String>,
+    unknown_dialog_streak: &mut u32,
 ) -> Option<String> {
     // Best-effort dialog detection against the project's baseline runner — a
     // workspace no longer carries a runner of its own.
-    let runner = project.default_runner_spec()?;
+    let Some(runner) = project.default_runner_spec() else {
+        *unknown_dialog_streak = 0;
+        return None;
+    };
     let signatures = runner.effective_dialog_signatures();
     if signatures.is_empty() {
         // Nothing configured for this runner (and no built-in default) —
         // clear any prior stuck-state so a config change that removes the
         // last signature doesn't leave us thinking the pane is still blocked.
+        // (The generic unknown-selection detector rides on the same runners
+        // that carry signatures — Claude — so it's disabled here too.)
         *last_dialog = None;
+        *unknown_dialog_streak = 0;
         return None;
     }
 
@@ -1707,7 +1834,23 @@ fn maybe_emit_dialog_event(
     // caller falls back to the title path rather than latching Blocked off a
     // sample we never actually took.
     let screen = screen?;
-    let detected = shelbi_orchestrator::ready::detect_blocking_dialog(screen, &signatures);
+    // A known signature wins outright and resets the unknown streak. Only when
+    // no named modal matches do we consider the generic unrecognized-menu shape,
+    // gated behind a short persistence streak so a transient menu isn't surfaced.
+    let detected = match shelbi_orchestrator::ready::detect_blocking_dialog(screen, &signatures) {
+        Some(kind) => {
+            *unknown_dialog_streak = 0;
+            Some(kind)
+        }
+        None if shelbi_orchestrator::ready::is_unknown_selection_dialog(screen) => {
+            *unknown_dialog_streak = unknown_dialog_streak.saturating_add(1);
+            (*unknown_dialog_streak >= UNKNOWN_DIALOG_MIN_STREAK).then(|| "unknown".to_string())
+        }
+        None => {
+            *unknown_dialog_streak = 0;
+            None
+        }
+    };
 
     let (events, next) = decide_dialog(last_dialog.as_deref(), detected.as_deref());
     for ev in events {
@@ -2469,6 +2612,13 @@ fn maybe_apply_ready_handoff(
                 (edge.to.clone(), true)
             } else {
                 tracing::warn!(workspace = %workspace.name, task = %task_id, "workflow declares no handoff status and no merge transition out of the active status; clearing ready marker");
+                if let Err(e) = shelbi_state::append_marker_skipped_event(
+                    &task_id,
+                    &workspace.name,
+                    "no-forward-target",
+                ) {
+                    tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_marker_skipped_event failed");
+                }
                 let _ = shelbi_orchestrator::workspace::clear_ready_marker(host, &marker);
                 return;
             };
@@ -2731,13 +2881,30 @@ fn maybe_apply_ready_handoff(
             }
         }
         Ok(Some(_)) => {
+            // The task loaded fine but is no longer `in_progress`-and-assigned to
+            // this workspace — an out-of-band board move / relabel / reassignment
+            // raced the worker's marker write. Clearing is correct (the marker is
+            // stale), but record WHY on the event stream so a written handoff
+            // marker is never *silently* discarded (the missed-handoff blind spot).
             tracing::debug!(workspace = %workspace.name, task = %task_id, "stale ready marker (task not in-progress for this workspace); clearing");
+            if let Err(e) = shelbi_state::append_marker_skipped_event(
+                &task_id,
+                &workspace.name,
+                "not-in-progress",
+            ) {
+                tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_marker_skipped_event failed");
+            }
         }
         Ok(None) => {
             // A *successful* board read shows the task no longer exists — the
             // marker genuinely names a task that's gone (worktree reused, card
-            // deleted). Safe to clear with the existing warning.
+            // deleted). Safe to clear; record it so the clear is auditable.
             tracing::warn!(workspace = %workspace.name, task = %task_id, "ready marker names unloadable task; clearing");
+            if let Err(e) =
+                shelbi_state::append_marker_skipped_event(&task_id, &workspace.name, "task-gone")
+            {
+                tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_marker_skipped_event failed");
+            }
         }
         Err(e) => {
             // The read FAILED — a transient backend error, not proof the task
@@ -5265,7 +5432,9 @@ Intro prose.
  Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel";
 
         let mut last_dialog = None;
-        let detected = maybe_emit_dialog_event(&project, &ws, Some(question), &mut last_dialog);
+        let mut unknown_streak = 0;
+        let detected =
+            maybe_emit_dialog_event(&project, &ws, Some(question), &mut last_dialog, &mut unknown_streak);
         assert_eq!(
             detected.as_deref(),
             Some("question"),
@@ -5275,16 +5444,99 @@ Intro prose.
 
         // The modal clears (a plain shell prompt) → no detection; the caller
         // falls back to its live/title state resolution.
-        let cleared = maybe_emit_dialog_event(&project, &ws, Some("➜  repo $ "), &mut last_dialog);
+        let cleared = maybe_emit_dialog_event(
+            &project,
+            &ws,
+            Some("➜  repo $ "),
+            &mut last_dialog,
+            &mut unknown_streak,
+        );
         assert_eq!(cleared, None, "a benign screen reports no dialog");
         assert_eq!(last_dialog, None);
 
         // A capture failure (no sample) reports no fresh detection either, so the
         // title path — not a latched Blocked — owns the tick.
         let mut stuck = Some("question".to_string());
-        let no_sample = maybe_emit_dialog_event(&project, &ws, None, &mut stuck);
+        let no_sample =
+            maybe_emit_dialog_event(&project, &ws, None, &mut stuck, &mut unknown_streak);
         assert_eq!(no_sample, None, "no sample reports no fresh dialog");
         assert_eq!(stuck.as_deref(), Some("question"), "no sample leaves the stuck-state untouched");
+
+        match prior_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn maybe_emit_dialog_event_debounces_then_reports_an_unknown_selection_menu() {
+        // An unrecognized selection menu (the Claude Code onboarding prompt) is
+        // reported as `dialog:unknown` — but only after it persists across
+        // `UNKNOWN_DIALOG_MIN_STREAK` polls, so a menu that flashes for one
+        // sample (or an ordinary pause, which draws no menu) never fires.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = review_serving_home();
+        let prior_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        let ws = project.workspaces[0].clone();
+
+        // None of the curated signatures match this; only its numbered-option
+        // shape does. Uses the `❯` cursor Claude Code actually renders.
+        let onboarding = "\
+Teach auto mode about your environment?
+Auto mode works better when it knows your environment. Takes about a minute.
+❯ 1. Yes
+  2. Not now
+  3. Don't show again";
+
+        let mut last_dialog = None;
+        let mut streak = 0;
+
+        // First sighting: below the streak threshold, so nothing is reported yet
+        // and no stuck-state is latched.
+        let first = maybe_emit_dialog_event(&project, &ws, Some(onboarding), &mut last_dialog, &mut streak);
+        assert_eq!(first, None, "an unknown menu is not reported on its first sample");
+        assert_eq!(last_dialog, None);
+        assert_eq!(streak, 1);
+
+        // Second consecutive sighting reaches the threshold → reported.
+        let second = maybe_emit_dialog_event(&project, &ws, Some(onboarding), &mut last_dialog, &mut streak);
+        assert_eq!(
+            second.as_deref(),
+            Some("unknown"),
+            "a persistent unknown menu must surface as dialog:unknown",
+        );
+        assert_eq!(last_dialog.as_deref(), Some("unknown"));
+
+        // It clears when the menu goes away (a live ready input box); the streak
+        // resets and a recovery is emitted.
+        let cleared = maybe_emit_dialog_event(
+            &project,
+            &ws,
+            Some("⏺ Done.\n  ? for shortcuts"),
+            &mut last_dialog,
+            &mut streak,
+        );
+        assert_eq!(cleared, None, "a ready pane clears the unknown dialog");
+        assert_eq!(last_dialog, None);
+        assert_eq!(streak, 0);
+
+        // Sanity: an ordinary pause (ready input box, no menu) never even builds
+        // the streak.
+        let pause = maybe_emit_dialog_event(
+            &project,
+            &ws,
+            Some("⏺ Done.\n  ? for shortcuts"),
+            &mut last_dialog,
+            &mut streak,
+        );
+        assert_eq!(pause, None);
+        assert_eq!(streak, 0, "an ordinary pause must not build the unknown streak");
 
         match prior_home {
             Some(h) => std::env::set_var("SHELBI_HOME", h),
@@ -6553,6 +6805,8 @@ while :; do sleep 60; done
             workspace,
             &mut last_known,
             &mut last_dialog,
+            &mut 0,
+            &mut false,
             &mut supervision,
             &mut limit_resume,
             &mut orphan_since,
@@ -6612,6 +6866,8 @@ while :; do sleep 60; done
             workspace,
             &mut last_known,
             &mut last_dialog,
+            &mut 0,
+            &mut false,
             &mut supervision,
             &mut limit_resume,
             &mut orphan_since,
@@ -6658,6 +6914,8 @@ while :; do sleep 60; done
             workspace,
             &mut last_known,
             &mut last_dialog,
+            &mut 0,
+            &mut false,
             &mut supervision,
             &mut limit_resume,
             &mut orphan_since,
@@ -6780,6 +7038,8 @@ while :; do sleep 60; done
             &project.workspaces[0],
             &mut last_known,
             &mut last_dialog,
+            &mut 0,
+            &mut false,
             &mut supervision,
             &mut limit_resume,
             &mut orphan_since,
@@ -7209,6 +7469,143 @@ transitions:
             !marker.exists(),
             "a marker a successful read shows is gone must be cleared"
         );
+
+        // The clear is explained on the event stream (never silently dropped).
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.lines().any(|l| l.contains(" marker-skipped ")
+                && l.contains(" task=ghost-task ")
+                && l.contains("reason=marker-skipped:task-gone")),
+            "a cleared gone-task marker must emit marker-skipped:task-gone; log: {log:?}",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ready_marker_for_a_no_longer_in_progress_task_is_skipped_with_an_event() {
+        // The missed-handoff blind spot's clear-not-defer case: a task that loaded
+        // fine (`Ok(Some)`) but is no longer `in_progress`-and-assigned to this
+        // workspace — an out-of-band board move raced the worker's marker write.
+        // Clearing is correct (the marker is stale), but it must be EXPLAINED on
+        // the event stream so a written handoff marker is never silently dropped.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-skip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+
+        // Task exists and is assigned to alpha, but was hand-moved to `review`
+        // before the scan read the marker (a manual board move doesn't unassign).
+        let mut task = in_progress_task("moved-out", "alpha");
+        task.column = Column::review();
+        shelbi_state::save_task("demo", &task, "body").unwrap();
+
+        let marker = write_marker(&project, "moved-out\n");
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
+        );
+
+        assert!(!marker.exists(), "a stale (moved-out) marker must be cleared");
+        // The task must NOT be pulled back to in_progress; it stays where the
+        // out-of-band move left it.
+        assert_eq!(
+            shelbi_state::load_task("demo", "moved-out").unwrap().task.column,
+            Column::review(),
+        );
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.lines().any(|l| l.contains(" marker-skipped ")
+                && l.contains(" task=moved-out ")
+                && l.contains("reason=marker-skipped:not-in-progress")),
+            "a stale marker must emit marker-skipped:not-in-progress; log: {log:?}",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ready_marker_promotes_even_with_an_issue_reconcile_in_flight_for_the_task() {
+        // Additional acceptance: a `.claude/shelbi-ready` marker must move its
+        // task to the handoff category even when a `poller:issue-reconcile` pass
+        // for that same task has just run. The marker scan (`maybe_apply_ready_handoff`,
+        // a per-workspace thread) and the reconcile passes (the supervisor thread)
+        // share NO in-memory state, and the scan is stateless — it re-reads the
+        // marker from disk every tick and only clears it on a resolved outcome —
+        // so a reconcile in flight can neither skip nor steal the marker. This
+        // pins that independence: with a reconcile event already on the stream for
+        // the task, the very next handoff tick still promotes and consumes the
+        // marker.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-reconcile-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        shelbi_state::save_task("demo", &in_progress_task("race-task", "alpha"), "body").unwrap();
+
+        // Simulate a `poller:issue-reconcile` pass having run for this same task
+        // "in flight" — the reconcile pass only ever APPENDS events (it never
+        // moves an in_progress task or touches the marker), so this is exactly
+        // what a concurrent reconcile would leave on the stream.
+        emit_issue_reconcile_event(
+            &project.name,
+            IssueReconcileEvent::Transition {
+                id: "race-task".into(),
+                workflow: "default".into(),
+                from: Column::todo(),
+                to: Column::in_progress(),
+            },
+        );
+
+        // The worker writes its ready marker while that reconcile activity is on
+        // the stream.
+        let marker = write_marker(&project, "race-task\n");
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
+        );
+
+        assert_eq!(
+            shelbi_state::load_task("demo", "race-task").unwrap().task.column,
+            Column::review(),
+            "the marker must still promote the task despite a reconcile in flight",
+        );
+        assert!(!marker.exists(), "the marker must be consumed on promotion");
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -9212,6 +9609,153 @@ transitions:
                 &mut elapsed_again
             ),
             "a dead slot must not be re-reaped",
+        );
+    }
+
+    /// End-to-end: a real tmux slot whose agent process has exited but whose
+    /// pane stayed alive (the wrapper's `[agent exited — press enter to close]`
+    /// chrome + Claude's resume block on screen, stale `shelbi:working` title) is
+    /// detected by `poll_one` as `supervision=agent-exited`, recorded as Blocked,
+    /// and NOT re-emitted on the next poll (deduped per incident). This is the
+    /// SIGTERMed-agent-inside-a-healthy-pane blind spot.
+    #[test]
+    fn poll_one_detects_an_exited_agent_inside_a_live_pane() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project_name = format!("agent-exited-{nonce}");
+        let session = format!("shelbi-{project_name}");
+        let home = std::env::temp_dir().join(&project_name);
+        std::fs::create_dir_all(&home).unwrap();
+        let _cleanup = LimitResumeTmuxCleanup {
+            session: session.clone(),
+            home: home.clone(),
+            prior_home: std::env::var_os("SHELBI_HOME"),
+            prior_hub_sock: std::env::var_os("SHELBI_HUB_SOCK"),
+        };
+        std::env::set_var("SHELBI_HOME", &home);
+        // No live hub daemon in this test — event emission falls back to a direct
+        // append. Clear any inherited socket so we don't dial a dead one.
+        std::env::remove_var("SHELBI_HUB_SOCK");
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.name.clone_from(&project_name);
+        shelbi_state::save_project(&project).unwrap();
+        let task_id = "stranded-worker";
+        shelbi_state::save_task(
+            &project.name,
+            &in_progress_task(task_id, "alpha"),
+            "keep working",
+        )
+        .unwrap();
+
+        // The agent process has exited; the wrapper prints its close prompt and
+        // Claude's resume block, then the pane blocks (stays alive) with that
+        // screen and a stale `shelbi:working` title.
+        let script = home.join("exited.sh");
+        std::fs::write(
+            &script,
+            "printf '\\033]2;shelbi:working\\007'\n\
+             printf '\\033[2J\\033[H'\n\
+             printf '%s\\n' \\\n\
+               'Resume this session with:' \\\n\
+               'claude --resume 56d67514-c708-4810-b420-143a1b42d9d0' \\\n\
+               '[agent exited — press enter to close]'\n\
+             while :; do sleep 60; done\n",
+        )
+        .unwrap();
+        start_limit_resume_tmux_session(&session, &script, &home.join("unused.receipt"));
+
+        let host = Host::Local;
+        let addr = TmuxAddr {
+            session: session.clone(),
+            window: "alpha".into(),
+        };
+        // Wait until the exit chrome is actually on screen before polling.
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(3) {
+            let screen = shelbi_tmux::capture(&host, &addr).unwrap_or_default();
+            if shelbi_orchestrator::ready::detect_agent_exited(&screen) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            "the pane must be alive even though the agent exited",
+        );
+
+        let workspace = project.workspaces[0].clone();
+        let mut last_known = None;
+        let mut last_dialog = None;
+        let mut unknown_streak = 0;
+        let mut last_agent_exited = false;
+        let mut supervision = SupervisionState::default();
+        let mut limit_resume = LimitResumeState::default();
+        let mut orphan_since = None;
+        poll_one(
+            &project,
+            &workspace,
+            &mut last_known,
+            &mut last_dialog,
+            &mut unknown_streak,
+            &mut last_agent_exited,
+            &mut supervision,
+            &mut limit_resume,
+            &mut orphan_since,
+        );
+
+        assert!(last_agent_exited, "the agent-exited latch must be armed");
+        assert_eq!(
+            last_known,
+            Some(WorkspaceState::Blocked),
+            "an exited agent must record Blocked, not the stale working title",
+        );
+        let status = load_workspace_status("alpha").unwrap().unwrap();
+        assert_eq!(status.state, WorkspaceState::Blocked);
+
+        let count_exit_lines = || {
+            let log =
+                std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
+            log.lines()
+                .filter(|l| {
+                    l.contains(&format!("project={project_name}"))
+                        && l.contains("workspace=alpha")
+                        && l.contains("supervision=agent-exited")
+                        && l.contains("reason=pane-alive")
+                })
+                .count()
+        };
+        assert_eq!(count_exit_lines(), 1, "exactly one agent-exited line on first poll");
+
+        // Second poll on the same still-exited screen must not re-emit.
+        poll_one(
+            &project,
+            &workspace,
+            &mut last_known,
+            &mut last_dialog,
+            &mut unknown_streak,
+            &mut last_agent_exited,
+            &mut supervision,
+            &mut limit_resume,
+            &mut orphan_since,
+        );
+        assert_eq!(
+            count_exit_lines(),
+            1,
+            "a still-exited pane must be deduped (one line per incident)",
         );
     }
 

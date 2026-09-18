@@ -349,6 +349,93 @@ pub fn detect_blocking_dialog(
         .map(|sig| sig.kind.clone())
 }
 
+/// True when a captured pane shows Claude Code's *agent-exited* chrome: the
+/// agent process inside the pane has ended, but the pane itself is still alive.
+///
+/// Shelbi's pane wrapper (`shelbi open --as-pane`) does NOT close the tmux
+/// window when the agent subprocess exits interactively — it prints
+/// `[agent exited — press enter to close]` and blocks on stdin, and above that
+/// Claude Code leaves its resume block:
+///
+/// ```text
+/// Resume this session with:
+/// claude --resume 56d67514-c708-4810-b420-143a1b42d9d0
+/// [agent exited — press enter to close]
+/// ```
+///
+/// So `workspace_pane_alive` (a `tmux` window-existence probe) keeps returning
+/// `true`, no hook fires, and the stale `shelbi:working` pane title keeps the
+/// slot reading as a healthy working agent forever. The poller runs this on its
+/// pane sample to surface that state distinctly (a SIGTERMed or crashed agent
+/// inside a live pane), so the orchestrator can `shelbi issue resume` it without
+/// reading panes.
+///
+/// ## Why this can't be a bare substring match
+///
+/// Exactly as [`detect_blocking_dialog`] and [`detect_usage_limit`], a pane
+/// merely *showing* this wording — editing the wrapper's code (which prints the
+/// line, `open/pane.rs`), a task description, an agent reasoning about this
+/// feature — must not trip it. We first veto on the two signals that prove the
+/// pane is *working, not exited*: Claude's live ready input box
+/// ([`is_input_ready`]) or its active-turn footer/spinner ([`is_claude_working`]).
+/// A genuinely exited agent draws neither, and `capture` samples only the
+/// visible screen (no scrollback), so those live controls are reliable "this
+/// agent is alive" evidence. The exit marker additionally requires the paired
+/// `press enter to close` half so a lone `agent exited` phrase in prose or code
+/// isn't enough; the resume block is matched on its own distinctive two-part
+/// wording.
+pub fn detect_agent_exited(screen: &str) -> bool {
+    // A live, ready input box or an active turn means the agent is alive — any
+    // exit/resume wording on screen is mere content, not the exit chrome.
+    if is_input_ready(screen) || is_claude_working(screen) {
+        return false;
+    }
+    let lower = screen.to_ascii_lowercase();
+    // The wrapper's interactive close prompt (em-dash or hyphen drift tolerated
+    // by matching the two invariant halves rather than the punctuation between).
+    let exit_prompt = lower.contains("agent exited") && lower.contains("press enter to close");
+    // Claude Code's post-exit resume block.
+    let resume_block = lower.contains("resume this session with") && lower.contains("--resume");
+    exit_prompt || resume_block
+}
+
+/// True when a captured pane is parked on an interactive selection menu that
+/// Shelbi has *no named signature for* — a numbered option list with none of
+/// the live-work signals — so the poller can report it as `dialog:unknown`
+/// rather than letting it masquerade as an ordinary `awaiting_input` pause.
+///
+/// This is the generic counterpart to [`detect_blocking_dialog`]'s curated
+/// substring allowlist: the allowlist catches the *known* modals (trust,
+/// permission, the AskUserQuestion widget, …), while this catches the shape
+/// they all share — Claude Code's onboarding prompts, a new product dialog, any
+/// menu we haven't enumerated. The onboarding prompt that stranded a workspace
+///
+/// ```text
+/// Teach auto mode about your environment?
+/// ❯ 1. Yes
+///   2. Not now
+///   3. Don't show again
+/// ```
+///
+/// carries none of the anchored footer substrings, so the allowlist misses it.
+///
+/// ## What anchors the match (and why it doesn't fire on an ordinary pause)
+///
+/// We require **at least two rendered menu-option lines** ([`is_menu_option_line`]
+/// — leading `❯`/`N.` chrome), which is the shape a real selection prompt has and
+/// which neither prose nor source carries. And, as with every other detector
+/// here, we first veto on [`is_input_ready`] / [`is_claude_working`]: an ordinary
+/// pause between tool batches draws the live input box or a spinner and never a
+/// numbered menu, so it can't match. The caller additionally debounces this
+/// across consecutive polls before emitting, so a menu that flashes for a single
+/// sample (mid-repaint, an auto-answered resume dialog) is not surfaced.
+pub fn is_unknown_selection_dialog(screen: &str) -> bool {
+    if is_input_ready(screen) || is_claude_working(screen) {
+        return false;
+    }
+    screen.lines().filter(|l| is_menu_option_line(l)).count() >= 2
+}
+
 /// A detected usage-limit stall, with the reset-time hint scraped from the
 /// pane when claude showed one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,7 +567,7 @@ fn is_usage_limit_banner_line(line: &str) -> bool {
 /// claude *rendering* the option and a pane merely *containing* the option's
 /// text (a string literal in source, a sentence in prose), neither of which
 /// carries the menu framing.
-fn is_menu_option_line(line: &str) -> bool {
+pub fn is_menu_option_line(line: &str) -> bool {
     // Drop leading whitespace and an optional selection cursor.
     let rest = line.trim_start();
     let rest = rest.strip_prefix('❯').map(str::trim_start).unwrap_or(rest);
@@ -1161,6 +1248,84 @@ mod tests {
             format!("{busy_editing}\n  ⏵⏵ accept edits on (shift+tab to cycle)");
         assert!(is_input_ready(&ready_editing));
         assert!(detect_blocking_dialog(&ready_editing, &sigs).is_none());
+    }
+
+    /// The pane wrapper's interactive close prompt (`open/pane.rs`) after the
+    /// agent subprocess exits inside a still-alive pane.
+    const AGENT_EXITED_SCREEN: &str = "\
+Resume this session with:
+claude --resume 56d67514-c708-4810-b420-143a1b42d9d0
+[agent exited — press enter to close]";
+
+    #[test]
+    fn detect_agent_exited_flags_the_wrapper_close_prompt() {
+        assert!(detect_agent_exited(AGENT_EXITED_SCREEN));
+        // Just the resume block (no close prompt) is also enough.
+        assert!(detect_agent_exited(
+            "Resume this session with:\nclaude --resume abc123"
+        ));
+        // Just the close prompt (no resume block) is also enough.
+        assert!(detect_agent_exited("[agent exited — press enter to close]"));
+        // Hyphen instead of em-dash drift is tolerated (matched by the two halves).
+        assert!(detect_agent_exited("[agent exited - press enter to close]"));
+    }
+
+    #[test]
+    fn detect_agent_exited_ignores_a_working_or_ready_pane() {
+        // A live turn: the exit chrome is not present, and a spinner vetoes any
+        // stray wording besides.
+        assert!(!detect_agent_exited(
+            "· Booping… (10s · ↑ 2k tokens)  esc to interrupt"
+        ));
+        // Editing the wrapper source that PRINTS the marker, with a ready footer
+        // proving the pane is alive: the veto keeps it from tripping.
+        let editing = "\
+    let _ = writeln!(io::stdout(), \"[agent exited — press enter to close]\");
+  ⏵⏵ accept edits on (shift+tab to cycle)";
+        assert!(is_input_ready(editing));
+        assert!(!detect_agent_exited(editing));
+        // A bare mention of \"agent exited\" without the paired close half and
+        // without the resume block is not enough.
+        assert!(!detect_agent_exited("the agent exited cleanly last run"));
+    }
+
+    #[test]
+    fn is_unknown_selection_dialog_flags_an_unrecognized_numbered_menu() {
+        // The Claude Code onboarding prompt that stranded a workspace — none of
+        // the curated dialog signatures match it, but its numbered-option shape
+        // does. (Uses the `❯` selection cursor Claude Code actually renders.)
+        let onboarding = "\
+Teach auto mode about your environment?
+Auto mode works better when it knows your environment. Takes about a minute.
+❯ 1. Yes
+  2. Not now
+  3. Don't show again";
+        assert!(is_unknown_selection_dialog(onboarding));
+        // And the curated allowlist genuinely misses it (this is why the generic
+        // detector exists).
+        let sigs = shelbi_core::default_dialog_signatures("claude");
+        assert!(detect_blocking_dialog(onboarding, &sigs).is_none());
+    }
+
+    #[test]
+    fn is_unknown_selection_dialog_ignores_ordinary_panes() {
+        // An ordinary pause between tool batches draws the ready input box, never
+        // a numbered menu — the veto (and the shape) keep it quiet.
+        assert!(!is_unknown_selection_dialog(
+            "⏺ Done.\n  ? for shortcuts"
+        ));
+        // A live turn is not a menu.
+        assert!(!is_unknown_selection_dialog(
+            "· Working… (45s · ↓ 39.0k tokens)  esc to interrupt"
+        ));
+        // A single option line is not enough to be a menu (avoids a lone
+        // inline suggestion / one-item prompt).
+        assert!(!is_unknown_selection_dialog("❯ 1. Only one option"));
+        // Prose that mentions a numbered list but carries no rendered option
+        // chrome does not match.
+        assert!(!is_unknown_selection_dialog(
+            "First do step one then step two of the plan."
+        ));
     }
 
     #[test]
