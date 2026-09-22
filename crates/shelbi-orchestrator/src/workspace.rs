@@ -6623,6 +6623,91 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_gate_prompts_pass_forward_and_reject_backward() {
+        // End-to-end for the consecutive-gate topology: resolve each gate's
+        // pass/reject targets from the declared workflow (the same helpers
+        // `classify_handoff` calls), build the gate plan, and assert the
+        // generated Pass/Reject transition commands the worker receives.
+        //   in-progress -> adversarial-review -> review-app -> review
+        let yaml = r#"
+name: default
+statuses:
+  - { id: in-progress,        name: InProgress,        category: active,  owner: agent, agent: developer }
+  - { id: adversarial-review, name: AdversarialReview, category: active,  owner: agent, agent: adversarial }
+  - { id: review-app,         name: ReviewApp,         category: active,  owner: agent, agent: review-app }
+  - { id: review,             name: Review,            category: handoff, owner: user }
+transitions:
+  - { from: in-progress,        to: adversarial-review, actions: [] }
+  - { from: adversarial-review, to: review-app,         actions: [push_branch, open_pr] }
+  - { from: adversarial-review, to: in-progress,        actions: [] }
+  - { from: review-app,         to: review,             actions: [] }
+  - { from: review-app,         to: in-progress,        actions: [] }
+"#;
+        let wf = shelbi_core::Workflow::from_yaml_str(yaml).unwrap();
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/adv-1/.claude/shelbi-ready");
+
+        // Build the gate plan exactly as `classify_handoff` does, from the
+        // resolved statuses, for whichever gate the task is sitting in.
+        let plan_for = |current: &str| {
+            let pass = wf.gate_pass_status(current).expect("pass target");
+            let reject = wf.gate_reject_status(current).expect("reject target");
+            HandoffPlan::Gate {
+                pass_id: pass.id.clone(),
+                pass_name: pass.name.clone(),
+                reject_id: reject.id.clone(),
+                reject_name: reject.name.clone(),
+            }
+        };
+
+        // First gate: Pass advances to the downstream `review-app` gate, Reject
+        // bounces back to `in-progress` — NOT the old bug's Pass -> review /
+        // Reject -> review-app.
+        let adv = compose_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "Fix the Safari SSO bug.",
+            &marker,
+            "main",
+            "myapp",
+            false,
+            &plan_for("adversarial-review"),
+        );
+        assert!(
+            adv.contains("printf '%s\\n%s\\n' fix-login review-app >"),
+            "adversarial-review Pass must advance to the downstream gate: {adv}"
+        );
+        assert!(
+            adv.contains("printf '%s\\n%s\\n' fix-login in-progress >"),
+            "adversarial-review Reject must bounce to the developer: {adv}"
+        );
+        assert!(
+            !adv.contains("fix-login review >"),
+            "adversarial-review must not pass straight to the human handoff: {adv}"
+        );
+
+        // Second gate: Pass advances to the human `review` handoff, Reject still
+        // bounces to `in-progress`.
+        let app = compose_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "Fix the Safari SSO bug.",
+            &marker,
+            "main",
+            "myapp",
+            false,
+            &plan_for("review-app"),
+        );
+        assert!(
+            app.contains("printf '%s\\n%s\\n' fix-login review >"),
+            "review-app Pass must advance to the human handoff: {app}"
+        );
+        assert!(
+            app.contains("printf '%s\\n%s\\n' fix-login in-progress >"),
+            "review-app Reject must bounce to the developer: {app}"
+        );
+    }
+
+    #[test]
     fn gate_launch_inlines_agent_charter_ahead_of_role_neutral_gate_wording() {
         // Acceptance criteria for #1315 (and #1311): a gate launch inlines the
         // SELECTED agent's charter, marked authoritative, ahead of the generated

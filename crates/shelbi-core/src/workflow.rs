@@ -405,10 +405,24 @@ impl Workflow {
     }
 
     /// The status an agent-owned active gate in `from` **passes** a task to on a
-    /// clean verdict: the target of `from`'s declared outgoing transition into a
-    /// [`StatusCategory::Handoff`] status (the human review stage). Falls back to
-    /// the workflow's first handoff status when `from` declares no such edge, and
-    /// returns `None` only when the workflow has no handoff status at all.
+    /// clean verdict — the next stage on the way to human review:
+    ///
+    /// 1. The target of `from`'s declared outgoing transition into a
+    ///    [`StatusCategory::Handoff`] status (the human review stage), when one
+    ///    is declared.
+    /// 2. Otherwise the target of `from`'s declared outgoing transition into the
+    ///    **next agent-owned active gate** ([`Workflow::is_agent_active_gate`]).
+    ///    This is what carries a task across *consecutive* active gates before
+    ///    the human handoff (e.g. `adversarial-review -> review-app`): the
+    ///    downstream gate is another active status, so without this step the
+    ///    handoff-only rule would skip past it to the first handoff status. The
+    ///    gate's *backward* bounce edge points at the developer's primary active
+    ///    column, which `is_agent_active_gate` excludes, so only a genuine
+    ///    forward gate matches here.
+    ///
+    /// Falls back to the workflow's first handoff status when `from` declares no
+    /// such edge, and returns `None` only when the workflow has no handoff
+    /// status at all.
     pub fn gate_pass_status(&self, from: &str) -> Option<&Status> {
         if let Some(ts) = &self.transitions {
             if let Some(to) = ts
@@ -422,6 +436,15 @@ impl Workflow {
             {
                 return self.status(to);
             }
+            // No handoff edge: advance to the next agent-owned active gate.
+            if let Some(to) = ts
+                .iter()
+                .filter(|t| t.from == from && t.to != from)
+                .map(|t| t.to.as_str())
+                .find(|to| self.is_agent_active_gate(to))
+            {
+                return self.status(to);
+            }
         }
         self.statuses
             .iter()
@@ -429,19 +452,50 @@ impl Workflow {
     }
 
     /// The status an agent-owned active gate in `from` **bounces** a rejected
-    /// task back to: the target of `from`'s declared outgoing transition into an
-    /// [`StatusCategory::Active`] status distinct from `from` (the developer's
-    /// working column). Falls back to the workflow's first active status other
-    /// than `from`, and returns `None` when there is none.
+    /// task back to — an earlier active stage, toward the developer:
+    ///
+    /// 1. The declared outgoing edge into the workflow's **primary** active
+    ///    column ([`Workflow::primary_active_status`], the developer's working
+    ///    status), when one is declared.
+    /// 2. Otherwise the first declared outgoing edge into an
+    ///    [`StatusCategory::Active`] status distinct from `from` that is **not**
+    ///    the forward pass target ([`Workflow::gate_pass_status`]). Excluding the
+    ///    pass target is what keeps consecutive gates from rejecting *forward*:
+    ///    when a gate chains into a downstream active gate, that downstream gate
+    ///    is also an active outgoing edge, so a naive "first active edge" rule
+    ///    would pick it as both pass and reject.
+    ///
+    /// Falls back to the workflow's first active status other than `from`, and
+    /// returns `None` when there is none.
     pub fn gate_reject_status(&self, from: &str) -> Option<&Status> {
         if let Some(ts) = &self.transitions {
+            let primary_id = self.primary_active_status().map(|s| s.id.as_str());
+            // Prefer the declared bounce edge back to the developer's column.
             if let Some(to) = ts
                 .iter()
                 .filter(|t| t.from == from && t.to != from)
                 .map(|t| t.to.as_str())
                 .find(|to| {
-                    self.status(to)
-                        .is_some_and(|s| s.category == StatusCategory::Active)
+                    Some(*to) == primary_id
+                        && self
+                            .status(to)
+                            .is_some_and(|s| s.category == StatusCategory::Active)
+                })
+            {
+                return self.status(to);
+            }
+            // Otherwise the first active edge that isn't the forward pass target,
+            // so a gate chained before another gate never rejects forward.
+            let pass_id = self.gate_pass_status(from).map(|s| s.id.as_str());
+            if let Some(to) = ts
+                .iter()
+                .filter(|t| t.from == from && t.to != from)
+                .map(|t| t.to.as_str())
+                .find(|to| {
+                    Some(*to) != pass_id
+                        && self
+                            .status(to)
+                            .is_some_and(|s| s.category == StatusCategory::Active)
                 })
             {
                 return self.status(to);
@@ -2144,6 +2198,65 @@ statuses:
             wf.gate_reject_status("adversarial-review")
                 .map(|s| s.id.as_str()),
             Some("in-progress"),
+        );
+    }
+
+    #[test]
+    fn consecutive_active_gates_pass_forward_and_reject_backward() {
+        // Two agent-owned active gates chained before the human handoff:
+        //   in-progress -> adversarial-review -> review-app -> review
+        //                        \-> in-progress   \-> in-progress
+        // Each gate must pass FORWARD to the next stage (the downstream gate,
+        // then the handoff) and reject BACKWARD to the developer's column —
+        // never confuse the forward gate for the rejection target.
+        let yaml = r#"
+name: default
+statuses:
+  - { id: in-progress,        name: InProgress,        category: active,  owner: agent, agent: developer }
+  - { id: adversarial-review, name: AdversarialReview, category: active,  owner: agent, agent: adversarial }
+  - { id: review-app,         name: ReviewApp,         category: active,  owner: agent, agent: review-app }
+  - { id: review,             name: Review,            category: handoff, owner: user }
+transitions:
+  - { from: in-progress,        to: adversarial-review, actions: [] }
+  - { from: adversarial-review, to: review-app,         actions: [push_branch, open_pr] }
+  - { from: adversarial-review, to: in-progress,        actions: [] }
+  - { from: review-app,         to: review,             actions: [] }
+  - { from: review-app,         to: in-progress,        actions: [] }
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        // The first gate passes forward to the *next active gate*, not straight
+        // to the human handoff, and rejects back to the developer.
+        assert_eq!(
+            wf.gate_pass_status("adversarial-review").map(|s| s.id.as_str()),
+            Some("review-app"),
+        );
+        assert_eq!(
+            wf.gate_reject_status("adversarial-review")
+                .map(|s| s.id.as_str()),
+            Some("in-progress"),
+        );
+        // The second gate passes forward to the human handoff and also rejects
+        // back to the developer.
+        assert_eq!(
+            wf.gate_pass_status("review-app").map(|s| s.id.as_str()),
+            Some("review"),
+        );
+        assert_eq!(
+            wf.gate_reject_status("review-app").map(|s| s.id.as_str()),
+            Some("in-progress"),
+        );
+        // The pass edge onto `review-app` is the one carrying the declared
+        // `push_branch` / `open_pr` actions, so a clean pass runs them.
+        let pass_edge = wf
+            .transitions
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|t| t.from == "adversarial-review" && t.to == "review-app")
+            .expect("declared pass edge");
+        assert_eq!(
+            pass_edge.actions,
+            vec![TransitionAction::PushBranch, TransitionAction::OpenPr],
         );
     }
 
