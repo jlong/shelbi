@@ -2175,6 +2175,7 @@ mod tests {
                 branch_prefix: Some("shelbi".into()),
                 ..Default::default()
             },
+            review: shelbi_core::ReviewConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),

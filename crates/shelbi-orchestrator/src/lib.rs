@@ -3705,6 +3705,7 @@ mod reload_target_tmux_tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
             repo: hub_work_dir.to_string_lossy().into_owned(),
             machines: vec![shelbi_core::Machine {
                 name: "hub".into(),
@@ -4517,6 +4518,7 @@ mod reload_workspace_tmux_tests {
             issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
         };
         shelbi_state::save_project(&project).unwrap();
     }

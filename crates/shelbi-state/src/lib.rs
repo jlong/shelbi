@@ -3710,6 +3710,7 @@ mod tests {
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            review: ReviewConfig::default(),
             issue_tracker: Default::default(),
             runners: Default::default(),
             agents: Default::default(),

@@ -593,15 +593,24 @@ fn ensure_editor_pane(
 /// no window shows in the user's window list; [`show_review_view`] swaps it
 /// into the middle column on demand.
 ///
-/// The pane runs `git difftool` — Shelbi's reuse of the OS/git-configured diff
-/// tool — over the review branch's changes: `-d` (dir-diff, so the whole
-/// changeset opens at once) `-y` (no per-file prompt) against the merge base of
-/// the project's base branch and `HEAD`, exactly the range `shelbi diff`
-/// reports. The GUI variant (`-g`) is used when a `diff.guitool` is configured.
+/// By default the pane runs `git difftool` — Shelbi's reuse of the
+/// OS/git-configured diff tool — over the review branch's changes: `-d`
+/// (dir-diff, so the whole changeset opens at once) `-y` (no per-file prompt)
+/// against the merge base of the project's base branch and `HEAD`, exactly the
+/// range `shelbi diff` reports. The GUI variant (`-g`) is used when a
+/// `diff.guitool` is configured.
 ///
-/// The diff tool is resolved *before* the pane is spawned so an unconfigured or
-/// unusable tool surfaces as an `Err` on the panel's status line rather than a
-/// dead pane in the middle column (see [`resolve_difftool_gui`]).
+/// A project that sets `review.diff_command` overrides that default: dir-diff
+/// mode invokes the tool with two directory paths, which a tool that reviews a
+/// **revision range** (e.g. `skim`) cannot interpret, so it renders nothing and
+/// leaks git warnings. The override runs the tool directly against the same
+/// `{base}`/`{head}` range instead (see [`diff_pane_command`]).
+///
+/// On the default path the diff tool is resolved *before* the pane is spawned
+/// so an unconfigured or unusable tool surfaces as an `Err` on the panel's
+/// status line rather than a dead pane in the middle column (see
+/// [`resolve_difftool_gui`]). Either way, a tool that exits without rendering
+/// leaves a readable message in the pane rather than only git warnings.
 fn ensure_diff_pane(
     project: &shelbi_core::Project,
     ws: &shelbi_core::WorkspaceSpec,
@@ -620,22 +629,20 @@ fn ensure_diff_pane(
         .machine(&ws.machine)
         .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
     let worktree = crate::workspace::workspace_worktree(machine, ws);
-    // Resolve the configured diff tool up front: a missing/unusable one is a
-    // clear error here, not a pane that flashes a git message and dies.
-    let use_gui = resolve_difftool_gui(&worktree)?;
+    // A `review.diff_command` override bypasses `git difftool` entirely (it
+    // runs the tool directly against a revision range), so it is its own
+    // configured tool — the `resolve_difftool_gui` pre-flight only runs on the
+    // default path, where a missing/unusable `diff.tool` is a clear error here
+    // rather than a pane that flashes a git message and dies.
+    let override_cmd = project.review_diff_command();
+    let use_gui = match override_cmd {
+        Some(_) => false, // unused on the override path
+        None => resolve_difftool_gui(&worktree)?,
+    };
     // Diff the branch against where it forked from the base branch — the same
     // `merge-base(base, HEAD)..HEAD` range `shelbi diff` shows.
     let base = git_capture(&worktree, &["merge-base", project.base_branch(), "HEAD"])?;
-    let gui = if use_gui { "-g " } else { "" };
-    // `cd <worktree> && exec git difftool …` — exec so the pane dies with the
-    // diff tool (as the editor pane dies with the editor) rather than dropping
-    // to a shell. `-d` opens the whole changeset at once; `-y` skips the
-    // per-file prompt.
-    let cmd = format!(
-        "cd {wt} && exec git difftool -d -y {gui}{base} HEAD",
-        wt = shelbi_core::shell_escape(&worktree.to_string_lossy()),
-        base = shelbi_core::shell_escape(&base),
-    );
+    let cmd = diff_pane_command(&worktree, &base, override_cmd, use_gui);
     ensure_stash_session(project, session)?;
     let stash = format!("_{session}");
     // Its own window in the stash (like the editor's) so closing it on teardown
@@ -687,6 +694,71 @@ fn resolve_difftool_gui(worktree: &std::path::Path) -> Result<bool> {
         "no diff tool configured — set git `diff.tool` (or `diff.guitool`) to your preferred diff tool"
             .into(),
     ))
+}
+
+/// Build the `sh -c` command string the diff window runs, for either the
+/// default `git difftool` path or a `review.diff_command` override.
+///
+/// * **Override** (`override_cmd = Some`): the template's `{worktree}` /
+///   `{base}` / `{head}` placeholders are substituted (shell-escaped) and the
+///   result is run as-is — the escape hatch for a diff tool that reviews a
+///   **revision range** (`skim {base} {head}`) instead of git's `--dir-diff`
+///   directory pair, which such a tool cannot interpret.
+/// * **Default** (`override_cmd = None`): `git difftool -d -y [-g] <base> HEAD`
+///   — `-d` opens the whole changeset, `-y` skips the per-file prompt, `-g`
+///   selects the GUI tool when [`resolve_difftool_gui`] chose it.
+///
+/// Either invocation is wrapped so a **non-zero exit** leaves a readable
+/// message in the pane and holds it (a `read`) instead of leaving only git's
+/// warnings behind — the "tool exited without rendering" case an incompatible
+/// tool produces. A clean exit (the reviewer quit the tool) returns 0, the
+/// shell falls through, and the pane dies as before, so the panel's
+/// [`mid_content_pane_dead`] recovery swaps chat back in.
+fn diff_pane_command(
+    worktree: &std::path::Path,
+    base: &str,
+    override_cmd: Option<&str>,
+    use_gui: bool,
+) -> String {
+    let wt = shelbi_core::shell_escape(&worktree.to_string_lossy());
+    let invocation = match override_cmd {
+        Some(template) => render_diff_command(template, worktree, base),
+        None => {
+            let gui = if use_gui { "-g " } else { "" };
+            format!(
+                "git difftool -d -y {gui}{base} HEAD",
+                base = shelbi_core::shell_escape(base),
+            )
+        }
+    };
+    // `{ …; }` groups the invocation so `$?` is the tool's own exit status; on
+    // a non-zero exit we print a plain-language explanation and `read` to keep
+    // the pane up so the message is legible (rather than the pane collapsing
+    // straight back to chat with only git warnings scrolled past).
+    format!(
+        "cd {wt} && {{ {invocation}; }}; __st=$?; \
+if [ \"$__st\" -ne 0 ]; then \
+printf '\\n[shelbi] diff tool exited without rendering a diff (status %s).\\n' \"$__st\"; \
+printf 'The configured diff tool may not accept this diff mode; set review.diff_command in project.yaml to a revision-range command (e.g. skim {{base}} {{head}}).\\n'; \
+printf 'Press Enter to return to chat.'; read -r __; fi"
+    )
+}
+
+/// Substitute the `{worktree}` / `{base}` / `{head}` placeholders in a
+/// `review.diff_command` template with shell-escaped values. The template is
+/// otherwise a literal shell command line (the tool name plus its own args),
+/// run as-is. `{head}` is always the literal `HEAD` ref — the same head the
+/// default `git difftool` path diffs against — and `{base}` is
+/// `merge-base(base_branch, HEAD)`, so `skim {base} {head}` reviews exactly the
+/// range `shelbi diff` reports.
+fn render_diff_command(template: &str, worktree: &std::path::Path, base: &str) -> String {
+    template
+        .replace(
+            "{worktree}",
+            &shelbi_core::shell_escape(&worktree.to_string_lossy()),
+        )
+        .replace("{base}", &shelbi_core::shell_escape(base))
+        .replace("{head}", "HEAD")
 }
 
 /// Run `git -C <worktree> <args>` and return trimmed stdout, mapping a non-zero
@@ -976,6 +1048,89 @@ pub fn reject_review(project_name: &str, task_id: &str, reason: &str) -> Result<
 mod tests {
     use super::*;
 
+    // -- diff pane command construction -------------------------------------
+
+    /// The default (no `review.diff_command`) path still opens the changeset via
+    /// `git difftool -d -y <base> HEAD` — the historical behavior AC #2 pins —
+    /// run in the worktree, with no `-g` when the terminal tool was chosen.
+    #[test]
+    fn diff_pane_command_default_uses_git_difftool_dir_diff() {
+        let cmd = diff_pane_command(std::path::Path::new("/tmp/wt"), "abc123", None, false);
+        assert!(
+            cmd.contains("git difftool -d -y abc123 HEAD"),
+            "default path is git difftool -d -y <base> HEAD: {cmd}"
+        );
+        assert!(!cmd.contains(" -g "), "terminal tool gets no -g: {cmd}");
+        assert!(cmd.starts_with("cd /tmp/wt &&"), "runs in the worktree: {cmd}");
+    }
+
+    /// A configured `diff.guitool` selects the GUI variant (`-g`) on the default
+    /// path.
+    #[test]
+    fn diff_pane_command_default_gui_passes_dash_g() {
+        let cmd = diff_pane_command(std::path::Path::new("/tmp/wt"), "abc123", None, true);
+        assert!(
+            cmd.contains("git difftool -d -y -g abc123 HEAD"),
+            "gui path passes -g: {cmd}"
+        );
+    }
+
+    /// A `review.diff_command` override bypasses `git difftool -d` entirely
+    /// (AC #1): the pane runs the substituted template instead, so a
+    /// revision-range tool never sees the two directory paths dir-diff would
+    /// hand it.
+    #[test]
+    fn diff_pane_command_override_bypasses_dir_diff() {
+        let cmd = diff_pane_command(
+            std::path::Path::new("/tmp/wt"),
+            "abc123",
+            Some("skim {base} {head}"),
+            false,
+        );
+        assert!(cmd.contains("skim abc123 HEAD"), "runs the override tool: {cmd}");
+        assert!(
+            !cmd.contains("git difftool"),
+            "override never falls back to git difftool -d: {cmd}"
+        );
+    }
+
+    /// The override receives the same `{base}` = `merge-base(base, HEAD)` and
+    /// `{head}` = `HEAD` range the pane computes today (AC #3), and `{worktree}`
+    /// is the worktree path. Values are shell-escaped so a path/ref with spaces
+    /// or metacharacters stays a single, safe argument.
+    #[test]
+    fn render_diff_command_substitutes_and_shell_escapes_placeholders() {
+        let out = render_diff_command(
+            "mytool {worktree} {base} {head}",
+            std::path::Path::new("/tmp/my wt"),
+            "abc123",
+        );
+        assert_eq!(out, "mytool '/tmp/my wt' abc123 HEAD");
+    }
+
+    /// Either invocation is wrapped so a diff tool that exits without rendering
+    /// leaves a readable message (and holds the pane) rather than only git
+    /// warnings — AC #4.
+    #[test]
+    fn diff_pane_command_surfaces_a_message_on_nonzero_exit() {
+        for override_cmd in [None, Some("skim {base} {head}")] {
+            let cmd =
+                diff_pane_command(std::path::Path::new("/tmp/wt"), "abc123", override_cmd, false);
+            assert!(
+                cmd.contains("exited without rendering"),
+                "carries a readable failure message: {cmd}"
+            );
+            assert!(
+                cmd.contains("review.diff_command"),
+                "points at the escape hatch: {cmd}"
+            );
+            assert!(
+                cmd.contains("read -r"),
+                "holds the pane so the message is legible: {cmd}"
+            );
+        }
+    }
+
     #[test]
     fn review_panel_cmd_is_a_respawn_loop_invoking_the_subcommand() {
         let cmd = review_panel_cmd("/usr/local/bin/shelbi", "myapp", "fix-login");
@@ -1073,6 +1228,7 @@ mod tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),

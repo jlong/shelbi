@@ -3791,6 +3791,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             default_workflow: None,
             config_mode: None,
             git: shelbi_core::GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
             machines: vec![shelbi_core::Machine {
                 name: "hub".into(),
                 kind: shelbi_core::MachineKind::Local,
@@ -5585,6 +5586,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             default_workflow: Some("app".into()),
             config_mode: None,
             git: shelbi_core::GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
             machines: vec![shelbi_core::Machine {
                 name: "hub".into(),
                 kind: shelbi_core::MachineKind::Local,

@@ -1965,6 +1965,7 @@ mod tests {
             issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
         }
     }
 
@@ -2038,6 +2039,7 @@ mod tests {
             issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
         };
         assert!(workspace_holding_branch(&project, "feature")
             .unwrap()
@@ -2129,6 +2131,7 @@ mod tests {
             issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
         }
     }
 
@@ -2222,6 +2225,7 @@ mod tests {
             issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
         };
         let out = delete_branch(&project, &task_on_branch("t", "feature")).unwrap();
         assert!(matches!(out, DeleteOutcome::NotPresent), "{out:?}");
@@ -2364,6 +2368,7 @@ mod tests {
             issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
         };
 
         let wt = local.to_string_lossy().into_owned();
@@ -2702,6 +2707,7 @@ mod tests {
                 merge_strategy: strategy,
                 ..Default::default()
             },
+            review: shelbi_core::ReviewConfig::default(),
         }
     }
 

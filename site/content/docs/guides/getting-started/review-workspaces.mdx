@@ -176,9 +176,13 @@ From the review panel you can:
 
 - **🤓 Chat with Reviewer** — talk to the Review agent (the default view).
 - **🔀 View Diff** — open your system diff tool over the review branch's
-  changes in the main pane. This uses git's configured diff tool
-  (`diff.tool`, or `diff.guitool` for a GUI tool); if none is configured the
-  panel shows a short error instead of launching.
+  changes in the main pane. By default this uses git's configured diff tool
+  (`diff.tool`, or `diff.guitool` for a GUI tool) in directory-diff mode; if
+  none is configured the panel shows a short error instead of launching. A
+  diff tool that reviews a **revision range** rather than two directory trees
+  (such as `skim`) cannot read the directory pair directory-diff mode hands
+  it, so set `review.diff_command` in `project.yaml` to run it directly
+  instead. See [Review diff command](#review-diff-command) below.
 - **✍️ Edit in `<editor>`** — open the review worktree in your
   [configured editor](/docs/configuration/global#configyaml).
 - **🌐 Open Browser** — open the served `url` in your system browser. This
@@ -205,6 +209,36 @@ any.
 
 </Step>
 </Steps>
+
+## Review diff command
+
+**View Diff** defaults to `git difftool -d -y <base> HEAD` — git's
+directory-diff mode, which builds two temp trees and hands your `diff.tool`
+**two directory paths**. Most terminal and GUI diff tools understand that.
+Some tools instead review a **revision range** (`skim <base> <head>`,
+for example): given two directory paths they render nothing and leak git
+warnings into the pane.
+
+For those, set a `review.diff_command` in `project.yaml`. It replaces the
+default `git difftool -d` invocation with a command of your own, run in the
+review worktree, with three placeholders substituted:
+
+- `{worktree}` — the review workspace worktree,
+- `{base}` — `merge-base(<base branch>, HEAD)`, the fork point, and
+- `{head}` — `HEAD`.
+
+`{base}` and `{head}` are exactly the range `shelbi diff` reports, so the
+override reviews the same changeset the default path does:
+
+```yaml
+review:
+  diff_command: skim {base} {head}
+```
+
+Leave `review.diff_command` unset (the default) and View Diff keeps using
+`git difftool -d -y`, so existing setups are unchanged. Either way, a diff
+tool that exits without rendering leaves a short message in the pane rather
+than only git warnings.
 
 ## Next
 

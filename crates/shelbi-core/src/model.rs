@@ -140,6 +140,14 @@ pub struct Project {
     /// [`Project::merge_strategy`].
     #[serde(default)]
     pub git: GitConfig,
+    /// Review-panel config: today just the **View Diff** escape hatch
+    /// ([`ReviewConfig::diff_command`]) for a diff tool that reviews a
+    /// revision range instead of git's `--dir-diff` directory pair. Absent
+    /// on existing projects, in which case View Diff keeps the default
+    /// `git difftool -d -y` path. See [`ReviewConfig`] and
+    /// [`Project::review_diff_command`].
+    #[serde(default, skip_serializing_if = "ReviewConfig::is_default")]
+    pub review: ReviewConfig,
     /// Which board backend this project's issues live in. Absent ⇒
     /// [`IssueTrackerBackend::FileSystem`] (today's markdown-on-disk board),
     /// so every existing project keeps working untouched. Only
@@ -234,6 +242,7 @@ pub const SHARED_PROJECT_FIELDS: &[&str] = &[
     "zen",
     "heartbeat",
     "git",
+    "review",
     "issue_tracker",
     "runners",
     "agents",
@@ -647,6 +656,45 @@ impl GitConfig {
             });
         }
         Ok(())
+    }
+}
+
+/// Project-level review-panel config. Stored under the `review:` key in the
+/// project YAML; absent altogether on existing projects, in which case every
+/// field falls back to its default and the review sidebar's **View Diff**
+/// keeps the historical `git difftool -d -y` behavior.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewConfig {
+    /// Command template the review sidebar's **View Diff** runs *instead of*
+    /// the default `git difftool -d -y <base> HEAD`.
+    ///
+    /// The default path uses git's dir-diff mode (`-d`), which invokes the
+    /// configured `diff.tool` with **two directory paths**. A tool that
+    /// instead reviews a **revision range** (e.g. `skim`, whose CLI is
+    /// `skim <base> <head>`) cannot interpret those directories, so it
+    /// renders nothing and leaks git warnings into the pane. Set this to the
+    /// tool's revision-range invocation to bypass dir-diff entirely.
+    ///
+    /// Placeholders, substituted before the command is run:
+    /// * `{worktree}` — the workspace worktree the diff is taken in (the
+    ///   command is also run with that directory as its cwd),
+    /// * `{base}` — `merge-base(base_branch, HEAD)`, the fork point, and
+    /// * `{head}` — `HEAD`.
+    ///
+    /// `{base}` and `{head}` are exactly the range `shelbi diff` reports, so
+    /// `skim {base} {head}` reviews the same changeset the default path does.
+    /// When `None` (the common case) View Diff uses `git difftool -d -y`, so
+    /// existing setups are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_command: Option<String>,
+}
+
+impl ReviewConfig {
+    /// Whether this block is entirely default (no fields set), so the
+    /// serializer can elide the `review:` key on a project that never
+    /// configured it and existing YAMLs round-trip without growing a key.
+    pub fn is_default(&self) -> bool {
+        *self == ReviewConfig::default()
     }
 }
 
@@ -1074,6 +1122,13 @@ impl Project {
     /// Configured merge strategy, defaulting to [`MergeStrategy::Squash`].
     pub fn merge_strategy(&self) -> MergeStrategy {
         self.git.merge_strategy
+    }
+
+    /// The review sidebar's **View Diff** override command, or `None` when
+    /// unset — in which case View Diff uses `git difftool -d -y`. See
+    /// [`ReviewConfig::diff_command`] for the placeholder contract.
+    pub fn review_diff_command(&self) -> Option<&str> {
+        self.review.diff_command.as_deref()
     }
 
     /// Workflow name used for tasks that omit `workflow:` in frontmatter.
@@ -3910,6 +3965,7 @@ workspace_settings_template: /etc/shelbi/p.json
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            review: ReviewConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),
@@ -4009,6 +4065,7 @@ workspaces:
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            review: ReviewConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),
@@ -4313,6 +4370,7 @@ workspaces:
             zen,
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            review: ReviewConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),
@@ -5660,6 +5718,7 @@ git:
                 merge_strategy: MergeStrategy::Rebase,
                 ..Default::default()
             },
+            review: ReviewConfig::default(),
             issue_tracker: IssueTrackerConfig {
                 backend: IssueTrackerBackend::Github,
                 github: Some(GithubConnection {
@@ -5781,6 +5840,36 @@ agent_runners:
         assert_eq!(
             serde_yaml::to_string(&via_helper).unwrap(),
             serde_yaml::to_string(&via_serde).unwrap()
+        );
+    }
+
+    #[test]
+    fn review_diff_command_parses_and_is_none_by_default() {
+        let base = "\
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+";
+        // Absent `review:` block ⇒ no override (default `git difftool -d`),
+        // and the elided key never appears on the wire (`is_default`).
+        let plain = Project::from_yaml_str(base).unwrap();
+        assert_eq!(plain.review_diff_command(), None);
+        assert!(
+            !serde_yaml::to_string(&plain).unwrap().contains("review:"),
+            "an unconfigured review block is elided from the wire form"
+        );
+
+        // A `review.diff_command` parses through to the accessor.
+        let with_cmd = format!("{base}review:\n  diff_command: skim {{base}} {{head}}\n");
+        let p = Project::from_yaml_str(&with_cmd).unwrap();
+        assert_eq!(p.review_diff_command(), Some("skim {base} {head}"));
+        assert!(
+            serde_yaml::to_string(&p).unwrap().contains("diff_command:"),
+            "a configured diff_command round-trips onto the wire"
         );
     }
 

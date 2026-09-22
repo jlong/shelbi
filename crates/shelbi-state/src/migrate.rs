@@ -562,7 +562,7 @@ mod tests {
 
     use shelbi_core::{
         AgentRunnerSpec, ConfigMode, GitConfig, HeartbeatConfig, Machine, MachineKind,
-        OrchestratorSpec, Project, ZenConfig,
+        OrchestratorSpec, Project, ReviewConfig, ZenConfig,
     };
 
     use crate::save_project;
@@ -626,6 +626,7 @@ mod tests {
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            review: ReviewConfig::default(),
             issue_tracker: Default::default(),
             runners: Default::default(),
             agents: Default::default(),

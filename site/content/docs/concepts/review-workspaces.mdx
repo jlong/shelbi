@@ -250,9 +250,14 @@ sidebar stays docked in the dashboard. The panel is where you drive the review:
   - **🤓 Chat with Reviewer** (default) — talk to the Review agent.
   - **🔀 View Diff** — open your system diff tool over the review branch's
     changes (the same `merge-base(base, HEAD)..HEAD` range `shelbi diff`
-    shows) in the main pane. It launches git's configured diff tool
-    (`diff.tool`, or `diff.guitool` for a GUI tool); with none configured the
-    panel reports a short error rather than launching.
+    shows) in the main pane. By default it launches git's configured diff tool
+    (`diff.tool`, or `diff.guitool` for a GUI tool) in directory-diff mode;
+    with none configured the panel reports a short error rather than launching.
+    A tool that reviews a revision range instead of two directory trees (such
+    as `skim`) needs a `review.diff_command` override in `project.yaml` — see
+    [Project config](/docs/configuration/project). A diff tool that exits
+    without rendering leaves a short message in the pane rather than only git
+    warnings.
   - **✍️ Edit in `<editor>`** — open the worktree in your configured editor
     (see below).
   - **🌐 Open Browser** — open the resolved review `url` in your system
