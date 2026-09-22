@@ -195,6 +195,7 @@ mod tests {
                 branch_prefix: prefix.map(str::to_string),
                 ..Default::default()
             },
+            review: shelbi_core::ReviewConfig::default(),
         }
     }
 

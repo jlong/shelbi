@@ -3706,6 +3706,7 @@ mod tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
             repo: "/tmp/demo".into(),
             machines: Vec::new(),
             editor: None,

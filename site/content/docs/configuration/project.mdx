@@ -124,6 +124,7 @@ workspaces:
 | `workspace_permissions_mode` | string | no | `auto` | Permissions posture rendered into the workspace settings template (`auto` → claude's `acceptEdits`). |
 | `heartbeat` | [Heartbeat](#heartbeat) | no | `60s` / `5m` | Adaptive hub heartbeat written to `events.log` so the orchestrator's watch fires on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. |
 | `git` | [Git](#git) | no | all defaults | Base branch, generated task branch prefix, and merge strategy for `shelbi merge` and Zen's auto-merge. |
+| `review` | [Review](#review) | no | all defaults | Review-interface behavior. Today just `diff_command`, the **View Diff** escape hatch for a diff tool that reviews a revision range instead of git's directory-diff pair. |
 
 ## machines
 
@@ -398,6 +399,42 @@ with `/`. Resolution runs in order: an explicit `branch:` in the task's
 frontmatter wins; otherwise Shelbi renders `git.branch`; when neither is set it
 names the branch after your authenticated GitHub username, falling back to
 `user`. The shipped `task` workflow sets `branch: '{{github_user}}/{{id}}'`.
+
+## review
+
+Behavior of the [review interface](/docs/concepts/review-workspaces#the-review-interface)'s
+**View Diff** action.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `diff_command` | string | no | none | Command **View Diff** runs instead of the default `git difftool -d -y <base> HEAD`. Set it when your diff tool reviews a **revision range** rather than git's directory-diff pair. See below. |
+
+By default **View Diff** runs `git difftool -d -y <base> HEAD` — git's
+directory-diff mode, which invokes your `diff.tool` with **two directory
+paths**. A tool whose CLI takes a revision range instead (such as `skim`,
+invoked `skim <base> <head>`) can't interpret those directories: it renders
+nothing and leaks git warnings into the pane. Point `review.diff_command` at
+the tool's revision-range invocation to bypass directory-diff entirely.
+
+The command runs in the review worktree with three placeholders substituted
+(shell-escaped):
+
+- `{worktree}` — the review workspace worktree,
+- `{base}` — `merge-base(<base branch>, HEAD)`, the fork point, and
+- `{head}` — `HEAD`.
+
+`{base}` and `{head}` are the same range `shelbi diff` reports, so the
+override reviews the same changeset the default path does.
+
+```yaml
+review:
+  diff_command: skim {base} {head}
+```
+
+Leave `diff_command` unset and **View Diff** keeps the default `git difftool
+-d -y` path, so existing setups are unchanged. Either way, a diff tool that
+exits without rendering leaves a short message in the pane rather than only
+git warnings.
 
 ## The PR-body template (`pr-template.md`)
 

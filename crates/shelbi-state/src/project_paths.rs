@@ -335,7 +335,7 @@ mod tests {
 
     use shelbi_core::{
         AgentRunnerSpec, ConfigMode, GitConfig, HeartbeatConfig, Machine, MachineKind,
-        OrchestratorSpec, ZenConfig,
+        OrchestratorSpec, ReviewConfig, ZenConfig,
     };
 
     use crate::test_lock::LOCK as TEST_LOCK;
@@ -395,6 +395,7 @@ mod tests {
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            review: ReviewConfig::default(),
             issue_tracker: Default::default(),
             runners: Default::default(),
             agents: Default::default(),

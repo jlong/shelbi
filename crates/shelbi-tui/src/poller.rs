@@ -6419,6 +6419,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),

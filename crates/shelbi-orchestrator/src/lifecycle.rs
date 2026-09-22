@@ -499,6 +499,7 @@ mod tests {
                 branch_prefix: Some("shelbi".into()),
                 ..Default::default()
             },
+            review: shelbi_core::ReviewConfig::default(),
         }
     }
 

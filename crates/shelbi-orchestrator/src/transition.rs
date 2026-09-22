@@ -636,6 +636,7 @@ mod tests {
             issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
         }
     }
 

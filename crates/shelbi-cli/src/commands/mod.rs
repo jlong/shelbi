@@ -483,6 +483,7 @@ pub(crate) mod test_support {
             issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
         };
         shelbi_state::save_project(&project).unwrap();
         shelbi_state::scaffold_project_statuses(project_name).unwrap();

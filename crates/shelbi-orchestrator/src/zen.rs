@@ -2994,6 +2994,7 @@ mod pr_create_tests {
             issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
         }
     }
 
@@ -9815,6 +9816,7 @@ mod probe_tests {
             issue_tracker: Default::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
+            review: shelbi_core::ReviewConfig::default(),
         }
     }
 
