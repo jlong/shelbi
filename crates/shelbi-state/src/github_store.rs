@@ -598,7 +598,7 @@ impl GitHubStore {
             .into_iter()
             .filter(|gh| !gh.is_pull_request())
             .map(|gh| {
-                let mut tf = gh.into_issue_file();
+                let mut tf = self.to_issue_file(gh);
                 tf.task.assigned_to = assignments.get(&tf.task.id).cloned();
                 tf
             })
@@ -714,7 +714,7 @@ impl IssueStore for GitHubStore {
                         if let Some(pair) = gh.reopened_terminal() {
                             reopened.push(pair);
                         }
-                        let tf = fold_assignment(gh.into_issue_file(), &assignments);
+                        let tf = fold_assignment(self.to_issue_file(gh), &assignments);
                         numbers.push((tf.task.id.clone(), number));
                         tf
                     })
@@ -751,7 +751,7 @@ impl IssueStore for GitHubStore {
                     if let Some(pair) = gh.reopened_terminal() {
                         reopened.push(pair);
                     }
-                    let tf = gh.into_issue_file();
+                    let tf = self.to_issue_file(gh);
                     if closed {
                         by_id.remove(&tf.task.id);
                     } else {
@@ -807,7 +807,7 @@ impl IssueStore for GitHubStore {
                 let issues = page
                     .issues
                     .into_iter()
-                    .map(|gh| fold_assignment(gh.into_issue_file(), &assignments))
+                    .map(|gh| fold_assignment(self.to_issue_file(gh), &assignments))
                     .collect();
                 Ok(crate::issue_store::ClosedPage {
                     issues,
@@ -1042,7 +1042,7 @@ impl IssueStore for GitHubStore {
         // mapping the read path uses. A half-applied move (an issue left open on
         // GitHub carrying a terminal label) reads as `backlog` here, so the
         // recorded edge matches the lane the card was actually rendering in.
-        let from = gh.column();
+        let from = gh.column(|| self.initial_status_column(&gh));
         let workflow = self.move_workflow_name(&gh);
 
         let to_label = status_label_name(to);
@@ -1150,7 +1150,7 @@ impl IssueStore for GitHubStore {
         // (`Some`) or a label-only repair (`Ok(None)`): the index entry changed
         // either way. Only the zero-request early return above (already there on
         // both axes) publishes nothing.
-        let mut tf = after.into_issue_file();
+        let mut tf = self.to_issue_file(after);
         tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
         self.publish_write(&tf, gh.number);
 
@@ -1289,7 +1289,7 @@ impl IssueStore for GitHubStore {
         // render-path caches so the new title/body/fields show before the next
         // daemon tick, sourced from the mutation's own response, not a re-read.
         let after: GhIssue = parse_json_object(&out)?;
-        let mut tf = after.into_issue_file();
+        let mut tf = self.to_issue_file(after);
         tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
         self.publish_write(&tf, gh.number);
         Ok(())
@@ -1437,7 +1437,7 @@ impl IssueStore for GitHubStore {
             high = Some(high.map_or(updated, |h| h.max(updated)));
             if since.watermark().is_some_and(|w| updated > w) {
                 let number = gh.number;
-                let tf = gh.into_issue_file();
+                let tf = self.to_issue_file(gh);
                 touched.push((tf.task.id.clone(), number));
                 changes.push(IssueChange::Upserted(Box::new(tf)));
             }
@@ -1545,6 +1545,43 @@ impl GitHubStore {
                 .map(|p| p.default_workflow_name().to_string())
                 .unwrap_or_else(|_| DEFAULT_WORKFLOW_NAME.to_string()),
         }
+    }
+
+    /// The [`Column`] an issue with no `shelbi:status/*` label enters at: the
+    /// resolved workflow's initial status, never a hardcoded `todo`.
+    ///
+    /// An issue authored on github.com carries no status label. Landing it in
+    /// `todo` pre-promoted it into the ready lane and skipped the user's triage
+    /// step, so it must instead enter at the workflow's declared entry status
+    /// (`backlog` for the shipped `app`/`default` workflows). The workflow is
+    /// resolved through the same chain every other call site uses
+    /// ([`GitHubStore::move_workflow_name`]: explicit task `workflow:` ->
+    /// project `default_workflow:` -> built-in `default`), then its
+    /// [`Workflow::resolved_initial_status`] is mapped to a column.
+    ///
+    /// The load is soft, matching every other workflow-resolution call site: an
+    /// unreadable workflow config falls back to the built-in
+    /// [`shelbi_core::default_workflow`] (whose initial status is `backlog`), so
+    /// a config gap can never resurrect the pre-promoting `todo`.
+    fn initial_status_column(&self, gh: &GhIssue) -> Column {
+        let name = self.move_workflow_name(gh);
+        crate::load_workflow(&self.project, &name)
+            .unwrap_or_else(|_| shelbi_core::default_workflow())
+            .resolved_initial_status()
+            .map(Column::from_status_id)
+            .unwrap_or_else(Column::backlog)
+    }
+
+    /// [`GhIssue::into_issue_file`] with the unlabeled-open fallback resolved
+    /// against this store's project config (see
+    /// [`GitHubStore::initial_status_column`]). Every read/write path funnels
+    /// its raw issues through here, so a github-authored issue lands in the
+    /// workflow's initial status uniformly. The workflow load fires only for an
+    /// unlabeled *open* issue — the closure is untouched for every labeled or
+    /// closed one.
+    fn to_issue_file(&self, gh: GhIssue) -> IssueFile {
+        let column = gh.column(|| self.initial_status_column(&gh));
+        gh.into_issue_file(column)
     }
 
     /// Resolve a shelbi id to the raw GitHub issue (number + fields), or `None`.
@@ -1935,7 +1972,7 @@ impl GitHubStore {
                     self.forget_issue(number);
                     return Ok(None);
                 }
-                let mut tf = gh.into_issue_file();
+                let mut tf = self.to_issue_file(gh);
                 // Fold the local assignment overlay so a caller reads the owning
                 // workspace even though the tracker stores no assignment.
                 tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
@@ -1955,7 +1992,7 @@ impl GitHubStore {
         let mut out = Vec::with_capacity(numbers.len());
         for chunk in numbers.chunks(CHUNK) {
             for (node, number) in self.graphql_issues_by_number(chunk)? {
-                let mut tf = self.gh_issue_hydrating_labels(node)?.into_issue_file();
+                let mut tf = self.to_issue_file(self.gh_issue_hydrating_labels(node)?);
                 tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
                 out.push((tf, number));
             }
@@ -2449,7 +2486,7 @@ impl GitHubStore {
         // renumbers a whole column, so one `prio` command can publish several
         // cards — intended.
         let after: GhIssue = parse_json_object(&out)?;
-        let mut tf = after.into_issue_file();
+        let mut tf = self.to_issue_file(after);
         tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
         self.publish_write(&tf, gh.number);
         Ok(())
@@ -4298,9 +4335,18 @@ impl GhIssue {
     }
 
     /// Map GitHub state + labels onto a shelbi [`Column`]. A closed issue is
-    /// always terminal; an open issue takes its status label, defaulting to
-    /// `todo` when unlabeled.
-    fn column(&self) -> Column {
+    /// always terminal; an open issue takes its status label. An open issue
+    /// with **no** `shelbi:status/*` label enters at `initial()` — the
+    /// workflow's declared initial status, resolved with project context by the
+    /// caller. An issue authored on github.com carries no status label, so
+    /// defaulting it to `todo` pre-promoted it into the ready lane and skipped
+    /// the user's triage step; it must land at the workflow's entry status
+    /// instead (see [`GitHubStore::initial_status_column`]).
+    ///
+    /// `initial` is a closure, not a value, so only the unlabeled-open arm pays
+    /// the workflow load: a labeled or closed issue (the common case) never
+    /// touches the config.
+    fn column(&self, initial: impl FnOnce() -> Column) -> Column {
         let closed = self.state == "closed";
         match self.status_label() {
             Some(id) => {
@@ -4323,15 +4369,17 @@ impl GhIssue {
                 }
             }
             None if closed => terminal_from_reason(self.state_reason.as_deref()),
-            None => Column::todo(),
+            None => initial(),
         }
     }
 
     /// Full mapping onto an [`IssueFile`]: native fields plus the parsed fenced
-    /// metadata block, with that block stripped from the body prose.
-    fn into_issue_file(self) -> IssueFile {
+    /// metadata block, with that block stripped from the body prose. The
+    /// interpreted `column` is supplied by the caller (via
+    /// [`GitHubStore::to_issue_file`]) so an unlabeled-open issue's initial
+    /// status is resolved with project context rather than hardcoded here.
+    fn into_issue_file(self, column: Column) -> IssueFile {
         let (prose, meta) = self.split_meta_or_warn();
-        let column = self.column();
         let id = self.resolve_id(&meta);
 
         let task = Issue {
@@ -4884,12 +4932,18 @@ mod tests {
     }
 
     #[test]
-    fn open_issue_without_status_label_defaults_to_todo() {
+    fn open_issue_without_status_label_enters_at_the_workflow_initial_status() {
         let _home = HomeGuard::new("open-issue-without");
+        // An open issue with no `shelbi:status/*` label (a github.com-authored
+        // card) enters at the workflow's initial status, not a hardcoded `todo`
+        // that would skip triage. With no project config on disk the workflow
+        // resolution falls back to the built-in default, whose initial status is
+        // `backlog` — still triage, never the pre-promoted `todo`.
         let issues = r#"{"number":1,"title":"Fresh","body":"hi","state":"open","labels":[{"name":"shelbi:id/fresh"}],"created_at":"2026-07-01T00:00:00Z","updated_at":"2026-07-02T00:00:00Z"}"#;
         let store = store_with(issues, "[]");
         let board = store.list().unwrap();
-        assert_eq!(board[0].task.column, Column::todo());
+        assert_eq!(board[0].task.column, Column::backlog());
+        assert_ne!(board[0].task.column, Column::todo());
     }
 
     #[test]
@@ -6002,11 +6056,13 @@ mod tests {
             updated_at: "2026-08-01T00:00:00Z".parse().unwrap(),
             pull_request: None,
         };
-        // Open + a terminal label reads as backlog for re-triage.
-        assert_eq!(mk("done").column(), Column::backlog());
-        assert_eq!(mk("canceled").column(), Column::backlog());
+        // Open + a terminal label reads as backlog for re-triage. The unlabeled
+        // fallback is never consulted here (every case is labeled), so a stub
+        // closure suffices.
+        assert_eq!(mk("done").column(Column::todo), Column::backlog());
+        assert_eq!(mk("canceled").column(Column::todo), Column::backlog());
         // An open non-terminal label is unchanged.
-        assert_eq!(mk("in-progress").column(), Column::in_progress());
+        assert_eq!(mk("in-progress").column(Column::todo), Column::in_progress());
     }
 
     #[test]
@@ -6026,7 +6082,58 @@ mod tests {
             updated_at: "2026-08-01T00:00:00Z".parse().unwrap(),
             pull_request: None,
         };
-        assert_eq!(gh.column(), Column::canceled());
+        assert_eq!(gh.column(Column::todo), Column::canceled());
+    }
+
+    #[test]
+    fn unlabeled_open_issue_adopts_the_workflows_initial_status_not_todo() {
+        // An issue authored on github.com (open, zero labels, no metadata block)
+        // must enter at the workflow's declared `initial_status`, not the old
+        // hardcoded `todo` that pre-promoted it into the ready lane and skipped
+        // the user's triage step (the #1332 regression).
+        let _home = HomeGuard::new("unlabeled-open-adopts-initial-status");
+        // A project whose default workflow enters at `review` — deliberately
+        // neither the old `todo` nor the built-in fallback `backlog`, so the
+        // column can only be right if it is read from the workflow config.
+        seed_test_project(Some("app"));
+        std::fs::write(
+            crate::workflow_path("test-project", "app").unwrap(),
+            "name: app\n\
+             initial_status: review\n\
+             statuses:\n\
+             - { id: backlog,     owner: user }\n\
+             - { id: todo,        owner: user }\n\
+             - { id: in-progress, owner: user }\n\
+             - { id: review,      owner: user }\n\
+             - { id: done,        owner: user }\n\
+             - { id: canceled,    owner: user }\n",
+        )
+        .unwrap();
+
+        let (store, _calls) = recording_store("", "", "", "");
+        let gh = GhIssue {
+            number: 1332,
+            title: "Filed straight on github.com".into(),
+            body: None,
+            state: "open".into(),
+            state_reason: None,
+            labels: vec![],
+            created_at: "2026-09-21T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-09-21T00:00:00Z".parse().unwrap(),
+            pull_request: None,
+        };
+
+        let tf = store.to_issue_file(gh);
+        assert_eq!(
+            tf.task.column,
+            Column::from_status_id("review"),
+            "an unlabeled open issue enters at the workflow's initial_status"
+        );
+        assert_ne!(
+            tf.task.column,
+            Column::todo(),
+            "it must never land pre-promoted in the ready lane"
+        );
     }
 
     #[test]
@@ -6623,7 +6730,7 @@ mod tests {
         // to return.
         let cached = rest_issue_json(9, "foo", "todo", "open", "", "cached body", "2026-08-02T00:00:00Z", false);
         let tf: GhIssue = parse_json_object(&cached).unwrap();
-        store.cache_issue_with_validator(9, &tf.into_issue_file(), Some(r#""v1""#.to_string()));
+        store.cache_issue_with_validator(9, &store.to_issue_file(tf), Some(r#""v1""#.to_string()));
 
         let got = store.fetch(9).unwrap().expect("304 returns the cached copy");
         assert_eq!(got.body, "cached body");
@@ -6660,7 +6767,7 @@ mod tests {
         // A cached copy is present; the park must NOT serve it (decision 1).
         let cached = rest_issue_json(3, "foo", "todo", "open", "", "stale cached body", "2026-08-01T00:00:00Z", false);
         let tf: GhIssue = parse_json_object(&cached).unwrap();
-        store.cache_issue_with_validator(3, &tf.into_issue_file(), Some(r#""v0""#.to_string()));
+        store.cache_issue_with_validator(3, &store.to_issue_file(tf), Some(r#""v0""#.to_string()));
 
         // First fetch: goes live, the rate limit fails and parks the REST tier.
         let first = store.fetch(3);
@@ -6698,7 +6805,7 @@ mod tests {
         let (store, calls) = graphql_recorder(move |_a| Ok(raw.clone()));
 
         // A write path publishes the mutation response into the per-number cache.
-        store.publish_write(&pub_tf.into_issue_file(), 4);
+        store.publish_write(&store.to_issue_file(pub_tf), 4);
 
         // The next action read carries no If-None-Match — the published entry held
         // no validator to replay.
