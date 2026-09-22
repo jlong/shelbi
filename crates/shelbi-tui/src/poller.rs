@@ -83,6 +83,7 @@ use shelbi_state::{
     events_log_path, load_workspace_status, parse_pane_title_marker, read_state,
     read_zenmode_summary, save_workspace_status, Cursor, IssueChange, IssueStore, WorkspaceState,
     WorkspaceStatus, ZenHeartbeatCue, ZenModeState, EXTERNAL_ISSUE_RECONCILE_CAUSE,
+    ISSUE_ADOPTION_CAUSE,
 };
 
 /// How often each per-workspace thread re-verifies its host's reverse
@@ -681,6 +682,17 @@ enum IssueReconcileEvent {
         from: Column,
         to: Column,
     },
+    /// A github-authored issue was first seen (past the reconcile baseline)
+    /// already sitting in a non-`backlog` status — a card adopted onto the
+    /// board directly into an actionable lane. No prior column exists, so this
+    /// is a creation, not a move: it is emitted as a `column -> column` event
+    /// (`from == to`), mirroring `issue add` into an agent-owned status, so
+    /// downstream consumers (auto-dispatch keys off `to_category=ready`) see it.
+    Adopted {
+        id: String,
+        workflow: String,
+        column: Column,
+    },
     /// A new comment landed on the tracker.
     Comment {
         id: String,
@@ -700,9 +712,23 @@ enum IssueReconcileEvent {
 ///   new column (a ready-marker handoff, an orchestrator `shelbi issue move`, a
 ///   dispatch — every hub-driven move appends its own transition), re-emitting
 ///   would double-count the one move, so the baseline advances silently instead.
-/// - **Upsert we have no prior column for** → record the baseline, emit nothing.
-///   This is the post-restart / newly-appeared-issue case; inventing a `from`
-///   would be a lie, and the issue's *next* genuine move reconciles normally.
+/// - **Upsert we have no prior column for, in a non-`backlog` status** → an
+///   `Adopted` creation event. A github-authored issue that materialized
+///   directly in an actionable lane (a `ready`-category `todo`, an `in_progress`
+///   / `review` / terminal status) never fired a move event, so the
+///   orchestrator's `to_category=`-keyed auto-dispatch never saw it and the card
+///   could sit idle indefinitely. Emit the same creation event `issue add` does
+///   for a card created directly into an agent-owned status (`from == to == the
+///   adopted status`, no fabricated source column) so the two paths behave
+///   identically — *unless* `recorded_target` proves the hub itself placed the
+///   card (its own `issue add` already emitted a creation event), in which case
+///   re-emitting would double-count it.
+/// - **Upsert we have no prior column for, in a `backlog` status** → record the
+///   baseline, emit nothing. Backlog is the triage inbox with no reaction rule;
+///   firing on every adopted backlog card would spam the log (and every poll
+///   re-sees the whole quiescent board on the github backend), so it stays quiet
+///   exactly as `issue add "title"` (the default) does. The card's *next* genuine
+///   move reconciles normally.
 /// - **Upsert whose column is unchanged** (a body / priority edit) → record the
 ///   baseline, emit nothing.
 /// - **New comment** → a `Comment` event, always (plan D4).
@@ -744,6 +770,22 @@ fn plan_issue_reconcile(
                             to: to.clone(),
                         });
                     }
+                } else if to.category() != StatusCategory::Backlog
+                    && recorded_target(&task.id).as_ref() != Some(&to)
+                {
+                    // First sighting of a card that materialized directly in an
+                    // actionable (non-backlog) status: an adoption. Emit a
+                    // creation event so auto-dispatch (keyed on `to_category=`)
+                    // sees it, unless the hub's own `issue add` already emitted
+                    // one (recorded_target already lands it at `to`).
+                    out.push(IssueReconcileEvent::Adopted {
+                        id: task.id.clone(),
+                        workflow: task
+                            .workflow
+                            .clone()
+                            .unwrap_or_else(|| DEFAULT_WORKFLOW_NAME.to_string()),
+                        column: to.clone(),
+                    });
                 }
                 seen.insert(task.id, to);
             }
@@ -822,6 +864,33 @@ fn emit_issue_reconcile_event(project: &str, ev: IssueReconcileEvent) {
                 tracing::info!(
                     project = %project, task = %id, from = %from.as_str(), to = %to.as_str(),
                     "issue-reconcile: external move reconciled into the event log"
+                );
+            }
+        }
+        IssueReconcileEvent::Adopted {
+            id,
+            workflow,
+            column,
+        } => {
+            // A creation, not a move: emit `column -> column` so the line reports
+            // the card came into existence in that status (no fabricated source),
+            // mirroring `issue add` into an agent-owned status. `append_task_event`
+            // resolves `to_category=` through the project's statuses catalog, so a
+            // custom status's real category rides the line even though the
+            // emit-vs-skip decision above uses the stock-id fallback.
+            if let Err(e) = append_task_event(
+                project,
+                &id,
+                &workflow,
+                column.clone(),
+                column.clone(),
+                ISSUE_ADOPTION_CAUSE,
+            ) {
+                tracing::warn!(project = %project, task = %id, error = %e, "issue-reconcile: append adoption failed");
+            } else {
+                tracing::info!(
+                    project = %project, task = %id, status = %column.as_str(),
+                    "issue-reconcile: board adoption surfaced into the event log"
                 );
             }
         }
@@ -9403,19 +9472,26 @@ transitions:
         );
     }
 
+    fn backlog_task(id: &str) -> Issue {
+        let mut t = todo_task(id);
+        t.column = Column::backlog();
+        t
+    }
+
     #[test]
-    fn plan_issue_reconcile_records_baseline_without_a_spurious_transition() {
-        // An issue we have no prior column for (post-restart / newly appeared)
-        // is only recorded — no `from` to honestly report, so no event — and its
-        // next genuine move reconciles normally.
+    fn plan_issue_reconcile_records_a_backlog_baseline_without_a_spurious_transition() {
+        // A backlog issue we have no prior column for (post-restart / newly
+        // appeared) is only recorded — backlog is the triage inbox with no
+        // reaction rule, so firing on it would spam the log — and its next
+        // genuine move reconciles normally.
         let mut seen = HashMap::new();
-        let first = plan_issue_reconcile(vec![upsert(review_task("c"))], &mut seen, no_hub_moves);
+        let first = plan_issue_reconcile(vec![upsert(backlog_task("c"))], &mut seen, no_hub_moves);
         assert!(first.is_empty());
-        assert_eq!(seen.get("c"), Some(&Column::review()));
+        assert_eq!(seen.get("c"), Some(&Column::backlog()));
 
         // A same-column edit (body / priority bump, column unchanged) is likewise
         // a no-op transition.
-        let noop = plan_issue_reconcile(vec![upsert(review_task("c"))], &mut seen, no_hub_moves);
+        let noop = plan_issue_reconcile(vec![upsert(backlog_task("c"))], &mut seen, no_hub_moves);
         assert!(noop.is_empty());
 
         // Now `c` actually moves → the transition surfaces.
@@ -9425,10 +9501,80 @@ transitions:
             vec![IssueReconcileEvent::Transition {
                 id: "c".into(),
                 workflow: DEFAULT_WORKFLOW_NAME.into(),
-                from: Column::review(),
+                from: Column::backlog(),
                 to: Column::done(),
             }]
         );
+    }
+
+    #[test]
+    fn plan_issue_reconcile_emits_an_adoption_for_a_new_card_in_a_ready_status() {
+        // The bug: a github-authored issue adopted onto the board directly into a
+        // `ready`-category status (`todo`) is a first sighting with no prior
+        // column, so the old code recorded the baseline and emitted nothing — and
+        // auto-dispatch, keyed on `to_category=ready`, never fired. It must now
+        // surface as an `Adopted` creation event (`column -> column`).
+        let mut seen = HashMap::new();
+        let events = plan_issue_reconcile(vec![upsert(todo_task("t"))], &mut seen, no_hub_moves);
+        assert_eq!(
+            events,
+            vec![IssueReconcileEvent::Adopted {
+                id: "t".into(),
+                workflow: DEFAULT_WORKFLOW_NAME.into(),
+                column: Column::todo(),
+            }]
+        );
+        assert_eq!(seen.get("t"), Some(&Column::todo()));
+
+        // Emitted exactly once: a later poll that re-sees the same card in the
+        // same status records nothing.
+        let repeat = plan_issue_reconcile(vec![upsert(todo_task("t"))], &mut seen, no_hub_moves);
+        assert!(repeat.is_empty());
+    }
+
+    #[test]
+    fn plan_issue_reconcile_emits_an_adoption_for_in_progress_review_and_terminal() {
+        // Adoption into any non-backlog lane emits one correctly-shaped event.
+        for task in [
+            in_progress_task("p", "alpha"),
+            review_task("v"),
+            done_task("z"),
+        ] {
+            let id = task.id.clone();
+            let column = task.column.clone();
+            let mut seen = HashMap::new();
+            let events = plan_issue_reconcile(vec![upsert(task)], &mut seen, no_hub_moves);
+            assert_eq!(
+                events,
+                vec![IssueReconcileEvent::Adopted {
+                    id: id.clone(),
+                    workflow: DEFAULT_WORKFLOW_NAME.into(),
+                    column: column.clone(),
+                }],
+                "adoption into {} should emit one creation event",
+                column.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn plan_issue_reconcile_suppresses_an_adoption_the_hub_itself_created() {
+        // `issue add --status todo` on the github backend creates the card AND
+        // appends its own `user:cli:add` creation event. The reconcile sweep then
+        // sees the new card as a first sighting; because the event log already
+        // records it at `todo`, the adoption is hub-originated and must NOT be
+        // re-emitted.
+        let mut seen = HashMap::new();
+        let recorded = HashMap::from([("t".to_string(), Column::todo())]);
+        let events = plan_issue_reconcile(vec![upsert(todo_task("t"))], &mut seen, |id| {
+            recorded.get(id).cloned()
+        });
+        assert!(
+            events.is_empty(),
+            "an adoption the hub's own `issue add` already recorded must not double-emit"
+        );
+        // The baseline still advances so a later genuine external move reconciles.
+        assert_eq!(seen.get("t"), Some(&Column::todo()));
     }
 
     #[test]
