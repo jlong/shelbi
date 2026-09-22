@@ -230,6 +230,19 @@ pub const EXTERNAL_ISSUE_RECONCILE_CAUSE: &str = "poller:issue-reconcile";
 /// the orchestrator is aware"). Emitted via [`append_issue_comment_event`].
 pub const EXTERNAL_ISSUE_COMMENT_CAUSE: &str = "poller:issue-comment";
 
+/// The `reason=` token stamped on the creation event the hub poller emits when
+/// [`crate::IssueStore::poll_changes`] first surfaces a github-authored issue
+/// that materialized directly in a non-`backlog` status — a card adopted onto
+/// the board past the reconcile baseline. Unlike an [`EXTERNAL_ISSUE_RECONCILE_CAUSE`]
+/// move (a `from -> to` between two columns we've seen), an adoption has no prior
+/// column, so the line reports the card came into existence in that status
+/// (`from == to`), exactly as `issue add` does for a card created directly into
+/// an agent-owned status. Carrying its own cause keeps the activity feed and the
+/// orchestrator's drain able to tell a first-sighting adoption apart from a real
+/// external move. Emitted via [`append_task_event`] from the poller's
+/// issue-reconcile pass.
+pub const ISSUE_ADOPTION_CAUSE: &str = "poller:issue-adopt";
+
 /// Every historical `reason=` token that has meant the ready-marker handoff.
 /// The canonical spelling changed over time
 /// (`worker:review-marker` → `workspace:review-marker` →

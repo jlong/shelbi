@@ -161,8 +161,8 @@ pub use event_log::{
     release_event_follower, task_event_body, write_event_cursor,
     EventEnvelope, EventKind, EventLogRead, FeedRead, HandoffCause, MessageDelivery, ReviewReadyEvent, ZenHeartbeatCue, ACTIONS_SKIPPED_MARKER, DAEMON_ACK,
     EXTERNAL_ISSUE_COMMENT_CAUSE, EXTERNAL_ISSUE_RECONCILE_CAUSE,
-    GITHUB_MERGE_RECONCILE_CAUSE, ORCH_EVENT_CALLBACK_SOCK_ENV, READY_MARKER_HANDOFF_ALIASES,
-    READY_MARKER_HANDOFF_CAUSE,
+    GITHUB_MERGE_RECONCILE_CAUSE, ISSUE_ADOPTION_CAUSE, ORCH_EVENT_CALLBACK_SOCK_ENV,
+    READY_MARKER_HANDOFF_ALIASES, READY_MARKER_HANDOFF_CAUSE,
 };
 pub use workspace_status::{
     clear_expected_teardown, clear_workspace_status, consume_expected_teardown,
