@@ -170,8 +170,8 @@ with the opposite asymmetry: the project's
 [`workspace_permissions_mode`](/docs/configuration/project#top-level-fields) is a
 **ceiling**. An agent may request equal-or-tighter and gets it; a request looser
 than the ceiling is clamped down, never granted. The plan's generic names map
-onto Claude's modes at launch: `read-only` becomes `plan`, `full-access` becomes
-`bypassPermissions`; `auto` / `default` / `acceptEdits` pass through unchanged.
+onto Claude's modes at launch: `read-only` becomes `default`, `full-access` becomes
+`bypassPermissions`; `auto` / `default` / `plan` / `acceptEdits` pass through unchanged.
 An unrecognized mode ranks as `default`, so a typo can never widen the ceiling.
 
 ## Migration from Workspace.runner
