@@ -1580,7 +1580,7 @@ fn spawn_remote_tui(
 ) -> Result<Child> {
     let endpoint = format!("unix://{}", socket_path.to_string_lossy());
     Command::new(&runner.command)
-        .args(&runner.flags)
+        .args(remote_tui_flags(&runner.flags))
         .arg("resume")
         .arg(thread_id)
         .args(["--remote", &endpoint])
@@ -1590,6 +1590,91 @@ fn spawn_remote_tui(
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(Error::Io)
+}
+
+/// Remote resume inherits permissions from the bridge-owned thread and rejects
+/// explicit overrides. Profiles are omitted because they can contain the same
+/// permission keys even when the profile flag itself looks harmless.
+fn remote_tui_flags(flags: &[String]) -> Vec<String> {
+    let mut filtered = Vec::with_capacity(flags.len());
+    let mut index = 0;
+    while index < flags.len() {
+        let flag = &flags[index];
+        if matches!(
+            flag.as_str(),
+            "--approve-for-me" | "--dangerously-bypass-approvals-and-sandbox"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(
+            flag.as_str(),
+            "-a"
+                | "--ask-for-approval"
+                | "-s"
+                | "--sandbox"
+                | "--add-dir"
+                | "-p"
+                | "--profile"
+        ) {
+            index += 2;
+            continue;
+        }
+        if flag.split_once('=').is_some_and(|(name, _)| {
+            matches!(
+                name,
+                "-a"
+                    | "--ask-for-approval"
+                    | "-s"
+                    | "--sandbox"
+                    | "--add-dir"
+                    | "-p"
+                    | "--profile"
+            )
+        }) {
+            index += 1;
+            continue;
+        }
+        if matches!(flag.as_str(), "-c" | "--config")
+            && flags
+                .get(index + 1)
+                .is_some_and(|value| is_permission_config(value))
+        {
+            index += 2;
+            continue;
+        }
+        if flag
+            .strip_prefix("-c=")
+            .or_else(|| flag.strip_prefix("--config="))
+            .is_some_and(is_permission_config)
+        {
+            index += 1;
+            continue;
+        }
+        filtered.push(flag.clone());
+        index += 1;
+    }
+    filtered
+}
+
+fn is_permission_config(value: &str) -> bool {
+    value.split_once('=').is_some_and(|(name, _)| {
+        matches!(
+            name.trim().split('.').next(),
+            Some(
+                "approval_policy"
+                    | "approvals_reviewer"
+                    | "sandbox_mode"
+                    | "permission_profile"
+                    | "default_permissions"
+                    | "permissions"
+                    | "network"
+                    | "sandbox_workspace_write"
+                    | "additional_writable_roots"
+                    | "workspace_roots"
+            )
+        )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1697,8 +1782,19 @@ fn prepare_private_runtime_dir(runtime_dir: &Path) -> Result<()> {
 }
 
 fn secure_socket_permissions(socket_path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(socket_path).map_err(Error::Io)?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+    let endpoint_metadata = fs::symlink_metadata(socket_path).map_err(Error::Io)?;
+    if !endpoint_metadata.file_type().is_symlink()
+        && !endpoint_metadata.file_type().is_socket()
+    {
+        return Err(Error::Other(format!(
+            "Codex socket path is not a Unix socket: {}",
+            socket_path.display()
+        )));
+    }
+    ensure_current_user_owns(&endpoint_metadata, socket_path, "socket endpoint")?;
+
+    let metadata = fs::metadata(socket_path).map_err(Error::Io)?;
+    if !metadata.file_type().is_socket() {
         return Err(Error::Other(format!(
             "Codex socket path is not a Unix socket: {}",
             socket_path.display()
@@ -1706,7 +1802,7 @@ fn secure_socket_permissions(socket_path: &Path) -> Result<()> {
     }
     ensure_current_user_owns(&metadata, socket_path, "socket")?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)).map_err(Error::Io)?;
-    let mode = fs::symlink_metadata(socket_path)
+    let mode = fs::metadata(socket_path)
         .map_err(Error::Io)?
         .permissions()
         .mode()
@@ -4452,6 +4548,43 @@ mod tests {
     }
 
     #[test]
+    fn remote_tui_omits_server_only_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let command = temp.path().join("fake-codex");
+        fs::write(
+            &command,
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --add-dir|--add-dir=*|/extra|--approve-for-me|sandbox_mode=*) exit 42 ;;\n  esac\ndone\n",
+        )
+        .unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+        let runner = shelbi_core::AgentRunnerSpec {
+            command: command.to_string_lossy().into_owned(),
+            flags: vec![
+                "--approve-for-me".into(),
+                "--add-dir".into(),
+                "/extra".into(),
+                "--add-dir=/more".into(),
+                "-c".into(),
+                "sandbox_mode=workspace-write".into(),
+                "-c=model_reasoning_effort=high".into(),
+            ],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        };
+
+        let mut child = spawn_remote_tui(
+            &runner,
+            temp.path(),
+            Path::new("/tmp/relay.sock"),
+            "thread-1",
+        )
+        .unwrap();
+
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
     fn native_sockets_use_an_owner_only_runtime_and_socket_modes() {
         let temp = tempfile::tempdir().unwrap();
         let paths = native_socket_paths("demo", temp.path());
@@ -4506,6 +4639,22 @@ mod tests {
         if !paths.runtime_dir.starts_with(temp.path()) {
             let _ = fs::remove_dir_all(&paths.runtime_dir);
         }
+    }
+
+    #[test]
+    fn codex_daemon_socket_symlink_is_accepted_and_secured() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("daemon.sock");
+        let endpoint = temp.path().join("app-server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(&socket, &endpoint).unwrap();
+
+        secure_socket_permissions(&endpoint).unwrap();
+
+        let mode = fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(listener);
     }
 
     #[test]
