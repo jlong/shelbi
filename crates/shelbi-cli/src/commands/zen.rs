@@ -502,12 +502,18 @@ fn print_status(project: &str, state: &State) -> Result<()> {
         }
         Err(e) => println!("checks: (could not read {project}.yaml: {e})"),
     }
-    match state.zen_last_crashed_at {
-        Some(ts) => println!("last crash: {}", ts.to_rfc3339()),
+    // `last crash` is a real crash time derived from the crash record — never
+    // the `zen_orchestrator_alive_at` liveness heartbeat, which ticks every
+    // minute while the orchestrator is healthy and used to be misread here.
+    match shelbi_state::orchestrator_crash_display_time(state) {
+        Some(ts) => match &state.orchestrator_last_crash_record {
+            Some(record) => println!("last crash: {}  ({record})", ts.to_rfc3339()),
+            None => println!("last crash: {}", ts.to_rfc3339()),
+        },
         None => println!("last crash: never"),
     }
-    if let Some(record) = &state.orchestrator_last_crash_record {
-        println!("last crash record: {record}");
+    if let Some(alive) = state.zen_orchestrator_alive_at {
+        println!("orchestrator alive: {}", alive.to_rfc3339());
     }
     let in_flight = count_in_flight_zen(project, state.zen_mode).unwrap_or(0);
     println!("in-flight zen issues: {in_flight}");

@@ -4358,7 +4358,7 @@ mod tests {
         shelbi_state::save_project(&project).unwrap();
         let paused = shelbi_state::State {
             zen_mode: shelbi_state::ZenModeState::Paused,
-            zen_last_crashed_at: None,
+            zen_orchestrator_alive_at: None,
             ..shelbi_state::State::default()
         };
         shelbi_state::write_state("demo", &paused).unwrap();

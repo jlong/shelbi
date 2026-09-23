@@ -82,7 +82,7 @@ pub fn orch_start(project: &str) -> Result<()> {
     }
 }
 
-/// `shelbi __zen-heartbeat <project>` — refresh `zen_last_crashed_at`
+/// `shelbi __zen-heartbeat <project>` — refresh `zen_orchestrator_alive_at`
 /// to "now" so the wrapper has a current liveness signal on disk.
 /// Errors are best-effort: a one-off write failure shouldn't kill the
 /// orchestrator pane.
@@ -98,7 +98,7 @@ pub fn heartbeat(project: &str) -> Result<()> {
     Ok(())
 }
 
-/// `shelbi __zen-orch-exit <project>` — clear `zen_last_crashed_at` so
+/// `shelbi __zen-orch-exit <project>` — clear `zen_orchestrator_alive_at` so
 /// the next orchestrator start doesn't misread this graceful exit as
 /// a crash. Idempotent.
 pub fn orch_exit(project: &str) -> Result<()> {
@@ -113,7 +113,7 @@ pub fn orch_exit(project: &str) -> Result<()> {
 /// boot — plus an `events.log` pointer to it, but ONLY for a genuine crash.
 ///
 /// A clean agent exit (`exit:0`) and every graceful teardown produce nothing.
-/// The discriminator is `zen_last_crashed_at`: every graceful path (quit,
+/// The discriminator is `zen_orchestrator_alive_at`: every graceful path (quit,
 /// quit-project, reload, host teardown) clears it *before* killing the pane,
 /// while a crash leaves the heartbeat's timestamp set — so a still-set marker
 /// is the crash signal. This mirrors the Zen crash-recovery contract exactly,
@@ -143,7 +143,7 @@ fn record_if_crash(project: &str, reason: &str, pane: Option<&str>) -> Result<()
     // Graceful teardowns clear the heartbeat before the kill; a cleared marker
     // means "expected exit", so there is nothing to record.
     let state = shelbi_state::read_state(project).map_err(|e| anyhow!(e))?;
-    if state.zen_last_crashed_at.is_none() {
+    if state.zen_orchestrator_alive_at.is_none() {
         return Ok(());
     }
 
@@ -264,7 +264,7 @@ mod tests {
         shelbi_state::zen_heartbeat(project).unwrap();
         assert!(shelbi_state::read_state(project)
             .unwrap()
-            .zen_last_crashed_at
+            .zen_orchestrator_alive_at
             .is_some());
     }
 

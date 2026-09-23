@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shelbi_core::{
     validate_agent_id, validate_branch, validate_project_name, validate_task_id, Agent, Column,
@@ -1350,19 +1350,34 @@ pub fn save_session(s: &Session) -> Result<()> {
 pub struct State {
     #[serde(default, deserialize_with = "ZenModeState::deserialize_lenient")]
     pub zen_mode: ZenModeState,
-    /// Liveness heartbeat, not a crash counter, despite the name: the
-    /// orchestrator pane wrapper refreshes this to "now" every 60s via
-    /// `shelbi __zen-heartbeat` ([`zen_heartbeat`]) and clears it on
-    /// graceful exit ([`zen_clear_crash`]). Only a timestamp that is
-    /// *still recent at the next orchestrator start* is read as a crash
-    /// signal ([`zen_check_crash_recovery`]). So watching this field
-    /// advance roughly once a minute while an orchestrator pane is open
-    /// is normal operation — it does not indicate that anything (a CLI
-    /// transition, a Zen re-eval, …) crashed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub zen_last_crashed_at: Option<DateTime<Utc>>,
+    /// Liveness heartbeat, *not* a crash time: the orchestrator pane
+    /// wrapper refreshes this to "now" every 60s via `shelbi __zen-heartbeat`
+    /// ([`zen_heartbeat`]) and clears it on graceful exit ([`zen_clear_crash`]).
+    /// Only a timestamp that is *still recent at the next orchestrator start*
+    /// is read as a crash signal ([`zen_check_crash_recovery`]). So watching
+    /// this field advance roughly once a minute while an orchestrator pane is
+    /// open is normal operation — it does not indicate that anything (a CLI
+    /// transition, a Zen re-eval, …) crashed. The Rust field was formerly
+    /// (mis)named `zen_last_crashed_at`, which led status renderers to print a
+    /// live heartbeat as a `last crash` time. For the *actual* last-crash time,
+    /// see [`State::orchestrator_last_crashed_at`].
+    ///
+    /// The on-disk key deliberately stays `zen_last_crashed_at` (via `rename`),
+    /// **not** the Rust field name: `State` carries `#[serde(flatten)] extra`,
+    /// so a mixed-version fleet (an old binary still running mid-upgrade, a
+    /// downgrade, a remote hub) round-trips this key. If a new binary wrote a
+    /// second key name, an old binary would preserve it in `extra` and keep
+    /// writing the legacy one, leaving *both* keys in the file — which a
+    /// `rename`+`alias` pair would then reject as a duplicate field, breaking
+    /// every state read for the project. One stable key name avoids that.
+    #[serde(
+        rename = "zen_last_crashed_at",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub zen_orchestrator_alive_at: Option<DateTime<Utc>>,
     /// Filesystem pointer to the most recent orchestrator crash record
-    /// ([`record_orchestrator_crash`]). Unlike [`zen_last_crashed_at`] — a
+    /// ([`record_orchestrator_crash`]). Unlike [`zen_orchestrator_alive_at`] — a
     /// bare liveness heartbeat — this points at a persisted post-mortem
     /// carrying the exit code/signal, a tail of the dead pane's output, and
     /// whether a config self-heal ran that boot. Set the moment an
@@ -1372,6 +1387,17 @@ pub struct State {
     /// next orchestrator instance and the user to diagnose from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_last_crash_record: Option<String>,
+    /// Wall-clock time of the most recent captured orchestrator crash, set
+    /// alongside [`orchestrator_last_crash_record`] by
+    /// [`record_orchestrator_crash`]. This is a *real* crash time — unlike the
+    /// [`zen_orchestrator_alive_at`] liveness heartbeat — so `shelbi status`
+    /// and `shelbi zen status` can report `last crash` honestly. Kept (not
+    /// cleared on a clean start) until the next crash overwrites it. For an
+    /// install whose crash record predates this field, the displayed time
+    /// falls back to the record's own filename stamp
+    /// ([`orchestrator_crash_display_time`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_last_crashed_at: Option<DateTime<Utc>>,
     /// Persisted Kanban workspace filter — `None` means "All workspaces". The
     /// Tasks TUI restores this on each launch so the user's last view
     /// survives a respawn or project switch.
@@ -2026,7 +2052,7 @@ mod global_state_tests {
     }
 }
 
-/// Window during which a `zen_last_crashed_at` heartbeat counts as a
+/// Window during which a `zen_orchestrator_alive_at` heartbeat counts as a
 /// recent-crash signal. Sized to catch a same-session crash without
 /// sandbagging a fresh Zen run hours after an unrelated abort.
 pub const ZEN_CRASH_RECOVERY_WINDOW_SECS: i64 = 3600;
@@ -2040,13 +2066,13 @@ pub const ZEN_CRASH_RECOVERY_WINDOW_SECS: i64 = 3600;
 pub enum ZenCrashRecovery {
     /// No recent crash signal; nothing was changed.
     NoCrash,
-    /// `zen_last_crashed_at` was within the recovery window AND
+    /// `zen_orchestrator_alive_at` was within the recovery window AND
     /// `zen_mode == On`. The mode has been forced to `Off` on disk;
     /// the caller should emit the warning event + log line.
     AutoDisabled { crashed_at: DateTime<Utc> },
 }
 
-/// Heartbeat tick — refresh `zen_last_crashed_at = now`. The intent is
+/// Heartbeat tick — refresh `zen_orchestrator_alive_at = now`. The intent is
 /// "the orchestrator was alive at this moment"; if the pane subsequently
 /// dies without [`zen_clear_crash`], the recent timestamp lets the next
 /// [`zen_check_crash_recovery`] detect the crash. Writes only to
@@ -2054,24 +2080,24 @@ pub enum ZenCrashRecovery {
 pub fn zen_heartbeat(project: &str) -> Result<()> {
     hub_version::ensure_daemon_matches_for_mutation()?;
     update_state(project, |state| {
-        state.zen_last_crashed_at = Some(Utc::now());
+        state.zen_orchestrator_alive_at = Some(Utc::now());
         Ok(())
     })
 }
 
-/// Clear `zen_last_crashed_at`. Called from the orchestrator's graceful
+/// Clear `zen_orchestrator_alive_at`. Called from the orchestrator's graceful
 /// exit path and from `quit_project` so a clean shutdown doesn't leave
 /// a stale timestamp on disk that the next start would misread as a
 /// crash. Idempotent — a no-op when nothing is set.
 pub fn zen_clear_crash(project: &str) -> Result<()> {
     hub_version::ensure_daemon_matches_for_mutation()?;
     update_state(project, |state| {
-        state.zen_last_crashed_at = None;
+        state.zen_orchestrator_alive_at = None;
         Ok(())
     })
 }
 
-/// Run at orchestrator start. If `zen_last_crashed_at` is within the
+/// Run at orchestrator start. If `zen_orchestrator_alive_at` is within the
 /// recovery window AND `zen_mode == On`, force the mode to `Off` and
 /// report `AutoDisabled`. Either way the stale timestamp is cleared so
 /// the new heartbeat starts from a fresh state. The signal has been
@@ -2080,13 +2106,13 @@ pub fn zen_clear_crash(project: &str) -> Result<()> {
 pub fn zen_check_crash_recovery(project: &str) -> Result<ZenCrashRecovery> {
     hub_version::ensure_daemon_matches_for_mutation()?;
     update_state(project, |state| {
-        let Some(crashed_at) = state.zen_last_crashed_at else {
+        let Some(crashed_at) = state.zen_orchestrator_alive_at else {
             return Ok(ZenCrashRecovery::NoCrash);
         };
         let age = Utc::now() - crashed_at;
         let recent = age <= chrono::Duration::seconds(ZEN_CRASH_RECOVERY_WINDOW_SECS);
         let should_disable = recent && state.zen_mode == ZenModeState::On;
-        state.zen_last_crashed_at = None;
+        state.zen_orchestrator_alive_at = None;
         if should_disable {
             state.zen_mode = ZenModeState::Off;
             Ok(ZenCrashRecovery::AutoDisabled { crashed_at })
@@ -2164,9 +2190,38 @@ pub fn record_orchestrator_crash(project: &str, crash: &OrchestratorCrash) -> Re
     let path_str = file.to_string_lossy().into_owned();
     update_state(project, |state| {
         state.orchestrator_last_crash_record = Some(path_str.clone());
+        state.orchestrator_last_crashed_at = Some(now);
         Ok(())
     })?;
     Ok(file)
+}
+
+/// The wall-clock time to display as the last orchestrator crash, or `None`
+/// when no crash has ever been recorded (renderers show `never`).
+///
+/// Prefers the explicit [`State::orchestrator_last_crashed_at`]. Falls back to
+/// the timestamp encoded in the crash-record filename — [`record_orchestrator_crash`]
+/// names its files `%Y%m%dT%H%M%S-<nanos>.md` — so an install whose record
+/// predates the dedicated field still reports a real crash time. Deliberately
+/// ignores [`State::zen_orchestrator_alive_at`]: that is a liveness heartbeat,
+/// not a crash time, and treating it as one is the bug this guards against.
+pub fn orchestrator_crash_display_time(state: &State) -> Option<DateTime<Utc>> {
+    if let Some(ts) = state.orchestrator_last_crashed_at {
+        return Some(ts);
+    }
+    let record = state.orchestrator_last_crash_record.as_deref()?;
+    crash_time_from_record_path(record)
+}
+
+/// Parse the `%Y%m%dT%H%M%S` stamp out of a crash-record path's filename
+/// (`.../crashes/20260915T052015-092995000.md`). Returns `None` for any name
+/// that doesn't match the shape [`record_orchestrator_crash`] writes.
+fn crash_time_from_record_path(path: &str) -> Option<DateTime<Utc>> {
+    let stem = std::path::Path::new(path).file_stem()?.to_str()?;
+    // Drop the "-<nanos>" suffix; keep the leading second-granularity stamp.
+    let stamp = stem.split_once('-').map(|(s, _)| s).unwrap_or(stem);
+    let naive = NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S").ok()?;
+    Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
 }
 
 /// Read `state.json` for `project`. Returns `State::default()` when the
@@ -5165,7 +5220,7 @@ mod tests {
         let s = read_state("p").unwrap();
         assert_eq!(s, State::default());
         assert_eq!(s.zen_mode, ZenModeState::Off);
-        assert!(s.zen_last_crashed_at.is_none());
+        assert!(s.zen_orchestrator_alive_at.is_none());
         assert!(!s.contextual_greeting_pending);
         std::env::remove_var("SHELBI_HOME");
     }
@@ -5198,12 +5253,24 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         let original = State {
             zen_mode: ZenModeState::On,
-            zen_last_crashed_at: Some("2026-06-19T12:34:56Z".parse::<DateTime<Utc>>().unwrap()),
+            zen_orchestrator_alive_at: Some("2026-06-19T12:34:56Z".parse::<DateTime<Utc>>().unwrap()),
             ..State::default()
         };
         write_state("p", &original).unwrap();
         let back = read_state("p").unwrap();
         assert_eq!(back, original);
+        // The heartbeat serializes under its stable legacy on-disk key —
+        // NOT the Rust field name — for mixed-version safety (see the field's
+        // doc comment). The renderers read it as a liveness time, not a crash.
+        let on_disk = std::fs::read_to_string(state_path("p").unwrap()).unwrap();
+        assert!(
+            on_disk.contains("\"zen_last_crashed_at\""),
+            "on-disk key must stay `zen_last_crashed_at`: {on_disk}"
+        );
+        assert!(
+            !on_disk.contains("zen_orchestrator_alive_at"),
+            "Rust field name must never leak to disk: {on_disk}"
+        );
         // Second round-trip is byte-stable.
         let first = std::fs::read(state_path("p").unwrap()).unwrap();
         write_state("p", &back).unwrap();
@@ -5219,11 +5286,13 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         let s = State {
             zen_mode: ZenModeState::On,
-            zen_last_crashed_at: None,
+            zen_orchestrator_alive_at: None,
             ..State::default()
         };
         write_state("p", &s).unwrap();
         let on_disk = std::fs::read_to_string(state_path("p").unwrap()).unwrap();
+        // The real on-disk key is `zen_last_crashed_at` (the Rust field renames
+        // to it); `skip_serializing_if` must omit it entirely when `None`.
         assert!(!on_disk.contains("zen_last_crashed_at"));
         std::env::remove_var("SHELBI_HOME");
     }
@@ -5240,7 +5309,7 @@ mod tests {
         ] {
             let s = State {
                 zen_mode: mode,
-                zen_last_crashed_at: None,
+                zen_orchestrator_alive_at: None,
                 ..State::default()
             };
             write_state("p", &s).unwrap();
@@ -5328,7 +5397,7 @@ mod tests {
         zen_heartbeat("p").unwrap();
         let s = read_state("p").unwrap();
         let ts = s
-            .zen_last_crashed_at
+            .zen_orchestrator_alive_at
             .expect("heartbeat should set the timestamp");
         // Newly written timestamp should be within the last few seconds.
         let age = (Utc::now() - ts).num_seconds().abs();
@@ -5342,12 +5411,12 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         zen_heartbeat("p").unwrap();
-        assert!(read_state("p").unwrap().zen_last_crashed_at.is_some());
+        assert!(read_state("p").unwrap().zen_orchestrator_alive_at.is_some());
         zen_clear_crash("p").unwrap();
-        assert!(read_state("p").unwrap().zen_last_crashed_at.is_none());
+        assert!(read_state("p").unwrap().zen_orchestrator_alive_at.is_none());
         // Second call on an already-clean state is a no-op.
         zen_clear_crash("p").unwrap();
-        assert!(read_state("p").unwrap().zen_last_crashed_at.is_none());
+        assert!(read_state("p").unwrap().zen_orchestrator_alive_at.is_none());
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -5374,13 +5443,100 @@ mod tests {
         );
         assert!(body.contains("panic: boom"), "body: {body}");
 
-        // State pointer now names the record.
-        let ptr = read_state("p")
-            .unwrap()
+        // State pointer now names the record, and a real crash time is
+        // stamped alongside it (distinct from the liveness heartbeat).
+        let s = read_state("p").unwrap();
+        let ptr = s
             .orchestrator_last_crash_record
+            .as_deref()
             .expect("pointer must be set");
         assert_eq!(ptr, path.to_string_lossy());
+        let crashed_at = s
+            .orchestrator_last_crashed_at
+            .expect("crash time must be stamped");
+        assert!(
+            (Utc::now() - crashed_at).num_seconds().abs() < 5,
+            "crash time should be ~now: {crashed_at}"
+        );
+        // The display time honors the explicit field.
+        assert_eq!(orchestrator_crash_display_time(&s), Some(crashed_at));
 
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn crash_display_time_falls_back_to_record_filename() {
+        // An install whose crash record predates the dedicated
+        // `orchestrator_last_crashed_at` field still reports a real crash
+        // time, parsed from the record's filename stamp.
+        let state = State {
+            orchestrator_last_crash_record: Some(
+                "/x/.shelbi/projects/p/crashes/20260915T052015-092995000.md".into(),
+            ),
+            orchestrator_last_crashed_at: None,
+            ..State::default()
+        };
+        let got = orchestrator_crash_display_time(&state).expect("should parse filename stamp");
+        assert_eq!(got.to_rfc3339(), "2026-09-15T05:20:15+00:00");
+    }
+
+    #[test]
+    fn crash_display_time_is_none_without_a_record() {
+        // A live heartbeat must NOT surface as a crash time — this is the
+        // bug the field split fixes.
+        let state = State {
+            zen_orchestrator_alive_at: Some(Utc::now()),
+            orchestrator_last_crash_record: None,
+            orchestrator_last_crashed_at: None,
+            ..State::default()
+        };
+        assert_eq!(orchestrator_crash_display_time(&state), None);
+    }
+
+    #[test]
+    fn crash_display_time_ignores_unparseable_record_name() {
+        let state = State {
+            orchestrator_last_crash_record: Some("/x/crashes/not-a-stamp.md".into()),
+            orchestrator_last_crashed_at: None,
+            ..State::default()
+        };
+        assert_eq!(orchestrator_crash_display_time(&state), None);
+    }
+
+    #[test]
+    fn on_disk_heartbeat_key_loads_into_renamed_field() {
+        // The heartbeat lives on disk under `zen_last_crashed_at` (the stable
+        // legacy key). The renamed Rust field must load it — and crucially,
+        // a state.json that ALSO carries unrelated unknown keys (the shape a
+        // mixed-version fleet produces via `#[serde(flatten)] extra`) must
+        // load without error: no duplicate-field rejection, and the unknown
+        // keys survive in `extra` for an old binary to round-trip.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let path = state_path("p").unwrap();
+        ensure_dir(path.parent().unwrap()).unwrap();
+        atomic_write(
+            &path,
+            br#"{"zen_mode":"on","zen_last_crashed_at":"2026-06-19T12:34:56Z","some_future_key":{"nested":true},"another_unknown":42}"#,
+        )
+        .unwrap();
+        let s = read_state("p").unwrap();
+        assert_eq!(
+            s.zen_orchestrator_alive_at,
+            Some("2026-06-19T12:34:56Z".parse::<DateTime<Utc>>().unwrap())
+        );
+        // Unknown keys are preserved untouched for cross-version round-trips.
+        assert_eq!(
+            s.extra.get("some_future_key"),
+            Some(&serde_json::json!({"nested": true}))
+        );
+        assert_eq!(
+            s.extra.get("another_unknown"),
+            Some(&serde_json::json!(42))
+        );
+        // And the known heartbeat key must NOT land in `extra`.
+        assert!(!s.extra.contains_key("zen_last_crashed_at"));
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -5411,7 +5567,7 @@ mod tests {
             "p",
             &State {
                 zen_mode: ZenModeState::On,
-                zen_last_crashed_at: None,
+                zen_orchestrator_alive_at: None,
                 ..State::default()
             },
         )
@@ -5435,7 +5591,7 @@ mod tests {
             "p",
             &State {
                 zen_mode: ZenModeState::On,
-                zen_last_crashed_at: Some(crashed_at),
+                zen_orchestrator_alive_at: Some(crashed_at),
                 ..State::default()
             },
         )
@@ -5449,7 +5605,7 @@ mod tests {
         let s = read_state("p").unwrap();
         assert_eq!(s.zen_mode, ZenModeState::Off);
         assert!(
-            s.zen_last_crashed_at.is_none(),
+            s.zen_orchestrator_alive_at.is_none(),
             "signal must be cleared after consumption"
         );
         std::env::remove_var("SHELBI_HOME");
@@ -5466,7 +5622,7 @@ mod tests {
             "p",
             &State {
                 zen_mode: ZenModeState::On,
-                zen_last_crashed_at: Some(stale),
+                zen_orchestrator_alive_at: Some(stale),
                 ..State::default()
             },
         )
@@ -5479,7 +5635,7 @@ mod tests {
         // Mode left alone; stale timestamp cleared so the next heartbeat
         // starts fresh.
         assert_eq!(s.zen_mode, ZenModeState::On);
-        assert!(s.zen_last_crashed_at.is_none());
+        assert!(s.zen_orchestrator_alive_at.is_none());
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -5493,7 +5649,7 @@ mod tests {
             "p",
             &State {
                 zen_mode: ZenModeState::Off,
-                zen_last_crashed_at: Some(recent),
+                zen_orchestrator_alive_at: Some(recent),
                 ..State::default()
             },
         )
@@ -5506,7 +5662,7 @@ mod tests {
         );
         let s = read_state("p").unwrap();
         assert_eq!(s.zen_mode, ZenModeState::Off);
-        assert!(s.zen_last_crashed_at.is_none());
+        assert!(s.zen_orchestrator_alive_at.is_none());
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -5520,7 +5676,7 @@ mod tests {
             "p",
             &State {
                 zen_mode: ZenModeState::Paused,
-                zen_last_crashed_at: Some(recent),
+                zen_orchestrator_alive_at: Some(recent),
                 ..State::default()
             },
         )
@@ -5545,7 +5701,7 @@ mod tests {
             "p",
             &State {
                 zen_mode: ZenModeState::On,
-                zen_last_crashed_at: Some(recent),
+                zen_orchestrator_alive_at: Some(recent),
                 ..State::default()
             },
         )
@@ -5654,7 +5810,7 @@ mod tests {
             "p",
             &State {
                 zen_mode: ZenModeState::Paused,
-                zen_last_crashed_at: None,
+                zen_orchestrator_alive_at: None,
                 ..State::default()
             },
         )
@@ -6266,7 +6422,7 @@ mod tests {
     // ---- write serialization (F3/F7/F9) -----------------------------------
 
     /// The F3 lost-update scenario: one thread heartbeats (touches only
-    /// `zen_last_crashed_at`) while another sets the workspace filter and
+    /// `zen_orchestrator_alive_at`) while another sets the workspace filter and
     /// zen mode. Pre-locking, whichever write landed last reverted the
     /// other's fields from its stale snapshot — a heartbeat could silently
     /// re-arm Zen Mode after the user opted out. With `update_state`, every
@@ -6310,7 +6466,7 @@ mod tests {
             "workspace filter lost to a concurrent mutator"
         );
         assert!(
-            s.zen_last_crashed_at.is_some(),
+            s.zen_orchestrator_alive_at.is_some(),
             "heartbeat timestamp lost to a concurrent mutator"
         );
         std::env::remove_var("SHELBI_HOME");

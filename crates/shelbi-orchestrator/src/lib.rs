@@ -1690,7 +1690,7 @@ fn orchestrator_pane_cmd(
     // non-zero exit / a signal that killed only the agent — the wrapper
     // survives and reports the code), and from the signal trap (the pane /
     // session being torn down under the wrapper). The graceful paths clear
-    // `zen_last_crashed_at` first, so the hook discriminates and only a real
+    // `zen_orchestrator_alive_at` first, so the hook discriminates and only a real
     // crash writes a record. The `__rec` shell function keeps the
     // shell-escaped `{bin}`/`{proj}` out of the trap body.
     //
@@ -2616,7 +2616,7 @@ mod pane_cmd_tests {
             "myapp",
             &shelbi_state::State {
                 zen_mode: shelbi_state::ZenModeState::On,
-                zen_last_crashed_at: Some(chrono::Utc::now()),
+                zen_orchestrator_alive_at: Some(chrono::Utc::now()),
                 ..shelbi_state::State::default()
             },
         )
@@ -2626,7 +2626,7 @@ mod pane_cmd_tests {
 
         let state = shelbi_state::read_state("myapp").unwrap();
         assert_eq!(state.zen_mode, shelbi_state::ZenModeState::On);
-        assert!(state.zen_last_crashed_at.is_none());
+        assert!(state.zen_orchestrator_alive_at.is_none());
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
