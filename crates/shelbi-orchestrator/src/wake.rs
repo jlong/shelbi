@@ -1697,8 +1697,19 @@ fn prepare_private_runtime_dir(runtime_dir: &Path) -> Result<()> {
 }
 
 fn secure_socket_permissions(socket_path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(socket_path).map_err(Error::Io)?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+    let endpoint_metadata = fs::symlink_metadata(socket_path).map_err(Error::Io)?;
+    if !endpoint_metadata.file_type().is_symlink()
+        && !endpoint_metadata.file_type().is_socket()
+    {
+        return Err(Error::Other(format!(
+            "Codex socket path is not a Unix socket: {}",
+            socket_path.display()
+        )));
+    }
+    ensure_current_user_owns(&endpoint_metadata, socket_path, "socket endpoint")?;
+
+    let metadata = fs::metadata(socket_path).map_err(Error::Io)?;
+    if !metadata.file_type().is_socket() {
         return Err(Error::Other(format!(
             "Codex socket path is not a Unix socket: {}",
             socket_path.display()
@@ -1706,7 +1717,7 @@ fn secure_socket_permissions(socket_path: &Path) -> Result<()> {
     }
     ensure_current_user_owns(&metadata, socket_path, "socket")?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)).map_err(Error::Io)?;
-    let mode = fs::symlink_metadata(socket_path)
+    let mode = fs::metadata(socket_path)
         .map_err(Error::Io)?
         .permissions()
         .mode()
@@ -4506,6 +4517,22 @@ mod tests {
         if !paths.runtime_dir.starts_with(temp.path()) {
             let _ = fs::remove_dir_all(&paths.runtime_dir);
         }
+    }
+
+    #[test]
+    fn codex_daemon_socket_symlink_is_accepted_and_secured() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("daemon.sock");
+        let endpoint = temp.path().join("app-server.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(&socket, &endpoint).unwrap();
+
+        secure_socket_permissions(&endpoint).unwrap();
+
+        let mode = fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(listener);
     }
 
     #[test]
