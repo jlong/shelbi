@@ -492,11 +492,14 @@ fn orchestrator_integration_line(
 fn print_zen_full(zen: &ZenSnapshot) {
     println!("mode: {}", zen.mode);
     match zen.last_crashed_at {
-        Some(ts) => println!("last crash: {}", ts.to_rfc3339()),
+        Some(ts) => match &zen.last_crash_record {
+            Some(record) => println!("last crash: {}  ({record})", ts.to_rfc3339()),
+            None => println!("last crash: {}", ts.to_rfc3339()),
+        },
         None => println!("last crash: never"),
     }
-    if let Some(record) = &zen.last_crash_record {
-        println!("last crash record: {record}");
+    if let Some(alive) = zen.orchestrator_alive_at {
+        println!("orchestrator alive: {}", alive.to_rfc3339());
     }
     if zen.crash_recovery_event {
         println!(
@@ -644,11 +647,18 @@ pub(crate) fn workspace_idle_busy(project: &str) -> Result<(usize, usize)> {
 #[derive(Debug)]
 struct ZenSnapshot {
     mode: ZenModeState,
+    /// The *actual* last-crash time, derived from the crash record (never the
+    /// liveness heartbeat) via [`shelbi_state::orchestrator_crash_display_time`].
+    /// `None` means no crash has been recorded, which renders as `never`.
     last_crashed_at: Option<DateTime<Utc>>,
     /// Pointer to the most recent orchestrator crash record, when one was
-    /// captured. Surfaced beneath `last crash` so the post-mortem (exit
+    /// captured. Rendered inline with `last crash` so the post-mortem (exit
     /// code/signal + output tail) is one open away.
     last_crash_record: Option<String>,
+    /// Liveness heartbeat ([`State::zen_orchestrator_alive_at`]): when the
+    /// orchestrator was last known alive. Shown on its own honestly-labeled
+    /// line so it is never mistaken for a crash time.
+    orchestrator_alive_at: Option<DateTime<Utc>>,
     /// True when the tail of `events.log` shows a recent
     /// `project=<name> zen=off reason=crash-recovery` line. Surfaced
     /// separately from `mode` because the mode was reset to `off` at
@@ -673,7 +683,8 @@ fn zen_snapshot(project: &str) -> Result<ZenSnapshot> {
     let crash_recovery_event = has_recent_crash_event(project)?;
     Ok(ZenSnapshot {
         mode: state.zen_mode,
-        last_crashed_at: state.zen_last_crashed_at,
+        last_crashed_at: shelbi_state::orchestrator_crash_display_time(&state),
+        orchestrator_alive_at: state.zen_orchestrator_alive_at,
         last_crash_record: state.orchestrator_last_crash_record,
         crash_recovery_event,
     })
