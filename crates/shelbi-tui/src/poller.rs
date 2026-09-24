@@ -4296,10 +4296,12 @@ enum AssignedReviewTask {
 }
 
 /// The review-column (handoff) task currently assigned to `workspace_name`, from
-/// a **warm** whole-board read through the cached issue store. The resume and
-/// reap passes read this to tell a stranded review slot (its task still pinned to
-/// it on the board) from a genuinely idle one — and to *skip* both when the read
-/// isn't warm. Filters the same review column the auto-loader routes to.
+/// a **warm** whole-board read, with ownership resolved through the local
+/// assignment overlay (the same source `issue show` reads) rather than the raw
+/// `assigned_to` baked into the index. The resume and reap passes read this to
+/// tell a stranded review slot (its task still pinned to it) from a genuinely
+/// idle one — and to *skip* both when the read isn't warm. Filters the same
+/// review column the auto-loader routes to.
 fn assigned_review_task_for(project: &Project, workspace_name: &str) -> AssignedReviewTask {
     // Warmth-gated read of the daemon-owned index (via [`warm_board`]): a stale,
     // cold, or failed board can't prove the card is still pinned here, so we
@@ -4307,10 +4309,37 @@ fn assigned_review_task_for(project: &Project, workspace_name: &str) -> Assigned
     let Some(board) = warm_board(project) else {
         return AssignedReviewTask::Unknown;
     };
-    match board.into_iter().find(|tf| {
-        tf.task.column == Column::review()
-            && tf.task.assigned_to.as_deref() == Some(workspace_name)
-    }) {
+    // Resolve ownership through the local assignment overlay for a remote
+    // backend, NOT the `assigned_to` the index carries. On a remote (GitHub)
+    // board, assignment lives in the daemon's overlay marker files, never on the
+    // remote; the index's `assigned_to` is a cached fold of that overlay from the
+    // last publish. A review load persists the slot assignment to the overlay
+    // (`set_fields` -> `set_task_assignment`) *before* spawning the pane, but an
+    // overlay write never bumps a GitHub issue's `updatedAt`, so it can lag the
+    // published index for a refresh cycle — or indefinitely, since a delta tick
+    // only re-reads issues GitHub reports as touched. Trusting the index alone
+    // reports the dev slot that handed the card off (or `None`) for a freshly
+    // loaded review slot, and the reaper kills its still-booting pane. Reading the
+    // overlay directly resolves the slot the same way `issue show` does, before
+    // the index catches up. A `file_system` backend keeps assignment in the card
+    // frontmatter (the overlay is empty), so it falls back to the board's value.
+    let overlay = if project.issue_tracker.backend.is_remote() {
+        shelbi_state::task_assignments(&project.name).unwrap_or_default()
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    let owner_is_slot = |tf: &shelbi_state::IssueFile| -> bool {
+        let owner = if project.issue_tracker.backend.is_remote() {
+            overlay.get(&tf.task.id).map(String::as_str)
+        } else {
+            tf.task.assigned_to.as_deref()
+        };
+        owner == Some(workspace_name)
+    };
+    match board
+        .into_iter()
+        .find(|tf| tf.task.column == Column::review() && owner_is_slot(tf))
+    {
         Some(tf) => AssignedReviewTask::Assigned(tf.task.id),
         Option::None => AssignedReviewTask::None,
     }
@@ -4881,9 +4910,17 @@ fn emit_review_ready(
 /// only a live, non-user-shell agent pane is killed; a user shell (the sidebar's
 /// open-idle pane) or an already-dead/unreachable slot is left alone.
 ///
-/// No start-up race with a fresh load: review dispatch persists the task's
-/// review-column assignment *before* spawning the pane, so a booting review slot
-/// already resolves via `assigned_review_task_for` and never reaches this reap.
+/// A fresh load does not reach this reap, because review dispatch persists the
+/// slot assignment to the local overlay (`set_fields` -> `set_task_assignment`)
+/// *before* spawning the pane, and [`assigned_review_task_for`] resolves
+/// ownership through that overlay — not the raw `assigned_to` in the
+/// daemon-published index. That distinction is load-bearing: on a remote backend
+/// the overlay write never bumps the GitHub issue's `updatedAt`, so the index can
+/// still show the dev slot that handed the card off for a full refresh cycle (or
+/// longer). Trusting the index alone resolved the booting slot as idle and reaped
+/// it ~2s after launch; reading the overlay resolves it `Assigned` immediately,
+/// so only a slot whose task was genuinely accepted or bounced (its overlay
+/// marker cleared) reaches this reap.
 fn maybe_reap_orphaned_review_slot(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
@@ -6566,8 +6603,12 @@ Auto mode works better when it knows your environment. Takes about a minute.
         let name = "ghguard-art-warm";
         let project = gh_review_project(&work_dir, name);
         // A review-column issue assigned to `alpha`, published to the daemon-owned
-        // index — the file the function now reads (no backend touch).
+        // index — the file the function now reads (no backend touch). On a remote
+        // backend the index's `assigned_to` is a fold of the local overlay, so a
+        // steady-state board carries the matching overlay marker too; write it so
+        // the fixture matches how a real published board looks.
         seed_warm_index(name, vec![idx_issue("t", "review", Some("alpha"))]);
+        shelbi_state::set_task_assignment(name, "t", Some("alpha")).unwrap();
 
         match assigned_review_task_for(&project, "alpha") {
             AssignedReviewTask::Assigned(id) => assert_eq!(id, "t"),
@@ -6584,6 +6625,90 @@ Auto mode works better when it knows your environment. Takes about a minute.
                 AssignedReviewTask::None
             ),
             "a warm board with no match must be a definite None"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn assigned_review_task_for_prefers_the_overlay_over_a_stale_index_owner() {
+        // The bug this fixes: loading a handed-off card onto a review slot from
+        // the sidebar wrote the slot assignment only to the local overlay, but
+        // the daemon-published index still carried the dev slot that handed the
+        // card off (an overlay write never bumps a GitHub `updatedAt`, so it
+        // never rides a delta tick). Reading only the index resolved the booting
+        // review slot as idle and the reaper killed its pane. Resolving through
+        // the overlay — as `issue show` does — must report the review slot.
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = gh_guard_home("art-overlay");
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let name = "ghguard-art-overlay";
+        let project = gh_review_project(&work_dir, name);
+
+        // The index still shows the card in review, owned by the dev slot
+        // `alpha` that handed it off — the exact stale-owner state seen live.
+        seed_warm_index(name, vec![idx_issue("t", "review", Some("alpha"))]);
+        // The review load wrote the slot assignment to the overlay before
+        // spawning the pane.
+        shelbi_state::set_task_assignment(name, "t", Some("review")).unwrap();
+
+        // The freshly loaded review slot resolves Assigned off the overlay, so
+        // its booting pane is never reaped.
+        match assigned_review_task_for(&project, "review") {
+            AssignedReviewTask::Assigned(id) => assert_eq!(id, "t"),
+            AssignedReviewTask::None => {
+                panic!("expected Assigned(t) off the overlay, got None (index owner used)")
+            }
+            AssignedReviewTask::Unknown => {
+                panic!("expected Assigned(t) off the overlay, got Unknown")
+            }
+        }
+        // The dev slot the stale index still names is superseded by the overlay,
+        // so it does not falsely resolve as owning the review card.
+        assert!(
+            matches!(
+                assigned_review_task_for(&project, "alpha"),
+                AssignedReviewTask::None
+            ),
+            "the overlay owner supersedes the stale index `assigned_to`"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn assigned_review_task_for_reaps_when_the_overlay_marker_is_cleared() {
+        // The counterpart guard: a card genuinely accepted or bounced has its
+        // overlay marker cleared, so the slot must still resolve None (idle) even
+        // if a stale index momentarily still names it — the reaper must reclaim
+        // the pane it left listening.
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = gh_guard_home("art-cleared");
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let name = "ghguard-art-cleared";
+        let project = gh_review_project(&work_dir, name);
+
+        // Index still lists the card in review pinned to `review`, but the
+        // overlay marker is gone (accepted/bounced clears it).
+        seed_warm_index(name, vec![idx_issue("t", "review", Some("review"))]);
+        // No `set_task_assignment` — the overlay has no marker for `t`.
+
+        assert!(
+            matches!(
+                assigned_review_task_for(&project, "review"),
+                AssignedReviewTask::None
+            ),
+            "a cleared overlay marker resolves idle so the reaper can reclaim the slot"
         );
 
         std::env::remove_var("SHELBI_HOME");
