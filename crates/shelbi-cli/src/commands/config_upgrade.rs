@@ -404,6 +404,8 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         && id.ends_with(".manifest")
     {
         sniff_agent_manifest(entry, &text, out);
+    } else if matches!(entry.format, SurfaceFormat::Json) && id.ends_with(".settings-local") {
+        sniff_workspace_settings_local(entry, &text, out);
     } else if matches!(entry.format, SurfaceFormat::Json)
         && (id.ends_with(".settings") || id.ends_with("workspace-settings-template"))
     {
@@ -1381,6 +1383,36 @@ fn sniff_settings_json(entry: &InventoryEntry, text: &str, out: &mut Vec<Upgrade
     }
 }
 
+/// Sniff a *deployed* workspace worktree `.claude/settings.local.json`. Unlike
+/// [`sniff_settings_json`] (which heals config templates in place), this file is
+/// a live, gitignored worktree artifact that may hold user keys (e.g. a
+/// user-added `permissions` block) *and* stale Shelbi hook commands. The repair
+/// is the deploy-time self-heal (`wire_settings_local`), which runs on the
+/// workspace's next dispatch and preserves user keys — not a config-upgrade
+/// rewrite. So this surfaces one [`Classification::NeedsJudgment`] finding
+/// (report-only) when the block is stale, rather than auto-writing to a live
+/// worktree. Detection reuses the orchestrator's health rule so the surfaced
+/// finding and the deploy heal can never disagree.
+fn sniff_workspace_settings_local(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return; // unparseable is the lint's problem, not the upgrade's
+    };
+    if shelbi_orchestrator::workspace::shelbi_hooks_need_reheal(&value) {
+        out.push(finding(
+            entry,
+            Classification::NeedsJudgment,
+            "WORKSPACE_SETTINGS_HOOK_STALE",
+            "this workspace's deployed Shelbi hook commands are stale (relative, \
+             unquoted, or pre-rename `claude.*` names) and break when the agent \
+             changes directory",
+            "Redeploy the workspace to re-heal its hooks: it fixes on the next \
+             dispatch, or run `shelbi workspace add <name>` now. The heal rewrites \
+             only Shelbi's hook entries and preserves your other settings.",
+            Location { line: 1, column: 1 },
+        ));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Renamed-sibling (file-shape) sniffers
 
@@ -1830,6 +1862,13 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              `--match-published-head-commit` guidance can't be merged in mechanically without \
              risking loss of local edits — the orchestrator repairs its own copy with judgment, \
              preserving customizations."
+        }
+        "WORKSPACE_SETTINGS_HOOK_STALE" => {
+            "This is a live workspace worktree file that also holds your own settings \
+             (e.g. a `permissions` block), so a config-upgrade rewrite could clobber \
+             them — the deploy-time self-heal repairs only Shelbi's hook entries on \
+             the workspace's next dispatch, preserving your keys, so this is reported \
+             rather than auto-applied."
         }
         _ => "This form is ambiguous or potentially lossy, so a human should confirm the fix.",
     }
@@ -2314,6 +2353,54 @@ mod tests {
             &mut out,
         );
         assert!(out.is_empty(), "clean template flagged: {:?}", codes(&out));
+    }
+
+    // ---- deployed workspace worktree settings.local.json ----------------
+
+    #[test]
+    fn stale_workspace_settings_local_surfaces_needs_judgment() {
+        let e = entry(
+            "project.demo.workspace.alpha.settings-local",
+            "project:demo",
+            SurfaceFormat::Json,
+        );
+        // A pre-anchoring deployed file: a user `permissions` block plus Shelbi
+        // hooks in the stale relative + pre-rename `claude.*` form.
+        let stale = r#"{
+  "permissions": { "allow": ["Bash(cargo check *)"] },
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": ".shelbi/hooks/claude.session-start" } ] }
+    ]
+  }
+}"#;
+        let mut out = Vec::new();
+        sniff_workspace_settings_local(&e, stale, &mut out);
+        let f = find(&out, "WORKSPACE_SETTINGS_HOOK_STALE")
+            .expect("stale worktree hooks must surface a finding");
+        // Report-only: the deploy-time heal repairs it, preserving user keys.
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+    }
+
+    #[test]
+    fn healthy_workspace_settings_local_is_a_no_op() {
+        let e = entry(
+            "project.demo.workspace.alpha.settings-local",
+            "project:demo",
+            SurfaceFormat::Json,
+        );
+        // The current, CWD-safe form (anchored + shell-quoted) beside a user key.
+        let healthy = "{\"permissions\":{\"defaultMode\":\"auto\"},\
+             \"hooks\":{\"Stop\":[{\"hooks\":[{\"command\":\"\\\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/stop.sh\\\"\"}]}]}}";
+        let mut out = Vec::new();
+        sniff_workspace_settings_local(&e, healthy, &mut out);
+        assert!(out.is_empty(), "healthy worktree file flagged: {:?}", codes(&out));
+
+        // Unparseable content is the lint's problem, not the upgrade's — no panic.
+        let mut bad = Vec::new();
+        sniff_workspace_settings_local(&e, "{ not json", &mut bad);
+        assert!(bad.is_empty());
     }
 
     // ---- review agent instructions (medium-agnostic rewrite) ------------

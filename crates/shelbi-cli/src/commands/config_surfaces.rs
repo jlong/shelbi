@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use shelbi_core::{
-    validate_project_name, ConfigMode, Project, ProjectStatuses, Workflow, LOCAL_PROJECT_FIELDS,
-    SHARED_PROJECT_FIELDS,
+    validate_project_name, ConfigMode, MachineKind, Project, ProjectStatuses, Workflow,
+    LOCAL_PROJECT_FIELDS, SHARED_PROJECT_FIELDS,
 };
 use shelbi_state::keymap::{
     validate_keymaps_yaml, ErrorKind as KeymapErrorKind, KeymapDiagnostic,
@@ -472,6 +472,37 @@ fn collect_project_entries(project: &str, out: &mut Vec<InventoryEntry>) -> Resu
         SurfaceFormat::Json,
         true,
     ));
+    // Deployed workspace worktree settings. Each local workspace owns a
+    // gitignored `.claude/settings.local.json` where Shelbi wires its
+    // window-title / message-tail hooks. A pre-anchoring shelbi left some of
+    // these with stale (relative / unquoted / pre-rename) hook commands that the
+    // deploy-time self-heal only repairs on that workspace's next dispatch. Sniff
+    // them here too so a stale-but-idle workspace still surfaces to the
+    // orchestrator on hub start. Local machines only — the pass runs on the hub
+    // and can't read a remote worktree over the config-upgrade path.
+    if let Some(parsed) = parsed.as_ref() {
+        for ws in &parsed.workspaces {
+            let Some(machine) = parsed.machine(&ws.machine) else {
+                continue;
+            };
+            if machine.kind != MachineKind::Local {
+                continue;
+            }
+            let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, ws);
+            out.push(entry(
+                &format!("project.{project}.workspace.{}.settings-local", ws.name),
+                &scope,
+                absolute(worktree.join(shelbi_orchestrator::workspace::WORKTREE_SETTINGS_LOCAL_REL))?,
+                candidate_root
+                    .join(".shelbi/wt")
+                    .join(&ws.name)
+                    .join(shelbi_orchestrator::workspace::WORKTREE_SETTINGS_LOCAL_REL),
+                SurfaceFormat::Json,
+                false,
+            ));
+        }
+    }
+
     out.push(entry(
         &format!("project.{project}.zenmode"),
         &scope,

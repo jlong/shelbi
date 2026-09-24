@@ -3267,7 +3267,24 @@ pub fn wire_settings_local(
             }
             Ok(value) if settings_contain_shelbi_hooks(&value) => {
                 // Case 3: user content that already carries our block (a prior
-                // self-heal / orchestrator merge). Nothing to do.
+                // self-heal / orchestrator merge). Usually nothing to do — but a
+                // block written by a pre-anchoring shelbi carries *stale* Shelbi
+                // hook commands: relative paths (break the moment the agent `cd`s
+                // out of the worktree root), unquoted anchored paths (break on a
+                // spaced worktree path), or pre-rename `claude.*` script names
+                // (point at files that no longer exist). Case 2 can't fix those —
+                // it only fires for a Shelbi-*only* file, and this file also holds
+                // user keys (e.g. a user-added `permissions` block). Re-heal in
+                // place: replace only Shelbi's own hook groups with the freshly
+                // rendered, anchored + quoted block, preserving every user key and
+                // any user-authored hook group.
+                if shelbi_hooks_need_reheal(&value) {
+                    if let Some(healed) = reheal_shelbi_hooks_into(&value, shelbi_block) {
+                        write_worktree_text(host, &settings_local, &healed, "settings-local")?;
+                        cleanup_legacy_shelbi_settings_json(host, worktree)?;
+                        return Ok(SettingsWireResult::SelfHealed);
+                    }
+                }
                 cleanup_legacy_shelbi_settings_json(host, worktree)?;
                 Ok(SettingsWireResult::Wired)
             }
@@ -3401,6 +3418,110 @@ fn merge_shelbi_hooks_into(user: &serde_json::Value, shelbi_block: &str) -> Opti
     let mut out = serde_json::to_string_pretty(&serde_json::Value::Object(merged)).ok()?;
     out.push('\n');
     Some(out)
+}
+
+/// The current, CWD-safe form of a Shelbi hook command as it appears *parsed*
+/// out of the JSON string value: shell-double-quoted around a
+/// `$CLAUDE_PROJECT_DIR`-anchored path. The leading `"` is the literal shell
+/// quote (see [`quote_shelbi_hook_commands`]), not the JSON string delimiter.
+const HEALTHY_SHELBI_HOOK_COMMAND_PREFIX: &str = "\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/";
+
+/// True iff `cmd` is a Shelbi-owned hook command already in the current,
+/// CWD-safe form: shell-quoted, `$CLAUDE_PROJECT_DIR`-anchored, and pointing at
+/// a current (post-rename) script name — i.e. nothing the re-heal would change.
+/// A command that is relative, anchored-but-unquoted, or still names a pre-rename
+/// `.shelbi/hooks/claude.*` script is *not* healthy and must be re-healed.
+fn is_healthy_shelbi_hook_command(cmd: &str) -> bool {
+    cmd.starts_with(HEALTHY_SHELBI_HOOK_COMMAND_PREFIX)
+        && !cmd.contains(shelbi_state::STALE_HOOK_COMMAND_MARKER)
+}
+
+/// True iff `value`'s `hooks` carry at least one Shelbi-owned command that is
+/// *not* in the current CWD-safe form ([`is_healthy_shelbi_hook_command`]) — the
+/// signal that a user-authored `settings.local.json` (Case 3) still holds a
+/// pre-anchoring Shelbi block and needs re-healing.
+///
+/// Exposed so the version-agnostic config validate-and-upgrade pass
+/// (`shelbi-cli`'s `config_upgrade`) can surface the same finding for a deployed
+/// workspace worktree file using the *same* health rule the deploy-time heal
+/// applies — the two can never disagree about what counts as stale.
+pub fn shelbi_hooks_need_reheal(value: &serde_json::Value) -> bool {
+    let Some(hooks) = value.as_object().and_then(|o| o.get("hooks")) else {
+        return false;
+    };
+    let mut stale = false;
+    // Return `true` from the visitor so the walk keeps scanning every command.
+    for_each_hook_command(hooks, &mut |cmd| {
+        if cmd.contains(SHELBI_HOOK_COMMAND_PREFIX) && !is_healthy_shelbi_hook_command(cmd) {
+            stale = true;
+        }
+        true
+    });
+    stale
+}
+
+/// True iff `group` is a Shelbi-owned hook group: a `{ "hooks": [ { command } ] }`
+/// group with at least one command and *every* command referencing Shelbi's
+/// exclusive `.shelbi/hooks/` namespace. Shelbi wires one command per group, so
+/// this cleanly distinguishes a Shelbi group from a user-authored one pointing
+/// elsewhere.
+fn hook_group_is_shelbi_owned(group: &serde_json::Value) -> bool {
+    let Some(inner) = group.get("hooks").and_then(|h| h.as_array()) else {
+        return false;
+    };
+    if inner.is_empty() {
+        return false;
+    }
+    inner.iter().all(|hook| {
+        hook.get("command")
+            .and_then(|c| c.as_str())
+            .map(|c| c.contains(SHELBI_HOOK_COMMAND_PREFIX))
+            .unwrap_or(false)
+    })
+}
+
+/// Remove every Shelbi-owned hook group ([`hook_group_is_shelbi_owned`]) from a
+/// parsed `hooks` map, leaving user-authored groups intact. An event whose array
+/// empties out is dropped so the subsequent re-merge re-inserts it cleanly.
+fn strip_shelbi_hook_groups(hooks: &mut serde_json::Map<String, serde_json::Value>) {
+    let events: Vec<String> = hooks.keys().cloned().collect();
+    for event in events {
+        let Some(serde_json::Value::Array(groups)) = hooks.get_mut(&event) else {
+            continue;
+        };
+        groups.retain(|group| !hook_group_is_shelbi_owned(group));
+        if groups.is_empty() {
+            hooks.remove(&event);
+        }
+    }
+}
+
+/// Re-heal a user-authored `settings.local.json` (Case 3) whose Shelbi hook
+/// block is stale: strip Shelbi's own hook groups and re-merge the freshly
+/// rendered `shelbi_block` (already anchored + quoted, current script names),
+/// preserving every user key and any user-authored hook group.
+///
+/// Returns `Some(pretty_json)` on success, or `None` for a shape we can't reason
+/// about (non-object root, or a `hooks`/event value that isn't the expected
+/// object-of-arrays) — the caller then leaves the file untouched. Idempotent:
+/// re-running on an already-healthy file reproduces it.
+fn reheal_shelbi_hooks_into(user: &serde_json::Value, shelbi_block: &str) -> Option<String> {
+    let mut merged = user.as_object()?.clone();
+    match merged.get_mut("hooks") {
+        Some(serde_json::Value::Object(hooks)) => strip_shelbi_hook_groups(hooks),
+        // A `hooks` value that isn't an object is a shape we won't guess at.
+        Some(_) => return None,
+        None => {}
+    }
+    // With Shelbi's stale groups gone, `merge_shelbi_hooks_into`'s precondition
+    // (no Shelbi hooks already present) holds, so it re-adds the block without
+    // duplication.
+    let remerged = merge_shelbi_hooks_into(&serde_json::Value::Object(merged), shelbi_block)?;
+    // Run the same anchor + quote transforms the deploy path applies so the
+    // re-merged Shelbi commands land in the current CWD-safe form no matter what
+    // form `shelbi_block` arrived in — one source of truth for the target shape,
+    // and the reason a re-heal is idempotent (a second pass is a no-op).
+    Some(quote_shelbi_hook_commands(&anchor_shelbi_hook_paths(&remerged)))
 }
 
 /// Walk every `command` string in a Claude-Code `hooks` object
@@ -7755,16 +7876,92 @@ transitions:
     }
 
     #[test]
-    fn wire_settings_local_is_noop_when_user_file_already_has_block() {
+    fn wire_settings_local_is_noop_when_user_file_already_has_healthy_block() {
         let wt = wiring_tmp_worktree("merged");
         let path = wt.join(".claude/settings.local.json");
-        // User content that the orchestrator already merged Shelbi's block into.
-        let merged = r#"{"permissions":{"defaultMode":"auto"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":".shelbi/hooks/session-start.sh"}]},{"hooks":[{"type":"command","command":"./my-hook.sh"}]}]}}"#;
+        // User content that already carries Shelbi's block in the current,
+        // CWD-safe (anchored + shell-quoted) form, plus a user hook. Nothing to
+        // heal → a true no-op, left byte-for-byte untouched.
+        let merged = r#"{"permissions":{"defaultMode":"auto"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/session-start.sh\""}]},{"hooks":[{"type":"command","command":"./my-hook.sh"}]}]}}"#;
         std::fs::write(&path, merged).unwrap();
-        let res = wire_settings_local(&Host::Local, &wt, "alpha", TEST_SHELBI_BLOCK).unwrap();
+        let res =
+            wire_settings_local(&Host::Local, &wt, "alpha", TEST_SHELBI_BLOCK_QUOTED).unwrap();
         assert!(matches!(res, SettingsWireResult::Wired));
         // Left byte-for-byte untouched — the user's hook survives.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), merged);
+        let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+    }
+
+    #[test]
+    fn wire_settings_local_reheals_stale_block_preserving_user_keys() {
+        // The narrower reported bug: a pre-anchoring workspace file that also
+        // holds user keys never healed. It carries a user `permissions` block, a
+        // user-authored hook, AND Shelbi's own hooks in the stale pre-#463 form —
+        // relative paths with pre-rename `claude.*` script names. Case 2 can't
+        // fire (not Shelbi-only) and the old case-3 no-op left it broken. It must
+        // now re-heal: Shelbi's hooks become the current anchored + quoted form
+        // while every user key and the user hook are preserved.
+        let wt = wiring_tmp_worktree("reheal");
+        let path = wt.join(".claude/settings.local.json");
+        let stale = r#"{
+  "permissions": { "allow": ["Bash(cargo check *)"] },
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": ".shelbi/hooks/claude.session-start" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": ".shelbi/hooks/claude.stop" } ] },
+      { "hooks": [ { "type": "command", "command": "./my-user-hook.sh" } ] }
+    ]
+  }
+}"#;
+        std::fs::write(&path, stale).unwrap();
+        let res =
+            wire_settings_local(&Host::Local, &wt, "alpha", TEST_SHELBI_BLOCK_QUOTED).unwrap();
+        // A real write the caller should disclose.
+        assert!(matches!(res, SettingsWireResult::SelfHealed));
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        // User's permissions survived verbatim.
+        assert_eq!(
+            v["permissions"]["allow"][0].as_str(),
+            Some("Bash(cargo check *)"),
+            "user permissions must be preserved: {written}"
+        );
+        // The user's own hook survived.
+        assert!(
+            written.contains("./my-user-hook.sh"),
+            "user hook must be preserved: {written}"
+        );
+        // Shelbi's hook is now anchored at the CURRENT script name and
+        // shell-quoted (the inner quotes are JSON-escaped as `\"` in the file).
+        assert!(
+            written.contains("\\\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/session-start.sh\\\""),
+            "shelbi hook must be anchored + quoted: {written}"
+        );
+        // No stale pre-rename `claude.*` command and no relative Shelbi command
+        // survive the heal.
+        assert!(
+            !written.contains(".shelbi/hooks/claude."),
+            "stale claude.* command must be gone: {written}"
+        );
+        assert!(
+            !written.contains("\".shelbi/hooks/"),
+            "no relative Shelbi command may survive: {written}"
+        );
+        // Detection agrees the file is now healthy — the basis for idempotency.
+        assert!(!shelbi_hooks_need_reheal(&v));
+
+        // Idempotent: a second wire is a clean case-3 no-op, no second write.
+        let res2 =
+            wire_settings_local(&Host::Local, &wt, "alpha", TEST_SHELBI_BLOCK_QUOTED).unwrap();
+        assert!(matches!(res2, SettingsWireResult::Wired));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            written,
+            "re-wire must not change the healed file"
+        );
         let _ = std::fs::remove_dir_all(wt.parent().unwrap());
     }
 
@@ -7778,7 +7975,10 @@ transitions:
         let path = wt.join(".claude/settings.local.json");
         let user = r#"{ "permissions": { "allow": ["Bash(cargo check *)"] } }"#;
         std::fs::write(&path, user).unwrap();
-        let res = wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK).unwrap();
+        // Production always renders the anchored + quoted block, so the merged
+        // file is CWD-safe from the first write — and the re-wire below is a
+        // genuine case-3 no-op (nothing stale to re-heal).
+        let res = wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK_QUOTED).unwrap();
         // Case 4: a real self-heal WRITE — distinct from a no-op wiring so the
         // caller can disclose it.
         assert!(matches!(res, SettingsWireResult::SelfHealed));
@@ -7795,7 +7995,8 @@ transitions:
 
         // Idempotent: a second wire is a no-op (case 3), no duplicate hook and
         // — critically — no second self-heal disclosure.
-        let res2 = wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK).unwrap();
+        let res2 =
+            wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK_QUOTED).unwrap();
         assert!(matches!(res2, SettingsWireResult::Wired));
         let written2 = std::fs::read_to_string(&path).unwrap();
         assert_eq!(written2, written, "re-wire must not change the file");
