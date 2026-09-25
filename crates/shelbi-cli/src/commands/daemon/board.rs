@@ -692,6 +692,7 @@ fn parse_open_project_names(listing: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use shelbi_core::{Column, Issue, Result as CoreResult};
+
     use shelbi_state::issue_store::{
         Cursor, IssueChange, IssueComment, IssueFields, NewIssue, PrioMove, StatusMove,
     };
@@ -1156,6 +1157,41 @@ mod tests {
             .filter(|l| l.contains("board refreshed="))
             .count();
         assert_eq!(refreshed, 1, "two quiet ticks add no lines");
+    }
+
+    #[test]
+    fn an_updated_at_only_bump_emits_no_line() {
+        // The reported bug: an open issue re-read after a comment / non-status
+        // label edit / reaction carries a newer `updatedAt` but the same
+        // board-semantic state. Before the fix the full-serialization diff
+        // counted the timestamp bump, so a `board refreshed changed=1` line fired
+        // on nearly every tick while a card was being worked — waking every
+        // events tail and orchestrator for nothing.
+        let _iso = IsolatedHome::new("updated-at-bump");
+        let (store, _) = fake(vec![issue("a", "todo", 0)]);
+        refresh_with_store("proj", &store, None).unwrap();
+
+        // Next tick reads the same card, only `updatedAt` advanced (a GitHub
+        // touch that did not move the card).
+        let mut bumped = issue("a", "todo", 0);
+        bumped.task.updated_at += chrono::Duration::seconds(37);
+        let (touched, _) = fake(vec![bumped]);
+        let out = refresh_with_store("proj", &touched, None).unwrap();
+        assert_eq!(out.changed, 0, "a bare updated_at bump is not a board change");
+
+        let refreshed = events_lines()
+            .into_iter()
+            .filter(|l| l.contains("board refreshed="))
+            .count();
+        assert_eq!(
+            refreshed, 1,
+            "only the priming tick emitted; the timestamp bump did not"
+        );
+
+        // The persisted index still advanced its updated_at — the file stays a
+        // freshness signal even though no event fired.
+        let idx = board_index::read_board_index("proj").expect("index written");
+        assert_eq!(idx.board.len(), 1);
     }
 
     #[test]
