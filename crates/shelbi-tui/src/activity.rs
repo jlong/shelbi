@@ -1556,6 +1556,7 @@ enum ZenReason {
         category: Option<String>,
     },
     Merge {
+        pr: Option<String>,
         sha: Option<String>,
     },
     FailedChecks {
@@ -1586,6 +1587,26 @@ enum ZenReason {
 /// `None` for non-zen reasons so callers can fall through to the
 /// default user-action renderer.
 fn parse_zen_reason(reason: &str) -> Option<ZenReason> {
+    // `orchestrator:zen-merge` is matched on its prefix, not an exact head.
+    // The orchestrator emits the canonical reason with a space
+    // (`orchestrator:zen-merge pr=<n>`), but `append_task_event` folds
+    // spaces into underscores on write, so on disk the head arrives glued
+    // to its tail as `orchestrator:zen-merge_pr=<n>` — an exact-head match
+    // would miss every real event-log line and drop it to `Other`.
+    // Historical lines (`orchestrator:zen-merge_ci-green(<n>)`) and the bare
+    // `orchestrator:zen-merge` land here too and still render with the merge
+    // badge, just without a parsed identifier. See `kv_from_mixed` for why
+    // the tail is scanned across both separators.
+    if reason == "orchestrator:zen-merge"
+        || reason.starts_with("orchestrator:zen-merge ")
+        || reason.starts_with("orchestrator:zen-merge_")
+    {
+        return Some(ZenReason::Merge {
+            pr: kv_from_mixed(reason, "pr"),
+            sha: kv_from_mixed(reason, "sha"),
+        });
+    }
+
     let (head, rest) = reason.split_once(' ').unwrap_or((reason, ""));
     let extras = parse_kv(rest);
     let get = |k: &str| extras.get(k).cloned();
@@ -1593,7 +1614,6 @@ fn parse_zen_reason(reason: &str) -> Option<ZenReason> {
         "orchestrator:zen-promote" => ZenReason::Promote {
             category: get("category"),
         },
-        "orchestrator:zen-merge" => ZenReason::Merge { sha: get("sha") },
         "zen:failed-checks" => ZenReason::FailedChecks {
             cmd: get("cmd"),
             exit: get("exit"),
@@ -1628,6 +1648,21 @@ fn agent_from_reason(reason: &str) -> Option<String> {
     reason
         .split('_')
         .find_map(|seg| seg.strip_prefix("agent=").map(str::to_string))
+}
+
+/// Pull `<key>=<value>` out of a reason whose tokens may be separated by
+/// spaces (the pre-normalization string the orchestrator emits, and what
+/// unit tests pass directly) or underscores (the on-disk form after
+/// `append_task_event` folds spaces). Used by the zen-merge parse, whose
+/// values are bare tokens — a PR number or short SHA — with no embedded
+/// separators. An empty value (`pr=`) is treated as absent.
+fn kv_from_mixed(reason: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    reason
+        .split([' ', '_'])
+        .find_map(|seg| seg.strip_prefix(prefix.as_str()))
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// Parse `k=v k2=v2 …` from a reason tail. Values may be double-quoted
@@ -2236,10 +2271,14 @@ fn render_zen_event(
             Some("backlog → todo".to_string()),
             Some(category_pill(to.category())),
         ),
-        ZenReason::Merge { sha } => {
-            let merged = sha
+        ZenReason::Merge { pr, sha } => {
+            // Identify what merged: the PR number first (what the templates
+            // emit), falling back to a merge SHA, then to a bare "merged"
+            // for historical lines that carry neither.
+            let merged = pr
                 .as_deref()
-                .map(|s| format!("merged {s}"))
+                .map(|n| format!("merged #{n}"))
+                .or_else(|| sha.as_deref().map(|s| format!("merged {s}")))
                 .unwrap_or_else(|| "merged".to_string());
             (
                 "merged",
@@ -3197,9 +3236,10 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_zen_reason("orchestrator:zen-merge sha=abc123"),
+            parse_zen_reason("orchestrator:zen-merge pr=1343"),
             Some(ZenReason::Merge {
-                sha: Some("abc123".into()),
+                pr: Some("1343".into()),
+                sha: None,
             })
         );
         assert_eq!(
@@ -3234,6 +3274,51 @@ mod tests {
             Some(ZenReason::MergeConflict {
                 files: Some("Cargo.lock,src/main.rs".into()),
             })
+        );
+    }
+
+    #[test]
+    fn parse_zen_reason_recognizes_the_normalized_on_disk_merge_form() {
+        // `append_task_event` folds the emitted reason's spaces into
+        // underscores before it hits `events.log`, so the parser must
+        // recognize the underscore-joined head+tail — an exact-head match
+        // (the old behavior) dropped every real merge line to `Other`.
+        assert_eq!(
+            parse_zen_reason("orchestrator:zen-merge_pr=1343"),
+            Some(ZenReason::Merge {
+                pr: Some("1343".into()),
+                sha: None,
+            }),
+            "canonical on-disk form must yield Merge with the PR number"
+        );
+        // A merge line that also carries a SHA, normalized.
+        assert_eq!(
+            parse_zen_reason("orchestrator:zen-merge_pr=1343_sha=abc1234"),
+            Some(ZenReason::Merge {
+                pr: Some("1343".into()),
+                sha: Some("abc1234".into()),
+            })
+        );
+        // Bare head (the pre-fix orchestrator template emitted this) still
+        // renders as a merge, just without an identifier.
+        assert_eq!(
+            parse_zen_reason("orchestrator:zen-merge"),
+            Some(ZenReason::Merge {
+                pr: None,
+                sha: None,
+            })
+        );
+        // Historical lines really on disk (2026-09-22/23): the old zenmode
+        // template emitted `ci-green(<n>)`, normalized to an underscore join.
+        // These must still yield Merge (the badge) even though the PR number
+        // is trapped inside `ci-green(...)` and not parsed out.
+        assert_eq!(
+            parse_zen_reason("orchestrator:zen-merge_ci-green(1343)"),
+            Some(ZenReason::Merge {
+                pr: None,
+                sha: None,
+            }),
+            "historical ci-green(<n>) lines must still render as a merge"
         );
     }
 
@@ -3517,9 +3602,11 @@ mod tests {
     }
 
     #[test]
-    fn render_zen_merge_secondary_includes_sha_and_green_checks() {
+    fn render_zen_merge_secondary_includes_pr_and_green_checks() {
+        // The on-disk form: `append_task_event` folds the emitted
+        // `orchestrator:zen-merge pr=1343` reason's space into an underscore.
         let lines = render_zen_for_test(
-            "orchestrator:zen-merge sha=abc123",
+            "orchestrator:zen-merge_pr=1343",
             Column::review(),
             Column::done(),
         );
@@ -3535,8 +3622,8 @@ mod tests {
             "secondary missing ci-green: {l1:?}"
         );
         assert!(
-            l1.contains("merged abc123"),
-            "secondary missing sha: {l1:?}"
+            l1.contains("merged #1343"),
+            "secondary missing pr number: {l1:?}"
         );
     }
 
@@ -3735,7 +3822,7 @@ mod tests {
             workspaces: false,
         };
         assert!(f.matches(&task_event("orchestrator:zen-promote category=4")));
-        assert!(f.matches(&task_event("orchestrator:zen-merge sha=abc")));
+        assert!(f.matches(&task_event("orchestrator:zen-merge_pr=1343")));
         assert!(f.matches(&task_event("zen:failed-checks cmd=\"cargo test\"")));
         assert!(!f.matches(&task_event("user:cli:start")));
         assert!(!f.matches(&workspace_event()));

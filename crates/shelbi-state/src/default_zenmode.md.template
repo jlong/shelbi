@@ -136,10 +136,12 @@ the workflow.
    Any identity movement fails closed; never recompute or substitute a probe
    field after CI begins.
 8. If green, finalize by moving the issue to `done` — the transition merges:
-   `shelbi issue move <task-id> --to done --reason "orchestrator:zen-merge
-   ci-green(<pr-number>)"`. The `review -> done` transition squash-merges into
-   `<base_branch>` and deletes the branch — this is the only merge. Do **not**
-   run `zen pr-merge` here.
+   `shelbi issue move <task-id> --to done --reason "orchestrator:zen-merge pr=<pr-number>"`.
+   Keep the reason on one line and use the `pr=<pr-number>` kv token exactly —
+   the event log folds spaces into underscores, and the activity feed reads
+   `pr=` back out of that normalized form to render the merge badge. The
+   `review -> done` transition squash-merges into `<base_branch>` and deletes
+   the branch — this is the only merge. Do **not** run `zen pr-merge` here.
 9. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
    or `reason=zen:ci-timeout`.
 
