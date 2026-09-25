@@ -263,11 +263,11 @@ run.
 | Action          | Effect                                                                                                                                                                                                |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `push_branch`   | Push the issue's branch to `origin`. No-op if already up to date.                                                                                                                                      |
-| `open_pr`       | Open a PR. Base is `transition.target` if set, else the workflow's resolved `base_branch`, else the parent issue's branch when `depends_on` is set. No-op if a PR is already open.                     |
+| `open_pr`       | Open a PR. Base is `transition.target` if set, else the parent issue's branch when `depends_on` names a parent that isn't yet done, else the workflow's resolved `base_branch`. No-op if a PR is already open. |
 | `merge`         | Merge the issue's branch with the effective `merge_strategy`. Via `gh pr merge` when a PR is open; via local `git merge` on the hub otherwise. v1 strategies: `squash`, `merge`.                       |
 | `close_pr`      | Close any open PR without merging.                                                                                                                                                                    |
 | `delete_branch` | Delete the local + remote branch. Skipped if a workspace still has the branch checked out. That worktree replaces the branch on its next dispatch.                                                   |
-| `restack`       | Rebase the issue's branch onto its parent issue's current branch. Fires automatically on dependent issues when a parent's `merge` completes (see [`depends_on`](#dependent-tasks-with-depends_on)).      |
+| `restack`       | Rebase the issue's branch onto the parent's merge target (the base the parent just landed on, typically `main`), not the parent's branch. Fires automatically on dependent issues when a parent's `merge` completes (see [`depends_on`](#dependent-tasks-with-depends_on)). |
 
 All actions are **hub-side** and idempotent. The orchestrator (or the
 CLI) on the hub machine runs them; workspaces never invoke actions
@@ -283,7 +283,7 @@ transitions:
 
   - from: review
     to: done
-    actions: [merge, delete_branch]
+    actions: [push_branch, merge]
 ```
 
 ### Per-transition `target:`
