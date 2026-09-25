@@ -4272,6 +4272,33 @@ fn maybe_resume_stranded_review_slots(
                             workspace = %ws.name,
                             "resumed stranded review slot",
                         );
+                        // The relaunch brings the slot's window back as a bare
+                        // agent/server pane; build its review panel beside it so
+                        // the resumed window matches a fresh load's layout
+                        // (`panel | agent`) without the human having to select
+                        // the task in the sidebar. No-focus: the poller runs in
+                        // the background and must never switch the user's active
+                        // window. `resume_review_task` returns only once the
+                        // relaunch's window is live, so the split lands now; a
+                        // `NeedsLaunch`/`Loading` outcome (window/assignment not
+                        // ready yet) is reported back and left for a later tick,
+                        // never kicking off a second load, and a build error is
+                        // surfaced without counting as a resume crash.
+                        match shelbi_orchestrator::review_ui::build_review_panel_no_focus(
+                            &project.name,
+                            &task_id,
+                        ) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    project = %project.name,
+                                    task = %task_id,
+                                    workspace = %ws.name,
+                                    error = %e,
+                                    "building the review panel after resume failed",
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         // Observable failure (the gap the bug called out): a
