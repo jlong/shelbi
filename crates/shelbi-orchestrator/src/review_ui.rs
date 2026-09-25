@@ -246,6 +246,52 @@ fn review_window_active(session: &str, window: &str) -> bool {
 /// sidebar never travels, so it stays docked in the dashboard and the dashboard
 /// window is never reshaped — a review load adds a panel only to its own window.
 pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<ReviewOpenOutcome> {
+    open_review_interface_inner(project_name, task_id, OpenFocus::Steal)
+}
+
+/// Whether [`open_review_interface_inner`] may take actions that move the user's
+/// focus or start work: switching the attached client to the review window,
+/// focusing a remote workspace, and kicking off a background load for a
+/// not-yet-loaded task. [`open_review_interface`] passes [`OpenFocus::Steal`];
+/// the poller's stranded-slot resume passes [`OpenFocus::Keep`] via
+/// [`build_review_panel_no_focus`], which only embeds a panel into an
+/// already-live window and otherwise reports back for a later tick.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenFocus {
+    /// Interactive entry: switch windows, focus remotes, start a load.
+    Steal,
+    /// Background resume: build the panel in place, never steal focus or load.
+    Keep,
+}
+
+/// Build the review panel into a resumed review slot's already-live window
+/// **without stealing the user's focus** — the poller's stranded-slot resume
+/// path. After [`crate::load::resume_review_task`] relaunches the agent/server
+/// pane, the slot's window is a bare agent pane until its panel is built beside
+/// it; previously that only happened when the human selected the task in the
+/// sidebar.
+///
+/// Unlike [`open_review_interface`] it never switches the attached client's
+/// active window, never focuses a remote slot, and never kicks off a background
+/// load. A task not yet loaded onto a review slot ([`ReviewOpenOutcome::Loading`])
+/// or a window that isn't live yet ([`ReviewOpenOutcome::NeedsLaunch`]) is
+/// reported back unchanged for the caller to retry on a later tick, so the
+/// background resume can never turn into a second load. Idempotent: a panel
+/// already live on the window is left as the single panel
+/// ([`ReviewOpenOutcome::Opened`]). Remote slots still degrade to
+/// [`ReviewOpenOutcome::RemoteFallback`], without focusing them.
+pub fn build_review_panel_no_focus(
+    project_name: &str,
+    task_id: &str,
+) -> Result<ReviewOpenOutcome> {
+    open_review_interface_inner(project_name, task_id, OpenFocus::Keep)
+}
+
+fn open_review_interface_inner(
+    project_name: &str,
+    task_id: &str,
+    focus: OpenFocus,
+) -> Result<ReviewOpenOutcome> {
     let project = shelbi_state::load_project(project_name)?;
     let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
     let tf = store
@@ -262,13 +308,20 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
         .cloned();
 
     let Some(ws) = review_ws else {
-        // Queued: load it onto a free review slot in the background. The
-        // start path creates the pane detached, so nothing steals focus.
-        // Routed through the review-specific loader (not the generic
-        // `load_task_by_id`) so a handoff task pinned to its dev slot is never
-        // re-seeded there, and the Review agent — not the review status's Zen
-        // agent — is dispatched onto the slot.
-        load::load_task_for_review(project_name, task_id)?;
+        // Queued: the interactive path loads it onto a free review slot in the
+        // background (the start path creates the pane detached, so nothing
+        // steals focus). Routed through the review-specific loader (not the
+        // generic `load_task_by_id`) so a handoff task pinned to its dev slot is
+        // never re-seeded there, and the Review agent — not the review status's
+        // Zen agent — is dispatched onto the slot.
+        //
+        // The no-focus resume path must NOT start a load — it only ever embeds
+        // into a slot the task is already assigned to — so it reports `Loading`
+        // back for a later tick, and the poller never turns a resume into a
+        // second load (the launch-loop the caller guards against).
+        if focus == OpenFocus::Steal {
+            load::load_task_for_review(project_name, task_id)?;
+        }
         return Ok(ReviewOpenOutcome::Loading);
     };
 
@@ -281,7 +334,12 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
     // Remote review slots live in their own tmux server; swap-pane can't
     // embed them. Degrade to focusing the workspace window.
     if !matches!(machine.host(), Host::Local) {
-        crate::focus_workspace(project_name, &ws.name)?;
+        // Interactive: focus the remote workspace window as a degraded open. The
+        // no-focus resume path must not move the user's window, so it only
+        // reports the fallback — a remote slot is never embedded either way.
+        if focus == OpenFocus::Steal {
+            crate::focus_workspace(project_name, &ws.name)?;
+        }
         return Ok(ReviewOpenOutcome::RemoteFallback(format!(
             "review slot `{}` is remote — opened its window instead of the embedded interface",
             ws.name
@@ -297,7 +355,18 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
     // now-reaped window is cleared first so the re-open takes the fresh path.
     if !review_window_live(&session, &ws.name) {
         if read_session_var(&session, PANEL_KEY).is_some() {
-            let _ = close_review_interface(project_name);
+            // Clear stale interface state left by a since-reaped window so a
+            // re-open takes the fresh path. `close_review_interface` also
+            // switches to the dashboard, which the no-focus resume path must not
+            // do, so it clears the pane/env state without the focus change.
+            match focus {
+                OpenFocus::Steal => {
+                    let _ = close_review_interface(project_name);
+                }
+                OpenFocus::Keep => {
+                    teardown_interface_state(&session);
+                }
+            }
         }
         return Ok(ReviewOpenOutcome::NeedsLaunch {
             workspace: ws.name.clone(),
@@ -318,13 +387,26 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
         if read_session_var(&session, TASK_KEY).as_deref() == Some(task_id)
             && panel_pane_live(&session, &ws.name, &panel)
         {
-            let _ = tmux_run(&["select-window", "-t", &review_win]);
+            // Idempotent: the panel is already up for this task. Re-focus on the
+            // interactive path; the no-focus resume leaves the window where it
+            // is, so a re-tick never stacks a second panel or steals focus.
+            if focus == OpenFocus::Steal {
+                let _ = tmux_run(&["select-window", "-t", &review_win]);
+            }
             return Ok(ReviewOpenOutcome::Opened(review_win));
         }
         // A panel left over from another task, or one that crashed/exited (dead,
         // or stranded in the wrong window), is torn down first so we never leak
         // its panes or stack a second panel into the window before (re)spawning.
-        let _ = close_review_interface(project_name);
+        // The no-focus path tears down without the dashboard focus change.
+        match focus {
+            OpenFocus::Steal => {
+                let _ = close_review_interface(project_name);
+            }
+            OpenFocus::Keep => {
+                teardown_interface_state(&session);
+            }
+        }
     }
 
     // The review agent/server pane already occupies the review window — it is
@@ -377,11 +459,15 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
     ])?;
     set_session_var(&session, PANEL_KEY, &panel_id)?;
 
-    // 2. Switch to the review window. Switching windows relocates no panes, so
+    // 2. Interactive open switches to the review window (relocating no panes, so
     //    the dashboard keeps its sidebar and this window shows just
-    //    `panel | agent`.
-    let _ = tmux_run(&["select-window", "-t", &review_win]);
-    let _ = tmux_run(&["select-pane", "-t", &chat]);
+    //    `panel | agent`) and selects the agent pane. The no-focus resume skips
+    //    both: the panel was split detached (`-d`), so the agent pane stays
+    //    active for when the user switches to the window on their own.
+    if focus == OpenFocus::Steal {
+        let _ = tmux_run(&["select-window", "-t", &review_win]);
+        let _ = tmux_run(&["select-pane", "-t", &chat]);
+    }
     Ok(ReviewOpenOutcome::Opened(review_win))
 }
 
@@ -1843,5 +1929,153 @@ mod tests {
 
         crate::tmux_test_support::kill_session(&format!("_{session}"));
         crate::tmux_test_support::kill_session(&session);
+    }
+
+    /// Number of panes currently in `session:window` (0 if the window is gone).
+    fn window_pane_count(session: &str, window: &str) -> usize {
+        tmux_capture(&["list-panes", "-t", &format!("{session}:{window}"), "-F", "#{pane_id}"])
+            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0)
+    }
+
+    /// Stranded-slot resume → panel built, no-focus. After the poller relaunches
+    /// a review slot the window is a bare agent pane; `build_review_panel_no_focus`
+    /// must split the panel beside it (the same `panel | agent` a fresh load
+    /// yields) WITHOUT switching the attached client's active window — the poller
+    /// runs in the background and must not steal the user's current window.
+    #[test]
+    fn resume_builds_the_review_panel_without_stealing_focus() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
+
+        let proj = format!("review-resume-panel-{}", std::process::id());
+        let home =
+            std::env::temp_dir().join(format!("shelbi-review-resume-panel-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&demo_project(&proj)).unwrap();
+        shelbi_state::save_task(&proj, &task_on("t-rev", "review-1", Column::review()), "body")
+            .unwrap();
+
+        // The relaunched slot: a bare agent window, dashboard the active window.
+        let session = format!("shelbi-{proj}");
+        crate::tmux_test_support::start_session(&session, "dashboard");
+        add_window(&session, "review-1");
+        let _ = tmux_run(&["select-window", "-t", &format!("{session}:dashboard")]);
+        assert!(review_window_active(&session, "dashboard"), "dashboard starts active");
+        let agent = local_workspace_pane_id(&session, "review-1").unwrap();
+        assert_eq!(window_pane_count(&session, "review-1"), 1, "bare agent window");
+
+        // The panel pane runs `{current_exe} __review-panel …`; under `cargo
+        // test` `current_exe` is the test harness, which has no such subcommand,
+        // so that process exits at once. Pin `remain-on-exit` on the window so
+        // the dead panel pane stays listed after it exits — this test asserts on
+        // the split's placement, not on the panel process surviving. Without it
+        // the window silently collapses back to one pane wherever the host tmux
+        // does not keep dead panes (the CI runner), failing the count assertion.
+        tmux_run(&["set-window-option", "-t", &format!("{session}:review-1"), "remain-on-exit", "on"])
+            .unwrap();
+
+        match build_review_panel_no_focus(&proj, "t-rev").unwrap() {
+            ReviewOpenOutcome::Opened(target) => {
+                assert_eq!(target, format!("{session}:review-1"))
+            }
+            other => panic!("expected the panel to build on the resumed slot, got {other:?}"),
+        }
+
+        // The panel is beside the agent, its state pinned to this slot/task.
+        assert_eq!(window_pane_count(&session, "review-1"), 2, "panel | agent");
+        assert!(read_session_var(&session, PANEL_KEY).is_some(), "the panel is built");
+        assert_eq!(read_session_var(&session, TASK_KEY).as_deref(), Some("t-rev"));
+        assert_eq!(read_session_var(&session, WS_KEY).as_deref(), Some("review-1"));
+        assert_eq!(read_session_var(&session, CHAT_KEY), Some(agent.clone()));
+        assert_eq!(read_session_var(&session, MID_KEY), Some(agent));
+
+        // Focus is untouched: dashboard is still the active window.
+        assert!(
+            review_window_active(&session, "dashboard"),
+            "a no-focus resume must not switch the user's active window to review-1"
+        );
+        assert!(!review_window_active(&session, "review-1"));
+
+        crate::tmux_test_support::kill_session(&session);
+        match prev_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Idempotence: a resume that ticks again while the panel is already up (for
+    /// example the human selected the task in the sidebar in the meantime) must
+    /// leave exactly one panel — reuse the live one, never stack a second.
+    #[test]
+    fn no_focus_build_reuses_a_live_panel_and_adds_no_second() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
+
+        let proj = format!("review-resume-dup-{}", std::process::id());
+        let home =
+            std::env::temp_dir().join(format!("shelbi-review-resume-dup-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&demo_project(&proj)).unwrap();
+        shelbi_state::save_task(&proj, &task_on("t-rev", "review-1", Column::review()), "body")
+            .unwrap();
+
+        let session = format!("shelbi-{proj}");
+        crate::tmux_test_support::start_session(&session, "dashboard");
+        add_window(&session, "review-1");
+
+        // Stage an interface already up for this task: a live panel beside the
+        // agent, every `SHELBI_REVIEW_*` var pinned (what a prior build leaves).
+        let agent = local_workspace_pane_id(&session, "review-1").unwrap();
+        let panel = split_sleeper(&format!("{session}:review-1"));
+        for (key, value) in [
+            (TASK_KEY, "t-rev"),
+            (WS_KEY, "review-1"),
+            (CHAT_KEY, agent.as_str()),
+            (MID_KEY, agent.as_str()),
+            (PANEL_KEY, panel.as_str()),
+        ] {
+            set_session_var(&session, key, value).unwrap();
+        }
+        assert_eq!(window_pane_count(&session, "review-1"), 2, "panel | agent staged");
+
+        // A second no-focus build reuses the live panel: same id, no new pane.
+        match build_review_panel_no_focus(&proj, "t-rev").unwrap() {
+            ReviewOpenOutcome::Opened(target) => {
+                assert_eq!(target, format!("{session}:review-1"))
+            }
+            other => panic!("expected a reuse of the live panel, got {other:?}"),
+        }
+        assert_eq!(
+            read_session_var(&session, PANEL_KEY).as_deref(),
+            Some(panel.as_str()),
+            "the existing panel is reused, not replaced"
+        );
+        assert_eq!(
+            window_pane_count(&session, "review-1"),
+            2,
+            "reuse must not stack a second panel"
+        );
+        assert!(panel_pane_live(&session, "review-1", &panel), "the live panel survives");
+
+        crate::tmux_test_support::kill_session(&session);
+        match prev_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
