@@ -955,12 +955,23 @@ pub fn record_board_index_number(project: &str, id: &str, number: i64) -> Result
 /// the daemon reports (and its zero/non-zero decides whether a tick is worth an
 /// events.log line at all).
 ///
-/// An issue counts as changed when it is added, removed, or its stored form
-/// differs (title, column, priority, metadata block, …). Keyed by task id;
-/// order-only churn does **not** count, since the store returns a canonical
-/// column-then-priority order and a pure reorder still moves an issue's
-/// `priority`, which the per-issue comparison already catches. A `None` old
-/// board (first tick, or a torn prior file) makes every issue count as new.
+/// An issue counts as changed when it is added, removed, or a **board-semantic**
+/// field of its stored form differs (title, column, priority, assignment,
+/// metadata block, body, …). Keyed by task id; order-only churn does **not**
+/// count, since the store returns a canonical column-then-priority order and a
+/// pure reorder still moves an issue's `priority`, which the per-issue comparison
+/// already catches. A `None` old board (first tick, or a torn prior file) makes
+/// every issue count as new.
+///
+/// The comparison deliberately ignores `created_at`/`updated_at`
+/// ([`issue_files_board_eq`]): an open issue's `updatedAt` bumps on *any* GitHub
+/// touch that leaves the card where it is — a comment, a non-status label edit, a
+/// reaction — and the incremental delta re-returns that issue on the next tick.
+/// Counting the bare timestamp bump made a `board refreshed … changed=1` line
+/// fire on nearly every tick while an issue was being worked, waking every events
+/// tail and orchestrator though nothing on the board had moved. The file is still
+/// rewritten each tick (so `fetched_at`/mtime and the persisted `updated_at`
+/// advance as a freshness signal); only the *event* is gated on a real change.
 pub fn board_diff_count(old: Option<&[IssueFile]>, new: &[IssueFile]) -> usize {
     use std::collections::HashMap;
     let Some(old) = old else {
@@ -977,7 +988,7 @@ pub fn board_diff_count(old: Option<&[IssueFile]>, new: &[IssueFile]) -> usize {
         match old_by_id.get(f.task.id.as_str()) {
             None => changed += 1,
             Some(prev) => {
-                if !issue_files_eq(prev, f) {
+                if !issue_files_board_eq(prev, f) {
                     changed += 1;
                 }
             }
@@ -992,11 +1003,16 @@ pub fn board_diff_count(old: Option<&[IssueFile]>, new: &[IssueFile]) -> usize {
     changed
 }
 
-/// Structural equality of two [`IssueFile`]s for change detection. Compares the
-/// serialized JSON so every field the index persists — typed [`Issue`] fields
-/// and the body — participates without hand-maintaining a field list that would
-/// silently rot as `Issue` grows. A serialize failure (practically
-/// unreachable) conservatively reports "changed" so a real edit is never missed.
+/// Structural equality of two [`IssueFile`]s. Compares the serialized JSON so
+/// every field the index persists — typed [`Issue`] fields and the body —
+/// participates without hand-maintaining a field list that would silently rot as
+/// `Issue` grows. A serialize failure (practically unreachable) conservatively
+/// reports "changed" so a real edit is never missed.
+///
+/// This is the *exact* equality the daemon's three-way merge uses to spot a CLI
+/// write-through (an issue whose on-disk form drifted from the merge base). The
+/// change **count** that gates the events.log line uses the timestamp-insensitive
+/// [`issue_files_board_eq`] instead — see [`board_diff_count`].
 ///
 /// [`Issue`]: shelbi_core::Issue
 pub fn issue_files_eq(a: &IssueFile, b: &IssueFile) -> bool {
@@ -1004,6 +1020,27 @@ pub fn issue_files_eq(a: &IssueFile, b: &IssueFile) -> bool {
         (Ok(ja), Ok(jb)) => ja == jb,
         _ => false,
     }
+}
+
+/// Board-semantic equality: like [`issue_files_eq`] but ignoring the
+/// `created_at`/`updated_at` timestamps.
+///
+/// An open issue's `updatedAt` advances on any GitHub-side touch — a comment, a
+/// non-status label edit, a reaction, a tool re-save — none of which move the card
+/// on the board or change any field the board renders. `createdAt` never changes
+/// but is normalized alongside it for symmetry. Every other persisted field still
+/// participates through [`issue_files_eq`]'s serialize-compare, so this stays
+/// forward-compatible as `Issue` grows and never misses a real edit. This is the
+/// comparison [`board_diff_count`] gates the `board refreshed` event on.
+fn issue_files_board_eq(a: &IssueFile, b: &IssueFile) -> bool {
+    fn without_timestamps(f: &IssueFile) -> IssueFile {
+        let epoch = DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_default();
+        let mut f = f.clone();
+        f.task.created_at = epoch;
+        f.task.updated_at = epoch;
+        f
+    }
+    issue_files_eq(&without_timestamps(a), &without_timestamps(b))
 }
 
 #[cfg(test)]
@@ -1105,6 +1142,56 @@ mod tests {
         let old = vec![issue("a", "todo", 0), issue("b", "todo", 1)];
         let new = vec![issue("a", "todo", 1), issue("b", "todo", 0)];
         assert_eq!(board_diff_count(Some(&old), &new), 2);
+    }
+
+    /// Bump an issue's `updated_at` (leaving every board-semantic field alone),
+    /// the way any GitHub touch that doesn't move the card does.
+    fn touch(mut f: IssueFile) -> IssueFile {
+        f.task.updated_at += chrono::Duration::seconds(37);
+        f
+    }
+
+    #[test]
+    fn diff_ignores_an_updated_at_only_bump() {
+        // The regression: an open issue re-read after a comment / non-status
+        // label edit carries a newer `updatedAt` but the same board-semantic
+        // state. A quiet re-read must report `changed == 0` so no `board
+        // refreshed` line fires and no orchestrator is woken for nothing.
+        let old = vec![issue("a", "todo", 0), issue("b", "review", 1)];
+        let new = vec![touch(old[0].clone()), touch(old[1].clone())];
+        assert_eq!(
+            board_diff_count(Some(&old), &new),
+            0,
+            "a bare updated_at bump is not a board change"
+        );
+    }
+
+    #[test]
+    fn diff_still_catches_a_real_change_alongside_a_timestamp_bump() {
+        // A genuine move (or edit) that also bumps `updatedAt` still counts
+        // exactly once — the timestamp is ignored, the real field is not.
+        let old = vec![issue("a", "todo", 0), issue("b", "review", 1)];
+        let mut moved = touch(old[0].clone());
+        moved.task.column = shelbi_core::Column::from_status_id("in_progress");
+        let new = vec![moved, touch(old[1].clone())];
+        assert_eq!(board_diff_count(Some(&old), &new), 1);
+    }
+
+    #[test]
+    fn issue_files_board_eq_ignores_timestamps_but_not_fields() {
+        let base = issue("a", "todo", 0);
+        assert!(
+            issue_files_board_eq(&base, &touch(base.clone())),
+            "timestamp-only drift is board-equal"
+        );
+        let mut reprioritized = base.clone();
+        reprioritized.task.priority = 3;
+        assert!(
+            !issue_files_board_eq(&base, &reprioritized),
+            "a real field change is not board-equal"
+        );
+        // And the full equality the merge relies on still sees the timestamp.
+        assert!(!issue_files_eq(&base, &touch(base.clone())));
     }
 
     // --- consumer read helper + write-through -------------------------------
