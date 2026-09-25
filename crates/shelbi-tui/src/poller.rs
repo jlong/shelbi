@@ -4113,6 +4113,13 @@ impl ReviewResumeState {
         }
     }
 
+    /// Drop the resume [`Self::decide_dead`] just recorded, when the resume
+    /// turned out to be unnecessary (a concurrent load had already brought
+    /// the slot up), so it doesn't count toward the crash-loop cap.
+    fn forget_last_resume(&mut self) {
+        self.restarts.pop();
+    }
+
     /// The slot's pane is dead and a review task is assigned to it. Decide
     /// whether to resume now, wait out the backoff, or give up. `now` is
     /// threaded in so the timing is unit-testable.
@@ -4189,6 +4196,24 @@ fn maybe_resume_stranded_review_slots(
             continue;
         }
 
+        // Window gone, but the review agent may still be alive, parked in the
+        // stash by a View Diff / editor swap whose content pane (and the panel)
+        // since exited. Bring that agent back instead of relaunching: a relaunch
+        // reseeds a second agent into a bare window and strands the parked one
+        // as a zombie.
+        if shelbi_orchestrator::review_ui::recover_parked_review_agent(&project.name, &ws.name) {
+            if let Err(e) = shelbi_state::append_workspace_pane_event(
+                &project.name,
+                &ws.name,
+                true,
+                "review-agent-recovered-from-stash",
+            ) {
+                tracing::warn!(workspace = %ws.name, error = %e, "append_workspace_pane_event failed");
+            }
+            entry.note_alive(now);
+            continue;
+        }
+
         // Pane dead. Nothing to resume unless a review-column task is still
         // assigned to this slot; if not, drop the crash history.
         let task_id = match assigned_review_task_for(project, &ws.name) {
@@ -4219,13 +4244,22 @@ fn maybe_resume_stranded_review_slots(
             ReviewResumeAction::None => {}
             ReviewResumeAction::Resume => {
                 // Reuse the manual/auto load path: it forces the Review agent,
-                // appends the serve recipe, and now permits a same-slot resume.
-                match shelbi_orchestrator::load::load_review_task(
+                // appends the serve recipe, and permits a same-slot resume. The
+                // resume variant re-checks liveness under the review-load lock,
+                // so a load already in flight on this slot (its assignment
+                // written before its pane exists) isn't killed and reseeded.
+                match shelbi_orchestrator::load::resume_review_task(
                     &project.name,
                     &task_id,
                     &ws.name,
                 ) {
-                    Ok(_) => {
+                    Ok(None) => {
+                        // A concurrent load brought the slot up while we waited
+                        // on the lock: not a crash, so don't count it.
+                        entry.forget_last_resume();
+                        entry.note_alive(now);
+                    }
+                    Ok(Some(_)) => {
                         let _ = shelbi_state::append_dispatch_event(
                             &task_id,
                             &ws.name,

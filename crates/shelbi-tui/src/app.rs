@@ -642,11 +642,23 @@ impl App {
                     // A lagging daemon surfaces here as a served index
                     // (`Stale`), so the sidebar degrades exactly like the Issues
                     // board instead of collapsing to empty.
-                    let review: Vec<IssueFile> = board
+                    let mut review: Vec<IssueFile> = board
                         .iter()
                         .filter(|f| f.task.column == Column::review())
                         .cloned()
                         .collect();
+                    // Resolve review-slot ownership from the local assignment
+                    // overlay, not the index's publish-time `assigned_to` fold:
+                    // a fresh review load lands in the overlay first and the
+                    // index can lag it, dropping the serving slot from the
+                    // Ready-for-Review nav.
+                    if let Ok(p) = shelbi_state::load_project(&self.project_name) {
+                        shelbi_state::fold_assignment_overlay(
+                            &self.project_name,
+                            &p.issue_tracker,
+                            &mut review,
+                        );
+                    }
                     let (ready, queued) = split_review_sections(&self.project_name, review);
                     self.ready_review = ready;
                     self.queued_review = queued;

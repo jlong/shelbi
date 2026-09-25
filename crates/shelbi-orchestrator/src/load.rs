@@ -218,6 +218,43 @@ pub fn load_review_task(project_name: &str, task_id: &str, workspace_name: &str)
     load_review_task_locked(project_name, task_id, workspace_name)
 }
 
+/// Resume a stranded review slot: re-load `task_id` onto the `workspace_name`
+/// it's still assigned to, **only if the slot is still dead** once the
+/// review-load lock is held. Returns `Ok(None)` when it found the slot alive and
+/// did nothing, and `Ok(Some(target))` when it relaunched.
+///
+/// This is the poller's resume entry point, and the recheck under the lock is
+/// the point. A review load persists the slot assignment *before* it spawns the
+/// pane, and the checkout / deploy in between takes seconds. A resume pass that
+/// ticks in that window sees "assigned, no window", reads it as stranded, and
+/// blocks on the lock behind the in-flight load. Once that load returns, an
+/// unguarded resume would kill the freshly booted pane and dispatch again. That
+/// was the repeated seed delivery and mid-load respawn seen when a load followed
+/// an orphan reap.
+pub fn resume_review_task(
+    project_name: &str,
+    task_id: &str,
+    workspace_name: &str,
+) -> Result<Option<String>> {
+    shelbi_state::ensure_daemon_matches_for_mutation()?;
+    let _guard = shelbi_state::lock_review_load(project_name)?;
+    let project = shelbi_state::load_project(project_name)?;
+    let ws = project
+        .workspace(workspace_name)
+        .cloned()
+        .ok_or_else(|| Error::Other(format!("unknown workspace `{workspace_name}`")))?;
+    let machine = project
+        .machine(&ws.machine)
+        .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
+    let addr = crate::workspace::workspace_tmux_addr(&project, &ws)?;
+    // A probe error reads as alive, matching the resume pass's own gate: never
+    // clobber a pane we can't prove is gone.
+    if crate::workspace::workspace_slot_alive(&machine.host(), &addr).unwrap_or(true) {
+        return Ok(None);
+    }
+    load_review_task_locked(project_name, task_id, workspace_name).map(Some)
+}
+
 /// Load `task_id` onto `workspace_name`, first **evicting** whatever other task
 /// currently occupies that review slot back to the review queue.
 ///
@@ -1633,6 +1670,54 @@ mod tests {
             "same-slot resume must clear the conflicting-slot guard, got: {err}"
         );
 
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resume_review_task_skips_a_slot_a_concurrent_load_already_brought_up() {
+        // The poller's resume pass reads "assigned, no window" while a manual
+        // load is between writing the assignment and spawning the pane, then
+        // blocks on the review-load lock behind it. Once the lock is held the
+        // slot is live, so the resume must leave that pane alone. Relaunching it
+        // killed the fresh pane and reseeded the agent.
+        if std::process::Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let first_pane = || {
+            std::process::Command::new("tmux")
+                .args(["list-panes", "-t", "shelbi-demo:review-1", "-F", "#{pane_id}"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        let _g = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+        shelbi_state::save_task("demo", &review_task("t-loading", "review-1"), "body").unwrap();
+
+        // Dead slot: the resume proceeds to a real load (which fails at dispatch
+        // in the test env), never the alive short-circuit.
+        let dead = resume_review_task("demo", "t-loading", "review-1");
+        assert!(!matches!(dead, Ok(None)), "a dead slot must be resumed, got {dead:?}");
+
+        // The concurrent load's pane is up: the resume is a no-op.
+        crate::tmux_test_support::start_session("shelbi-demo", "review-1");
+        let pane_before = first_pane();
+        assert!(matches!(
+            resume_review_task("demo", "t-loading", "review-1"),
+            Ok(None)
+        ));
+        assert_eq!(
+            first_pane(),
+            pane_before,
+            "the live pane must not be respawned"
+        );
+
+        crate::tmux_test_support::kill_session("shelbi-demo");
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

@@ -66,8 +66,8 @@ pub use issue_migrate::{
 };
 pub use board_index::{
     board_index_path, board_refresh_error_path, clear_board_refresh_error, expected_board_repo,
-    github_board_repo, mark_board_index_stale, patch_board_index_issue, read_board,
-    read_board_index, read_board_refresh_error, read_board_report, read_board_report_with_cfg,
+    fold_assignment_overlay, github_board_repo, mark_board_index_stale, patch_board_index_issue,
+    read_board, read_board_index, read_board_refresh_error, read_board_report, read_board_report_with_cfg,
     read_board_with_cfg, read_valid_board_index, record_board_index_number,
     record_board_refresh_error, remove_board_index_issue, update_board_index, write_board_index,
     BoardFreshness, BoardIndex, BoardRefreshError, BoardReport, BoardSource, ReadPath,

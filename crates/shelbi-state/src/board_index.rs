@@ -464,6 +464,32 @@ pub fn read_board_with_cfg(project: &str, cfg: &IssueTrackerConfig) -> Result<Bo
     Ok(board_state_from_index(project, cfg, cfg.refresh_interval_secs()))
 }
 
+/// Re-resolve every issue's `assigned_to` in `board` from the local assignment
+/// overlay, for a **remote** backend. A no-op for a `file_system` backend, whose
+/// assignment lives in the card frontmatter the board was read from.
+///
+/// On a remote (GitHub) board, assignment is local routing that lives only in
+/// the overlay (`assignments/<id>`); the published index's `assigned_to` is a
+/// fold of that overlay captured at publish time, so it can lag a fresh review
+/// load (an overlay write never bumps a GitHub `updatedAt`, and a stale / parked
+/// daemon stops re-publishing entirely). A consumer that decides slot ownership
+/// from the index alone then reads a serving review slot as unowned: `shelbi
+/// workspace list` calls it an `orphaned session` and the sidebar drops it from
+/// the Ready-for-Review nav. Folding the overlay here resolves ownership the way
+/// `issue show` does. The overlay is authoritative, so an id with no marker
+/// resolves to no owner. An overlay read failure leaves `board` untouched.
+pub fn fold_assignment_overlay(project: &str, cfg: &IssueTrackerConfig, board: &mut [IssueFile]) {
+    if !cfg.backend.is_remote() {
+        return;
+    }
+    let Ok(overlay) = crate::task_assignments(project) else {
+        return;
+    };
+    for tf in board.iter_mut() {
+        tf.task.assigned_to = overlay.get(&tf.task.id).cloned();
+    }
+}
+
 /// Map the on-disk index to a [`BoardState`] from its `stale` flag and the age
 /// of its `fetched_at` relative to `interval_secs` (the project's refresh
 /// cadence). A missing, torn, or identity-mismatched file (another repository's
@@ -1178,6 +1204,31 @@ mod tests {
             }
             other => panic!("expected Warm from a fresh index, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fold_assignment_overlay_resolves_owners_from_the_overlay_on_a_remote_board() {
+        // A fresh review load writes the review slot to the overlay, but the
+        // published index still names the dev slot that handed the card off.
+        // The fold must report the overlay owner, and an id with no overlay
+        // marker (accepted / bounced) resolves to no owner.
+        let _iso = IsolatedHome::new("fold");
+        let mut loaded = issue("loaded", "review", 0);
+        loaded.task.assigned_to = Some("alpha".into());
+        let mut cleared = issue("cleared", "review", 0);
+        cleared.task.assigned_to = Some("review".into());
+        crate::set_task_assignment("proj", "loaded", Some("review")).unwrap();
+
+        let mut board = vec![loaded.clone(), cleared.clone()];
+        fold_assignment_overlay("proj", &github_cfg(), &mut board);
+        assert_eq!(board[0].task.assigned_to.as_deref(), Some("review"));
+        assert_eq!(board[1].task.assigned_to, None);
+
+        // A file_system board keeps its frontmatter owners untouched.
+        let mut board = vec![loaded, cleared];
+        fold_assignment_overlay("proj", &IssueTrackerConfig::default(), &mut board);
+        assert_eq!(board[0].task.assigned_to.as_deref(), Some("alpha"));
+        assert_eq!(board[1].task.assigned_to.as_deref(), Some("review"));
     }
 
     #[test]
