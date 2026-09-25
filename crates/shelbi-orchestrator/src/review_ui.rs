@@ -64,6 +64,14 @@ const DIFF_KEY: &str = "SHELBI_REVIEW_DIFF";
 const CHAT_KEY: &str = "SHELBI_REVIEW_CHAT";
 /// Session env var holding the task id the interface is currently open on.
 const TASK_KEY: &str = "SHELBI_REVIEW_TASK";
+/// Session env var naming the review slot (its workspace window) the interface
+/// is built in. Lets a slot teardown ([`release_slot_review_interface`]) tell
+/// whether the session's interface state belongs to the slot being killed.
+const WS_KEY: &str = "SHELBI_REVIEW_WS";
+/// Every `SHELBI_REVIEW_*` session var the interface sets, cleared on teardown.
+const INTERFACE_KEYS: [&str; 7] = [
+    MID_KEY, PANEL_KEY, EDITOR_KEY, DIFF_KEY, CHAT_KEY, TASK_KEY, WS_KEY,
+];
 
 /// Which view the middle content slot should show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,6 +332,7 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
     // panel on its left.
     let chat = local_workspace_pane_id(&session, &ws.name)?;
     set_session_var(&session, TASK_KEY, task_id)?;
+    set_session_var(&session, WS_KEY, &ws.name)?;
     set_session_var(&session, CHAT_KEY, &chat)?;
     set_session_var(&session, MID_KEY, &chat)?;
 
@@ -826,9 +835,19 @@ fn ensure_stash_session(project: &shelbi_core::Project, session: &str) -> Result
 pub fn close_review_interface(project_name: &str) -> Result<()> {
     let session = format!("shelbi-{project_name}");
     let dashboard = format!("{session}:dashboard");
+    teardown_interface_state(&session);
+    let _ = tmux_run(&["select-window", "-t", &dashboard]);
+    Ok(())
+}
 
-    let chat = read_session_var(&session, CHAT_KEY);
-    let mid = read_session_var(&session, MID_KEY);
+/// The pane-and-env half of [`close_review_interface`], without the focus
+/// change: swap the chat pane back into the review window's content slot, kill
+/// the editor / diff / panel panes, and clear every `SHELBI_REVIEW_*` var.
+/// Returns the chat (review agent) pane id the interface had pinned, so a slot
+/// teardown can reap it if the swap-back couldn't return it to its window.
+fn teardown_interface_state(session: &str) -> Option<String> {
+    let chat = read_session_var(session, CHAT_KEY);
+    let mid = read_session_var(session, MID_KEY);
 
     // If the editor is currently in the middle, swap the chat pane back so the
     // agent pane returns to the review window before the editor's stash-session
@@ -841,23 +860,99 @@ pub fn close_review_interface(project_name: &str) -> Result<()> {
     // Kill the editor pane. It is the sole pane of its own `__review-editor`
     // window in the hidden stash session, so this closes that window only —
     // the stash session and its `views` panes (swapped out elsewhere) survive.
-    if let Some(editor) = read_session_var(&session, EDITOR_KEY) {
+    if let Some(editor) = read_session_var(session, EDITOR_KEY) {
         let _ = tmux_run(&["kill-pane", "-t", &editor]);
     }
     // The diff pane, like the editor, is the sole pane of its own
     // `__review-diff` window in the hidden stash session — killing it closes
     // that window only.
-    if let Some(diff) = read_session_var(&session, DIFF_KEY) {
+    if let Some(diff) = read_session_var(session, DIFF_KEY) {
         let _ = tmux_run(&["kill-pane", "-t", &diff]);
     }
-    if let Some(panel) = read_session_var(&session, PANEL_KEY) {
+    if let Some(panel) = read_session_var(session, PANEL_KEY) {
         let _ = tmux_run(&["kill-pane", "-t", &panel]);
     }
-    for key in [MID_KEY, PANEL_KEY, EDITOR_KEY, DIFF_KEY, CHAT_KEY, TASK_KEY] {
-        unset_session_var(&session, key);
+    for key in INTERFACE_KEYS {
+        unset_session_var(session, key);
     }
-    let _ = tmux_run(&["select-window", "-t", &dashboard]);
-    Ok(())
+    chat
+}
+
+/// Whether the session's review interface state is bound to the local review
+/// slot `window`. Keyed on [`WS_KEY`]; an interface opened before that var
+/// existed falls back to "one of its panes sits in the slot's window".
+fn interface_bound_to(session: &str, window: &str) -> bool {
+    if let Some(ws) = read_session_var(session, WS_KEY) {
+        return ws == window;
+    }
+    [PANEL_KEY, CHAT_KEY, MID_KEY]
+        .into_iter()
+        .filter_map(|key| read_session_var(session, key))
+        .any(|pane| panel_pane_live(session, window, &pane))
+}
+
+/// Release the review interface bound to local review slot `window` ahead of
+/// that slot's window being killed. Every slot teardown runs this
+/// ([`crate::workspace::kill_workspace_pane`]): the accept close, the poller's
+/// orphaned-review-slot reap, an eviction, and a re-dispatch's pane reset.
+///
+/// Without it only the review panel's own exit ran the full
+/// [`close_review_interface`]; every other teardown just killed the slot's
+/// window. That left the session's `SHELBI_REVIEW_*` vars pointing at dead
+/// panes, and when a View Diff / editor swap had parked the review agent in
+/// the stash session, the agent survived as a zombie outside the killed window.
+/// The next load onto the slot then started from that stale state.
+///
+/// Swaps the agent back, kills the editor / diff / panel panes, and clears the
+/// vars. If the slot's window is the active one, focus moves to the dashboard
+/// first (as a panel close does). Returns the agent pane id when it's still
+/// alive but outside the slot's window (the swap-back failed because the
+/// content pane had already exited), so the caller reaps it with the slot. A
+/// session with no interface bound to `window` is left untouched.
+pub(crate) fn release_slot_review_interface(session: &str, window: &str) -> Option<String> {
+    if !interface_bound_to(session, window) {
+        return None;
+    }
+    if review_window_active(session, window) {
+        let _ = tmux_run(&["select-window", "-t", &format!("{session}:dashboard")]);
+    }
+    teardown_interface_state(session)
+        .filter(|chat| pane_alive_anywhere(chat) && !panel_pane_live(session, window, chat))
+}
+
+/// Recover a local review slot whose window is gone while its review agent is
+/// still alive, parked in the stash session by a View Diff / editor swap. The
+/// swapped-in content pane (and the panel) exiting collapses the review window,
+/// but the agent pane lives on in `__review-diff` / `__review-editor`.
+///
+/// Moves the agent back into a fresh `window` window in the project session
+/// and clears the stale interface state, so the slot serves again with the
+/// same agent. Returns `true` when it recovered the agent. The stranded-slot
+/// resume must not relaunch in that case: a relaunch reseeds a second agent
+/// into a bare window and leaves the parked one running as a zombie.
+pub fn recover_parked_review_agent(project_name: &str, window: &str) -> bool {
+    let session = format!("shelbi-{project_name}");
+    if review_window_live(&session, window)
+        || read_session_var(&session, WS_KEY).as_deref() != Some(window)
+    {
+        return false;
+    }
+    let Some(chat) = read_session_var(&session, CHAT_KEY) else {
+        return false;
+    };
+    if !pane_alive_anywhere(&chat) {
+        return false;
+    }
+    let dst = format!("{session}:");
+    if tmux_run(&["break-pane", "-d", "-s", &chat, "-t", &dst, "-n", window]).is_err() {
+        return false;
+    }
+    // The agent is home. Pin it as the middle so teardown skips the swap-back,
+    // then drop the rest of the collapsed interface (its panel / diff / editor
+    // panes and every var). The next open rebuilds the panel around the agent.
+    let _ = set_session_var(&session, MID_KEY, &chat);
+    teardown_interface_state(&session);
+    true
 }
 
 /// The `sh -c` body that runs the review panel in its pane. Kept as a
@@ -1152,7 +1247,7 @@ mod tests {
 
     #[test]
     fn session_env_keys_are_distinct() {
-        let keys = [MID_KEY, PANEL_KEY, EDITOR_KEY, DIFF_KEY, CHAT_KEY, TASK_KEY];
+        let keys = INTERFACE_KEYS;
         let mut sorted = keys.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -1571,5 +1666,182 @@ mod tests {
             None => std::env::remove_var("SHELBI_HOME"),
         }
         let _ = std::fs::remove_dir_all(&home);
+    }
+    /// Spawn a detached pane running `sleep 600` by splitting `target`, and
+    /// return its pane id.
+    fn split_sleeper(target: &str) -> String {
+        let out = std::process::Command::new("tmux")
+            .args([
+                "split-window", "-h", "-d", "-t", target, "-P", "-F", "#{pane_id}", "sh", "-c",
+                "sleep 600",
+            ])
+            .output()
+            .expect("tmux split-window");
+        assert!(out.status.success(), "split-window into `{target}` failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Stand up the review interface on `review-1` as a View Diff leaves it:
+    /// the panel and the diff pane in the review window, the agent parked in
+    /// the stash session's `__review-diff` window, and every `SHELBI_REVIEW_*`
+    /// var pointing at them. Returns `(agent, panel, diff)` pane ids.
+    fn stage_view_diff_interface(session: &str, task_id: &str) -> (String, String, String) {
+        let agent = local_workspace_pane_id(session, "review-1").unwrap();
+        let panel = split_sleeper(&format!("{session}:review-1"));
+        let stash = format!("_{session}");
+        let ok = std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &stash, "-n", "__review-diff", "sh", "-c", "sleep 600"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "failed to create the stash session");
+        let diff = local_workspace_pane_id(&stash, "__review-diff").unwrap();
+        // View Diff: the diff pane takes the middle, the agent goes to the stash.
+        tmux_run(&["swap-pane", "-s", &diff, "-t", &agent]).unwrap();
+        for (key, value) in [
+            (TASK_KEY, task_id),
+            (WS_KEY, "review-1"),
+            (CHAT_KEY, agent.as_str()),
+            (MID_KEY, diff.as_str()),
+            (PANEL_KEY, panel.as_str()),
+            (DIFF_KEY, diff.as_str()),
+        ] {
+            set_session_var(session, key, value).unwrap();
+        }
+        assert!(!panel_pane_live(session, "review-1", &agent), "agent parked in the stash");
+        (agent, panel, diff)
+    }
+
+    fn assert_interface_cleared(session: &str) {
+        for key in INTERFACE_KEYS {
+            assert!(
+                read_session_var(session, key).is_none(),
+                "`{key}` must be cleared by the slot teardown"
+            );
+        }
+    }
+
+    /// Reap -> load on the same review slot. An orphan reap (or accept) after a
+    /// View Diff used to kill only the review window: the agent parked in the
+    /// stash survived as a zombie and the session kept stale `SHELBI_REVIEW_*`
+    /// vars, so the next load onto the slot came up bare. The slot teardown must
+    /// now release the whole interface, and the next load must build the panel.
+    #[test]
+    fn reap_after_view_diff_releases_the_interface_and_the_next_load_opens_clean() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
+
+        let proj = format!("review-reap-{}", std::process::id());
+        let home = std::env::temp_dir().join(format!("shelbi-review-reap-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&demo_project(&proj)).unwrap();
+
+        let session = format!("shelbi-{proj}");
+        crate::tmux_test_support::start_session(&session, "dashboard");
+        add_window(&session, "review-1");
+        let (agent, panel, diff) = stage_view_diff_interface(&session, "t-old");
+
+        // The orphan reap / accept close: kill the slot's pane.
+        let host = Host::Local;
+        let addr = shelbi_core::TmuxAddr {
+            session: session.clone(),
+            window: "review-1".into(),
+        };
+        crate::workspace::kill_workspace_pane(&host, &addr, "review-1").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(!review_window_live(&session, "review-1"), "the slot's window is reaped");
+        for (what, pane) in [("agent", &agent), ("panel", &panel), ("diff", &diff)] {
+            assert!(!pane_alive_anywhere(pane), "the {what} pane must not survive the reap");
+        }
+        assert_interface_cleared(&session);
+
+        // Load the next task onto the same slot: the dispatch brings up a fresh
+        // bare agent window, then the review interface is opened on it.
+        shelbi_state::save_task(&proj, &task_on("t-next", "review-1", Column::review()), "body")
+            .unwrap();
+        add_window(&session, "review-1");
+        let new_agent = local_workspace_pane_id(&session, "review-1").unwrap();
+        match open_review_interface(&proj, "t-next").unwrap() {
+            ReviewOpenOutcome::Opened(target) => assert_eq!(target, format!("{session}:review-1")),
+            other => panic!("expected the interface to open on the reloaded slot, got {other:?}"),
+        }
+        assert!(read_session_var(&session, PANEL_KEY).is_some(), "the panel is built");
+        assert_eq!(read_session_var(&session, TASK_KEY).as_deref(), Some("t-next"));
+        assert_eq!(read_session_var(&session, WS_KEY).as_deref(), Some("review-1"));
+        assert_eq!(read_session_var(&session, CHAT_KEY), Some(new_agent.clone()));
+        assert_eq!(read_session_var(&session, MID_KEY), Some(new_agent));
+
+        crate::tmux_test_support::kill_session(&format!("_{session}"));
+        crate::tmux_test_support::kill_session(&session);
+        match prev_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The review window collapses while the agent is parked in the stash (the
+    /// swapped-in diff pane and the panel both exited). The resume pass must get
+    /// the same agent back into the slot's window, not relaunch a second one.
+    /// If the slot is torn down in that state instead, the parked agent must be
+    /// reaped with it rather than left running as a zombie.
+    #[test]
+    fn a_parked_agent_is_recovered_or_reaped_when_the_review_window_collapses() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
+
+        let proj = format!("review-park-{}", std::process::id());
+        let session = format!("shelbi-{proj}");
+        crate::tmux_test_support::start_session(&session, "dashboard");
+        add_window(&session, "review-1");
+
+        let collapse = |panel: &str, diff: &str| {
+            let _ = tmux_run(&["kill-pane", "-t", diff]);
+            let _ = tmux_run(&["kill-pane", "-t", panel]);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(!review_window_live(&session, "review-1"), "the review window collapsed");
+        };
+
+        // Recovery: the parked agent is moved back into a `review-1` window.
+        let (agent, panel, diff) = stage_view_diff_interface(&session, "t-rev");
+        collapse(&panel, &diff);
+        assert!(
+            !recover_parked_review_agent(&proj, "review-2"),
+            "an interface bound to another slot is not this slot's agent"
+        );
+        assert!(recover_parked_review_agent(&proj, "review-1"));
+        assert!(panel_pane_live(&session, "review-1", &agent), "the same agent is back home");
+        assert_interface_cleared(&session);
+        assert!(
+            !recover_parked_review_agent(&proj, "review-1"),
+            "a live window needs no recovery"
+        );
+
+        // Teardown in the collapsed state reaps the parked agent too.
+        crate::tmux_test_support::kill_session(&format!("_{session}"));
+        let (agent, panel, diff) = stage_view_diff_interface(&session, "t-rev");
+        collapse(&panel, &diff);
+        let addr = shelbi_core::TmuxAddr {
+            session: session.clone(),
+            window: "review-1".into(),
+        };
+        crate::workspace::kill_workspace_pane(&Host::Local, &addr, "review-1").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!pane_alive_anywhere(&agent), "the parked agent must not survive as a zombie");
+        assert_interface_cleared(&session);
+
+        crate::tmux_test_support::kill_session(&format!("_{session}"));
+        crate::tmux_test_support::kill_session(&session);
     }
 }

@@ -1865,8 +1865,17 @@ pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -
     // around to collide with the next `task start`.
     match host {
         Host::Local => {
+            // Release any review interface built in this slot first, so the
+            // teardown clears the session's `SHELBI_REVIEW_*` state and the
+            // stashed diff / editor panes too, not just the window. Otherwise
+            // the next load onto the slot starts from stale state. It also
+            // returns the review agent when a View Diff / editor swap left it
+            // parked outside the window, so it's reaped below, not left behind
+            // as a zombie.
+            let stranded_agent =
+                crate::review_ui::release_slot_review_interface(&addr.session, &addr.window);
             let window_ids = local_slot_window_ids(host, addr)?;
-            if window_ids.is_empty() {
+            if window_ids.is_empty() && stranded_agent.is_none() {
                 return Ok(());
             }
             // No sidebar rescue is needed: the dashboard sidebar lives
@@ -1883,6 +1892,13 @@ pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -
             // first match.
             for id in &window_ids {
                 let _ = shelbi_ssh::run(host, ["tmux", "kill-window", "-t", id.as_str()])
+                    .map_err(Error::Io)?;
+            }
+            if let Some(pane) = stranded_agent {
+                // Re-mark: a killed window's wrapper may already have consumed
+                // the mark set above.
+                let _ = shelbi_state::mark_expected_teardown(workspace_name);
+                let _ = shelbi_ssh::run(host, ["tmux", "kill-pane", "-t", pane.as_str()])
                     .map_err(Error::Io)?;
             }
         }

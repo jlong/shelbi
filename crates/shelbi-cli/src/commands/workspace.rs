@@ -327,11 +327,15 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
     // so without this it looks like a live pane no active task points at and
     // gets mislabeled `orphaned session`. Map each review slot to the task it's
     // serving so `list` renders it as `review: <id>` (and the probe skips it).
-    let review: Vec<shelbi_state::IssueFile> = board
+    let mut review: Vec<shelbi_state::IssueFile> = board
         .iter()
         .filter(|tf| tf.task.column == Column::review())
         .cloned()
         .collect();
+    // Review-slot ownership comes from the local assignment overlay, not the
+    // index's publish-time `assigned_to` fold, which can lag a fresh review load
+    // and mislabel the serving slot `orphaned session`.
+    shelbi_state::fold_assignment_overlay(project, &p.issue_tracker, &mut review);
     let review_by_ws = review_assignments(&p, &review);
 
     let occupied = occupied_idle_workspaces(&p, &assigned, &review_by_ws)?;
