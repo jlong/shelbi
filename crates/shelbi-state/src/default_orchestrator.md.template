@@ -515,8 +515,12 @@ One bullet per event prefix. React to every matching line.
   merge-conditions flow owns this issue):
   - `conclusion=success` → the reviewed head is green, so finalize by moving the
     issue to `done` (`shelbi issue move <id> --to done
-    --reason "orchestrator:zen-merge"`). The workflow's `review -> done`
-    transition owns the merge, so do **not** run `shelbi zen pr-merge` here —
+    --reason "orchestrator:zen-merge pr=<pr>"`, quoting the `pr=<pr>` from the
+    `ci` line). Keep the reason on one line and use the `pr=<pr>` kv token
+    exactly — the event log folds spaces into underscores, and the activity feed
+    reads `pr=` back out of that normalized form to render the merge badge. The
+    workflow's `review -> done` transition owns the merge, so do **not** run
+    `shelbi zen pr-merge` here —
     that double-merges against the transition's own `merge` action and strands
     the card in `review`. This event is the trigger, not a second merge path.
   - `conclusion=failure` → bounce the issue back to its workspace to fix the

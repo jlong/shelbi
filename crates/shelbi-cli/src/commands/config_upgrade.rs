@@ -423,9 +423,11 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_orchestrator_instructions(entry, &text, out);
         sniff_orchestrator_active_dispatch(entry, &text, out);
         sniff_deprecated_task_command(entry, &text, out);
+        sniff_zen_merge_reason_format(entry, &text, out);
     } else if id.ends_with(".zenmode") {
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_pr_create_published_head(entry, &text, out);
+        sniff_zen_merge_reason_format(entry, &text, out);
     }
 }
 
@@ -1239,6 +1241,54 @@ fn sniff_zen_pr_create_published_head(
     ));
 }
 
+/// Detect an agent prose copy (orchestrator `instructions.md` or `zenmode.md`)
+/// that emits the Zen auto-merge reason in a pre-canonical format the activity
+/// feed can't render as a merge.
+///
+/// The canonical reason is `orchestrator:zen-merge pr=<n>`: it survives the
+/// space->underscore folding `append_task_event` applies (`pr=<n>` is a kv token
+/// the feed reads back out of the normalized form), so the feed renders the
+/// merge badge and the PR number. The pre-canonical copies never do:
+/// * the old `zenmode.md` emitted `orchestrator:zen-merge ci-green(<pr-number>)`
+///   — normalized to `orchestrator:zen-merge_ci-green(<n>)`, whose head never
+///   equals the parser's key, so it fell through to a generic row; and
+/// * the old orchestrator `instructions.md` emitted a bare
+///   `orchestrator:zen-merge` with no PR identifier at all.
+///
+/// A default change (one canonical reason format shared by the emitter, the
+/// parser, and the docs) only reaches NEW projects via the shipped templates;
+/// existing projects carry forked copies, so this sniffer hands the orchestrator
+/// a boot finding to refresh them (per the AGENTS.md "Changing shipped defaults"
+/// guardrail).
+///
+/// The fix is a prose refresh a user may have forked and customized, so it
+/// routes to [`Classification::NeedsJudgment`] for the orchestrator to repair
+/// its own copy rather than a mechanical rewrite clobbering local edits.
+fn sniff_zen_merge_reason_format(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    // Only copies that actually emit the zen-merge reason are in scope. A copy
+    // already carrying the canonical `pr=` token is current and must not
+    // re-surface (idempotent), matching the shipped defaults.
+    const MARKER: &str = "orchestrator:zen-merge";
+    const CANONICAL: &str = "orchestrator:zen-merge pr=";
+    if !text.contains(MARKER) || text.contains(CANONICAL) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        "ZEN_MERGE_REASON_FORMAT_STALE",
+        "the Zen auto-merge reason isn't the canonical `orchestrator:zen-merge pr=<n>` form, so \
+         the activity feed can't render it as a merge — the pre-canonical `ci-green(<n>)` and \
+         bare `orchestrator:zen-merge` variants normalize to a head the feed's parser doesn't \
+         recognize, dropping the row to a generic move with no merge badge",
+        "Emit the merge reason as `--reason \"orchestrator:zen-merge pr=<pr-number>\"` on one \
+         line, using the `pr=<n>` kv token exactly (the event log folds spaces into underscores \
+         and the feed reads `pr=` back out of that normalized form). Mirror the shipped default \
+         `zenmode.md` / orchestrator `instructions.md`.",
+        locate_line_containing(text, MARKER),
+    ));
+}
+
 /// Location of the first line containing `needle` (substring match), for
 /// anchoring a finding to where the deprecated wording first appears. Falls back
 /// to `1:1`. Unlike [`locate_line`], which needs a whole-line match.
@@ -1869,6 +1919,12 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              them — the deploy-time self-heal repairs only Shelbi's hook entries on \
              the workspace's next dispatch, preserving your keys, so this is reported \
              rather than auto-applied."
+        }
+        "ZEN_MERGE_REASON_FORMAT_STALE" => {
+            "The merge-finalize prose is free-form and user-customizable, so switching the \
+             zen-merge reason to the canonical `orchestrator:zen-merge pr=<n>` form can't be \
+             applied by a blind find-replace without risking local edits — the orchestrator \
+             repairs its own copy with judgment, preserving customizations."
         }
         _ => "This form is ambiguous or potentially lossy, so a human should confirm the fix.",
     }
@@ -2887,6 +2943,92 @@ mod tests {
             "the shipped default zenmode.md lost the `--match-published-head-commit` guidance: \
              {:?}",
             codes(&out),
+        );
+    }
+
+    // ---- zen-merge reason format ----------------------------------------
+
+    #[test]
+    fn zenmode_with_legacy_ci_green_merge_reason_is_needs_judgment() {
+        // The pre-canonical zenmode wording that normalizes to a head the feed
+        // can't render as a merge.
+        let text = "# Zen\n\nFinalize: `shelbi issue move <id> --to done --reason \
+                    \"orchestrator:zen-merge ci-green(<pr-number>)\"`.\n";
+        let mut out = Vec::new();
+        sniff_zen_merge_reason_format(&zen_entry(), text, &mut out);
+        let f = find(&out, "ZEN_MERGE_REASON_FORMAT_STALE").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+        // Anchored to where the deprecated wording first appears, not 1:1.
+        assert_eq!(f.location.line, 3);
+    }
+
+    #[test]
+    fn orchestrator_with_bare_zen_merge_reason_is_needs_judgment() {
+        // The pre-canonical orchestrator wording: a bare reason with no PR token.
+        let text = "# Orchestrator\n\nOn green CI: `shelbi issue move <id> --to done \
+                    --reason \"orchestrator:zen-merge\"`.\n";
+        let mut out = Vec::new();
+        sniff_zen_merge_reason_format(&orch_entry(), text, &mut out);
+        assert!(
+            find(&out, "ZEN_MERGE_REASON_FORMAT_STALE").is_some(),
+            "a bare `orchestrator:zen-merge` reason should be flagged: {:?}",
+            codes(&out),
+        );
+    }
+
+    #[test]
+    fn canonical_zen_merge_reason_is_clean() {
+        let text = "# Zen\n\nFinalize: `shelbi issue move <id> --to done --reason \
+                    \"orchestrator:zen-merge pr=<pr-number>\"`.\n";
+        let mut out = Vec::new();
+        sniff_zen_merge_reason_format(&zen_entry(), text, &mut out);
+        assert!(
+            find(&out, "ZEN_MERGE_REASON_FORMAT_STALE").is_none(),
+            "the canonical `orchestrator:zen-merge pr=<n>` reason should not be flagged: {:?}",
+            codes(&out),
+        );
+    }
+
+    #[test]
+    fn prose_without_any_zen_merge_reason_is_not_flagged() {
+        // A copy that never emits the merge reason (e.g. review-workspace project
+        // whose merge is human-driven) is out of scope — the sniff fires only on
+        // a copy that actually emits the reason.
+        let text = "# Custom\n\nThe human's `done` move drives the merge here.\n";
+        let mut out = Vec::new();
+        sniff_zen_merge_reason_format(&zen_entry(), text, &mut out);
+        assert!(find(&out, "ZEN_MERGE_REASON_FORMAT_STALE").is_none());
+    }
+
+    /// Drift guard: the shipped default zenmode.md and orchestrator
+    /// instructions.md must emit the canonical `orchestrator:zen-merge pr=<n>`
+    /// reason, so a freshly-materialized project never trips this sniffer. If
+    /// this fails, a template's merge-finalize step lost (or never had) the
+    /// `pr=` kv token.
+    #[test]
+    fn shipped_defaults_carry_the_canonical_zen_merge_reason() {
+        let mut out = Vec::new();
+        sniff_zen_merge_reason_format(&zen_entry(), shelbi_state::DEFAULT_ZENMODE, &mut out);
+        sniff_zen_merge_reason_format(
+            &orch_entry(),
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+            &mut out,
+        );
+        assert!(
+            find(&out, "ZEN_MERGE_REASON_FORMAT_STALE").is_none(),
+            "a shipped default no longer emits the canonical `orchestrator:zen-merge pr=<n>` \
+             reason: {:?}",
+            codes(&out),
+        );
+        // Guard the sniffer's precondition: both shipped defaults must actually
+        // mention the zen-merge reason, or the sniff silently stops firing.
+        assert!(
+            shelbi_state::DEFAULT_ZENMODE.contains("orchestrator:zen-merge")
+                && shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS
+                    .contains("orchestrator:zen-merge"),
+            "a shipped default no longer mentions `orchestrator:zen-merge` — the sniffer's \
+             scope check is now dead",
         );
     }
 

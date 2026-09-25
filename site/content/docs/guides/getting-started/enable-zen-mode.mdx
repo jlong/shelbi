@@ -183,7 +183,7 @@ the remote Git ref, not GitHub PR metadata. Repositories that require protected
 PR or merge-queue mutations stay in review for a human merge.
 
 ```
-2026-06-22T14:31:08+00:00 project=myapp task=tighten-rate-limit-error-copy workflow=task review -> done reason=orchestrator:zen-merge from_category=handoff to_category=done
+2026-06-22T14:31:08+00:00 project=myapp task=tighten-rate-limit-error-copy workflow=task review -> done reason=orchestrator:zen-merge_pr=241 from_category=handoff to_category=done
 ```
 
 The card lands in **Done** after GitHub reports the merge:
@@ -245,7 +245,7 @@ strings:
 | --- | --- |
 | `orchestrator:zen-promote category=<n>` | The orchestrator promoted a backlog card under judgment category `<n>`. |
 | `orchestrator:zen-decline reason-text=<short>` | A mechanically-eligible card was considered and explicitly left in backlog — the orchestrator surfaces it in its next reply. |
-| `orchestrator:zen-merge sha=<short>` | A reviewed issue cleared the bar and landed on `main`. |
+| `orchestrator:zen-merge pr=<n>` | A reviewed issue cleared the bar and landed on `main`. |
 
 `shelbi events tail --follow` shows the same lines in raw form if you
 want to watch from a shell.
