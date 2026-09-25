@@ -28,8 +28,8 @@ import type { CSSProperties, ReactNode } from "react"
  * Motion is entirely CSS: the card lifts on hover (`hover:` on the `group`
  * card) and each vignette does one tasteful, feature-appropriate thing via
  * `group-hover:` — a card slides one column right, a worker's task types in, a
- * new tmux line prints, review checks draw themselves, the file cursor steps
- * down, the newest commit slides into the log. Ambient life (the working dot,
+ * new tmux line prints, the review panel's Approve button presses and the PR
+ * merges, the file cursor steps down, the newest commit slides into the log. Ambient life (the working dot,
  * the prompt cursor) uses `motion-safe:animate-pulse`. Every transform / loop
  * is gated behind `motion-safe:` (or reset with `motion-reduce:`) so
  * `prefers-reduced-motion: reduce` gets a still, legible section.
@@ -51,6 +51,9 @@ const TUI_MAGENTA = "var(--tui-magenta)" // REVIEW category
 const TUI_GREEN = "var(--tui-green)" // DONE category + working badge
 const TUI_CYAN = "var(--tui-cyan)" // project name + review branch accent
 const TUI_SEL_BG = "var(--tui-sel-bg)" // selection / focus fill
+// `--tui-sel-fg` (text on the selection fill) is used directly as an arbitrary
+// Tailwind class (`text-[color:var(--tui-sel-fg)]`) in the review nav block.
+const TUI_RED = "var(--tui-light-red)" // Reject action (ANSI red)
 const TUI_TASK_BOX_BG = "var(--tui-task-box-bg)" // quiet callout block (kanban cards)
 const CHROME_BAR_BG = "var(--tui-chrome-bar-bg)"
 const CHROME_BAR_BORDER = "var(--tui-chrome-bar-border)"
@@ -291,44 +294,96 @@ function TmuxVignette() {
 }
 
 /**
- * Review flow: the REVIEW column (magenta) with the branch that landed there,
- * over the checklist a review agent holds every task to. On hover each check
- * draws itself in green, staggered top to bottom.
+ * Review flow: the left column of the real review window
+ * (`crates/shelbi-tui/src/review_panel.rs`) — a square back button, the
+ * `Ready for review` status (cyan) over the review worktree folder, the
+ * view-switcher nav block (🤓 Chat with Reviewer active, 🔀 View Diff, ✍️ Edit
+ * in Vim, 🌐 Open Browser), then the `— Actions —` group with green Approve /
+ * red Reject. At rest Chat holds the nav selection (white on the selection
+ * fill). On hover the selection moves to Approve, which fills green
+ * (reverse-video, the panel's pressed-button look) and then flips to the yellow
+ * `⠋ merging PR…` spinner state the panel shows while the gated PR merge runs —
+ * only states the real panel has. Every animated layer is `motion-safe:` gated,
+ * so `prefers-reduced-motion` gets the still resting panel.
  */
 function ReviewVignette() {
-  const rows = ["build passes", "lint clean", "tests green", "diff reviewed"]
+  // The view-switcher entries, in the real panel's order. Chat is the active
+  // (and initially selected) view; the rest are the other middle-pane views.
+  const nav = [
+    { glyph: "🤓", label: "Chat with Reviewer" },
+    { glyph: "🔀", label: "View Diff" },
+    { glyph: "✍️", label: "Edit in Vim" },
+    { glyph: "🌐", label: "Open Browser" },
+  ]
   return (
     <MiniTerminal title="shelbi · review">
-      <div className="text-[11px]">
-        <div className="mb-2 flex items-center gap-1.5" style={{ color: TUI_MAGENTA }}>
-          <span>▾</span> REVIEW
-          <span className="ml-auto truncate" style={{ color: TUI_CYAN }}>
-            ⎇ shelbi/deploy-staging-env
-          </span>
+      <div className="text-[11px] leading-tight">
+        {/* Square back button — arrow only, no label. */}
+        <span
+          className="mb-2 inline-flex h-4 w-6 items-center justify-center rounded-[3px] text-[10px]"
+          style={{ background: TUI_SEL_BG, color: TUI_GRAY }}
+        >
+          ←
+        </span>
+        {/* Status + worktree folder (left-truncated). */}
+        <div className="font-semibold" style={{ color: TUI_CYAN }}>
+          Ready for review
         </div>
-        <div className="flex flex-col gap-1.5">
-          {rows.map((label, i) => (
-            <div key={label} className="flex items-center gap-2">
-              <span
-                className="flex h-3 w-3 items-center justify-center rounded-[3px] border"
-                style={{ borderColor: TUI_DIVIDER }}
-              >
-                <svg viewBox="0 0 10 10" className="h-2 w-2" fill="none" style={{ color: TUI_GREEN }}>
-                  <path
-                    d="M1.5 5.2 4 7.5 8.5 2.5"
-                    stroke="currentColor"
-                    strokeWidth="1.5"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    pathLength={1}
-                    style={{ transitionDelay: `${i * 110}ms` }}
-                    className="[stroke-dasharray:1] [stroke-dashoffset:1] transition-[stroke-dashoffset] duration-300 ease-out motion-safe:group-hover:[stroke-dashoffset:0] motion-reduce:[stroke-dashoffset:0]"
+        <div className="mb-2 truncate" style={{ color: TUI_GRAY }}>
+          📂 …/wt/review
+        </div>
+        {/* View-switcher nav block: full-bleed selection fill on the active row,
+            mirroring the panel's edge-to-edge nav. */}
+        <div className="-mx-2.5 flex flex-col">
+          {nav.map((item, i) => {
+            const isChat = i === 0
+            return (
+              <div key={item.label} className="relative px-2.5 py-0.5">
+                {isChat && (
+                  <span
+                    className="absolute inset-0 transition-opacity duration-300 ease-out motion-safe:group-hover:opacity-0"
+                    style={{ background: TUI_SEL_BG }}
                   />
-                </svg>
-              </span>
-              <span style={{ color: TUI_GRAY }}>{label}</span>
-            </div>
-          ))}
+                )}
+                {isChat ? (
+                  <span className="relative whitespace-nowrap font-semibold text-[color:var(--tui-sel-fg)] transition-colors duration-300 ease-out motion-safe:group-hover:text-[color:var(--tui-cyan)]">
+                    {item.glyph} {item.label}
+                  </span>
+                ) : (
+                  <span className="relative whitespace-nowrap" style={{ color: TUI_GRAY }}>
+                    {item.glyph} {item.label}
+                  </span>
+                )}
+              </div>
+            )
+          })}
+        </div>
+        {/* Actions. */}
+        <div className="mb-1 mt-2" style={{ color: TUI_DARK_GRAY }}>
+          — Actions —
+        </div>
+        {/* Approve: rest (flat green) → pressed (green reverse-video) → the
+            yellow "merging PR…" spinner, layered and crossfaded on hover. Each
+            overlay is opaque so it fully covers the beat beneath it. */}
+        <div className="relative">
+          <div className="whitespace-nowrap" style={{ background: TUI_BG, color: TUI_GREEN }}>
+            [ ✅ Approve ]
+          </div>
+          <div
+            className="absolute inset-0 whitespace-nowrap opacity-0 motion-safe:group-hover:[animation:reviewApprovePress_2.4s_ease-in-out_forwards]"
+            style={{ background: TUI_GREEN, color: TUI_BG }}
+          >
+            [ ✅ Approve ]
+          </div>
+          <div
+            className="absolute inset-0 whitespace-nowrap font-semibold opacity-0 motion-safe:group-hover:[animation:reviewMerging_2.4s_ease-in-out_forwards]"
+            style={{ background: TUI_BG, color: TUI_YELLOW }}
+          >
+            [ ⠋ merging PR… ]
+          </div>
+        </div>
+        <div className="whitespace-nowrap" style={{ color: TUI_RED }}>
+          [ ❌ Reject ]
         </div>
       </div>
     </MiniTerminal>
