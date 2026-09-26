@@ -190,6 +190,14 @@ pub struct App {
     pub sidebar_index: usize,
     pub last_refresh: Instant,
     pub status_line: String,
+    /// Count of errors in this project's persistent log newer than the read
+    /// marker — drives the sidebar's unread-errors button (shown only when
+    /// non-zero). Recomputed each [`App::refresh`] from
+    /// [`shelbi_state::unread_error_count`], and zeroed the instant the log is
+    /// opened so the button disappears on the next render without waiting for a
+    /// refresh tick. Errors no longer flash in the footer status line; they land
+    /// in the log (see [`App::log_error`]) and surface through this button.
+    pub unread_errors: usize,
     /// Board freshness banner for the footer — `board 12s` when warm, `board 4m
     /// stale · quota resets 16:03` when the daemon index lags or is parked,
     /// `board 4m cached · no daemon` on a cache fallback. `None` for a local
@@ -222,6 +230,12 @@ pub struct App {
     /// frame by the sidebar renderer and read by the mouse-click handler to
     /// map a click coordinate back to a row index.
     pub list_area: Rect,
+    /// Screen-space rect of the unread-errors button when it is showing — the
+    /// bottom-left 5×3 block of the footer, written each frame by
+    /// [`crate::sidebar::render_footer`] and read by the mouse handler to route a
+    /// click onto it. `None` on any frame where no button is drawn (no unread
+    /// errors, or a footer too small to fit it).
+    pub error_button_area: Option<Rect>,
     /// Names of machines the user has collapsed in the Workspaces tree.
     /// Mirrored to `~/.shelbi/state.json::sidebar.collapsed_machines` so
     /// the choice survives a sidebar respawn and follows the user across
@@ -296,12 +310,14 @@ impl App {
             sidebar_index: 0,
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
+            unread_errors: 0,
             should_quit: false,
             zen_mode: ZenModeState::Off,
             zen_toggle_chord: ZenToggleChord::AltZ,
             keymaps: Keymaps::default(),
             display_style: DisplayStyle::detect(),
             list_area: Rect::default(),
+            error_button_area: None,
             collapsed_machines: BTreeSet::new(),
             daemon_version_line: None,
             daemon_version_mismatch: false,
@@ -354,6 +370,20 @@ impl App {
     /// [`DisplayStyle::detect`] per frame.
     pub fn display_style(&self) -> DisplayStyle {
         self.display_style
+    }
+
+    /// Whether a click at `(column, row)` lands on the unread-errors button.
+    /// `false` whenever the button isn't currently drawn (no unread errors, or a
+    /// footer too small to fit it), so the caller can fall through to row
+    /// hit-testing. Mirrors [`App::row_at`]'s coordinate contract.
+    pub fn error_button_contains(&self, column: u16, row: u16) -> bool {
+        let Some(area) = self.error_button_area else {
+            return false;
+        };
+        column >= area.x
+            && column < area.x.saturating_add(area.width)
+            && row >= area.y
+            && row < area.y.saturating_add(area.height)
     }
 
     /// Translate a click in terminal coordinates into a row index, if the
@@ -596,6 +626,14 @@ impl App {
         // refresh cadence so a stale red mismatch clears without requiring a
         // separate `shelbi reload sidebar`.
         self.probe_daemon_version();
+        // Reconcile the unread-errors button against the persistent log on the
+        // normal cadence — so an error logged by another pane (kanban/activity/
+        // review) of this project, or the read state after the popup marked
+        // everything seen, is reflected without a dedicated refresh. Best-effort:
+        // a read failure leaves the last-known count rather than flapping.
+        if let Ok(count) = shelbi_state::unread_error_count(&self.project_name) {
+            self.unread_errors = count;
+        }
         // Refresh the human-readable label from the project YAML. A load
         // failure (fresh/half-set-up project) leaves the slug showing.
         self.display_name = shelbi_state::load_project(&self.project_name)
@@ -800,7 +838,7 @@ impl App {
                 self.collapsed_machines.remove(machine);
             }
             Err(e) => {
-                self.status_line = format!("collapse `{machine}` failed: {e}");
+                self.log_error(&format!("collapse `{machine}` failed"), e);
             }
         }
     }
@@ -809,22 +847,22 @@ impl App {
         match view {
             View::Builtin(name) => match shelbi_orchestrator::show_view(&self.project_name, name) {
                 Ok(()) => self.status_line = format!("▶ {name}"),
-                Err(e) => self.status_line = format!("show view `{name}` failed: {e}"),
+                Err(e) => self.log_error(&format!("show view `{name}` failed"), e),
             },
             View::Workspace(name) => {
                 match shelbi_orchestrator::focus_workspace(&self.project_name, name) {
                     Ok(()) => self.status_line = format!("▶ {name}"),
-                    Err(e) => self.status_line = format!("focus `{name}` failed: {e}"),
+                    Err(e) => self.log_error(&format!("focus `{name}` failed"), e),
                 }
             }
             View::Agent(id) => {
                 let target = format!("shelbi-{}:{}", self.project_name, id);
                 let out = run_tmux(["select-window", "-t", &target]);
                 if !out {
-                    self.status_line = format!(
+                    self.log_error_message(&format!(
                         "couldn't switch to `{id}` — window not in this session \
                          (remote workspaces need `tmux attach -t shelbi-w-{id}` for now)"
-                    );
+                    ));
                 } else {
                     self.status_line = format!("▶ {id}");
                 }
@@ -892,7 +930,7 @@ impl App {
         let slots = match shelbi_orchestrator::load::review_slots(&self.project_name) {
             Ok(slots) => slots,
             Err(e) => {
-                self.status_line = format!("review slots query failed: {e}");
+                self.log_error("review slots query failed", e);
                 return;
             }
         };
@@ -1034,11 +1072,14 @@ impl App {
                 self.open_loaded_review_interface(&task_id, &target);
             }
             Ok(Err(e)) => {
-                self.status_line = format!("review load failed: {e}");
+                self.log_error("review load failed", e);
                 self.review_job = None;
             }
             Err(TryRecvError::Disconnected) => {
-                self.status_line = format!("review load for {} was interrupted", job.task_id);
+                self.log_error_message(&format!(
+                    "review load for {} was interrupted",
+                    job.task_id
+                ));
                 self.review_job = None;
             }
             Err(TryRecvError::Empty) => {
@@ -1107,7 +1148,7 @@ impl App {
             Ok(ReviewOpenOutcome::NeedsLaunch { workspace }) => {
                 self.start_review_load(id.to_string(), workspace)
             }
-            Err(e) => self.status_line = format!("review `{id}` failed: {e}"),
+            Err(e) => self.log_error(&format!("review `{id}` failed"), e),
         }
     }
 
@@ -1257,9 +1298,69 @@ impl App {
                 self.status_line = format!("zen {action}");
             }
             Err(e) => {
-                self.status_line = format!("zen toggle failed: {e}");
+                self.log_error("zen toggle failed", e);
             }
         }
+    }
+
+    /// Record an error to the project's persistent error log instead of flashing
+    /// it in the footer status line (where the next message overwrote it and a
+    /// restart lost it). `context` is the short human phrase describing what
+    /// failed; `err` is the underlying error, joined as `"{context}: {err}"`.
+    ///
+    /// Best-effort by design: a failed log write is swallowed so a disk hiccup
+    /// can never crash the sidebar (the whole point of routing errors here). The
+    /// unread count is bumped optimistically so the button appears immediately;
+    /// the next [`App::refresh`] reconciles it against disk.
+    pub fn log_error(&mut self, context: &str, err: impl std::fmt::Display) {
+        self.log_error_message(&format!("{context}: {err}"));
+    }
+
+    /// Record a pre-formed error message to the persistent log — the sibling of
+    /// [`App::log_error`] for the error sites whose text isn't a `context: err`
+    /// join (e.g. "review load for X was interrupted"). Same best-effort,
+    /// button-bumping semantics.
+    pub fn log_error_message(&mut self, message: &str) {
+        if shelbi_state::append_error(&self.project_name, message, None).is_ok() {
+            self.unread_errors = self.unread_errors.saturating_add(1);
+        }
+    }
+
+    /// Open the persistent error log in a centered `tmux display-popup` running
+    /// `shelbi __error-log <project>`, the same modal surface style as the
+    /// palette / review-load popups. The subcommand marks every entry read on
+    /// open, so on return we re-read the unread count from disk (dropping the
+    /// button) — recomputed rather than zeroed so an error that arrived while the
+    /// popup was up still shows. Blocks the sidebar loop while the popup is up,
+    /// exactly as the review-load confirm does.
+    pub fn open_error_log(&mut self) {
+        let bin = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.log_error("open error log failed", e);
+                return;
+            }
+        };
+        let cmd = format!(
+            "{} __error-log {}",
+            shelbi_agent::shell_escape(&bin.to_string_lossy()),
+            shelbi_agent::shell_escape(&self.project_name),
+        );
+        // `-B` suppresses tmux's own popup border so only the viewer's titled
+        // block frames the modal (one border, not two) — the same convention the
+        // review-load / reject popups use since they also draw their own border.
+        run_tmux([
+            "display-popup",
+            "-B",
+            "-E",
+            "-w",
+            "80%",
+            "-h",
+            "60%",
+            cmd.as_str(),
+        ]);
+        // The popup marked the log read on open; reconcile the button from disk.
+        self.unread_errors = shelbi_state::unread_error_count(&self.project_name).unwrap_or(0);
     }
 }
 
@@ -2035,6 +2136,91 @@ mod tests {
             .unwrap()
             .list_in_status(&Column::in_progress())
             .unwrap()
+    }
+
+    /// Errors route to the persistent log, not the footer status line, while
+    /// non-error status messages keep using the status line. This is the
+    /// error-vs-status split the whole feature turns on.
+    #[test]
+    fn log_error_persists_to_the_log_and_leaves_the_status_line_intact() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        let _home_env = EnvVarGuard::set("SHELBI_HOME", &home);
+
+        let mut app = App::new_sidebar("demo");
+        // A prior non-error status message is on the status line...
+        app.status_line = "▶ activity".into();
+
+        // ...logging an error must NOT overwrite it, and must land in the log.
+        app.log_error("zen toggle failed", "daemon unreachable");
+        assert_eq!(
+            app.status_line, "▶ activity",
+            "an error must not clobber a non-error status message"
+        );
+        assert_eq!(app.unread_errors, 1, "the button count is bumped");
+
+        let entries = shelbi_state::read_errors("demo").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message, "zen toggle failed: daemon unreachable");
+
+        // A pre-formed message routes the same way.
+        app.log_error_message("review load for t-1 was interrupted");
+        assert_eq!(app.status_line, "▶ activity");
+        assert_eq!(app.unread_errors, 2);
+        assert_eq!(shelbi_state::read_errors("demo").unwrap().len(), 2);
+    }
+
+    /// Opening the error log marks it read and drops the button count back to
+    /// zero on the next refresh — the unread state survives across a fresh
+    /// `App` (a restart) with everything already acknowledged.
+    #[test]
+    fn refresh_reconciles_the_unread_button_against_the_marked_log() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        let _home_env = EnvVarGuard::set("SHELBI_HOME", &home);
+
+        shelbi_state::append_error("demo", "a failed: x", None).unwrap();
+        shelbi_state::append_error("demo", "b failed: y", None).unwrap();
+
+        // A cold sidebar refresh picks up the unread count from disk.
+        let mut app = App::new_sidebar("demo");
+        app.refresh().ok();
+        assert_eq!(app.unread_errors, 2, "cold refresh reflects unread errors");
+
+        // Opening the log marks it read; a subsequent refresh clears the button.
+        shelbi_state::mark_errors_read("demo").unwrap();
+        app.refresh().ok();
+        assert_eq!(app.unread_errors, 0, "read errors leave no button");
+
+        // A brand-new App (restart) with everything already read shows no button.
+        let mut restarted = App::new_sidebar("demo");
+        restarted.refresh().ok();
+        assert_eq!(
+            restarted.unread_errors, 0,
+            "the read state survives a restart"
+        );
+    }
+
+    /// The button hitbox matches only clicks inside the recorded rect, and
+    /// never when no button is drawn — the guard the mouse handler leans on
+    /// before falling through to row hit-testing.
+    #[test]
+    fn error_button_contains_matches_only_inside_the_recorded_rect() {
+        let mut app = App::new_sidebar("demo");
+        assert!(
+            !app.error_button_contains(0, 0),
+            "no rect recorded => never a hit"
+        );
+        app.error_button_area = Some(Rect {
+            x: 2,
+            y: 10,
+            width: 5,
+            height: 3,
+        });
+        assert!(app.error_button_contains(2, 10), "top-left corner hits");
+        assert!(app.error_button_contains(6, 12), "bottom-right corner hits");
+        assert!(!app.error_button_contains(7, 10), "one past the right edge misses");
+        assert!(!app.error_button_contains(2, 13), "one past the bottom misses");
     }
 
     #[test]
@@ -4462,6 +4648,12 @@ mod tests {
 
     #[test]
     fn poll_review_load_surfaces_failure_and_clears_the_job() {
+        // A failed load now routes to the persistent error log, not the footer
+        // status line — so isolate SHELBI_HOME to a fresh dir and assert the log.
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        let _home_env = EnvVarGuard::set("SHELBI_HOME", &home);
+
         let mut app = App::new_sidebar("demo");
         let (tx, rx) = channel();
         app.review_job = Some(ReviewLoadJob {
@@ -4474,10 +4666,16 @@ mod tests {
         app.poll_review_load();
         assert!(app.review_job.is_none());
         assert!(
-            app.status_line.contains("review load failed")
-                && app.status_line.contains("busy"),
-            "got: {}",
+            app.status_line.is_empty(),
+            "errors no longer flash in the footer, got: {}",
             app.status_line
+        );
+        let entries = shelbi_state::read_errors("demo").unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.message.contains("review load failed") && e.message.contains("busy")),
+            "the failure lands in the error log, got: {entries:?}"
         );
     }
 
@@ -4574,29 +4772,33 @@ mod tests {
 
     #[test]
     fn on_active_window_dispatches_setup_only_on_a_change_to_a_review_window() {
+        // The setup path's error now routes to the persistent log, so isolate
+        // SHELBI_HOME to a fresh dir and assert the log rather than the footer.
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        let _home_env = EnvVarGuard::set("SHELBI_HOME", &home);
+
         let mut app = App::new_sidebar("demo");
         app.ready_review = vec![serving_entry("alpha", "review-1")];
 
         // First switch to a review window dispatches setup. With no tmux/
-        // project in the unit-test env `open_review_interface` errors, which
-        // surfaces on the status line naming the task — proof the window→task
-        // route fired.
+        // project in the unit-test env `open_review_interface` errors, which now
+        // lands in the error log naming the task — proof the window→task route
+        // fired.
         app.on_active_window("review-1".into());
         assert_eq!(app.last_active_window.as_deref(), Some("review-1"));
+        let after_first = shelbi_state::read_errors("demo").unwrap();
         assert!(
-            app.status_line.contains("alpha"),
-            "setup should have dispatched for the task on review-1, got: {}",
-            app.status_line
+            after_first.iter().any(|e| e.message.contains("alpha")),
+            "setup should have dispatched for the task on review-1, log: {after_first:?}"
         );
 
-        // Re-entering the same window is a no-op: clear the status line and
-        // confirm a repeat tick doesn't re-run setup.
-        app.status_line.clear();
+        // Re-entering the same window is a no-op: no new error is logged.
         app.on_active_window("review-1".into());
-        assert!(
-            app.status_line.is_empty(),
-            "re-entering an already-current window must not re-run setup, got: {}",
-            app.status_line
+        assert_eq!(
+            shelbi_state::read_errors("demo").unwrap().len(),
+            after_first.len(),
+            "re-entering an already-current window must not re-run setup",
         );
     }
 
