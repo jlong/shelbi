@@ -11,7 +11,7 @@ import type { CSSProperties, ReactNode } from "react"
  * carries the accessible feature list. Cards alternate vignette-top vs
  * vignette-bottom so the columns stagger rather than align in rows.
  *
- * Each vignette shares the site's mockup design language (see
+ * Most vignettes share the site's mockup design language (see
  * `KanbanMockup.tsx`): a compact macOS-Terminal frame — traffic-light dots, a
  * `shelbi · <view>` / `jlong@hub — <cmd>` title bar, and a `--tui-bg` canvas —
  * wrapping a full-color slice of the real Shelbi TUI. Color comes from the same
@@ -19,17 +19,19 @@ import type { CSSProperties, ReactNode } from "react"
  * columns read blue / yellow / magenta / green (TO DO / IN PROGRESS / REVIEW /
  * DONE — `category_color()` in the crate), the working `⏵` badge is green, the
  * project/review accents are cyan, and everything inverts with the light/dark
- * toggle for free. Details stay grounded in `crates/shelbi-tui` and the CLI:
- * the real board columns, the sidebar's `— Workspaces —` section with `▾ hub` /
- * `▾ devbox` groups and `⏵`/`·` badges, a tmux pane with a green status bar and
- * `❯` prompt, the `⎇ shelbi/<id>` branch meta, real `shelbi` commands,
- * `tasks/*.md` + `workflows/*.yaml` paths, and 7-char commit hashes.
+ * toggle for free. The "Open source" card is the one exception: it drops the
+ * terminal chrome for a plain centered frame holding a single open-source mark
+ * (see `OpenSourceVignette`). Details stay grounded in `crates/shelbi-tui` and
+ * the CLI: the real board columns, the sidebar's `— Workspaces —` section with
+ * `▾ hub` / `▾ devbox` groups and `⏵`/`·` badges, a tmux pane with a green
+ * status bar and `❯` prompt, the `⎇ shelbi/<id>` branch meta, real `shelbi`
+ * commands, and `tasks/*.md` + `workflows/*.yaml` paths.
  *
  * Motion is entirely CSS: the card lifts on hover (`hover:` on the `group`
  * card) and each vignette does one tasteful, feature-appropriate thing via
  * `group-hover:` — a card slides one column right, a worker's task types in, a
  * new tmux line prints, review checks draw themselves, the file cursor steps
- * down, the newest commit slides into the log. Ambient life (the working dot,
+ * down, the open-source mark brightens. Ambient life (the working dot,
  * the prompt cursor) uses `motion-safe:animate-pulse`. Every transform / loop
  * is gated behind `motion-safe:` (or reset with `motion-reduce:`) so
  * `prefers-reduced-motion: reduce` gets a still, legible section.
@@ -376,50 +378,52 @@ function FileTreeVignette() {
 }
 
 /**
- * Open source: an MIT badge over a couple of commit-log lines with real 7-char
- * hashes (git's yellow). On hover the newest commit slides into the top of the
- * log and the star tick fills in.
+ * Open source: a single centered mark on a plain `--tui-bg` frame (no terminal
+ * title bar or traffic lights), with a small "MIT licensed" caption in the mono
+ * style beneath it. The mark is an original inline unrolled-scroll SVG — an
+ * open document, reading as "open source" — drawn in the neutral
+ * `--tui-gray`/`--tui-fg` palette via `currentColor` so it inverts with the
+ * light/dark toggle for free. We deliberately don't use the OSI "keyhole" logo:
+ * OSI's trademark guidelines allow it for OSI-licensed projects only with an
+ * `®`, an attribution line, and a hyperlink to opensource.org, and forbid
+ * recoloring, none of which fits a clean decorative vignette. On hover the mark
+ * brightens from gray to full foreground; the effect is gated behind
+ * `motion-safe:` so `prefers-reduced-motion` gets a still, legible mark.
  */
 function OpenSourceVignette() {
-  const commits = [
-    { hash: "84d863e", msg: "feat(review): serve recipe" },
-    { hash: "ae38b70", msg: "fix(tui): clamp sidebar" },
-  ]
   return (
-    <MiniTerminal title="jlong@hub — git log">
-      <div className="text-[11px]">
-        <div className="mb-2 flex items-center gap-2">
-          <span
-            className="inline-block rounded border px-1.5 py-0.5 text-[10px] font-semibold tracking-wide"
-            style={{ borderColor: TUI_DIVIDER, color: TUI_FG }}
-          >
-            MIT
-          </span>
-          <span style={{ color: TUI_CYAN }}>main</span>
-          <span className="ml-auto text-[color:var(--tui-divider)] transition-colors duration-200 group-hover:text-[color:var(--tui-yellow)]">
-            ★
-          </span>
-        </div>
-        <div className="max-h-0 overflow-hidden opacity-0 transition-all duration-300 ease-out motion-safe:group-hover:max-h-5 motion-safe:group-hover:opacity-100">
-          <div className="flex items-center gap-2 pb-1.5">
-            <span style={{ color: TUI_YELLOW }}>dea6e14</span>
-            <span className="truncate" style={{ color: TUI_GRAY }}>
-              site: rework feature grid
-            </span>
-          </div>
-        </div>
-        <div className="flex flex-col gap-1.5">
-          {commits.map((c) => (
-            <div key={c.hash} className="flex items-center gap-2">
-              <span style={{ color: TUI_YELLOW }}>{c.hash}</span>
-              <span className="truncate" style={{ color: TUI_GRAY }}>
-                {c.msg}
-              </span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </MiniTerminal>
+    <div
+      aria-hidden="true"
+      className="flex min-h-[132px] flex-col items-center justify-center gap-3 overflow-hidden rounded-md border shadow-sm transition-shadow duration-200 group-hover:shadow-md"
+      style={{ borderColor: CHROME_BAR_BORDER, background: TUI_BG }}
+    >
+      <span className="text-[color:var(--tui-gray)] transition-colors duration-200 motion-safe:group-hover:text-[color:var(--tui-fg)]">
+        <svg
+          width={44}
+          height={44}
+          viewBox="0 0 48 48"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={2.5}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          {/* Top roll, wider than the sheet so its cylinder reads clearly. */}
+          <rect x={9} y={6} width={30} height={7} rx={3.5} />
+          {/* Bottom roll. */}
+          <rect x={9} y={35} width={30} height={7} rx={3.5} />
+          {/* Unrolled sheet between the two rolls. */}
+          <path d="M14 12 H34 V36 H14 Z" />
+          {/* Text lines on the sheet. */}
+          <path d="M19 18 H29" strokeWidth={2} />
+          <path d="M19 24 H29" strokeWidth={2} />
+          <path d="M19 30 H25" strokeWidth={2} />
+        </svg>
+      </span>
+      <span className="font-mono text-[10px] tracking-wide" style={{ color: TUI_DARK_GRAY }}>
+        MIT licensed
+      </span>
+    </div>
   )
 }
 
