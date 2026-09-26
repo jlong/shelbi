@@ -380,8 +380,8 @@ function FileTreeVignette() {
 /**
  * Open source: a single centered mark on a plain `--tui-bg` frame (no terminal
  * title bar or traffic lights), with a small "MIT licensed" caption in the mono
- * style beneath it. The mark is an original inline open-padlock SVG — a lock
- * whose shackle is swung open, reading as "open source" — drawn in the neutral
+ * style beneath it. The mark is an original inline unrolled-scroll SVG — an
+ * open document, reading as "open source" — drawn in the neutral
  * `--tui-gray`/`--tui-fg` palette via `currentColor` so it inverts with the
  * light/dark toggle for free. We deliberately don't use the OSI "keyhole" logo:
  * OSI's trademark guidelines allow it for OSI-licensed projects only with an
@@ -408,13 +408,15 @@ function OpenSourceVignette() {
           strokeLinecap="round"
           strokeLinejoin="round"
         >
-          {/* Lock body. */}
-          <rect x={13} y={23} width={22} height={18} rx={3.5} />
-          {/* Shackle, swung open — the left leg hovers clear of the body. */}
-          <path d="M31 23 V13 A7 7 0 0 0 17 13 V18" />
-          {/* Keyhole. */}
-          <circle cx={24} cy={30} r={2.2} fill="currentColor" stroke="none" />
-          <path d="M24 31.6 V35.4" strokeWidth={2} />
+          {/* Left roll. */}
+          <path d="M9 16 A4 4 0 0 1 9 24 H13 V16 Z" />
+          {/* Right roll. */}
+          <path d="M39 32 A4 4 0 0 0 39 24 H35 V32 Z" />
+          {/* Unrolled sheet between the two rolls. */}
+          <path d="M13 16 H35 V32 H13 Z" />
+          {/* Text lines on the sheet. */}
+          <path d="M18 21.5 H30" strokeWidth={2} />
+          <path d="M18 26.5 H26" strokeWidth={2} />
         </svg>
       </span>
       <span className="font-mono text-[10px] tracking-wide" style={{ color: TUI_DARK_GRAY }}>
