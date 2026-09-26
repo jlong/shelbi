@@ -408,16 +408,16 @@ function OpenSourceVignette() {
           strokeLinecap="round"
           strokeLinejoin="round"
         >
-          {/* Left roll, taller than the sheet so its cylinder reads clearly. */}
-          <rect x={7.5} y={9} width={7} height={30} rx={3.5} />
-          {/* Right roll. */}
-          <rect x={33.5} y={9} width={7} height={30} rx={3.5} />
+          {/* Top roll, wider than the sheet so its cylinder reads clearly. */}
+          <rect x={9} y={6} width={30} height={7} rx={3.5} />
+          {/* Bottom roll. */}
+          <rect x={9} y={35} width={30} height={7} rx={3.5} />
           {/* Unrolled sheet between the two rolls. */}
-          <path d="M14 13 H34 V35 H14 Z" />
+          <path d="M14 12 H34 V36 H14 Z" />
           {/* Text lines on the sheet. */}
-          <path d="M19 19 H29" strokeWidth={2} />
+          <path d="M19 18 H29" strokeWidth={2} />
           <path d="M19 24 H29" strokeWidth={2} />
-          <path d="M19 29 H25" strokeWidth={2} />
+          <path d="M19 30 H25" strokeWidth={2} />
         </svg>
       </span>
       <span className="font-mono text-[10px] tracking-wide" style={{ color: TUI_DARK_GRAY }}>
