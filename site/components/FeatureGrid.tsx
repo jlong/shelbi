@@ -380,15 +380,12 @@ function FileTreeVignette() {
 /**
  * Open source: a single centered mark on a plain `--tui-bg` frame (no terminal
  * title bar or traffic lights), with a small "MIT licensed" caption in the mono
- * style beneath it. The mark is an original inline unrolled-scroll SVG — an
- * open document, reading as "open source" — drawn in the neutral
- * `--tui-gray`/`--tui-fg` palette via `currentColor` so it inverts with the
- * light/dark toggle for free. We deliberately don't use the OSI "keyhole" logo:
- * OSI's trademark guidelines allow it for OSI-licensed projects only with an
- * `®`, an attribution line, and a hyperlink to opensource.org, and forbid
- * recoloring, none of which fits a clean decorative vignette. On hover the mark
- * brightens from gray to full foreground; the effect is gated behind
- * `motion-safe:` so `prefers-reduced-motion` gets a still, legible mark.
+ * style beneath it. The mark is the OSI "keyhole" logo (pulled from the
+ * project's Figma file, node `2054:2`), drawn in the neutral `--tui-gray`/
+ * `--tui-fg` palette via `currentColor` so it inverts with the light/dark
+ * toggle for free. On hover the mark brightens from gray to full foreground;
+ * the effect is gated behind `motion-safe:` so `prefers-reduced-motion` gets a
+ * still, legible mark.
  */
 function OpenSourceVignette() {
   return (
@@ -398,26 +395,8 @@ function OpenSourceVignette() {
       style={{ borderColor: CHROME_BAR_BORDER, background: TUI_BG }}
     >
       <span className="text-[color:var(--tui-gray)] transition-colors duration-200 motion-safe:group-hover:text-[color:var(--tui-fg)]">
-        <svg
-          width={44}
-          height={44}
-          viewBox="0 0 48 48"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={2.5}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          {/* Top roll, wider than the sheet so its cylinder reads clearly. */}
-          <rect x={9} y={6} width={30} height={7} rx={3.5} />
-          {/* Bottom roll. */}
-          <rect x={9} y={35} width={30} height={7} rx={3.5} />
-          {/* Unrolled sheet between the two rolls. */}
-          <path d="M14 12 H34 V36 H14 Z" />
-          {/* Text lines on the sheet. */}
-          <path d="M19 18 H29" strokeWidth={2} />
-          <path d="M19 24 H29" strokeWidth={2} />
-          <path d="M19 30 H25" strokeWidth={2} />
+        <svg width={36} height={36} viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeWidth={1.5}>
+          <path d="M2.80591 23.1355C4.37734 26.0412 6.86154 28.3427 9.86785 29.6893C10.1199 29.8022 10.4122 29.6789 10.5166 29.4232L13.9432 21.0351C14.0476 20.7794 13.9235 20.4897 13.6797 20.36C12.8252 19.9053 12.1196 19.2074 11.6557 18.3495C11.1121 17.3444 10.9339 16.1819 11.1513 15.0601C11.3687 13.9384 11.9684 12.9267 12.8481 12.1975C13.7279 11.4683 14.8332 11.0667 15.9759 11.0611C17.1185 11.0555 18.2277 11.4463 19.1145 12.1669C20.0014 12.8874 20.6109 13.8932 20.8393 15.0128C21.0677 16.1324 20.9008 17.2965 20.3671 18.3069C19.9116 19.1693 19.2128 19.8741 18.3628 20.3371C18.1203 20.4692 17.999 20.7601 18.1059 21.0147L21.6143 29.369C21.7213 29.6236 22.0148 29.744 22.2657 29.6287C25.2587 28.2527 27.7203 25.9271 29.2632 23.0062C30.8842 19.9377 31.391 16.402 30.6973 13.0018C30.0036 9.60146 28.1524 6.54687 25.4591 4.35846C22.7658 2.17005 19.397 0.983213 15.9267 1.00018C12.4564 1.01715 9.09933 2.23686 6.42753 4.4515C3.75572 6.66614 1.93447 9.73868 1.27409 13.1456C0.61371 16.5525 1.15506 20.083 2.80591 23.1355Z" />
         </svg>
       </span>
       <span className="font-mono text-[10px] tracking-wide" style={{ color: TUI_DARK_GRAY }}>
