@@ -370,3 +370,33 @@ html:not(.dark) pre.shiki span {
   font-weight: var(--shiki-light-font-weight) !important;
   text-decoration: var(--shiki-light-text-decoration) !important;
 }
+
+/* FeatureGrid "Review flow" vignette (site/components/FeatureGrid.tsx): the
+   Approve button's hover sequence — a green reverse-video press that hands off
+   to the yellow "merging PR…" spinner. Two overlays crossfade over one 2.4s
+   timeline; each is opaque so it covers the beat beneath it. Both are applied
+   only under `motion-safe:group-hover:`, so reduced-motion never runs them. */
+@keyframes reviewApprovePress {
+  0%,
+  8% {
+    opacity: 0;
+  }
+  18%,
+  55% {
+    opacity: 1;
+  }
+  68%,
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes reviewMerging {
+  0%,
+  60% {
+    opacity: 0;
+  }
+  72%,
+  100% {
+    opacity: 1;
+  }
+}
