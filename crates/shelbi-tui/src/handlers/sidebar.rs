@@ -185,7 +185,12 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     // while it's up.
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(idx) = app.row_at(mouse.column, mouse.row) {
+            // The unread-errors button overlaps the footer, below the row list,
+            // so test it first — a click there opens the error log rather than
+            // falling through to (and missing) a row.
+            if app.error_button_contains(mouse.column, mouse.row) {
+                app.open_error_log();
+            } else if let Some(idx) = app.row_at(mouse.column, mouse.row) {
                 app.sidebar_index = idx;
                 app.activate_selection();
             }

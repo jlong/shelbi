@@ -462,7 +462,17 @@ fn title_case(s: &str) -> String {
     }
 }
 
-fn render_footer(f: &mut Frame, app: &App, area: Rect) {
+/// The unread-errors button is a solid 5-wide × 3-tall block anchored to the
+/// footer's bottom-left corner, with a single bold `!` in its center cell. The
+/// three footer rows it overlaps (keybinds / version / zen) shift right by
+/// [`ERROR_BUTTON_W`] + 1 while it shows, so it never paints over their text.
+pub(crate) const ERROR_BUTTON_W: u16 = 5;
+pub(crate) const ERROR_BUTTON_H: u16 = 3;
+/// Reddish-gray fill — muted enough to read as chrome, warm enough to signal
+/// something's wrong, and legible in both light and dark terminals.
+const ERROR_BUTTON_BG: Color = Color::Rgb(110, 70, 70);
+
+fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
     // Vertical rhythm is fixed: [status?] keybinds, blank, zen-row. The
     // zen row sits at the same y-coordinate whether Zen is On or Off so
     // toggling never nudges the keybind line above.
@@ -477,22 +487,43 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         .constraints(constraints)
         .split(area);
 
-    // Indent for status + keybinds matches the list's 1-col horizontal
-    // padding. The zen row deliberately bypasses this so its background
-    // can reach the sidebar edge.
-    let indent = Margin {
-        horizontal: 1,
-        vertical: 0,
+    // The unread-errors button only shows when there are unread errors and the
+    // footer is wide enough to fit the button plus a gap before the shifted
+    // rows. When it shows, the keybinds/version/zen rows slide right by
+    // `ERROR_BUTTON_W + 1` so their text clears the button block. `first_fixed`
+    // is the index of the keybinds row (the first of the three fixed rows the
+    // button overlaps).
+    let first_fixed = if has_status { 1 } else { 0 };
+    let show_button =
+        app.unread_errors > 0 && area.width > ERROR_BUTTON_W + 1 && rows.len() >= first_fixed + 3;
+    let content_x = area.x + if show_button { ERROR_BUTTON_W + 1 } else { 1 };
+    // The left edge available to the shifted rows; the `-1` on the no-button
+    // path preserves the original 1-col right gutter parity.
+    let content_w = area
+        .width
+        .saturating_sub(content_x - area.x)
+        .saturating_sub(if show_button { 0 } else { 1 });
+    // Sub-rect of one fixed row, offset for the button when it shows.
+    let content_row = |row: Rect| Rect {
+        x: content_x,
+        width: content_w,
+        ..row
     };
+
     let mut idx = 0;
     if has_status {
+        // The status row sits above the button and keeps the full-width 1-col
+        // indent — only the three fixed rows below it shift for the button.
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 app.status_line.clone(),
                 Style::default().fg(Color::Yellow),
             )))
             .wrap(Wrap { trim: true }),
-            rows[idx].inner(indent),
+            rows[idx].inner(Margin {
+                horizontal: 1,
+                vertical: 0,
+            }),
         );
         idx += 1;
     }
@@ -508,17 +539,70 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             keybinds,
             Style::default().fg(Color::DarkGray),
         ))),
-        rows[idx].inner(indent),
+        content_row(rows[idx]),
     );
     idx += 1;
 
     // Version row (the former blank spacer): daemon/CLI version refreshed
     // with the sidebar state, painted red when the running daemon doesn't
     // match this binary. Blank until probed, so the rhythm is unchanged.
-    render_version_row(f, rows[idx].inner(indent), app);
+    render_version_row(f, content_row(rows[idx]), app);
     idx += 1;
 
-    render_zen_row(f, rows[idx], app);
+    // The zen row paints edge-to-edge (its ON band reaches both sidebar edges),
+    // so it keeps the full-width rect when no button shows — only the button
+    // case narrows it to clear the block.
+    let zen_area = if show_button {
+        content_row(rows[idx])
+    } else {
+        rows[idx]
+    };
+    render_zen_row(f, zen_area, app);
+
+    // Paint the button last so it sits on top of the (now-clear) bottom-left
+    // 5×3 block, and record its rect for the mouse handler. Cleared to `None`
+    // on every frame it isn't shown so a stale hitbox can't linger.
+    if show_button {
+        let button = Rect {
+            x: area.x,
+            y: rows[first_fixed].y,
+            width: ERROR_BUTTON_W,
+            height: ERROR_BUTTON_H,
+        };
+        render_error_button(f, button);
+        app.error_button_area = Some(button);
+    } else {
+        app.error_button_area = None;
+    }
+}
+
+/// Draw the unread-errors button: a solid reddish-gray 5×3 block with a single
+/// bold white `!` in the center cell. No border — the fill is the affordance.
+fn render_error_button(f: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let style = Style::default()
+        .bg(ERROR_BUTTON_BG)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let mid_col = (area.width / 2) as usize;
+    let mid_row = area.height / 2;
+    let lines: Vec<Line> = (0..area.height)
+        .map(|r| {
+            let content: String = (0..area.width as usize)
+                .map(|c| {
+                    if r == mid_row && c == mid_col {
+                        '!'
+                    } else {
+                        ' '
+                    }
+                })
+                .collect();
+            Line::from(Span::styled(content, style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn status_row_height(app: &App) -> u16 {
@@ -831,6 +915,73 @@ mod tests {
         assert!(
             joined.contains("settings"),
             "the old one-row footer clipped the final word:\n{joined}"
+        );
+    }
+
+    fn leading_spaces(s: &str) -> usize {
+        s.chars().take_while(|c| *c == ' ').count()
+    }
+
+    /// With no unread errors the footer looks like today — no button block and
+    /// no recorded hitbox. Bumping the unread count paints a solid 5×3
+    /// reddish-gray block with a bold `!` centered in the bottom-left corner and
+    /// records its rect for the mouse handler.
+    #[test]
+    fn unread_error_button_appears_only_with_unread_errors() {
+        // No unread errors: no button, no hitbox.
+        let mut app = App::new_sidebar("demo");
+        let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        assert!(
+            app.error_button_area.is_none(),
+            "no button hitbox without unread errors"
+        );
+
+        // With unread errors: a 5×3 block in the bottom-left, `!` centered.
+        let mut app = App::new_sidebar("demo");
+        app.unread_errors = 3;
+        let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let area = app.error_button_area.expect("button hitbox recorded");
+        assert_eq!((area.width, area.height), (ERROR_BUTTON_W, ERROR_BUTTON_H));
+        assert_eq!(area.x, 0, "button anchors to the sidebar's left edge");
+
+        let buf = term.backend().buffer().clone();
+        // Center cell carries the bold `!`.
+        let cx = area.x + area.width / 2;
+        let cy = area.y + area.height / 2;
+        assert_eq!(buf[(cx, cy)].symbol(), "!", "the `!` sits in the center cell");
+        // Every button cell carries the reddish-gray fill.
+        for dy in 0..area.height {
+            for dx in 0..area.width {
+                assert_eq!(
+                    buf[(area.x + dx, area.y + dy)].bg,
+                    ERROR_BUTTON_BG,
+                    "button cell ({dx},{dy}) must carry the reddish-gray fill"
+                );
+            }
+        }
+    }
+
+    /// While the button shows, the keybinds/version/zen rows slide right past it
+    /// (from the 1-col indent to `ERROR_BUTTON_W + 1`) so their text never sits
+    /// under the block.
+    #[test]
+    fn footer_rows_shift_right_while_the_button_shows() {
+        let row_indent = |unread: usize| -> usize {
+            let mut app = App::new_sidebar("demo");
+            bind(&mut app, Some("ctrl-p"), Some("q"));
+            app.unread_errors = unread;
+            let mut term = Terminal::new(TestBackend::new(40, 16)).unwrap();
+            term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+            let rows = dump(&term);
+            leading_spaces(&rows[row_y(&rows, "palette")])
+        };
+        assert_eq!(row_indent(0), 1, "no button: the keybinds row keeps 1-col indent");
+        assert_eq!(
+            row_indent(3),
+            (ERROR_BUTTON_W + 1) as usize,
+            "with button: the keybinds row shifts clear of the block"
         );
     }
 
