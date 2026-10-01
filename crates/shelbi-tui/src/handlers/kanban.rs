@@ -95,6 +95,10 @@ pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Ou
         Some(KanbanAction::OpenPopover) => app.open_popover(),
         Some(KanbanAction::Refresh) => app.refresh(),
         Some(KanbanAction::CycleWorkflowFilter) => app.cycle_workflow_filter(),
+        Some(KanbanAction::OpenWorkspace) => {
+            let ws = app.selected_task().and_then(|tf| tf.task.assigned_to.clone());
+            app.open_assigned_workspace(ws);
+        }
         None => {
             // The dropdown toggles live outside the action enum for now —
             // dropdown-open is a transient UI mode, not a stand-alone
@@ -200,6 +204,16 @@ pub fn handle_popover_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) {
         Some(PopoverAction::ScrollHome) => app.popover_scroll_home(),
         Some(PopoverAction::MoveLeft) => app.popover_move_left(),
         Some(PopoverAction::MoveRight) => app.popover_move_right(),
+        // Jump to the open card's assigned workspace. Close the modal on a
+        // successful switch so returning to the board lands on a clean view;
+        // a card with no workspace keeps the popover open (the header already
+        // shows it has none, and the `o` hint is suppressed there).
+        Some(PopoverAction::OpenWorkspace) => {
+            let ws = app.popover_task().and_then(|tf| tf.task.assigned_to.clone());
+            if app.open_assigned_workspace(ws) {
+                app.close_popover();
+            }
+        }
         None => {}
     }
 }
@@ -311,6 +325,25 @@ mod tests {
             },
             body: String::new(),
         }
+    }
+
+    #[test]
+    fn o_on_board_without_workspace_reports_and_opens_no_popover() {
+        // `o` jumps to the selected card's workspace. For a card with none,
+        // the wire must stay on the board (no popover), take the
+        // no-workspace branch (status line set), and not shell out. We only
+        // assert the None path here — the switch itself spawns `shelbi open`.
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let km = fresh_keymaps();
+        let mut app = KanbanApp::new("demo");
+        app.tasks = vec![task_file("task-1", Column::backlog())];
+        app.selected_column = 0;
+        app.selected_row = 0;
+        app.status_line.clear();
+        let out = handle_kanban_key(&mut app, key(KeyCode::Char('o')), &km);
+        assert_eq!(out, Outcome::Continue);
+        assert!(!app.popover_is_open(), "the jump never opens the popover");
+        assert_eq!(app.status_line, "no workspace assigned to this card");
     }
 
     #[test]

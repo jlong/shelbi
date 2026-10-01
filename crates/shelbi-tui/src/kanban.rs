@@ -1355,6 +1355,40 @@ impl KanbanApp {
         self.move_card(&id, new_col_idx);
     }
 
+    /// Switch the tmux client to the chat of the workspace a card is
+    /// assigned to. `assigned_to` is the card's `assigned_to` field — the
+    /// bare workspace name (no `@`); callers pass `selected_task()`'s value
+    /// on the board and `popover_task()`'s when a card is open, so the jump
+    /// works whether or not the card detail is showing.
+    ///
+    /// Reuses [`shelbi_orchestrator::focus_workspace`] — the same
+    /// focus-or-create path the sidebar's Enter-on-workspace and the
+    /// command palette use — so it transparently handles idle, remote, and
+    /// not-yet-opened workspace windows rather than issuing a raw
+    /// `select-window` that would fail for those.
+    ///
+    /// Returns `true` only when it actually switched, so a caller like the
+    /// popover handler can close the modal on a successful jump. A card with
+    /// no workspace leaves the board where it is and surfaces that in the
+    /// status line (the `o` hint is also hidden for such a card), satisfying
+    /// the "clearly indicate there is no workspace" contract.
+    pub fn open_assigned_workspace(&mut self, assigned_to: Option<String>) -> bool {
+        let Some(ws) = assigned_to else {
+            self.status_line = "no workspace assigned to this card".to_string();
+            return false;
+        };
+        match shelbi_orchestrator::focus_workspace(&self.project_name, &ws) {
+            Ok(()) => {
+                self.status_line = format!("▶ @{ws}");
+                true
+            }
+            Err(e) => {
+                self.status_line = format!("open @{ws} failed: {e}");
+                false
+            }
+        }
+    }
+
     /// Move the popover's task one workflow-eligible column left/right.
     /// Same `move_card` path the board's `move_card_*` uses (workflow
     /// validation, branch-cut lifecycle, event line) but **clamped** at
@@ -2247,7 +2281,7 @@ fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
     let km = app.keymaps();
     let style = app.display_style();
     let fc = |c| format_chord_or_unbound(c, style);
-    let text = format!(
+    let mut text = format!(
         "  {}/{} col   {}/{} row   {} open   {}/{} move col   {}/{} reorder   {} workflow   f filter   {} refresh",
         fc(km.kanban.first_chord_for(KanbanAction::NavLeft)),
         fc(km.kanban.first_chord_for(KanbanAction::NavRight)),
@@ -2261,6 +2295,18 @@ fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
         fc(km.kanban.first_chord_for(KanbanAction::CycleWorkflowFilter)),
         fc(km.kanban.first_chord_for(KanbanAction::Refresh)),
     );
+    // Only advertise the workspace jump when the selected card actually has
+    // one — its absence from the footer is the board-side "no workspace to
+    // open" signal, mirroring the status-line message pressing `o` yields.
+    if app
+        .selected_task()
+        .is_some_and(|tf| tf.task.assigned_to.is_some())
+    {
+        text.push_str(&format!(
+            "   {} workspace",
+            fc(km.kanban.first_chord_for(KanbanAction::OpenWorkspace)),
+        ));
+    }
     let keys = Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)));
     let status = if app.status_line.is_empty() {
         Line::raw("")
@@ -2858,7 +2904,7 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let km = app.keymaps();
     let style = app.display_style();
     let fc = |c| format_chord_or_unbound(c, style);
-    let hint_text = format!(
+    let mut hint_text = format!(
         "  {}  close      {}/{}  scroll      {}  top      {}/{}  move col",
         fc(km.popover.first_chord_for(PopoverAction::Close)),
         fc(km.popover.first_chord_for(PopoverAction::ScrollDown)),
@@ -2867,6 +2913,19 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         fc(km.popover.first_chord_for(PopoverAction::MoveLeft)),
         fc(km.popover.first_chord_for(PopoverAction::MoveRight)),
     );
+    // The open card already shows its `workspace @name` line in the header
+    // when assigned; offer the jump only then, so a card with no workspace
+    // simply lacks the affordance rather than pressing `o` to no visible
+    // effect (the popover covers the status line).
+    if app
+        .popover_task()
+        .is_some_and(|tf| tf.task.assigned_to.is_some())
+    {
+        hint_text.push_str(&format!(
+            "      {}  workspace",
+            fc(km.popover.first_chord_for(PopoverAction::OpenWorkspace)),
+        ));
+    }
     let hint = Line::from(Span::styled(
         hint_text,
         Style::default().fg(Color::DarkGray),
@@ -3100,6 +3159,56 @@ mod tests {
         assert!(!app.has_more_done(), "no cursor ⇒ no load-more row");
         app.closed_next_cursor = Some("PAGE2".into());
         assert!(app.has_more_done(), "a cursor ⇒ a load-more row");
+    }
+
+    #[test]
+    fn open_assigned_workspace_without_a_workspace_reports_and_does_not_switch() {
+        // A card with no `assigned_to` has nothing to jump to: the method
+        // must return false (so the popover caller won't close the modal) and
+        // surface a clear status-line message rather than silently no-op or
+        // shell out to `shelbi open`. This is the only branch safe to unit
+        // test — the success path spawns the real `shelbi` binary.
+        let mut app = KanbanApp::new("demo");
+        app.status_line.clear();
+        let switched = app.open_assigned_workspace(None);
+        assert!(!switched, "no workspace ⇒ no switch");
+        assert_eq!(app.status_line, "no workspace assigned to this card");
+    }
+
+    #[test]
+    fn selected_task_without_a_workspace_feeds_open_assigned_workspace_none() {
+        // End-to-end of the board wiring minus the shell-out: a selected card
+        // with no assignment yields `None`, which the no-workspace branch
+        // handles. Guards the `selected_task().and_then(assigned_to)` plumbing
+        // the handler uses.
+        let mut app = KanbanApp::new("demo");
+        app.tasks = vec![task_file("a", Column::backlog(), 0, "2026-06-20T10:00:00Z")];
+        app.selected_column = BACKLOG_IDX;
+        app.selected_row = 0;
+        let ws = app.selected_task().and_then(|tf| tf.task.assigned_to.clone());
+        assert_eq!(ws, None);
+        assert!(!app.open_assigned_workspace(ws));
+        assert_eq!(app.status_line, "no workspace assigned to this card");
+    }
+
+    #[test]
+    fn selected_task_with_a_workspace_exposes_its_name() {
+        // The board handler pulls `assigned_to` off the selected card before
+        // calling `open_assigned_workspace`; confirm that read resolves to the
+        // bare workspace name (the `@` is display-only). We stop short of the
+        // switch itself, which spawns `shelbi open`.
+        let mut app = KanbanApp::new("demo");
+        app.tasks = vec![task_file_for(
+            "a",
+            Column::backlog(),
+            0,
+            "2026-06-20T10:00:00Z",
+            Some("bravo"),
+        )];
+        app.selected_column = BACKLOG_IDX;
+        app.selected_row = 0;
+        let ws = app.selected_task().and_then(|tf| tf.task.assigned_to.clone());
+        assert_eq!(ws.as_deref(), Some("bravo"));
     }
 
     #[test]
