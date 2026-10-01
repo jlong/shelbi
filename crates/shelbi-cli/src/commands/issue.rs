@@ -1574,7 +1574,7 @@ fn start(
     // has meanwhile completed before undoing anything.
     let mut launched_late = false;
     let addr = match await_launch(&rx, launch_deadline, LAUNCH_POLL_INTERVAL, || {
-        dispatch_progress_token(id, &workspace_name)
+        dispatch_progress_token(project, id, &workspace_name)
     }) {
         LaunchWait::Completed(addr) => addr,
         LaunchWait::SpawnFailed(e) => {
@@ -1597,6 +1597,7 @@ fn start(
             // Worker thread panicked before sending its result. Treat as a failed
             // launch: record it, roll the card back + tear the pane down, surface.
             if let Err(le) = shelbi_state::append_dispatch_event(
+                project,
                 id,
                 &workspace_name,
                 "failed",
@@ -1637,6 +1638,7 @@ fn start(
             // spawned, and fail loudly. The abandoned thread dies with this
             // process.
             if let Err(le) = shelbi_state::append_dispatch_event(
+                project,
                 id,
                 &workspace_name,
                 "failed",
@@ -1701,6 +1703,7 @@ fn start(
                      failed ({e}) — check it and kill a stale worker by hand if one is left"
                 );
             } else if let Err(e) = shelbi_state::append_dispatch_event(
+                project,
                 id,
                 prev_ws_name,
                 "released",
@@ -1872,14 +1875,14 @@ fn await_launch(
 /// read failure returns 0 — a stable token that simply doesn't reset the idle
 /// clock, which is the conservative choice (it can only shorten the wait, never
 /// extend it past the deadline forever).
-fn dispatch_progress_token(task_id: &str, workspace: &str) -> u64 {
+fn dispatch_progress_token(project: &str, task_id: &str, workspace: &str) -> u64 {
     let Ok(path) = shelbi_state::events_log_path() else {
         return 0;
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
         return 0;
     };
-    count_dispatch_events(&text, task_id, workspace, &[])
+    count_dispatch_events(&text, project, task_id, workspace, &[])
 }
 
 /// Does the launch look genuinely complete? True when a live, non-user-shell
@@ -1921,19 +1924,39 @@ fn launch_appears_complete(
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
-    count_dispatch_events(&text, task_id, &workspace.name, &["confirmed", "unverified"]) > 0
+    count_dispatch_events(
+        &text,
+        &project_yaml.name,
+        task_id,
+        &workspace.name,
+        &["confirmed", "unverified"],
+    ) > 0
 }
 
-/// Count `dispatch task=<id> workspace=<ws> status=<s> …` lines in an events.log
-/// body for one task/workspace. When `statuses` is non-empty, only lines whose
-/// `status=` is one of them count; an empty `statuses` counts every dispatch
-/// line for the pair. Split out so both the progress token and the completion
-/// check share one parser (and so it is unit-testable without touching disk).
-fn count_dispatch_events(log: &str, task_id: &str, workspace: &str, statuses: &[&str]) -> u64 {
+/// Count `dispatch project=<p> task=<id> workspace=<ws> status=<s> …` lines in
+/// an events.log body for one project/task/workspace. When `statuses` is
+/// non-empty, only lines whose `status=` is one of them count; an empty
+/// `statuses` counts every dispatch line for the triple. Split out so both the
+/// progress token and the completion check share one parser (and so it is
+/// unit-testable without touching disk).
+///
+/// `events.log` is hub-global and workspace names are unique only within a
+/// project, so the match is scoped to `project`: a line that carries `project=`
+/// must match it, while a legacy line without one (pre-upgrade binary) counts on
+/// task+workspace alone, as today.
+fn count_dispatch_events(
+    log: &str,
+    project: &str,
+    task_id: &str,
+    workspace: &str,
+    statuses: &[&str],
+) -> u64 {
+    let proj_tok = format!("project={project} ");
     let task_tok = format!("task={task_id} ");
     let ws_tok = format!("workspace={workspace} ");
     log.lines()
         .filter(|l| l.contains(" dispatch ") && l.contains(&task_tok) && l.contains(&ws_tok))
+        .filter(|l| !l.contains("project=") || l.contains(&proj_tok))
         .filter(|l| {
             statuses.is_empty()
                 || statuses
@@ -3493,34 +3516,52 @@ workspaces:
     }
 
     #[test]
-    fn count_dispatch_events_scopes_by_task_workspace_and_status() {
+    fn count_dispatch_events_scopes_by_project_task_workspace_and_status() {
         // The launch-progress token and the completion check both key off this
-        // parser, so it must count only THIS task+workspace's dispatch lines and,
-        // when asked, only the confirm-level statuses.
+        // parser, so it must count only THIS project+task+workspace's dispatch
+        // lines and, when asked, only the confirm-level statuses.
         let log = "\
-2026-09-08T04:30:06Z dispatch task=t1 workspace=alpha status=message-channel detail=mode=hooks
-2026-09-08T04:30:17Z dispatch task=t1 workspace=alpha status=confirmed detail=seed_busy_observed
-2026-09-08T04:30:20Z dispatch task=t2 workspace=alpha status=confirmed detail=seed_busy_observed
-2026-09-08T04:30:25Z dispatch task=t1 workspace=bravo status=confirmed detail=seed_busy_observed
-2026-09-08T04:30:30Z dispatch task=t1 workspace=alpha status=unverified detail=verification_unsupported";
+2026-09-08T04:30:06Z dispatch project=acme task=t1 workspace=alpha status=message-channel detail=mode=hooks
+2026-09-08T04:30:17Z dispatch project=acme task=t1 workspace=alpha status=confirmed detail=seed_busy_observed
+2026-09-08T04:30:20Z dispatch project=acme task=t2 workspace=alpha status=confirmed detail=seed_busy_observed
+2026-09-08T04:30:25Z dispatch project=acme task=t1 workspace=bravo status=confirmed detail=seed_busy_observed
+2026-09-08T04:30:30Z dispatch project=acme task=t1 workspace=alpha status=unverified detail=verification_unsupported";
 
-        // Every dispatch line for the (task, workspace) pair.
-        assert_eq!(count_dispatch_events(log, "t1", "alpha", &[]), 3);
+        // Every dispatch line for the (project, task, workspace) triple.
+        assert_eq!(count_dispatch_events(log, "acme", "t1", "alpha", &[]), 3);
         // A different task / workspace is not counted.
-        assert_eq!(count_dispatch_events(log, "t2", "alpha", &[]), 1);
-        assert_eq!(count_dispatch_events(log, "t1", "bravo", &[]), 1);
+        assert_eq!(count_dispatch_events(log, "acme", "t2", "alpha", &[]), 1);
+        assert_eq!(count_dispatch_events(log, "acme", "t1", "bravo", &[]), 1);
         // Confirm-level statuses only — message-channel is excluded, so a
         // never-confirmed launch (message-channel alone) reads as 0.
         assert_eq!(
-            count_dispatch_events(log, "t1", "alpha", &["confirmed", "unverified"]),
+            count_dispatch_events(log, "acme", "t1", "alpha", &["confirmed", "unverified"]),
             2
         );
         // A trailing `status=confirmed` with no detail (end-of-line) still counts.
-        let trailing = "2026-09-08T04:30:17Z dispatch task=t1 workspace=alpha status=confirmed";
+        let trailing =
+            "2026-09-08T04:30:17Z dispatch project=acme task=t1 workspace=alpha status=confirmed";
         assert_eq!(
-            count_dispatch_events(trailing, "t1", "alpha", &["confirmed"]),
+            count_dispatch_events(trailing, "acme", "t1", "alpha", &["confirmed"]),
             1
         );
+    }
+
+    #[test]
+    fn count_dispatch_events_is_scoped_to_the_project() {
+        // Same-named workspace in two projects: one project's dispatch lines must
+        // not count toward the other's (the hub-global `events.log` collision this
+        // fixes). A legacy line with no `project=` still counts on task+workspace
+        // alone, for backward compatibility during the upgrade window.
+        let log = "\
+2026-09-08T04:30:17Z dispatch project=proj-a task=t1 workspace=alpha status=confirmed detail=d
+2026-09-08T04:30:20Z dispatch project=proj-b task=t1 workspace=alpha status=confirmed detail=d
+2026-09-08T04:30:25Z dispatch task=t1 workspace=alpha status=confirmed detail=legacy_no_project";
+
+        // Project A sees its own line plus the legacy unscoped one.
+        assert_eq!(count_dispatch_events(log, "proj-a", "t1", "alpha", &[]), 2);
+        // Project B likewise — crucially NOT project A's line.
+        assert_eq!(count_dispatch_events(log, "proj-b", "t1", "alpha", &[]), 2);
     }
 
     #[test]
