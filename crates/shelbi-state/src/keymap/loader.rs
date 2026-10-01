@@ -1990,6 +1990,28 @@ projects:
     }
 
     #[test]
+    fn o_dispatches_to_open_workspace_in_board_and_popover() {
+        // The "jump to the card's assigned workspace" affordance binds `o`
+        // in both the board and the popover so it works whether the card is
+        // open or closed; these must come from the embedded defaults.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let (km, _) = load_keymaps(None);
+        assert_eq!(
+            km.kanban
+                .dispatch(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            Some(KanbanAction::OpenWorkspace)
+        );
+        assert_eq!(
+            km.popover
+                .dispatch(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            Some(PopoverAction::OpenWorkspace)
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
     fn empty_list_unbinds_without_reverting_to_default() {
         // F3: `action: []` is a deliberate unbind. It must NOT fall back to
         // the built-in chords, and it must emit no diagnostic (the empty

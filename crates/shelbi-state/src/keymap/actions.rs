@@ -57,6 +57,7 @@ pub enum KanbanAction {
     OpenPopover,
     Refresh,
     CycleWorkflowFilter,
+    OpenWorkspace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,6 +70,7 @@ pub enum PopoverAction {
     ScrollHome,
     MoveLeft,
     MoveRight,
+    OpenWorkspace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -130,6 +132,7 @@ impl Action {
                 KanbanAction::CycleWorkflowFilter => {
                     "Kanban: cycle workflow filter (All → wf1 → wf2 → All)"
                 }
+                KanbanAction::OpenWorkspace => "Kanban: open selected card's assigned workspace",
             },
             Action::Popover(a) => match a {
                 PopoverAction::Close => "Popover: close",
@@ -140,6 +143,7 @@ impl Action {
                 PopoverAction::ScrollHome => "Popover: scroll to top",
                 PopoverAction::MoveLeft => "Popover: move task to the left column",
                 PopoverAction::MoveRight => "Popover: move task to the right column",
+                PopoverAction::OpenWorkspace => "Popover: open card's assigned workspace",
             },
             Action::Activity(a) => match a {
                 ActivityAction::ScrollUp => "Activity: scroll up",
@@ -197,6 +201,10 @@ impl Action {
                 KanbanAction::OpenPopover => &["enter", "space"],
                 KanbanAction::Refresh => &["r"],
                 KanbanAction::CycleWorkflowFilter => &["tab"],
+                // `o` for "open workspace" — jump to the tmux chat of the
+                // selected card's assigned workspace. Free across the board
+                // keymap; mirrored on the popover so it works open or closed.
+                KanbanAction::OpenWorkspace => &["o"],
             },
             Action::Popover(a) => match a {
                 PopoverAction::Close => &["esc", "enter", "space", "q"],
@@ -210,6 +218,9 @@ impl Action {
                 // join them the way `reorder_*` pairs K / shift-up.
                 PopoverAction::MoveLeft => &["H", "shift-left"],
                 PopoverAction::MoveRight => &["L", "shift-right"],
+                // Mirrors the board's `o` so jumping to the card's workspace
+                // works whether the card is open or closed.
+                PopoverAction::OpenWorkspace => &["o"],
             },
             Action::Activity(a) => match a {
                 ActivityAction::ScrollUp => &["k", "up"],
@@ -274,6 +285,7 @@ impl Action {
                 KanbanAction::OpenPopover => "open_popover",
                 KanbanAction::Refresh => "refresh",
                 KanbanAction::CycleWorkflowFilter => "cycle_workflow_filter",
+                KanbanAction::OpenWorkspace => "open_workspace",
             },
             Action::Popover(a) => match a {
                 PopoverAction::Close => "close",
@@ -284,6 +296,7 @@ impl Action {
                 PopoverAction::ScrollHome => "scroll_home",
                 PopoverAction::MoveLeft => "move_left",
                 PopoverAction::MoveRight => "move_right",
+                PopoverAction::OpenWorkspace => "open_workspace",
             },
             Action::Activity(a) => match a {
                 ActivityAction::ScrollUp => "scroll_up",
@@ -335,6 +348,7 @@ impl Action {
             KanbanAction::OpenPopover,
             KanbanAction::Refresh,
             KanbanAction::CycleWorkflowFilter,
+            KanbanAction::OpenWorkspace,
         ];
         const POPOVER: &[PopoverAction] = &[
             PopoverAction::Close,
@@ -345,6 +359,7 @@ impl Action {
             PopoverAction::ScrollHome,
             PopoverAction::MoveLeft,
             PopoverAction::MoveRight,
+            PopoverAction::OpenWorkspace,
         ];
         const ACTIVITY: &[ActivityAction] = &[
             ActivityAction::ScrollUp,
