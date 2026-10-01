@@ -1770,6 +1770,17 @@ fn poll_one(
         debounce_idle_edge(prior.map(|p| p.state), new_state, *idle_debounce_streak);
     *idle_debounce_streak = streak;
 
+    // Hold a confirmed-serving review slot at `Serving` when this tick's generic
+    // observation is only the idle-at-prompt reading. `handle_review_slot` above
+    // records `Serving` directly whenever its probe passes; this covers the ticks
+    // it fell through because the probe couldn't be re-confirmed (a board blip or
+    // a probe transport hiccup), which otherwise flap `serving -> awaiting_input`
+    // and re-emit `review-ready` ~30s later. See [`fold_review_serving`].
+    let new_state = fold_review_serving(
+        new_state,
+        review_slot_has_loaded_marker(project, workspace, machine, &host),
+    );
+
     let current_task = current_task_for(project, &workspace.name);
     let outcome = decide(
         &workspace.name,
@@ -3745,6 +3756,66 @@ fn debounce_idle_edge(
         }
         _ => (observed, 0),
     }
+}
+
+/// Fold an idle-at-prompt reading on a confirmed-serving review slot back to
+/// [`WorkspaceState::Serving`].
+///
+/// A `review`-tagged slot the poller already confirmed serving (its
+/// `.claude/shelbi-review-loaded` marker is present — see
+/// [`ensure_review_marker_and_serving_state`]) sits idle at its ready prompt
+/// between the human's questions. Claude's ready input box — and the
+/// suggested-prompt ghost text it draws under the ready summary (`❯ open it in
+/// the browser`) — matches [`ready::is_input_ready`], so [`live_workspace_state`]
+/// reports `AwaitingInput`. For a serving review slot that idle-at-prompt *is*
+/// the serving state, not a workspace-free await.
+///
+/// The short-circuit in [`handle_review_slot`] records `Serving` directly on any
+/// tick its `ready:` probe passes, so this fold only matters on a tick where the
+/// slot fell through to the generic pane observer because the probe *couldn't be
+/// re-confirmed this cycle* — a board blip ([`AssignedReviewTask::Unknown`]) or a
+/// probe transport hiccup under hub load (`None`). Without the fold those ticks
+/// flapped `serving -> awaiting_input` and bounced back to `serving` ~30s later,
+/// re-emitting `review-ready` on every bounce. Folding keeps the committed state
+/// at `Serving`, so [`decide`] sees no transition and neither the spurious edge
+/// nor the repeated signal fires.
+///
+/// Only the bare idle reading folds: a blocking dialog is classified `Blocked`
+/// upstream (via `maybe_emit_dialog_event`) and an active turn is `Working`, so
+/// genuine awaiting-input on a review slot (a permission prompt, a live turn) is
+/// untouched and still surfaces.
+fn fold_review_serving(observed: WorkspaceState, confirmed_serving_review: bool) -> WorkspaceState {
+    if confirmed_serving_review && observed == WorkspaceState::AwaitingInput {
+        WorkspaceState::Serving
+    } else {
+        observed
+    }
+}
+
+/// True when `workspace` is a `review`-tagged slot carrying a review-loaded
+/// marker — the durable, board-independent signal that the poller already
+/// confirmed this slot serving (written by
+/// [`ensure_review_marker_and_serving_state`], cleared only on teardown/reap in
+/// [`maybe_reap_orphaned_review_slot`]). Read straight off the marker rather than
+/// the board so the fold holds precisely on the ticks the flap happens — a board
+/// that can't be read warm ([`AssignedReviewTask::Unknown`]) is one of the two
+/// triggers, so resolving "is this slot serving" through the board would go blind
+/// on exactly those ticks.
+fn review_slot_has_loaded_marker(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    machine: &shelbi_core::Machine,
+    host: &shelbi_core::Host,
+) -> bool {
+    if !project.effective_tags(workspace).contains("review") {
+        return false;
+    }
+    let marker =
+        shelbi_orchestrator::workspace::workspace_review_loaded_marker(machine, workspace);
+    matches!(
+        shelbi_orchestrator::workspace::read_review_loaded_marker(host, &marker),
+        Ok(Some(_))
+    )
 }
 
 /// Auto-restart supervision for one workspace's agent pane, run every poll
@@ -5888,6 +5959,76 @@ Auto mode works better when it knows your environment. Takes about a minute.
         assert_eq!(out.prev_state, Some(WorkspaceState::AwaitingInput));
         assert_eq!(out.status.state, WorkspaceState::Working);
         assert_eq!(out.status.last_transition, ts(200));
+    }
+
+    // An idle review agent parked at its ready summary, as `capture-pane` sees
+    // it: the ready input box plus the suggested-prompt ghost text Claude Code
+    // draws under the summary (`❯ open it in the browser`). No live spinner row,
+    // no interrupt footer — so `is_claude_working` is false and `is_input_ready`
+    // is true. This is the exact frame from the flap report (serving the
+    // `review-flow-vignette` branch, idle since its ready summary).
+    const IDLE_REVIEW_PANE_WITH_GHOST_TEXT: &str = "\
+● Ready for review. The dev server is up on :4310; open it in the browser to
+  walk the mirrored review panel.
+────────────────────────────────────────────────────
+❯ open it in the browser
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ? for shortcuts";
+
+    #[test]
+    fn idle_serving_review_pane_with_ghost_text_holds_serving() {
+        // THE FLAP this task fixes: a loaded, serving review slot whose agent
+        // sits idle at its ready prompt (with suggested-prompt ghost text) was
+        // read as AwaitingInput by the generic pane observer on any tick
+        // `handle_review_slot` fell through — a board blip or a probe transport
+        // hiccup — flapping `serving -> awaiting_input` and bouncing back ~30s
+        // later with a fresh `review-ready`.
+        let observed = live_workspace_state(IDLE_REVIEW_PANE_WITH_GHOST_TEXT)
+            .expect("the ready input box resolves to a live state");
+        // The classifier still reads the bare idle pane as AwaitingInput…
+        assert_eq!(observed, WorkspaceState::AwaitingInput);
+
+        // …but a confirmed-serving review slot folds it back to Serving, so a
+        // slot already at Serving sees no transition and emits no event.
+        let folded = fold_review_serving(observed, true);
+        assert_eq!(folded, WorkspaceState::Serving);
+        let prior = Some(PriorState {
+            state: WorkspaceState::Serving,
+            last_transition: Some(ts(50)),
+        });
+        let out = decide("bravo", Some("t".into()), prior, folded, ts(200));
+        assert!(
+            !out.transitioned,
+            "an idle serving review slot must not flap serving -> awaiting_input",
+        );
+        assert_eq!(out.status.state, WorkspaceState::Serving);
+        assert_eq!(out.status.last_transition, ts(50));
+    }
+
+    #[test]
+    fn fold_review_serving_only_touches_an_idle_review_slot() {
+        // Folds only when the slot is a confirmed-serving review slot AND the
+        // bare idle reading is what the generic observer produced.
+        assert_eq!(
+            fold_review_serving(WorkspaceState::AwaitingInput, true),
+            WorkspaceState::Serving,
+        );
+        // Not a confirmed-serving review slot → untouched (a dev slot idle at
+        // its prompt is genuinely AwaitingInput).
+        assert_eq!(
+            fold_review_serving(WorkspaceState::AwaitingInput, false),
+            WorkspaceState::AwaitingInput,
+        );
+        // A live turn and a blocking dialog are never folded, so genuine
+        // awaiting-input on a review slot (a permission prompt -> Blocked) and an
+        // active turn (-> Working) still surface even while the marker is present.
+        for state in [
+            WorkspaceState::Working,
+            WorkspaceState::Blocked,
+            WorkspaceState::Serving,
+        ] {
+            assert_eq!(fold_review_serving(state, true), state);
+        }
     }
 
     #[test]
