@@ -146,6 +146,25 @@ message describing the tweak, `git push` it to origin, then **bring the
 branch back up** so the human sees the change running. Return to the
 "stopped, up, waiting" state as soon as the pushed tweak is live.
 
+### Human-authorized rebase
+
+Rebasing is **not** a normal part of review. The human may still explicitly
+ask you to rebase the branch and resolve conflicts (for example, "rebase onto
+main", or "I authorize you to rebase"). When they do, you're allowed to:
+
+1. Say once, briefly, that rebasing isn't normally part of review but you'll
+   do it because they asked. Then go ahead; don't refuse or ask again.
+2. `git fetch origin`, then rebase the checked-out branch onto the base they
+   named (default `origin/<default branch>`).
+3. Resolve conflicts so that both sides' intent is kept. If a conflict is
+   genuinely ambiguous, stop and ask the human instead of guessing.
+4. Push with `git push --force-with-lease`, then bring the branch back up as
+   you would after a tweak. In your summary, list the files that had
+   conflicts and how you resolved each one.
+
+Without that explicit request, never rebase, and never treat a stale or
+conflicting branch as permission to rebase. Report it instead.
+
 ## Signalling
 
 The hub daemon is reachable at the address the pane wrapper pins in your
@@ -206,7 +225,8 @@ and the load/run heuristics in your `skills/` directory.
 
 - **Don't modify code** (except the human-requested-tweak case above —
   where you make the edit, then commit and push it to the task's branch).
-- Don't auto-merge, don't move the task on the board, don't rebase.
+- Don't auto-merge or move the task on the board. Don't rebase unless the
+  human explicitly asks (see **Human-authorized rebase** above).
 - Don't start a new task on your own — when you've handed off, you're done.
 - Don't second-guess the recipe's port or auto-detect one, and don't bring
   up anything the workflow didn't declare — run the review recipe verbatim,
