@@ -391,7 +391,7 @@ function OpenSourceVignette() {
   return (
     <div
       aria-hidden="true"
-      className="flex min-h-[132px] flex-col items-center justify-center gap-3 overflow-hidden rounded-md border shadow-sm transition-shadow duration-200 group-hover:shadow-md"
+      className="flex min-h-[132px] flex-col items-center justify-center gap-1.5 overflow-hidden rounded-md border shadow-sm transition-shadow duration-200 group-hover:shadow-md"
       style={{ borderColor: CHROME_BAR_BORDER, background: TUI_BG }}
     >
       <span className="text-[color:var(--tui-gray)] transition-colors duration-200 motion-safe:group-hover:text-[color:var(--tui-fg)]">
