@@ -2078,4 +2078,120 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    /// Regression (`opening-an-already-loaded-review-task-relaunches-the-review-agent`):
+    /// selecting a review task that is already loaded and **serving** on its slot
+    /// must build the review panel beside the running agent pane — never relaunch
+    /// the agent. The sidebar's interactive select routes through
+    /// [`open_review_interface`] (the focus-stealing path); on a live window with
+    /// a bare agent pane and no interface state yet (the state an auto-load leaves
+    /// — it never builds a panel), that path must split the panel in and *reuse*
+    /// the existing agent pane as the chat/content column, not kill + respawn it.
+    ///
+    /// The guard that proves "no relaunch" is the agent pane id: it is captured
+    /// before the open and must equal `CHAT_KEY` afterwards (the same pane is
+    /// pinned as content), and the window must hold exactly `panel | agent` — two
+    /// panes, the agent one unchanged.
+    #[test]
+    fn selecting_a_serving_slot_builds_the_panel_without_relaunching_the_agent() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        crate::tmux_test_support::use_private_tmux_server();
+
+        let proj = format!("review-select-serving-{}", std::process::id());
+        let home = std::env::temp_dir()
+            .join(format!("shelbi-review-select-serving-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&demo_project(&proj)).unwrap();
+        // A review-column task already assigned to the review slot — the on-disk
+        // shape both an auto-load and a hand-load leave behind, so this one test
+        // covers the auto-loaded case too (they differ only in who set
+        // `assigned_to`, which this path reads identically).
+        shelbi_state::save_task(&proj, &task_on("t-rev", "review-1", Column::review()), "body")
+            .unwrap();
+
+        // The serving slot: a live `review-1` window holding only the agent pane,
+        // with the dashboard the active window. No `SHELBI_REVIEW_*` state exists
+        // yet — exactly what an auto-load leaves (it builds no panel).
+        let session = format!("shelbi-{proj}");
+        crate::tmux_test_support::start_session(&session, "dashboard");
+        add_window(&session, "review-1");
+        let agent = local_workspace_pane_id(&session, "review-1").unwrap();
+        assert_eq!(window_pane_count(&session, "review-1"), 1, "bare agent window");
+        assert!(read_session_var(&session, PANEL_KEY).is_none(), "no interface state yet");
+
+        // The panel pane runs `{current_exe} __review-panel …`; under the test
+        // harness that process exits at once, so pin `remain-on-exit` to keep the
+        // (dead) panel pane listed — this test asserts on the split's placement
+        // and the agent pane's survival, not on the panel process living.
+        tmux_run(&[
+            "set-window-option",
+            "-t",
+            &format!("{session}:review-1"),
+            "remain-on-exit",
+            "on",
+        ])
+        .unwrap();
+
+        // The sidebar-select path.
+        match open_review_interface(&proj, "t-rev").unwrap() {
+            ReviewOpenOutcome::Opened(target) => assert_eq!(target, format!("{session}:review-1")),
+            other => panic!("expected the panel to open on the serving slot, got {other:?}"),
+        }
+
+        // Panel built beside the agent, and the agent pane was reused as the
+        // content column — NOT relaunched. The chat pane id is the guard: a
+        // relaunch would have killed + respawned it, so a differing id here is the
+        // exact regression.
+        assert_eq!(window_pane_count(&session, "review-1"), 2, "panel | agent");
+        assert!(read_session_var(&session, PANEL_KEY).is_some(), "the panel is built");
+        assert_eq!(
+            read_session_var(&session, CHAT_KEY),
+            Some(agent.clone()),
+            "the running agent pane is reused as content, not relaunched",
+        );
+        assert_eq!(read_session_var(&session, MID_KEY), Some(agent.clone()));
+        assert_eq!(read_session_var(&session, TASK_KEY).as_deref(), Some("t-rev"));
+        assert_eq!(read_session_var(&session, WS_KEY).as_deref(), Some("review-1"));
+        assert!(
+            panel_pane_live(&session, "review-1", &agent),
+            "the agent pane is still the same live pane after the open",
+        );
+
+        // Selecting it AGAIN re-focuses the live panel: no second panel, and the
+        // agent pane is still the same one (no relaunch on a repeat select).
+        let panel = read_session_var(&session, PANEL_KEY).unwrap();
+        match open_review_interface(&proj, "t-rev").unwrap() {
+            ReviewOpenOutcome::Opened(target) => assert_eq!(target, format!("{session}:review-1")),
+            other => panic!("expected a reuse of the live panel on re-select, got {other:?}"),
+        }
+        assert_eq!(
+            window_pane_count(&session, "review-1"),
+            2,
+            "a repeat select must not stack a second panel",
+        );
+        assert_eq!(
+            read_session_var(&session, PANEL_KEY).as_deref(),
+            Some(panel.as_str()),
+            "the existing panel is reused, not replaced",
+        );
+        assert_eq!(
+            read_session_var(&session, CHAT_KEY),
+            Some(agent),
+            "the agent pane is unchanged across a repeat select",
+        );
+
+        crate::tmux_test_support::kill_session(&format!("_{session}"));
+        crate::tmux_test_support::kill_session(&session);
+        match prev_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
