@@ -2135,27 +2135,37 @@ pub enum ZenHeartbeatCue {
     Reread,
 }
 
-/// Append `<rfc3339> dispatch task=<id> workspace=<name> status=<status> detail=<detail>`
+/// Append `<rfc3339> dispatch project=<project> task=<id> workspace=<name> status=<status> detail=<detail>`
 /// to `~/.shelbi/events.log`. Use this to surface dispatch-time anomalies
 /// (e.g. the initial prompt was pasted but Enter never landed) that aren't
 /// state transitions but still need to show up in `shelbi events tail` so the
 /// orchestrator (and the user) sees them at the moment they happen.
 ///
+/// `project` scopes the line: `events.log` is hub-global and workspace names
+/// (`alpha`, `bravo`, `review`, …) are unique only within a project, so every
+/// reader that keys off a `dispatch` line — [`recent_dispatch_active`] — needs
+/// the project to avoid colliding with a same-named workspace in another
+/// project. (Lines written by older binaries carry no `project=`; the readers
+/// fall back to workspace-only matching for those — see
+/// [`recent_dispatch_active`].)
+///
 /// Detail is a single short token; whitespace folds to underscores so the
 /// line stays parseable.
 pub fn append_dispatch_event(
+    project: &str,
     task_id: &str,
     workspace: &str,
     status: &str,
     detail: &str,
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
     let task_id = sanitize_field(task_id);
     let workspace = sanitize_field(workspace);
     let status = sanitize_reason(status);
     let detail = sanitize_reason(detail);
     append_event_line(&format!(
-        "{ts} dispatch task={task_id} workspace={workspace} status={status} detail={detail}"
+        "{ts} dispatch project={project} task={task_id} workspace={workspace} status={status} detail={detail}"
     ))
 }
 
@@ -2182,10 +2192,18 @@ const DISPATCH_ACTIVE_TAIL_BYTES: u64 = 64 * 1024;
 /// tail.
 const DISPATCH_ACTIVE_STATUSES: [&str; 3] = ["message-channel", "confirmed", "unverified"];
 
-/// Did a launch to `workspace` reach the hub→pane message channel, confirm its
-/// pane busy, or land unverified within the last `within` — any
-/// `dispatch … workspace=<workspace> status=<s>` line whose `<s>` is in
-/// [`DISPATCH_ACTIVE_STATUSES`]?
+/// Did a launch to `project`'s `workspace` reach the hub→pane message channel,
+/// confirm its pane busy, or land unverified within the last `within` — any
+/// `dispatch project=<project> workspace=<workspace> status=<s>` line whose
+/// `<s>` is in [`DISPATCH_ACTIVE_STATUSES`]?
+///
+/// `events.log` is hub-global and workspace names are unique only within a
+/// project (several projects share `alpha` / `bravo` / `review` / …), so the
+/// match is on `(project, workspace)`: a launch to project B's `alpha` must not
+/// read as "in flight" for project A's genuinely stranded `alpha`. A legacy
+/// line from a pre-upgrade binary carries no `project=`; it is treated as a
+/// match on the workspace alone (today's behavior), so an in-flight launch such
+/// a binary logged still suppresses a spurious resume during the upgrade window.
 ///
 /// The stranded-slot resume passes (`maybe_resume_stranded_dev_slots` and its
 /// review cousin `maybe_resume_stranded_review_slots`) and the active-gate
@@ -2210,7 +2228,7 @@ const DISPATCH_ACTIVE_STATUSES: [&str; 3] = ["message-channel", "confirmed", "un
 /// Bounded by `within` so a stale signal from *before* a `quit`+reopen — whose
 /// slot really is stranded and must still be resumed — is ignored. Best-effort:
 /// `false` on any I/O error, a missing log, or an unrepresentable `within`.
-pub fn recent_dispatch_active(workspace: &str, within: Duration) -> bool {
+pub fn recent_dispatch_active(project: &str, workspace: &str, within: Duration) -> bool {
     let Ok(within) = chrono::Duration::from_std(within) else {
         return false;
     };
@@ -2220,6 +2238,7 @@ pub fn recent_dispatch_active(workspace: &str, within: Duration) -> bool {
     let Ok(text) = read_events_tail(&path, DISPATCH_ACTIVE_TAIL_BYTES) else {
         return false;
     };
+    let proj = sanitize_field(project);
     let ws = sanitize_field(workspace);
     let cutoff = Utc::now() - within;
     for line in text.lines().rev() {
@@ -2231,6 +2250,14 @@ pub fn recent_dispatch_active(workspace: &str, within: Duration) -> bool {
         }
         if event_field(body, "workspace") != Some(ws.as_str()) {
             continue;
+        }
+        // Scope to this project. A line that carries `project=` must match;
+        // a legacy line without one (pre-upgrade binary) falls back to the
+        // workspace-only match above, as today.
+        if let Some(line_proj) = event_field(body, "project") {
+            if line_proj != proj.as_str() {
+                continue;
+            }
         }
         let Some(status) = event_field(body, "status") else {
             continue;
@@ -2275,10 +2302,10 @@ fn read_events_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
 /// `/activity` and the orchestrator can see the deliberate override rather than
 /// silently discovering a review slot occupied by dev work.
 ///
-/// Same task-scoped shape (no leading `project=`) as [`append_dispatch_event`];
-/// identifier fields (`task`, `workspace`) are pinned to the strict
-/// [`sanitize_field`] allowlist and `reason` folds whitespace to underscores so
-/// the record stays a single parseable line.
+/// Task-scoped shape (no `project=`), unlike [`append_dispatch_event`] which
+/// carries one; identifier fields (`task`, `workspace`) are pinned to the
+/// strict [`sanitize_field`] allowlist and `reason` folds whitespace to
+/// underscores so the record stays a single parseable line.
 pub fn append_review_slot_override_event(
     task_id: &str,
     workspace: &str,
@@ -5534,16 +5561,18 @@ mod tests {
         // the workspace dispatch path emits (see `shelbi_orchestrator::workspace`);
         // the orchestrator greps for `stalled` to recover a dispatch that never
         // reached its workspace.
-        append_dispatch_event("fix-login", "alpha", "confirmed", "busy observed").unwrap();
-        append_dispatch_event("build-thing", "charlie", "stalled", "readiness timeout").unwrap();
+        append_dispatch_event("acme", "fix-login", "alpha", "confirmed", "busy observed").unwrap();
+        append_dispatch_event("acme", "build-thing", "charlie", "stalled", "readiness timeout")
+            .unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 2);
-        // Shape: `<ts> dispatch task=<id> workspace=<name> status=<s> detail=<d>`.
+        // Shape: `<ts> dispatch project=<p> task=<id> workspace=<name> status=<s> detail=<d>`.
         // The `dispatch` prefix lets `shelbi events tail` show it without
         // colliding with task=... or workspace=... lines.
         let line = lines[0];
-        assert!(line.contains(" dispatch task=fix-login "), "line: {line}");
+        assert!(line.contains(" dispatch project=acme "), "line: {line}");
+        assert!(line.contains(" task=fix-login "), "line: {line}");
         assert!(line.contains(" workspace=alpha "), "line: {line}");
         assert!(line.contains(" status=confirmed "), "line: {line}");
         // Whitespace in detail folds to underscores so the line stays parseable.
@@ -5563,9 +5592,10 @@ mod tests {
 
         // A `confirmed` dispatch to bravo written just now is a fresh launch
         // signal for that slot.
-        append_dispatch_event("fix-login", "bravo", "confirmed", "seed busy observed").unwrap();
+        append_dispatch_event("acme", "fix-login", "bravo", "confirmed", "seed busy observed")
+            .unwrap();
         assert!(
-            recent_dispatch_active("bravo", Duration::from_secs(60)),
+            recent_dispatch_active("acme", "bravo", Duration::from_secs(60)),
             "a just-written confirmation for bravo must match",
         );
 
@@ -5573,40 +5603,49 @@ mod tests {
         // launch, before the pane exists, so it is the signal present when the
         // stranded sweep reads the still-launching window dead. It must count as
         // an active launch even though the `confirmed` line has not landed yet.
-        append_dispatch_event("new-task", "golf", "message-channel", "mode=hooks runner=claude")
-            .unwrap();
+        append_dispatch_event(
+            "acme",
+            "new-task",
+            "golf",
+            "message-channel",
+            "mode=hooks runner=claude",
+        )
+        .unwrap();
         assert!(
-            recent_dispatch_active("golf", Duration::from_secs(60)),
+            recent_dispatch_active("acme", "golf", Duration::from_secs(60)),
             "a message-channel (launch in flight, pre-confirmation) must match",
         );
 
         // `unverified` (pane up, submit not cleanly verified) is also an active
         // launch, not a failure.
-        append_dispatch_event("odd-task", "hotel", "unverified", "verification unsupported")
+        append_dispatch_event("acme", "odd-task", "hotel", "unverified", "verification unsupported")
             .unwrap();
         assert!(
-            recent_dispatch_active("hotel", Duration::from_secs(60)),
+            recent_dispatch_active("acme", "hotel", Duration::from_secs(60)),
             "an unverified dispatch landed a live pane and must match",
         );
 
         // Not another slot's signal…
         assert!(
-            !recent_dispatch_active("alpha", Duration::from_secs(60)),
+            !recent_dispatch_active("acme", "alpha", Duration::from_secs(60)),
             "a launch signal for bravo must not match alpha",
         );
 
         // …and not a failure status for the same slot: a `stalled` dispatch left
         // the task put for retry, it did not bring a pane up.
-        append_dispatch_event("build-thing", "delta", "stalled", "readiness timeout").unwrap();
+        append_dispatch_event("acme", "build-thing", "delta", "stalled", "readiness timeout")
+            .unwrap();
         assert!(
-            !recent_dispatch_active("delta", Duration::from_secs(60)),
+            !recent_dispatch_active("acme", "delta", Duration::from_secs(60)),
             "a stalled dispatch is a failure, not an active launch",
         );
 
         // A launch signal older than the grace window (the pre-`quit` case a
         // genuinely stranded slot presents) must NOT match a short window, but
         // does match a window wide enough to reach it — proving it's the age,
-        // not the shape, that excludes it.
+        // not the shape, that excludes it. This line is also deliberately in the
+        // legacy unscoped shape (no `project=`) a pre-upgrade binary wrote, so it
+        // doubles as coverage that such a line still parses and matches.
         let old_ts = (Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
         let path = events_log_path().unwrap();
         let mut f = std::fs::OpenOptions::new()
@@ -5621,12 +5660,43 @@ mod tests {
         .unwrap();
         drop(f);
         assert!(
-            !recent_dispatch_active("echo", Duration::from_secs(60)),
+            !recent_dispatch_active("acme", "echo", Duration::from_secs(60)),
             "a launch signal an hour old must not match a 60s window",
         );
         assert!(
-            recent_dispatch_active("echo", Duration::from_secs(2 * 3600)),
-            "the same signal matches a window wide enough to reach it",
+            recent_dispatch_active("acme", "echo", Duration::from_secs(2 * 3600)),
+            "the same (legacy, unscoped) signal matches a window wide enough to reach it",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn recent_dispatch_active_is_scoped_to_the_project() {
+        // `events.log` is hub-global and workspace names are unique only within a
+        // project, so a launch to project B's `alpha` must not read as "in flight"
+        // for project A's genuinely stranded `alpha`. Without `(project,
+        // workspace)` scoping, B's fresh `message-channel` line would suppress
+        // A's resume for the whole grace window — the cross-project-collision
+        // class this fixes.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Project B launches its own `alpha` right now.
+        append_dispatch_event("proj-b", "b-task", "alpha", "message-channel", "mode=hooks")
+            .unwrap();
+
+        // Project A's `alpha` is genuinely stranded: it has no launch of its own.
+        assert!(
+            !recent_dispatch_active("proj-a", "alpha", Duration::from_secs(60)),
+            "project B's launch of its same-named `alpha` must not read as active \
+             for project A's stranded `alpha`",
+        );
+        // …while project B's own `alpha` does read as active, same line.
+        assert!(
+            recent_dispatch_active("proj-b", "alpha", Duration::from_secs(60)),
+            "project B's launch must still read as active for project B's `alpha`",
         );
 
         std::env::remove_var("SHELBI_HOME");

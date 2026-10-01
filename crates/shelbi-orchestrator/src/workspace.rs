@@ -2114,6 +2114,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         spec.project.base_branch(),
     ) {
         if let Err(log_err) = shelbi_state::append_dispatch_event(
+            &spec.project.name,
             spec.task_id,
             &spec.workspace.name,
             "sync-failed",
@@ -2132,6 +2133,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //     commits would land on the wrong ref.
     if let Err(e) = verify_worktree_on_branch(&host, &worktree, spec.branch) {
         if let Err(log_err) = shelbi_state::append_dispatch_event(
+            &spec.project.name,
             spec.task_id,
             &spec.workspace.name,
             "branch-mismatch",
@@ -2275,6 +2277,7 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         spec.project.base_branch(),
     ) {
         if let Err(log_err) = shelbi_state::append_dispatch_event(
+            &spec.project.name,
             spec.task_id,
             &spec.workspace.name,
             "resume-sync-failed",
@@ -2389,6 +2392,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
             SettingsWireResult::SelfHealed => disclose_settings_selfheal(&a.workspace.name),
             SettingsWireResult::MergeRequired { message } => {
                 append_dispatch_status(
+                    &a.project.name,
                     a.task_id,
                     &a.workspace.name,
                     "settings-merge-required",
@@ -2411,6 +2415,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or(a.runner.command.as_str());
     append_dispatch_status(
+        &a.project.name,
         a.task_id,
         &a.workspace.name,
         "message-channel",
@@ -2581,6 +2586,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         // runners) rather than demand a busy signal we cannot read.
         if !submit_profile.has_ui_verifier() {
             append_dispatch_status(
+                &a.project.name,
                 a.task_id,
                 &a.workspace.name,
                 "unverified",
@@ -2599,6 +2605,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         // `shelbi:working` title marker / active-processing footer.
         if crate::submit::verify_seeded(a.host, a.addr, &baseline, crate::ready::READY_TIMEOUT) {
             append_dispatch_status(
+                &a.project.name,
                 a.task_id,
                 &a.workspace.name,
                 "confirmed",
@@ -2618,11 +2625,23 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         {
             match crate::submit::send_verified(a.host, a.addr, &startup_prompt, &baseline)? {
                 crate::submit::SubmitStatus::Submitted { detail } => {
-                    append_dispatch_status(a.task_id, &a.workspace.name, "confirmed", detail);
+                    append_dispatch_status(
+                        &a.project.name,
+                        a.task_id,
+                        &a.workspace.name,
+                        "confirmed",
+                        detail,
+                    );
                     return Ok(());
                 }
                 crate::submit::SubmitStatus::DeliveredUnverified { detail } => {
-                    append_dispatch_status(a.task_id, &a.workspace.name, "unverified", detail);
+                    append_dispatch_status(
+                        &a.project.name,
+                        a.task_id,
+                        &a.workspace.name,
+                        "unverified",
+                        detail,
+                    );
                     return Ok(());
                 }
                 // No submission signal even after the paste + retry Enter — fall
@@ -2639,6 +2658,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         // so the caller leaves the task in its ready-category column for a
         // clean retry.
         append_dispatch_status(
+            &a.project.name,
             a.task_id,
             &a.workspace.name,
             "stuck",
@@ -2672,6 +2692,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     if submit_profile.uses_claude_ui() {
         if !crate::ready::wait_for_claude_ready(a.host, a.addr, crate::ready::READY_TIMEOUT)? {
             if let Err(e) = shelbi_state::append_dispatch_event(
+                &a.project.name,
                 a.task_id,
                 &a.workspace.name,
                 "stalled",
@@ -2713,7 +2734,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     //    ready-category column, exactly like a readiness timeout, instead of
     //    moving it to `in_progress` on a workspace that never got the prompt.
     let status = crate::submit::send_verified(a.host, a.addr, &startup_prompt, &baseline)?;
-    if !record_dispatch_submit(a.addr, a.task_id, &a.workspace.name, status) {
+    if !record_dispatch_submit(&a.project.name, a.addr, a.task_id, &a.workspace.name, status) {
         return Err(Error::Other(format!(
             "prompt was not accepted on {} — no submission signal after a retry \
              Enter. Dispatch aborted so the task stays put for retry; check the \
@@ -2739,6 +2760,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
 /// reaction rules already key on: whether the prompt is visibly parked in
 /// the box or simply unproven, the dispatch must not mark the task active.
 fn record_dispatch_submit(
+    project: &str,
     addr: &TmuxAddr,
     task_id: &str,
     workspace: &str,
@@ -2746,11 +2768,11 @@ fn record_dispatch_submit(
 ) -> bool {
     match status {
         crate::submit::SubmitStatus::Submitted { detail } => {
-            append_dispatch_status(task_id, workspace, "confirmed", detail);
+            append_dispatch_status(project, task_id, workspace, "confirmed", detail);
             true
         }
         crate::submit::SubmitStatus::DeliveredUnverified { detail } => {
-            append_dispatch_status(task_id, workspace, "unverified", detail);
+            append_dispatch_status(project, task_id, workspace, "unverified", detail);
             true
         }
         crate::submit::SubmitStatus::EligibilityRevoked
@@ -2761,7 +2783,13 @@ fn record_dispatch_submit(
                  after a retry Enter — dispatch stalled; leaving the task unmoved",
                 addr.target(),
             );
-            append_dispatch_status(task_id, workspace, "stalled", "no_busy_signal_after_retry");
+            append_dispatch_status(
+                project,
+                task_id,
+                workspace,
+                "stalled",
+                "no_busy_signal_after_retry",
+            );
             false
         }
     }
@@ -2882,8 +2910,9 @@ fn classify_limit_resume_screen(
     }
 }
 
-fn append_dispatch_status(task_id: &str, workspace: &str, status: &str, detail: &str) {
-    if let Err(e) = shelbi_state::append_dispatch_event(task_id, workspace, status, detail) {
+fn append_dispatch_status(project: &str, task_id: &str, workspace: &str, status: &str, detail: &str) {
+    if let Err(e) = shelbi_state::append_dispatch_event(project, task_id, workspace, status, detail)
+    {
         eprintln!("shelbi: failed to record dispatch {status} in events.log: {e}");
     }
 }
@@ -12253,7 +12282,7 @@ mod sync_worktree_freshcut_tests {
         );
         let line = events
             .lines()
-            .find(|l| l.contains("dispatch task=task-ev"))
+            .find(|l| l.contains(" dispatch ") && l.contains("task=task-ev"))
             .unwrap_or_else(|| panic!("expected a dispatch event line, got: {events}"));
         assert!(line.contains("workspace=alice"), "line: {line}");
         assert!(line.contains("status=sync-failed"), "line: {line}");

@@ -1018,6 +1018,7 @@ impl App {
             return;
         }
         let _ = shelbi_state::append_dispatch_event(
+            &self.project_name,
             &task_id,
             &workspace,
             "review-load",

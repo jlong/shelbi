@@ -992,7 +992,11 @@ pub fn parse_event_line(line: &str) -> Event {
         return Event::System(SystemEvent {
             ts,
             kind: SystemKind::Dispatch,
-            project,
+            // `dispatch` carries `project=` as an in-body field (like `send` /
+            // `review-ready`), not a leading prefix, so read it from the kv map;
+            // fall back to any outer prefix, and leave it `None` for a legacy
+            // line that has neither.
+            project: kv.get("project").cloned().or(project),
             target: kv.get("task").cloned(),
             status: kv.get("status").cloned(),
             detail: kv.get("workspace").cloned(),
@@ -3086,6 +3090,34 @@ mod tests {
                 assert_eq!(sys.status.as_deref(), Some("submitted"));
             }
             other => panic!("expected System(Send), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_dispatch_event_reading_project_from_field() {
+        // `dispatch` now carries `project=` as a later field (like `send`), so
+        // the parser reads it back out of the k=v tail onto the event's scope.
+        let line = "2026-07-22T14:00:00+00:00 dispatch project=demo task=t workspace=alpha status=confirmed detail=busy_observed";
+        match parse_event_line(line) {
+            Event::System(sys) => {
+                assert_eq!(sys.kind, SystemKind::Dispatch);
+                assert_eq!(sys.project.as_deref(), Some("demo"));
+                assert_eq!(sys.target.as_deref(), Some("t"));
+                assert_eq!(sys.status.as_deref(), Some("confirmed"));
+                assert_eq!(sys.detail.as_deref(), Some("alpha"));
+            }
+            other => panic!("expected System(Dispatch), got {other:?}"),
+        }
+
+        // A legacy line without `project=` still classifies, project `None`.
+        let legacy = "2026-07-22T14:00:00+00:00 dispatch task=t workspace=alpha status=confirmed detail=busy_observed";
+        match parse_event_line(legacy) {
+            Event::System(sys) => {
+                assert_eq!(sys.kind, SystemKind::Dispatch);
+                assert_eq!(sys.project, None);
+                assert_eq!(sys.target.as_deref(), Some("t"));
+            }
+            other => panic!("expected System(Dispatch), got {other:?}"),
         }
     }
 

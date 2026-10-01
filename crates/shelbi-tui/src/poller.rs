@@ -4087,6 +4087,7 @@ fn maybe_dispatch_parked_active_gates(project: &Project) {
                 // a gate that can't be dispatched (no free workspace) is
                 // otherwise invisible, the same gap the review auto-loader closed.
                 let _ = shelbi_state::append_dispatch_event(
+                    &project.name,
                     &tf.task.id,
                     "-",
                     "active-gate-failed",
@@ -4119,7 +4120,7 @@ fn gate_task_is_served(project: &Project, task: &shelbi_core::Issue) -> bool {
     let Some(ws_name) = task.assigned_to.as_deref() else {
         return false;
     };
-    if shelbi_state::recent_dispatch_active(ws_name, DISPATCH_CONFIRM_GRACE) {
+    if shelbi_state::recent_dispatch_active(&project.name, ws_name, DISPATCH_CONFIRM_GRACE) {
         return true;
     }
     let Some(ws) = project.workspace(ws_name) else {
@@ -4285,7 +4286,7 @@ fn maybe_resume_stranded_review_slots(
         // stranded slot. Checked before the stash-recovery probe below: a slot
         // the dispatcher only just seeded has no parked View-Diff agent to
         // recover.
-        if shelbi_state::recent_dispatch_active(&ws.name, DISPATCH_CONFIRM_GRACE) {
+        if shelbi_state::recent_dispatch_active(&project.name, &ws.name, DISPATCH_CONFIRM_GRACE) {
             entry.note_alive(now);
             continue;
         }
@@ -4355,6 +4356,7 @@ fn maybe_resume_stranded_review_slots(
                     }
                     Ok(Some(_)) => {
                         let _ = shelbi_state::append_dispatch_event(
+                            &project.name,
                             &task_id,
                             &ws.name,
                             "review-resume",
@@ -4399,6 +4401,7 @@ fn maybe_resume_stranded_review_slots(
                         // resume that can't dispatch lands in events.log, not
                         // just the logs.
                         let _ = shelbi_state::append_dispatch_event(
+                            &project.name,
                             &task_id,
                             &ws.name,
                             "review-load-failed",
@@ -4694,7 +4697,7 @@ fn maybe_resume_stranded_dev_slots(
         // there, latch the slot alive and hand future crashes to the pane
         // supervisor. The grace window keeps a stale pre-`quit` signal from
         // masking a genuinely stranded slot.
-        if shelbi_state::recent_dispatch_active(&ws.name, DISPATCH_CONFIRM_GRACE) {
+        if shelbi_state::recent_dispatch_active(&project.name, &ws.name, DISPATCH_CONFIRM_GRACE) {
             entry.note_alive(now);
             continue;
         }
@@ -4758,7 +4761,7 @@ fn maybe_resume_stranded_dev_slots(
         // re-probe runs before `decide_dead` so a slot found alive here doesn't
         // pollute the crash-loop history.
         if shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true)
-            || shelbi_state::recent_dispatch_active(&ws.name, DISPATCH_CONFIRM_GRACE)
+            || shelbi_state::recent_dispatch_active(&project.name, &ws.name, DISPATCH_CONFIRM_GRACE)
         {
             entry.note_alive(now);
             continue;
@@ -4769,6 +4772,7 @@ fn maybe_resume_stranded_dev_slots(
             ReviewResumeAction::Resume => match resume_dev_workspace(project, ws, &task_id) {
                 Ok(()) => {
                     let _ = shelbi_state::append_dispatch_event(
+                        &project.name,
                         &task_id,
                         &ws.name,
                         "dev-resume",
@@ -4783,6 +4787,7 @@ fn maybe_resume_stranded_dev_slots(
                 }
                 Err(e) => {
                     let _ = shelbi_state::append_dispatch_event(
+                        &project.name,
                         &task_id,
                         &ws.name,
                         "dev-resume-failed",
@@ -5502,6 +5507,7 @@ mod tests {
         // The launch's FIRST dispatch line — the message channel opened before the
         // pane is spawned. No `status=confirmed` yet: the sweep races the launch.
         shelbi_state::append_dispatch_event(
+            name,
             "t-rev",
             "alpha",
             "message-channel",
@@ -7199,6 +7205,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         // The dispatch's FIRST line — the message channel opened before the pane
         // is spawned. No `status=confirmed` yet: the sweep races the launch.
         shelbi_state::append_dispatch_event(
+            name,
             "t-dev",
             "alpha",
             "message-channel",
@@ -11426,7 +11433,7 @@ transitions:
         let project = local_project(&work_dir);
 
         // The launch path's `status=confirmed` line for `alpha`.
-        shelbi_state::append_dispatch_event("t-gate", "alpha", "confirmed", "busy pane observed")
+        shelbi_state::append_dispatch_event("demo", "t-gate", "alpha", "confirmed", "busy pane observed")
             .unwrap();
 
         assert!(gate_task_is_served(

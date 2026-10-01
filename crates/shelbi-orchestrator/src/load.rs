@@ -368,6 +368,7 @@ fn evict_review_slot_locked(
     )?;
 
     let _ = shelbi_state::append_dispatch_event(
+        project_name,
         &evicted_id,
         workspace_name,
         "review-evict",
@@ -591,6 +592,7 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
         // workspace=… status=review-load …`) so the two are indistinguishable
         // in `events.log`.
         let _ = shelbi_state::append_dispatch_event(
+            project_name,
             &task_id,
             &workspace,
             "review-load",
@@ -610,6 +612,7 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
                 // dispatch primitive already logs sync/branch failures; this
                 // covers every other rejection before it.
                 let _ = shelbi_state::append_dispatch_event(
+                    project_name,
                     &task_id,
                     &workspace,
                     "review-load-failed",
@@ -1099,6 +1102,7 @@ pub fn dispatch_active_gate(project_name: &str, task_id: &str) -> Result<Dispatc
     // orchestrator sees the same `dispatch task=… workspace=…` line a manual
     // `issue start` would emit.
     let _ = shelbi_state::append_dispatch_event(
+        project_name,
         task_id,
         &chosen.name,
         "active-gate",
