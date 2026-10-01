@@ -2159,35 +2159,65 @@ pub fn append_dispatch_event(
     ))
 }
 
-/// Bytes of the `events.log` tail scanned by [`recent_dispatch_confirmed`].
+/// Bytes of the `events.log` tail scanned by [`recent_dispatch_active`].
 /// Mirrors the window `zen_lifecycle::recent_config_self_heal` uses — enough
 /// to span the last few seconds of dispatch chatter without slurping the
 /// unbounded log.
-const DISPATCH_CONFIRM_TAIL_BYTES: u64 = 64 * 1024;
+const DISPATCH_ACTIVE_TAIL_BYTES: u64 = 64 * 1024;
 
-/// Did a dispatch to `workspace` confirm its pane busy within the last
-/// `within` — a `dispatch … workspace=<workspace> status=confirmed` line (the
-/// `seed_busy_observed` / `busy_observed` confirmations [`append_dispatch_event`]
-/// writes once a launch-seeded prompt lands on a live, busy pane)?
+/// The dispatch `status=` values that mean "a launch is in flight on this slot,
+/// or just finished bringing it up" — as opposed to a failure status
+/// (`stalled` / `stuck` / `sync-failed` / `branch-mismatch` / …) that left the
+/// task put for a retry, or a bookkeeping status (`dev-resume` / `review-load`
+/// / `active-gate` / …). [`recent_dispatch_active`] treats any of these as
+/// authoritative over a momentary dead probe.
 ///
-/// The stranded-dev-slot resume pass (`maybe_resume_stranded_dev_slots`) uses
-/// this as the authoritative "a launch just brought this slot up" signal. Its
-/// own tmux liveness probe can read a freshly launched window as dead for a
-/// beat, and on a `quit`+reopen the slot has never been seen alive, so without
-/// this the pass would relaunch a pane the dispatch path just confirmed
-/// working — a spurious `--continue` on top of a live session. A confirmation
-/// trumps a momentary dead probe. Bounded by `within` so a stale confirmation
-/// from *before* the reopen — whose slot really is stranded and must still be
-/// resumed — is ignored. Best-effort: `false` on any I/O error, a missing log,
-/// or an unrepresentable `within`.
-pub fn recent_dispatch_confirmed(workspace: &str, within: Duration) -> bool {
+/// `message-channel` is the one that closes the spurious-resume race. The
+/// dispatch path (`shelbi_orchestrator::workspace::deploy_and_spawn`) writes it
+/// at the very start of a launch — *before* it kills the old pane and spawns the
+/// new one — so it is already in the log by the time the stranded-slot sweep can
+/// ever read the freshly launched window dead. `confirmed` / `unverified` come
+/// later, once the pane is up, and are kept so a slot that confirmed a few beats
+/// ago still reads active even after its `message-channel` scrolls past the
+/// tail.
+const DISPATCH_ACTIVE_STATUSES: [&str; 3] = ["message-channel", "confirmed", "unverified"];
+
+/// Did a launch to `workspace` reach the hub→pane message channel, confirm its
+/// pane busy, or land unverified within the last `within` — any
+/// `dispatch … workspace=<workspace> status=<s>` line whose `<s>` is in
+/// [`DISPATCH_ACTIVE_STATUSES`]?
+///
+/// The stranded-slot resume passes (`maybe_resume_stranded_dev_slots` and its
+/// review cousin `maybe_resume_stranded_review_slots`) and the active-gate
+/// dispatch guard (`gate_task_is_served`) use this as the authoritative "a
+/// launch owns this slot right now" signal. Their own tmux liveness probe can
+/// read a freshly launched window as dead for a beat, and on a `quit`+reopen the
+/// slot has never been seen alive, so without this a pass would relaunch a pane
+/// a dispatch is actively bringing up — a spurious `--continue` (dev) or a
+/// second "you're being resumed" load (review) on top of a live session.
+///
+/// Matching `status=confirmed` alone was not enough: a launch takes several
+/// seconds between seeding its prompt and confirming the pane busy, and the
+/// misfiring sweep probes the window *during* that gap — it reads the pane dead
+/// before the confirmation is ever written, so the confirmation it is looking
+/// for does not exist yet (observed: a `status=confirmed` and the spurious
+/// `dev-resume`/`review-resume` landing within the same millisecond, the
+/// confirmation losing the race to the sweep's decision). `message-channel` is
+/// written *first*, before the pane is even torn down, so it is reliably present
+/// throughout that gap. Treating it as authoritative is what makes the guard
+/// deterministic rather than a race it keeps losing.
+///
+/// Bounded by `within` so a stale signal from *before* a `quit`+reopen — whose
+/// slot really is stranded and must still be resumed — is ignored. Best-effort:
+/// `false` on any I/O error, a missing log, or an unrepresentable `within`.
+pub fn recent_dispatch_active(workspace: &str, within: Duration) -> bool {
     let Ok(within) = chrono::Duration::from_std(within) else {
         return false;
     };
     let Ok(path) = events_log_path() else {
         return false;
     };
-    let Ok(text) = read_events_tail(&path, DISPATCH_CONFIRM_TAIL_BYTES) else {
+    let Ok(text) = read_events_tail(&path, DISPATCH_ACTIVE_TAIL_BYTES) else {
         return false;
     };
     let ws = sanitize_field(workspace);
@@ -2202,7 +2232,10 @@ pub fn recent_dispatch_confirmed(workspace: &str, within: Duration) -> bool {
         if event_field(body, "workspace") != Some(ws.as_str()) {
             continue;
         }
-        if event_field(body, "status") != Some("confirmed") {
+        let Some(status) = event_field(body, "status") else {
+            continue;
+        };
+        if !DISPATCH_ACTIVE_STATUSES.contains(&status) {
             continue;
         }
         if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_tok) {
@@ -5521,35 +5554,56 @@ mod tests {
     }
 
     #[test]
-    fn recent_dispatch_confirmed_matches_only_a_fresh_confirmation_for_the_slot() {
+    fn recent_dispatch_active_matches_a_fresh_launch_signal_for_the_slot() {
         use std::io::Write as _;
 
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        // A `confirmed` dispatch to bravo written just now is a fresh
-        // confirmation for that slot.
+        // A `confirmed` dispatch to bravo written just now is a fresh launch
+        // signal for that slot.
         append_dispatch_event("fix-login", "bravo", "confirmed", "seed busy observed").unwrap();
         assert!(
-            recent_dispatch_confirmed("bravo", Duration::from_secs(60)),
+            recent_dispatch_active("bravo", Duration::from_secs(60)),
             "a just-written confirmation for bravo must match",
         );
 
-        // Not another slot's confirmation…
+        // The race-closing case: `message-channel` is written at the *start* of a
+        // launch, before the pane exists, so it is the signal present when the
+        // stranded sweep reads the still-launching window dead. It must count as
+        // an active launch even though the `confirmed` line has not landed yet.
+        append_dispatch_event("new-task", "golf", "message-channel", "mode=hooks runner=claude")
+            .unwrap();
         assert!(
-            !recent_dispatch_confirmed("alpha", Duration::from_secs(60)),
-            "a confirmation for bravo must not match alpha",
+            recent_dispatch_active("golf", Duration::from_secs(60)),
+            "a message-channel (launch in flight, pre-confirmation) must match",
         );
 
-        // …and not a non-confirmed status for the same slot.
+        // `unverified` (pane up, submit not cleanly verified) is also an active
+        // launch, not a failure.
+        append_dispatch_event("odd-task", "hotel", "unverified", "verification unsupported")
+            .unwrap();
+        assert!(
+            recent_dispatch_active("hotel", Duration::from_secs(60)),
+            "an unverified dispatch landed a live pane and must match",
+        );
+
+        // Not another slot's signal…
+        assert!(
+            !recent_dispatch_active("alpha", Duration::from_secs(60)),
+            "a launch signal for bravo must not match alpha",
+        );
+
+        // …and not a failure status for the same slot: a `stalled` dispatch left
+        // the task put for retry, it did not bring a pane up.
         append_dispatch_event("build-thing", "delta", "stalled", "readiness timeout").unwrap();
         assert!(
-            !recent_dispatch_confirmed("delta", Duration::from_secs(60)),
-            "a stalled dispatch is not a confirmation",
+            !recent_dispatch_active("delta", Duration::from_secs(60)),
+            "a stalled dispatch is a failure, not an active launch",
         );
 
-        // A confirmation older than the grace window (the pre-`quit` case a
+        // A launch signal older than the grace window (the pre-`quit` case a
         // genuinely stranded slot presents) must NOT match a short window, but
         // does match a window wide enough to reach it — proving it's the age,
         // not the shape, that excludes it.
@@ -5567,12 +5621,12 @@ mod tests {
         .unwrap();
         drop(f);
         assert!(
-            !recent_dispatch_confirmed("echo", Duration::from_secs(60)),
-            "a confirmation an hour old must not match a 60s window",
+            !recent_dispatch_active("echo", Duration::from_secs(60)),
+            "a launch signal an hour old must not match a 60s window",
         );
         assert!(
-            recent_dispatch_confirmed("echo", Duration::from_secs(2 * 3600)),
-            "the same confirmation matches a window wide enough to reach it",
+            recent_dispatch_active("echo", Duration::from_secs(2 * 3600)),
+            "the same signal matches a window wide enough to reach it",
         );
 
         std::env::remove_var("SHELBI_HOME");

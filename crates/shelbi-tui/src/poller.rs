@@ -4106,9 +4106,10 @@ fn maybe_dispatch_parked_active_gates(project: &Project) {
 /// Whether a task parked in an agent-owned active gate already has a live
 /// worker, so the active-gate pass must leave it alone.
 ///
-/// Served = its `assigned_to` slot's pane is alive, OR a dispatch just confirmed
-/// that slot busy ([`DISPATCH_CONFIRM_GRACE`], authoritative over a momentary
-/// dead read of a freshly launched pane). A gate with **no** assignment, or one
+/// Served = its `assigned_to` slot's pane is alive, OR a dispatch is actively
+/// launching that slot or just confirmed it busy ([`DISPATCH_CONFIRM_GRACE`],
+/// authoritative over a momentary dead read of a freshly launched pane). A gate
+/// with **no** assignment, or one
 /// whose assigned developer slot is dead (killed by the ready handoff), is NOT
 /// served — the parked case this pass dispatches. A probe *error* reads as
 /// served (alive) so a transient tmux hiccup never re-dispatches — and thereby
@@ -4118,7 +4119,7 @@ fn gate_task_is_served(project: &Project, task: &shelbi_core::Issue) -> bool {
     let Some(ws_name) = task.assigned_to.as_deref() else {
         return false;
     };
-    if shelbi_state::recent_dispatch_confirmed(ws_name, DISPATCH_CONFIRM_GRACE) {
+    if shelbi_state::recent_dispatch_active(ws_name, DISPATCH_CONFIRM_GRACE) {
         return true;
     }
     let Some(ws) = project.workspace(ws_name) else {
@@ -4263,6 +4264,28 @@ fn maybe_resume_stranded_review_slots(
         let alive =
             shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true);
         if alive {
+            entry.note_alive(now);
+            continue;
+        }
+
+        // A dispatch that is actively launching this slot — or just confirmed
+        // its pane busy — is authoritative over a momentary dead read of the
+        // freshly launched window, the same spurious-resume race the dev pass
+        // guards against ([`maybe_resume_stranded_dev_slots`]). The load path
+        // runs in the orchestrator pane, a separate process, so the signal
+        // reaches this pass only through the durable events log. Crucially this
+        // keys off `status=message-channel` (written at the *start* of the
+        // launch, before the old pane is even torn down), not just
+        // `status=confirmed`: the sweep probes the window *during* the seconds
+        // between seed and confirmation, so a confirmation-only check loses the
+        // race and relaunches a second "you're being resumed" load on top of the
+        // live session (see [`shelbi_state::recent_dispatch_active`]). When the
+        // signal is fresh, latch the slot alive and stand down this tick. The
+        // grace window keeps a stale pre-`quit` signal from masking a genuinely
+        // stranded slot. Checked before the stash-recovery probe below: a slot
+        // the dispatcher only just seeded has no parked View-Diff agent to
+        // recover.
+        if shelbi_state::recent_dispatch_active(&ws.name, DISPATCH_CONFIRM_GRACE) {
             entry.note_alive(now);
             continue;
         }
@@ -4590,14 +4613,15 @@ impl DevResumeState {
     }
 }
 
-/// How recently a `dispatch … status=confirmed` line must sit for
-/// [`maybe_resume_stranded_dev_slots`] to treat the slot as alive on the
-/// strength of that confirmation alone. A launch confirms busy within a few
-/// seconds; the dev-resume probe that misfired did so ~2s after the
-/// confirmation. This window comfortably covers dispatch latency plus tick
-/// jitter while staying far shorter than any pre-`quit` confirmation, so a
-/// genuinely stranded slot (whose last confirmation predates the reopen) is
-/// still resumed.
+/// How recently an active-launch dispatch line (`status=message-channel` /
+/// `confirmed` / `unverified`; see [`shelbi_state::recent_dispatch_active`])
+/// must sit for [`maybe_resume_stranded_dev_slots`] to treat the slot as alive
+/// on the strength of that launch alone. A launch opens its message channel
+/// immediately and confirms busy within a few seconds; the dev-resume probe that
+/// misfired did so ~2s into that window. This grace comfortably covers dispatch
+/// latency plus tick jitter while staying far shorter than any pre-`quit` launch
+/// signal, so a genuinely stranded slot (whose last dispatch predates the
+/// reopen) is still resumed.
 const DISPATCH_CONFIRM_GRACE: Duration = Duration::from_secs(60);
 
 /// Resume any *dev* slot whose `in_progress` task is assigned on disk but whose
@@ -4657,17 +4681,20 @@ fn maybe_resume_stranded_dev_slots(
             continue;
         }
 
-        // A dispatch that just confirmed this slot's pane busy
-        // (`seed_busy_observed` / `busy_observed`) is authoritative over a
-        // momentary dead read of the freshly launched window. `shelbi issue
-        // start` runs in the orchestrator pane, a separate process, so the
-        // confirmation reaches this pass only through the durable events log;
-        // when it's there, latch the slot alive and hand future crashes to the
-        // pane supervisor. This is the fix for the spurious `--continue` that
-        // relaunched a slot ~2s after its dispatch confirmed busy. The grace
-        // window keeps a stale pre-`quit` confirmation from masking a genuinely
-        // stranded slot.
-        if shelbi_state::recent_dispatch_confirmed(&ws.name, DISPATCH_CONFIRM_GRACE) {
+        // A dispatch actively launching this slot — or one that just confirmed
+        // its pane busy — is authoritative over a momentary dead read of the
+        // freshly launched window. `shelbi issue start` runs in the orchestrator
+        // pane, a separate process, so the signal reaches this pass only through
+        // the durable events log. It keys off `status=message-channel` (written
+        // at the start of the launch, before the old pane is torn down), not just
+        // `status=confirmed`: the dead read lands in the seconds between seed and
+        // confirmation, so a confirmation-only check loses that race and fires a
+        // spurious `--continue` ~2s after the launch began (the bug this closes;
+        // see [`shelbi_state::recent_dispatch_active`]). When the signal is
+        // there, latch the slot alive and hand future crashes to the pane
+        // supervisor. The grace window keeps a stale pre-`quit` signal from
+        // masking a genuinely stranded slot.
+        if shelbi_state::recent_dispatch_active(&ws.name, DISPATCH_CONFIRM_GRACE) {
             entry.note_alive(now);
             continue;
         }
@@ -4731,7 +4758,7 @@ fn maybe_resume_stranded_dev_slots(
         // re-probe runs before `decide_dead` so a slot found alive here doesn't
         // pollute the crash-loop history.
         if shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true)
-            || shelbi_state::recent_dispatch_confirmed(&ws.name, DISPATCH_CONFIRM_GRACE)
+            || shelbi_state::recent_dispatch_active(&ws.name, DISPATCH_CONFIRM_GRACE)
         {
             entry.note_alive(now);
             continue;
@@ -5432,6 +5459,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn review_resume_stands_down_while_a_dispatch_is_in_flight() {
+        // The REAL spurious-resume race on a review slot, driven end-to-end
+        // through `maybe_resume_stranded_review_slots`. A review task is being
+        // loaded onto `alpha`: the launch has opened its hub→pane message channel
+        // (`status=message-channel`) but has NOT confirmed the pane busy yet — it
+        // is still spawning the window. The stranded sweep fires in that gap and
+        // probes the not-yet-live window dead (as it does on a tmux-less box).
+        //
+        // This is the ordering the earlier confirmation-only guard missed: the
+        // confirmation it looked for does not exist during the launch gap, so the
+        // sweep would fall through to `decide_dead` → Resume and relaunch a second
+        // "you're being resumed" load on top of the launch in flight. The board
+        // is set up as a genuinely stranded slot (a review-column task still
+        // assigned to `alpha` on a warm board) so that WITHOUT an in-flight-aware
+        // guard the resume fires. `recent_dispatch_active` keys off the
+        // `message-channel` line (written before the pane exists), so the pass
+        // latches the slot alive and stands down, emitting no `review-resume`
+        // (nor a failed `review-load-failed` attempt) and recording no crash.
+        //
+        // Removing the guard — or narrowing it back to `status=confirmed` only —
+        // makes this test fail (the sweep resumes), which is exactly the hole the
+        // confirmation-only guard left open.
+        let _env = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = gh_guard_home("review-inflight-race");
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let name = "ghguard-review-inflight-race";
+        let project = gh_review_project(&work_dir, name);
+
+        // A review-column task still pinned to the slot on a warm board: the
+        // stranded scenario the guard must not resume through while a dispatch is
+        // in flight. (Only read in the counterfactual where the guard is absent;
+        // present here so this reproduces the real race.)
+        seed_warm_index(name, vec![idx_issue("t-rev", "review", Some("alpha"))]);
+        shelbi_state::set_task_assignment(name, "t-rev", Some("alpha")).unwrap();
+
+        // The launch's FIRST dispatch line — the message channel opened before the
+        // pane is spawned. No `status=confirmed` yet: the sweep races the launch.
+        shelbi_state::append_dispatch_event(
+            "t-rev",
+            "alpha",
+            "message-channel",
+            "mode=hooks runner=claude",
+        )
+        .unwrap();
+
+        let mut state: HashMap<String, ReviewResumeState> = HashMap::new();
+        maybe_resume_stranded_review_slots(&project, &mut state);
+
+        let log =
+            std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
+        assert!(
+            !log.contains("status=review-resume"),
+            "a slot with a dispatch in flight must not be resumed; log:\n{log}"
+        );
+        assert!(
+            !log.contains("status=review-load-failed"),
+            "the pass must stand down, not even attempt a (failing) resume; log:\n{log}"
+        );
+        assert!(
+            state
+                .get("alpha")
+                .map(|s| s.restarts.is_empty())
+                .unwrap_or(true),
+            "standing down on an in-flight launch records no restart",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     // -- dev-slot resume state machine --------------------------------------
 
     #[test]
@@ -5466,7 +5568,7 @@ mod tests {
         // freshly launched window and (momentarily) reads it dead. Without the
         // confirmation guard this would `decide_dead` → Resume and relaunch the
         // live pane with `--continue`. `maybe_resume_stranded_dev_slots` calls
-        // `note_alive` on a `recent_dispatch_confirmed` hit *before* it consults
+        // `note_alive` on a `recent_dispatch_active` hit *before* it consults
         // `ever_alive`, so the pass stands down. This asserts that ordering on
         // the state machine: a confirmation latches the hand-off guard, which
         // then gates `decide_dead` out.
@@ -7046,6 +7148,128 @@ Auto mode works better when it knows your environment. Takes about a minute.
                 AssignedDevTask::None
             ),
             "a done (non-active) task on a warm board must resolve to None, not Assigned"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn dev_resume_stands_down_while_a_dispatch_is_in_flight() {
+        // The REAL spurious-resume race on a dev slot, driven end-to-end through
+        // `maybe_resume_stranded_dev_slots`. A task is being dispatched onto
+        // `alpha`: the launch has opened its hub→pane message channel
+        // (`status=message-channel`) but has NOT confirmed the pane busy yet — it
+        // is still spawning the window. The stranded sweep fires in that gap and
+        // probes the not-yet-live window dead (as it does on a tmux-less box).
+        //
+        // This reproduces the ordering the confirmation-only guard missed: the
+        // `status=confirmed` line it looked for is not written until seconds after
+        // the pane comes up, so during the launch gap the sweep found no
+        // confirmation, fell through to `decide_dead` → Resume, and fired a
+        // spurious `--continue` on top of the launch in flight (the bug this task
+        // closes; see `~/.shelbi/events.log` alpha 2026-09-25). The slot is a
+        // genuine strand (an in-progress task still assigned to `alpha` on a warm
+        // board, dev slot never seen alive) so that WITHOUT an in-flight-aware
+        // guard the resume fires. `recent_dispatch_active` keys off the
+        // `message-channel` line (written before the pane exists), so the pass
+        // latches the slot alive and stands down — no `dev-resume` and no
+        // `dev-resume-failed` attempt.
+        //
+        // On current `main` (`recent_dispatch_confirmed`, which matches
+        // `status=confirmed` only) this test fails: the guard sees no confirmation
+        // and the pass resumes the slot.
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = gh_guard_home("dev-inflight-race");
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let name = "ghguard-dev-inflight-race";
+        let project = gh_dev_project(&work_dir, name);
+
+        // An in-progress task still pinned to the dev slot on a warm board: the
+        // stranded scenario the guard must not resume through while a dispatch is
+        // in flight. (Read only in the counterfactual where the guard is absent;
+        // present here so this reproduces the real race.)
+        seed_warm_index(name, vec![idx_issue("t-dev", "in-progress", Some("alpha"))]);
+        shelbi_state::set_task_assignment(name, "t-dev", Some("alpha")).unwrap();
+
+        // The dispatch's FIRST line — the message channel opened before the pane
+        // is spawned. No `status=confirmed` yet: the sweep races the launch.
+        shelbi_state::append_dispatch_event(
+            "t-dev",
+            "alpha",
+            "message-channel",
+            "mode=hooks runner=claude",
+        )
+        .unwrap();
+
+        let mut state: HashMap<String, DevResumeState> = HashMap::new();
+        maybe_resume_stranded_dev_slots(&project, &mut state);
+
+        let log =
+            std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
+        assert!(
+            !log.contains("status=dev-resume "),
+            "a slot with a dispatch in flight must not be resumed; log:\n{log}"
+        );
+        assert!(
+            !log.contains("status=dev-resume-failed"),
+            "the pass must stand down, not even attempt a (failing) resume; log:\n{log}"
+        );
+        assert!(
+            state
+                .get("alpha")
+                .map(|s| s.restarts.is_empty())
+                .unwrap_or(true),
+            "standing down on an in-flight launch records no restart",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn dev_resume_still_fires_for_a_genuinely_stranded_slot() {
+        // The other half of the guard: broadening `recent_dispatch_active` to
+        // `message-channel` must NOT suppress a real strand. A `quit`+reopen leaves
+        // an in-progress task assigned to a dead dev slot with NO recent dispatch
+        // line at all (the last launch predates the reopen and has scrolled past /
+        // aged out). The pass must still reach `decide_dead` → Resume and attempt
+        // exactly one resume. Here the issue body doesn't exist on the fabricated
+        // board, so the attempt surfaces as a single `dev-resume-failed` — the
+        // point is that the pass ACTS rather than standing down, proving the
+        // in-flight guard is scoped to a fresh launch, not a blanket mute.
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = gh_guard_home("dev-strand-resumes");
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let name = "ghguard-dev-strand-resumes";
+        let project = gh_dev_project(&work_dir, name);
+
+        seed_warm_index(name, vec![idx_issue("t-dev", "in-progress", Some("alpha"))]);
+        shelbi_state::set_task_assignment(name, "t-dev", Some("alpha")).unwrap();
+        // No dispatch event: the launch that first brought this slot up is long
+        // gone, so the slot is genuinely stranded.
+
+        let mut state: HashMap<String, DevResumeState> = HashMap::new();
+        maybe_resume_stranded_dev_slots(&project, &mut state);
+
+        let log =
+            std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
+        assert!(
+            log.contains("status=dev-resume"),
+            "a genuinely stranded slot must still be resumed exactly once; log:\n{log}"
+        );
+        assert_eq!(
+            state.get("alpha").map(|s| s.restarts.len()).unwrap_or(0),
+            1,
+            "a genuine strand resumes exactly once this tick",
         );
 
         std::env::remove_var("SHELBI_HOME");
