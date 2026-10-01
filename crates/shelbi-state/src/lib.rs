@@ -22,6 +22,7 @@ use shelbi_core::{
 mod agent_workspaces;
 pub mod board_index;
 pub mod done_history;
+pub mod error_log;
 mod event_log;
 pub mod gh_budget;
 pub mod gh_requests;
@@ -76,6 +77,10 @@ pub use board_index::{
 pub use done_history::{
     done_history_path, patch_done_history_issue, read_done_history, remove_done_history_issue,
     update_done_history, write_done_history, DoneHistory, DONE_HISTORY_FILE, DONE_HISTORY_TTL,
+};
+pub use error_log::{
+    append_error, clear_errors, error_log_path, mark_errors_read, read_errors,
+    read_errors_with_unread, unread_error_count, ErrorLogEntry, ERROR_LOG_CAP,
 };
 pub use issue_store::{
     is_terminal_column, issue_store_for, issue_store_for_project, raw_issue_store_for,

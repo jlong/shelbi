@@ -440,6 +440,12 @@ enum Cmd {
         #[arg(long)]
         out: String,
     },
+    /// (internal) Render the persistent error-log viewer — meant to be invoked
+    /// inside a `tmux display-popup` by the sidebar's unread-errors button (or
+    /// inline by the palette's "Open error log" entry). Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__error-log")]
+    ErrorLog { project: String },
 }
 
 fn main() -> Result<()> {
@@ -580,6 +586,7 @@ fn main() -> Result<()> {
             let submitted = commands::review_reject::run(out)?;
             std::process::exit(if submitted { 0 } else { 1 });
         }
+        Some(Cmd::ErrorLog { project }) => commands::error_log::run(project),
         Some(Cmd::ZenOrchStart { project }) => commands::zen_lifecycle::orch_start(&project),
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),
         Some(Cmd::ZenOrchExit { project }) => commands::zen_lifecycle::orch_exit(&project),

@@ -773,6 +773,18 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
     // flag so an empty-query palette reads exactly as it did before; typing
     // `E` / `Edit` / `settings` surfaces them. Placed ahead of the global
     // action trail so "Quit Shelbi" stays the structurally-last entry.
+    // "Open error log" — always available, even with no unread (or zero) errors,
+    // so the log is reachable from the palette regardless of the sidebar button's
+    // state. The viewer shows an empty-state line when the log is empty.
+    out.push(Entry {
+        id: "action:error-log".into(),
+        label: "Open error log".into(),
+        kind: EntryKind::Action,
+        subtitle: Some("view this project's recent errors".into()),
+        shortcut: None,
+        decoration: None,
+        hidden_until_query: false,
+    });
     out.extend(edit_entries(&app.project_name));
     // "Add project" now lives in the projects sidebar as its trailing row on an
     // empty-query load, so the main-column copy is hidden until the user types
@@ -1112,6 +1124,12 @@ fn dispatch(project: &str, entry: &Entry) -> Result<()> {
         // dispatch, so the editor inherits a clean normal-mode terminal and
         // the palette process closes once it returns.
         return open_edit_target(project, &entry.id);
+    }
+    if entry.id == "action:error-log" {
+        // `run` has already restored the terminal before dispatch, so the viewer
+        // sets up its own alt-screen inside the palette's popup pane and closes
+        // the palette process when it returns — no nested `display-popup`.
+        return super::error_log::run(project.to_string());
     }
     if entry.id == "action:toggle-zen" {
         // Shares the read/write/log path with the TUI's Alt+Z handler
@@ -2103,12 +2121,13 @@ mod tests {
         let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         // Switch Project leads structurally, then the view block
-        // (Chat/Tasks/Activity), then the mode toggle, then the global actions
-        // trail (Add → Quit). Workspaces/reviews/agents are empty in this
-        // fixture so they don't appear, and no other projects exist so no
-        // inline "Switch to X" rows. (Switch Project is `hidden_until_query`,
-        // so it's present here in the raw list but dropped from the empty-query
-        // *search* — see `switch_project_hidden_from_empty_query_but_searchable`.)
+        // (Chat/Tasks/Activity), then the mode toggle, then "Open error log",
+        // then the global actions trail (Add → Quit). Workspaces/reviews/agents
+        // are empty in this fixture so they don't appear, and no other projects
+        // exist so no inline "Switch to X" rows. (Switch Project is
+        // `hidden_until_query`, so it's present here in the raw list but dropped
+        // from the empty-query *search* — see
+        // `switch_project_hidden_from_empty_query_but_searchable`.)
         assert_eq!(
             ids,
             vec![
@@ -2117,6 +2136,7 @@ mod tests {
                 "view:tasks",
                 "view:activity",
                 "action:toggle-zen",
+                "action:error-log",
                 "action:add-project",
                 "action:quit-project",
                 "action:quit-shelbi",
