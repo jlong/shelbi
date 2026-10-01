@@ -32,15 +32,35 @@ use crate::workspace::{start_workspace_on_task, StartSpec};
 /// free. Reading the index (instead of the backend) keeps the autoloader off
 /// GitHub's list budget and consistent with what the sidebar and pollers see.
 fn active_board(project: &Project) -> Result<Vec<IssueFile>> {
-    Ok(
-        shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker)?
-            .into_issues()
-            .into_iter()
-            .filter(|tf| {
-                tf.task.column == Column::in_progress() || tf.task.column == Column::review()
-            })
-            .collect(),
-    )
+    Ok(overlay_resolved_board(project)?
+        .into_iter()
+        .filter(|tf| tf.task.column == Column::in_progress() || tf.task.column == Column::review())
+        .collect())
+}
+
+/// Read `project`'s open board and resolve every card's `assigned_to` from the
+/// authoritative local assignment overlay before returning it.
+///
+/// The daemon-owned `board-index.json`'s `assigned_to` is a *publish-time* fold
+/// of that overlay, so it lags a fresh (review) load: the load writes the new
+/// slot to the overlay immediately, but an overlay write never bumps a GitHub
+/// `updatedAt` and a parked / rate-limit-throttled daemon stops re-publishing
+/// entirely, so the index keeps naming the slot that previously owned the card
+/// (the dev slot that built it). A loader that decided occupancy from the index
+/// alone then read a just-served review slot as free and re-dispatched onto it
+/// every supervisor tick. Every occupancy / "is this task still queued?"
+/// decision in this module reads through here (the `BoardState`-gated autoloader
+/// read folds the overlay inline, for the same reason) so none of them mistake
+/// a just-loaded slot for free. The overlay is authoritative — an id with no
+/// marker resolves to no owner — and the direct store `get`/`list` paths already
+/// apply it, so this only normalizes the index path to match. A no-op for a
+/// local (`file_system`) backend, whose `assigned_to` lives authoritatively in
+/// the card frontmatter the board was read from.
+fn overlay_resolved_board(project: &Project) -> Result<Vec<IssueFile>> {
+    let mut board =
+        shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker)?.into_issues();
+    shelbi_state::fold_assignment_overlay(&project.name, &project.issue_tracker, &mut board);
+    Ok(board)
 }
 
 /// Load `task_id` onto a free workspace whose effective tags satisfy the
@@ -300,13 +320,15 @@ fn evict_review_slot_locked(
     keep: &str,
 ) -> Result<Option<String>> {
     let store = shelbi_state::issue_store_for(project_name)?;
+    let project = shelbi_state::load_project(project_name)?;
     // Only review-column tasks are "loaded for review"; an in-progress task on
     // the slot (an odd state) isn't ours to bounce back to the review queue —
     // leave it for `load_review_task_locked`'s busy guard to reject. The occupant
-    // is found from the daemon-owned index (§5); the `store` is kept for the
-    // assignment-clear write below.
-    let review: Vec<IssueFile> = shelbi_state::read_board(project_name)?
-        .into_issues()
+    // is found from the daemon-owned index (§5) with ownership resolved from the
+    // authoritative overlay (see [`overlay_resolved_board`]), so a lagging index
+    // can't hide the real occupant; the `store` is kept for the assignment-clear
+    // write below.
+    let review: Vec<IssueFile> = overlay_resolved_board(&project)?
         .into_iter()
         .filter(|tf| tf.task.column == Column::review())
         .collect();
@@ -405,6 +427,33 @@ fn load_review_task_locked(
         )));
     }
 
+    // Independent safety net: a re-load onto the SAME slot this task already
+    // owns is a no-op when that slot's pane is still alive — it is already
+    // serving this task, so re-dispatching would needlessly kill and respawn
+    // the live review pane (the per-tick churn this guards against, orthogonal
+    // to the overlay-fold fix that already stops the auto-loader planning the
+    // re-load). Only a *positively* confirmed live slot short-circuits; a dead
+    // slot (quit/crash) or an unprobeable one falls through to the relaunch
+    // below, which is the legitimate stranded-slot resume, so this never blocks
+    // a genuine recovery. `tf`'s `assigned_to` is overlay-authoritative (the
+    // store applies the overlay on `get`), so "assigned to the target + pane
+    // alive" uniquely means "serving this task on this slot".
+    if tf.task.assigned_to.as_deref() == Some(workspace_name) {
+        let machine = project
+            .machine(&ws.machine)
+            .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
+        let addr = crate::workspace::workspace_tmux_addr(&project, &ws)?;
+        if crate::workspace::workspace_slot_alive(&machine.host(), &addr).unwrap_or(false) {
+            tracing::debug!(
+                project = %project_name,
+                task = %task_id,
+                workspace = %workspace_name,
+                "review-load no-op: slot already serving this task (live pane)",
+            );
+            return Ok(addr.target());
+        }
+    }
+
     let workflow = shelbi_state::load_task_workflow(project_name, &project, &tf.task)
         .unwrap_or_else(|_| shelbi_core::default_workflow());
     let agent = workflow
@@ -441,8 +490,11 @@ fn review_slot_busy_with_other(
     task_id: &str,
 ) -> Result<bool> {
     // The same active (in-progress + review) scan as [`active_board`], asked of
-    // one slot — read from the daemon-owned index (§5), not the backend.
-    let active = shelbi_state::read_board(project_name)?.into_issues();
+    // one slot — read from the daemon-owned index (§5), not the backend, with
+    // ownership resolved from the authoritative overlay so a lagging index can't
+    // mislabel the slot (see [`overlay_resolved_board`]).
+    let project = shelbi_state::load_project(project_name)?;
+    let active = overlay_resolved_board(&project)?;
     Ok(active.iter().any(|t| {
         (t.task.column == Column::in_progress() || t.task.column == Column::review())
             && t.task.id != task_id
@@ -483,11 +535,20 @@ pub fn autoload_review_queue(project_name: &str) -> Result<Vec<AutoLoadedReview>
     // poller's reapers follow.
     let review_tasks: Vec<IssueFile> =
         match shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker)? {
-        shelbi_state::BoardState::Warm(board) => board
-            .into_iter()
-            // Board order (priority, then id) — the same order the sidebar shows.
-            .filter(|tf| tf.task.column == Column::review())
-            .collect(),
+        shelbi_state::BoardState::Warm(mut board) => {
+            // Resolve ownership from the authoritative overlay before deciding
+            // which review cards are still queued vs already serving: the
+            // index's `assigned_to` lags a fresh review load (see
+            // [`overlay_resolved_board`]), so without this fold the planner
+            // reads a just-loaded card as still queued and re-grabs its slot
+            // every tick — the loop this fixes.
+            shelbi_state::fold_assignment_overlay(&project.name, &project.issue_tracker, &mut board);
+            board
+                .into_iter()
+                // Board order (priority, then id) — the same order the sidebar shows.
+                .filter(|tf| tf.task.column == Column::review())
+                .collect()
+        }
         shelbi_state::BoardState::Stale(_) | shelbi_state::BoardState::Cold => {
             return Ok(Vec::new())
         }
@@ -1292,6 +1353,12 @@ mod tests {
         ]);
         idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
         shelbi_state::write_board_index("demo", &idx).unwrap();
+        // The occupancy scan resolves ownership from the authoritative overlay
+        // (the index's `assigned_to` is only a publish-time fold of it), so the
+        // markers the daemon would have folded in must be present for the slot
+        // to read busy. Mirror them here.
+        shelbi_state::set_task_assignment("demo", "sentinel-active", Some("alpha")).unwrap();
+        shelbi_state::set_task_assignment("demo", "sentinel-review", Some("review-1")).unwrap();
 
         let active = active_board(&project).unwrap();
         let ids: Vec<&str> = active.iter().map(|t| t.task.id.as_str()).collect();
@@ -1300,6 +1367,54 @@ mod tests {
         assert!(!ids.contains(&"sentinel-todo"), "todo is not active");
 
         // review-1 reads busy (from the index), so only review-2 is offered.
+        let free: Vec<String> = free_review_workspaces("demo")
+            .unwrap()
+            .into_iter()
+            .map(|w| w.name)
+            .collect();
+        assert_eq!(free, vec!["review-2".to_string()]);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn occupancy_scan_resolves_a_lagging_index_from_the_overlay() {
+        // The reported bug: a review load wrote the review slot to the local
+        // assignment overlay, but the daemon-owned `board-index.json` still
+        // names the dev slot that built the card (an overlay write never bumps
+        // GitHub's `updatedAt`, and a parked daemon stops re-publishing). The
+        // occupancy scan must trust the overlay, not the lagging index —
+        // otherwise the review slot reads free and the auto-loader re-grabs the
+        // task onto it every ~10s tick (the per-tick `review-load` loop).
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let mut project = tagged_project();
+        project.issue_tracker = github_cfg();
+        shelbi_state::save_project(&project).unwrap();
+
+        // Index: the card is still pinned to the dev slot `alpha` (the lag the
+        // daemon hasn't re-published away yet).
+        let mut idx =
+            shelbi_state::BoardIndex::fresh(vec![ifile(review_task("t-served", "alpha"))]);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("demo", &idx).unwrap();
+        // Overlay: the fresh review load already moved it onto `review-1`.
+        shelbi_state::set_task_assignment("demo", "t-served", Some("review-1")).unwrap();
+
+        // The active scan resolves ownership from the overlay: the card reads as
+        // on `review-1`, not the index's stale `alpha`.
+        let active = active_board(&project).unwrap();
+        let served = active.iter().find(|t| t.task.id == "t-served").unwrap();
+        assert_eq!(
+            served.task.assigned_to.as_deref(),
+            Some("review-1"),
+            "overlay must win over the lagging index assignment",
+        );
+
+        // So `review-1` reads busy and only `review-2` is offered — the slot is
+        // never mistaken for free, so the auto-loader won't re-load onto it.
         let free: Vec<String> = free_review_workspaces("demo")
             .unwrap()
             .into_iter()
