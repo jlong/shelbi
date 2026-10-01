@@ -450,8 +450,19 @@ const LEGACY_REVIEW_WORDING: &[&str] = &["serve recipe", "diff-only", "why no se
 pub(crate) const REVIEW_TWEAK_SECTION_HEADING: &str =
     "## The one exception: a human-requested tweak";
 
-/// Detect two deprecations in the review agent's instructions (or, for the
-/// server-centric wording, its bundled load-run skill). Both fixes are a prose
+/// Distinctive phrases the "Human-authorized rebase" charter change introduces.
+/// The old review charter banned rebasing outright ("don't rebase."); the new
+/// one lets the review agent rebase **when the human explicitly asks**, with a
+/// one-line "this isn't normally part of review" note, a `--force-with-lease`
+/// push, and a conflict summary. A review-instructions copy carrying none of
+/// these markers is still on the old absolute prohibition and refuses an
+/// explicitly authorized rebase. Kept in sync with the shipped default template
+/// by the drift guard in this module's tests.
+const HUMAN_AUTHORIZED_REBASE_MARKERS: &[&str] =
+    &["human-authorized rebase", "rebase unless the"];
+
+/// Detect three deprecations in the review agent's instructions (or, for the
+/// server-centric wording, its bundled load-run skill). Every fix is a prose
 /// refresh a user may have forked and customized — never a mechanical,
 /// non-lossy rewrite — so each routes to [`Classification::NeedsJudgment`] for
 /// the orchestrator to repair its own copy rather than silently clobbering
@@ -493,6 +504,36 @@ fn sniff_review_instructions(entry: &InventoryEntry, text: &str, out: &mut Vec<U
                 "Refresh the `The one exception: a human-requested tweak` section to require \
                  committing the tweak to the checked-out branch and `git push`ing it to origin \
                  before bringing the branch back up — mirror the shipped default template.",
+                locate_line(text, REVIEW_TWEAK_SECTION_HEADING),
+            ));
+        }
+
+        // The review charter now permits a rebase when the human explicitly
+        // asks (the "Human-authorized rebase" subsection), and softened the
+        // absolute "don't rebase" bullet accordingly. A forked copy still on
+        // the old wording refuses even an explicitly authorized rebase. Scope
+        // this to the actual review instructions via the tweak section (the
+        // bundled load-run skill has none), and fire when none of the
+        // human-authorized-rebase wording is present.
+        let lower = text.to_ascii_lowercase();
+        let allows_authorized_rebase = HUMAN_AUTHORIZED_REBASE_MARKERS
+            .iter()
+            .any(|m| lower.contains(m));
+        if !allows_authorized_rebase {
+            out.push(finding(
+                entry,
+                Classification::NeedsJudgment,
+                "REVIEW_INSTRUCTIONS_NO_HUMAN_AUTHORIZED_REBASE",
+                "the review agent's instructions ban rebasing outright and never allow the \
+                 human-authorized exception — so an explicit human request to rebase and \
+                 resolve conflicts is refused",
+                "Refresh the review defaults to allow a rebase only when the human explicitly \
+                 asks: add a `Human-authorized rebase` subsection (after the human-requested-tweak \
+                 exception) and soften the `What you don't do` no-rebase bullet. The agent says \
+                 once that rebasing isn't normally part of review, then `git fetch origin`, rebases \
+                 onto the named base, resolves conflicts, pushes with `--force-with-lease`, brings \
+                 the branch back up, and summarizes the resolved conflicts — and without an \
+                 explicit request still never rebases. Mirror the shipped default template.",
                 locate_line(text, REVIEW_TWEAK_SECTION_HEADING),
             ));
         }
@@ -1888,6 +1929,11 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              fresh-primary base discipline can't be merged in mechanically without risking \
              local edits — the orchestrator refreshes its own copy instead."
         }
+        "REVIEW_INSTRUCTIONS_NO_HUMAN_AUTHORIZED_REBASE" => {
+            "These are prose instructions a project may have forked and customized, so the \
+             human-authorized-rebase exception can't be merged in mechanically without risking \
+             local edits — the orchestrator refreshes its own copy instead."
+        }
         "ZEN_PR_MERGE_DOUBLE_MERGE" => {
             "The merge/finalize prose is free-form and user-customizable, so the corrected \
              gate-then-transition policy can't be applied by a mechanical rewrite without \
@@ -2609,6 +2655,78 @@ mod tests {
             .is_some(),
             "shipped default review template no longer has a `{REVIEW_TWEAK_SECTION_HEADING}` \
              section — the sniffer's absence check is now dead",
+        );
+    }
+
+    // ---- review agent instructions (human-authorized rebase) ------------
+
+    #[test]
+    fn review_instructions_without_human_authorized_rebase_are_needs_judgment() {
+        // Pre-change charter: has the tweak exception section but bans rebasing
+        // outright, with none of the human-authorized-rebase wording.
+        let text = format!(
+            "# Review\n\n{REVIEW_TWEAK_SECTION_HEADING}\n\nMake that specific edit. \
+             **Commit and push the tweak to the task's branch.**\n\n## What you don't do\n\n\
+             - Don't auto-merge, don't move the task on the board, don't rebase.\n"
+        );
+        let mut out = Vec::new();
+        sniff_review_instructions(&review_instr_entry(), &text, &mut out);
+        let f = find(&out, "REVIEW_INSTRUCTIONS_NO_HUMAN_AUTHORIZED_REBASE").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+    }
+
+    #[test]
+    fn review_instructions_with_human_authorized_rebase_are_clean() {
+        // Any one marker is enough to mark the human-authorized exception present.
+        for marker in ["### Human-authorized rebase", "Don't rebase unless the"] {
+            let text = format!(
+                "# Review\n\n{REVIEW_TWEAK_SECTION_HEADING}\n\nMake that specific edit. \
+                 **Commit and push the tweak to the task's branch.**\n\n{marker}\n\nguidance here\n"
+            );
+            let mut out = Vec::new();
+            sniff_review_instructions(&review_instr_entry(), &text, &mut out);
+            assert!(
+                find(&out, "REVIEW_INSTRUCTIONS_NO_HUMAN_AUTHORIZED_REBASE").is_none(),
+                "prose carrying `{marker}` was flagged: {:?}",
+                codes(&out)
+            );
+        }
+    }
+
+    #[test]
+    fn review_instructions_without_tweak_section_skip_the_rebase_sniff() {
+        // No exception section at all (e.g. the load-run skill): too customized
+        // to reason about, so the rebase absence sniff stays quiet too.
+        let text = "# Review\n\n## My own load notes\n\nno tweak section here\n";
+        let mut out = Vec::new();
+        sniff_review_instructions(&review_instr_entry(), text, &mut out);
+        assert!(find(&out, "REVIEW_INSTRUCTIONS_NO_HUMAN_AUTHORIZED_REBASE").is_none());
+    }
+
+    /// Drift guard: the shipped default review template must carry the
+    /// human-authorized-rebase guidance, so a freshly-materialized project never
+    /// trips this sniffer, and the markers it keys on must exist in the default.
+    #[test]
+    fn shipped_default_review_template_carries_human_authorized_rebase_guidance() {
+        let mut out = Vec::new();
+        sniff_review_instructions(
+            &review_instr_entry(),
+            shelbi_state::DEFAULT_REVIEW_INSTRUCTIONS,
+            &mut out,
+        );
+        assert!(
+            find(&out, "REVIEW_INSTRUCTIONS_NO_HUMAN_AUTHORIZED_REBASE").is_none(),
+            "shipped default review template trips the human-authorized-rebase sniffer: {:?}",
+            codes(&out)
+        );
+        let lower = shelbi_state::DEFAULT_REVIEW_INSTRUCTIONS.to_ascii_lowercase();
+        assert!(
+            HUMAN_AUTHORIZED_REBASE_MARKERS
+                .iter()
+                .any(|m| lower.contains(m)),
+            "shipped default review template carries none of the human-authorized-rebase \
+             markers — the sniffer's absence check is now dead",
         );
     }
 
