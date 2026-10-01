@@ -11,7 +11,7 @@ import type { CSSProperties, ReactNode } from "react"
  * carries the accessible feature list. Cards alternate vignette-top vs
  * vignette-bottom so the columns stagger rather than align in rows.
  *
- * Each vignette shares the site's mockup design language (see
+ * Most vignettes share the site's mockup design language (see
  * `KanbanMockup.tsx`): a compact macOS-Terminal frame — traffic-light dots, a
  * `shelbi · <view>` / `jlong@hub — <cmd>` title bar, and a `--tui-bg` canvas —
  * wrapping a full-color slice of the real Shelbi TUI. Color comes from the same
@@ -19,17 +19,19 @@ import type { CSSProperties, ReactNode } from "react"
  * columns read blue / yellow / magenta / green (TO DO / IN PROGRESS / REVIEW /
  * DONE — `category_color()` in the crate), the working `⏵` badge is green, the
  * project/review accents are cyan, and everything inverts with the light/dark
- * toggle for free. Details stay grounded in `crates/shelbi-tui` and the CLI:
- * the real board columns, the sidebar's `— Workspaces —` section with `▾ hub` /
- * `▾ devbox` groups and `⏵`/`·` badges, a tmux pane with a green status bar and
- * `❯` prompt, the `⎇ shelbi/<id>` branch meta, real `shelbi` commands,
- * `tasks/*.md` + `workflows/*.yaml` paths, and 7-char commit hashes.
+ * toggle for free. The "Open source" card is the one exception: it drops the
+ * terminal chrome for a plain centered frame holding a single open-source mark
+ * (see `OpenSourceVignette`). Details stay grounded in `crates/shelbi-tui` and
+ * the CLI: the real board columns, the sidebar's `— Workspaces —` section with
+ * `▾ hub` / `▾ devbox` groups and `⏵`/`·` badges, a tmux pane with a green
+ * status bar and `❯` prompt, the `⎇ shelbi/<id>` branch meta, real `shelbi`
+ * commands, and `tasks/*.md` + `workflows/*.yaml` paths.
  *
  * Motion is entirely CSS: the card lifts on hover (`hover:` on the `group`
  * card) and each vignette does one tasteful, feature-appropriate thing via
  * `group-hover:` — a card slides one column right, a worker's task types in, a
  * new tmux line prints, review checks draw themselves, the file cursor steps
- * down, the newest commit slides into the log. Ambient life (the working dot,
+ * down, the open-source mark brightens. Ambient life (the working dot,
  * the prompt cursor) uses `motion-safe:animate-pulse`. Every transform / loop
  * is gated behind `motion-safe:` (or reset with `motion-reduce:`) so
  * `prefers-reduced-motion: reduce` gets a still, legible section.
@@ -376,50 +378,31 @@ function FileTreeVignette() {
 }
 
 /**
- * Open source: an MIT badge over a couple of commit-log lines with real 7-char
- * hashes (git's yellow). On hover the newest commit slides into the top of the
- * log and the star tick fills in.
+ * Open source: a single centered mark on a plain `--tui-bg` frame (no terminal
+ * title bar or traffic lights), with a small "MIT licensed" caption in the mono
+ * style beneath it. The mark is the OSI "keyhole" logo (pulled from the
+ * project's Figma file, node `2054:2`), drawn in the neutral `--tui-gray`/
+ * `--tui-fg` palette via `currentColor` so it inverts with the light/dark
+ * toggle for free. On hover the mark brightens from gray to full foreground;
+ * the effect is gated behind `motion-safe:` so `prefers-reduced-motion` gets a
+ * still, legible mark.
  */
 function OpenSourceVignette() {
-  const commits = [
-    { hash: "84d863e", msg: "feat(review): serve recipe" },
-    { hash: "ae38b70", msg: "fix(tui): clamp sidebar" },
-  ]
   return (
-    <MiniTerminal title="jlong@hub — git log">
-      <div className="text-[11px]">
-        <div className="mb-2 flex items-center gap-2">
-          <span
-            className="inline-block rounded border px-1.5 py-0.5 text-[10px] font-semibold tracking-wide"
-            style={{ borderColor: TUI_DIVIDER, color: TUI_FG }}
-          >
-            MIT
-          </span>
-          <span style={{ color: TUI_CYAN }}>main</span>
-          <span className="ml-auto text-[color:var(--tui-divider)] transition-colors duration-200 group-hover:text-[color:var(--tui-yellow)]">
-            ★
-          </span>
-        </div>
-        <div className="max-h-0 overflow-hidden opacity-0 transition-all duration-300 ease-out motion-safe:group-hover:max-h-5 motion-safe:group-hover:opacity-100">
-          <div className="flex items-center gap-2 pb-1.5">
-            <span style={{ color: TUI_YELLOW }}>dea6e14</span>
-            <span className="truncate" style={{ color: TUI_GRAY }}>
-              site: rework feature grid
-            </span>
-          </div>
-        </div>
-        <div className="flex flex-col gap-1.5">
-          {commits.map((c) => (
-            <div key={c.hash} className="flex items-center gap-2">
-              <span style={{ color: TUI_YELLOW }}>{c.hash}</span>
-              <span className="truncate" style={{ color: TUI_GRAY }}>
-                {c.msg}
-              </span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </MiniTerminal>
+    <div
+      aria-hidden="true"
+      className="flex min-h-[132px] flex-col items-center justify-center gap-1.5 overflow-hidden rounded-md border shadow-sm transition-shadow duration-200 group-hover:shadow-md"
+      style={{ borderColor: CHROME_BAR_BORDER, background: TUI_BG }}
+    >
+      <span className="text-[color:var(--tui-gray)] transition-colors duration-200 motion-safe:group-hover:text-[color:var(--tui-fg)]">
+        <svg width={36} height={36} viewBox="0 0 32 32" fill="none" stroke="currentColor" strokeWidth={1.5}>
+          <path d="M2.80591 23.1355C4.37734 26.0412 6.86154 28.3427 9.86785 29.6893C10.1199 29.8022 10.4122 29.6789 10.5166 29.4232L13.9432 21.0351C14.0476 20.7794 13.9235 20.4897 13.6797 20.36C12.8252 19.9053 12.1196 19.2074 11.6557 18.3495C11.1121 17.3444 10.9339 16.1819 11.1513 15.0601C11.3687 13.9384 11.9684 12.9267 12.8481 12.1975C13.7279 11.4683 14.8332 11.0667 15.9759 11.0611C17.1185 11.0555 18.2277 11.4463 19.1145 12.1669C20.0014 12.8874 20.6109 13.8932 20.8393 15.0128C21.0677 16.1324 20.9008 17.2965 20.3671 18.3069C19.9116 19.1693 19.2128 19.8741 18.3628 20.3371C18.1203 20.4692 17.999 20.7601 18.1059 21.0147L21.6143 29.369C21.7213 29.6236 22.0148 29.744 22.2657 29.6287C25.2587 28.2527 27.7203 25.9271 29.2632 23.0062C30.8842 19.9377 31.391 16.402 30.6973 13.0018C30.0036 9.60146 28.1524 6.54687 25.4591 4.35846C22.7658 2.17005 19.397 0.983213 15.9267 1.00018C12.4564 1.01715 9.09933 2.23686 6.42753 4.4515C3.75572 6.66614 1.93447 9.73868 1.27409 13.1456C0.61371 16.5525 1.15506 20.083 2.80591 23.1355Z" />
+        </svg>
+      </span>
+      <span className="font-mono text-[10px] tracking-wide" style={{ color: TUI_GRAY }}>
+        MIT licensed
+      </span>
+    </div>
   )
 }
 
