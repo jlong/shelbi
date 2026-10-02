@@ -18,9 +18,8 @@ TUI keybindings in `~/.shelbi/keys.yaml`.
 
 These commands are what the built-in configuration workflow runs. When you ask a
 built-in orchestrator to change Shelbi configuration, it drives `inventory` and
-`lint` behind the reserved [`update-shelbi-configuration`](/docs/maintainers/system-configuration)
-skill so edits are staged, validated, previewed, and confirmed before any live
-file is touched.
+`lint` behind the reserved `update-shelbi-configuration` skill so edits are
+staged, validated, previewed, and confirmed before any live file is touched.
 
 Every subcommand accepts the global `--root <PATH>` (override the Shelbi root
 directory, else `$SHELBI_ROOT`, else the install-time default) and
@@ -224,9 +223,10 @@ shelbi config list-actions
 
 ## See also
 
-- [System configuration](/docs/maintainers/system-configuration): how the
-  reserved configuration skill and system plugin drive these commands, plus
-  ownership, fallback, and compatibility behavior.
+- [System configuration](https://github.com/jlong/shelbi/blob/main/docs/maintainers/system-configuration.md):
+  how the reserved configuration skill and system plugin drive these commands,
+  plus ownership, fallback, and compatibility behavior (maintainer docs on
+  GitHub).
 - [Global config](/docs/configuration/global#keysyaml): the `keys.yaml` schema,
   modes, actions, chord syntax, and the built-in defaults.
 - [Config modes](/docs/concepts/config-modes): flat versus in-repo project
