@@ -258,10 +258,10 @@ impl Workflow {
         let sub = |s: &str| substitute_review_url(s, port);
         Some(ResolvedReviewRecipe {
             workdir: r.workdir.clone(),
-            setup: r.setup.as_deref().map(&sub),
+            setup: r.setup.as_deref().map(sub),
             serve: sub(&r.serve),
-            ready: r.ready.as_deref().map(&sub),
-            url: r.url.as_deref().map(&sub),
+            ready: r.ready.as_deref().map(sub),
+            url: r.url.as_deref().map(sub),
             port,
         })
     }
