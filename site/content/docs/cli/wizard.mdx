@@ -17,13 +17,25 @@ Enter launch    c customize    q quit
 ```
 
 Press Enter to create the detected plan and launch the dashboard. Press `c` to
-edit the prefilled project, repository, branch, remote, runner, workspace, and
-orchestrator values. Press `q`, Esc, or Ctrl+C to leave without project state.
+edit the prefilled project, repository, branch, remote, runner, orchestrator, and
+issue-tracker values. Press `q`, Esc, or Ctrl+C to leave without project state.
 
 If both Claude Code and Codex are detected, the wizard first asks `Which
 agent?`. If the current directory is not a Git repository, it first asks
 permission to run `git init -b main`. Missing tmux or runner prerequisites stop
 setup before the card and print an install-and-retry message.
+
+The wizard also asks **where the project's issues should live**: GitHub Issues
+(a card is a GitHub issue your team can see and file) or File system (private
+markdown on this machine). GitHub is pre-selected, with the `owner/repo`
+pre-filled, when the origin remote is a GitHub repo; otherwise File system is the
+default. Choosing GitHub preflights `gh` (installed, authenticated, Issues
+enabled, and push access for label creation) before anything is written, and on
+a failure explains the fix and offers to retry or fall back to File system. The
+chosen backend shows on the setup card and is written as an `issue_tracker:`
+block in the project config. See [`shelbi init`](/docs/cli/init#where-your-issues-live)
+for the full behavior and [`shelbi issue-store migrate`](/docs/cli/issue) to move
+an existing board between backends.
 
 The command is idempotent at the project-registration level. If any project is
 already registered, it completes without creating another one. Use

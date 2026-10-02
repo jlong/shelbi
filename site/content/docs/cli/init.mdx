@@ -25,6 +25,29 @@ many workspaces and which naming scheme you want, then creating each one with
 [`shelbi workspace add`](/docs/cli/workspace). Run `shelbi` interactively for that
 first-boot interview.
 
+## Where your issues live
+
+Interactive setup asks where the project's board should live:
+
+- **GitHub Issues** stores each card as a GitHub issue, so teammates and
+  contributors can see and file them. It is pre-selected, with the `owner/repo`
+  pre-filled, when the origin remote is a GitHub repo. Choosing it runs a
+  preflight first: `gh` must be installed and authenticated, and your account
+  must be able to read issues and create labels on the repo (Issues enabled plus
+  push access). On a preflight failure the setup explains the fix and lets you
+  retry or fall back to File system, so a GitHub config that would not load is
+  never written. On success, Shelbi creates `shelbi:id/*` and `shelbi:status/*`
+  labels on first use and stores a small metadata block in each issue's body.
+- **File system** keeps the board as private markdown files on this machine
+  under `~/.shelbi/projects/<name>/tasks/`. No GitHub needed. This is the
+  default.
+
+The choice is written as an `issue_tracker:` block in the project config: the
+shared `project.yaml` for in-repo mode, or `~/.shelbi/projects/<name>.yaml` for
+global mode. To move an existing board between backends later, use
+[`shelbi issue-store migrate`](/docs/cli/issue). Setup never switches the backend
+of a project that already has issues without pointing you there first.
+
 ## Automation
 
 From a repository with exactly one supported runner on `PATH`, this is the
@@ -69,9 +92,19 @@ Pass `--runner claude` or `--runner codex` to make automation deterministic.
 | `--default-branch <BRANCH>` | string | detected branch, then `main` | Override the detected default branch. `--branch` is an alias. |
 | `--github-url <URL>` | string | detected origin | Override the detected origin URL. `--remote` is an alias; pass an empty value to omit it. |
 | `--orchestrator-runner <RUNNER>` | `claude` \| `codex` | selected `--runner` | Use a different installed runner for the orchestrator. |
+| `--issue-tracker <BACKEND>` | `github` \| `file_system` | `file_system` | Where the board lives. `github` is preflighted before anything is written; a failure is a hard error naming the fix (no silent fall-back). Omit to keep `file_system`. |
+| `--github-repo <OWNER/REPO>` | string | detected origin repo | The repo for `--issue-tracker github`. Required when the origin remote is not a GitHub repo. |
 
 Detected-plan overrides require `-y`. The `-y` path cannot be combined with
-`--mode` or `--pick-up`.
+`--mode` or `--pick-up`. Without `--issue-tracker`, `-y` keeps the `file_system`
+default so existing scripted setups are unchanged. The chosen backend is printed
+in the plan summary.
+
+Create a project whose board is GitHub Issues without prompts:
+
+```bash
+shelbi init -y --issue-tracker github --github-repo acme/myapp
+```
 
 ## Config-location and pick-up options
 
