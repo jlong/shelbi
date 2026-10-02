@@ -1,14 +1,11 @@
----
-title: System Configuration
-order: 90
-summary: "How Shelbi's reserved configuration skill, system plugin, and config inventory/lint interfaces fit together: ownership, fallback, lint scope, and compatibility."
----
+# System Configuration
 
 This is the maintainer's map of the system-owned configuration-update path: the
 reserved skill that safely edits Shelbi configuration, the plugin that carries
 it into a built-in orchestrator, and the `shelbi config` interfaces both rely
-on. It complements the user-facing [`shelbi config`](/docs/cli/config)
-reference; read that first for the command surface.
+on. It complements the user-facing
+[`shelbi config`](https://shelbi.dev/docs/cli/config) reference; read that first
+for the command surface.
 
 ## The pieces
 
@@ -30,10 +27,12 @@ reference; read that first for the command surface.
 ## Ownership
 
 The name `update-shelbi-configuration` is reserved. It is installed **last**,
-after user and project skills are mirrored into the worktree, so a customized
-orchestrator prompt cannot shadow or disable the operational safety workflow. A
-project skill that tries to claim the same name is suppressed with a warning
-rather than silently winning.
+after user and project skills are mirrored into the worktree
+(`deploy_orchestrator_system_skill` in
+`crates/shelbi-orchestrator/src/workspace.rs`), so a customized orchestrator
+prompt cannot shadow or disable the operational safety workflow. A project skill
+that tries to claim the same name is suppressed with a warning rather than
+silently winning.
 
 The plugin is staged into a **Shelbi-owned, session-scoped** path
 (`.claude/shelbi-system-plugins/update-shelbi-configuration`), never a runner's
@@ -73,8 +72,10 @@ valid local patch must remain usable, so a mismatch warns but never blocks. The
 installed-path lookup handles the standalone archive layout (plugin beside the
 binary), prefix installs (`share/shelbi/plugins` preferred over a stale adjacent
 `bin/plugins`), Homebrew's versioned pkgshare, and the cargo development layout.
-Release, Homebrew, and APT packaging checks assert all three packaged files ship,
-so dot-directories cannot be silently dropped from an archive.
+Release, Homebrew, and APT packaging checks assert all three packaged files ship
+(`scripts/release/verify-system-plugin-packages.sh` over the archives and `.deb`,
+plus the `apt-verify-install` job in `.github/workflows/release.yml`), so
+dot-directories cannot be silently dropped from an archive.
 
 ## Lint scope
 
@@ -92,9 +93,10 @@ families:
 Both live and staged linting run the identical checks; `--staged` points them at
 an inventory candidate directory instead of live files. Diagnostics carry a
 stable `code`, a `severity`, a source `location`, and often a `remediation`
-hint. **Both warnings and errors make the report unclean and exit non-zero**:
-configuration is valid or it is not, so the workflow never applies a config that
-lints with warnings.
+hint. **Both warnings and errors make the report unclean and exit non-zero**
+(`shelbi config lint` exits 1 whenever the report is not clean): configuration is
+valid or it is not, so the workflow never applies a config that lints with
+warnings.
 
 Lint is deliberately read-only. The write half of the workflow (atomic apply to
 canonical paths, running lifecycle commands for `lifecycle_owned` surfaces) is
@@ -128,9 +130,10 @@ plugin resolution and fallback by the unit tests in `system_plugin.rs`.
 
 ## See also
 
-- [`shelbi config`](/docs/cli/config): the command reference for `inventory`,
-  `lint`, and the keybinding subcommands.
-- [Config modes](/docs/concepts/config-modes): flat versus in-repo layouts,
-  which shape the registration surfaces inventory reports.
-- [Agents](/docs/concepts/agents): how orchestrator and role agents are
-  materialized into a worktree, where the system skill is installed last.
+- [`shelbi config`](https://shelbi.dev/docs/cli/config): the command reference
+  for `inventory`, `lint`, and the keybinding subcommands.
+- [Config modes](https://shelbi.dev/docs/concepts/config-modes): flat versus
+  in-repo layouts, which shape the registration surfaces inventory reports.
+- [Agents](https://shelbi.dev/docs/concepts/agents): how orchestrator and role
+  agents are materialized into a worktree, where the system skill is installed
+  last.

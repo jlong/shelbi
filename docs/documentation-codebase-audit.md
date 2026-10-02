@@ -207,7 +207,7 @@ Status terms: **reviewed** means substantive Shelbi claims were compared with im
 
 - **Severity:** High
 - **Type:** Verified operational conflict and stale release state
-- **Documentation locations:** `site/content/docs/maintainers/release.mdx`, “Current Release Scope,” “Tag And Publish,” and rollback commands
+- **Documentation locations:** `docs/release.md`, “Current Release Scope,” “Tag And Publish,” and rollback commands
 - **Documented claim:** Push the release tag, then run `goreleaser release --clean` locally. The page also says the tap, APT repository/domain, and owners are unresolved and releases must not ship until resolved.
 - **Actual behavior and evidence:** A pushed `v*.*.*` tag automatically starts the release job, whose GoReleaser step publishes the GitHub release: `.github/workflows/release.yml:1-7,156-207`. Conditional jobs then open the Homebrew PR and publish APT: `.github/workflows/release.yml:211-315`. The repository runbook correctly says pushing the tag starts publishing and does not instruct a second local publish: `docs/release.md:24-38`. The changelog and public install page already describe released Homebrew/APT channels, contradicting the unresolved/do-not-ship section.
 - **User impact:** A maintainer following the published site can race CI, encounter duplicate release failures, or mutate already-published assets from a local machine. Stale “unresolved” gates make it unclear which runbook is authoritative.

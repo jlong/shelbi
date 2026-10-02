@@ -74,6 +74,21 @@ const nextConfig: NextConfig = {
         destination: "/docs/concepts/events-log",
         permanent: true,
       },
+      // Maintainer docs moved off the public site into the repo under `docs/`.
+      // Redirect the old published URLs to their GitHub homes so bookmarks and
+      // external links keep resolving instead of 404ing.
+      {
+        source: "/docs/maintainers/release",
+        destination:
+          "https://github.com/jlong/shelbi/blob/main/docs/release.md",
+        permanent: true,
+      },
+      {
+        source: "/docs/maintainers/system-configuration",
+        destination:
+          "https://github.com/jlong/shelbi/blob/main/docs/maintainers/system-configuration.md",
+        permanent: true,
+      },
     ];
   },
 };
