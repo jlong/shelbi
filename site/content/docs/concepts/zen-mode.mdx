@@ -820,6 +820,9 @@ board is quiescent).
   underlying scheduler is wired and where the prompt template lives.
 - [The events log](/docs/concepts/events-log) — the canonical
   format of the `mode=zen` and `orchestrator:zen-*` lines Zen emits.
+- [GitHub Issues backend](/docs/concepts/github-issues#github-assignees-and-zen-mode):
+  on a GitHub-backed board, Zen only auto-promotes backlog issues assigned to
+  the authenticated user; assign yourself to make an outside issue eligible.
 - [Workflows](/docs/guides/getting-started/workflows#lifecycle-who-moves-a-task-between-the-default-statuses)
   — what `Review` and `Done` mean in the default flow Zen accelerates,
   and how custom workflows declare their own `handoff` and `done`

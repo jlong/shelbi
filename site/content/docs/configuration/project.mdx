@@ -125,6 +125,7 @@ workspaces:
 | `heartbeat` | [Heartbeat](#heartbeat) | no | `60s` / `5m` | Adaptive hub heartbeat written to `events.log` so the orchestrator's watch fires on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. |
 | `git` | [Git](#git) | no | all defaults | Base branch, generated task branch prefix, and merge strategy for `shelbi merge` and Zen's auto-merge. |
 | `review` | [Review](#review) | no | all defaults | Review-interface behavior. Today just `diff_command`, the **View Diff** escape hatch for a diff tool that reviews a revision range instead of git's directory-diff pair. |
+| `issue_tracker` | [IssueTracker](#issue_tracker) | no | `file_system` | Which backend the board lives in: `file_system` (local markdown, the default) or `github` (issues in a repo). See [GitHub Issues backend](/docs/concepts/github-issues). |
 
 ## machines
 
@@ -436,6 +437,56 @@ Leave `diff_command` unset and **View Diff** keeps the default `git difftool
 exits without rendering leaves a short message in the pane rather than only
 git warnings.
 
+## issue_tracker
+
+Which backend the project's board lives in, plus the non-secret connection facts
+for a remote backend. An absent block is the default (`file_system`), so existing
+projects keep working. See [GitHub Issues backend](/docs/concepts/github-issues)
+for the concept and the full behavior.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `backend` | `file_system` \| `github` \| `jira` \| `linear` | no | `file_system` | The live backend. `file_system` (local markdown) and `github` resolve to a working board today; `jira` and `linear` parse and validate but return a "not yet implemented" error. |
+| `github` | [GithubConnection](#github-connection) | when `backend: github` | — | GitHub connection facts. |
+| `jira` | object | when `backend: jira` | — | `{ project: KEY }`. Stub backend. |
+| `linear` | object | when `backend: linear` | — | `{ team: KEY }`. Stub backend. |
+| `refresh_secs` | integer | no | `30` | How often (seconds) the hub daemon re-reads a **remote** board and rewrites `board-index.json`. `0` or absent folds to the default. Ignored for `file_system`, whose local read is free. |
+| `budget` | [Budget](#issue_tracker-budget) | no | all defaults | Rate-limit governor thresholds for a remote backend. |
+
+Only the **selected** backend's connection block is validated, so you can stage a
+`github:` block alongside `backend: file_system` without it failing the load. The
+auth token is never a field here: it is resolved out of band from `gh` (see
+[prerequisites](/docs/concepts/github-issues#prerequisites)).
+
+```yaml
+issue_tracker:
+  backend: github
+  github:
+    repo: owner/repo
+  # Optional, remote-only:
+  refresh_secs: 30
+```
+
+### github connection
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `repo` | string | yes (when `backend: github`) | — | `owner/repo` slug naming the repository the issues live in. Validated as a well-formed slug. |
+
+### issue_tracker budget
+
+The rate-limit governor's thresholds for a remote backend. Every field defaults,
+so an untouched block is the shipped policy. See
+[freshness and rate limits](/docs/concepts/github-issues#freshness-and-rate-limits).
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `graphql_high` | integer | `2000` | GraphQL points above which the refresh runs at the configured cadence unthrottled. |
+| `graphql_medium` | integer | `500` | Points down to which the daemon slows (rather than pauses) the refresh, using `slow_refresh_secs`. |
+| `graphql_low` | integer | `100` | Points below which reads are served from cache with a warning; between this and `graphql_medium` the index refresh pauses while user-initiated single fetches still run. |
+| `slow_refresh_secs` | integer | `120` | Throttled refresh cadence for the middle GraphQL band. |
+| `rest_reserve` | integer | `100` | REST requests-remaining reserve below which a mutating call is refused up front. |
+
 ## The PR-body template (`pr-template.md`)
 
 Alongside the project's YAML, `workflows/`, `agents/`, and `zenmode.md`, each
@@ -510,3 +561,5 @@ task-body-based PR, so a missing description never blocks the handoff.
   `workspaces:` and `orchestrator:`.
 - [Workflow config](/docs/configuration/workflow) — the per-project
   status pipeline and its per-workflow `zen` / `git` overrides.
+- [GitHub Issues backend](/docs/concepts/github-issues): the concept behind the
+  `issue_tracker` block and how a GitHub-backed board behaves.
