@@ -4805,41 +4805,188 @@ struct ShelbiMeta {
 /// Split an issue body into `(prose, metadata)`: the fenced shelbi block is
 /// removed from the returned prose and parsed as YAML into [`ShelbiMeta`]. The
 /// metadata half is a `Result` so the two callers can diverge on a broken
-/// hand-edit (decision 6, 2026-09-14): a body with **no** `<!-- shelbi:begin -->`
-/// marker at all is ordinary plain prose and yields `Ok(default)`; a body whose
-/// block is present but unrecoverable — unparseable inner YAML, or a marker with
-/// no matching `<!-- shelbi:end -->` — yields `Err(<parse detail>)`. Write paths
-/// `?` that `Err` into [`Error::MalformedIssueMetadata`] rather than clobbering
-/// the human's edit with defaults; read paths warn once and fall back to
-/// [`ShelbiMeta::default`]. Prose is always returned intact (the whole body when
-/// the block is unterminated), so a read still renders the card.
+/// hand-edit (decision 6, 2026-09-14): a body with **no** real block is ordinary
+/// plain prose and yields `Ok(default)`; a body whose real block is present but
+/// unrecoverable — unparseable inner YAML, or a real `begin` with no matching
+/// `<!-- shelbi:end -->` — yields `Err(<parse detail>)`. Write paths `?` that
+/// `Err` into [`Error::MalformedIssueMetadata`] rather than clobbering the
+/// human's edit with defaults; read paths warn once and fall back to
+/// [`ShelbiMeta::default`]. Prose is always returned intact, so a read still
+/// renders the card.
+///
+/// Only a block in the exact shape [`build_body`] writes counts as "real": the
+/// begin marker alone on its own line, immediately followed by a ```` ```yaml ````
+/// fence, a closing ```` ``` ````, and the end marker alone on its own line right
+/// after it. A marker *mentioned* in the prose — inline code, inside a fenced
+/// code block, or mid-line — is not alone on a top-level line (or sits inside a
+/// documentation fence we track and skip), so it is left in the prose untouched
+/// and never parsed. When several real blocks exist, the **last** one wins, since
+/// `build_body` always appends its block at the very end of the body; everything
+/// else (including earlier real-looking blocks) stays in the prose verbatim.
 fn split_shelbi_meta(body: &str) -> (String, std::result::Result<ShelbiMeta, String>) {
-    let Some(begin) = body.find(META_BEGIN) else {
-        // No block at all: an ordinary plain-prose issue, never a failure.
-        return (body.trim().to_string(), Ok(ShelbiMeta::default()));
-    };
-    let after_begin = begin + META_BEGIN.len();
-    let Some(end_rel) = body[after_begin..].find(META_END) else {
-        // Unterminated marker: leave the body untouched, but report the failure
-        // so a write refuses rather than dropping the orphan begin marker into
-        // the prose and emitting a second block after it.
+    let scan = scan_meta_block(body);
+    if let Some((start, end, inner)) = scan.last_complete {
+        // Prose = everything before the block + everything after it, trimmed so a
+        // stripped trailing block doesn't leave a double blank gap.
+        let prose = format!("{}{}", &body[..start], &body[end..]);
+        return (prose.trim().to_string(), parse_meta_yaml(&inner));
+    }
+    if scan.saw_unterminated {
+        // A real-block attempt (begin alone on its own line, immediately followed
+        // by a ```yaml fence) that never completed. Leave the body untouched, but
+        // report the failure so a write refuses rather than dropping the orphan
+        // marker into the prose and emitting a second block after it.
         return (
             body.trim().to_string(),
             Err(format!(
                 "`{META_BEGIN}` marker with no matching `{META_END}`"
             )),
         );
-    };
-    let inner = &body[after_begin..after_begin + end_rel];
-    let after_end = after_begin + end_rel + META_END.len();
+    }
+    // No real block (and no broken attempt): ordinary plain prose, never a
+    // failure — even if the prose quotes the markers.
+    (body.trim().to_string(), Ok(ShelbiMeta::default()))
+}
 
-    // Prose = everything before the marker + everything after it, with the
-    // seam's surrounding blank lines collapsed so a stripped block doesn't
-    // leave a double blank gap.
-    let prose = format!("{}{}", &body[..begin], &body[after_end..]);
-    let prose = prose.trim().to_string();
+/// Outcome of scanning a body for the shelbi metadata block.
+#[derive(Default)]
+struct MetaScan {
+    /// The byte span `[start, end)` of the last well-shaped block and its inner
+    /// YAML (the text between the fences), when one was found.
+    last_complete: Option<(usize, usize, String)>,
+    /// A real-block attempt was found but never completed (no closing fence, or a
+    /// closing fence with no end marker after it). Only consulted when no complete
+    /// block exists — a complete block always wins.
+    saw_unterminated: bool,
+}
 
-    (prose, parse_meta_yaml(inner))
+/// Line-scan `body` for the metadata block, fence-aware so marker mentions inside
+/// a documentation code fence are skipped rather than parsed. Returns the span of
+/// the **last** well-shaped block (begin / ```yaml / ``` / end), and whether any
+/// real-block attempt was left unterminated. See [`split_shelbi_meta`].
+fn scan_meta_block(body: &str) -> MetaScan {
+    // State of the scan. Markers are only recognized at `Top` (fence depth 0);
+    // `Doc` swallows an unrelated documentation code fence so a marker quoted
+    // inside it is ignored. The block's own `begin` / `yaml` / `end` shape is
+    // tracked by the remaining states.
+    enum St {
+        Top,
+        Doc { fence: char, len: usize },
+        SawBegin,
+        InYaml { ystart: usize },
+        SawClose { ystart: usize, yend: usize },
+    }
+
+    // Transition from a top-level line: open the block on a lone begin marker,
+    // or enter a documentation fence. Everything else stays top-level prose.
+    fn top_transition(t: &str) -> St {
+        if t == META_BEGIN {
+            St::SawBegin
+        } else if let Some((fence, len)) = fence_open(t) {
+            St::Doc { fence, len }
+        } else {
+            St::Top
+        }
+    }
+
+    let mut scan = MetaScan::default();
+    let mut st = St::Top;
+    // Byte offset of the begin line of the block currently being parsed.
+    let mut begin_byte = 0usize;
+    let mut offset = 0usize;
+
+    for raw in body.split_inclusive('\n') {
+        let ls = offset;
+        let le = offset + raw.len();
+        offset = le;
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let t = line.trim();
+
+        st = match st {
+            St::Top => {
+                let next = top_transition(t);
+                if matches!(next, St::SawBegin) {
+                    begin_byte = ls;
+                }
+                next
+            }
+            St::Doc { fence, len } => {
+                if is_fence_close(t, fence, len) {
+                    St::Top
+                } else {
+                    St::Doc { fence, len }
+                }
+            }
+            St::SawBegin => {
+                if t == "```yaml" {
+                    St::InYaml { ystart: le }
+                } else {
+                    // Begin not immediately followed by a ```yaml fence: it is a
+                    // prose mention, not a real block. Re-handle this line as
+                    // top-level (it may itself start a block or a doc fence).
+                    let next = top_transition(t);
+                    if matches!(next, St::SawBegin) {
+                        begin_byte = ls;
+                    }
+                    next
+                }
+            }
+            St::InYaml { ystart } => {
+                if is_fence_close(t, '`', 3) {
+                    St::SawClose { ystart, yend: ls }
+                } else {
+                    St::InYaml { ystart }
+                }
+            }
+            St::SawClose { ystart, yend } => {
+                if t == META_END {
+                    scan.last_complete = Some((begin_byte, le, body[ystart..yend].to_string()));
+                    St::Top
+                } else {
+                    // Closing fence with no end marker right after it: a broken
+                    // real block. Re-handle this line as top-level.
+                    scan.saw_unterminated = true;
+                    let next = top_transition(t);
+                    if matches!(next, St::SawBegin) {
+                        begin_byte = ls;
+                    }
+                    next
+                }
+            }
+        };
+    }
+
+    // A block left mid-parse at EOF (begin + ```yaml never closed, or closed but
+    // no end marker) is an unterminated real block. A lone begin with no ```yaml
+    // (SawBegin) or an unterminated doc fence (Doc) is just prose.
+    if matches!(st, St::InYaml { .. } | St::SawClose { .. }) {
+        scan.saw_unterminated = true;
+    }
+
+    scan
+}
+
+/// If `t` opens a code fence, return its `(fence_char, run_length)`. A fence
+/// opener is a run of at least three ```` ``` ```` or `~~~` at the line start;
+/// an info string (e.g. `yaml`) may follow. Used to detect and skip
+/// documentation fences so marker mentions inside them are not parsed.
+fn fence_open(t: &str) -> Option<(char, usize)> {
+    for fence in ['`', '~'] {
+        let len = t.chars().take_while(|&c| c == fence).count();
+        if len >= 3 {
+            return Some((fence, len));
+        }
+    }
+    None
+}
+
+/// Whether `t` closes a fence opened with `fence` × `len`: a line of nothing but
+/// the same fence character, at least as long as the opener (CommonMark: a
+/// closing fence carries no info string).
+fn is_fence_close(t: &str, fence: char, len: usize) -> bool {
+    let run = t.chars().count();
+    run >= len && run >= 3 && t.chars().all(|c| c == fence)
 }
 
 /// Split a body a write path is about to rewrite, refusing an unparseable block
@@ -4856,11 +5003,12 @@ fn split_shelbi_meta_for_write(id: &str, body: &str) -> Result<(String, ShelbiMe
     Ok((prose, meta))
 }
 
-/// Parse the inner text of a fenced shelbi block into [`ShelbiMeta`]. The inner
-/// text is a fenced ```` ```yaml ```` code block; strip the fence lines and
-/// deserialize the YAML. Returns `Err(<serde_yaml message>)` on a parse failure
-/// so the caller can surface the reason — a write refuses, a read warns and
-/// falls back to defaults. An empty block is a clean default, not a failure.
+/// Parse the inner YAML of a shelbi block into [`ShelbiMeta`]. [`scan_meta_block`]
+/// hands over the text already stripped of its ```` ```yaml ```` / ```` ``` ````
+/// fences, but [`strip_code_fence`] is applied defensively so a stray fence line
+/// never leaks into the YAML. Returns `Err(<serde_yaml message>)` on a parse
+/// failure so the caller can surface the reason — a write refuses, a read warns
+/// and falls back to defaults. An empty block is a clean default, not a failure.
 fn parse_meta_yaml(inner: &str) -> std::result::Result<ShelbiMeta, String> {
     let yaml = strip_code_fence(inner);
     if yaml.trim().is_empty() {
@@ -5342,6 +5490,86 @@ mod tests {
             meta.params.get("feature").and_then(|v| v.as_str()),
             Some("auth-rewrite")
         );
+    }
+
+    #[test]
+    fn prose_quoting_the_markers_parses_the_real_trailing_block() {
+        // The #1385 shape: a bullet quotes both markers in inline code, then the
+        // real block Shelbi appends at the end carries `workflow` + `depends_on`.
+        // The inline mentions are not alone on a top-level line, so the real
+        // trailing block parses cleanly with no warning (decision: match only
+        // `build_body`'s exact shape, take the last block).
+        let body = "Docs for the GitHub integration.\n\n\
+             - Shelbi wraps metadata between `<!-- shelbi:begin -->` and \
+             `<!-- shelbi:end -->`.\n\n\
+             <!-- shelbi:begin -->\n```yaml\nworkflow: task\ndepends_on:\n\
+             - other-task\n```\n<!-- shelbi:end -->\n";
+        let (prose, meta) = split_shelbi_meta(body);
+        let meta = meta.expect("the real trailing block parses with no warning");
+        assert_eq!(meta.workflow.as_deref(), Some("task"));
+        assert_eq!(meta.depends_on, vec!["other-task".to_string()]);
+        // The inline-code mentions stay in the prose, markers and all.
+        assert!(prose.contains("`<!-- shelbi:begin -->`"));
+        assert!(prose.contains("`<!-- shelbi:end -->`"));
+        // The real block is stripped: the only occurrence of a bare begin marker
+        // line left in the prose would be the mention, which is inline, not bare.
+        assert!(!prose.contains("\n<!-- shelbi:begin -->\n"));
+
+        // A read-modify-write round-trips: writing the (unchanged) prose + meta
+        // back leaves the quoted markers intact and emits exactly one real block.
+        let rewritten = build_body(&prose, &meta);
+        assert!(rewritten.contains("`<!-- shelbi:begin -->`"));
+        assert!(rewritten.contains("`<!-- shelbi:end -->`"));
+        assert_eq!(
+            rewritten.matches("\n```yaml\n").count(),
+            1,
+            "exactly one real block is re-emitted, not a duplicate"
+        );
+        let (_prose2, meta2) = split_shelbi_meta(&rewritten);
+        let meta2 = meta2.expect("the rewritten body still round-trips");
+        assert_eq!(meta2.workflow.as_deref(), Some("task"));
+        assert_eq!(meta2.depends_on, vec!["other-task".to_string()]);
+    }
+
+    #[test]
+    fn markers_inside_a_documentation_fence_are_left_in_the_prose() {
+        // A fenced code block (4-backtick outer, so the inner ```yaml does not
+        // close it) demonstrates the block shape, and a real block follows. The
+        // fenced example is skipped — markers inside a doc fence are never parsed —
+        // and the real trailing block wins.
+        let body = "Here is what Shelbi writes:\n\n\
+             ````\n<!-- shelbi:begin -->\n```yaml\nworkflow: example\n```\n\
+             <!-- shelbi:end -->\n````\n\n\
+             <!-- shelbi:begin -->\n```yaml\nworkflow: real\n```\n<!-- shelbi:end -->\n";
+        let (prose, meta) = split_shelbi_meta(body);
+        let meta = meta.expect("the real block after the doc fence parses");
+        assert_eq!(meta.workflow.as_deref(), Some("real"));
+        // The documented example (including its markers) stays in the prose.
+        assert!(prose.contains("workflow: example"));
+        assert!(prose.contains("````"));
+
+        // Mid-line mention: a marker embedded in a sentence is likewise prose.
+        let midline = "The begin marker <!-- shelbi:begin --> starts the block.\n\n\
+             <!-- shelbi:begin -->\n```yaml\nworkflow: mid\n```\n<!-- shelbi:end -->\n";
+        let (prose, meta) = split_shelbi_meta(midline);
+        let meta = meta.expect("the real block parses despite the mid-line mention");
+        assert_eq!(meta.workflow.as_deref(), Some("mid"));
+        assert!(prose.contains("The begin marker <!-- shelbi:begin --> starts"));
+    }
+
+    #[test]
+    fn several_real_blocks_take_the_last_one() {
+        // `build_body` always appends its block at the very end, so when more than
+        // one well-shaped block exists the last one is authoritative; earlier ones
+        // stay in the prose verbatim.
+        let body = "<!-- shelbi:begin -->\n```yaml\nworkflow: stale\n```\n\
+             <!-- shelbi:end -->\n\nMore prose.\n\n\
+             <!-- shelbi:begin -->\n```yaml\nworkflow: current\n```\n<!-- shelbi:end -->\n";
+        let (prose, meta) = split_shelbi_meta(body);
+        let meta = meta.expect("a body with two blocks parses the last");
+        assert_eq!(meta.workflow.as_deref(), Some("current"));
+        // The earlier block is not re-parsed, but its text survives in the prose.
+        assert!(prose.contains("workflow: stale"));
     }
 
     #[test]
