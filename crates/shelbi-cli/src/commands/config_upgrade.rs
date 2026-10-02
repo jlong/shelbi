@@ -424,10 +424,12 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_orchestrator_active_dispatch(entry, &text, out);
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_merge_reason_format(entry, &text, out);
+        sniff_zen_assignee_scope(entry, &text, out);
     } else if id.ends_with(".zenmode") {
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_pr_create_published_head(entry, &text, out);
         sniff_zen_merge_reason_format(entry, &text, out);
+        sniff_zen_assignee_scope(entry, &text, out);
     }
 }
 
@@ -1372,6 +1374,54 @@ fn sniff_zen_merge_reason_format(entry: &InventoryEntry, text: &str, out: &mut V
     ));
 }
 
+/// Distinct phrases the external-tracker Zen assignee-scope guidance introduces:
+/// the mechanical `zen scan` now excludes any issue not assigned to the
+/// authenticated user on a remote tracker (and fails closed if that login can't
+/// be resolved). A zenmode / orchestrator copy that describes the `zen scan` but
+/// carries none of these markers predates the change, so its orchestrator doesn't
+/// know the scan already filters by ownership — it may second-guess an empty scan
+/// on a github board, or try to promote an outside contributor's issue. Kept in
+/// sync with the shipped defaults by the drift guard in this module's tests.
+const ZEN_ASSIGNEE_SCOPE_MARKERS: &[&str] = &["assigned to you", "assigned to the user"];
+
+/// Detect an agent prose copy (orchestrator `instructions.md` or `zenmode.md`)
+/// whose `zen scan` description predates the external-tracker assignee-scope
+/// guidance.
+///
+/// A default change (the mechanical scan excludes non-owned issues on a remote
+/// tracker) only reaches NEW projects via the shipped templates; existing
+/// projects carry forked copies, so this hands the orchestrator a boot finding to
+/// refresh them (per the AGENTS.md "Changing shipped defaults" guardrail). The fix
+/// is a prose refresh a user may have forked and customized, so it routes to
+/// [`Classification::NeedsJudgment`] for the orchestrator to repair its own copy
+/// rather than a mechanical rewrite clobbering local edits.
+fn sniff_zen_assignee_scope(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    // Only copies that actually describe the mechanical scan are in scope. A copy
+    // already carrying the assignee-scope wording is current and must not
+    // re-surface (idempotent), matching the shipped defaults.
+    if !text.contains("zen scan") {
+        return;
+    }
+    if ZEN_ASSIGNEE_SCOPE_MARKERS.iter().any(|m| text.contains(m)) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        "ZEN_ASSIGNEE_SCOPE_MISSING",
+        "the Zen scan prose doesn't note that on an external issue tracker the mechanical \
+         scan already excludes issues not assigned to the authenticated user — so the \
+         orchestrator may second-guess an empty scan on a github board, or try to promote an \
+         outside contributor's issue the scan would never surface",
+        "Add to the `zen scan` description: on an external tracker (e.g. github) the \
+         mechanical scan already excludes any issue not assigned to you (the authenticated \
+         account) and fails closed if that login can't be resolved, so trust the list and \
+         don't re-check ownership. Mirror the shipped default `zenmode.md` / orchestrator \
+         `instructions.md`.",
+        locate_line_containing(text, "zen scan"),
+    ));
+}
+
 /// Location of the first line containing `needle` (substring match), for
 /// anchoring a finding to where the deprecated wording first appears. Falls back
 /// to `1:1`. Unlike [`locate_line`], which needs a whole-line match.
@@ -2000,6 +2050,12 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              `--match-published-head-commit` guidance can't be merged in mechanically without \
              risking loss of local edits — the orchestrator repairs its own copy with judgment, \
              preserving customizations."
+        }
+        "ZEN_ASSIGNEE_SCOPE_MISSING" => {
+            "The Zen scan prose is free-form and user-customizable, so the external-tracker \
+             assignee-scope note can't be merged in mechanically without risking loss of local \
+             edits — the orchestrator repairs its own copy with judgment, preserving \
+             customizations."
         }
         "WORKSPACE_SETTINGS_HOOK_STALE" => {
             "This is a live workspace worktree file that also holds your own settings \
@@ -3244,6 +3300,73 @@ mod tests {
                     .contains("orchestrator:zen-merge"),
             "a shipped default no longer mentions `orchestrator:zen-merge` — the sniffer's \
              scope check is now dead",
+        );
+    }
+
+    // ---- zen assignee scope ---------------------------------------------
+
+    #[test]
+    fn zenmode_without_assignee_scope_note_is_needs_judgment() {
+        // A pre-change zenmode copy: it drives `zen scan` but says nothing about
+        // the external-tracker assignee filter.
+        let text = "# Zen\n\nThe mechanical scan (`shelbi zen scan`) hands you safe backlog \
+                    ids: not blocked, not opt-out, no file overlap.\n";
+        let mut out = Vec::new();
+        sniff_zen_assignee_scope(&zen_entry(), text, &mut out);
+        let f = find(&out, "ZEN_ASSIGNEE_SCOPE_MISSING").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+        assert_eq!(f.location.line, 3);
+    }
+
+    #[test]
+    fn prose_without_zen_scan_is_not_flagged_for_assignee_scope() {
+        // A copy that never mentions the scan is out of scope (the sniff fires
+        // only on a copy that actually describes `zen scan`).
+        let text = "# Custom\n\nWe promote by hand here.\n";
+        let mut out = Vec::new();
+        sniff_zen_assignee_scope(&zen_entry(), text, &mut out);
+        assert!(find(&out, "ZEN_ASSIGNEE_SCOPE_MISSING").is_none());
+    }
+
+    #[test]
+    fn copy_with_assignee_scope_note_is_clean() {
+        let text = "# Zen\n\n`shelbi zen scan` hands you safe ids; on an external tracker it \
+                    already excludes any issue not assigned to you.\n";
+        let mut out = Vec::new();
+        sniff_zen_assignee_scope(&zen_entry(), text, &mut out);
+        assert!(
+            find(&out, "ZEN_ASSIGNEE_SCOPE_MISSING").is_none(),
+            "a copy carrying the assignee-scope note should not be flagged: {:?}",
+            codes(&out),
+        );
+    }
+
+    /// Drift guard: the shipped default `zenmode.md` and orchestrator
+    /// `instructions.md` must carry the assignee-scope note, so a freshly
+    /// materialized project never trips this sniffer. If this fails, a template
+    /// lost (or never had) the external-tracker assignee wording.
+    #[test]
+    fn shipped_defaults_carry_the_zen_assignee_scope_note() {
+        let mut out = Vec::new();
+        sniff_zen_assignee_scope(&zen_entry(), shelbi_state::DEFAULT_ZENMODE, &mut out);
+        sniff_zen_assignee_scope(
+            &orch_entry(),
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+            &mut out,
+        );
+        assert!(
+            find(&out, "ZEN_ASSIGNEE_SCOPE_MISSING").is_none(),
+            "a shipped default lost the external-tracker assignee-scope note: {:?}",
+            codes(&out),
+        );
+        // Guard the sniffer's precondition: both shipped defaults must actually
+        // describe `zen scan`, or the sniff silently stops firing.
+        assert!(
+            shelbi_state::DEFAULT_ZENMODE.contains("zen scan")
+                && shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("zen scan"),
+            "a shipped default no longer mentions `zen scan` — the sniffer's scope check is \
+             now dead",
         );
     }
 

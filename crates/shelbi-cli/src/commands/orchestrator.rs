@@ -1448,6 +1448,7 @@ workspaces: []\n";
                 params: BTreeMap::new(),
             },
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 

@@ -4608,6 +4608,7 @@ workspaces:
         shelbi_state::IssueFile {
             task,
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 

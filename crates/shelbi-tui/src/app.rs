@@ -2497,6 +2497,7 @@ mod tests {
                 params: BTreeMap::new(),
             },
             body: String::new(),
+            tracker_assignees: Vec::new(),
         };
         // The handed-off review task (unassigned → Queued for Review) and an
         // in-progress task pinning the dev slot `alpha` busy.
@@ -2585,6 +2586,7 @@ mod tests {
                 params: BTreeMap::new(),
             },
             body: String::new(),
+            tracker_assignees: Vec::new(),
         };
         // Several cards across the columns the sidebar renders.
         let board = vec![

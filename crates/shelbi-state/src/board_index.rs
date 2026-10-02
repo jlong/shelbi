@@ -59,7 +59,15 @@ pub const BOARD_INDEX_FILE: &str = "board-index.json";
 /// changed struct with serde defaults papering over the difference. `0` is the
 /// value a pre-identity file deserializes to (the field is absent), so it never
 /// matches and every such file is re-read cold on the next tick.
-pub const BOARD_INDEX_SCHEMA_VERSION: u32 = 1;
+///
+/// Bumped 1 → 2 when each [`IssueFile`] gained `tracker_assignees` and the index
+/// gained [`BoardIndex::viewer_login`] (external-tracker Zen ownership gating): a
+/// v1 index carries neither, so every issue would read back as unassigned and the
+/// authenticated login as absent — making Zen fail closed indefinitely. Forcing a
+/// v1 index cold means the daemon refetches the board (now selecting assignees)
+/// and the viewer login on the next tick, instead of the stale file masquerading
+/// as "nothing is owned by the user".
+pub const BOARD_INDEX_SCHEMA_VERSION: u32 = 2;
 
 /// The host-qualified repository identity stamped on a board index for a GitHub
 /// `owner/repo` selector: `github.com/<owner>/<repo>`. github.com is the only
@@ -170,6 +178,18 @@ pub struct BoardIndex {
     /// pre-schedule file forces the next tick cold, which then stamps it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_cold_read: Option<String>,
+    /// The login of the account the backend token is authenticated as — "the
+    /// user" for Zen ownership gating on an external tracker. The daemon captures
+    /// it on each GraphQL board read (GitHub's `viewer { login }`, which rides
+    /// along for free) and stamps it here, so the heartbeat-cadence Zen scan reads
+    /// the login straight off this file and adds no GitHub request per tick. A
+    /// login the current read didn't resurface (the REST fallback, which carries
+    /// no `viewer`) is carried forward from the previous index rather than cleared.
+    /// `None` on the `file_system` backend (no tracker identity), on a pre-v2 file,
+    /// and until the first GraphQL read lands — in which case the Zen scan fails
+    /// closed (nothing eligible) rather than promoting issues it can't attribute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_login: Option<String>,
 }
 
 impl BoardIndex {
@@ -217,6 +237,9 @@ impl BoardIndex {
             // test-built index that wants to read as valid stamps it itself.
             repo: None,
             schema_version: BOARD_INDEX_SCHEMA_VERSION,
+            // The authenticated login is a daemon-publish concern (captured from
+            // the GraphQL board read); a freshly constructed index records none.
+            viewer_login: None,
         }
     }
 
@@ -425,6 +448,22 @@ pub fn read_board_index_at(path: &Path) -> Option<BoardIndex> {
 /// part of the publish) and the read-modify-write mutators.
 pub fn read_valid_board_index(project: &str, expected_repo: Option<&str>) -> Option<BoardIndex> {
     read_board_index(project).filter(|idx| idx.identity_matches(expected_repo))
+}
+
+/// The authenticated account login the daemon stamped on `project`'s board index
+/// ([`BoardIndex::viewer_login`]), read only when the index's identity and schema
+/// are current. This is the zero-extra-API-call source the Zen ownership gate
+/// reads to learn "who the user is" on an external tracker: a mismatched, stale
+/// (pre-v2), or missing index — or one the daemon hasn't yet stamped a login onto
+/// — returns `None`, and the gate fails closed. The `cfg` supplies the expected
+/// repository identity so one project never reads another's (or a retargeted
+/// project's) login.
+pub fn read_board_index_viewer_login(
+    project: &str,
+    cfg: &IssueTrackerConfig,
+) -> Result<Option<String>> {
+    let expected = expected_board_repo(cfg);
+    Ok(read_valid_board_index(project, expected.as_deref()).and_then(|idx| idx.viewer_login))
 }
 
 /// The shared read every **list** consumer uses instead of sweeping the backend
@@ -1057,6 +1096,7 @@ mod tests {
         IssueFile {
             task,
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 
@@ -1272,6 +1312,7 @@ mod tests {
             // is exercised, not short-circuited by the identity gate.
             repo: Some(github_board_repo("owner/repo")),
             schema_version: BOARD_INDEX_SCHEMA_VERSION,
+            viewer_login: None,
         }
     }
 
@@ -1521,6 +1562,35 @@ mod tests {
         assert_eq!(back.schema_version, BOARD_INDEX_SCHEMA_VERSION);
         // And the index still validates against the configured repository.
         assert!(back.identity_matches(expected_board_repo(&github_cfg()).as_deref()));
+    }
+
+    #[test]
+    fn read_board_index_viewer_login_returns_the_stamped_login_when_identity_matches() {
+        let _iso = IsolatedHome::new("viewer-login");
+        let mut idx = index_aged(vec![issue("a", "todo", 0)], 0, false);
+        idx.viewer_login = Some("octocat".into());
+        write_board_index("proj", &idx).unwrap();
+        assert_eq!(
+            read_board_index_viewer_login("proj", &github_cfg())
+                .unwrap()
+                .as_deref(),
+            Some("octocat"),
+        );
+    }
+
+    #[test]
+    fn read_board_index_viewer_login_is_none_for_a_mismatched_identity() {
+        let _iso = IsolatedHome::new("viewer-login-mismatch");
+        let mut idx = index_aged(vec![issue("a", "todo", 0)], 0, false);
+        idx.viewer_login = Some("octocat".into());
+        // Stamp a *different* repository's identity: the Zen gate must not read
+        // another repo's (or a retargeted project's) login.
+        idx.repo = Some(github_board_repo("other/repo"));
+        write_board_index("proj", &idx).unwrap();
+        assert_eq!(
+            read_board_index_viewer_login("proj", &github_cfg()).unwrap(),
+            None,
+        );
     }
 
     #[test]

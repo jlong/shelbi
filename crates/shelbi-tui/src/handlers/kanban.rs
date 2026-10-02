@@ -328,6 +328,7 @@ mod tests {
                 params: std::collections::BTreeMap::new(),
             },
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 
