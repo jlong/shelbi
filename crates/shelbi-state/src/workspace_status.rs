@@ -236,6 +236,53 @@ pub fn clear_expected_teardown(workspace: &str) -> Result<()> {
     }
 }
 
+/// Env var naming the file the `shelbi __review-serve` wrapper records the
+/// launched review server's process-group id into. The orchestrator injects it
+/// into a local review pane (value = [`review_serve_pgid_path`]); the wrapper
+/// reads it. Defined here so the producer (orchestrator) and consumer (CLI
+/// wrapper) can't drift on the spelling.
+pub const REVIEW_SERVE_PGID_FILE_ENV: &str = "SHELBI_REVIEW_PGID_FILE";
+
+/// `~/.shelbi/workspaces/<name>/review-serve.pgid` — records the process-group
+/// id of the review dev server the Review agent launched through the
+/// `shelbi __review-serve` wrapper. Kept hub-side (not in the tmux session env,
+/// which dies with the pane, and not in memory) so any teardown path can signal
+/// the whole server tree even across a hub / daemon restart between launch and
+/// teardown. The wrapper writes it; the orchestrator reads it on teardown and
+/// clears it. Keyed by workspace so the orchestrator's `kill_workspace_pane`
+/// (which only has the workspace name) needs no worktree plumbing to find it.
+pub fn review_serve_pgid_path(workspace: &str) -> Result<PathBuf> {
+    crate::ensure_flat_path_component("workspace", workspace)?;
+    Ok(workspaces_dir()?.join(workspace).join("review-serve.pgid"))
+}
+
+/// Read the persisted review-server process-group id for `workspace`, if the
+/// wrapper recorded one. A missing file (no server was tracked — a dev slot, a
+/// remote review slot, or a load that never served) reads as `Ok(None)`. A
+/// malformed or non-positive body also reads as `None` (best-effort: a corrupt
+/// record must never wedge teardown, and the `> 1` floor makes it impossible
+/// for a `kill(-pgid, …)` to ever target init / every process). The file is
+/// left in place for [`clear_review_serve_pgid`] to remove.
+pub fn read_review_serve_pgid(workspace: &str) -> Result<Option<i32>> {
+    let path = review_serve_pgid_path(workspace)?;
+    match fs::read_to_string(&path) {
+        Ok(s) => Ok(s.trim().parse::<i32>().ok().filter(|&p| p > 1)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
+/// Remove a workspace's review-server pgid record, if any. Idempotent and
+/// best-effort — a missing file is not an error.
+pub fn clear_review_serve_pgid(workspace: &str) -> Result<()> {
+    let path = review_serve_pgid_path(workspace)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
 /// Local Unix-domain socket the hub daemon (`shelbi daemon`) listens on.
 /// `$SHELBI_HUB_SOCK` wins when set so tests, alternate users, or
 /// XDG_RUNTIME_DIR layouts can re-home it without touching `SHELBI_HOME`.

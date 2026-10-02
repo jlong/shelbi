@@ -443,6 +443,21 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
 /// phrases mark the deprecation.
 const LEGACY_REVIEW_WORDING: &[&str] = &["serve recipe", "diff-only", "why no server came up"];
 
+/// Anchor marking a review charter that still teaches the agent to launch the
+/// dev server itself (section 3, "Bring it up"). Present in both the old and
+/// the wrapper-aware prose, so it tells "this file owns the serve-launch
+/// guidance" apart from a load-run skill or a heavily-customized copy that
+/// dropped the section.
+const REVIEW_SERVE_LAUNCH_ANCHOR: &str = "durable background process";
+
+/// Distinctive token the serve-wrapper guidance introduces. A charter carrying
+/// the serve-launch anchor but none of this is still on the pre-wrapper prose
+/// that has the agent `setsid`/`nohup` the server itself — so Shelbi never
+/// learns the server's pgid and can't reap its process tree on teardown (the
+/// review-dev-server-leak fix). Kept in sync with the shipped default template
+/// by the drift guard in this module's tests.
+const REVIEW_SERVE_WRAPPER_MARKER: &str = "shelbi __review-serve";
+
 /// The section heading under which the review agent's one code-touching
 /// exception (a human-requested tweak) lives. Shared between the shipped
 /// default and the sniff so the two can never disagree about the heading the
@@ -480,6 +495,33 @@ fn sniff_review_instructions(entry: &InventoryEntry, text: &str, out: &mut Vec<U
              (not `## Review serve recipe`); when no recipe is declared, bring nothing up and \
              say nothing about it (no `diff-only` / `why no server came up` narration).",
             Location { line: 1, column: 1 },
+        ));
+    }
+
+    // Serve-wrapper guidance (review-dev-server-leak fix). A charter that still
+    // teaches the agent to launch the server itself (anchor present) but never
+    // mentions the `shelbi __review-serve` wrapper has it `setsid`/`nohup` the
+    // server on its own — so Shelbi has no pgid to reap and the process tree is
+    // orphaned on teardown, piling up across loads and holding the review port.
+    // Fire only when the serve-launch section is present (a load-run skill or a
+    // copy that dropped it is too customized to reason about) and the wrapper
+    // token is absent.
+    if text.contains(REVIEW_SERVE_LAUNCH_ANCHOR) && !text.contains(REVIEW_SERVE_WRAPPER_MARKER) {
+        out.push(finding(
+            entry,
+            Classification::NeedsJudgment,
+            "REVIEW_INSTRUCTIONS_NO_SERVE_WRAPPER",
+            "the review agent's serve-launch guidance predates the `shelbi __review-serve` \
+             wrapper — it backgrounds the dev server itself (setsid/nohup), so Shelbi never \
+             learns the server's process group and leaves its whole tree orphaned (holding the \
+             review port) on teardown",
+            "Refresh the `Bring it up` guidance to run the recipe's serve line exactly as \
+             rendered — on a review slot it is already wrapped in `shelbi __review-serve -- …`, \
+             which launches the server in its own session and lets Shelbi reap the whole process \
+             tree on every teardown path. Tell the agent to keep that prefix and NOT add its own \
+             `setsid`/`nohup`; it only backgrounds the command so it outlives the turn. Mirror \
+             the shipped default template.",
+            locate_line(text, REVIEW_SERVE_LAUNCH_ANCHOR),
         ));
     }
 
@@ -2629,6 +2671,61 @@ mod tests {
         let mut out = Vec::new();
         sniff_review_instructions(&review_instr_entry(), text, &mut out);
         assert!(find(&out, "REVIEW_INSTRUCTIONS_TWEAK_NO_PUSH").is_none());
+    }
+
+    // ---- review agent instructions (serve wrapper, dev-server leak) ------
+
+    #[test]
+    fn pre_wrapper_serve_guidance_is_needs_judgment() {
+        // Pre-fix charter: launches the server itself with setsid, no wrapper.
+        let text = "# Review\n\n### 3. Bring it up\n\nStart the recipe's process yourself as a \
+             **durable background process**:\n\n```sh\nsetsid sh -c 'npm run dev -- -p 4310' &\n```\n";
+        let mut out = Vec::new();
+        sniff_review_instructions(&review_instr_entry(), text, &mut out);
+        let f = find(&out, "REVIEW_INSTRUCTIONS_NO_SERVE_WRAPPER").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+    }
+
+    #[test]
+    fn serve_guidance_with_the_wrapper_is_clean() {
+        let text = "# Review\n\n### 3. Bring it up\n\nStart the recipe's process yourself as a \
+             **durable background process**. The serve line is wrapped in \
+             `shelbi __review-serve -- …`; keep that prefix.\n";
+        let mut out = Vec::new();
+        sniff_review_instructions(&review_instr_entry(), text, &mut out);
+        assert!(
+            find(&out, "REVIEW_INSTRUCTIONS_NO_SERVE_WRAPPER").is_none(),
+            "wrapper-aware prose should not be flagged: {:?}",
+            codes(&out)
+        );
+    }
+
+    #[test]
+    fn review_instructions_without_the_serve_section_are_not_flagged() {
+        // No serve-launch section (e.g. the load-run skill): too customized to
+        // reason about, so the wrapper absence sniff stays quiet.
+        let text = "# Review\n\n## Diff notes\n\nno serve-launch section here\n";
+        let mut out = Vec::new();
+        sniff_review_instructions(&review_instr_entry(), text, &mut out);
+        assert!(find(&out, "REVIEW_INSTRUCTIONS_NO_SERVE_WRAPPER").is_none());
+    }
+
+    /// Drift guard: the shipped default review template must carry the serve
+    /// wrapper guidance, so a freshly-materialized project never trips the
+    /// wrapper sniffer, and the anchor it keys on must still exist.
+    #[test]
+    fn shipped_default_review_template_carries_serve_wrapper_guidance() {
+        assert!(
+            shelbi_state::DEFAULT_REVIEW_INSTRUCTIONS.contains(REVIEW_SERVE_LAUNCH_ANCHOR),
+            "shipped default review template dropped the serve-launch anchor — the wrapper \
+             sniffer's absence check is now dead",
+        );
+        assert!(
+            shelbi_state::DEFAULT_REVIEW_INSTRUCTIONS.contains(REVIEW_SERVE_WRAPPER_MARKER),
+            "shipped default review template no longer teaches the `shelbi __review-serve` \
+             wrapper — it would trip its own sniffer",
+        );
     }
 
     /// Drift guard: the shipped default review template must carry the
