@@ -16,6 +16,10 @@ pub fn tasks_loop<B: Backend>(
 ) -> Result<()> {
     loop {
         app.maybe_refresh();
+        // Apply any completed background card-move persistence (advance to the
+        // next queued hop, settle, or roll back on failure) before drawing, so
+        // outcomes show within a tick without the UI ever blocking on the write.
+        app.poll_pending_moves();
         term.draw(|f| kanban::render_full(f, app, f.area()))?;
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
