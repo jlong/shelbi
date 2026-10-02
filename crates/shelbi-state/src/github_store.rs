@@ -1947,13 +1947,23 @@ impl GitHubStore {
             // Remotely verified: hand back the cached copy. We only sent
             // `If-None-Match` when we held one, so a `304` implies a cached entry.
             Some(304) => {
-                let Some((tf, _)) = cached else {
+                let Some((mut tf, _)) = cached else {
                     return Err(Error::Other(format!(
                         "GitHub returned 304 for issue #{number} in {} but no cached \
                          copy is held to return",
                         self.repo
                     )));
                 };
+                // The body is remotely verified, but the local assignment overlay
+                // is *not* part of that body — assignment is local-only and never
+                // written to GitHub, so assigning a workspace never bumps the
+                // issue's `ETag`. The cached copy folded in whatever `assigned_to`
+                // was current when the `200` cached it, which in a long-lived
+                // process can be arbitrarily stale (e.g. the dev workspace that
+                // built the task, after it has since been handed to a review
+                // slot). Re-fold the *current* overlay so a `304` reflects the
+                // live owner, exactly as the `200` branch below does.
+                tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
                 Ok(Some(tf))
             }
             // Gone: drop the cache, same as the GraphQL null node.
@@ -8587,6 +8597,55 @@ mod tests {
             rest[1].contains(r#"If-None-Match: "etag-v1""#),
             "the second read replays the stored validator: {}",
             rest[1]
+        );
+    }
+
+    #[test]
+    fn a_304_refolds_the_current_assignment_overlay_not_the_cached_owner() {
+        // Regression (review-panel-isn't-built-after-a-load): the local
+        // assignment overlay is never written to GitHub, so assigning a
+        // workspace does not bump the issue's ETag. A long-lived process (the
+        // sidebar) therefore keeps getting `304`s and, before this fix, kept
+        // serving the `assigned_to` it folded in when the `200` first cached the
+        // body. That stranded a freshly review-loaded task showing its *dev*
+        // owner forever, which the open path misread as "queued" and tried to
+        // re-load onto a busy slot ("no free review workspace").
+        //
+        // The task starts assigned to the dev workspace `alpha`; the `200`
+        // caches it. The overlay is then moved to the `review` slot (a local
+        // write that leaves the ETag untouched), and the next read comes back
+        // `304`. The returned copy must reflect the *current* overlay (`review`),
+        // exactly as the `200` branch would — not the stale cached `alpha`.
+        let _home = HomeGuard::new("fetch-304-refold-overlay");
+        crate::set_task_assignment("test-project", "foo", Some("alpha")).unwrap();
+
+        let issue = rest_issue_json(9, "foo", "serving", "open", "", "Body", "2026-08-02T00:00:00Z", false);
+        let raw200 = rest_200_raw(&issue, Some(r#""etag-v1""#));
+        let raw304 = rest_304_raw(r#""etag-v1""#);
+        let n = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let nn = n.clone();
+        let (store, _calls) = graphql_recorder(move |_args| {
+            let mut g = nn.lock().unwrap();
+            *g += 1;
+            if *g == 1 { Ok(raw200.clone()) } else { Ok(raw304.clone()) }
+        });
+
+        let first = store.fetch(9).unwrap().expect("issue exists");
+        assert_eq!(
+            first.task.assigned_to.as_deref(),
+            Some("alpha"),
+            "the 200 folds in the dev owner current at cache time"
+        );
+
+        // The task is loaded onto the review slot — a local overlay write that
+        // never touches the issue body or its ETag.
+        crate::set_task_assignment("test-project", "foo", Some("review")).unwrap();
+
+        let second = store.fetch(9).unwrap().expect("304 returns the cached copy");
+        assert_eq!(
+            second.task.assigned_to.as_deref(),
+            Some("review"),
+            "a 304 must re-fold the live overlay, not serve the stale cached owner"
         );
     }
 
