@@ -1064,7 +1064,9 @@ fn review_panel_loop<B: Backend>(
                 Ok(Err(e)) => {
                     merge_rx = None;
                     app.merging = false;
-                    app.status_line = format!("approve failed: {e}");
+                    let msg = format!("approve failed: {e}");
+                    crate::error_report::log_error(project_name, "review-panel", &msg);
+                    app.status_line = msg;
                     continue;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -1074,7 +1076,9 @@ fn review_panel_loop<B: Backend>(
                     // than spinning forever.
                     merge_rx = None;
                     app.merging = false;
-                    app.status_line = "approve failed: merge worker exited unexpectedly".into();
+                    let msg = "approve failed: merge worker exited unexpectedly".to_string();
+                    crate::error_report::log_error(project_name, "review-panel", &msg);
+                    app.status_line = msg;
                     continue;
                 }
             }
@@ -1153,7 +1157,9 @@ fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect
         // put and can be re-opened from the sidebar.
         PanelEffect::FocusDashboard => {
             if let Err(e) = shelbi_orchestrator::review_ui::focus_dashboard(project_name) {
-                app.status_line = format!("back to dashboard failed: {e}");
+                let msg = format!("back to dashboard failed: {e}");
+                crate::error_report::log_error(project_name, "review-panel", &msg);
+                app.status_line = msg;
             }
         }
         PanelEffect::ShowChat => {
@@ -1162,7 +1168,9 @@ fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect
                 &app.task_id,
                 shelbi_orchestrator::review_ui::ReviewMidView::Chat,
             ) {
-                app.status_line = format!("show chat failed: {e}");
+                let msg = format!("show chat failed: {e}");
+                crate::error_report::log_error(project_name, "review-panel", &msg);
+                app.status_line = msg;
             }
         }
         PanelEffect::ShowDiff => {
@@ -1171,7 +1179,9 @@ fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect
                 &app.task_id,
                 shelbi_orchestrator::review_ui::ReviewMidView::Diff,
             ) {
-                app.status_line = format!("view diff failed: {e}");
+                let msg = format!("view diff failed: {e}");
+                crate::error_report::log_error(project_name, "review-panel", &msg);
+                app.status_line = msg;
             }
         }
         PanelEffect::ShowVim => {
@@ -1180,13 +1190,16 @@ fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect
                 &app.task_id,
                 shelbi_orchestrator::review_ui::ReviewMidView::Editor,
             ) {
-                app.status_line = format!("open editor failed: {e}");
+                let msg = format!("open editor failed: {e}");
+                crate::error_report::log_error(project_name, "review-panel", &msg);
+                app.status_line = msg;
             }
         }
         PanelEffect::OpenBrowser => match review_url(project_name, &app.task_id) {
             Some(url) => {
                 let (prog, args) = open_url_command(current_os(), &url);
                 if let Err(e) = spawn_opener(&prog, &args) {
+                    crate::error_report::log_error(project_name, "review-panel", &e);
                     app.status_line = e;
                 }
             }
@@ -1198,6 +1211,7 @@ fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect
             } else {
                 let (prog, args) = reveal_command(current_os(), &app.worktree);
                 if let Err(e) = spawn_opener(&prog, &args) {
+                    crate::error_report::log_error(project_name, "review-panel", &e);
                     app.status_line = e;
                 }
             }
@@ -1219,7 +1233,11 @@ fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect
                     &reason,
                 ) {
                     Ok(()) => app.should_quit = true,
-                    Err(e) => app.status_line = format!("reject failed: {e}"),
+                    Err(e) => {
+                        let msg = format!("reject failed: {e}");
+                        crate::error_report::log_error(project_name, "review-panel", &msg);
+                        app.status_line = msg;
+                    }
                 }
             }
         }

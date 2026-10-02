@@ -21,6 +21,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 mod activity;
 mod app;
+mod error_report;
 mod handlers;
 mod kanban;
 mod keymap;

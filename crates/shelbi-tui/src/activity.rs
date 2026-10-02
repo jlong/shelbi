@@ -457,9 +457,18 @@ impl ActivityApp {
                 self.status_line = format!("zen {label}");
             }
             Err(e) => {
-                self.status_line = format!("zen toggle failed: {e}");
+                self.fail_status(format!("zen toggle failed: {e}"));
             }
         }
+    }
+
+    /// Set the status line to a user-facing error AND record it to the project's
+    /// persistent error log (best-effort, tagged `activity`), so it survives the
+    /// next status-line overwrite / a restart and lights the sidebar's
+    /// unread-errors button. The status line keeps showing the raw message.
+    fn fail_status(&mut self, message: String) {
+        crate::error_report::log_error(&self.project_name, "activity", &message);
+        self.status_line = message;
     }
 
     /// Toggle the Zen pill — flips between including-only-zen and not.
@@ -530,7 +539,7 @@ impl ActivityApp {
         let path = match events_log_path() {
             Ok(p) => p,
             Err(e) => {
-                self.status_line = format!("events.log path failed: {e}");
+                self.fail_status(format!("events.log path failed: {e}"));
                 return;
             }
         };
@@ -564,7 +573,7 @@ impl ActivityApp {
         let text = match read_tail(&path, self.log_offset) {
             Ok(t) => t,
             Err(e) => {
-                self.status_line = format!("read events.log: {e}");
+                self.fail_status(format!("read events.log: {e}"));
                 return;
             }
         };
