@@ -153,17 +153,45 @@ pub fn record_request(budget: Budget, caller: &str, outcome: Outcome) {
     record_request_at(budget, caller, outcome, Utc::now());
 }
 
+/// [`record_request`] carrying the GraphQL point `cost` GitHub charged (from the
+/// response's `rateLimit { cost }`). The GraphQL read path records this so
+/// `shelbi doctor` projects exhaustion from **points** spent — the 5,000/hr
+/// GraphQL budget is priced in points, not requests, so a burst of cheap-looking
+/// requests can each cost several points. `cost` is omitted (`None`) on REST,
+/// where one request spends one unit of the request-count budget.
+pub fn record_request_with_cost(budget: Budget, caller: &str, outcome: Outcome, cost: Option<u64>) {
+    record_request_cost_at(budget, caller, outcome, cost, Utc::now());
+}
+
 /// [`record_request`] with an explicit timestamp — the seam a test drives to
 /// simulate a request stream without waiting real time.
 pub fn record_request_at(budget: Budget, caller: &str, outcome: Outcome, at: DateTime<Utc>) {
+    record_request_cost_at(budget, caller, outcome, None, at);
+}
+
+/// [`record_request_at`] carrying the GraphQL point `cost`. The one writer of the
+/// `cost=` field; every other entry point funnels here with `cost = None`.
+pub fn record_request_cost_at(
+    budget: Budget,
+    caller: &str,
+    outcome: Outcome,
+    cost: Option<u64>,
+    at: DateTime<Utc>,
+) {
     let Some(path) = log_path() else {
         return;
     };
     if let Some(parent) = path.parent() {
         let _ = crate::ensure_dir(parent);
     }
+    // `cost=` rides only on a spent request that actually surfaced one; a 304 or a
+    // failed attempt spent no primary quota, so a cost there would be misleading.
+    let cost_field = match (outcome, cost) {
+        (Outcome::Ok, Some(c)) => format!(" cost={c}"),
+        _ => String::new(),
+    };
     let line = format!(
-        "{} budget={} caller={} outcome={}\n",
+        "{} budget={} caller={} outcome={}{cost_field}\n",
         at.to_rfc3339(),
         budget_tag(budget),
         sanitize_caller(caller),
@@ -201,6 +229,13 @@ pub struct RequestEntry {
     /// The error class for a failed attempt (`conn` / `ratelimit` / …), or
     /// `None` when the request spent budget or was a 304.
     pub err_class: Option<String>,
+    /// The point cost GitHub charged this request, from the GraphQL response's
+    /// `rateLimit { cost }`. `Some` only on a spent GraphQL request that surfaced
+    /// it; `None` on REST (whose budget is counted in whole requests, one per
+    /// call), on a failed/304 request, and on a line an older shelbi wrote with no
+    /// `cost=` field. A reader treats `None` as a cost of one so the point total
+    /// degrades to the request count rather than vanishing.
+    pub cost: Option<u64>,
 }
 
 /// Read the request records made within `window` before `now`, newest last.
@@ -250,11 +285,14 @@ fn parse_line(line: &str) -> Option<RequestEntry> {
     let mut spent = true;
     let mut not_modified = false;
     let mut err_class = None;
+    let mut cost = None;
     for tok in tokens {
         if let Some(v) = tok.strip_prefix("budget=") {
             budget = parse_budget(v);
         } else if let Some(v) = tok.strip_prefix("caller=") {
             caller = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("cost=") {
+            cost = v.parse().ok();
         } else if let Some(v) = tok.strip_prefix("outcome=") {
             if v == "ok" {
                 spent = true;
@@ -275,6 +313,7 @@ fn parse_line(line: &str) -> Option<RequestEntry> {
         spent,
         not_modified,
         err_class,
+        cost,
     })
 }
 
@@ -491,6 +530,35 @@ mod tests {
     }
 
     #[test]
+    fn graphql_cost_round_trips_and_is_recorded_only_on_a_spend() {
+        let _iso = IsolatedHome::new("cost");
+        let now = Utc::now();
+        // A GraphQL spend carrying a point cost, and a 304/failed attempt whose
+        // cost argument must be dropped (they spent no primary quota).
+        record_request_cost_at(Budget::Graphql, "id-search", Outcome::Ok, Some(13), now);
+        record_request_cost_at(Budget::Graphql, "issue-fetch", Outcome::NotModified, Some(9), now);
+        record_request_cost_at(Budget::Graphql, "issue-fetch", Outcome::Err("conn"), Some(9), now);
+
+        let recent = recent_entries(Duration::from_secs(60), now);
+        let spent: Vec<&RequestEntry> = recent.iter().filter(|e| e.spent).collect();
+        assert_eq!(spent.len(), 1, "only the 200 spends");
+        assert_eq!(spent[0].cost, Some(13), "the spend carries its point cost");
+        assert!(
+            recent.iter().filter(|e| !e.spent).all(|e| e.cost.is_none()),
+            "a 304 / failed attempt records no cost"
+        );
+    }
+
+    #[test]
+    fn a_line_without_a_cost_field_reads_as_no_cost() {
+        // Backward compatibility: a GraphQL line an older shelbi wrote has no
+        // `cost=`, so the reader sees `None` and the doctor charges it one point.
+        let e = parse_line("2026-10-02T13:00:00Z budget=graphql caller=id-search outcome=ok").unwrap();
+        assert!(e.spent);
+        assert_eq!(e.cost, None);
+    }
+
+    #[test]
     fn an_old_line_with_no_outcome_reads_as_spent() {
         // Backward compatibility: a line written before the `outcome=` field
         // counts as spent, so historical logs still project correctly.
@@ -509,6 +577,7 @@ mod tests {
             spent: true,
             not_modified: false,
             err_class: None,
+            cost: None,
         };
         let entries = vec![
             spent(Budget::Graphql, "board-refresh"),
