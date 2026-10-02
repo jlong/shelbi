@@ -175,6 +175,10 @@ pub struct KanbanApp {
     /// which only re-reads the cached first page — never discards what the user
     /// paged in. Merged into [`tasks`](Self::tasks) alongside the first page.
     pub closed_more: Vec<IssueFile>,
+    /// Coalesces the transient GitHub board-refresh failure so a persistent
+    /// outage (the board read parks every tick) logs a bounded number of error
+    /// entries instead of one per tick. See [`crate::error_report`].
+    refresh_errors: crate::error_report::TransientErrorLog,
 }
 
 /// One rendered column header's screen-space rectangle plus the index
@@ -411,6 +415,36 @@ impl KanbanApp {
             column_overrides: std::collections::BTreeMap::new(),
             closed_next_cursor: None,
             closed_more: Vec::new(),
+            refresh_errors: crate::error_report::TransientErrorLog::new("github"),
+        }
+    }
+
+    /// Set the status line to a one-shot user-facing error AND record it to the
+    /// project's persistent error log (best-effort, tagged `kanban`), so it
+    /// survives the next status-line overwrite / a restart and lights the
+    /// sidebar's unread-errors button. The status line keeps showing the raw
+    /// message exactly as before.
+    fn fail_status(&mut self, message: String) {
+        crate::error_report::log_error(&self.project_name, "kanban", &message);
+        self.status_line = message;
+    }
+
+    /// Variant of [`fail_status`](Self::fail_status) for the transient GitHub
+    /// board-refresh failure: the status line still shows the raw message every
+    /// tick, but the persistent log is *coalesced* so a standing outage can't
+    /// flood it (tagged `github`).
+    fn fail_refresh(&mut self, message: String) {
+        if let Some(line) = self.refresh_errors.fail(&message, chrono::Utc::now()) {
+            crate::error_report::log_error(&self.project_name, "github", &line);
+        }
+        self.status_line = message;
+    }
+
+    /// Note a successful board refresh, logging a single "recovered" line if the
+    /// refresh had been failing. A no-op on an already-healthy stream.
+    fn clear_refresh_error(&mut self) {
+        if let Some(line) = self.refresh_errors.recover() {
+            crate::error_report::log_error(&self.project_name, "github", &line);
         }
     }
 
@@ -531,7 +565,7 @@ impl KanbanApp {
             &col.status_id,
             Some(new_state),
         ) {
-            self.status_line = format!("column override persist failed: {e}");
+            self.fail_status(format!("column override persist failed: {e}"));
         }
     }
 
@@ -743,7 +777,7 @@ impl KanbanApp {
         self.workflows = match shelbi_state::list_workflows(&self.project_name) {
             Ok(wfs) => wfs,
             Err(e) => {
-                self.status_line = format!("workflow load failed: {e}");
+                self.fail_status(format!("workflow load failed: {e}"));
                 vec![default_workflow()]
             }
         };
@@ -753,7 +787,7 @@ impl KanbanApp {
         self.project_statuses = match shelbi_state::load_project_statuses(&self.project_name) {
             Ok(ps) => ps,
             Err(e) => {
-                self.status_line = format!("statuses.yaml load failed: {e}");
+                self.fail_status(format!("statuses.yaml load failed: {e}"));
                 default_project_statuses()
             }
         };
@@ -772,7 +806,7 @@ impl KanbanApp {
         let store = match shelbi_state::issue_store_for(&self.project_name) {
             Ok(store) => store,
             Err(e) => {
-                self.status_line = format!("refresh failed: {e}");
+                self.fail_refresh(format!("refresh failed: {e}"));
                 return;
             }
         };
@@ -784,6 +818,9 @@ impl KanbanApp {
         match shelbi_state::read_board_report(&self.project_name) {
             Ok(report) => {
                 self.board_banner = report.freshness.banner();
+                // A board read that returned (cold, warm or stale) is a healthy
+                // refresh: log a single "recovered" line if it had been parked.
+                self.clear_refresh_error();
                 match report.state {
                     shelbi_state::BoardState::Cold => {
                         // No data yet; leave `tasks` as-is (empty on first paint)
@@ -797,7 +834,7 @@ impl KanbanApp {
             }
             Err(e) => {
                 self.board_banner = None;
-                self.status_line = format!("refresh failed: {e}");
+                self.fail_refresh(format!("refresh failed: {e}"));
             }
         }
     }
@@ -870,7 +907,7 @@ impl KanbanApp {
         let store = match shelbi_state::issue_store_for(&self.project_name) {
             Ok(store) => store,
             Err(e) => {
-                self.status_line = format!("load more failed: {e}");
+                self.fail_status(format!("load more failed: {e}"));
                 return;
             }
         };
@@ -888,7 +925,7 @@ impl KanbanApp {
                 self.clamp_selection();
             }
             Err(e) => {
-                self.status_line = format!("load more failed: {e}");
+                self.fail_status(format!("load more failed: {e}"));
             }
         }
     }
@@ -1006,7 +1043,7 @@ impl KanbanApp {
         self.workspace_filter = filter.clone();
         let disk = filter.as_ref().map(|f| f.to_disk());
         if let Err(e) = shelbi_state::set_workspace_filter(&self.project_name, disk.as_deref()) {
-            self.status_line = format!("filter persist failed: {e}");
+            self.fail_status(format!("filter persist failed: {e}"));
         }
         // The selection may now point past the end of a column that
         // just shrank; clamp before the next render reads it.
@@ -1383,7 +1420,7 @@ impl KanbanApp {
                 true
             }
             Err(e) => {
-                self.status_line = format!("open @{ws} failed: {e}");
+                self.fail_status(format!("open @{ws} failed: {e}"));
                 false
             }
         }
@@ -1486,7 +1523,7 @@ impl KanbanApp {
         // Gate before the in-progress lifecycle can create a git branch. A
         // stale daemon must leave both the board and repository untouched.
         if let Err(e) = shelbi_state::ensure_daemon_matches_for_mutation() {
-            self.status_line = format!("move blocked: {e}");
+            self.fail_status(format!("move blocked: {e}"));
             return;
         }
         // A task's position IS its status id, so the destination column's
@@ -1514,12 +1551,12 @@ impl KanbanApp {
                                     &project, id,
                                 )
                             {
-                                self.status_line = format!("branch cut failed: {e}");
+                                self.fail_status(format!("branch cut failed: {e}"));
                                 return;
                             }
                         }
                         Err(e) => {
-                            self.status_line = format!("load project failed: {e}");
+                            self.fail_status(format!("load project failed: {e}"));
                             return;
                         }
                     }
@@ -1543,7 +1580,7 @@ impl KanbanApp {
             }
             Ok(None) => {}
             Err(e) => {
-                self.status_line = format!("move failed: {e}");
+                self.fail_status(format!("move failed: {e}"));
                 return;
             }
         }
@@ -1581,13 +1618,13 @@ impl KanbanApp {
             return;
         };
         if let Err(e) = shelbi_state::ensure_daemon_matches_for_mutation() {
-            self.status_line = format!("reorder blocked: {e}");
+            self.fail_status(format!("reorder blocked: {e}"));
             return;
         }
         if let Err(e) = shelbi_state::issue_store_for(&self.project_name)
             .and_then(|s| s.set_priority(&id, shelbi_state::PrioMove::Set(new_pos as u32)))
         {
-            self.status_line = format!("reorder failed: {e}");
+            self.fail_status(format!("reorder failed: {e}"));
             return;
         }
         self.refresh();
@@ -3401,6 +3438,71 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         );
 
         shelbi_state::clear_test_gh_runner();
+    }
+
+    /// A one-shot kanban error lands in the project's persistent error log with
+    /// the `kanban` source (and still shows on the status line), so the sidebar's
+    /// unread-errors button — which reconciles from disk — lights no matter which
+    /// view raised it.
+    #[test]
+    fn kanban_error_is_written_to_the_persistent_error_log() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = IsolatedKanbanEnv::new("kanban-error-log");
+
+        let mut app = KanbanApp::new("demo");
+        app.fail_status("move failed: boom".to_string());
+
+        // Status-line feedback is unchanged...
+        assert_eq!(app.status_line, "move failed: boom");
+        // ...and the error is now durable in the log, tagged `kanban`.
+        let entries = shelbi_state::read_errors("demo").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message, "move failed: boom");
+        assert_eq!(entries[0].source.as_deref(), Some("kanban"));
+    }
+
+    /// A GitHub refresh that keeps failing every tick must not write one log
+    /// entry per tick (which would push useful history out of the 500-entry cap):
+    /// the first failure logs, identical repeats coalesce, and a single
+    /// "recovered" line lands when the board comes back.
+    #[test]
+    fn repeated_refresh_failures_coalesce_and_recovery_logs_once() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = IsolatedKanbanEnv::new("kanban-refresh-coalesce");
+
+        let mut app = KanbanApp::new("demo");
+        // The board refresh fails on three consecutive ticks with the same text.
+        for _ in 0..3 {
+            app.fail_refresh("refresh failed: GitHub API unreachable".to_string());
+        }
+        // Every tick still updates the status line verbatim.
+        assert_eq!(app.status_line, "refresh failed: GitHub API unreachable");
+        // But only the first failure was logged (the others coalesced, well
+        // within the quiet interval).
+        let entries = shelbi_state::read_errors("demo").unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "a standing outage logs one entry, not one per tick; got {entries:?}"
+        );
+        assert_eq!(entries[0].source.as_deref(), Some("github"));
+
+        // When the refresh succeeds again, exactly one "recovered" line lands.
+        app.clear_refresh_error();
+        let entries = shelbi_state::read_errors("demo").unwrap();
+        assert_eq!(entries.len(), 2, "recovery adds one line; got {entries:?}");
+        assert!(
+            entries[1].message.contains("recovered"),
+            "got: {}",
+            entries[1].message
+        );
+        // A second clear on a now-healthy stream logs nothing.
+        app.clear_refresh_error();
+        assert_eq!(shelbi_state::read_errors("demo").unwrap().len(), 2);
     }
 
     #[test]

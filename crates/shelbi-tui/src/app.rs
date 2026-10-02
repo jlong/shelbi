@@ -1322,7 +1322,11 @@ impl App {
     /// join (e.g. "review load for X was interrupted"). Same best-effort,
     /// button-bumping semantics.
     pub fn log_error_message(&mut self, message: &str) {
-        if shelbi_state::append_error(&self.project_name, message, None).is_ok() {
+        // Route through the shared helper (tagged `sidebar`) so every view logs
+        // the same way; the sidebar keeps its own optimistic bump since — unlike
+        // the other panes — it owns the button and shows it without waiting for
+        // the next disk refresh.
+        if crate::error_report::log_error(&self.project_name, "sidebar", message) {
             self.unread_errors = self.unread_errors.saturating_add(1);
         }
     }
