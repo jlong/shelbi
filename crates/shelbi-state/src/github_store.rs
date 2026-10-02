@@ -2061,9 +2061,19 @@ impl GitHubStore {
             self.remember_number(id, n);
             return Ok(Some(n));
         }
+        // A recently-confirmed miss short-circuits the label search: an id the
+        // index can't resolve and the search already came up empty for is
+        // (practically) never going to resolve, so re-searching it on every pass
+        // is pure GraphQL-point waste. The index check above still runs first, so
+        // a genuinely new task the daemon has since indexed resolves immediately,
+        // regardless of a stale miss entry.
+        if self.recently_missing(id) {
+            return Ok(None);
+        }
         let n = self.search_number(id)?;
-        if let Some(n) = n {
-            self.remember_number(id, n);
+        match n {
+            Some(n) => self.remember_number(id, n),
+            None => self.remember_missing(id),
         }
         Ok(n)
     }
@@ -2126,10 +2136,36 @@ impl GitHubStore {
     }
 
     /// Remember `id`→`number` in the process-local cache. A poisoned lock is a
-    /// silent miss (the next resolution just re-reads the index or searches).
+    /// silent miss (the next resolution just re-reads the index or searches). Any
+    /// prior negative-cache entry for the id is dropped: a positive resolution
+    /// proves the id now resolves, so a stale "missing" verdict must not linger.
     fn remember_number(&self, id: &str, number: i64) {
         if let Ok(mut guard) = id_number_cache().lock() {
             guard.insert((self.repo.clone(), id.to_string()), number);
+        }
+        if let Ok(mut guard) = id_number_miss_cache().lock() {
+            guard.remove(&(self.repo.clone(), id.to_string()));
+        }
+    }
+
+    /// Whether `id` has a negative-cache entry (a confirmed empty label search)
+    /// still inside [`ID_NUMBER_MISS_TTL_SECS`]. A poisoned lock reads as "not
+    /// missing" so the search still runs — the cache only ever *saves* work, it
+    /// never withholds a resolution.
+    fn recently_missing(&self, id: &str) -> bool {
+        id_number_miss_cache()
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&(self.repo.clone(), id.to_string())).copied())
+            .is_some_and(|at| read_now().saturating_sub(at) < ID_NUMBER_MISS_TTL_SECS)
+    }
+
+    /// Record that the label search resolved `id` to nothing, so a repeat
+    /// resolution inside the TTL skips the search. A poisoned lock drops the note
+    /// (the next resolution just searches again).
+    fn remember_missing(&self, id: &str) {
+        if let Ok(mut guard) = id_number_miss_cache().lock() {
+            guard.insert((self.repo.clone(), id.to_string()), read_now());
         }
     }
 
@@ -3267,7 +3303,19 @@ fn on_read_result(
                 } else {
                     crate::gh_requests::Outcome::Ok
                 };
-                crate::gh_requests::record_request(budget, caller, outcome);
+                // Attribute the GraphQL point cost (`rateLimit { cost }`) so the
+                // doctor projects exhaustion from points, not request count; REST
+                // spends one request per call, so it carries no `cost=`.
+                if budget == crate::gh_budget::Budget::Graphql {
+                    crate::gh_requests::record_request_with_cost(
+                        budget,
+                        caller,
+                        outcome,
+                        extract_graphql_cost(body),
+                    );
+                } else {
+                    crate::gh_requests::record_request(budget, caller, outcome);
+                }
             }
             // Fold the GraphQL response's `rateLimit` into the governor's tier.
             if budget == crate::gh_budget::Budget::Graphql {
@@ -3478,6 +3526,25 @@ fn extract_graphql_rate_limit(body: &str) -> Option<(Option<i64>, Option<i64>)> 
         rl.remaining.map(|r| r as i64),
         rl.reset_at.map(|dt| dt.timestamp()),
     ))
+}
+
+/// The point `cost` GitHub charged for a GraphQL response, from its
+/// `data.rateLimit { cost }`. `None` when the body isn't the expected envelope or
+/// the query didn't ask for `cost` (the board/single/search/batch queries do;
+/// the narrower ones don't) — the request log then carries no `cost=` and the
+/// doctor charges that request one point.
+fn extract_graphql_cost(body: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Env {
+        data: Option<Data>,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        #[serde(rename = "rateLimit")]
+        rate_limit: Option<GhRateLimit>,
+    }
+    let env: Env = serde_json::from_str(body.trim()).ok()?;
+    env.data?.rate_limit?.cost
 }
 
 /// The typed error a parked read returns instead of calling `gh`. Its `stderr`
@@ -3745,7 +3812,7 @@ struct GraphQlBoardPage {
 /// board index parses so [`GhIssueNode`] serves both. One point.
 const SINGLE_ISSUE_QUERY: &str = r#"
 query Issue($owner: String!, $name: String!, $number: Int!) {
-  rateLimit { remaining resetAt }
+  rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       number title state stateReason createdAt updatedAt body
@@ -3761,7 +3828,7 @@ query Issue($owner: String!, $name: String!, $number: Int!) {
 /// One point.
 const ID_SEARCH_QUERY: &str = r#"
 query IdSearch($q: String!) {
-  rateLimit { remaining resetAt }
+  rateLimit { cost remaining resetAt }
   search(query: $q, type: ISSUE, first: 2) {
     nodes { ... on Issue { number } }
   }
@@ -3785,7 +3852,7 @@ fn build_issues_by_number_query(numbers: &[i64]) -> String {
     }
     format!(
         "query IssuesByNumber($owner: String!, $name: String!) {{\n  \
-         rateLimit {{ remaining resetAt }}\n  \
+         rateLimit {{ cost remaining resetAt }}\n  \
          repository(owner: $owner, name: $name) {{\n{aliases}  }}\n}}\n"
     )
 }
@@ -3798,7 +3865,7 @@ fn build_issues_by_number_query(numbers: &[i64]) -> String {
 /// own cursor. One point per request.
 const ISSUE_LABELS_QUERY: &str = r#"
 query IssueLabels($owner: String!, $name: String!, $number: Int!, $after: String) {
-  rateLimit { remaining resetAt }
+  rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       labels(first: 100, after: $after) {
@@ -4023,6 +4090,34 @@ fn id_number_cache() -> &'static IdNumberCache {
     ID_NUMBER_CACHE.get_or_init(Default::default)
 }
 
+/// How long a **confirmed id→number miss** (the label search returned nothing) is
+/// remembered before the search is retried for that id.
+///
+/// Without this, an id the open index doesn't carry and the search can't resolve
+/// — a done/canceled task whose issue was deleted, or a stale `assignments/`
+/// marker for a long-gone task — is label-searched on *every* `resolve_number`
+/// pass. A long-lived consumer that re-resolves such a set on a periodic cadence
+/// (the Activity feed waking on each events.log append, the orchestrator drain)
+/// then burns one GraphQL `id-search` point per unresolved id per pass — the
+/// 4k-points/hr burn this cache stops. Ten minutes comfortably exceeds every
+/// consumer's wake cadence (the ~30s board tick, the ~3min heartbeat), so a
+/// quiet board costs zero periodic searches; it matches the cold-read /
+/// done-history TTLs, and a genuinely new task still resolves well inside it via
+/// [`GitHubStore::index_number`] (the daemon publishes its number within a tick,
+/// and that check precedes the negative cache), so the miss never masks a real
+/// id for more than one daemon cadence.
+const ID_NUMBER_MISS_TTL_SECS: i64 = 600;
+
+/// Process-local **negative** id→number cache: `(repo, shelbi id)` → the epoch at
+/// which the label search last confirmed the id resolves to nothing. Read by
+/// [`GitHubStore::recently_missing`] under [`ID_NUMBER_MISS_TTL_SECS`]; cleared
+/// for an id the moment a positive resolution lands ([`GitHubStore::remember_number`]).
+type IdNumberMissCache = std::sync::Mutex<std::collections::HashMap<(String, String), i64>>;
+static ID_NUMBER_MISS_CACHE: std::sync::OnceLock<IdNumberMissCache> = std::sync::OnceLock::new();
+fn id_number_miss_cache() -> &'static IdNumberMissCache {
+    ID_NUMBER_MISS_CACHE.get_or_init(Default::default)
+}
+
 /// Per-number full-issue cache keyed by `(repo, number)` →
 /// `(updatedAt, issue, validator)`. The `If-None-Match` ETag store the REST
 /// conditional-GET single-issue read (`GitHubStore::fetch`) reads and writes: the
@@ -4054,6 +4149,9 @@ fn issue_cache_get(repo: &str, number: i64) -> Option<(DateTime<Utc>, IssueFile,
 #[cfg(any(test, feature = "test-support"))]
 pub fn clear_issue_caches_for_test() {
     if let Ok(mut g) = id_number_cache().lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = id_number_miss_cache().lock() {
         g.clear();
     }
     if let Ok(mut g) = issue_cache().lock() {
@@ -4149,6 +4247,11 @@ struct GhRateLimit {
     remaining: Option<u64>,
     #[serde(rename = "resetAt", default)]
     reset_at: Option<DateTime<Utc>>,
+    /// The point cost GitHub charged this query, when the query asked for it
+    /// (`rateLimit { cost … }`). Recorded on the request log so `shelbi doctor`
+    /// projects GraphQL exhaustion from points spent, not request count.
+    #[serde(default)]
+    cost: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8974,6 +9077,12 @@ mod tests {
         )
     }
 
+    /// An `IdSearch` response that resolves to nothing — the shape the search
+    /// returns for an id whose issue was deleted or never carried the label.
+    fn gql_search_empty() -> String {
+        r#"{"data":{"rateLimit":{"remaining":4999},"search":{"nodes":[]}}}"#.to_string()
+    }
+
     fn gql_aliased(nodes: &[(usize, &str)]) -> String {
         let inner: Vec<String> = nodes.iter().map(|(k, n)| format!("\"i{k}\":{n}")).collect();
         format!(
@@ -9162,6 +9271,44 @@ mod tests {
             second.task.assigned_to.as_deref(),
             Some("review"),
             "a 304 must re-fold the live overlay, not serve the stale cached owner"
+        );
+    }
+
+    /// Regression (this task, the `changed=1`-every-tick half): a `get` on a
+    /// serving (overlay-assigned) task writes its index entry through
+    /// `refresh_index_entry` carrying the *same* `assigned_to` the daemon's board
+    /// read folds in. Before #1393 the write-through could carry a stale owner (a
+    /// `304` served the cached dev owner), so the daemon's re-fold flipped it back
+    /// every tick and `board_diff_count` reported `changed=1` on an otherwise
+    /// quiet board while a review slot served. With the overlay re-folded on every
+    /// read, the write-through form matches the fold and the ping-pong is gone.
+    #[test]
+    fn a_get_on_a_serving_task_writes_the_overlay_owner_into_the_index() {
+        let _home = HomeGuard::new("serving-get-no-churn");
+        // The published index already carries the task owned by the review slot,
+        // exactly as the daemon's overlay-folding board read published it.
+        crate::set_task_assignment("test-project", "foo", Some("review")).unwrap();
+        write_test_index(
+            "test-project",
+            &[("foo", 9)],
+            vec![idx_issue("foo", "review", "2026-08-02T00:00:00Z")],
+        );
+        // A live single-issue read (as the review panel's loop does each tick).
+        let issue = rest_issue_json(9, "foo", "review", "open", "", "Body", "2026-08-02T00:00:00Z", false);
+        let raw = rest_200_raw(&issue, Some(r#""etag-v1""#));
+        let (store, _calls) = graphql_recorder(move |_args| Ok(raw.clone()));
+
+        let got = store.get("foo").unwrap().expect("found");
+        assert_eq!(got.task.assigned_to.as_deref(), Some("review"));
+
+        // The write-through the `get` applied must carry the overlay owner, so the
+        // daemon's next fold finds nothing to change (no spurious `changed=1`).
+        let idx = crate::board_index::read_board_index("test-project").expect("index");
+        let entry = idx.board.iter().find(|f| f.task.id == "foo").expect("entry");
+        assert_eq!(
+            entry.task.assigned_to.as_deref(),
+            Some("review"),
+            "the single-issue write-through carries the current overlay owner, matching the daemon fold"
         );
     }
 
@@ -9517,6 +9664,131 @@ mod tests {
             1,
             "one aliased request; the index resolved both numbers"
         );
+    }
+
+    /// The negative-cache regression (this task): an id the index can't carry and
+    /// the label search resolves to nothing is searched **once**, not on every
+    /// `resolve_number` pass. This is the per-tick `caller=id-search` burst a
+    /// serving review slot amplified to the 30s board cadence — a periodic
+    /// consumer (the Activity feed, the orchestrator drain) re-resolving a set of
+    /// done/deleted-task ids. With the miss cached, a second resolution issues no
+    /// further search.
+    #[test]
+    fn an_unresolvable_id_is_label_searched_once_then_negative_cached() {
+        let _home = HomeGuard::new("neg-cache");
+        // A published index that carries a different, real issue — so `ghost`
+        // misses the index (not an error) and falls to the search.
+        write_test_index(
+            "test-project",
+            &[("real", 1)],
+            vec![idx_issue("real", "todo", "2026-01-01T00:00:00Z")],
+        );
+        let searches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s = searches.clone();
+        let (store, _calls) = graphql_recorder(move |args| {
+            if args.join(" ").contains("IdSearch") {
+                s.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(gql_search_empty())
+            } else {
+                panic!("no other GraphQL call expected for an unresolvable id: {}", args.join(" "))
+            }
+        });
+
+        // Two passes over the same unresolvable id — exactly what a periodic
+        // consumer does each wake.
+        assert!(store.fetch_many(&["ghost"]).unwrap().is_empty());
+        assert!(store.fetch_many(&["ghost"]).unwrap().is_empty());
+
+        assert_eq!(
+            searches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the empty label search runs once; the second pass is served from the negative cache"
+        );
+    }
+
+    /// The negative cache never masks a genuinely new task: the index check runs
+    /// before the miss cache, so once the daemon publishes the id's number, a
+    /// resolution that earlier missed resolves from the index with no search.
+    #[test]
+    fn a_newly_indexed_id_resolves_despite_an_earlier_miss() {
+        let _home = HomeGuard::new("neg-cache-reindex");
+        write_test_index(
+            "test-project",
+            &[("real", 1)],
+            vec![idx_issue("real", "todo", "2026-01-01T00:00:00Z")],
+        );
+        let searches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s = searches.clone();
+        let node = gql_node(7, "late", "todo", "OPEN", "", "late body", "2026-01-02T00:00:00Z");
+        let (store, _calls) = graphql_recorder(move |args| {
+            let joined = args.join(" ");
+            if joined.contains("IdSearch") {
+                s.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(gql_search_empty())
+            } else {
+                // The by-number batch fetch once the index carries `late`.
+                Ok(gql_aliased(&[(0, &node)]))
+            }
+        });
+
+        // First pass: `late` is unknown, searched, and negative-cached.
+        assert!(store.fetch_many(&["late"]).unwrap().is_empty());
+        assert_eq!(searches.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // The daemon now publishes `late`'s number into the index.
+        write_test_index(
+            "test-project",
+            &[("real", 1), ("late", 7)],
+            vec![
+                idx_issue("real", "todo", "2026-01-01T00:00:00Z"),
+                idx_issue("late", "todo", "2026-01-02T00:00:00Z"),
+            ],
+        );
+
+        // Second pass resolves via the index — no new search, despite the miss.
+        let got = store.fetch_many(&["late"]).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].task.id, "late");
+        assert_eq!(
+            searches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the index check precedes the miss cache, so the re-indexed id never re-searches"
+        );
+    }
+
+    /// The miss expires after [`ID_NUMBER_MISS_TTL_SECS`]: an id still unresolvable
+    /// once the window passes is searched again (a deleted id stays cheap within a
+    /// window; a transient search lag self-heals after one).
+    #[test]
+    fn the_negative_cache_expires_after_its_ttl() {
+        let _home = HomeGuard::new("neg-cache-ttl");
+        write_test_index(
+            "test-project",
+            &[("real", 1)],
+            vec![idx_issue("real", "todo", "2026-01-01T00:00:00Z")],
+        );
+        let searches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s = searches.clone();
+        let (store, _calls) = graphql_recorder(move |args| {
+            if args.join(" ").contains("IdSearch") {
+                s.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(gql_search_empty())
+            } else {
+                panic!("only the search is expected: {}", args.join(" "))
+            }
+        });
+
+        set_test_now(1_000);
+        assert!(store.fetch_many(&["ghost"]).unwrap().is_empty());
+        // Just inside the window: no new search.
+        set_test_now(1_000 + ID_NUMBER_MISS_TTL_SECS - 1);
+        assert!(store.fetch_many(&["ghost"]).unwrap().is_empty());
+        assert_eq!(searches.load(std::sync::atomic::Ordering::SeqCst), 1, "within TTL: cached");
+        // Past the window: the search runs again.
+        set_test_now(1_000 + ID_NUMBER_MISS_TTL_SECS + 1);
+        assert!(store.fetch_many(&["ghost"]).unwrap().is_empty());
+        assert_eq!(searches.load(std::sync::atomic::Ordering::SeqCst), 2, "past TTL: re-searched");
+        set_test_now(0);
     }
 
     #[test]

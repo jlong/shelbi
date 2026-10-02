@@ -111,6 +111,15 @@ fn report_budget(
         .collect();
     let not_modified = mine.iter().copied().filter(|e| e.not_modified).count();
     let count = spent.len();
+    // The budget's spend unit: GraphQL is priced in *points* (a request can cost
+    // several), REST in whole *requests*. The projection and the caller breakdown
+    // are built on this unit so the GraphQL number matches the `remaining` deltas,
+    // never the request count that hid this burn.
+    let unit = match kind {
+        Budget::Graphql => "points",
+        Budget::Rest => "req",
+    };
+    let points = spend_total(&spent);
     let remaining_str = remaining
         .map(|r| format!("{r} remaining"))
         .unwrap_or_else(|| "remaining unknown".to_string());
@@ -129,8 +138,8 @@ fn report_budget(
     let exhaust_secs = seconds_to_exhaustion(rate, remaining_for_projection);
     let exhaust_str = format_duration(exhaust_secs);
     println!(
-        "  {label}: {} req/s (~{per_hour}/hr) · {remaining_str} · exhausts in ~{exhaust_str}",
-        format_rate(rate),
+        "  {label}: ~{per_hour} {unit}/hr ({count} requests, {points} {unit}) · {remaining_str} \
+         · exhausts in ~{exhaust_str}",
     );
 
     if exhaust_secs < EXHAUSTION_WARN.as_secs_f64() {
@@ -143,7 +152,7 @@ fn report_budget(
         if !callers.is_empty() {
             let named = callers
                 .iter()
-                .map(|(name, n)| format!("{name} ({n})"))
+                .map(|(name, n)| format!("{name} ({n} {unit})"))
                 .collect::<Vec<_>>()
                 .join(", ");
             println!("    Top callers: {named}");
@@ -151,6 +160,20 @@ fn report_budget(
     }
     report_failed_attempts(&failed);
     report_not_modified(not_modified);
+}
+
+/// The spend one request charged against its budget: the GraphQL point `cost`
+/// when the response surfaced it, else one (a REST request spends one of its
+/// request-count budget, and a pre-`cost=` GraphQL line charges one point so the
+/// total degrades to a count rather than vanishing).
+fn entry_spend(e: &RequestEntry) -> u64 {
+    e.cost.unwrap_or(1)
+}
+
+/// Total budget units spent across `entries` — GraphQL points (summed `cost`) or
+/// REST requests (one each).
+fn spend_total(entries: &[&RequestEntry]) -> u64 {
+    entries.iter().map(|e| entry_spend(e)).sum()
 }
 
 /// Print a line for REST conditional-`GET` 304s — requests that reached GitHub,
@@ -187,19 +210,25 @@ fn report_failed_attempts(failed: &[&RequestEntry]) {
     );
 }
 
-/// The observed requests-per-second for a budget's entries, measured over the
-/// span the entries actually cover (oldest → now), floored at one second so a
-/// burst clustered in a moment doesn't divide by ~zero. `None` when there are no
+/// The observed **budget units** per second for a budget's entries — GraphQL
+/// points (summed `cost`) or REST requests (one each) — measured over the span
+/// the entries actually cover (oldest → now), floored at one second so a burst
+/// clustered in a moment doesn't divide by ~zero. `None` when there are no
 /// entries. Span-based (rather than dividing by the fixed window) so a short,
 /// intense burst reads as its true instantaneous rate rather than being diluted
 /// across an hour of otherwise-quiet history.
+///
+/// Spending in points (not request count) is what lets the projection catch the
+/// 13-call GraphQL `id-search` burst: ~13 requests looked cheap on a request
+/// rate, but each spends a point, so the points rate projects the real
+/// ~4k-points/hr exhaustion the request count hid.
 fn observed_rate(entries: &[&RequestEntry], now: DateTime<Utc>) -> Option<f64> {
     if entries.is_empty() {
         return None;
     }
     let oldest = entries.iter().map(|e| e.at).min()?;
     let span_secs = (now - oldest).num_seconds().max(1) as f64;
-    Some(entries.len() as f64 / span_secs)
+    Some(spend_total(entries) as f64 / span_secs)
 }
 
 /// Seconds until a budget at `rate` req/s runs out, given `remaining` (falling
@@ -209,16 +238,19 @@ fn seconds_to_exhaustion(rate: f64, remaining: Option<u64>) -> f64 {
     budget_left / rate
 }
 
-/// Callers for a budget's entries, ordered by descending request count (ties
-/// broken by name), capped at the top three so the warning stays legible.
-fn top_callers(entries: &[&RequestEntry]) -> Vec<(String, usize)> {
+/// Callers for a budget's entries, ordered by descending **spend** — GraphQL
+/// points (summed `cost`) or REST requests — ties broken by name, capped at the
+/// top three so the warning stays legible. Ranking by spend (not request count)
+/// names the reader actually draining the budget: a caller making a few costly
+/// GraphQL queries outranks one making many one-point calls.
+fn top_callers(entries: &[&RequestEntry]) -> Vec<(String, u64)> {
     use std::collections::HashMap;
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut spend: HashMap<&str, u64> = HashMap::new();
     for e in entries {
-        *counts.entry(e.caller.as_str()).or_insert(0) += 1;
+        *spend.entry(e.caller.as_str()).or_insert(0) += entry_spend(e);
     }
-    let mut ranked: Vec<(String, usize)> =
-        counts.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    let mut ranked: Vec<(String, u64)> =
+        spend.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     ranked.truncate(3);
     ranked
@@ -230,15 +262,6 @@ fn github_budget_snapshot(project: &str) -> Option<shelbi_state::gh_budget::Rate
     let token = shelbi_state::resolve_github_token_by_name(project).ok()?;
     let key = shelbi_state::gh_budget::token_key(token.expose());
     Some(shelbi_state::gh_budget::read_state(&key))
-}
-
-/// A compact rate: `10` for whole values, `0.5` otherwise.
-fn format_rate(rate: f64) -> String {
-    if (rate.round() - rate).abs() < 1e-9 {
-        format!("{}", rate.round() as i64)
-    } else {
-        format!("{rate:.1}")
-    }
 }
 
 /// A compact human duration for a seconds count: `8m`, `2h`, `45s`.
@@ -267,6 +290,20 @@ mod tests {
             spent: true,
             not_modified: false,
             err_class: None,
+            cost: None,
+        }
+    }
+
+    /// A spent GraphQL entry carrying a point `cost`.
+    fn cost_entry(caller: &str, cost: u64, at: DateTime<Utc>) -> RequestEntry {
+        RequestEntry {
+            at,
+            budget: Budget::Graphql,
+            caller: caller.to_string(),
+            spent: true,
+            not_modified: false,
+            err_class: None,
+            cost: Some(cost),
         }
     }
 
@@ -278,6 +315,7 @@ mod tests {
             spent: false,
             not_modified: false,
             err_class: Some(class.to_string()),
+            cost: None,
         }
     }
 
@@ -311,8 +349,8 @@ mod tests {
         ];
         let refs: Vec<&RequestEntry> = entries.iter().collect();
         let ranked = top_callers(&refs);
-        assert_eq!(ranked[0], ("pollers".to_string(), 2));
-        assert_eq!(ranked[1], ("write".to_string(), 1));
+        assert_eq!(ranked[0], ("pollers".to_string(), 2u64));
+        assert_eq!(ranked[1], ("write".to_string(), 1u64));
     }
 
     /// The acceptance path (plan Phase 3): a simulated ~10-requests-per-second log
@@ -404,7 +442,50 @@ mod tests {
             spent: false,
             not_modified: true,
             err_class: None,
+            cost: None,
         }
+    }
+
+    /// AC3: the GraphQL projection is **points**-based. A burst of id-searches
+    /// that looks cheap on a request rate still spends a point each, so the
+    /// points rate projects the real exhaustion — and matches the `remaining`
+    /// delta the hub observed (~38 points per 30s tick ⇒ ~4,560/hr).
+    #[test]
+    fn graphql_projection_is_points_based_and_matches_the_remaining_delta() {
+        let now = Utc::now();
+        // One tick's worth of the live burst: 13 id-searches (1 pt each) + two
+        // issue-fetch batches costing 10 and 15 points — 38 points over ~8s.
+        let mut entries: Vec<RequestEntry> = (0..13)
+            .map(|i| cost_entry("id-search", 1, now - chrono::Duration::seconds(8 - i / 2)))
+            .collect();
+        entries.push(cost_entry("issue-fetch", 10, now - chrono::Duration::seconds(1)));
+        entries.push(cost_entry("issue-fetch", 15, now));
+
+        let spent: Vec<&RequestEntry> = entries.iter().collect();
+        assert_eq!(spend_total(&spent), 38, "13 + 10 + 15 points spent this tick");
+
+        // The points rate (38 / ~8s ≈ 4.75 pts/s) projects the 5,000-point budget
+        // to exhaust in ~1,050s — well under 30 min — where the 15-request count
+        // over 8s (~1.9/s) would have projected ~44 min and hidden the burn.
+        let rate = observed_rate(&spent, now).expect("a points rate");
+        let exhaust = seconds_to_exhaustion(rate, Some(5_000));
+        assert!(
+            exhaust < EXHAUSTION_WARN.as_secs_f64(),
+            "points projection trips the <30m warning ({exhaust}s)"
+        );
+        // And the costly issue-fetch outranks the many cheap id-searches by spend.
+        let callers = top_callers(&spent);
+        assert_eq!(callers[0], ("issue-fetch".to_string(), 25u64));
+        assert_eq!(callers[1], ("id-search".to_string(), 13u64));
+    }
+
+    /// A pre-`cost=` GraphQL line (an older shelbi) charges one point, so the
+    /// projection degrades to the request count rather than reading as zero spend.
+    #[test]
+    fn a_costless_graphql_line_charges_one_point() {
+        let now = Utc::now();
+        let e = entry("id-search", Budget::Graphql, now);
+        assert_eq!(entry_spend(&e), 1);
     }
 
     /// A 304 is neither spend nor a failed attempt: it stays out of the failed

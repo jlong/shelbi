@@ -281,6 +281,10 @@ fn refresh_with_store(
     };
     let fetched_at_return = fetched_at.clone();
     let remaining_return = read.remaining;
+    // Which budget `remaining_return` belongs to: the GraphQL path reports the
+    // GraphQL points budget, the REST fallback the REST request budget. The event
+    // labels it so a reader never mistakes a REST number for GraphQL headroom.
+    let rest_fallback = read.rest_fallback;
 
     // The reopened issues to announce on this tick: those the read observed open
     // on GitHub while still carrying a terminal `shelbi:status/*` label, minus
@@ -350,7 +354,7 @@ fn refresh_with_store(
     .map_err(|e| anyhow!(e))?;
 
     if changed > 0 {
-        emit_board_refreshed(project, &fetched_at_return, changed, remaining_return);
+        emit_board_refreshed(project, &fetched_at_return, changed, remaining_return, rest_fallback);
     }
     // Announce each newly-observed reopen, independent of `changed`. Best-effort,
     // and no store call — the loop stays read-only against GitHub.
@@ -480,15 +484,26 @@ fn merge_index_numbers(
     numbers.into_iter().collect()
 }
 
-/// Append the `board refreshed=<ts> changed=<n> [remaining=<n>]` line for
-/// `project`. The `remaining` GraphQL points budget is appended when the read
-/// surfaced it (the GraphQL board path), omitted otherwise. Best-effort: a
-/// failed events append is logged, never propagated — the index file is the
-/// durable artifact, the event is the orchestrator's nudge.
-fn emit_board_refreshed(project: &str, fetched_at: &str, changed: usize, remaining: Option<u64>) {
+/// Append the `board refreshed=<ts> changed=<n> [<budget>_remaining=<n>]` line
+/// for `project`. The remaining budget is appended when the read surfaced it,
+/// **labeled by which budget it is**: `graphql_remaining=` for the GraphQL board
+/// path (points), `rest_remaining=` for the REST fallback (requests). Before this
+/// the field was a bare `remaining=`, so a REST-fallback tick's REST number read
+/// as GraphQL headroom to the orchestrator and `doctor`; labeling it keeps the
+/// two budgets distinct. Best-effort: a failed events append is logged, never
+/// propagated — the index file is the durable artifact, the event is the
+/// orchestrator's nudge.
+fn emit_board_refreshed(
+    project: &str,
+    fetched_at: &str,
+    changed: usize,
+    remaining: Option<u64>,
+    rest_fallback: bool,
+) {
     let mut body = format!("project={project} board refreshed={fetched_at} changed={changed}");
     if let Some(remaining) = remaining {
-        body.push_str(&format!(" remaining={remaining}"));
+        let label = if rest_fallback { "rest_remaining" } else { "graphql_remaining" };
+        body.push_str(&format!(" {label}={remaining}"));
     }
     if let Err(e) = shelbi_state::append_external_event(&body) {
         tracing::debug!(project, error = %e, "shelbi daemon: failed to append board-refreshed event");
@@ -1426,13 +1441,19 @@ mod tests {
         assert_eq!(idx.remaining, Some(4989));
         assert_eq!(idx.reset, Some(1_800_000_000));
 
-        // The changed tick's events line carries `remaining=`.
+        // The changed tick's events line carries the GraphQL budget, labeled as
+        // such (the GraphQL board path, not the REST fallback).
         let refreshed: Vec<_> = events_lines()
             .into_iter()
             .filter(|l| l.contains("board refreshed="))
             .collect();
         assert_eq!(refreshed.len(), 1);
-        assert!(refreshed[0].contains("remaining=4989"), "{}", refreshed[0]);
+        assert!(refreshed[0].contains("graphql_remaining=4989"), "{}", refreshed[0]);
+        assert!(
+            !refreshed[0].contains(" remaining=4989"),
+            "the bare unlabeled field is gone: {}",
+            refreshed[0]
+        );
     }
 
     #[test]
