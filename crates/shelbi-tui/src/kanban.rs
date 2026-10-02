@@ -17,7 +17,8 @@
 //! it in a `while true` loop) — so we deliberately don't bind a quit key.
 //! Switching away is the palette's job.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use ratatui::{
@@ -179,6 +180,44 @@ pub struct KanbanApp {
     /// outage (the board read parks every tick) logs a bounded number of error
     /// entries instead of one per tick. See [`crate::error_report`].
     refresh_errors: crate::error_report::TransientErrorLog,
+    /// Optimistic card moves whose filesystem/GitHub/git persistence is still
+    /// running on a background thread, keyed by task id. Each entry carries the
+    /// rollback position, the status id shown on screen, the in-flight write's
+    /// receiver, and any further hops queued behind it. [`refresh`](Self::refresh)
+    /// overlays `shown_status_id` onto the freshly-read board so a lagging poll
+    /// never bounces the card, and [`poll_pending_moves`](Self::poll_pending_moves)
+    /// (driven each event-loop tick) applies the background results — advancing
+    /// to the next queued hop on success, rolling the card back on failure. See
+    /// [`PendingMove`].
+    pub(crate) pending_moves: HashMap<String, PendingMove>,
+}
+
+/// One task's in-flight optimistic move. The card is already shown in
+/// `shown_status_id`'s column; this tracks what still has to land on disk and
+/// where to snap the card back if it doesn't.
+///
+/// Persistence is **serialized per task id**: a single write runs at a time and
+/// further hops wait in `queue`, so rapid repeated moves of the same card
+/// (`L L L`) land in press order and the final persisted status matches the
+/// screen. Different cards keep independent entries and run concurrently.
+pub(crate) struct PendingMove {
+    /// The last position known persisted on disk — the rollback target. Starts
+    /// at the card's real column when the chain began and advances as each hop
+    /// lands, so a mid-chain failure snaps the card back to what actually made
+    /// it to disk, not all the way to the chain's origin.
+    confirmed: Column,
+    /// The status id the card is optimistically shown in right now (the latest
+    /// requested target). Overlaid on refreshed board data until the backing
+    /// write is confirmed.
+    shown_status_id: String,
+    /// The target of the write currently running, paired with its result
+    /// receiver. `None` once every queued hop has landed and the entry is only
+    /// waiting for a refresh to confirm `shown_status_id` on disk.
+    rx: Option<(Column, Receiver<std::result::Result<(), String>>)>,
+    /// Further targets to persist, in press order, once the in-flight write
+    /// finishes. Coalescing happens naturally: the screen already shows the
+    /// latest hop, and each queued write runs in turn.
+    queue: VecDeque<Column>,
 }
 
 /// One rendered column header's screen-space rectangle plus the index
@@ -416,6 +455,7 @@ impl KanbanApp {
             closed_next_cursor: None,
             closed_more: Vec::new(),
             refresh_errors: crate::error_report::TransientErrorLog::new("github"),
+            pending_moves: HashMap::new(),
         }
     }
 
@@ -837,6 +877,11 @@ impl KanbanApp {
                 self.fail_refresh(format!("refresh failed: {e}"));
             }
         }
+        // Re-apply any in-flight optimistic moves onto the just-read board so a
+        // poll that landed before a background write finished never bounces a
+        // card back to its old column (and drop entries the board now agrees
+        // with). Runs last, after `self.tasks` is rebuilt.
+        self.reconcile_pending_moves();
     }
 
     /// Fold a warm/stale board read into `self.tasks`, merging the on-demand
@@ -1519,81 +1564,243 @@ impl KanbanApp {
         Some(eligible[next])
     }
 
+    /// Move card `id` to column `new_col_idx` **optimistically**: the card
+    /// jumps on screen (and the selection follows) this frame, before any
+    /// filesystem / GitHub / git work runs. The daemon check, in-progress
+    /// branch-cut, `move_status` write and `append_task_event` then run on a
+    /// background thread in that order — see [`persist_move_step`] — and their
+    /// outcome is applied by [`poll_pending_moves`](Self::poll_pending_moves):
+    /// a success advances to the next queued hop (or settles the entry), a
+    /// failure snaps the card back and surfaces the error on the status line.
+    ///
+    /// Only the on-screen position is optimistic; a stale daemon or failed
+    /// branch cut still leaves the task file, GitHub and git refs untouched.
+    ///
+    /// Both move entry points funnel here — the board keys
+    /// ([`move_card_left`](Self::move_card_left) /
+    /// [`move_card_right`](Self::move_card_right)) and the popover
+    /// ([`popover_move`](Self::popover_move)).
     fn move_card(&mut self, id: &str, new_col_idx: usize) {
-        // Gate before the in-progress lifecycle can create a git branch. A
-        // stale daemon must leave both the board and repository untouched.
-        if let Err(e) = shelbi_state::ensure_daemon_matches_for_mutation() {
-            self.fail_status(format!("move blocked: {e}"));
-            return;
-        }
         // A task's position IS its status id, so the destination column's
         // status id is the move target verbatim — no lossy category round
         // trip. This is what lets a card land in `canceled` / any custom
         // column, not just one of the five stock buckets.
         let target_col = self.column(new_col_idx).clone();
-        let new_col = Column::from_status_id(&target_col.status_id);
-        // Lifecycle hook: when a move actually transitions a task INTO
-        // `in_progress`, cut its branch on the hub (depends_on aware) and
-        // persist `branch:` first — see `shelbi_orchestrator::lifecycle`.
-        // If the cut fails (e.g. depends_on names a branch that doesn't
-        // exist locally yet) we bail without moving the card so the YAML
-        // and the git refs stay consistent.
-        if new_col == Column::in_progress() {
-            // By-id lookup (not a selected-column scan): the popover's
-            // move path keys off the popover task, which a background
-            // refresh may have drifted away from the board selection.
-            if let Some(tf) = self.tasks.iter().find(|tf| tf.task.id == id) {
-                if tf.task.column != Column::in_progress() {
-                    match shelbi_state::load_project(&self.project_name) {
-                        Ok(project) => {
-                            if let Err(e) =
-                                shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress(
-                                    &project, id,
-                                )
-                            {
-                                self.fail_status(format!("branch cut failed: {e}"));
-                                return;
-                            }
+        let target = Column::from_status_id(&target_col.status_id);
+
+        // By-id lookup (not a selected-column scan): the popover's move path
+        // keys off the popover task, which a background refresh may have
+        // drifted away from the board selection.
+        let Some(idx) = self.tasks.iter().position(|tf| tf.task.id == id) else {
+            return;
+        };
+        // Capture the pre-move column BEFORE the optimistic overwrite — it is the
+        // card's real disk position and so the rollback target for a fresh chain.
+        let pre_move = self.tasks[idx].task.column.clone();
+        if pre_move == target {
+            return; // already here — nothing to move
+        }
+
+        // Optimistic: move the card in memory and follow it now, before any
+        // persistence. `refresh`'s pending overlay keeps it here until the
+        // write lands, so a lagging poll can't snap it back.
+        self.tasks[idx].task.column = target.clone();
+        self.status_line = format!("{id} → {}", target_col.status_name);
+        self.follow_card(id);
+
+        match self.pending_moves.get_mut(id) {
+            Some(pm) => {
+                // This card already has a pending chain: queue this hop so writes
+                // land in press order and the final persisted status matches the
+                // screen (serialize-per-task). The screen already shows this hop;
+                // the background chain catches up. If the chain had gone idle
+                // (its last write landed and it was only awaiting a refresh to
+                // confirm), kick the new hop off right away — `poll_pending_moves`
+                // only advances a chain that has a write in flight.
+                pm.shown_status_id = target.as_str().to_string();
+                pm.queue.push_back(target);
+                self.start_next_hop_if_idle(id);
+            }
+            None => {
+                // First hop of a fresh chain: `pre_move` is the real disk
+                // position, so it is the rollback target. Spawn the write.
+                let rx = spawn_persist_move(&self.project_name, id, target.clone());
+                self.pending_moves.insert(
+                    id.to_string(),
+                    PendingMove {
+                        confirmed: pre_move,
+                        shown_status_id: target.as_str().to_string(),
+                        rx: Some((target, rx)),
+                        queue: VecDeque::new(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Seat the board selection on whichever column the card currently occupies.
+    /// Used after an optimistic move and after a rollback so the cursor tracks
+    /// the card as it jumps. A card filtered out of the current view leaves the
+    /// selection untouched.
+    fn follow_card(&mut self, id: &str) {
+        for col_idx in 0..self.all_columns.len() {
+            if let Some(row) = self
+                .column_tasks(col_idx)
+                .iter()
+                .position(|tf| tf.task.id == id)
+            {
+                self.selected_column = col_idx;
+                self.selected_row = row;
+                return;
+            }
+        }
+    }
+
+    /// If `id`'s chain has no write in flight but has a hop waiting, spawn it.
+    /// The single source of forward progress for a chain: both a fresh enqueue
+    /// onto an idle chain and the completion of one hop funnel through here, so a
+    /// card never has two concurrent writes and a settled-then-moved card can't
+    /// strand its next hop.
+    fn start_next_hop_if_idle(&mut self, id: &str) {
+        let target = {
+            let Some(pm) = self.pending_moves.get_mut(id) else {
+                return;
+            };
+            if pm.rx.is_some() {
+                return; // a write is already running — wait for it
+            }
+            pm.queue.pop_front()
+        };
+        if let Some(target) = target {
+            let rx = spawn_persist_move(&self.project_name, id, target.clone());
+            if let Some(pm) = self.pending_moves.get_mut(id) {
+                pm.rx = Some((target, rx));
+            }
+        }
+    }
+
+    /// Drain background move results, one step per in-flight card. Called every
+    /// event-loop tick (alongside [`maybe_refresh`](Self::maybe_refresh)).
+    ///
+    /// On a hop's success the next queued hop is spawned, or — if the queue is
+    /// empty — the entry is left *settled*, overlaying its target on refreshes
+    /// until a poll's raw board agrees (so a lagging index can't bounce the
+    /// card). On failure the card snaps back to the last position that actually
+    /// reached disk, the queue is dropped, and the error shows on the status
+    /// line. Nothing was persisted for the failed hop, exactly as before.
+    pub fn poll_pending_moves(&mut self) {
+        let ids: Vec<String> = self.pending_moves.keys().cloned().collect();
+        for id in ids {
+            let result = match self.pending_moves.get(&id).and_then(|pm| pm.rx.as_ref()) {
+                Some((_, rx)) => match rx.try_recv() {
+                    Ok(res) => res,
+                    Err(TryRecvError::Empty) => continue,
+                    Err(TryRecvError::Disconnected) => {
+                        // Worker dropped its sender without a result (a panic):
+                        // treat as a failure rather than spinning forever.
+                        Err("move failed: persistence worker exited unexpectedly".to_string())
+                    }
+                },
+                // No in-flight write — a settled entry awaiting refresh
+                // confirmation (resolved in `reconcile_pending_moves`).
+                None => continue,
+            };
+            match result {
+                Ok(()) => {
+                    // The in-flight hop landed. Advance the rollback target to it,
+                    // clear the in-flight slot, then start the next queued hop (or
+                    // leave the entry settled for `reconcile_pending_moves` to
+                    // hold until the raw board catches up).
+                    if let Some(pm) = self.pending_moves.get_mut(&id) {
+                        if let Some((landed, _)) = pm.rx.take() {
+                            pm.confirmed = landed;
                         }
-                        Err(e) => {
-                            self.fail_status(format!("load project failed: {e}"));
-                            return;
+                    }
+                    self.start_next_hop_if_idle(&id);
+                }
+                Err(e) => {
+                    // Roll the card back to the last confirmed on-disk position,
+                    // drop any queued hops, and surface the error.
+                    if let Some(pm) = self.pending_moves.remove(&id) {
+                        if let Some(tf) = self.tasks.iter_mut().find(|tf| tf.task.id == id) {
+                            tf.task.column = pm.confirmed;
                         }
+                        // Route the background persistence failure through the
+                        // shared error helper (tagged `kanban`) so it lands in
+                        // the persistent error log and lights the sidebar's
+                        // unread-errors button, not just the transient status
+                        // line. The message already carries the historical
+                        // `move blocked:` / `branch cut failed:` / `move failed:`
+                        // prefix from `persist_move_step`.
+                        self.fail_status(e);
+                        self.follow_card(&id);
                     }
                 }
             }
         }
-        match shelbi_state::issue_store_for(&self.project_name)
-            .and_then(|s| s.move_status(id, &new_col, "user:tui"))
-        {
-            Ok(Some(mv)) => {
-                if let Err(e) = shelbi_state::append_task_event(
-                    &self.project_name,
-                    id,
-                    &mv.workflow,
-                    mv.from,
-                    mv.to,
-                    "user:tui",
-                ) {
-                    tracing::warn!(task = %id, error = %e, "append_task_event failed");
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                self.fail_status(format!("move failed: {e}"));
-                return;
+    }
+
+    /// Reconcile pending optimistic moves against a freshly-read board (called
+    /// at the tail of [`refresh`](Self::refresh)). A *settled* entry whose target
+    /// the raw board now shows is dropped; every other entry has its
+    /// `shown_status_id` overlaid onto `self.tasks` so a poll that landed before
+    /// the write completed doesn't snap the card back to its old column.
+    fn reconcile_pending_moves(&mut self) {
+        if self.pending_moves.is_empty() {
+            return;
+        }
+        // A settled entry (no in-flight write, nothing queued) resolves once the
+        // raw board agrees with the shown target — or if the card has dropped out
+        // of the current view entirely (filtered / gone), where there is nothing
+        // left to hold.
+        let resolved: Vec<String> = self
+            .pending_moves
+            .iter()
+            .filter(|(_, pm)| pm.rx.is_none() && pm.queue.is_empty())
+            .filter(|(id, pm)| match self.tasks.iter().find(|tf| tf.task.id == **id) {
+                Some(tf) => self.resolved_status_id(&tf.task) == pm.shown_status_id,
+                None => true,
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in resolved {
+            self.pending_moves.remove(&id);
+        }
+        // Overlay the rest: keep each card where the screen already shows it.
+        for (id, pm) in &self.pending_moves {
+            if let Some(tf) = self.tasks.iter_mut().find(|tf| tf.task.id == *id) {
+                tf.task.column = Column::from_status_id(&pm.shown_status_id);
             }
         }
-        self.status_line = format!("{id} → {}", target_col.status_name);
-        self.refresh();
-        // Follow the card.
-        self.selected_column = new_col_idx;
-        if let Some(row) = self
-            .column_tasks(new_col_idx)
-            .iter()
-            .position(|tf| tf.task.id == id)
-        {
-            self.selected_row = row;
+    }
+
+    /// True while any optimistic move is still persisting (a write is in flight
+    /// or a hop is queued behind one). A *settled* entry awaiting refresh
+    /// confirmation does not count. Test seam — the real loop never polls this.
+    #[cfg(test)]
+    pub(crate) fn has_in_flight_moves(&self) -> bool {
+        self.pending_moves
+            .values()
+            .any(|pm| pm.rx.is_some() || !pm.queue.is_empty())
+    }
+
+    /// Block until every pending move's background persistence has finished
+    /// (each entry is either settled or rolled back). Test-only: the live loop
+    /// drives [`poll_pending_moves`](Self::poll_pending_moves) a tick at a time
+    /// instead of blocking. Panics if the writes don't settle within 10s.
+    #[cfg(test)]
+    pub(crate) fn block_on_pending_moves(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            self.poll_pending_moves();
+            if !self.has_in_flight_moves() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pending moves did not settle within 10s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -1617,6 +1824,14 @@ impl KanbanApp {
         let Some(id) = self.selected_task().map(|tf| tf.task.id.clone()) else {
             return;
         };
+        // A card with an in-flight move is mid-persist; a priority write now
+        // would race that chain's `move_status`. Hold the reorder until the move
+        // settles — the lock is per-card, covering every mutation path, not just
+        // a repeat of the same key.
+        if self.pending_moves.contains_key(&id) {
+            self.status_line = format!("{id}: move in progress — reorder held");
+            return;
+        }
         if let Err(e) = shelbi_state::ensure_daemon_matches_for_mutation() {
             self.fail_status(format!("reorder blocked: {e}"));
             return;
@@ -2854,6 +3069,89 @@ fn resolve_task_status(task: &Issue, workflow: &Workflow) -> String {
     stored.to_string()
 }
 
+/// Spawn one card-move persistence step on a background thread and hand back the
+/// receiver its result will arrive on. The UI thread never blocks on the daemon
+/// probe, the branch cut, or the `move_status` write; [`poll_pending_moves`]
+/// drains the receiver each tick.
+///
+/// [`poll_pending_moves`]: KanbanApp::poll_pending_moves
+fn spawn_persist_move(
+    project_name: &str,
+    id: &str,
+    target: Column,
+) -> Receiver<std::result::Result<(), String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let project = project_name.to_string();
+    let id = id.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(persist_move_step(&project, &id, &target));
+    });
+    rx
+}
+
+/// Persist a single card move to `target`, off the UI thread. Runs the same
+/// steps, in the same order, the synchronous `move_card` used to run inline
+/// (daemon check, in-progress branch cut, `move_status`, `append_task_event`),
+/// so a successful move's on-disk state, event line and branch-cut behavior are
+/// identical to before. Any failure returns a ready-to-display message (keeping
+/// the historical `move blocked:` / `branch cut failed:` / `move failed:`
+/// prefixes) and leaves the task file, GitHub and git refs untouched.
+fn persist_move_step(
+    project_name: &str,
+    id: &str,
+    target: &Column,
+) -> std::result::Result<(), String> {
+    // Gate before the in-progress lifecycle can create a git branch. A stale
+    // daemon must leave both disk and the repository untouched.
+    if let Err(e) = shelbi_state::ensure_daemon_matches_for_mutation() {
+        return Err(format!("move blocked: {e}"));
+    }
+    // Lifecycle hook: a move that actually transitions a task INTO
+    // `in_progress` cuts its branch on the hub (depends_on aware) and persists
+    // `branch:` first — see `shelbi_orchestrator::lifecycle`. Read the task's
+    // current (on-disk) column to decide, so a serialized chain only cuts on the
+    // hop that crosses into `in_progress`, exactly as the inline path did.
+    if *target == Column::in_progress() {
+        match shelbi_state::issue_store_for(project_name).and_then(|s| s.get(id)) {
+            Ok(Some(tf)) if tf.task.column != Column::in_progress() => {
+                match shelbi_state::load_project(project_name) {
+                    Ok(project) => {
+                        if let Err(e) =
+                            shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress(
+                                &project, id,
+                            )
+                        {
+                            return Err(format!("branch cut failed: {e}"));
+                        }
+                    }
+                    Err(e) => return Err(format!("load project failed: {e}")),
+                }
+            }
+            Ok(_) => {}
+            Err(e) => return Err(format!("move failed: {e}")),
+        }
+    }
+    match shelbi_state::issue_store_for(project_name)
+        .and_then(|s| s.move_status(id, target, "user:tui"))
+    {
+        Ok(Some(mv)) => {
+            if let Err(e) = shelbi_state::append_task_event(
+                project_name,
+                id,
+                &mv.workflow,
+                mv.from,
+                mv.to,
+                "user:tui",
+            ) {
+                tracing::warn!(task = %id, error = %e, "append_task_event failed");
+            }
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(format!("move failed: {e}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Issue detail popover
 
@@ -3521,8 +3819,23 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
 
         let server = serve_mismatched_daemon_once(&env.socket);
         app.move_card_right();
+        // The move is optimistic: the card jumps on screen immediately, before
+        // the background daemon check runs.
+        assert_eq!(
+            app.tasks.iter().find(|tf| tf.task.id == "fix-login").unwrap().task.column,
+            Column::in_progress(),
+            "card moves on screen before any persistence"
+        );
+        // Drain the background write — the daemon mismatch fails it, which snaps
+        // the card back and surfaces the error.
+        app.block_on_pending_moves();
         server.join().unwrap();
 
+        assert_eq!(
+            app.tasks.iter().find(|tf| tf.task.id == "fix-login").unwrap().task.column,
+            Column::todo(),
+            "a stale daemon rolls the card back to its original column"
+        );
         let persisted = shelbi_state::load_task("demo", "fix-login").unwrap();
         assert_eq!(persisted.task.column, Column::todo());
         assert_eq!(persisted.task.priority, 0);
@@ -3538,6 +3851,19 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             app.status_line
         );
         assert!(!shelbi_state::events_log_path().unwrap().exists());
+        // A background persistence failure is routed through the shared error
+        // helper, so besides the transient status line it lands in the
+        // project's persistent error log tagged `kanban` (and lights the
+        // sidebar's unread-errors button, which reconciles from disk).
+        let errors = shelbi_state::read_errors("demo").unwrap();
+        assert_eq!(errors.len(), 1, "one rollback error is logged; got {errors:?}");
+        assert_eq!(errors[0].source.as_deref(), Some("kanban"));
+        assert!(
+            errors[0].message.starts_with("move blocked:")
+                && errors[0].message.contains("shelbi daemon restart"),
+            "error: {}",
+            errors[0].message
+        );
     }
 
     #[test]
@@ -3626,6 +3952,9 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         app.selected_column = 1;
         app.selected_row = 0;
         app.move_card_right();
+        // Persistence runs on a background thread now; wait for it to land before
+        // asserting on the event log it writes.
+        app.block_on_pending_moves();
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
@@ -3704,6 +4033,8 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         assert!(app.popover_is_open());
 
         app.popover_move_right();
+        // Persistence is backgrounded; drain it before asserting on the event log.
+        app.block_on_pending_moves();
 
         // Same status-move path as the board: event line emitted…
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
@@ -3780,6 +4111,235 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             "status line: {:?}",
             app.status_line
         );
+    }
+
+    /// A board move is optimistic: the card lands in the new column (and the
+    /// selection follows) on the very next frame, while the daemon check /
+    /// `move_status` write / event append run on a background thread. Draining
+    /// the write then leaves the task persisted and the overlay resolved.
+    #[test]
+    fn move_card_is_optimistic_then_persists_in_the_background() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = IsolatedKanbanEnv::new("optimistic-move");
+        crate::test_support::provision_hub_repo_for_project(&env.home, "demo");
+
+        // backlog -> todo so the hop never touches the in-progress branch cut:
+        // this test is about the optimistic/persist/settle mechanics.
+        let task = task_file("fix-login", Column::backlog(), 0, "2026-07-13T12:00:00Z");
+        shelbi_state::save_task("demo", &task.task, &task.body).unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+        app.selected_column = BACKLOG_IDX;
+        app.selected_row = 0;
+
+        app.move_card_right();
+        // Optimistic: the in-memory card and the selection have already moved,
+        // before any persistence has run.
+        assert_eq!(
+            app.tasks.iter().find(|tf| tf.task.id == "fix-login").unwrap().task.column,
+            Column::todo(),
+        );
+        assert_eq!(app.selected_column, 1, "selection follows the card");
+        assert!(app.has_in_flight_moves(), "the write is running off-thread");
+        // Disk has not necessarily caught up yet; drain the background write.
+        app.block_on_pending_moves();
+
+        let persisted = shelbi_state::load_task("demo", "fix-login").unwrap();
+        assert_eq!(persisted.task.column, Column::todo(), "move persisted");
+
+        // A refresh now reads the settled value from disk and drops the overlay.
+        app.refresh();
+        assert!(app.pending_moves.is_empty(), "settled overlay resolved");
+        assert_eq!(
+            app.tasks.iter().find(|tf| tf.task.id == "fix-login").unwrap().task.column,
+            Column::todo(),
+        );
+    }
+
+    /// A refresh that lands while a move's write is still in flight must not
+    /// snap the card back to its old column: the pending overlay holds it in the
+    /// optimistic column until the write is confirmed.
+    #[test]
+    fn refresh_during_in_flight_move_does_not_bounce_the_card() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = IsolatedKanbanEnv::new("refresh-midwrite");
+        crate::test_support::provision_hub_repo_for_project(&env.home, "demo");
+
+        // Disk still says todo — the background write hasn't landed.
+        let task = task_file("fix-login", Column::todo(), 0, "2026-07-13T12:00:00Z");
+        shelbi_state::save_task("demo", &task.task, &task.body).unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+
+        // Model an in-flight move to in-progress. A live (never-fired) channel so
+        // reconcile sees `rx.is_some()` — i.e. not yet settled. `_tx` is held so
+        // the receiver isn't disconnected.
+        let (_tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+        app.pending_moves.insert(
+            "fix-login".to_string(),
+            PendingMove {
+                confirmed: Column::todo(),
+                shown_status_id: "in-progress".to_string(),
+                rx: Some((Column::in_progress(), rx)),
+                queue: VecDeque::new(),
+            },
+        );
+
+        // A poll re-read of the board (still todo on disk) must leave the card
+        // where the screen shows it.
+        app.refresh();
+
+        let in_progress_idx = 2;
+        assert!(
+            app.column_tasks(in_progress_idx)
+                .iter()
+                .any(|tf| tf.task.id == "fix-login"),
+            "overlay keeps the card in its optimistic column across a refresh"
+        );
+        assert!(
+            !app.column_tasks(1).iter().any(|tf| tf.task.id == "fix-login"),
+            "the card must not reappear in its old column"
+        );
+    }
+
+    /// A settled move (write done) keeps overlaying its target while a lagging
+    /// board index still reports the old column, then resolves once the index
+    /// catches up — the no-bounce guarantee against index lag.
+    #[test]
+    fn settled_move_overlays_until_the_board_agrees_then_resolves() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = IsolatedKanbanEnv::new("settled-overlay");
+        crate::test_support::provision_hub_repo_for_project(&env.home, "demo");
+
+        // Lagging board: disk still shows todo even though the move "landed".
+        let task = task_file("fix-login", Column::todo(), 0, "2026-07-13T12:00:00Z");
+        shelbi_state::save_task("demo", &task.task, &task.body).unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+        app.pending_moves.insert(
+            "fix-login".to_string(),
+            PendingMove {
+                confirmed: Column::todo(),
+                shown_status_id: "in-progress".to_string(),
+                rx: None,
+                queue: VecDeque::new(),
+            },
+        );
+
+        app.refresh();
+        assert!(
+            app.pending_moves.contains_key("fix-login"),
+            "a settled entry is held while the board still disagrees"
+        );
+        assert!(
+            app.column_tasks(2).iter().any(|tf| tf.task.id == "fix-login"),
+            "overlay keeps the card in its target column"
+        );
+
+        // The board catches up: disk now agrees with the shown target.
+        let moved = task_file("fix-login", Column::in_progress(), 0, "2026-07-13T12:05:00Z");
+        shelbi_state::save_task("demo", &moved.task, &moved.body).unwrap();
+        app.refresh();
+        assert!(
+            app.pending_moves.is_empty(),
+            "the entry resolves once the board agrees"
+        );
+        assert!(app.column_tasks(2).iter().any(|tf| tf.task.id == "fix-login"));
+    }
+
+    /// Rapid repeated moves of the same card (`L L L` — here three rights) are
+    /// serialized per task id: the card ends in the final column on screen and,
+    /// after the chain drains, on disk too.
+    #[test]
+    fn rapid_repeated_moves_coalesce_to_the_final_column() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = IsolatedKanbanEnv::new("rapid-moves");
+        crate::test_support::provision_hub_repo_for_project(&env.home, "demo");
+
+        let task = task_file("fix-login", Column::backlog(), 0, "2026-07-13T12:00:00Z");
+        shelbi_state::save_task("demo", &task.task, &task.body).unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+        app.selected_column = BACKLOG_IDX;
+        app.selected_row = 0;
+
+        // backlog -> todo -> in-progress -> review, three presses in a row with
+        // no poll in between, so the hops queue behind the first write.
+        app.move_card_right();
+        app.move_card_right();
+        app.move_card_right();
+
+        assert_eq!(
+            app.tasks.iter().find(|tf| tf.task.id == "fix-login").unwrap().task.column,
+            Column::review(),
+            "the screen shows the final column immediately"
+        );
+        assert_eq!(app.selected_column, 3, "selection follows to review");
+
+        app.block_on_pending_moves();
+
+        let persisted = shelbi_state::load_task("demo", "fix-login").unwrap();
+        assert_eq!(
+            persisted.task.column,
+            Column::review(),
+            "the final persisted status matches the screen"
+        );
+        // The in-progress hop cut the task branch on the way through.
+        assert!(
+            persisted.task.branch.is_some(),
+            "crossing in-progress still cut the branch"
+        );
+    }
+
+    /// Moving a card again while its previous move is only *settled* (the write
+    /// landed but a confirming refresh hasn't run) must still persist the new
+    /// hop — a settled chain that is re-enqueued has to be kicked back into
+    /// motion, not stranded.
+    #[test]
+    fn moving_a_settled_card_again_persists_the_new_hop() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = IsolatedKanbanEnv::new("settled-remove");
+        crate::test_support::provision_hub_repo_for_project(&env.home, "demo");
+
+        let task = task_file("fix-login", Column::backlog(), 0, "2026-07-13T12:00:00Z");
+        shelbi_state::save_task("demo", &task.task, &task.body).unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+        app.selected_column = BACKLOG_IDX;
+        app.selected_row = 0;
+
+        // First hop backlog -> todo, drained to a settled state (no refresh yet,
+        // so the entry is still held awaiting board confirmation).
+        app.move_card_right();
+        app.block_on_pending_moves();
+        assert!(
+            app.pending_moves.contains_key("fix-login"),
+            "entry is settled, still awaiting a confirming refresh"
+        );
+
+        // Now move it again todo -> in-progress before any refresh resolves the
+        // settled entry. The new hop must actually persist.
+        app.move_card_right();
+        assert!(app.has_in_flight_moves(), "the re-enqueued hop was kicked off");
+        app.block_on_pending_moves();
+
+        let persisted = shelbi_state::load_task("demo", "fix-login").unwrap();
+        assert_eq!(persisted.task.column, Column::in_progress());
     }
 
     // ---- workspace filter ---------------------------------------------------
