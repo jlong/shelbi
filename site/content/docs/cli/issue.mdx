@@ -23,6 +23,18 @@ Prefer `shelbi issue`.
 
 </Callout>
 
+<Callout type="note" title="Works against either backend">
+
+The file paths above describe the default **file system** backend. When a project
+sets `issue_tracker.backend: github`, each card is a GitHub issue instead and
+these same subcommands drive it (`move` relabels the issue, `comment` posts a
+native issue comment, and so on). See the
+[GitHub Issues backend](/docs/concepts/github-issues), and
+[`shelbi issue-store migrate`](#issue-store-migrate) to move a board between
+backends.
+
+</Callout>
+
 A board mid-flight, with one issue promoted to `TO DO`, one dispatched to a
 workspace, and one already `DONE`:
 
@@ -309,6 +321,39 @@ history, move it back to `backlog` instead.
 
 </Callout>
 
+## comment
+
+```text
+shelbi issue comment <ID> <TEXT>
+```
+
+Post a comment on an issue. It works against whichever backend the project is
+configured for: on the default `file_system` board the comment is a local
+markdown file; on a `github` board it is a native GitHub issue comment. See the
+[GitHub Issues backend](/docs/concepts/github-issues#comments-and-moving-cards-from-either-side).
+
+## issue-store migrate
+
+```text
+shelbi issue-store migrate --to <BACKEND> [--dry-run] [--pace-secs <SECS>]
+```
+
+`issue-store` is a sibling top-level command that operates on the backend itself.
+Its one subcommand, `migrate`, moves the project's issues between the
+`file_system` and `github` backends, matched on the stable Shelbi id so a re-run
+never duplicates an already-migrated card. The source is the *other* live backend:
+`--to github` reads the on-disk board and creates issues; `--to file_system` reads
+GitHub issues and writes markdown files.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--to <BACKEND>` | `github` \| `file_system` | — | Backend to migrate **into** (required). |
+| `--dry-run` | flag | off | Preview the plan without writing anything to the target. |
+| `--pace-secs <SECS>` | float | `7.5` | Seconds between successive creates on a `--to github` run, to stay under GitHub's secondary content-creation limit (80/min, 500/hr). `0` disables pacing. Ignored for `--to file_system`. |
+
+After the migration completes, switch the project's `issue_tracker.backend` to the
+new backend. See [GitHub Issues backend](/docs/concepts/github-issues#migrating-between-backends).
+
 ## Examples
 
 Triage a new request into the backlog with a dependency on existing work:
@@ -354,3 +399,5 @@ shelbi issue resume docs-write-changelog-page
   `start` route into.
 - [Orchestrator](/docs/concepts/orchestrator) — how `--reason` tags get
   parsed by the scheduler.
+- [GitHub Issues backend](/docs/concepts/github-issues): how these subcommands
+  behave when the board is GitHub issues rather than local markdown.

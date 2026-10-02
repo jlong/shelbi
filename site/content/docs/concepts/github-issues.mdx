@@ -1,0 +1,396 @@
+---
+title: GitHub Issues backend
+order: 19
+summary: Keep a project's Kanban board as GitHub issues in one repo, covering the label scheme, the metadata block, assignee-gated Zen, and the daemon's cached, rate-limit-aware reads.
+---
+
+A Shelbi project keeps its board in one of two places. By default the board
+is private markdown on your own machine (the **file system** backend). Set
+`issue_tracker.backend: github` and the board becomes **GitHub issues in a
+single repo** instead: every card is a real issue your team can see, file, and
+comment on from github.com, while Shelbi keeps driving it from the TUI and the
+CLI exactly as before.
+
+This page covers how that mapping works, what Shelbi writes onto GitHub (and
+what it deliberately does not), how assignees gate Zen Mode, and how the daemon
+keeps reads fresh without burning through your API budget.
+
+## Enabling it
+
+The backend is selected by the [`issue_tracker`](/docs/configuration/project#issue_tracker)
+block in the project YAML:
+
+```yaml
+issue_tracker:
+  backend: github
+  github:
+    repo: owner/repo
+```
+
+`github.repo` is the `owner/repo` slug of the repository the issues live in.
+It is required whenever `backend: github`, and it is validated at load time: a
+missing or malformed slug fails the load with an actionable error naming the
+field, so a config that would not resolve is never written.
+
+### Prerequisites
+
+Shelbi talks to GitHub through the [`gh`](https://cli.github.com) CLI, and
+resolves the auth token out of band rather than storing one in any committed
+file. Before enabling the backend:
+
+- **`gh` is installed and authenticated.** The token is resolved from
+  `$GH_TOKEN`, then `$GITHUB_TOKEN`, then `gh auth token` (the `gh` keychain),
+  then an out-of-repo `tokens.yml`. `gh auth login` is the normal path.
+- **The token can read issues and manage labels on the repo.** In practice that
+  means Issues are enabled on the repo and your account has push access, because
+  Shelbi creates its label scheme on first use (see
+  [label auto-creation](#label-auto-creation)). The repo-scoped `repo` token
+  scope covers both.
+
+No secret is ever written into the project YAML or any other file on disk. The
+`github:` block carries only the non-secret repo selector.
+
+<Callout type="note" title="Setup preflights this for you">
+
+When you pick **GitHub Issues** during [first-project setup](/docs/guides/getting-started/first-project#2-choose-where-your-issues-live),
+Shelbi preflights `gh` auth and repo access before writing anything, explains
+the fix if the check fails, and lets you retry or fall back to the file system.
+
+</Callout>
+
+### What the file system backend does instead
+
+Leave `issue_tracker` out entirely (or set `backend: file_system`) and the board
+stays local: each card is a markdown file under
+`~/.shelbi/projects/<name>/tasks/`, with no GitHub involved. This is the default,
+so existing projects keep working untouched. A local read is a directory read and
+is free, so none of the caching or budget machinery on this page applies to it.
+
+### Backends that are declared but not implemented
+
+The `issue_tracker.backend` enum also accepts `jira` and `linear`. These parse
+and validate (a `jira:` or `linear:` block requires its selector), but they have
+no live store yet: selecting one resolves to a typed error, reported exactly as:
+
+```text
+issue_tracker backend `jira` is not yet implemented (only `file_system` is available today)
+```
+
+Only `file_system` and `github` resolve to a working board today. (That error
+string predates the GitHub backend and still names only `file_system`; `github`
+is nonetheless live.)
+
+## How issues map to cards
+
+One Shelbi card is one GitHub issue. The link between them is carried entirely in
+labels and a hidden metadata block, so the issue stays a perfectly normal GitHub
+issue that a human can read and comment on.
+
+### The label scheme
+
+Each tracked issue carries two Shelbi labels:
+
+- **An id anchor:** `shelbi:id/<slug>`, the stable round-trip anchor that maps a
+  GitHub issue back to its Shelbi id. GitHub caps a label at 50 characters, so an
+  id whose label would overflow is anchored under a truncated
+  `shelbi:id/<slug>-<hash8>` label and carries its full id in the
+  [metadata block](#the-metadata-block) instead. Because the label stays a
+  deterministic function of the id, resolving a card by id is a single
+  server-side label query.
+- **A single status label:** `shelbi:status/<status>`, naming the card's current
+  column (for example `shelbi:status/in-progress`). Exactly one status label is
+  present at a time.
+
+Every other label on the issue is Shelbi's to leave alone. A move swaps only the
+single `shelbi:status/*` label and preserves every non-Shelbi label untouched, so
+your own triage, area, or priority labels ride along undisturbed.
+
+### The metadata block
+
+Shelbi's own fields that have no natural GitHub home live in a fenced block at
+the bottom of the issue body, delimited by HTML comments so they render as
+nothing on github.com:
+
+````markdown
+Human prose. Written by whoever filed the issue. Shelbi never touches this.
+
+<!-- shelbi:begin -->
+```yaml
+workflow: app
+branch: jlong/fix-login
+depends_on:
+  - some-dependency
+priority: 0
+```
+<!-- shelbi:end -->
+````
+
+The fields written into the block are:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | The full Shelbi id, present **only** when the `shelbi:id/*` anchor label had to be truncated. A short id round-trips through the label alone and omits this. |
+| `workflow` | The [workflow](/docs/guides/getting-started/workflows) the card runs under. |
+| `branch` | The card's `branch:` override, when set. |
+| `depends_on` | The card's dependency ids. |
+| `prefers_machine` | The machine-affinity routing hint. |
+| `priority` | A plain integer, renumbered across a column client-side exactly like the file system board. |
+| `zen` | The card's per-issue [Zen override](/docs/concepts/zen-mode#per-issue-overrides). |
+| `launch` | The card's launch config. |
+
+Any unknown keys flatten into the card's params, so a newer Shelbi binary's
+fields survive a read by an older one. A block with no set fields is omitted
+entirely rather than written as an empty fence.
+
+**Shelbi never rewrites the human prose around the block.** A field update
+(`set_fields` / `set_priority`) rewrites only the fenced block and preserves the
+prose verbatim. If a human hand-edits the block into something unparseable, the
+write path refuses rather than clobbering the edit with default metadata, and the
+read path renders the card with empty metadata after warning once.
+
+### Terminal statuses close the issue
+
+Moving a card to a terminal status closes the GitHub issue, encoding *which*
+terminal in GitHub's own close reason so the mapping recovers even from GitHub
+state alone:
+
+| Shelbi status | GitHub state |
+| --- | --- |
+| `done` | closed, `state_reason: completed` |
+| `canceled` | closed, `state_reason: not_planned` |
+
+The mapping is enforced in both directions. A **closed** issue always reads as a
+terminal card (`done`, or `canceled` when its reason is `not_planned`), so
+closing an issue on github.com lands it in a terminal column regardless of a
+stale status label. Symmetrically, an **open** issue never reads as terminal: an
+open issue still carrying a stale `shelbi:status/done` or `shelbi:status/canceled`
+label (the shape you get by reopening a done issue to comment) reads as `backlog`
+for re-triage, and the stale label is repaired by the next Shelbi-initiated move.
+
+### Issues opened directly on GitHub
+
+An issue someone files on github.com without Shelbi's labels is still handled:
+
+- **No `shelbi:id/*` label:** the issue number stands in as the card's id, so an
+  un-migrated repo still renders and every write, move, and comment path can act
+  on the issue by its number.
+- **No `shelbi:status/*` label:** the card enters at its workflow's declared
+  **initial** status (`backlog` for the shipped `app` and `default` workflows),
+  never a hardcoded `todo`. Landing an externally-filed issue straight in the
+  ready lane would skip your triage step, so it waits in the entry column
+  instead.
+
+**Pull requests are filtered out everywhere.** GitHub models a PR as a kind of
+issue, but Shelbi never returns one as a card on any read, search, or poll path.
+
+### Label auto-creation
+
+Shelbi creates its labels on first use. Before any write applies a
+`shelbi:id/*` or `shelbi:status/*` label, it ensures the label exists, creating
+any that are missing with the description `Managed by shelbi` (status labels get
+distinct colors; everything else gets GitHub's default grey). Creation is
+idempotent: a label that already exists, or that races into existence, is left
+untouched. There is no separate provisioning step.
+
+## What is not synced to GitHub
+
+**Workspace assignment stays local.** A card's `assigned_to` field (which
+workspace is currently working it) is ephemeral routing state, not board state a
+github.com viewer should see, so it is never written to GitHub. It lives in a
+local **assignment overlay** (marker files under `<project_dir>/assignments/`).
+Every read folds the overlay back onto the reconstructed card, so the active-
+workspace, conflict, and supervision scans still see which workspace owns a card
+even though GitHub stores nothing about it. Because assignment never touches the
+issue, assigning a workspace does not bump the issue's timestamp or `ETag`.
+
+This is distinct from GitHub's own **assignees** (the people assigned to the
+issue), which Shelbi *does* read, as a signal that gates Zen Mode. See the next
+section.
+
+## GitHub assignees and Zen Mode
+
+On the file system backend every card is yours: there is no notion of ownership,
+so nothing is filtered on that axis. On GitHub, where anyone can file an issue in
+your repo, Shelbi uses the issue's **assignees** to decide what
+[Zen Mode](/docs/concepts/zen-mode) may act on autonomously.
+
+- **Issues Shelbi creates are assigned to you.** A card created through Shelbi is
+  assigned to the authenticated `gh` user, so the work Shelbi files stays
+  eligible for auto-promotion. (If that login cannot be resolved, for example an
+  unauthenticated token or an offline machine, the issue is created unassigned
+  with a warning rather than failing the create; it simply will not be
+  Zen-eligible.)
+- **Zen only auto-promotes backlog issues assigned to you.** Under Zen, a backlog
+  issue is mechanically eligible only when its GitHub assignees include the
+  authenticated account's login. Work an outside contributor filed, or that is
+  assigned to someone else, is never auto-promoted. The match is
+  case-insensitive. When the login cannot be resolved the gate **fails closed**:
+  nothing is eligible, rather than risking autonomous action on the whole repo.
+
+The authenticated login comes from the daemon's board index (captured on the same
+GraphQL read that refreshes the board, at no extra API cost), so the gate costs
+nothing per tick.
+
+**To make an outside issue eligible, assign yourself to it on GitHub.** Adding
+your account to the issue's assignees is exactly what lets it pass the ownership
+gate on the next refresh. This gate is only mechanical eligibility; the Zen
+[judgment categories](/docs/concepts/zen-mode#the-judgment-layer) still decide
+whether an eligible issue is actually promoted.
+
+## Freshness and rate limits
+
+A remote board is a paginated API sweep, not a free directory read, so Shelbi
+does not let every view hit GitHub on its own cadence. Instead the **hub daemon
+owns a single board index** and every list consumer (the sidebar, the Issues
+board, the pollers, `shelbi zen scan`, `shelbi issue list`) reads that index
+rather than calling GitHub itself.
+
+### The board index
+
+The daemon runs one refresh loop per open project. It reads the board through the
+store and publishes it to `board-index.json` in the project's state directory
+(`~/.shelbi/projects/<name>/`). The index holds the open board, an id-to-number
+map, and a freshness envelope (when it was fetched, the last-seen rate-limit
+remaining and reset, the active read path, and the authenticated login).
+
+The refresh cadence is the `issue_tracker.refresh_secs` value, defaulting to
+**30s**. Readers treat the index as stale after roughly three refresh intervals
+(with a 90s floor). A full cold read is forced at least every 10 minutes;
+between cold reads the loop fetches only incremental deltas.
+
+### The done-history cache
+
+Closed cards are cached separately, in `done-history.json`: the first page of
+done and canceled issues, newest-closed first, with a **10-minute** TTL. The
+terminal history barely changes, so it is served from disk without a backend
+request until the TTL expires, and a merge or cancel through Shelbi patches the
+page immediately so the move is visible on the next paint.
+
+### GraphQL with a REST fallback
+
+The board refresh uses GraphQL, which bills against a separate 5,000-points-per-
+hour budget. If a GraphQL read fails for any reason that is **not** a rate limit
+(an older GitHub Enterprise host, a token missing a GraphQL scope, a transport
+blip), Shelbi falls back to the REST open-issue list for that refresh and records
+that the index came from the fallback path. A GraphQL *rate limit* is not
+retried against REST, because the two budgets are separate and hammering REST
+would not help. Single-issue fetches use a REST conditional `GET` with
+`If-None-Match`, so an unchanged issue comes back as a `304 Not Modified` that
+costs no quota.
+
+### The budget, and what `shelbi status` shows
+
+`shelbi status --full` prints a `## GitHub` section for a remote project with the
+read path, the index age, and the per-budget remaining, reset, and request count
+over the last hour:
+
+```text
+## GitHub
+
+read path: graphql
+board index: 17s old (warm)
+graphql budget: 4014 remaining, resets 13:22 · 729 requests in the last hour (1 failed)
+rest budget: 4971 remaining, resets 13:36 · 142 requests in the last hour (20 not-modified)
+```
+
+The bare `shelbi status` summary condenses this to one line:
+
+```text
+github: board 17s · graphql 4014 left
+```
+
+Conditional-GET `304` reads show as `(N not-modified)` and failed attempts as
+`(N failed)`, kept separate from spend so neither reads as a consumed request.
+
+A budget governor scales the refresh down as the GraphQL budget tightens: above
+2,000 points it runs at the configured cadence; between 500 and 2,000 it slows to
+a 120s cadence; between 100 and 500 the index refresh pauses until the quota
+resets (while user-initiated single fetches still run); below 100, reads are
+served from cache with a warning. A separate REST reserve (100 requests) refuses
+a mutating call up front rather than failing deep inside a transition:
+
+```text
+shelbi: refusing to write to owner/repo: only 98 GitHub REST requests remain
+(reserve floor 100); the limit resets at 2026-10-02T13:36:00+00:00. Not sending the request.
+```
+
+### When the budget runs out or auth fails
+
+- **Rate limit reached:** board reads park until the quota resets rather than
+  hammering a 403. The status section shows the budget as `· parked`, and a read
+  that must run returns a typed "board reads … are parked until the GitHub API
+  rate limit resets" error.
+- **Network unreachable:** a connection failure parks reads behind an escalating
+  breaker; the status section adds a `network: unreachable (board reads parked)`
+  line.
+- **`gh` auth fails:** the daemon cannot publish an index, so the section reads
+  `board index: never published` with a `last error:` line. The underlying error
+  names every place the token resolver looked and the fix:
+
+  ```text
+  no auth token found for the `github` issue-tracker backend: checked $GH_TOKEN,
+  $GITHUB_TOKEN, `gh auth token`, and <token_file>; run `gh auth login` or set GH_TOKEN
+  ```
+
+Shelbi never renders stale data as if it were live: an unreachable or
+unauthenticated read surfaces a clear error instead.
+
+## Comments, and moving cards from either side
+
+The board is bidirectional. You can drive it from Shelbi or from github.com, and
+the other side catches up on the next refresh.
+
+- **Comments.** [`shelbi issue comment`](/docs/cli/issue) posts a native GitHub
+  issue comment, and reads surface comments back (new comments appear as events
+  the orchestrator can react to). Shelbi appends a hidden idempotency marker to
+  each comment it posts so a retried send never duplicates; the marker is
+  stripped on every read, so it never reaches the UI.
+- **Moving a card in Shelbi relabels the issue.** A move swaps the single
+  `shelbi:status/*` label (keeping every other label) and opens or closes the
+  issue when the target status is terminal, in one verified GitHub update.
+- **Editing on GitHub is picked up on the next refresh.** Change a card's status
+  label, or close an issue, directly on github.com and Shelbi reconciles it on
+  the next read through the state-and-label mapping described
+  [above](#terminal-statuses-close-the-issue).
+- **Merged PRs auto-reconcile.** When a review-stage card's pull request is
+  merged on GitHub out of band (a teammate clicks Merge), the hub poller advances
+  the card straight to `done` with the local merge **skipped** (GitHub has
+  already integrated the branch) and emits a `reason=poller:github-merge-reconcile`
+  transition so the move shows up like any other. This runs on a slow reconcile
+  clock, not the fast workspace tick, controlled by
+  [`github_reconcile_interval_secs`](/docs/configuration/project#top-level-fields)
+  (default `900`; set `0` to disable).
+
+## Migrating between backends
+
+Move an existing board from one backend to the other with
+[`shelbi issue-store migrate`](/docs/cli/issue):
+
+```bash
+# Push a local markdown board up to GitHub issues.
+shelbi issue-store migrate --to github --dry-run   # preview first
+shelbi issue-store migrate --to github
+
+# Or pull GitHub issues down into a local markdown board.
+shelbi issue-store migrate --to file_system
+```
+
+The migration matches on the stable Shelbi id, so a re-run never duplicates an
+already-migrated card. A `--to github` run paces its creates (default 7.5s
+between issues) to stay under GitHub's secondary content-creation limit; switch
+the project's `issue_tracker.backend` once the migration completes.
+
+## See also
+
+- [Project config](/docs/configuration/project#issue_tracker): the
+  `issue_tracker` block's full field reference, including `refresh_secs` and the
+  rate-limit `budget` thresholds.
+- [`shelbi issue`](/docs/cli/issue): the CLI that drives the board, including
+  `comment` and the `issue-store migrate` backend mover.
+- [`shelbi status`](/docs/cli/status): the bootstrap snapshot whose `## GitHub`
+  section reports the read path and budget.
+- [Zen Mode](/docs/concepts/zen-mode): the autonomy the assignee gate protects.
+- [The events log](/docs/concepts/events-log): where the
+  `poller:github-merge-reconcile` and board-refresh lines land.
+- [Set up your first project](/docs/guides/getting-started/first-project#2-choose-where-your-issues-live):
+  choosing GitHub Issues or the file system during onboarding.

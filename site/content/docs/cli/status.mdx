@@ -12,9 +12,11 @@ shelbi status [OPTIONS] [COMMAND]
 Bare `shelbi status` emits a concise, human-readable summary of where the board
 stands right now. Pass `--full` to emit the full sectioned payload the
 [orchestrator](/docs/concepts/orchestrator) consumes on bootstrap: five
-sections — `## Board`, `## Workspaces`, `## Zen`, `## Handoff`, and
-`## Daemon`. Both the plain summary and `--full` are idempotent and safe to
-re-run.
+sections, `## Board`, `## Workspaces`, `## Zen`, `## Handoff`, and
+`## Daemon`, plus a sixth `## GitHub` section when the project's board is on the
+[GitHub backend](/docs/concepts/github-issues#the-budget-and-what-shelbi-status-shows)
+(read path, board-index age, and per-budget rate-limit numbers). Both the plain
+summary and `--full` are idempotent and safe to re-run.
 
 `--handoff` prints the contents of `HANDOFF.md` from the project's local
 `work_dir` and then **deletes the file**. It's a no-op when no `HANDOFF.md` is
@@ -76,3 +78,5 @@ shelbi status list
   payload on bootstrap and how the handoff note keeps sessions continuous.
 - [`shelbi events`](/docs/cli/events) — the transition log the orchestrator
   follows after it has read the bootstrap snapshot.
+- [GitHub Issues backend](/docs/concepts/github-issues#freshness-and-rate-limits):
+  what the `## GitHub` section's read-path and budget numbers mean.
