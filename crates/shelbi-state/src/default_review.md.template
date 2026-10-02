@@ -69,36 +69,43 @@ you silently work around.
 
 Start the recipe's process yourself as a **durable background process**: it
 must keep running after your turn ends so the human can use it. Run the
-recipe's serve/run command exactly as written (its port, if it has one, is
+recipe's serve/run command **exactly as written** (its port, if it has one, is
 already substituted) — do **not** run it as a foreground command that blocks
 you, and do **not** leave it as a job that dies when your shell exits.
 
+On a review slot the recipe's serve line is already wrapped in
+`shelbi __review-serve -- …`. That wrapper launches the server in its **own
+session** and records it so Shelbi reaps the whole process tree — the server
+and every child it forks (`next-server`, `esbuild`, a `concurrently` parent, …)
+— when the review ends. **Keep that prefix exactly**: do not strip it, and do
+**not** add your own `setsid` / `nohup` around it. You only have to background
+it so it outlives your turn.
+
 There is **no `shelbi workspace serve` command** — you launch the process
-directly. Two reliable ways to make it durable:
+directly. Two reliable ways, writing `<SERVE>` for the recipe's serve line
+**verbatim** (keep any `shelbi __review-serve --` prefix intact):
 
 ```sh
-# a) Detached process, output to a log you can tail on failure:
-setsid sh -c 'cd site && npm run dev -- -p 4310' >/tmp/review-serve.log 2>&1 &
-#    (use `nohup … >log 2>&1 &` where setsid is unavailable)
+# a) Background it, output to a log you can tail on failure:
+cd site && <SERVE> >/tmp/review-serve.log 2>&1 &
 
 # b) Or a dedicated, inspectable tmux window in your session:
-tmux new-window -d -n serve 'cd site && npm run dev -- -p 4310'
+tmux new-window -d -n serve 'cd site && <SERVE>'
 ```
 
-- If the recipe names a working directory, prepend the `cd` (as shown). The
+- If the recipe names a working directory, `cd` into it first (as shown). The
   port, if any, is already resolved in the command — do not fill anything in.
-- **To refresh** for a new branch or a follow-up tweak, kill the running
-  process first, then start it again, so you never stack two on one port:
+- **To refresh** for a new branch or a follow-up tweak, stop the running
+  server first, then start it again, so you never stack two on one port:
 
   ```sh
   lsof -ti tcp:<port> | xargs kill 2>/dev/null || true
   ```
 
-You do **not** reap the port when the review ends — the workflow's
-review-exit transition tears the process down by port (the
-`lsof -ti tcp:$SLOT | xargs kill` run block on review→done / review→todo /
-review→canceled). Your job is only to get it up and keep it up while the
-task is in review.
+You do **not** reap the server when the review ends — Shelbi tears down the
+server it tracked (the whole process tree, via the `shelbi __review-serve`
+wrapper above) on every teardown path, so nothing is left holding the port.
+Your job is only to get it up and keep it up while the task is in review.
 
 ### 4. Wait for ready, then summarize
 

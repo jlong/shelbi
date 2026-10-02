@@ -1852,7 +1852,96 @@ fn transport_failure_reason(out: &std::process::Output) -> String {
 /// survives a ready-marker handoff teardown and holds the slot un-dispatchable.
 /// Enumerating window ids and killing each closes the slot whole. See
 /// fix-resume-ready-marker-orphaned-session.
+/// How long [`stop_review_server`] waits after SIGTERM for the review server's
+/// process group to exit on its own before escalating to SIGKILL. A dev server
+/// (next / vite / contentlayer) shuts down well within this; the KILL is the
+/// backstop for one that ignores TERM.
+const REVIEW_SERVER_TERM_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Stop the review dev server tracked for `workspace`, if the
+/// `shelbi __review-serve` wrapper recorded one, and clear the record.
+///
+/// Reads the persisted process-group id (hub-side, so it survives a hub /
+/// daemon restart between launch and teardown — satisfying the restart case),
+/// SIGTERMs the whole group, waits briefly for a graceful exit, then SIGKILLs
+/// any survivor. Because the server was `setsid`'d into its own session, the
+/// one group signal reaps the server AND every grandchild in a single stroke
+/// instead of leaving them orphaned to launchd.
+///
+/// It only ever signals a pgid our own wrapper wrote — never "whatever holds
+/// the port" — so a server the user started by hand is never touched. A
+/// `kill(-pgid, 0)` liveness probe guards against a recycled pid whose group is
+/// already gone, and the `> 1` floor in [`shelbi_state::read_review_serve_pgid`]
+/// makes it impossible to target init / every process. A missing record is a
+/// no-op, which is why this is safe on every `kill_workspace_pane` (dev slots
+/// and remote review slots simply have no record). Best-effort throughout: a
+/// read error degrades to the pre-fix behavior rather than blocking teardown.
+pub(crate) fn stop_review_server(workspace: &str) {
+    let pgid = match shelbi_state::read_review_serve_pgid(workspace) {
+        Ok(Some(p)) => p,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(workspace, error = %e, "reading review-serve pgid record");
+            return;
+        }
+    };
+    if terminate_process_group(pgid) {
+        tracing::info!(workspace, pgid, "reaped review dev server process group");
+    }
+    let _ = shelbi_state::clear_review_serve_pgid(workspace);
+}
+
+/// SIGTERM → brief wait → SIGKILL the process group `pgid`. Returns whether a
+/// live group was found (and thus signaled).
+///
+/// Hard safety bound: a `pgid <= 1` or an already-dead group is a no-op, since
+/// `kill(-pgid, …)` with `0`/`1` would target the caller's own group or init.
+#[cfg(unix)]
+fn terminate_process_group(pgid: i32) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    // Safety: `kill(2)` touches no memory. A negative pid addresses the whole
+    // process group; signal 0 only probes existence/permission.
+    let group_alive = || unsafe { libc::kill(-pgid, 0) == 0 };
+    if !group_alive() {
+        return false;
+    }
+    unsafe {
+        libc::kill(-pgid, libc::SIGTERM);
+    }
+    let deadline = std::time::Instant::now() + REVIEW_SERVER_TERM_GRACE;
+    while std::time::Instant::now() < deadline {
+        if !group_alive() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+    true
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_pgid: i32) -> bool {
+    false
+}
+
 pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -> Result<()> {
+    // Reap the review dev server this slot's `shelbi __review-serve` wrapper
+    // launched, if any, BEFORE taking the pane down. The server was setsid'd
+    // into its own session, so killing the tmux window alone leaves its whole
+    // process tree (next-server / esbuild / contentlayer2 / …) orphaned to
+    // launchd, still holding the review port, to pile up across loads. Every
+    // teardown path funnels through here — the accept/bounce handlers (via
+    // `close_review_window`), the stale-slot reaper and dev-orphan reconcile in
+    // the poller, project quit, and the supervisor-restart pane reset in
+    // `deploy_and_spawn` step 3 — so this one call covers them all. It also
+    // reaps a leftover from a previous load of this slot on the next dispatch's
+    // reset (the port-collision case). A no-op when nothing was tracked: dev
+    // slots and remote review slots never record a pgid.
+    stop_review_server(workspace_name);
     // Local: `kill-window` (the dashboard session must stay alive).
     // Remote: `kill-session -t session` (the session IS the workspace).
     //
@@ -2176,8 +2265,8 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // wiring the long-stubbed `SpawnArgs.port`) and append the workflow's
     // resolved serve recipe to the prompt so the Review agent runs it verbatim
     // instead of auto-detecting a framework/port. A dev dispatch gets neither.
-    let (review_port, review_section) =
-        review_dispatch_extras(spec.project, spec.workspace, spec.task_id);
+    let (review_port, review_section, review_pgid_file) =
+        review_dispatch_extras(spec.project, spec.workspace, spec.task_id, &host);
     if let Some(section) = &review_section {
         prompt.push_str(section);
     }
@@ -2192,6 +2281,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         task_id: spec.task_id,
         agent: spec.agent,
         port: review_port,
+        review_pgid_file: review_pgid_file.as_deref(),
         resume: false,
         prompt: &prompt,
     })?;
@@ -2319,6 +2409,11 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         task_id: spec.task_id,
         agent: spec.agent,
         port: None,
+        // Resume doesn't re-pin the review recipe/port (it replays the resume
+        // prompt, not the dispatch recipe), so there's no wrapped serve line to
+        // track here. The old server is still reaped: step 3's
+        // `kill_workspace_pane` runs `stop_review_server` before relaunch.
+        review_pgid_file: None,
         resume,
         prompt: &prompt,
     })?;
@@ -2349,6 +2444,12 @@ struct SpawnArgs<'a> {
     /// `None` on the dispatch path; retained so the pane-launch plumbing can
     /// export a slot-derived port without a signature change.
     port: Option<u16>,
+    /// Injected as `SHELBI_REVIEW_PGID_FILE` into the pane env when `Some` — the
+    /// hub-side path the `shelbi __review-serve` wrapper records the review
+    /// server's pgid to. `Some` only for a local review slot (the sole case the
+    /// serve line is rendered wrapped). `None` elsewhere, so the local launch
+    /// path simply omits the var.
+    review_pgid_file: Option<&'a str>,
     /// `true` for a `shelbi task resume`: the pane is relaunched WITHOUT
     /// clearing the worktree, and a claude runner reloads its prior
     /// conversation via `--continue`. `false` for a normal (context-clearing)
@@ -2520,6 +2621,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
                 hub_sock: &hub_sock.to_string_lossy(),
                 pane_cmd: &pane_cmd,
                 port: a.port,
+                review_pgid_file: a.review_pgid_file,
             });
             shelbi_ssh::run_capture(a.host, &argv).map_err(|e| {
                 Error::Other(format!(
@@ -4645,6 +4747,10 @@ struct LocalPaneTmuxArgs<'a> {
     /// Deterministic dev-server port for a review workspace, injected as
     /// `PORT` into the pane env. `None` on the dev path (no `PORT`).
     port: Option<u16>,
+    /// Hub-side path the `shelbi __review-serve` wrapper records the review
+    /// server's pgid to, injected as `SHELBI_REVIEW_PGID_FILE`. `Some` only on a
+    /// local review slot; `None` otherwise (the var is then omitted).
+    review_pgid_file: Option<&'a str>,
     pane_cmd: &'a str,
 }
 
@@ -4703,6 +4809,17 @@ fn local_pane_tmux_argv(a: LocalPaneTmuxArgs<'_>) -> Vec<String> {
     if let Some(port) = a.port {
         argv.push("-e".into());
         argv.push(format!("PORT={port}"));
+    }
+    // Review workspaces also pin the pgid file the `shelbi __review-serve`
+    // wrapper records the server's process-group id into, so any teardown path
+    // can reap the whole server tree. `None` on the dev path (and remote
+    // review), which omits the var.
+    if let Some(pgid_file) = a.review_pgid_file {
+        argv.push("-e".into());
+        argv.push(format!(
+            "{}={pgid_file}",
+            shelbi_state::REVIEW_SERVE_PGID_FILE_ENV
+        ));
     }
     // The pane command runs through `sh -c` so tmux picks up the user's
     // PATH from the tmux server's existing env (Homebrew, asdf, etc).
@@ -5264,27 +5381,48 @@ fn compose_gate_prompt(
 ///   [`render_review_recipe_section`]). `None` when the workflow declares no
 ///   `review:` block (a diff-only review).
 ///
-/// Returns `(None, None)` for a non-review dispatch — dev workspaces get no
-/// `PORT` and no recipe. A failure to load the task/workflow degrades to no
-/// recipe rather than blocking the dispatch (the agent then falls back to a
-/// diff-only review per its charter).
+/// Returns `(None, None, None)` for a non-review dispatch — dev workspaces get
+/// no `PORT`, no recipe, and no pgid file. A failure to load the task/workflow
+/// degrades to no recipe rather than blocking the dispatch (the agent then
+/// falls back to a diff-only review per its charter).
+///
+/// The third element is the pgid-file path injected as `SHELBI_REVIEW_PGID_FILE`
+/// into the pane; it is `Some` only for a **local** review slot, which is also
+/// when the serve line is rendered wrapped in `shelbi __review-serve` (see
+/// [`render_review_recipe_section`]). Remote review slots get the historical
+/// unwrapped recipe and no tracking (the workspace host has no shelbi binary),
+/// which is fine — review is hub-local in practice.
 fn review_dispatch_extras(
     project: &Project,
     workspace: &WorkspaceSpec,
     task_id: &str,
-) -> (Option<u16>, Option<String>) {
+    host: &Host,
+) -> (Option<u16>, Option<String>, Option<String>) {
     if !project.effective_tags(workspace).contains("review") {
-        return (None, None);
+        return (None, None, None);
     }
     let port = workspace.slot.and_then(|s| u16::try_from(s).ok());
-    let section = review_recipe_section(project, task_id, port);
-    (port, section)
+    // Track + reap the server only on a local review slot, where both the
+    // wrapper (shelbi on PATH) and the hub-side pgid file resolve on the same
+    // machine the server runs on.
+    let pgid_file = matches!(host, Host::Local)
+        .then(|| shelbi_state::review_serve_pgid_path(&workspace.name).ok())
+        .flatten()
+        .map(|p| p.to_string_lossy().into_owned());
+    let section = review_recipe_section(project, task_id, port, pgid_file.is_some());
+    (port, section, pgid_file)
 }
 
 /// Load the task's workflow, resolve its `review:` recipe against `port`, and
 /// render it as a prompt section — or `None` when there's no recipe (diff-only)
-/// or the task/workflow can't be loaded.
-fn review_recipe_section(project: &Project, task_id: &str, port: Option<u16>) -> Option<String> {
+/// or the task/workflow can't be loaded. `wrap_serve` renders the serve line
+/// through the `shelbi __review-serve` lifecycle wrapper (local slots only).
+fn review_recipe_section(
+    project: &Project,
+    task_id: &str,
+    port: Option<u16>,
+    wrap_serve: bool,
+) -> Option<String> {
     let tf = shelbi_state::issue_store_for_project(project)
         .ok()?
         .get(task_id)
@@ -5292,13 +5430,19 @@ fn review_recipe_section(project: &Project, task_id: &str, port: Option<u16>) ->
         .flatten()?;
     let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task).ok()?;
     let recipe = workflow.resolved_review_recipe(port)?;
-    Some(render_review_recipe_section(&recipe))
+    Some(render_review_recipe_section(&recipe, wrap_serve))
 }
 
 /// Render a resolved review recipe as a prompt section the Review agent runs
 /// verbatim. The `## Review recipe` heading is the anchor the Review charter
 /// keys off to tell "bring this branch up" apart from a no-recipe review.
-fn render_review_recipe_section(r: &shelbi_core::ResolvedReviewRecipe) -> String {
+///
+/// When `wrap_serve` is set the serve line is rendered through the
+/// `shelbi __review-serve` wrapper, which starts the server in its own session
+/// and records its pgid so teardown can reap the whole tree. The project's
+/// `review:` recipe is unchanged on disk — the wrapper is applied only here, at
+/// render time, so the recipe stays project-customizable.
+fn render_review_recipe_section(r: &shelbi_core::ResolvedReviewRecipe, wrap_serve: bool) -> String {
     use std::fmt::Write as _;
     let mut s = String::from(
         "\n\n---\n## Review recipe\n\n\
@@ -5315,7 +5459,21 @@ fn render_review_recipe_section(r: &shelbi_core::ResolvedReviewRecipe) -> String
     if let Some(setup) = &r.setup {
         let _ = writeln!(s, "- Setup (run once, must exit 0 before serving): `{setup}`");
     }
-    let _ = writeln!(s, "- Serve: `{}`", r.serve);
+    if wrap_serve {
+        // The wrapper owns the launch topology (new session + pgid record) so
+        // teardown can clean the server up; the inner command is the recipe's
+        // own serve line, unchanged. Keep it exactly as written.
+        let _ = writeln!(
+            s,
+            "- Serve: `shelbi __review-serve -- {}` \
+             (this runs your serve command through Shelbi's wrapper so the \
+             server is reaped on teardown — run it exactly as written, do not \
+             strip the `shelbi __review-serve --` prefix)",
+            r.serve
+        );
+    } else {
+        let _ = writeln!(s, "- Serve: `{}`", r.serve);
+    }
     if let Some(ready) = &r.ready {
         let _ = writeln!(s, "- Ready probe (poll until it exits 0): `{ready}`");
     }
@@ -6131,7 +6289,7 @@ mod tests {
             url: Some("http://localhost:4310".into()),
             port: Some(4310),
         };
-        let section = render_review_recipe_section(&recipe);
+        let section = render_review_recipe_section(&recipe, false);
         // The charter keys off this exact heading to tell "bring up" from no-recipe.
         assert!(section.contains("## Review recipe"), "{section}");
         assert!(section.contains("`site`"), "{section}");
@@ -6140,6 +6298,42 @@ mod tests {
         assert!(section.contains("http://localhost:4310"), "{section}");
         // Port resolved → no misconfiguration warning.
         assert!(!section.contains("no assigned slot"), "{section}");
+        // Unwrapped (remote / dev) renders the bare serve command.
+        assert!(
+            !section.contains("shelbi __review-serve"),
+            "unwrapped recipe must not carry the wrapper: {section}"
+        );
+    }
+
+    #[test]
+    fn review_recipe_section_wraps_the_serve_line_for_a_local_slot() {
+        // A local review slot renders the serve line through the lifecycle
+        // wrapper so teardown can reap the whole server tree. The wrapped line
+        // carries the recipe's own serve command verbatim as the inner cmd.
+        let recipe = ResolvedReviewRecipe {
+            workdir: Some("site".into()),
+            setup: Some("npm install --no-audit --no-fund".into()),
+            serve: "npm run dev -- -p 4310".into(),
+            ready: Some("curl -sf http://localhost:4310".into()),
+            url: Some("http://localhost:4310".into()),
+            port: Some(4310),
+        };
+        let section = render_review_recipe_section(&recipe, true);
+        assert!(
+            section.contains("shelbi __review-serve -- npm run dev -- -p 4310"),
+            "{section}"
+        );
+        // The inner serve command is preserved unchanged; setup/ready/url are
+        // never wrapped.
+        assert!(section.contains("curl -sf http://localhost:4310"), "{section}");
+        assert!(
+            section.contains("npm install --no-audit --no-fund"),
+            "{section}"
+        );
+        assert!(
+            !section.contains("shelbi __review-serve -- npm install"),
+            "setup must not be wrapped: {section}"
+        );
     }
 
     #[test]
@@ -6154,7 +6348,7 @@ mod tests {
             url: None,
             port: None,
         };
-        let section = render_review_recipe_section(&recipe);
+        let section = render_review_recipe_section(&recipe, false);
         assert!(section.contains("no assigned slot"), "{section}");
         assert!(section.contains("Do NOT guess a port"), "{section}");
     }
@@ -9688,6 +9882,158 @@ mod user_shell_tmux_tests {
         );
     }
 
+    fn review_server_test_tmpdir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    fn pid_alive(pid: i32) -> bool {
+        // Safety: `kill(2)` with signal 0 only probes existence/permission.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    fn pgroup_alive(pgid: i32) -> bool {
+        unsafe { libc::kill(-pgid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        cond()
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_file(path: &std::path::Path) -> i32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if let Ok(p) = s.trim().parse::<i32>() {
+                    return p;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stub grandchild never recorded its pid at {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// The core of the fix: tearing a review slot down reaps the WHOLE process
+    /// tree the server launched — grandchildren included — not just the direct
+    /// child, and it does so from on-disk state alone. The second property is
+    /// the daemon/TUI-restart case: `stop_review_server` reads the pgid off
+    /// disk and holds no in-memory handle, so a hub that restarted between
+    /// launch and teardown still reaps the server.
+    #[cfg(unix)]
+    #[test]
+    fn stop_review_server_reaps_the_whole_group_from_disk_state() {
+        use std::os::unix::process::CommandExt;
+        let _g = crate::test_lock::acquire();
+        let tmp = review_server_test_tmpdir("stop-review-server");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Stand in for the `shelbi __review-serve` launch: a session leader
+        // (new process group, pgid == its pid) whose child shell forks a
+        // long-lived GRANDCHILD. The inner shell writes the grandchild's real
+        // pid (`$!`) to `gc_file`. A non-interactive shell has no job control,
+        // so every `&` keeps the descendant in the leader's process group —
+        // exactly the topology the wrapper's setsid produces, two levels deep.
+        let gc_file = tmp.join("grandchild.pid");
+        let script = format!(
+            "sh -c 'sleep 300 & echo $! > {gc} ; wait' & wait",
+            gc = gc_file.display()
+        );
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(&script);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // Safety: async-signal-safe `setsid` in the forked child before exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn stub server");
+        let pgid = child.id() as i32;
+
+        // Persist the pgid exactly as the wrapper would. The `Child` handle is
+        // kept ONLY so the test can reap the (soon-dead) leader at the end;
+        // `stop_review_server` never sees it — it works purely from this file,
+        // which is what makes the restart case hold.
+        let path = shelbi_state::review_serve_pgid_path("rev").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{pgid}\n")).unwrap();
+
+        let gc_pid = wait_for_pid_file(&gc_file);
+        assert!(pid_alive(gc_pid), "grandchild should be alive before teardown");
+        assert!(pgroup_alive(pgid), "group should be alive before teardown");
+
+        stop_review_server("rev");
+
+        // Reap the (now-killed) leader first: it's the test's own child, so
+        // until we wait() it, it lingers as a zombie and still answers
+        // `kill(pid, 0)`. In production the leader is orphaned to init, which
+        // reaps it — `stop_review_server` neither needs nor holds the handle.
+        let _ = child.wait();
+
+        assert!(
+            wait_until(|| !pgroup_alive(pgid)),
+            "the server's process group must be gone after teardown"
+        );
+        assert!(
+            wait_until(|| !pid_alive(gc_pid)),
+            "the grandchild (pid {gc_pid}) must be gone after teardown"
+        );
+        assert!(
+            shelbi_state::read_review_serve_pgid("rev")
+                .unwrap()
+                .is_none(),
+            "the pgid record must be cleared after teardown"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A missing pgid record (a dev slot, a remote review slot, or a load that
+    /// never served) makes `stop_review_server` a clean no-op — which is why it
+    /// is safe to call on every `kill_workspace_pane`.
+    #[test]
+    fn stop_review_server_is_a_noop_without_a_record() {
+        let _g = crate::test_lock::acquire();
+        let tmp = review_server_test_tmpdir("stop-review-server-noop");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        // No pgid file written → must not panic and must leave no record.
+        stop_review_server("rev");
+        assert!(shelbi_state::read_review_serve_pgid("rev").unwrap().is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
     /// Regression for the resumed-pane orphan: a raced relaunch can leave two
     /// windows sharing the slot's name (a `shelbi task resume` `new-window`
     /// stacking on the crash supervisor's). A ready-marker handoff calls
@@ -10399,6 +10745,7 @@ mod rebase_git_tests {
             project: "demo",
             hub_sock: "/tmp/shelbi-hub.sock",
             port: None,
+            review_pgid_file: None,
             pane_cmd: "shelbi --project demo open alpha --as-pane",
         });
         assert_eq!(argv[0], "tmux");
@@ -10458,6 +10805,7 @@ mod rebase_git_tests {
             project: "demo",
             hub_sock: "/Users/dev/.shelbi/hub.sock",
             port: None,
+            review_pgid_file: None,
             pane_cmd: "shelbi --project demo open bravo --as-pane",
         });
         assert_eq!(argv[0], "tmux");
@@ -10485,6 +10833,7 @@ mod rebase_git_tests {
             project: "demo",
             hub_sock: "/tmp/shelbi-hub.sock",
             port: Some(3010),
+            review_pgid_file: Some("/home/me/.shelbi/workspaces/review-2/review-serve.pgid"),
             pane_cmd: "shelbi --project demo open review-2 --as-pane",
         });
         // `-e PORT=3010` present, and every `-e` still sits directly before a
@@ -10498,10 +10847,28 @@ mod rebase_git_tests {
             "-e",
             "PORT payload not preceded by -e: {argv:?}"
         );
+        // The review pgid-file var rides its own `-e` triplet so the
+        // `shelbi __review-serve` wrapper in the pane can record the server's
+        // pgid for teardown.
+        let pgid_at = argv
+            .iter()
+            .position(|s| {
+                s == "SHELBI_REVIEW_PGID_FILE=/home/me/.shelbi/workspaces/review-2/review-serve.pgid"
+            })
+            .unwrap_or_else(|| panic!("SHELBI_REVIEW_PGID_FILE -e missing: {argv:?}"));
+        assert_eq!(
+            argv[pgid_at - 1],
+            "-e",
+            "pgid-file payload not preceded by -e: {argv:?}"
+        );
         let sh_at = argv.iter().position(|s| s == "sh").unwrap();
         assert!(
             port_at < sh_at,
             "PORT must precede the sh -c positional: {argv:?}"
+        );
+        assert!(
+            pgid_at < sh_at,
+            "pgid-file must precede the sh -c positional: {argv:?}"
         );
     }
 
@@ -10520,6 +10887,7 @@ mod rebase_git_tests {
             project: "demo",
             hub_sock: "/tmp/shelbi-hub.sock",
             port: None,
+            review_pgid_file: None,
             pane_cmd: "shelbi --project demo open alpha --as-pane",
         });
         let at = argv
@@ -10540,6 +10908,7 @@ mod rebase_git_tests {
             project: "demo",
             hub_sock: "/tmp/shelbi-hub.sock",
             port: None,
+            review_pgid_file: None,
             pane_cmd: "shelbi --project demo open alpha --as-pane",
         });
         assert!(

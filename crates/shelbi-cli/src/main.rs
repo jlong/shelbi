@@ -441,6 +441,18 @@ enum Cmd {
         #[arg(long)]
         out: String,
     },
+    /// (internal) Launch wrapper the Review agent runs in place of a workflow
+    /// `review:` serve command. Starts the command in its own session /
+    /// process group and records its pgid to `$SHELBI_REVIEW_PGID_FILE` so any
+    /// teardown path can reap the whole server tree (server + grandchildren)
+    /// instead of orphaning it to launchd. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__review-serve")]
+    ReviewServe {
+        /// The serve command and its args — everything after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
     /// (internal) Render the persistent error-log viewer — meant to be invoked
     /// inside a `tmux display-popup` by the sidebar's unread-errors button (or
     /// inline by the palette's "Open error log" entry). Not for direct use.
@@ -587,6 +599,7 @@ fn main() -> Result<()> {
             let submitted = commands::review_reject::run(out)?;
             std::process::exit(if submitted { 0 } else { 1 });
         }
+        Some(Cmd::ReviewServe { cmd }) => commands::review_serve::run(cmd),
         Some(Cmd::ErrorLog { project }) => commands::error_log::run(project),
         Some(Cmd::ZenOrchStart { project }) => commands::zen_lifecycle::orch_start(&project),
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),

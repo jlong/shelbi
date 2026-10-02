@@ -55,19 +55,27 @@ report the misconfiguration.
 There is **no `shelbi workspace serve` command** — once you've resolved the
 serve command, launch it yourself as a **durable background process** that
 outlives your turn (not a foreground command, and not a job that dies with
-your shell):
+your shell).
+
+On a review slot the recipe's serve line is already wrapped in
+`shelbi __review-serve -- …`. That wrapper runs the server in its **own
+session** and records it so Shelbi reaps the whole process tree on teardown.
+Keep that prefix exactly — do **not** strip it, and do **not** add your own
+`setsid`/`nohup`. You only background it (`<SERVE>` is the recipe's serve line
+verbatim):
 
 ```sh
-setsid sh -c '<resolved serve command>' >/tmp/review-serve.log 2>&1 &
-#   (or a dedicated tmux window: tmux new-window -d -n serve '<serve cmd>')
+<SERVE> >/tmp/review-serve.log 2>&1 &
+#   (or a dedicated tmux window: tmux new-window -d -n serve '<SERVE>')
 ```
 
 The recipe's serve/run command already has its port substituted — there is
-nothing to fill in. To **refresh** for a new branch or a tweak, kill the
-running process first
+nothing to fill in. To **refresh** for a new branch or a tweak, stop the
+running server first
 (`lsof -ti tcp:<port> | xargs kill 2>/dev/null || true`), then start it
-again, so you never stack two on one port. You do not reap the port
-at review end — the workflow's review-exit transition kills it by port.
+again, so you never stack two on one port. You do not reap the server at
+review end — Shelbi tears down the server it tracked (the whole process tree,
+via the `shelbi __review-serve` wrapper) on every teardown path.
 
 ## Readiness
 
