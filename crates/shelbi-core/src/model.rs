@@ -747,9 +747,10 @@ impl std::fmt::Display for MergeStrategy {
 
 /// Which board backend a project's issues live in. The wire form is the
 /// snake-case variant name (`file_system` | `github` | `jira` | `linear`).
-/// The `file_system` backend (`shelbi_state::FileSystemStore`) is the only one
-/// that resolves to a live store today; the remote backends parse and validate
-/// but resolve to a typed "not yet implemented".
+/// `file_system` (`shelbi_state::FileSystemStore`) and `github`
+/// (`shelbi_state::github_store`) both resolve to a live store today; `jira`
+/// and `linear` parse and validate but resolve to a typed "not yet
+/// implemented".
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueTrackerBackend {
@@ -758,7 +759,8 @@ pub enum IssueTrackerBackend {
     /// `issue_tracker` block resolves here, so existing projects keep working.
     #[default]
     FileSystem,
-    /// GitHub issues in a single repo. Selector: [`GithubConnection::repo`].
+    /// GitHub issues in a single repo (`shelbi_state::github_store`). Live
+    /// today. Selector: [`GithubConnection::repo`].
     Github,
     /// Jira issues in a project. Stub: parses and validates, not yet resolvable.
     Jira,

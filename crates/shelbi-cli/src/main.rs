@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod commands;
+mod issue_tracker_setup;
 mod project_root;
 mod wizard;
 
@@ -824,6 +825,10 @@ mod cli_tests {
             "https://github.com/example/demo.git",
             "--orchestrator-runner",
             "claude",
+            "--issue-tracker",
+            "github",
+            "--github-repo",
+            "example/demo",
         ]);
         assert!(cli.yes);
         assert_eq!(cli.root.as_deref(), Some(std::path::Path::new("/tmp/demo")));
@@ -848,6 +853,11 @@ mod cli_tests {
             Some("https://github.com/example/demo.git")
         );
         assert_eq!(args.orchestrator_runner, Some(wizard::Runner::Claude));
+        assert_eq!(
+            args.issue_tracker,
+            Some(commands::init::IssueTrackerArg::Github)
+        );
+        assert_eq!(args.github_repo.as_deref(), Some("example/demo"));
     }
 
     #[test]

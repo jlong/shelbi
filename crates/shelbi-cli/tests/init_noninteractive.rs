@@ -25,6 +25,9 @@ struct FakePath {
     claude: bool,
     codex: bool,
     tmux: bool,
+    /// A fake `gh` that passes the GitHub issue-tracker preflight (installed,
+    /// authenticated, Issues enabled, push access).
+    gh_ok: bool,
 }
 
 impl FakePath {
@@ -34,6 +37,14 @@ impl FakePath {
             claude: true,
             codex: false,
             tmux: true,
+            gh_ok: false,
+        }
+    }
+
+    fn one_runner_with_gh() -> Self {
+        Self {
+            gh_ok: true,
+            ..Self::one_runner()
         }
     }
 }
@@ -66,6 +77,14 @@ fn fake_path(root: &Path, tools: FakePath) -> PathBuf {
     }
     if tools.tmux {
         executable(&bin.join("tmux"), "#!/bin/sh\nprintf 'tmux 3.5a\\n'\n");
+    }
+    if tools.gh_ok {
+        executable(
+            &bin.join("gh"),
+            "#!/bin/sh\ncase \"$1\" in\n  --version) printf 'gh version 2.40.0\\n' ;;\n  \
+             api) printf '{\"has_issues\": true, \"permissions\": {\"push\": true}}\\n' ;;\n  \
+             *) exit 1 ;;\nesac\n",
+        );
     }
     bin
 }
@@ -275,6 +294,70 @@ fn yes_mode_with_one_runner_initializes_git_while_stdin_is_open() {
 }
 
 #[test]
+fn yes_mode_issue_tracker_github_preflights_and_writes_a_loadable_github_board() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("ghproj");
+    let home = temp.path().join("home");
+    git_init(&repo);
+    // Give the repo a GitHub origin so detection is exercised too.
+    let add_remote = Command::new(real_program("git"))
+        .args(["remote", "add", "origin", "git@github.com:acme/ghproj.git"])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(add_remote.success());
+    let bin = fake_path(&temp.path().join("path"), FakePath::one_runner_with_gh());
+
+    let result = run_init(&repo, &home, &bin, &["init", "-y", "--issue-tracker", "github"]);
+    assert!(
+        result.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        result.stdout,
+        result.stderr
+    );
+    // The plan summary names the chosen backend and the detected repo.
+    assert!(result.stdout.contains("issue tracker: GitHub (acme/ghproj)"));
+    // The written project loads from the GitHub backend with the detected repo.
+    let project = load_project(&home, "ghproj");
+    assert_eq!(
+        project.issue_tracker.backend,
+        shelbi_core::IssueTrackerBackend::Github
+    );
+    assert_eq!(
+        project.issue_tracker.github.as_ref().unwrap().repo,
+        "acme/ghproj"
+    );
+    project.issue_tracker.validate().unwrap();
+}
+
+#[test]
+fn yes_mode_issue_tracker_github_fails_clearly_when_gh_is_missing() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("noghproj");
+    let home = temp.path().join("home");
+    git_init(&repo);
+    // one_runner() has no `gh` on PATH, so the preflight must fail before any
+    // project is written.
+    let bin = fake_path(&temp.path().join("path"), FakePath::one_runner());
+
+    let result = run_init(
+        &repo,
+        &home,
+        &bin,
+        &["init", "-y", "--issue-tracker", "github", "--github-repo", "acme/noghproj"],
+    );
+    assert!(!result.status.success(), "stdout:\n{}", result.stdout);
+    assert!(
+        result.stderr.contains("gh") || result.stdout.contains("gh"),
+        "expected a gh-related fix, stderr:\n{}\nstdout:\n{}",
+        result.stderr,
+        result.stdout
+    );
+    // Nothing was written: no project registration.
+    assert!(!home.join("projects/noghproj.yaml").exists());
+}
+
+#[test]
 fn yes_mode_with_one_runner_never_reads_from_a_tty() {
     let temp = TempDir::new().unwrap();
     let repo = temp.path().join("tty-demo");
@@ -341,6 +424,7 @@ fn ambiguous_runners_fail_without_state_until_runner_flag_resolves_them() {
             claude: true,
             codex: true,
             tmux: true,
+            gh_ok: false,
         },
     );
 
@@ -384,6 +468,7 @@ fn missing_prerequisites_do_not_initialize_git_or_scaffold_state() {
             claude: false,
             codex: false,
             tmux: true,
+            gh_ok: false,
         },
     );
     let no_runner = run_init(
@@ -407,6 +492,7 @@ fn missing_prerequisites_do_not_initialize_git_or_scaffold_state() {
             claude: true,
             codex: false,
             tmux: false,
+            gh_ok: false,
         },
     );
     let no_tmux = run_init(&no_tmux_repo, &no_tmux_home, &no_tmux_bin, &["init", "-y"]);
@@ -425,6 +511,7 @@ fn missing_prerequisites_do_not_initialize_git_or_scaffold_state() {
             claude: true,
             codex: false,
             tmux: true,
+            gh_ok: false,
         },
     );
     let no_git = run_init(&no_git_repo, &no_git_home, &no_git_bin, &["init", "-y"]);
@@ -490,6 +577,7 @@ fn all_explicit_plan_flags_override_detected_defaults() {
             claude: true,
             codex: true,
             tmux: true,
+            gh_ok: false,
         },
     );
     let repo_arg = repo.to_str().unwrap();
@@ -559,6 +647,7 @@ fn configured_repository_is_a_write_free_success_even_without_prerequisites() {
             claude: false,
             codex: false,
             tmux: false,
+            gh_ok: false,
         },
     );
     let second = run_init(&repo, &home, &empty_bin, &["init", "-y"]);
@@ -584,6 +673,7 @@ fn yes_mode_rejects_legacy_prompting_flows_while_stdin_is_open() {
             claude: false,
             codex: false,
             tmux: false,
+            gh_ok: false,
         },
     );
 

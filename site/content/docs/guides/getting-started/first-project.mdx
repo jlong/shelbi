@@ -44,12 +44,35 @@ you prefer. It asks exactly one runner question before the plan card:
   codex (<detected version>)
 ```
 
-Choose one and setup continues. This is the only extra question on an otherwise
-detected Git repository.
+Choose one and setup continues.
 
 </Callout>
 
-## 2. Confirm the setup card
+## 2. Choose where your issues live
+
+Next, Shelbi asks where this project's board should live:
+
+```text
+? Issue tracker:
+> GitHub Issues   cards are GitHub issues your team can see and file
+  File system     private markdown files on this machine
+```
+
+- **GitHub Issues** stores each card as a GitHub issue. It is pre-selected, with
+  the `owner/repo` pre-filled, when your origin remote is a GitHub repo. Shelbi
+  preflights first: `gh` must be installed and authenticated, and your account
+  must be able to read issues and create labels on the repo (Issues enabled plus
+  push access). If the preflight fails, Shelbi explains the fix and lets you
+  retry or fall back to File system, so a GitHub config that would not load is
+  never written. On success it creates `shelbi:id/*` and `shelbi:status/*` labels
+  on first use and stores a small metadata block in each issue's body.
+- **File system** keeps the board as private markdown under
+  `~/.shelbi/projects/<name>/tasks/`. No GitHub needed, and it is the default.
+
+You can move a board between backends later with
+[`shelbi issue-store migrate`](/docs/cli/issue).
+
+## 3. Confirm the setup card
 
 After preflight, Shelbi summarizes everything it will create:
 
@@ -59,6 +82,7 @@ After preflight, Shelbi summarizes everything it will create:
   │  repo        ~/code/myapp (main)                         │
   │  github      github.com:you/myapp.git                    │
   │  agent       codex                                       │
+  │  issues      GitHub · you/myapp                          │
   │  workspaces  created on first boot                       │
   │  workflows   task (branch → PR → review) · subtask       │
   │  agents      orchestrator · developer · review           │
@@ -96,6 +120,7 @@ Customize setup. Press Enter to keep each detected value.
 ? GitHub repo URL (optional):
 ? Agent runner (used by every workspace):
 ? Orchestrator runner:
+? Issue tracker:
 ```
 
 This is where you can choose a different project name or root, change the
@@ -103,7 +128,7 @@ branch or remote, or use a different runner for the orchestrator. Workspaces
 themselves are sized and named later, in the orchestrator's first-boot
 interview.
 
-## 3. Land on the dashboard
+## 4. Land on the dashboard
 
 After Enter, Shelbi prints `✓ Project <name> created.` and launches the TUI.
 The new board contains one Backlog card named **Welcome to Shelbi** and the

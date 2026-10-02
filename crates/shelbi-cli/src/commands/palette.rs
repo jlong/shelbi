@@ -1930,6 +1930,12 @@ fn create_and_open_project(form: super::add_project::AddProjectForm) -> Result<(
         default_branch: None,
         github_url: None,
         orchestrator_runner: None,
+        // The palette "Add project" dialog runs inside the TUI alt-screen, so it
+        // must not reach an inquire prompt. Pin the board to file_system
+        // non-interactively; the user can switch it later via `shelbi init` or
+        // `shelbi issue-store migrate`.
+        issue_tracker: Some(super::init::IssueTrackerArg::FileSystem),
+        github_repo: None,
         pick_up: false,
     };
     let resolved = super::init::scaffold_with_prompt(args)?;

@@ -18,9 +18,14 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use inquire::{Confirm, Select, Text};
 use shelbi_core::{
-    AgentRunnerSpec, Machine, MachineKind, OrchestratorSpec, Project,
+    AgentRunnerSpec, IssueTrackerBackend, IssueTrackerConfig, Machine, MachineKind,
+    OrchestratorSpec, Project,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::issue_tracker_setup::{
+    self, GithubSuggestion, RealGhProbe,
+};
 
 pub const BANNER: &str = concat!(
     "   ▄▀▀▀▀▀▄   ▀▀    ▀▀  ▀▀▀▀▀▀▀   ▀▀   ▀▀▀▀▀▀▀▀▀▀▄   ▀▀▀▀▀\n",
@@ -99,6 +104,12 @@ pub(crate) struct DetectedSetupPlan {
     pub(crate) detected_runners: Vec<DetectedRunner>,
     pub(crate) tmux_version: String,
     pub(crate) cpu_count: usize,
+    /// Which board backend the project's issues live in. Defaults to
+    /// `file_system`; the interactive issue-tracker step (or the
+    /// `--issue-tracker` scripted override) can switch it to GitHub with a
+    /// validated `owner/repo`. Written verbatim into the project registration
+    /// by [`DetectedSetupPlan::to_project`].
+    pub(crate) issue_tracker: IssueTrackerConfig,
     /// Repository path approved for deferred `git init`. `None` means the
     /// detected root was already a repository. Keeping the path (rather than
     /// only a bool) lets Customize safely distinguish a newly chosen path.
@@ -115,6 +126,9 @@ pub(crate) struct SetupPlanOverrides {
     pub(crate) default_branch: Option<String>,
     pub(crate) remote_url: Option<String>,
     pub(crate) orchestrator_runner: Option<Runner>,
+    /// Scripted issue-tracker choice (from `--issue-tracker` / `--github-repo`).
+    /// Already validated by the caller; applied verbatim.
+    pub(crate) issue_tracker: Option<IssueTrackerConfig>,
 }
 
 impl DetectedSetupPlan {
@@ -156,6 +170,9 @@ impl DetectedSetupPlan {
                 );
             }
             self.orchestrator_runner = orchestrator_runner;
+        }
+        if let Some(issue_tracker) = overrides.issue_tracker {
+            self.issue_tracker = issue_tracker;
         }
 
         // Keep schema validation ahead of every write. The shared commit
@@ -231,9 +248,10 @@ impl DetectedSetupPlan {
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
             review: shelbi_core::ReviewConfig::default(),
-            // New projects default to the file_system board; a user opts into a
-            // remote tracker by adding an `issue_tracker:` block to project.yaml.
-            issue_tracker: Default::default(),
+            // The board backend chosen during onboarding (file_system by
+            // default; github when the user picks GitHub Issues). An all-default
+            // file_system block is elided from the written YAML.
+            issue_tracker: self.issue_tracker.clone(),
             runners: Default::default(),
             agents: Default::default(),
             detected_shapes: Vec::new(),
@@ -333,7 +351,15 @@ where
         [only] => only.runner,
         many => ui.select_runner(many)?,
     };
-    let plan = assemble_plan(snapshot, selected_runner, initialize_git);
+    let mut plan = assemble_plan(snapshot, selected_runner, initialize_git);
+
+    let suggestion = GithubSuggestion {
+        repo: issue_tracker_setup::detect_github_repo(plan.remote_url.as_deref()),
+    };
+    plan.issue_tracker = ui.choose_issue_tracker(&suggestion)?;
+    // Never silently switch a project that already has a local board onto a
+    // remote backend; point the user at `issue-store migrate` instead.
+    issue_tracker_setup::ensure_board_not_stranded(&plan.project_name, &plan.issue_tracker)?;
 
     match ui.plan_action(&plan)? {
         PlanAction::Launch => create_project_from_plan(plan, probe, ui),
@@ -982,6 +1008,10 @@ fn assemble_plan(
         detected_runners: snapshot.runners,
         tmux_version: snapshot.tmux_version,
         cpu_count: snapshot.cpu_count,
+        // Detection is write-free and never shells out to `gh`; the board
+        // defaults to file_system and the interactive step (or a scripted
+        // override) opts into GitHub.
+        issue_tracker: issue_tracker_setup::file_system_config(),
         git_init_root,
     }
 }
@@ -1089,6 +1119,11 @@ impl PreflightSink for SilentPreflight {
 trait SetupUi: PreflightSink {
     fn confirm_git_init(&mut self, root: &Path) -> Result<bool>;
     fn select_runner(&mut self, runners: &[DetectedRunner]) -> Result<Runner>;
+    /// Ask where the project's issues should live (GitHub Issues or File
+    /// system), running the GitHub preflight before returning so a GitHub
+    /// choice is always one that loads. Returns the chosen, validated config.
+    fn choose_issue_tracker(&mut self, suggestion: &GithubSuggestion)
+        -> Result<IssueTrackerConfig>;
     fn plan_action(&mut self, plan: &DetectedSetupPlan) -> Result<PlanAction>;
     fn customize(&mut self, plan: &DetectedSetupPlan) -> Result<DetectedSetupPlan>;
     fn message(&mut self, message: &str) -> Result<()>;
@@ -1123,6 +1158,13 @@ impl SetupUi for NonInteractiveSetupUi {
 
     fn select_runner(&mut self, _runners: &[DetectedRunner]) -> Result<Runner> {
         bail!("non-interactive setup reached an unexpected runner prompt")
+    }
+
+    fn choose_issue_tracker(
+        &mut self,
+        _suggestion: &GithubSuggestion,
+    ) -> Result<IssueTrackerConfig> {
+        bail!("non-interactive setup reached an unexpected issue-tracker prompt")
     }
 
     fn plan_action(&mut self, _plan: &DetectedSetupPlan) -> Result<PlanAction> {
@@ -1175,6 +1217,13 @@ impl SetupUi for RealSetupUi {
             .prompt()
             .map(|choice| choice.0.runner)
             .context("agent runner selection")
+    }
+
+    fn choose_issue_tracker(
+        &mut self,
+        suggestion: &GithubSuggestion,
+    ) -> Result<IssueTrackerConfig> {
+        issue_tracker_setup::choose_issue_tracker_interactive(suggestion, &mut RealGhProbe)
     }
 
     fn plan_action(&mut self, plan: &DetectedSetupPlan) -> Result<PlanAction> {
@@ -1295,6 +1344,12 @@ fn customize_from(plan: &DetectedSetupPlan) -> Result<DetectedSetupPlan> {
         plan.orchestrator_runner,
     )?;
 
+    let suggestion = GithubSuggestion {
+        repo: issue_tracker_setup::detect_github_repo(remote_url.as_deref()),
+    };
+    let issue_tracker =
+        issue_tracker_setup::choose_issue_tracker_interactive(&suggestion, &mut RealGhProbe)?;
+
     Ok(DetectedSetupPlan {
         project_name,
         display_name,
@@ -1306,6 +1361,7 @@ fn customize_from(plan: &DetectedSetupPlan) -> Result<DetectedSetupPlan> {
         detected_runners: plan.detected_runners.clone(),
         tmux_version: plan.tmux_version.clone(),
         cpu_count: plan.cpu_count,
+        issue_tracker,
         git_init_root: plan.git_init_root.clone(),
     })
 }
@@ -1485,6 +1541,7 @@ fn render_plan_card(writer: &mut impl Write, plan: &DetectedSetupPlan) -> Result
             .unwrap_or_else(|| "not configured".to_string()),
     ));
     lines.extend(card_rows("agent", plan.selected_runner.id()));
+    lines.extend(card_rows("issues", &issue_tracker_summary(&plan.issue_tracker)));
     lines.extend(card_rows(
         "workspaces",
         "created at first boot (orchestrator interview)",
@@ -1521,6 +1578,18 @@ fn render_plan_card(writer: &mut impl Write, plan: &DetectedSetupPlan) -> Result
     writeln!(writer, "  └{}┘", "─".repeat(card_width))?;
     writer.flush()?;
     Ok(())
+}
+
+/// One-line summary of the chosen issue-tracker backend for the plan card.
+fn issue_tracker_summary(tracker: &IssueTrackerConfig) -> String {
+    match tracker.backend {
+        IssueTrackerBackend::Github => match tracker.github.as_ref() {
+            Some(github) if !github.repo.is_empty() => format!("GitHub · {}", github.repo),
+            _ => "GitHub".to_string(),
+        },
+        IssueTrackerBackend::FileSystem => "file system (local markdown)".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn card_rows(label: &str, value: &str) -> Vec<String> {
@@ -1727,6 +1796,7 @@ mod tests {
             detected_runners: vec![fixture_runner(runner)],
             tmux_version: "3.5a".to_string(),
             cpu_count: 10,
+            issue_tracker: issue_tracker_setup::file_system_config(),
             git_init_root: None,
         }
     }
@@ -1793,12 +1863,15 @@ mod tests {
     struct MockUi {
         confirm_git: bool,
         selected_runner: Runner,
+        issue_tracker: IssueTrackerConfig,
         action: PlanAction,
         customized: Option<DetectedSetupPlan>,
         preflight: Vec<PreflightItem>,
         messages: Vec<String>,
         confirm_calls: usize,
         select_calls: usize,
+        issue_tracker_calls: usize,
+        issue_tracker_suggestion: Option<GithubSuggestion>,
         action_calls: usize,
         action_input: Option<DetectedSetupPlan>,
         customize_input: Option<DetectedSetupPlan>,
@@ -1809,12 +1882,15 @@ mod tests {
             Self {
                 confirm_git: true,
                 selected_runner: Runner::Claude,
+                issue_tracker: issue_tracker_setup::file_system_config(),
                 action,
                 customized: None,
                 preflight: Vec::new(),
                 messages: Vec::new(),
                 confirm_calls: 0,
                 select_calls: 0,
+                issue_tracker_calls: 0,
+                issue_tracker_suggestion: None,
                 action_calls: 0,
                 action_input: None,
                 customize_input: None,
@@ -1838,6 +1914,15 @@ mod tests {
         fn select_runner(&mut self, _runners: &[DetectedRunner]) -> Result<Runner> {
             self.select_calls += 1;
             Ok(self.selected_runner)
+        }
+
+        fn choose_issue_tracker(
+            &mut self,
+            suggestion: &GithubSuggestion,
+        ) -> Result<IssueTrackerConfig> {
+            self.issue_tracker_calls += 1;
+            self.issue_tracker_suggestion = Some(suggestion.clone());
+            Ok(self.issue_tracker.clone())
         }
 
         fn plan_action(&mut self, plan: &DetectedSetupPlan) -> Result<PlanAction> {
@@ -1941,6 +2026,9 @@ mod tests {
                 "https://user:secret@github.com/example/demo.git?token=hidden".to_string(),
             ),
             orchestrator_runner: Some(Runner::Claude),
+            issue_tracker: Some(
+                crate::issue_tracker_setup::github_config("example/demo").unwrap(),
+            ),
         })
         .unwrap();
 
@@ -1952,9 +2040,14 @@ mod tests {
         );
         assert_eq!(plan.selected_runner, Runner::Codex);
         assert_eq!(plan.orchestrator_runner, Runner::Claude);
+        assert_eq!(plan.issue_tracker.backend, IssueTrackerBackend::Github);
 
         let project = plan.to_project().unwrap();
         assert_eq!(project.orchestrator.runner, "claude");
+        assert_eq!(
+            project.issue_tracker.github.as_ref().unwrap().repo,
+            "example/demo"
+        );
         // Workspace provisioning is deferred to the orchestrator's first-boot
         // interview, so a scripted init produces an empty pool.
         assert!(project.workspaces.is_empty());
@@ -2878,6 +2971,58 @@ mod tests {
         assert!(runners.contains("Claude Code"));
         assert!(runners.contains("@openai/codex"));
         assert!(!runners.contains("+    "));
+    }
+
+    #[test]
+    fn issue_tracker_summary_reads_backend_and_repo() {
+        assert_eq!(
+            issue_tracker_summary(&issue_tracker_setup::file_system_config()),
+            "file system (local markdown)"
+        );
+        assert_eq!(
+            issue_tracker_summary(&issue_tracker_setup::github_config("jlong/shelbi").unwrap()),
+            "GitHub · jlong/shelbi"
+        );
+    }
+
+    #[test]
+    fn github_choice_flows_from_select_to_card_and_persisted_project() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("shaft");
+        std::fs::create_dir_all(&root).unwrap();
+        let home = temp.path().join("home");
+        let env = EnvGuard::new(&["SHELBI_HOME"]);
+        env.set("SHELBI_HOME", &home);
+
+        let mut probe = FakeProbe::ready(&root, vec![fixture_runner(Runner::Claude)]);
+        let mut ui = MockUi::new(PlanAction::Launch);
+        // The user picks GitHub Issues in the issue-tracker step.
+        ui.issue_tracker = issue_tracker_setup::github_config("jlong/shaft").unwrap();
+
+        assert_eq!(
+            setup_one_project_with(&root, &mut probe, &mut ui).unwrap(),
+            SetupOutcome::Created("shaft".to_string())
+        );
+        // The step ran exactly once and was handed the repo detected from the
+        // origin remote as its suggestion.
+        assert_eq!(ui.issue_tracker_calls, 1);
+        assert_eq!(
+            ui.issue_tracker_suggestion
+                .as_ref()
+                .and_then(|s| s.repo.as_deref()),
+            Some("jlong/shaft")
+        );
+        // The plan card the user confirmed showed the GitHub repo.
+        let card_plan = ui.action_input.as_ref().unwrap();
+        let mut writer = RecordingWriter::default();
+        render_plan_card(&mut writer, card_plan).unwrap();
+        assert!(writer.text().contains("GitHub · jlong/shaft"));
+
+        // And the persisted project loads from the GitHub backend.
+        let saved = shelbi_state::load_project("shaft").unwrap();
+        assert_eq!(saved.issue_tracker.backend, IssueTrackerBackend::Github);
+        assert_eq!(saved.issue_tracker.github.unwrap().repo, "jlong/shaft");
     }
 
     #[test]
