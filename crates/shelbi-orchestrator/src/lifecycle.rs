@@ -418,6 +418,7 @@ mod tests {
         IssueFile {
             task,
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 

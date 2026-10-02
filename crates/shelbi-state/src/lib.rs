@@ -68,7 +68,8 @@ pub use issue_migrate::{
 pub use board_index::{
     board_index_path, board_refresh_error_path, clear_board_refresh_error, expected_board_repo,
     fold_assignment_overlay, github_board_repo, mark_board_index_stale, patch_board_index_issue,
-    read_board, read_board_index, read_board_refresh_error, read_board_report, read_board_report_with_cfg,
+    read_board, read_board_index, read_board_index_viewer_login, read_board_refresh_error,
+    read_board_report, read_board_report_with_cfg,
     read_board_with_cfg, read_valid_board_index, record_board_index_number,
     record_board_refresh_error, remove_board_index_issue, update_board_index, write_board_index,
     BoardFreshness, BoardIndex, BoardRefreshError, BoardReport, BoardSource, ReadPath,
@@ -2527,6 +2528,23 @@ pub fn task_path(project: &str, id: &str) -> Result<PathBuf> {
 pub struct IssueFile {
     pub task: Issue,
     pub body: String,
+    /// Logins of the accounts the issue is assigned to **on the external
+    /// tracker** (GitHub's native `assignees`), populated from the tracker on
+    /// read. This is deliberately distinct from [`Issue::assigned_to`], which is
+    /// Shelbi's local workspace-routing overlay and is never sent to or read from
+    /// the tracker. `tracker_assignees` is read-only board data: it is the
+    /// ownership signal Zen auto-promotion gates on (an external-tracker backlog
+    /// issue is mechanically eligible only when assigned to the authenticated
+    /// user), so it lives on the read wrapper rather than the authored [`Issue`]
+    /// and is never written into a task's YAML frontmatter or the GitHub body
+    /// metadata block — the tracker's native assignees are the source of truth.
+    /// Empty on the filesystem backend (which has no tracker-side ownership) and
+    /// on any issue the tracker reports with no assignees. Carried through
+    /// `board-index.json` and the done-history cache (both serialize `IssueFile`);
+    /// a stale cache written before this field existed reads back empty, which the
+    /// board-index schema-version bump forces cold so it is refetched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tracker_assignees: Vec<String>,
 }
 
 /// Path of the per-project task lock: `<project_dir>/tasks.lock`, a
@@ -2637,6 +2655,9 @@ pub fn parse_task_file(text: &str) -> Result<IssueFile> {
     Ok(IssueFile {
         task,
         body: body.to_string(),
+        // Filesystem issues have no external-tracker assignees; this field is
+        // populated only by the remote-tracker read path.
+        tracker_assignees: Vec::new(),
     })
 }
 
@@ -3058,7 +3079,7 @@ pub fn move_task(
     // task lock: two concurrent moves into one column would otherwise
     // both read the same `len()` and land on duplicate priorities.
     let _lock = lock_tasks(project)?;
-    let IssueFile { mut task, body } = load_task(project, id)?;
+    let IssueFile { mut task, body, tracker_assignees: _ } = load_task(project, id)?;
     if task.column == new_column {
         return Ok(None);
     }
@@ -3101,7 +3122,7 @@ pub fn move_task_and_unassign(
 ) -> Result<Option<(Column, Column, String)>> {
     hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
-    let IssueFile { mut task, body } = load_task(project, id)?;
+    let IssueFile { mut task, body, tracker_assignees: _ } = load_task(project, id)?;
     let old_column = task.column.clone();
     let workflow = resolved_task_workflow_name_for_project(project, &task)?;
     let already_there = old_column == new_column;
@@ -3142,7 +3163,7 @@ pub fn move_task_and_unassign(
 pub fn release_task_to_todo(project: &str, id: &str) -> Result<Option<(Column, Column, String)>> {
     hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
-    let IssueFile { mut task, body } = load_task(project, id)?;
+    let IssueFile { mut task, body, tracker_assignees: _ } = load_task(project, id)?;
     let old_column = task.column.clone();
     let workflow = resolved_task_workflow_name_for_project(project, &task)?;
     let already_todo = old_column == Column::todo();
@@ -3258,7 +3279,7 @@ pub fn parked_review_tasks(project: &str) -> Result<BTreeSet<String>> {
 pub fn park_review_task(project: &str, id: &str) -> Result<Option<String>> {
     hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
-    let IssueFile { mut task, body } = load_task(project, id)?;
+    let IssueFile { mut task, body, tracker_assignees: _ } = load_task(project, id)?;
     let was = task.assigned_to.take();
     task.updated_at = Utc::now();
     save_task_unlocked(project, &task, &body)?;
@@ -3551,7 +3572,7 @@ pub fn reject_review_task_to(
 ) -> Result<Option<(Column, Column, String)>> {
     hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
-    let IssueFile { mut task, body } = load_task(project, id)?;
+    let IssueFile { mut task, body, tracker_assignees: _ } = load_task(project, id)?;
     let old_column = task.column.clone();
     let workflow = resolved_task_workflow_name_for_project(project, &task)?;
 
@@ -7298,6 +7319,7 @@ workspaces:
                 params: std::collections::BTreeMap::new(),
             },
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 

@@ -9,6 +9,23 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### October 2, 2026
+
+**Zen only auto-promotes GitHub issues assigned to you.** On a GitHub-backed
+project, Zen Mode's mechanical scan now treats a backlog issue as eligible only
+when it is assigned to the account Shelbi is authenticated as. Issues an outside
+contributor opened, or that are assigned to someone else, no longer show up in
+`shelbi zen scan` or the heartbeat's `zen_eligible` count, so Zen never
+auto-promotes work you did not take on. The authenticated login is read from the
+daemon's board index, so this adds no per-tick GitHub call, and if the login
+cannot be resolved the scan returns nothing rather than guessing. To keep the
+work Shelbi files eligible, any issue created through `shelbi issue add` or the
+TUI new-issue flow on the GitHub backend is now assigned to you on creation.
+Workspace routing (`assigned_to`) is unchanged and is still never written to
+GitHub, and the filesystem backend is unaffected. Open issues Shelbi created
+before this change are unassigned and will stop being auto-promoted; assign the
+ones you want back with `gh issue edit <n> --add-assignee @me`.
+
 ### August 25, 2026
 
 **v0.9.0. Multi-runner agents, plus review-slot and orchestrator hardening.**

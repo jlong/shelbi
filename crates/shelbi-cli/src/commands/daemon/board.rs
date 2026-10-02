@@ -327,6 +327,14 @@ fn refresh_with_store(
         // Record which read path produced this board so `shelbi status` can report
         // whether the reader is on GraphQL or the REST fallback (Phase 3 §6).
         index.rest_fallback = read.rest_fallback;
+        // The authenticated login for the Zen ownership gate: prefer the one this
+        // read surfaced (GraphQL `viewer`), else carry the current on-disk index's
+        // forward. A REST-fallback tick carries no `viewer`, so this keeps the last
+        // known login rather than blanking it and making Zen fail closed.
+        index.viewer_login = read
+            .viewer_login
+            .clone()
+            .or_else(|| fresh.as_ref().and_then(|f| f.viewer_login.clone()));
         // Stamp the repository identity on every publish so a reader can prove the
         // file describes this project's configured repository, and carry the
         // cold-read schedule so the ten-minute floor survives a daemon restart.
@@ -727,6 +735,10 @@ mod tests {
         /// surfaces as [`shelbi_state::BoardRead::reopened`], so a test can drive
         /// the daemon's reopened-event path. Empty by default.
         reopened: Vec<(String, String)>,
+        /// The authenticated login `refresh_board` surfaces as
+        /// [`shelbi_state::BoardRead::viewer_login`], so a test can drive the
+        /// daemon's viewer-login stamping and carry-forward. `None` by default.
+        viewer_login: Option<String>,
     }
 
     fn issue(id: &str, column: &str, priority: u32) -> IssueFile {
@@ -738,6 +750,7 @@ mod tests {
         IssueFile {
             task,
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 
@@ -815,6 +828,7 @@ mod tests {
                 reset: self.budget.1,
                 rest_fallback: false,
                 reopened: self.reopened.clone(),
+                viewer_login: self.viewer_login.clone(),
             })
         }
         fn list_in_status(&self, status: &Column) -> CoreResult<Vec<IssueFile>> {
@@ -936,6 +950,7 @@ mod tests {
                 budget: (None, None),
                 fail: Arc::new(AtomicBool::new(false)),
                 reopened: Vec::new(),
+                viewer_login: None,
             },
             opens,
         )
@@ -954,6 +969,7 @@ mod tests {
                 budget: (Some(4_000), Some(1_800_000_000)),
                 fail: Arc::clone(&fail),
                 reopened: Vec::new(),
+                viewer_login: None,
             },
             fail,
         )
@@ -972,6 +988,7 @@ mod tests {
                 budget: (None, None),
                 fail: Arc::new(AtomicBool::new(false)),
                 reopened: Vec::new(),
+                viewer_login: None,
             },
             closeds,
         )
@@ -995,6 +1012,7 @@ mod tests {
                 budget: (None, None),
                 fail: Arc::new(AtomicBool::new(false)),
                 reopened,
+                viewer_login: None,
             },
             opens,
             closeds,
@@ -1019,6 +1037,7 @@ mod tests {
                 budget,
                 fail: Arc::new(AtomicBool::new(false)),
                 reopened: Vec::new(),
+                viewer_login: None,
             },
             seen_since,
         )
@@ -1089,6 +1108,31 @@ mod tests {
         assert_eq!(refreshed.len(), 1, "one refreshed line: {refreshed:?}");
         assert!(refreshed[0].contains("project=proj"), "{}", refreshed[0]);
         assert!(refreshed[0].contains("changed=2"), "{}", refreshed[0]);
+    }
+
+    #[test]
+    fn refresh_stamps_the_viewer_login_and_carries_it_forward() {
+        // The authenticated login the GraphQL board read surfaces is stamped onto
+        // the index (the zero-extra-API-call source the Zen ownership gate reads).
+        let _iso = IsolatedHome::new("viewer-login");
+        let (mut store, _) = fake(vec![issue("a", "todo", 0)]);
+        store.viewer_login = Some("octocat".into());
+        refresh_with_store("proj", &store, None).unwrap();
+        let idx = board_index::read_board_index("proj").expect("index written");
+        assert_eq!(idx.viewer_login.as_deref(), Some("octocat"));
+
+        // A later tick that surfaces no login (the REST fallback carries no
+        // `viewer`) must not blank the stamped login — it is carried forward from
+        // the on-disk index rather than cleared, so Zen doesn't fall closed on a
+        // transient fallback tick.
+        let (store2, _) = fake(vec![issue("a", "todo", 0)]); // viewer_login: None
+        refresh_with_store("proj", &store2, None).unwrap();
+        let idx = board_index::read_board_index("proj").expect("index written");
+        assert_eq!(
+            idx.viewer_login.as_deref(),
+            Some("octocat"),
+            "the login is carried forward across a tick that surfaced none"
+        );
     }
 
     #[test]
@@ -1672,6 +1716,7 @@ issue_tracker:\n\
                 reset: None,
                 rest_fallback: self.rest_fallback,
                 reopened: Vec::new(),
+                viewer_login: None,
             })
         }
         fn list_in_status(&self, status: &Column) -> CoreResult<Vec<IssueFile>> {

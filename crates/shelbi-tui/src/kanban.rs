@@ -3480,6 +3480,7 @@ mod tests {
                 params: std::collections::BTreeMap::new(),
             },
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 
@@ -4091,6 +4092,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
                     params: std::collections::BTreeMap::new(),
                 },
                 body: String::new(),
+                tracker_assignees: Vec::new(),
             }
         }];
         app.popover = Some(TaskPopover {
@@ -5111,6 +5113,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
                 params: std::collections::BTreeMap::new(),
             },
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 

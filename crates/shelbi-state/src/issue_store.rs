@@ -368,6 +368,15 @@ pub struct BoardRead {
     /// Empty for every backend that cannot see GitHub state (the filesystem
     /// board, the process cache) and on the REST fallback path.
     pub reopened: Vec<(String, String)>,
+    /// The login of the account the backend token is authenticated as, when this
+    /// read surfaced it — GitHub's GraphQL `viewer { login }`, which rides along
+    /// on the board query for free. The daemon stamps it into
+    /// [`crate::BoardIndex::viewer_login`] so the Zen ownership gate learns "who
+    /// the user is" with no extra request. `None` on the REST fallback (which
+    /// carries no `viewer`) and on every backend with no tracker identity (the
+    /// filesystem board, the process cache); the daemon then carries the previous
+    /// index's login forward rather than clearing it.
+    pub viewer_login: Option<String>,
 }
 
 /// One lazily-fetched page of the terminal `done`/`canceled` history
@@ -551,6 +560,8 @@ pub trait IssueStore {
             rest_fallback: false,
             // A backend with no view of GitHub state cannot observe a reopen.
             reopened: Vec::new(),
+            // No tracker identity to resolve on a non-GitHub backend.
+            viewer_login: None,
         })
     }
 

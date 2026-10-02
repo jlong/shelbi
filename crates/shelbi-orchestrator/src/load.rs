@@ -1328,6 +1328,7 @@ mod tests {
         IssueFile {
             task,
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 
@@ -1616,6 +1617,7 @@ mod tests {
         IssueFile {
             task,
             body: "body".into(),
+            tracker_assignees: Vec::new(),
         }
     }
 

@@ -6839,6 +6839,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         shelbi_state::IssueFile {
             task,
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 
@@ -6874,6 +6875,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
             // state under test), not Cold-by-identity-mismatch.
             repo: Some(shelbi_state::github_board_repo("owner/repo")),
             schema_version: shelbi_state::BOARD_INDEX_SCHEMA_VERSION,
+            viewer_login: None,
         };
         shelbi_state::write_board_index(name, &idx).unwrap();
     }
@@ -9925,6 +9927,7 @@ transitions:
         shelbi_state::IssueFile {
             task,
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 

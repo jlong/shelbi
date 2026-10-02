@@ -912,10 +912,12 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             shelbi_state::IssueFile {
                 task: make_task("work-1", Column::in_progress(), 0, Some("alpha")),
                 body: String::new(),
+                tracker_assignees: Vec::new(),
             },
             shelbi_state::IssueFile {
                 task: make_task("rev-1", Column::review(), 0, Some("review-1")),
                 body: String::new(),
+                tracker_assignees: Vec::new(),
             },
         ]);
         idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));

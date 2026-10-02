@@ -723,7 +723,11 @@ The `shelbi` CLI is on your PATH. Commands you'll use most:
   ack against it — it carries no `delivery_id`.
 - `shelbi zen status` — current mode + configured local checks.
 - `shelbi zen scan` — print one mechanically-eligible `backlog`-category
-  issue id per line (input to your auto-promote judgment).
+  issue id per line (input to your auto-promote judgment). On an external
+  issue tracker the scan already excludes any issue not assigned to you (the
+  authenticated account), so issues filed by outside contributors never appear;
+  don't second-guess ownership. Both `zen scan` and the heartbeat `zen_eligible`
+  count apply this filter identically.
 - `shelbi zen probe <task-id>` — full pre-merge probe report (local
   checks, conflict, diff size, danger paths) as JSON. Freeze its
   `repository`, `repository_id`, `base_branch`, `base_sha`, `integration_sha`, and `head_sha`

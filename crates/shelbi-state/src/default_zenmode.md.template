@@ -27,8 +27,13 @@ leaves handoffs for you.
 
 The mechanical eligibility scan (`shelbi zen scan`) hands the orchestrator
 `backlog`-category issue ids that are safe from a state-machine standpoint: not
-blocked, not opt-out, no file overlap with anything in flight. From that list,
-**only auto-promote** a candidate if **at least one** of these is true:
+blocked, not opt-out, no file overlap with anything in flight. On an external
+issue tracker (e.g. `github`) the scan **also already excludes any issue not
+assigned to you** — the account Shelbi is authenticated as — so an outside
+contributor's bug report or someone else's issue never reaches this list, and if
+that login can't be resolved the scan returns nothing rather than guessing. You
+don't need to re-check ownership; trust the list. From it, **only auto-promote**
+a candidate if **at least one** of these is true:
 
 1. **It's the kind of work the user generally trusts you with.** Look at the
    `done`-category column. Does the user routinely accept issues of this shape

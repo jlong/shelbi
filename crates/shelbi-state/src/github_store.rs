@@ -693,11 +693,17 @@ impl IssueStore for GitHubStore {
                     // state, so it cannot tell a reopened-with-terminal-label
                     // issue from a backlog card — it reports no reopened pairs.
                     reopened: Vec::new(),
+                    // The REST fallback selects no `viewer`; the daemon carries
+                    // the previous index's login forward rather than clearing it.
+                    viewer_login: None,
                 });
             }
         };
 
         let assignments = crate::task_assignments(&self.project)?;
+        // The authenticated login this read carried, captured before `page.issues`
+        // is consumed below; stamped onto both the cold and delta `BoardRead`.
+        let viewer_login = page.viewer_login.clone();
         match since {
             None => {
                 // Cold read: capture every open issue's number alongside its
@@ -727,6 +733,7 @@ impl IssueStore for GitHubStore {
                     reset: page.reset,
                     rest_fallback: false,
                     reopened,
+                    viewer_login,
                 })
             }
             Some(_) => {
@@ -771,6 +778,7 @@ impl IssueStore for GitHubStore {
                     reset: page.reset,
                     rest_fallback: false,
                     reopened,
+                    viewer_login,
                 })
             }
         }
@@ -941,12 +949,31 @@ impl IssueStore for GitHubStore {
         }
         let body = build_body(&spec.body, &meta);
 
-        let fields = vec![
+        // Assign the new issue to the authenticated user so the work Shelbi files
+        // stays Zen-eligible (the scan only auto-promotes issues assigned to the
+        // user). GitHub's native `assignees` is the source of truth — this is not
+        // written into the fenced metadata block. If the login can't be resolved
+        // (an unauthenticated token, offline), create it unassigned with a warning
+        // rather than failing the create; it simply won't be Zen-eligible.
+        let assignee = self.viewer_login();
+        if assignee.is_none() {
+            tracing::warn!(
+                repo = %self.repo,
+                id = %spec.id,
+                "could not resolve the authenticated GitHub login; creating the issue \
+                 unassigned (it will not be Zen-eligible until assigned)"
+            );
+        }
+
+        let mut fields = vec![
             ("title", spec.title.clone()),
             ("body", body),
             ("labels[]", id_anchor),
             ("labels[]", status_label),
         ];
+        if let Some(login) = &assignee {
+            fields.push(("assignees[]", login.clone()));
+        }
         let created: GhIssue = match self.api_send(
             "POST",
             &format!("repos/{}/issues", self.repo),
@@ -1027,6 +1054,11 @@ impl IssueStore for GitHubStore {
         let mut tf = IssueFile {
             task: issue.clone(),
             body: spec.body,
+            // The tracker assignees GitHub actually recorded on the create (the
+            // authenticated user, when the assignee was sent and accepted), read
+            // straight off the POST response so the published card is Zen-eligible
+            // immediately rather than waiting for the next board refresh.
+            tracker_assignees: created.assignees.iter().map(|u| u.login.clone()).collect(),
         };
         tf.task.assigned_to = crate::get_task_assignment(&self.project, &tf.task.id)?;
         self.publish_write(&tf, created.number);
@@ -1850,10 +1882,16 @@ impl GitHubStore {
         // body assigns it before any break, so it is definitely set by the time
         // it is read after the loop, and no dead initializer is flagged.
         let mut budget: Option<GhRateLimit>;
+        // The authenticated login repeats identically on every page, so the first
+        // page that carries one wins and later pages don't clobber it with `None`.
+        let mut viewer_login: Option<String> = None;
 
         loop {
             let page = self.graphql_request(query, after.as_deref(), since_str.as_deref())?;
             budget = page.rate_limit;
+            if viewer_login.is_none() {
+                viewer_login = page.viewer_login;
+            }
             for node in page.connection.nodes {
                 issues.push(self.gh_issue_hydrating_labels(node)?);
             }
@@ -1883,6 +1921,7 @@ impl GitHubStore {
             issues,
             remaining: budget.as_ref().and_then(|r| r.remaining),
             reset: budget.and_then(|r| r.reset_at).map(|dt| dt.timestamp()),
+            viewer_login,
         })
     }
 
@@ -2045,6 +2084,33 @@ impl GitHubStore {
     /// issues for this store.
     fn board_repo_identity(&self) -> String {
         crate::board_index::github_board_repo(&self.repo)
+    }
+
+    /// The login of the account `gh` is authenticated as — "the user" new issues
+    /// are assigned to on create so the work Shelbi files stays Zen-eligible, and
+    /// the same identity the Zen scan gates ownership on.
+    ///
+    /// Resolution is cheapest-first: the login the daemon already stamped onto the
+    /// board index ([`crate::BoardIndex::viewer_login`], no API call), else a
+    /// single live `gh api user` read for a fresh project whose index hasn't been
+    /// published yet. `None` when neither resolves (an unauthenticated token, or
+    /// offline); the caller then creates the issue unassigned rather than failing
+    /// the create. Not on a per-heartbeat path — `add` is a manual/orchestrator
+    /// create — so the one live read it may cost is acceptable.
+    fn viewer_login(&self) -> Option<String> {
+        if let Some(login) = crate::board_index::read_valid_board_index(
+            &self.project,
+            Some(&self.board_repo_identity()),
+        )
+        .and_then(|idx| idx.viewer_login)
+        {
+            if !login.is_empty() {
+                return Some(login);
+            }
+        }
+        let out = (self.gh)(&["api", "user", "--jq", ".login"]).ok()?;
+        let login = out.trim().to_string();
+        (!login.is_empty()).then_some(login)
     }
 
     /// The number for `id` from the published board index's id→number map, if the
@@ -3602,12 +3668,14 @@ fn graphql_fallback_repos() -> &'static std::sync::Mutex<std::collections::HashS
 const BOARD_INDEX_QUERY: &str = r#"
 query BoardIndex($owner: String!, $name: String!, $after: String) {
   rateLimit { cost remaining resetAt }
+  viewer { login }
   repository(owner: $owner, name: $name) {
     issues(states: [OPEN], first: 100, after: $after,
            orderBy: { field: UPDATED_AT, direction: DESC }) {
       pageInfo { hasNextPage endCursor }
       nodes {
         number title state stateReason createdAt updatedAt body
+        assignees(first: 10) { nodes { login } }
         labels(first: 10) { pageInfo { hasNextPage endCursor } nodes { name } }
       }
     }
@@ -3622,6 +3690,7 @@ query BoardIndex($owner: String!, $name: String!, $after: String) {
 const BOARD_INDEX_DELTA_QUERY: &str = r#"
 query BoardIndexDelta($owner: String!, $name: String!, $after: String, $since: DateTime!) {
   rateLimit { cost remaining resetAt }
+  viewer { login }
   repository(owner: $owner, name: $name) {
     issues(first: 100, after: $after,
            filterBy: { since: $since },
@@ -3629,6 +3698,7 @@ query BoardIndexDelta($owner: String!, $name: String!, $after: String, $since: D
       pageInfo { hasNextPage endCursor }
       nodes {
         number title state stateReason createdAt updatedAt body
+        assignees(first: 10) { nodes { login } }
         labels(first: 10) { pageInfo { hasNextPage endCursor } nodes { name } }
       }
     }
@@ -3649,6 +3719,7 @@ query BoardClosed($owner: String!, $name: String!, $after: String) {
       pageInfo { hasNextPage endCursor }
       nodes {
         number title state stateReason createdAt updatedAt body
+        assignees(first: 10) { nodes { login } }
         labels(first: 10) { pageInfo { hasNextPage endCursor } nodes { name } }
       }
     }
@@ -3663,6 +3734,9 @@ struct GraphQlBoardPage {
     issues: Vec<GhIssue>,
     remaining: Option<u64>,
     reset: Option<i64>,
+    /// The authenticated account login this read carried (`viewer { login }`),
+    /// stamped by the daemon onto the board index for the Zen ownership gate.
+    viewer_login: Option<String>,
 }
 
 // --- single-issue + aliased multi-fetch + id search (plan §3) -----------------
@@ -3675,6 +3749,7 @@ query Issue($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       number title state stateReason createdAt updatedAt body
+      assignees(first: 10) { nodes { login } }
       labels(first: 10) { pageInfo { hasNextPage endCursor } nodes { name } }
     }
   }
@@ -3703,7 +3778,8 @@ fn build_issues_by_number_query(numbers: &[i64]) -> String {
     for (k, n) in numbers.iter().enumerate() {
         aliases.push_str(&format!(
             "    i{k}: issue(number: {n}) {{ number title state stateReason createdAt \
-             updatedAt body labels(first: 10) {{ pageInfo {{ hasNextPage endCursor }} \
+             updatedAt body assignees(first: 10) {{ nodes {{ login }} }} \
+             labels(first: 10) {{ pageInfo {{ hasNextPage endCursor }} \
              nodes {{ name }} }} }}\n"
         ));
     }
@@ -4051,6 +4127,18 @@ struct GraphQlData {
     #[serde(rename = "rateLimit")]
     rate_limit: Option<GhRateLimit>,
     repository: Option<GhRepository>,
+    /// The authenticated account (`viewer { login }`). Selected on the board
+    /// queries so the daemon captures "who the token is" with no extra request;
+    /// the login flows into `board-index.json` for the Zen ownership gate.
+    #[serde(default)]
+    viewer: Option<GhViewer>,
+}
+
+/// GitHub's `viewer` — the account the request is authenticated as. Only its
+/// `login` is read, to stamp onto the board index as the Zen "user".
+#[derive(Debug, Deserialize)]
+struct GhViewer {
+    login: String,
 }
 
 /// The `rateLimit` block on every board response — the free budget signal the
@@ -4099,7 +4187,19 @@ struct GhIssueNode {
     updated_at: DateTime<Utc>,
     #[serde(default)]
     body: Option<String>,
+    /// GitHub's native assignees (`assignees(first: 10) { nodes { login } }`).
+    /// Defaulted so a fixture without the connection still parses.
+    #[serde(default)]
+    assignees: GhAssigneeConnection,
     labels: GhLabelConnection,
+}
+
+/// The `assignees` connection on a GraphQL issue node — only the logins are
+/// read, to populate [`IssueFile::tracker_assignees`] for the Zen ownership gate.
+#[derive(Debug, Default, Deserialize)]
+struct GhAssigneeConnection {
+    #[serde(default)]
+    nodes: Vec<GhUser>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4128,6 +4228,7 @@ impl GhIssueNode {
             state: self.state.to_ascii_lowercase(),
             state_reason: self.state_reason.map(|r| r.to_ascii_lowercase()),
             labels: self.labels.nodes,
+            assignees: self.assignees.nodes,
             created_at: self.created_at,
             updated_at: self.updated_at,
             pull_request: None,
@@ -4139,6 +4240,10 @@ impl GhIssueNode {
 struct GraphQlResponsePage {
     connection: GhIssuesConnection,
     rate_limit: Option<GhRateLimit>,
+    /// The authenticated login from this response's `viewer { login }`, when
+    /// present. The same value repeats on every page, so a paginated read keeps
+    /// the first page's.
+    viewer_login: Option<String>,
 }
 
 /// Parse one `gh api graphql` board response into its issues page + budget.
@@ -4169,6 +4274,7 @@ fn parse_graphql_board_response(text: &str) -> Result<GraphQlResponsePage> {
     Ok(GraphQlResponsePage {
         connection: repository.issues,
         rate_limit: data.rate_limit,
+        viewer_login: data.viewer.map(|v| v.login),
     })
 }
 
@@ -4204,6 +4310,12 @@ struct GhIssue {
     state_reason: Option<String>,
     #[serde(default)]
     labels: Vec<GhLabel>,
+    /// GitHub's native assignees. On the REST issues endpoint this is the
+    /// `assignees: [{ login, … }]` array; on the GraphQL path it is carried over
+    /// from the node's `assignees.nodes` by [`GhIssueNode::into_gh_issue`]. Only
+    /// the login is read. Defaulted so a response that omits it still parses.
+    #[serde(default)]
+    assignees: Vec<GhUser>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     /// Present only on pull requests, which the issues endpoint also returns;
@@ -4391,6 +4503,12 @@ impl GhIssue {
     fn into_issue_file(self, column: Column) -> IssueFile {
         let (prose, meta) = self.split_meta_or_warn();
         let id = self.resolve_id(&meta);
+        // GitHub's native assignee logins — the read-only ownership signal the Zen
+        // scan gates on. Distinct from `Issue::assigned_to` (local workspace
+        // routing), so it rides on the `IssueFile` wrapper and is never written
+        // back to GitHub or into a task's frontmatter.
+        let tracker_assignees: Vec<String> =
+            self.assignees.into_iter().map(|u| u.login).collect();
 
         let task = Issue {
             id,
@@ -4409,7 +4527,11 @@ impl GhIssue {
             updated_at: self.updated_at,
             params: meta.params,
         };
-        IssueFile { task, body: prose }
+        IssueFile {
+            task,
+            body: prose,
+            tracker_assignees,
+        }
     }
 }
 
@@ -4823,6 +4945,17 @@ mod tests {
             .iter()
             .map(|l| serde_json::json!({ "name": l.get("name").cloned().unwrap_or(serde_json::Value::Null) }))
             .collect();
+        // Map the REST `assignees: [{login}]` array onto the GraphQL
+        // `assignees { nodes { login } }` shape so the GraphQL board path carries
+        // tracker assignees through in tests exactly as the live reader does.
+        let assignee_nodes: Vec<serde_json::Value> = v
+            .get("assignees")
+            .and_then(|a| a.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|a| serde_json::json!({ "login": a.get("login").cloned().unwrap_or(serde_json::Value::Null) }))
+            .collect();
         serde_json::json!({
             "number": v.get("number").cloned().unwrap_or(serde_json::json!(0)),
             "title": v.get("title").cloned().unwrap_or(serde_json::json!("")),
@@ -4831,6 +4964,7 @@ mod tests {
             "createdAt": v.get("created_at").cloned().unwrap_or(serde_json::json!("2026-01-01T00:00:00Z")),
             "updatedAt": v.get("updated_at").cloned().unwrap_or(serde_json::json!("2026-01-01T00:00:00Z")),
             "body": v.get("body").cloned().unwrap_or(serde_json::json!("")),
+            "assignees": { "nodes": assignee_nodes },
             "labels": { "nodes": label_nodes },
         })
         .to_string()
@@ -4929,6 +5063,25 @@ mod tests {
 
         // Closed + completed → done.
         assert_eq!(board[1].task.column, Column::done());
+    }
+
+    #[test]
+    fn list_maps_rest_assignees_onto_tracker_assignees() {
+        let _home = HomeGuard::new("rest-assignees");
+        // GitHub's REST issues endpoint returns `assignees: [{login, …}]`; the
+        // mapping lifts the logins onto `IssueFile::tracker_assignees` (the Zen
+        // ownership signal) while leaving `assigned_to` (local routing) untouched.
+        let issues = r#"{"number":7,"title":"Mine","body":"","state":"open","assignees":[{"login":"octocat"},{"login":"hubot"}],"labels":[{"name":"shelbi:id/mine"},{"name":"shelbi:status/backlog"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}
+{"number":8,"title":"Nobody","body":"","state":"open","assignees":[],"labels":[{"name":"shelbi:id/nobody"},{"name":"shelbi:status/backlog"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let store = store_with(issues, "[]");
+
+        let board = store.list().unwrap();
+        let mine = board.iter().find(|tf| tf.task.id == "mine").expect("mine");
+        assert_eq!(mine.tracker_assignees, vec!["octocat".to_string(), "hubot".to_string()]);
+        // Tracker assignees are never confused with local workspace routing.
+        assert_eq!(mine.task.assigned_to, None);
+        let nobody = board.iter().find(|tf| tf.task.id == "nobody").expect("nobody");
+        assert!(nobody.tracker_assignees.is_empty());
     }
 
     #[test]
@@ -5424,6 +5577,107 @@ mod tests {
         assert!(create.contains("priority: 0"));
         assert!(create.contains("Prose body"));
         assert!(create.contains(META_BEGIN));
+    }
+
+    #[test]
+    fn add_assigns_the_new_issue_to_the_authenticated_user() {
+        let _home = HomeGuard::new("add-assigns-viewer");
+        // No board index yet (fresh project), so the create resolves the login via
+        // a live `gh api user` read and sends it as `assignees[]`, keeping the work
+        // Shelbi files Zen-eligible.
+        let created = r#"{"number":10,"title":"Do the thing","body":"","state":"open","labels":[],"assignees":[{"login":"octocat"}],"created_at":"2026-08-03T00:00:00Z","updated_at":"2026-08-03T00:00:00Z"}"#;
+        let calls: Calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            let joined = args.join(" ");
+            // The authenticated-user identity read (`gh api user --jq .login`).
+            if args.contains(&"user") && !joined.contains("repos/") {
+                return Ok("octocat\n".to_string());
+            }
+            // The dup-check id search finds no existing issue.
+            if args.contains(&"graphql") {
+                return Ok(
+                    r#"{"data":{"rateLimit":{"remaining":4999},"search":{"nodes":[]}}}"#.to_string(),
+                );
+            }
+            let method = args
+                .iter()
+                .position(|a| *a == "-X")
+                .and_then(|i| args.get(i + 1))
+                .copied()
+                .unwrap_or("GET");
+            if method != "GET" {
+                // The create POST (and label-create POSTs) echo the created issue.
+                return Ok(created.to_string());
+            }
+            // All GET reads (column list, labels) come back empty.
+            Ok(String::new())
+        });
+
+        let spec = NewIssue::new("do-thing", "Do the thing", Column::todo(), "Prose body");
+        store.add(spec).unwrap();
+
+        let calls = calls.lock().unwrap();
+        // `gh api user` was consulted for the login.
+        assert!(
+            call_containing(&calls, &["api", "user"]).is_some(),
+            "expected a `gh api user` identity read: {calls:?}"
+        );
+        // The create POST carries the viewer login as a native assignee.
+        let create =
+            call_containing(&calls, &["-X POST", "repos/owner/repo/issues", "title=Do the thing"])
+                .expect("issue create POST");
+        assert!(
+            create.contains("assignees[]=octocat"),
+            "create POST must assign the authenticated user: {create}"
+        );
+    }
+
+    #[test]
+    fn add_creates_unassigned_when_the_login_cannot_be_resolved() {
+        let _home = HomeGuard::new("add-no-login");
+        // No board index and `gh api user` returns nothing (unauthenticated /
+        // offline): the create still lands, just without an assignee — it simply
+        // won't be Zen-eligible until assigned. Never fail the create over this.
+        let created = r#"{"number":10,"title":"T","body":"","state":"open","labels":[],"created_at":"2026-08-03T00:00:00Z","updated_at":"2026-08-03T00:00:00Z"}"#;
+        let calls: Calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            let joined = args.join(" ");
+            if args.contains(&"user") && !joined.contains("repos/") {
+                return Ok(String::new()); // no identity resolvable
+            }
+            if args.contains(&"graphql") {
+                return Ok(
+                    r#"{"data":{"rateLimit":{"remaining":4999},"search":{"nodes":[]}}}"#.to_string(),
+                );
+            }
+            let method = args
+                .iter()
+                .position(|a| *a == "-X")
+                .and_then(|i| args.get(i + 1))
+                .copied()
+                .unwrap_or("GET");
+            if method != "GET" {
+                return Ok(created.to_string());
+            }
+            Ok(String::new())
+        });
+
+        let spec = NewIssue::new("do-thing", "Do the thing", Column::todo(), "Prose body");
+        // The create succeeds despite the unresolved login.
+        store.add(spec).expect("create should not fail when the login is unresolvable");
+
+        let calls = calls.lock().unwrap();
+        let create =
+            call_containing(&calls, &["-X POST", "repos/owner/repo/issues", "title=Do the thing"])
+                .expect("issue create POST");
+        assert!(
+            !create.contains("assignees[]="),
+            "no assignee should be sent when the login is unresolvable: {create}"
+        );
     }
 
     #[test]
@@ -6062,6 +6316,7 @@ mod tests {
             labels: vec![GhLabel {
                 name: format!("shelbi:status/{label}"),
             }],
+            assignees: Vec::new(),
             created_at: "2026-08-01T00:00:00Z".parse().unwrap(),
             updated_at: "2026-08-01T00:00:00Z".parse().unwrap(),
             pull_request: None,
@@ -6088,6 +6343,7 @@ mod tests {
             labels: vec![GhLabel {
                 name: "shelbi:status/canceled".into(),
             }],
+            assignees: Vec::new(),
             created_at: "2026-08-01T00:00:00Z".parse().unwrap(),
             updated_at: "2026-08-01T00:00:00Z".parse().unwrap(),
             pull_request: None,
@@ -6128,6 +6384,7 @@ mod tests {
             state: "open".into(),
             state_reason: None,
             labels: vec![],
+            assignees: Vec::new(),
             created_at: "2026-09-21T00:00:00Z".parse().unwrap(),
             updated_at: "2026-09-21T00:00:00Z".parse().unwrap(),
             pull_request: None,
@@ -7640,6 +7897,7 @@ mod tests {
         IssueFile {
             task,
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 
@@ -7681,6 +7939,35 @@ mod tests {
         // An ordinary open board (no open-plus-terminal-label issue) reports no
         // reopened pairs.
         assert!(read.reopened.is_empty(), "no reopened pairs on an ordinary board");
+    }
+
+    #[test]
+    fn refresh_board_cold_captures_assignees_and_viewer_login() {
+        let _iso = IsolatedHome::new("assignees");
+        // A cold board read carries the authenticated `viewer { login }` and each
+        // node's `assignees { nodes { login } }`. One issue is assigned to the
+        // viewer, one to someone else, one to nobody — the Zen ownership gate
+        // reads exactly these onto `IssueFile::tracker_assignees`.
+        let json = r#"{"data":{"rateLimit":{"cost":1,"remaining":4999,"resetAt":"2026-09-08T01:00:00Z"},"viewer":{"login":"octocat"},"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"c1"},"nodes":[
+{"number":1,"title":"mine","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-01T00:00:00Z","body":"","assignees":{"nodes":[{"login":"octocat"}]},"labels":{"nodes":[{"name":"shelbi:id/mine"},{"name":"shelbi:status/backlog"}]}},
+{"number":2,"title":"theirs","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-01T00:00:00Z","body":"","assignees":{"nodes":[{"login":"someone-else"}]},"labels":{"nodes":[{"name":"shelbi:id/theirs"},{"name":"shelbi:status/backlog"}]}},
+{"number":3,"title":"nobody","state":"OPEN","stateReason":null,"createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-01T00:00:00Z","body":"","assignees":{"nodes":[]},"labels":{"nodes":[{"name":"shelbi:id/nobody"},{"name":"shelbi:status/backlog"}]}}
+]}}}}"#;
+        let store = graphql_store(json);
+
+        let read = store.refresh_board(None, &[]).unwrap();
+        // The authenticated login rides back for the index to stamp.
+        assert_eq!(read.viewer_login.as_deref(), Some("octocat"));
+
+        let by_id = |id: &str| {
+            read.board
+                .iter()
+                .find(|tf| tf.task.id == id)
+                .unwrap_or_else(|| panic!("{id} on board"))
+        };
+        assert_eq!(by_id("mine").tracker_assignees, vec!["octocat".to_string()]);
+        assert_eq!(by_id("theirs").tracker_assignees, vec!["someone-else".to_string()]);
+        assert!(by_id("nobody").tracker_assignees.is_empty());
     }
 
     #[test]
@@ -8476,6 +8763,7 @@ mod tests {
         IssueFile {
             task,
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }
     }
 

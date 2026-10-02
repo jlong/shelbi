@@ -3062,6 +3062,7 @@ mod pr_create_tests {
         let mut idx = shelbi_state::BoardIndex::fresh(vec![shelbi_state::IssueFile {
             task: t,
             body: String::new(),
+            tracker_assignees: Vec::new(),
         }]);
         idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
         shelbi_state::write_board_index("zen-open", &idx).unwrap();
@@ -12197,6 +12198,46 @@ printf 'target:%s\\n' \"$CARGO_TARGET_DIR\"";
 // rules here are mechanical (and Rust-tested); the rules there are
 // user-tunable (and live in the prompt).
 
+/// Who "the user" is for Zen ownership gating, and hence which backlog issues
+/// are mechanically eligible on an external issue tracker.
+///
+/// On the filesystem backend every issue is the user's — there is no tracker
+/// notion of ownership — so the gate is [`OwnershipGate::Unrestricted`] and
+/// nothing is filtered on this axis. On an external tracker (GitHub) a backlog
+/// issue is eligible only when its [`shelbi_state::IssueFile::tracker_assignees`]
+/// include the authenticated account's login
+/// ([`OwnershipGate::RequireAssignee`]): work an outside contributor filed, or
+/// that is assigned to someone else, is never auto-promoted. When that login
+/// can't be resolved the gate **fails closed** ([`OwnershipGate::FailClosed`]):
+/// nothing is eligible, because promoting an issue we can't prove the user owns
+/// is the one outcome this gate exists to prevent. Never fail open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnershipGate {
+    /// Filesystem backend (or any backend with no tracker-side ownership): no
+    /// ownership filtering.
+    Unrestricted,
+    /// External tracker with the authenticated login resolved: eligible only
+    /// when the issue's tracker assignees include this login (case-insensitive,
+    /// matching GitHub login semantics).
+    RequireAssignee(String),
+    /// External tracker whose authenticated login could not be resolved: nothing
+    /// is eligible (fail closed).
+    FailClosed,
+}
+
+impl OwnershipGate {
+    /// Whether an issue carrying these tracker assignees passes the gate.
+    fn allows(&self, tracker_assignees: &[String]) -> bool {
+        match self {
+            OwnershipGate::Unrestricted => true,
+            OwnershipGate::RequireAssignee(login) => tracker_assignees
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(login)),
+            OwnershipGate::FailClosed => false,
+        }
+    }
+}
+
 /// Backlog task ids that are mechanically eligible for Zen auto-promotion,
 /// sorted by priority (lower number = higher priority). See module docs for
 /// the rules — and what we *don't* check.
@@ -12211,7 +12252,37 @@ pub fn mechanically_eligible(project: &Project) -> Result<Vec<String>> {
     // reads instead of the live full sweep.
     let tasks = board_from_caches(project)?;
     let demoted = read_demoted_task_ids()?;
-    Ok(mechanically_eligible_from(&tasks, &demoted))
+    let ownership = resolve_ownership_gate(project)?;
+    Ok(mechanically_eligible_from(&tasks, &demoted, &ownership))
+}
+
+/// Build the ownership gate for `project`'s Zen scan.
+///
+/// Filesystem backends are unrestricted. An external tracker needs the
+/// authenticated user's login, which we read from the daemon-owned board index
+/// (`board-index.json`'s `viewer_login`, captured there with no extra API call
+/// so the heartbeat-cadence scan adds no GitHub request per tick). A remote
+/// backend whose login we can't resolve — a cold/absent index, a token with no
+/// identity — fails closed, so Zen never promotes an issue it can't attribute.
+fn resolve_ownership_gate(project: &Project) -> Result<OwnershipGate> {
+    if !project.issue_tracker.backend.is_remote() {
+        return Ok(OwnershipGate::Unrestricted);
+    }
+    match shelbi_state::read_board_index_viewer_login(&project.name, &project.issue_tracker)? {
+        Some(login) if !login.is_empty() => Ok(OwnershipGate::RequireAssignee(login)),
+        _ => {
+            // Fail closed and say why: the board index carries no authenticated
+            // login yet (the daemon hasn't published one, or the token has no
+            // identity), so we cannot tell which backlog issues the user owns.
+            tracing::warn!(
+                project = %project.name,
+                "zen: external tracker but no authenticated login in the board index; \
+                 failing closed (nothing is mechanically eligible until the daemon \
+                 republishes the index with a viewer login)"
+            );
+            Ok(OwnershipGate::FailClosed)
+        }
+    }
 }
 
 /// The whole board — open plus terminal history — assembled from the open index
@@ -12260,6 +12331,7 @@ fn open_board(project: &Project) -> Result<Vec<shelbi_state::IssueFile>> {
 pub fn mechanically_eligible_from(
     tasks: &[shelbi_state::IssueFile],
     demoted: &std::collections::HashSet<String>,
+    ownership: &OwnershipGate,
 ) -> Vec<String> {
     let columns: std::collections::HashMap<String, Column> = tasks
         .iter()
@@ -12279,6 +12351,10 @@ pub fn mechanically_eligible_from(
         .filter(|tf| !zen_disabled(&tf.task))
         .filter(|tf| !demoted.contains(&tf.task.id))
         .filter(|tf| !file_overlaps_in_flight(&tf.body, &in_flight_bodies))
+        // Ownership gate: on an external tracker, only backlog issues assigned
+        // to the authenticated user survive (and nothing survives when that
+        // login is unresolved — `FailClosed`). No-op on the filesystem backend.
+        .filter(|tf| ownership.allows(&tf.tracker_assignees))
         .map(|tf| &tf.task)
         .collect();
 
@@ -12428,6 +12504,17 @@ mod scan_tests {
         IssueFile {
             task,
             body: body.into(),
+            tracker_assignees: Vec::new(),
+        }
+    }
+
+    /// An `IssueFile` carrying external-tracker assignee logins — for the
+    /// ownership-gate tests.
+    fn tf_assigned(task: Issue, body: &str, assignees: &[&str]) -> IssueFile {
+        IssueFile {
+            task,
+            body: body.into(),
+            tracker_assignees: assignees.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -12437,7 +12524,7 @@ mod scan_tests {
             tf(task("done-a", Column::done(), 0, &[]), ""),
             tf(task("todo-a", Column::todo(), 0, &[]), ""),
         ];
-        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::Unrestricted);
         assert!(got.is_empty());
     }
 
@@ -12448,7 +12535,7 @@ mod scan_tests {
             tf(task("a", Column::backlog(), 0, &[]), ""),
             tf(task("c", Column::backlog(), 1, &[]), ""),
         ];
-        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::Unrestricted);
         assert_eq!(got, vec!["a", "c", "b"]);
     }
 
@@ -12458,7 +12545,7 @@ mod scan_tests {
             tf(task("blocked", Column::backlog(), 0, &["other"]), ""),
             tf(task("other", Column::todo(), 0, &[]), ""),
         ];
-        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::Unrestricted);
         assert!(got.is_empty(), "{got:?}");
     }
 
@@ -12471,7 +12558,7 @@ mod scan_tests {
             tf(task("x", Column::todo(), 0, &[]), ""),
             tf(task("y", Column::in_progress(), 0, &[]), ""),
         ];
-        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::Unrestricted);
         assert!(got.is_empty(), "{got:?}");
     }
 
@@ -12481,7 +12568,7 @@ mod scan_tests {
             tf(task("waiting", Column::backlog(), 0, &["dep"]), ""),
             tf(task("dep", Column::done(), 0, &[]), ""),
         ];
-        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::Unrestricted);
         assert_eq!(got, vec!["waiting"]);
     }
 
@@ -12493,7 +12580,7 @@ mod scan_tests {
             ..Default::default()
         });
         let tasks = vec![tf(t, "")];
-        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::Unrestricted);
         assert!(got.is_empty(), "{got:?}");
     }
 
@@ -12506,7 +12593,7 @@ mod scan_tests {
         });
         let unset = task("unset", Column::backlog(), 1, &[]);
         let tasks = vec![tf(opt_in, ""), tf(unset, "")];
-        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::Unrestricted);
         assert_eq!(got, vec!["opt-in", "unset"]);
     }
 
@@ -12518,7 +12605,7 @@ mod scan_tests {
         ];
         let mut demoted = HashSet::new();
         demoted.insert("demoted".to_string());
-        let got = mechanically_eligible_from(&tasks, &demoted);
+        let got = mechanically_eligible_from(&tasks, &demoted, &OwnershipGate::Unrestricted);
         assert_eq!(got, vec!["fresh"]);
     }
 
@@ -12533,7 +12620,7 @@ mod scan_tests {
             tf(task("in-flight", Column::in_progress(), 0, &[]), body_a),
             tf(task("candidate", Column::backlog(), 0, &[]), body_b),
         ];
-        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::Unrestricted);
         assert!(got.is_empty(), "{got:?}");
     }
 
@@ -12548,7 +12635,7 @@ mod scan_tests {
             ),
             tf(task("candidate", Column::backlog(), 0, &[]), candidate_body),
         ];
-        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::Unrestricted);
         assert_eq!(got, vec!["candidate"]);
     }
 
@@ -12559,8 +12646,66 @@ mod scan_tests {
         let tasks: Vec<IssueFile> = (0..10)
             .map(|i| tf(task(&format!("t-{i}"), Column::backlog(), i, &[]), ""))
             .collect();
-        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::Unrestricted);
         assert_eq!(got.len(), 10);
+    }
+
+    // --- ownership gate (external-tracker Zen eligibility) --------------
+
+    #[test]
+    fn require_assignee_includes_only_issues_assigned_to_the_user() {
+        // Three otherwise-eligible backlog issues: assigned to the user, assigned
+        // to someone else, and unassigned. On an external tracker only the user's
+        // own issue is mechanically eligible.
+        let tasks = vec![
+            tf_assigned(task("mine", Column::backlog(), 0, &[]), "", &["octocat"]),
+            tf_assigned(task("theirs", Column::backlog(), 1, &[]), "", &["someone-else"]),
+            tf(task("nobody", Column::backlog(), 2, &[]), ""),
+        ];
+        let gate = OwnershipGate::RequireAssignee("octocat".into());
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &gate);
+        assert_eq!(got, vec!["mine"]);
+    }
+
+    #[test]
+    fn require_assignee_matches_the_login_case_insensitively() {
+        // GitHub logins are case-insensitive; a differently-cased assignee still
+        // counts as the user's own.
+        let tasks = vec![tf_assigned(
+            task("mine", Column::backlog(), 0, &[]),
+            "",
+            &["OctoCat"],
+        )];
+        let gate = OwnershipGate::RequireAssignee("octocat".into());
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &gate);
+        assert_eq!(got, vec!["mine"]);
+    }
+
+    #[test]
+    fn fail_closed_makes_nothing_eligible() {
+        // When the authenticated login can't be resolved, the gate fails closed:
+        // even an assigned backlog issue is withheld rather than promoted blindly.
+        let tasks = vec![
+            tf_assigned(task("mine", Column::backlog(), 0, &[]), "", &["octocat"]),
+            tf(task("nobody", Column::backlog(), 1, &[]), ""),
+        ];
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::FailClosed);
+        assert!(got.is_empty(), "fail-closed must promote nothing: {got:?}");
+    }
+
+    #[test]
+    fn unrestricted_ignores_tracker_assignees() {
+        // The filesystem backend has no tracker ownership, so the gate is
+        // Unrestricted and assignees are not consulted — every eligible backlog
+        // issue qualifies, assigned or not.
+        let tasks = vec![
+            tf_assigned(task("mine", Column::backlog(), 0, &[]), "", &["octocat"]),
+            tf_assigned(task("theirs", Column::backlog(), 1, &[]), "", &["someone-else"]),
+            tf(task("nobody", Column::backlog(), 2, &[]), ""),
+        ];
+        let got =
+            mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::Unrestricted);
+        assert_eq!(got, vec!["mine", "theirs", "nobody"]);
     }
 
     // --- helpers --------------------------------------------------------
@@ -12649,7 +12794,7 @@ mod scan_tests {
                 )
             })
             .collect();
-        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        let got = mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::Unrestricted);
         assert_eq!(got, vec!["t-0", "t-1", "t-2"]);
     }
 }
