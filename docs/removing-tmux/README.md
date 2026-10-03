@@ -104,7 +104,7 @@ fixable, plus the emulator decision.
 
 | Subtask | Scope | Status |
 | --- | --- | --- |
-| `rt-machine-setup` | `shelbi machine setup`, the PATH probe, the version check | Pending |
+| `rt-machine-setup` | `shelbi machine setup`, the PATH probe, the version check | Landed |
 | `rt-relay` | `shelbi relay` and the remote transport in `shelbi-client` | Pending |
 | `rt-remote-spawn` | Remote spawn through session processes; delete the paste-buffer launch; reconnect after an SSH drop | Pending |
 
