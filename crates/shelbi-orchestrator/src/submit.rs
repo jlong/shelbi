@@ -15,7 +15,7 @@
 //! 1. Snapshot a [`PaneBaseline`] BEFORE delivering anything — was the pane
 //!    already mid-turn, did the title already carry `shelbi:working`? Both
 //!    poison the corresponding submit signals for THIS delivery.
-//! 2. Deliver the text WITHOUT its Enter ([`shelbi_tmux::send_text`]), let
+//! 2. Deliver the text WITHOUT its Enter (the backend's `send_text`), let
 //!    the pane settle, then send Enter as a separate key event
 //!    ([`deliver_text`]) — an Enter riding the same instant as the paste is
 //!    exactly the keystroke that gets eaten.
@@ -41,6 +41,8 @@
 
 use shelbi_core::{AgentRunnerSpec, Error, Host, Result, TmuxAddr};
 use shelbi_state::PaneMarker;
+
+use crate::session_backend::{backend, SessionBackend, SessionTarget};
 
 /// Verification capability for the runner receiving a pane injection.
 ///
@@ -142,10 +144,12 @@ impl PaneBaseline {
         if !profile.has_ui_verifier() {
             return PaneBaseline::fresh(profile);
         }
-        let screen =
-            shelbi_tmux::capture_history(host, addr, PROMPT_SUBMIT_SCROLLBACK).unwrap_or_default();
-        let visible_screen = shelbi_tmux::capture(host, addr).unwrap_or_default();
-        let title = shelbi_tmux::pane_title(host, addr).unwrap_or_default();
+        let target = SessionTarget::from_tmux_addr(addr);
+        let screen = backend()
+            .history(host, &target, PROMPT_SUBMIT_SCROLLBACK)
+            .unwrap_or_default();
+        let visible_screen = backend().snapshot(host, &target).unwrap_or_default();
+        let title = backend().title(host, &target).unwrap_or_default();
         Self::from_snapshots(profile, &screen, &visible_screen, &title)
     }
 
@@ -250,10 +254,17 @@ pub fn deliver_text(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
             "verified-submit refuses an empty message".to_string(),
         ));
     }
+    // Serialize concurrent injections into the same pane. Two threads pasting
+    // into one target (e.g. a hub dispatch and a manual `shelbi send` racing)
+    // could otherwise interleave their text + Enter. Held across the whole
+    // text → settle → Enter sequence and released when this returns; locks for
+    // different targets are independent, so unrelated panes never contend.
+    let target = SessionTarget::from_tmux_addr(addr);
+    let _injection = backend().injection_lock(&target);
     deliver_text_with(
-        || shelbi_tmux::send_text(host, addr, text),
+        || backend().send_text(host, &target, text),
         || std::thread::sleep(SUBMIT_SETTLE),
-        || shelbi_tmux::send_enter(host, addr),
+        || backend().send_enter(host, &target),
     )
 }
 
@@ -337,15 +348,16 @@ fn verify_submitted_guarded(
             detail: "verification_unsupported",
         };
     }
+    let target = SessionTarget::from_tmux_addr(addr);
     verify_submitted_with_profile(
         text,
         || wait_for_prompt_submitted(host, addr, text, baseline, PROMPT_SUBMIT_WAIT),
-        || shelbi_tmux::capture(host, addr).unwrap_or_default(),
+        || backend().snapshot(host, &target).unwrap_or_default(),
         || {
             if !may_submit() {
                 return false;
             }
-            if let Err(e) = shelbi_tmux::send_enter(host, addr) {
+            if let Err(e) = backend().send_enter(host, &target) {
                 eprintln!(
                     "shelbi: retry Enter to {} after stalled submit failed: {e}",
                     addr.target(),
@@ -442,15 +454,17 @@ pub fn verify_seeded(
     if !baseline.profile.has_ui_verifier() {
         return false;
     }
+    let target = SessionTarget::from_tmux_addr(addr);
     let start = std::time::Instant::now();
     loop {
         let title = if baseline.profile == SubmitProfile::ClaudeUi && !baseline.title_working {
-            shelbi_tmux::pane_title(host, addr).unwrap_or_default()
+            backend().title(host, &target).unwrap_or_default()
         } else {
             String::new()
         };
-        let screen =
-            shelbi_tmux::capture_history(host, addr, PROMPT_SUBMIT_SCROLLBACK).unwrap_or_default();
+        let screen = backend()
+            .history(host, &target, PROMPT_SUBMIT_SCROLLBACK)
+            .unwrap_or_default();
         if seed_busy_signal(&title, &screen, baseline) {
             return true;
         }
@@ -526,10 +540,11 @@ fn wait_for_prompt_submitted(
     baseline: &PaneBaseline,
     timeout: std::time::Duration,
 ) -> bool {
+    let target = SessionTarget::from_tmux_addr(addr);
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if baseline.profile == SubmitProfile::ClaudeUi && !baseline.title_working {
-            let title = shelbi_tmux::pane_title(host, addr).unwrap_or_default();
+            let title = backend().title(host, &target).unwrap_or_default();
             if title_signals_submit(&title) {
                 return true;
             }
@@ -540,8 +555,9 @@ fn wait_for_prompt_submitted(
         // much more durable signal that Enter landed, and the scrollback
         // keeps it visible even if a burst of output has scrolled the
         // footer.
-        let screen =
-            shelbi_tmux::capture_history(host, addr, PROMPT_SUBMIT_SCROLLBACK).unwrap_or_default();
+        let screen = backend()
+            .history(host, &target, PROMPT_SUBMIT_SCROLLBACK)
+            .unwrap_or_default();
         if screen_shows_submitted_profile(&screen, text, baseline.busy, baseline.profile) {
             return true;
         }

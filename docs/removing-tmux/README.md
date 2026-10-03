@@ -74,7 +74,7 @@ fixable, plus the emulator decision.
 
 | Subtask | Scope | Status |
 | --- | --- | --- |
-| `rt-backend-trait-tmux` | `SessionBackend` trait (session operations only) implemented over `shelbi-tmux` with no behavior change | Pending |
+| `rt-backend-trait-tmux` | `SessionBackend` trait (session operations only), keyed on a backend-neutral `SessionTarget`, implemented over `shelbi-tmux` with no behavior change; migrated `workspace.rs`, `submit.rs`, `ready.rs`, `handoff.rs`, `load.rs` | Landed |
 | `rt-backend-callers` | Move call sites (`workspace.rs`, `submit.rs`, `ready.rs`, `handoff.rs`, `load.rs`, `issue.rs`, `send.rs`, `open.rs`, `open/pane.rs`, `wake.rs`, poller probes) onto the trait | Pending |
 | `rt-backend-sessions` | Implement `SessionBackend` over session processes; hidden backend-select setting | Pending |
 

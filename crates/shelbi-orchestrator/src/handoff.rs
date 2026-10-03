@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use shelbi_core::{Error, Host, Result, TmuxAddr};
 
+use crate::session_backend::{backend, SessionBackend, SessionTarget};
 use crate::submit::{self, SubmitStatus};
 
 /// Hard cap on how long we'll block a reload/quit waiting for the
@@ -390,62 +391,34 @@ fn handoff_request_message() -> String {
     )
 }
 
-/// `tmux has-session -t <name>` on the local server.
+/// Does a local session with this name exist? Three-state probe collapsed to
+/// the historical `Result<bool>` shape — an unreachable probe (tmux unspawnable)
+/// surfaces as `Err` rather than a false "absent".
 fn local_session_exists(session: &str) -> Result<bool> {
-    let target = shelbi_tmux::session_target(session);
-    let out = std::process::Command::new("tmux")
-        .args(["has-session", "-t", &target])
-        .output()
-        .map_err(Error::Io)?;
-    Ok(out.status.success())
+    backend()
+        .probe(&Host::Local, &SessionTarget::session(session), None)
+        .into_exists()
 }
 
 /// Read `SHELBI_PANE_orch` from the session's tmux environment. Returns
 /// `None` when the var is unset (older session before
 /// `ensure_dashboard` pinned it) or empty.
 fn read_orch_pane_id(session: &str) -> Result<Option<String>> {
-    let target = shelbi_tmux::session_target(session);
-    let out = std::process::Command::new("tmux")
-        .args([
-            "show-environment",
-            "-t",
-            &target,
-            "SHELBI_PANE_orch",
-        ])
-        .output()
-        .map_err(Error::Io)?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    let line = String::from_utf8_lossy(&out.stdout);
-    let line = line.trim();
-    if line.starts_with('-') {
-        return Ok(None);
-    }
-    let Some((_, value)) = line.split_once('=') else {
-        return Ok(None);
-    };
-    if value.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(value.to_string()))
-    }
+    backend().get_env(
+        &Host::Local,
+        &SessionTarget::session(session),
+        "SHELBI_PANE_orch",
+    )
 }
 
-/// `tmux list-panes -a -F #{pane_id}` — true when the given pane id
-/// shows up in the live pane list. Catches the case where the
-/// orchestrator pane crashed (or was manually killed) after
+/// True when the given pane id shows up in the live pane list. Catches the case
+/// where the orchestrator pane crashed (or was manually killed) after
 /// `SHELBI_PANE_orch` was set but before we asked.
 fn pane_alive(pane_id: &str) -> Result<bool> {
-    let out = std::process::Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_id}"])
-        .output()
-        .map_err(Error::Io)?;
-    if !out.status.success() {
-        return Ok(false);
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(stdout.lines().any(|l| l.trim() == pane_id))
+    Ok(backend()
+        .live_pane_ids(&Host::Local)?
+        .iter()
+        .any(|l| l == pane_id))
 }
 
 #[cfg(test)]

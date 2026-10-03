@@ -28,6 +28,7 @@ pub mod lifecycle;
 pub mod load;
 pub mod ready;
 pub mod review_ui;
+pub mod session_backend;
 pub mod submit;
 pub mod supervision;
 pub mod system_plugin;
