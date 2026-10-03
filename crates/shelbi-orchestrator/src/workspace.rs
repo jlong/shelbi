@@ -5923,8 +5923,13 @@ fn sync_worktree_for_resume(
     if has_git {
         // Worktree is intact — preserve it verbatim. This is the whole
         // contract of resume: don't touch the branch, the commits, or the
-        // uncommitted changes.
-        return Ok(());
+        // uncommitted changes. The one repair we must make is reattaching a
+        // DETACHED HEAD the post-handoff detach left behind (see
+        // `reattach_detached_resume_head`): a worker relaunched on a detached
+        // worktree commits on a detached HEAD, and the handoff's `push_branch`
+        // (which pushes the branch ref) misses those commits
+        // (bug-resume-leaves-detached-worktree).
+        return reattach_detached_resume_head(host, &wt_str, branch);
     }
 
     // No valid worktree. If a dir is lingering (created but never got its
@@ -5973,6 +5978,88 @@ fn sync_worktree_for_resume(
     if !out.status.success() {
         return Err(Error::Command {
             cmd: argv.join(" "),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Reattach a resumed worktree's HEAD to its task `branch` when the
+/// post-handoff detach left it parked at the branch tip
+/// (bug-resume-leaves-detached-worktree).
+///
+/// At handoff [`detach_workspace_worktree`] runs `git checkout --detach`, which
+/// parks HEAD at the branch tip commit with the branch ref released but the
+/// working tree byte-for-byte unchanged. [`sync_worktree_for_resume`] otherwise
+/// leaves an intact worktree verbatim, so a resume relaunched on that detached
+/// worktree would have the worker commit on a detached HEAD; the handoff's
+/// `push_branch` pushes the *branch* ref and silently misses those commits.
+/// Reattaching HEAD to `branch` here restores the pre-handoff state without
+/// touching the tree.
+///
+/// This is the resume counterpart of the dev-start path's `git checkout
+/// <branch>` in [`sync_worktree`] — it reattaches only when it can do so
+/// losslessly, and it holds the three resume guard rails:
+///
+/// - An **attached** HEAD (on the task branch or any other) is left verbatim —
+///   resume trusts the tree and must never force a checkout that could lose
+///   work. This is the common no-op case.
+/// - A detached HEAD that has **diverged** from the branch tip means something
+///   already committed on the detached HEAD; reattaching with a plain
+///   `git checkout <branch>` would abandon those commits. Refuse instead, with a
+///   message naming both commits so the operator can reconcile by hand.
+/// - If the branch ref is somehow absent there is nothing to reattach to, so
+///   the detached HEAD is left as-is (the recreate path handles a *missing*
+///   worktree, not this one).
+fn reattach_detached_resume_head(host: &Host, wt_str: &str, branch: &str) -> Result<()> {
+    // A detached HEAD reports the literal `HEAD`; anything else is a branch
+    // name and is preserved untouched.
+    let head_ref = shelbi_ssh::run_capture(
+        host,
+        ["git", "-C", wt_str, "rev-parse", "--abbrev-ref", "HEAD"],
+    )?;
+    if head_ref.trim() != "HEAD" {
+        return Ok(());
+    }
+
+    // Detached. Without the branch ref there's nothing to reattach to — leave
+    // the worktree as-is rather than guess.
+    let branch_exists = shelbi_ssh::run(
+        host,
+        ["git", "-C", wt_str, "rev-parse", "--verify", "--quiet", branch],
+    )
+    .map_err(Error::Io)?
+    .status
+    .success();
+    if !branch_exists {
+        return Ok(());
+    }
+
+    // Reattach only when HEAD sits exactly at the branch tip — the byte-for-byte
+    // state the detach left. Any difference means work landed on the detached
+    // HEAD (or the branch moved underneath it); refuse rather than silently
+    // discard it with a plain checkout.
+    let head_sha = shelbi_ssh::run_capture(host, ["git", "-C", wt_str, "rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    let branch_sha = shelbi_ssh::run_capture(host, ["git", "-C", wt_str, "rev-parse", branch])?
+        .trim()
+        .to_string();
+    if head_sha != branch_sha {
+        return Err(Error::Other(format!(
+            "refusing to resume: worktree at {wt_str} has a detached HEAD at {head_sha} but \
+             task branch `{branch}` is at {branch_sha} — the detached HEAD has diverged from the \
+             branch, so reattaching would abandon commits made on it. Reconcile by hand (inspect \
+             the worktree, then `git -C {wt_str} checkout {branch}` or merge/branch the detached \
+             work) before resuming."
+        )));
+    }
+
+    let out = shelbi_ssh::run(host, ["git", "-C", wt_str, "checkout", branch]).map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("git -C {wt_str} checkout {branch}"),
             status: out.status.to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
@@ -12105,6 +12192,116 @@ mod sync_worktree_git_tests {
         assert!(
             wt.join("work.txt").exists(),
             "prior commit's file must be present"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resume_reattaches_a_detached_worktree_left_by_handoff() {
+        // bug-resume-leaves-detached-worktree: the post-handoff detach parks
+        // HEAD at the branch tip in DETACHED state (branch ref released, tree
+        // byte-for-byte unchanged). A resume relaunched on that worktree would
+        // have the worker commit on a detached HEAD, which the handoff's
+        // `push_branch` (it pushes the branch ref) silently drops. Resume-sync
+        // must reattach HEAD to the task branch so later commits land on it.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("resume-reattach");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+
+        // Stand up the task branch with a commit, then detach exactly as the
+        // handoff does via `detach_workspace_worktree`.
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+        std::fs::write(wt.join("work.txt"), "landed\n").unwrap();
+        assert!(run_git_in(&wt, &["add", "work.txt"]).status.success());
+        assert!(run_git_in(&wt, &["commit", "-q", "-m", "work"])
+            .status
+            .success());
+        let tip = String::from_utf8_lossy(&run_git_in(&wt, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        assert_eq!(
+            detach_workspace_worktree(&Host::Local, &wt),
+            DetachOutcome::Detached {
+                from_branch: Some("shelbi/x".to_string())
+            },
+        );
+        assert_eq!(head_of(&wt), "HEAD", "precondition: HEAD must be detached");
+
+        sync_worktree_for_resume(&Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+
+        assert_eq!(
+            head_of(&wt),
+            "shelbi/x",
+            "resume must reattach HEAD to the task branch"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run_git_in(&wt, &["rev-parse", "HEAD"]).stdout).trim(),
+            tip,
+            "reattach must not move HEAD off the branch tip",
+        );
+        assert!(
+            wt.join("work.txt").exists(),
+            "committed work must survive the reattach"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resume_refuses_when_detached_head_diverged_from_branch_tip() {
+        // A detached HEAD that no longer matches the branch tip means work
+        // landed on the detached HEAD (or the branch moved underneath it).
+        // Reattaching with a plain checkout would abandon that commit, so
+        // resume must refuse — naming both commits — and leave the tree as-is.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("resume-diverged");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+        std::fs::write(wt.join("a.txt"), "a\n").unwrap();
+        assert!(run_git_in(&wt, &["add", "a.txt"]).status.success());
+        assert!(run_git_in(&wt, &["commit", "-q", "-m", "branch tip"])
+            .status
+            .success());
+        let branch_sha = String::from_utf8_lossy(&run_git_in(&wt, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+
+        // Detach, then commit on the detached HEAD so it diverges from the
+        // branch ref (which stays at `branch_sha`).
+        assert!(run_git_in(&wt, &["checkout", "--detach"]).status.success());
+        std::fs::write(wt.join("b.txt"), "b\n").unwrap();
+        assert!(run_git_in(&wt, &["add", "b.txt"]).status.success());
+        assert!(run_git_in(&wt, &["commit", "-q", "-m", "detached work"])
+            .status
+            .success());
+        let head_sha = String::from_utf8_lossy(&run_git_in(&wt, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        assert_ne!(head_sha, branch_sha, "precondition: HEAD must have diverged");
+
+        let err = sync_worktree_for_resume(&Host::Local, &machine, &wt, "shelbi/x", "main")
+            .expect_err("a diverged detached HEAD must make resume refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&head_sha) && msg.contains(&branch_sha),
+            "refusal must name both the detached HEAD and the branch tip, got: {msg}"
+        );
+        // The refusal must change nothing — still detached at its own commit.
+        assert_eq!(head_of(&wt), "HEAD", "worktree must stay detached on refuse");
+        assert_eq!(
+            String::from_utf8_lossy(&run_git_in(&wt, &["rev-parse", "HEAD"]).stdout).trim(),
+            head_sha,
+            "the detached work must not be touched",
         );
         let _ = std::fs::remove_dir_all(&repo);
     }
