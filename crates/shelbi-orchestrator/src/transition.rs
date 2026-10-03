@@ -29,6 +29,13 @@ use shelbi_core::{Error, Host, Project, Result, Issue, TransitionAction, Workflo
 use crate::actions;
 use crate::workspace::workspace_worktree;
 
+#[path = "transition_move.rs"]
+mod issue_move;
+pub use issue_move::{
+    move_issue, move_issue_with, GitTransitionRunner, MoveError, MoveOutcome, MoveRequest,
+    MoveWarning, TransitionEdge, TransitionRunner,
+};
+
 /// How long to sleep between [`Transition::ready`] poll attempts.
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -590,7 +597,7 @@ mod tests {
     /// signature. The tests here only exercise paths that return before
     /// any action touches git/gh, so the machine/workspace surface is
     /// deliberately empty.
-    fn bare_project() -> Project {
+    pub(super) fn bare_project() -> Project {
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
@@ -640,7 +647,7 @@ mod tests {
         }
     }
 
-    fn bare_task(id: &str) -> Issue {
+    pub(super) fn bare_task(id: &str) -> Issue {
         let now = chrono::Utc::now();
         Issue {
             id: id.into(),
