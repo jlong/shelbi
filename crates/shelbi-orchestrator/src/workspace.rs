@@ -20,6 +20,8 @@ use shelbi_core::{
     WorkspaceSpec,
 };
 
+use crate::session_backend::{backend, Liveness, SessionBackend, SessionTarget};
+
 /// Absolute path to the currently-running `shelbi` binary, so the
 /// wrapper invocation we hand to tmux is anchored to *this* build
 /// rather than whatever happens to be on PATH inside the pane's
@@ -1437,50 +1439,6 @@ pub fn push_workspace_branch_to_origin(host: &Host, worktree: &Path, branch: &st
     }
 }
 
-/// Argv for the local slot-liveness probe: list the project session's
-/// windows so the caller can look for the workspace's window among them.
-fn list_windows_argv(addr: &TmuxAddr) -> Vec<String> {
-    vec![
-        "tmux".into(),
-        "list-windows".into(),
-        "-t".into(),
-        format!("={}", addr.session),
-        "-F".into(),
-        "#W".into(),
-    ]
-}
-
-/// Argv listing a session's windows as `<window_id> <window_name>` pairs.
-/// Where [`list_windows_argv`] answers "is *a* window with this name alive?",
-/// this lets the caller find EVERY window id bound to a slot's name — the set a
-/// name-based `-t =session:=name` target can't reach, since that spelling
-/// resolves to only the first match.
-fn list_window_ids_argv(addr: &TmuxAddr) -> Vec<String> {
-    vec![
-        "tmux".into(),
-        "list-windows".into(),
-        "-t".into(),
-        format!("={}", addr.session),
-        "-F".into(),
-        "#{window_id} #{window_name}".into(),
-    ]
-}
-
-/// Parse `tmux list-windows -F '#{window_id} #{window_name}'` output into the
-/// window ids whose name exactly equals `window`. A window name can carry
-/// spaces (Claude rewrites its window title mid-session), so split only on the
-/// FIRST space: the id (`@<n>`, never spaced) is the head and the untouched
-/// tail is the name.
-fn slot_window_ids_from_list(stdout: &str, window: &str) -> Vec<String> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let (id, name) = line.trim_end().split_once(' ')?;
-            (name == window).then(|| id.to_string())
-        })
-        .collect()
-}
-
 /// Every tmux window id currently bound to a local slot's name. Local
 /// workspaces are windows inside the shared project session, so a slot can
 /// (under a raced relaunch — e.g. the crash supervisor and a `shelbi task
@@ -1488,25 +1446,26 @@ fn slot_window_ids_from_list(stdout: &str, window: &str) -> Vec<String> {
 /// accrete more than one window sharing its name. Teardown has to reap all of
 /// them, so it enumerates ids here rather than trusting a single name match.
 fn local_slot_window_ids(host: &Host, addr: &TmuxAddr) -> Result<Vec<String>> {
-    let out = shelbi_ssh::run(host, list_window_ids_argv(addr)).map_err(Error::Io)?;
-    if !out.status.success() {
+    match backend()
+        .enumerate_slots(host, &SessionTarget::session(addr.session.as_str()), None)
+        .map_err(Error::Io)?
+    {
+        Some(slots) => Ok(crate::session_backend::slot_ids_named(&slots, &addr.window)),
         // No session / no server → nothing is bound to the slot.
-        return Ok(Vec::new());
+        None => Ok(Vec::new()),
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(slot_window_ids_from_list(&stdout, &addr.window))
 }
 
 /// Does the workspace have a live tmux pane right now?
 pub fn workspace_pane_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
-    // Local: check `session:window` exists. Remote: it's a whole session.
-    // `tmux list-windows -t session -F #W | grep -w window` does both.
-    let out = shelbi_ssh::run(host, list_windows_argv(addr)).map_err(Error::Io)?;
-    if !out.status.success() {
-        return Ok(false);
+    // Local: a window named `addr.window` inside the project session.
+    match backend()
+        .enumerate_slots(host, &SessionTarget::session(addr.session.as_str()), None)
+        .map_err(Error::Io)?
+    {
+        Some(slots) => Ok(slots.iter().any(|w| w.name == addr.window)),
+        None => Ok(false),
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(stdout.lines().any(|w| w.trim() == addr.window))
 }
 
 /// Does this workspace slot have a live tmux allocation right now?
@@ -1516,10 +1475,9 @@ pub fn workspace_pane_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
 /// may auto-rename the lone window away from `agent`, so session liveness is
 /// the authoritative availability check there.
 pub fn workspace_slot_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
-    match host {
-        Host::Local => workspace_pane_alive(host, addr),
-        Host::Ssh { .. } => shelbi_tmux::has_session(host, &addr.session),
-    }
+    backend()
+        .probe(host, &SessionTarget::from_tmux_addr(addr), None)
+        .into_exists()
 }
 
 /// tmux user option marking a workspace slot as a plain user shell opened
@@ -1536,27 +1494,12 @@ pub const USER_SHELL_OPTION: &str = "@shelbi-user-shell";
 /// [`USER_SHELL_OPTION`]). Called right after the shell pane/session is
 /// created by the open-idle-workspace path.
 pub fn mark_user_shell(host: &Host, addr: &TmuxAddr) -> Result<()> {
-    let argv: Vec<String> = match host {
-        Host::Local => vec![
-            "tmux".into(),
-            "set-option".into(),
-            "-w".into(),
-            "-t".into(),
-            shelbi_tmux::command_target(addr),
-            USER_SHELL_OPTION.into(),
-            "1".into(),
-        ],
-        Host::Ssh { .. } => vec![
-            "tmux".into(),
-            "set-option".into(),
-            "-t".into(),
-            format!("={}", addr.session),
-            USER_SHELL_OPTION.into(),
-            "1".into(),
-        ],
-    };
-    shelbi_ssh::run_capture(host, &argv)?;
-    Ok(())
+    backend().set_metadata(
+        host,
+        &SessionTarget::from_tmux_addr(addr),
+        USER_SHELL_OPTION,
+        "1",
+    )
 }
 
 /// Is this workspace slot occupied by a user shell — a live slot carrying
@@ -1569,39 +1512,15 @@ pub fn workspace_user_shell_open(host: &Host, addr: &TmuxAddr) -> Result<bool> {
     if !workspace_slot_alive(host, addr)? {
         return Ok(false);
     }
-    let out = shelbi_ssh::run(host, user_shell_probe_argv(host, addr)).map_err(Error::Io)?;
-    Ok(user_shell_mark_set(&out))
-}
-
-/// Argv reading the [`USER_SHELL_OPTION`] mark off a live slot — window-scoped
-/// for local workspaces, session-scoped for remote ones.
-fn user_shell_probe_argv(host: &Host, addr: &TmuxAddr) -> Vec<String> {
-    match host {
-        Host::Local => vec![
-            "tmux".into(),
-            "show-options".into(),
-            "-w".into(),
-            "-v".into(),
-            "-t".into(),
-            shelbi_tmux::command_target(addr),
-            USER_SHELL_OPTION.into(),
-        ],
-        Host::Ssh { .. } => vec![
-            "tmux".into(),
-            "show-options".into(),
-            "-v".into(),
-            "-t".into(),
-            format!("={}", addr.session),
-            USER_SHELL_OPTION.into(),
-        ],
-    }
-}
-
-/// Did the user-shell option probe report the mark as set? A non-zero exit is
-/// a plain "not marked" — older tmux exits non-zero for an unset user option —
-/// not an error worth surfacing.
-fn user_shell_mark_set(out: &std::process::Output) -> bool {
-    out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "1"
+    Ok(backend()
+        .get_metadata(
+            host,
+            &SessionTarget::from_tmux_addr(addr),
+            USER_SHELL_OPTION,
+            None,
+        )?
+        .as_deref()
+        == Some("1"))
 }
 
 /// tmux user option stamping when a workspace slot's current agent pane was
@@ -1619,27 +1538,12 @@ pub const LAUNCH_EPOCH_OPTION: &str = "@shelbi-launch-epoch";
 /// only costs the reaper its launch-age grace for this slot, never the launch.
 pub fn stamp_launch_epoch(host: &Host, addr: &TmuxAddr) -> Result<()> {
     let now = chrono::Utc::now().timestamp().to_string();
-    let argv: Vec<String> = match host {
-        Host::Local => vec![
-            "tmux".into(),
-            "set-option".into(),
-            "-w".into(),
-            "-t".into(),
-            shelbi_tmux::command_target(addr),
-            LAUNCH_EPOCH_OPTION.into(),
-            now,
-        ],
-        Host::Ssh { .. } => vec![
-            "tmux".into(),
-            "set-option".into(),
-            "-t".into(),
-            format!("={}", addr.session),
-            LAUNCH_EPOCH_OPTION.into(),
-            now,
-        ],
-    };
-    shelbi_ssh::run_capture(host, &argv)?;
-    Ok(())
+    backend().set_metadata(
+        host,
+        &SessionTarget::from_tmux_addr(addr),
+        LAUNCH_EPOCH_OPTION,
+        &now,
+    )
 }
 
 /// How long ago this workspace slot's current agent pane was launched, per its
@@ -1648,30 +1552,16 @@ pub fn stamp_launch_epoch(host: &Host, addr: &TmuxAddr) -> Result<()> {
 /// shelbi, or the option couldn't be read. A clock that has since gone backwards
 /// clamps to zero rather than underflowing.
 pub fn workspace_launch_age(host: &Host, addr: &TmuxAddr) -> Option<std::time::Duration> {
-    let argv: Vec<String> = match host {
-        Host::Local => vec![
-            "tmux".into(),
-            "show-options".into(),
-            "-w".into(),
-            "-v".into(),
-            "-t".into(),
-            shelbi_tmux::command_target(addr),
-            LAUNCH_EPOCH_OPTION.into(),
-        ],
-        Host::Ssh { .. } => vec![
-            "tmux".into(),
-            "show-options".into(),
-            "-v".into(),
-            "-t".into(),
-            format!("={}", addr.session),
-            LAUNCH_EPOCH_OPTION.into(),
-        ],
-    };
-    let out = shelbi_ssh::run(host, argv).ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let epoch: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    let value = backend()
+        .get_metadata(
+            host,
+            &SessionTarget::from_tmux_addr(addr),
+            LAUNCH_EPOCH_OPTION,
+            None,
+        )
+        .ok()
+        .flatten()?;
+    let epoch: i64 = value.trim().parse().ok()?;
     let now = chrono::Utc::now().timestamp();
     Some(std::time::Duration::from_secs((now - epoch).max(0) as u64))
 }
@@ -1745,89 +1635,29 @@ pub fn probe_workspace_slot(
     addr: &TmuxAddr,
     deadline: std::time::Duration,
 ) -> SlotProbe {
-    let alive = match host {
-        Host::Local => {
-            // Same semantics as `workspace_pane_alive`: a non-zero exit is
-            // "no session" (dead), success means look for the window.
-            match shelbi_ssh::run_with_deadline(host, list_windows_argv(addr), deadline) {
-                Ok(out) => {
-                    out.status.success()
-                        && String::from_utf8_lossy(&out.stdout)
-                            .lines()
-                            .any(|w| w.trim() == addr.window)
-                }
-                Err(e) => {
-                    return SlotProbe::Unreachable {
-                        reason: probe_error_reason(&e, deadline),
-                    }
-                }
-            }
+    // The three-state slot probe lives on the backend (local = window inside
+    // the project session, remote = the standalone session; a transport
+    // failure reads Unreachable, never Dead). Map its verdict to a table row.
+    match backend().probe(host, &SessionTarget::from_tmux_addr(addr), Some(deadline)) {
+        Liveness::Unreachable { reason } => SlotProbe::Unreachable { reason },
+        Liveness::Dead => SlotProbe::Dead,
+        Liveness::Alive => {
+            // Best-effort mark probe, same degradation as the unbounded path:
+            // an unreadable option reads as "not a user shell", never an error.
+            // The machine just answered the liveness probe, so a timeout here is
+            // a blip, not the auth wedge — degrading beats flapping to
+            // unreachable.
+            let user_shell = backend()
+                .get_metadata(
+                    host,
+                    &SessionTarget::from_tmux_addr(addr),
+                    USER_SHELL_OPTION,
+                    Some(deadline),
+                )
+                .map(|v| v.as_deref() == Some("1"))
+                .unwrap_or(false);
+            SlotProbe::Alive { user_shell }
         }
-        Host::Ssh { .. } => {
-            let argv = vec![
-                "tmux".to_string(),
-                "has-session".to_string(),
-                "-t".to_string(),
-                format!("={}", addr.session),
-            ];
-            match shelbi_ssh::run_with_deadline(host, argv, deadline) {
-                // Same discrimination as `shelbi_tmux::has_session`: tmux
-                // answers 0 (exists) or 1 (doesn't, incl. no server); any
-                // other exit is the transport failing, not tmux answering.
-                Ok(out) => match out.status.code() {
-                    Some(0) => true,
-                    Some(1) => false,
-                    _ => {
-                        return SlotProbe::Unreachable {
-                            reason: transport_failure_reason(&out),
-                        }
-                    }
-                },
-                Err(e) => {
-                    return SlotProbe::Unreachable {
-                        reason: probe_error_reason(&e, deadline),
-                    }
-                }
-            }
-        }
-    };
-    if !alive {
-        return SlotProbe::Dead;
-    }
-    // Best-effort mark probe, same degradation as the unbounded path: an
-    // unreadable option reads as "not a user shell", never an error. The
-    // machine just answered the liveness probe, so a timeout here is a
-    // blip, not the auth wedge — degrading beats flapping to unreachable.
-    let mark_argv = user_shell_probe_argv(host, addr);
-    let user_shell = match shelbi_ssh::run_with_deadline(host, mark_argv, deadline) {
-        Ok(out) => user_shell_mark_set(&out),
-        Err(_) => false,
-    };
-    SlotProbe::Alive { user_shell }
-}
-
-/// One-line reason for a probe that never produced an exit status. The
-/// timeout case is worded for its dominant cause — an SSH session parked on
-/// an interactive auth step that BatchMode can't suppress (Tailscale SSH's
-/// web-auth flow runs outside the openssh client).
-fn probe_error_reason(e: &std::io::Error, deadline: std::time::Duration) -> String {
-    if e.kind() == std::io::ErrorKind::TimedOut {
-        format!(
-            "ssh probe timed out after {}s (interactive auth pending?)",
-            deadline.as_secs()
-        )
-    } else {
-        format!("probe failed: {e}")
-    }
-}
-
-/// One-line reason for a probe whose transport answered with a non-tmux
-/// exit (e.g. ssh's 255): prefer ssh's own first diagnostic line.
-fn transport_failure_reason(out: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    match stderr.lines().find(|l| !l.trim().is_empty()) {
-        Some(line) => line.trim().to_string(),
-        None => format!("ssh exited {}", out.status),
     }
 }
 
@@ -1980,15 +1810,13 @@ pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -
             // duplicate-named window can't survive by hiding behind the
             // first match.
             for id in &window_ids {
-                let _ = shelbi_ssh::run(host, ["tmux", "kill-window", "-t", id.as_str()])
-                    .map_err(Error::Io)?;
+                backend().kill_window(host, id)?;
             }
             if let Some(pane) = stranded_agent {
                 // Re-mark: a killed window's wrapper may already have consumed
                 // the mark set above.
                 let _ = shelbi_state::mark_expected_teardown(workspace_name);
-                let _ = shelbi_ssh::run(host, ["tmux", "kill-pane", "-t", pane.as_str()])
-                    .map_err(Error::Io)?;
+                backend().kill_pane(host, &pane)?;
             }
         }
         Host::Ssh { .. } => {
@@ -2000,9 +1828,9 @@ pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -
             // to suppress on that side — but writing the marker is
             // still safe and keeps the API symmetric.
             let _ = shelbi_state::mark_expected_teardown(workspace_name);
-            let target = format!("={}", addr.session);
-            let _ = shelbi_ssh::run(host, ["tmux", "kill-session", "-t", &target])
-                .map_err(Error::Io)?;
+            // The remote slot IS its own session, so killing the session tears
+            // the workspace down whole.
+            backend().kill(host, &SessionTarget::session(addr.session.as_str()))?;
         }
     }
     Ok(())
@@ -2610,8 +2438,14 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
             );
             let hub_sock = shelbi_state::hub_socket_path()
                 .map_err(|e| Error::Other(format!("resolving hub socket path: {e}")))?;
-            let create_new_session = !shelbi_tmux::has_session(a.host, &a.addr.session)?;
-            let argv = local_pane_tmux_argv(LocalPaneTmuxArgs {
+            let create_new_session = !backend()
+                .probe(
+                    a.host,
+                    &SessionTarget::session(a.addr.session.as_str()),
+                    None,
+                )
+                .into_exists()?;
+            let spec = LocalPaneTmuxArgs {
                 create_new_session,
                 session: &a.addr.session,
                 window: &a.addr.window,
@@ -2622,8 +2456,8 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
                 pane_cmd: &pane_cmd,
                 port: a.port,
                 review_pgid_file: a.review_pgid_file,
-            });
-            shelbi_ssh::run_capture(a.host, &argv).map_err(|e| {
+            };
+            backend().spawn_local_pane(a.host, spec).map_err(|e| {
                 Error::Other(format!(
                     "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
                     a.workspace.name,
@@ -2633,16 +2467,16 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
             })?;
         }
         Host::Ssh { .. } => {
-            shelbi_tmux::new_session(a.host, &a.addr.session, &a.addr.window, None).map_err(
-                |e| {
+            backend()
+                .spawn(a.host, &SessionTarget::from_tmux_addr(a.addr), None)
+                .map_err(|e| {
                     Error::Other(format!(
                         "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
                         a.workspace.name,
                         runner_label(&a.runner.command),
                         a.runner.command,
                     ))
-                },
-            )?;
+                })?;
             // Remote panes run the agent directly — the lifecycle wrapper isn't
             // deployed on the workspace host — so we build the launch command
             // here and send it into the pane. This goes through the SAME
@@ -2655,7 +2489,9 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
                 startup_prompt_rel,
             );
             let cd_launch = remote_cd_launch(a.host, a.worktree, &launch, a.port);
-            shelbi_tmux::send_line(a.host, a.addr, &cd_launch).map_err(|e| {
+            backend()
+                .send_line(a.host, &SessionTarget::from_tmux_addr(a.addr), &cd_launch)
+                .map_err(|e| {
                 Error::Other(format!(
                     "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
                     a.workspace.name,
@@ -2954,7 +2790,8 @@ pub fn resume_limit_stalled_pane<F>(
 where
     F: Fn() -> bool,
 {
-    let screen = shelbi_tmux::capture(host, addr)?;
+    let target = SessionTarget::from_tmux_addr(addr);
+    let screen = backend().snapshot(host, &target)?;
     match classify_limit_resume_screen(&screen, expected_stall) {
         LimitResumeScreen::ExpectedIncident => {}
         LimitResumeScreen::BannerGone => return Ok(LimitResumeOutcome::SkippedBannerGone),
@@ -2965,9 +2802,9 @@ where
     if !is_eligible() {
         return Ok(LimitResumeOutcome::SkippedIneligible);
     }
-    shelbi_tmux::send_enter(host, addr)?;
+    backend().send_enter(host, &target)?;
     if !crate::ready::wait_for_claude_ready(host, addr, crate::ready::READY_TIMEOUT)? {
-        let after_wait = shelbi_tmux::capture(host, addr)?;
+        let after_wait = backend().snapshot(host, &target)?;
         return Ok(
             if classify_limit_resume_screen(&after_wait, expected_stall)
                 == LimitResumeScreen::ExpectedIncident
@@ -4729,7 +4566,7 @@ fn copy_dir_contents_to_remote(ssh_host: &str, src: &Path, dest: &Path) -> Resul
 /// Inputs to [`local_pane_tmux_argv`] — mirrors the local dispatch
 /// path's tmux invocation exactly so tests can assert on the argv shape
 /// without spinning up a tmux server.
-struct LocalPaneTmuxArgs<'a> {
+pub struct LocalPaneTmuxArgs<'a> {
     /// `true` → `tmux new-session -d -s <session> -n <window> …`.
     /// `false` → `tmux new-window -d -t =<session>: -n <window> …` inside
     /// the already-live project session.
@@ -4764,7 +4601,7 @@ struct LocalPaneTmuxArgs<'a> {
 /// hooks would silently no-op (the exact bug the outer function is
 /// wired to prevent). See `open/pane.rs` where the wrapper prefers
 /// inherited env over the state lookup.
-fn local_pane_tmux_argv(a: LocalPaneTmuxArgs<'_>) -> Vec<String> {
+pub(crate) fn local_pane_tmux_argv(a: LocalPaneTmuxArgs<'_>) -> Vec<String> {
     let task_env = format!("TASK_ID={}", a.task_id);
     let project_env = format!("PROJECT={}", a.project);
     let hub_env = format!("SHELBI_HUB_SOCK={}", a.hub_sock);
@@ -6726,39 +6563,10 @@ mod tests {
         assert_eq!(addr.window, "agent");
     }
 
-    #[test]
-    fn slot_window_ids_matches_every_window_with_the_slot_name() {
-        // Two windows share the slot name `alice` (a raced relaunch left a
-        // duplicate). Teardown must reap BOTH, so both ids come back — the
-        // single-name-match a `-t =session:=alice` target uses would strand
-        // the second as an orphaned session.
-        let listing = "@3 alice\n@7 orch\n@9 alice\n";
-        assert_eq!(
-            slot_window_ids_from_list(listing, "alice"),
-            vec!["@3".to_string(), "@9".to_string()],
-        );
-    }
-
-    #[test]
-    fn slot_window_ids_splits_on_first_space_so_spaced_names_still_match() {
-        // Claude rewrites its window title, which can contain spaces. The id
-        // (`@<n>`) never does, so splitting on the FIRST space keeps a spaced
-        // name intact for the exact comparison.
-        let listing = "@1 shelbi working\n@2 alice\n";
-        assert_eq!(
-            slot_window_ids_from_list(listing, "shelbi working"),
-            vec!["@1".to_string()],
-        );
-        assert!(slot_window_ids_from_list(listing, "shelbi").is_empty());
-    }
-
-    #[test]
-    fn slot_window_ids_empty_when_no_window_carries_the_name() {
-        // A dead / renamed-away slot yields nothing to reap.
-        let listing = "@4 orch\n@5 bob\n";
-        assert!(slot_window_ids_from_list(listing, "alice").is_empty());
-        assert!(slot_window_ids_from_list("", "alice").is_empty());
-    }
+    // The `slot_window_ids_from_list` parser and its three cases moved to
+    // `crate::session_backend` (as `parse_slot_list` + `slot_ids_named`)
+    // when enumerate moved behind the `SessionBackend` seam; the assertions are
+    // unchanged there.
 
     #[test]
     fn worktree_path_under_machine_workdir() {
@@ -10107,71 +9915,17 @@ mod user_shell_tmux_tests {
 
 #[cfg(test)]
 mod slot_probe_tests {
-    //! Classification tests for the bounded slot probe: the pure reason
-    //! helpers, the deadline config clamp, and (when tmux is on PATH) a
-    //! real-tmux round-trip of [`probe_workspace_slot`]'s local arm.
+    //! Classification tests for the bounded slot probe: the deadline config
+    //! clamp and (when tmux is on PATH) a real-tmux round-trip of
+    //! [`probe_workspace_slot`]'s local arm.
+    //!
+    //! The pure reason helpers (`probe_error_reason`, `transport_failure_reason`)
+    //! and the `@shelbi-user-shell` value interpretation moved to
+    //! `crate::session_backend` with the probe/metadata operations; their
+    //! classification tests live there, unchanged.
     use super::*;
     use shelbi_core::Host;
     use std::time::Duration;
-
-    /// Build a real `Output` with the given exit code — `ExitStatus` has no
-    /// public constructor, so we harvest one from a `sh -c "exit N"`.
-    fn fake_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("exit {code}"))
-            .status()
-            .expect("sh must run");
-        std::process::Output {
-            status,
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: stderr.as_bytes().to_vec(),
-        }
-    }
-
-    #[test]
-    fn probe_error_reason_words_the_timeout_for_the_auth_wedge() {
-        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline");
-        let reason = probe_error_reason(&timeout, Duration::from_secs(5));
-        assert_eq!(
-            reason,
-            "ssh probe timed out after 5s (interactive auth pending?)"
-        );
-
-        // A non-timeout spawn failure keeps its own diagnostic.
-        let other = std::io::Error::new(std::io::ErrorKind::NotFound, "no such binary");
-        let reason = probe_error_reason(&other, Duration::from_secs(5));
-        assert!(reason.contains("no such binary"), "reason: {reason}");
-        assert!(!reason.contains("timed out"), "reason: {reason}");
-    }
-
-    #[test]
-    fn transport_failure_reason_prefers_ssh_stderr_over_exit_status() {
-        // ssh's own diagnostic (first non-blank line) is the best reason.
-        let out = fake_output(255, "", "\nssh: connect to host devbox port 22: refused\n");
-        assert_eq!(
-            transport_failure_reason(&out),
-            "ssh: connect to host devbox port 22: refused"
-        );
-
-        // No stderr at all → fall back to the exit status.
-        let out = fake_output(255, "", "");
-        assert!(
-            transport_failure_reason(&out).contains("255"),
-            "reason: {}",
-            transport_failure_reason(&out)
-        );
-    }
-
-    #[test]
-    fn user_shell_mark_set_requires_success_and_the_literal_1() {
-        assert!(user_shell_mark_set(&fake_output(0, "1\n", "")));
-        assert!(!user_shell_mark_set(&fake_output(0, "0\n", "")));
-        assert!(!user_shell_mark_set(&fake_output(0, "", "")));
-        // Older tmux exits non-zero for an unset user option — plain "not
-        // marked", even if something landed on stdout.
-        assert!(!user_shell_mark_set(&fake_output(1, "1\n", "")));
-    }
 
     #[test]
     fn probe_deadline_clamps_the_env_override() {
