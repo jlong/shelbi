@@ -391,6 +391,12 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__zen-heartbeat")]
     ZenHeartbeat { project: String },
+    /// (internal) Start the on-demand hub daemon if it isn't already running,
+    /// waiting for its socket. The CLI/TUI open paths call the same helper; this
+    /// exposes it for ops and tests. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__ensure-daemon")]
+    EnsureDaemon,
     /// (internal) Graceful-exit clear the orchestrator pane wrapper
     /// runs after the agent returns. Not for direct use.
     #[command(hide = true)]
@@ -603,6 +609,9 @@ fn main() -> Result<()> {
         Some(Cmd::ErrorLog { project }) => commands::error_log::run(project),
         Some(Cmd::ZenOrchStart { project }) => commands::zen_lifecycle::orch_start(&project),
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),
+        Some(Cmd::EnsureDaemon) => {
+            shelbi_state::ensure_daemon_running().map_err(|e| anyhow::anyhow!(e.to_string()))
+        }
         Some(Cmd::ZenOrchExit { project }) => commands::zen_lifecycle::orch_exit(&project),
         Some(Cmd::OrchRecordExit {
             project,

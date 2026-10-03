@@ -1993,6 +1993,10 @@ fn add_project_entry() -> Entry {
 /// [`super::run_tmux`] helper.
 fn switch_to_project(target: &str) -> Result<()> {
     shelbi_state::touch_project_launched(target).map_err(|e| anyhow::anyhow!(e))?;
+    // Opening a project starts the on-demand hub daemon if needed. Best-effort.
+    if let Err(e) = shelbi_state::ensure_daemon_running() {
+        eprintln!("shelbi: warning: could not start the hub daemon: {e}");
+    }
     shelbi_orchestrator::ensure_dashboard(target).map_err(|e| anyhow::anyhow!(e))?;
 
     let session = format!("shelbi-{target}");

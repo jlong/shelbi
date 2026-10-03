@@ -1,10 +1,11 @@
 //! Hub-side Unix-socket listener for worker → hub messages.
 //!
-//! This is the runtime half of `shelbi daemon` (the OS-supervisor
-//! install/uninstall/status/restart plumbing lives in the sibling
-//! [`super::supervise`] module). Phases 1, 2, and 9 of the Worker →
+//! This is the runtime half of `shelbi daemon` (the on-demand
+//! restart/status plumbing lives in the sibling [`super::lifecycle`]
+//! module). Phases 1, 2, and 9 of the Worker →
 //! Orchestrator Communication feature (see
-//! `Plans/worker-orchestrator-communication.md` §5, §6, §9, §13).
+//! `Plans/worker-orchestrator-communication.md` §5, §6, §9, §13), and
+//! Phase 3 of the remove-tmux effort (`docs/removing-tmux/phase3-daemon.md`).
 //!
 //! ## Foreground (`shelbi daemon`, no subcommand)
 //!
@@ -230,13 +231,18 @@ pub(super) fn run_foreground() -> Result<()> {
     // to events.log / the orchestrator handoff file and never blocks serving.
     let _ = crate::commands::config_upgrade::run_startup_pass();
 
-    // launchd/systemd hand a supervised process a minimal PATH that omits the
-    // Homebrew / version-manager bindir `gh` lives in, so every board-refresh
-    // tick's `gh auth token` probe fails and no index is ever published. Fix the
-    // running daemon in-process now, and rewrite an old supervisor unit (one
-    // installed before PATH was baked in) so the next relaunch is correct too.
-    super::supervise::ensure_gh_on_path();
-    super::supervise::heal_daemon_unit_path();
+    // Run with the user's interactive login-shell environment, not the minimal
+    // one a detached on-demand spawn inherits. `.zshrc` is where nvm/fnm/Homebrew
+    // PATH setup lives, so this is how the daemon's git/`gh`/ssh/workflow actions
+    // find their tools — replacing the baked minimal PATH that used to need
+    // healing to locate `gh`. Overlaid (not replaced) so anything the launcher
+    // set intentionally (e.g. SHELBI_ROOT in a test) survives.
+    apply_login_shell_env();
+
+    // Retire any leftover launchd/systemd supervisor unit so its KeepAlive /
+    // Restart=always loop can't fight the on-demand daemon. Idempotent; disclose
+    // whatever it removed on events.log.
+    retire_leftover_supervisor_units();
 
     // Tighten the umask around bind() so the socket inode is created
     // 0600 from the very start. Without this there is a window between
@@ -276,6 +282,11 @@ pub(super) fn run_foreground() -> Result<()> {
     // The single board reader per hub: one refresh loop per open project,
     // publishing `board-index.json` on each project's configured cadence.
     super::board::spawn_refresh_manager(daemon.board.clone(), stop.clone());
+    // Exit when no project is open (the on-demand lifecycle: nothing to serve,
+    // and the next open restarts us). A short minimum-lifetime debounce keeps a
+    // just-started daemon alive long enough for the opener to record its open
+    // flag and for a restart to verify, and avoids thrash on project switches.
+    spawn_idle_monitor(stop.clone(), sock.clone());
 
     serve(&listener, &daemon, &stop);
 
@@ -288,6 +299,104 @@ pub(super) fn run_foreground() -> Result<()> {
     }
     eprintln!("shelbi daemon: stopped");
     Ok(())
+}
+
+/// Overlay the user's interactive login-shell environment onto this process's
+/// environment. Captured once (`$SHELL -l -i -c env`, cached in `shelbi-core`)
+/// and applied over the inherited environment so subprocesses (git, `gh`, ssh,
+/// workflow actions) see the user's real PATH and config. An empty capture (the
+/// login shell couldn't run) is a no-op, so a failure degrades to the inherited
+/// environment rather than clobbering it.
+fn apply_login_shell_env() {
+    for (key, value) in shelbi_core::login_shell_env() {
+        std::env::set_var(key, value);
+    }
+}
+
+/// Stop and remove any leftover launchd/systemd supervisor unit (the retired
+/// install path), disclosing each removal on `events.log`. Idempotent and
+/// best-effort — a host with no unit does nothing, and a disclosure hiccup never
+/// takes the daemon down.
+fn retire_leftover_supervisor_units() {
+    let removed = super::lifecycle::retire_supervisor_units();
+    for path in removed {
+        let body = format!("daemon-unit-retired unit={}", path.display());
+        if let Err(e) = shelbi_state::append_external_event(&body) {
+            tracing::debug!(error = %e, "shelbi daemon: failed to disclose daemon-unit-retired");
+        }
+        tracing::warn!(
+            unit = %path.display(),
+            "shelbi daemon: retired a leftover supervisor unit (daemon is now on-demand)",
+        );
+    }
+}
+
+/// Default minimum daemon lifetime before the idle monitor may trigger an exit.
+/// Covers the window where a just-opened project hasn't recorded its flag yet
+/// and the restart-verify window (which waits up to ~10s). Overridable with
+/// [`IDLE_GRACE_ENV`] (milliseconds) so tests drive it fast.
+const IDLE_GRACE: Duration = Duration::from_secs(15);
+/// Default interval between idle checks once past the grace period. Overridable
+/// with [`IDLE_POLL_ENV`] (milliseconds).
+const IDLE_POLL: Duration = Duration::from_secs(5);
+const IDLE_GRACE_ENV: &str = "SHELBI_DAEMON_IDLE_GRACE_MS";
+const IDLE_POLL_ENV: &str = "SHELBI_DAEMON_IDLE_POLL_MS";
+
+/// Parse a milliseconds env override, falling back to `default` on absence or a
+/// non-positive/unparseable value.
+fn duration_from_env_ms(key: &str, default: Duration) -> Duration {
+    match std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(ms) if ms > 0 => Duration::from_millis(ms),
+        _ => default,
+    }
+}
+
+/// Spawn the idle-exit monitor: after a minimum-lifetime grace, poll the
+/// open-project set and shut the daemon down once it is empty. Shutting down
+/// reuses the signal path — flip the shared stop flag, then self-connect to wake
+/// the blocking `accept()` so the main loop drains and exits.
+fn spawn_idle_monitor(stop: Arc<AtomicBool>, sock: PathBuf) {
+    let grace = duration_from_env_ms(IDLE_GRACE_ENV, IDLE_GRACE);
+    let poll = duration_from_env_ms(IDLE_POLL_ENV, IDLE_POLL);
+    thread::spawn(move || {
+        if !sleep_unless_stopped(&stop, grace, poll) {
+            return;
+        }
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let empty = shelbi_state::list_open_projects()
+                .map(|v| v.is_empty())
+                .unwrap_or(false);
+            if empty {
+                eprintln!("shelbi daemon: no project open, shutting down");
+                stop.store(true, Ordering::SeqCst);
+                // Wake the accept loop so it notices the flag and drains.
+                let _ = UnixStream::connect(&sock);
+                return;
+            }
+            if !sleep_unless_stopped(&stop, poll, poll) {
+                return;
+            }
+        }
+    });
+}
+
+/// Sleep for `total` in `slice`-sized steps, returning early (`false`) if the
+/// stop flag is set partway through so the monitor doesn't outlive a shutdown.
+/// Returns `true` if the full duration elapsed without a stop.
+fn sleep_unless_stopped(stop: &Arc<AtomicBool>, total: Duration, slice: Duration) -> bool {
+    let slice = slice.min(total).max(Duration::from_millis(10));
+    let mut waited = Duration::ZERO;
+    while waited < total {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        thread::sleep(slice);
+        waited += slice;
+    }
+    !stop.load(Ordering::SeqCst)
 }
 
 /// Decrements the live-connection counter when a handler thread exits —

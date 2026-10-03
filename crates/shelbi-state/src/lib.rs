@@ -21,6 +21,7 @@ use shelbi_core::{
 
 mod agent_workspaces;
 pub mod board_index;
+mod daemon_lifecycle;
 pub mod done_history;
 pub mod error_log;
 mod event_log;
@@ -114,6 +115,9 @@ pub use agent_workspaces::{
 pub use hub_config::{
     hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
     HubConfig, ProjectMeta, ProjectSummary,
+};
+pub use daemon_lifecycle::{
+    daemon_lock_held, ensure_daemon_running, hub_lock_path, stop_daemon,
 };
 pub use hub_version::{
     classify_daemon_version, daemon_version_status, ensure_daemon_matches_for_mutation,
@@ -1458,6 +1462,18 @@ pub struct State {
     /// [`shelbi_tui::kanban::ColumnExpansion`] for the in-memory model.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub kanban_column_overrides: BTreeMap<String, KanbanColumnOverride>,
+    /// Whether the project is currently open. Set when the project is opened
+    /// (`ensure_dashboard`) and cleared when it is quit, this is the single
+    /// source of truth for "open" in Phase 3 of the remove-tmux effort
+    /// (`docs/removing-tmux/phase3-daemon.md`): the on-demand daemon's idle
+    /// exit and its per-project poller manager both key off the open set.
+    /// Deliberately *not* derived from the orchestrator session existing, so
+    /// supervision can restart a dead orchestrator in a project that is still
+    /// open. Defaults to `false` and is skipped when `false`, so a closed
+    /// project's `state.json` stays byte-identical to before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open: bool,
     /// Forward-compat catch-all: any `state.json` key this binary doesn't
     /// recognize (a field a newer binary added) is captured here and written
     /// back verbatim, instead of being silently dropped on the next
@@ -1773,6 +1789,93 @@ pub fn claim_first_run_hint() -> Result<bool> {
         state.first_run_seen = true;
         Ok(true)
     })
+}
+
+#[cfg(test)]
+mod open_record_tests {
+    use super::*;
+    use crate::test_lock::LOCK;
+
+    fn fresh_home() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-open-record-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(p.join("projects")).unwrap();
+        p
+    }
+
+    #[test]
+    fn open_flag_defaults_closed_and_round_trips() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A project with no state.json reads as closed, and the missing-file
+        // default write stays byte-identical to "no open key".
+        assert!(!is_project_open("p").unwrap(), "missing state → closed");
+
+        set_project_open("p", true).unwrap();
+        assert!(is_project_open("p").unwrap(), "set open → open");
+
+        set_project_open("p", false).unwrap();
+        assert!(!is_project_open("p").unwrap(), "cleared → closed");
+        // The cleared state serializes without the `open` key (skip-if-false).
+        let text = fs::read_to_string(state_path("p").unwrap()).unwrap();
+        assert!(!text.contains("\"open\""), "closed state omits the key: {text}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn list_open_projects_reports_only_registered_open_ones() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Register three projects (the *.yaml stem is the id) and open two.
+        for name in ["alpha", "beta", "gamma"] {
+            fs::write(home.join("projects").join(format!("{name}.yaml")), b"").unwrap();
+        }
+        set_project_open("alpha", true).unwrap();
+        set_project_open("gamma", true).unwrap();
+        // beta stays closed; an unregistered-but-open project is ignored because
+        // it has no *.yaml registration.
+        set_project_open("ghost", true).unwrap();
+
+        let open = list_open_projects().unwrap();
+        assert_eq!(open, vec!["alpha".to_string(), "gamma".to_string()]);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn open_flag_preserves_other_state_fields() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        set_zen_mode_direct("p", ZenModeState::On);
+        set_project_open("p", true).unwrap();
+        let s = read_state("p").unwrap();
+        assert_eq!(s.zen_mode, ZenModeState::On, "open write must not clobber zen_mode");
+        assert!(s.open);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Set zen_mode without the daemon-version gate `set_zen_mode` applies.
+    fn set_zen_mode_direct(project: &str, mode: ZenModeState) {
+        update_state(project, |st| {
+            st.zen_mode = mode;
+            Ok(())
+        })
+        .unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -2345,6 +2448,60 @@ pub fn set_workspace_filter(project: &str, filter: Option<&str>) -> Result<()> {
         state.workspace_filter = filter.map(|s| s.to_string());
         Ok(())
     })
+}
+
+/// Record (`true`) or clear (`false`) a project's open flag in its
+/// `state.json`. Routed through [`update_state`] so concurrent writers (a
+/// heartbeat tick, a filter change) don't lose the change, and idempotent — a
+/// no-op when already in the requested state. See [`State::open`].
+pub fn set_project_open(project: &str, open: bool) -> Result<()> {
+    update_state(project, |state| {
+        state.open = open;
+        Ok(())
+    })
+}
+
+/// Whether `project` is currently marked open. A missing `state.json` reads as
+/// closed (the [`State::default`] has `open: false`).
+pub fn is_project_open(project: &str) -> Result<bool> {
+    Ok(read_state(project)?.open)
+}
+
+/// Every registered project currently marked open, sorted by name.
+///
+/// Scans `~/.shelbi/projects/*.yaml` for registered project ids (the same
+/// source [`crate::list_projects`] uses) and keeps the ones whose `state.json`
+/// has `open: true`. A project whose state can't be read is treated as closed
+/// rather than aborting the scan, so one unreadable file never hides the rest
+/// of the open set. The daemon's idle-exit monitor and per-project poller
+/// manager both consume this.
+pub fn list_open_projects() -> Result<Vec<String>> {
+    let dir = projects_dir()?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut open = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(shelbi_core::Error::Io)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        if is_project_open(name).unwrap_or(false) {
+            open.push(name.to_string());
+        }
+    }
+    open.sort();
+    Ok(open)
 }
 
 /// Compose the persistence key for a Kanban column override. The key

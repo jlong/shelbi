@@ -82,7 +82,7 @@ fixable, plus the emulator decision.
 
 | Subtask | Scope | Status |
 | --- | --- | --- |
-| `rt-daemon-lifecycle` | On-demand daemon start; retire launchd/systemd units with an upgrade step | Pending |
+| `rt-daemon-lifecycle` | On-demand daemon start; idle exit; the open-project record (`State::open` + `set_project_open`/`is_project_open`/`list_open_projects`); retire launchd/systemd units with an on-start upgrade step; `daemon restart`/`status` without a supervisor; captured login-shell env. Design: [`phase3-daemon.md`](phase3-daemon.md). The login-shell env capture helper lives at `shelbi_core::login_shell_env` (module `shelbi-core/src/login_env.rs`); `rt-session-process` reuses it for session spawn. | In review |
 | `rt-daemon-poller` | Per-project poller manager and the open-project record | Pending |
 | `rt-daemon-layout-split` | Split layout out of the poller (session half to daemon, layout half to clients) | Pending |
 | `rt-mutations-daemon` | "The daemon executes mutations": control socket, per-issue queue, expected state, recheck before irreversible steps (also the second half of Phase 4a) | Pending |

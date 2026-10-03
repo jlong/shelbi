@@ -15,6 +15,11 @@ pub struct Args {
 pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
     let project_name = require_project(project_opt)?;
     let addr = shelbi_orchestrator::dashboard_addr(&project_name);
+    // Opening a project starts the on-demand hub daemon if needed. Best-effort:
+    // a daemon that won't start shouldn't block the orchestrator bootstrap.
+    if let Err(e) = shelbi_state::ensure_daemon_running() {
+        eprintln!("shelbi: warning: could not start the hub daemon: {e}");
+    }
     let status = shelbi_orchestrator::ensure_dashboard(&project_name).map_err(|e| anyhow!(e))?;
 
     match status {
