@@ -1209,6 +1209,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "shelbi-app"
+version = "0.9.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "shelbi-core",
+ "shelbi-palette",
+ "shelbi-state",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "shelbi-client"
 version = "0.9.0"
 dependencies = [
