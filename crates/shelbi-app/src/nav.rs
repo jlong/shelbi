@@ -33,6 +33,31 @@ impl View {
     pub fn default_for_project() -> View {
         View::Issues
     }
+
+    /// Parse a sidebar-nav view name (the suffix of a `view:<name>` palette
+    /// id) into a [`View`]. The historical builtin names map to the native
+    /// views; anything else is a session view bound to that name (the
+    /// orchestrator "chat" is `orch`).
+    pub fn from_view_id(name: &str) -> View {
+        match name {
+            "tasks" => View::Issues,
+            "activity" => View::Activity,
+            "machines" => View::Machines,
+            other => View::Session(other.to_string()),
+        }
+    }
+
+    /// The nav view name used in a `view:<name>` id — the inverse of
+    /// [`View::from_view_id`]. Round-trips: `from_view_id(v.as_view_id())`
+    /// is `v`.
+    pub fn as_view_id(&self) -> String {
+        match self {
+            View::Issues => "tasks".to_string(),
+            View::Activity => "activity".to_string(),
+            View::Machines => "machines".to_string(),
+            View::Session(name) => name.clone(),
+        }
+    }
 }
 
 /// Where keyboard focus sits. With the main area focused on a terminal
@@ -340,6 +365,23 @@ mod tests {
         assert_eq!(c.sidebar_selection(), 0);
         c.select_down(0);
         assert_eq!(c.sidebar_selection(), 0);
+    }
+
+    #[test]
+    fn view_id_round_trips() {
+        for v in [
+            View::Issues,
+            View::Activity,
+            View::Machines,
+            View::Session("orch".into()),
+            View::Session("alpha-1".into()),
+        ] {
+            assert_eq!(View::from_view_id(&v.as_view_id()), v);
+        }
+        // The historical builtin names resolve to the native views.
+        assert_eq!(View::from_view_id("tasks"), View::Issues);
+        assert_eq!(View::from_view_id("activity"), View::Activity);
+        assert_eq!(View::from_view_id("orch"), View::Session("orch".into()));
     }
 
     #[test]

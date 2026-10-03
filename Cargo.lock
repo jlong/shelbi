@@ -1185,6 +1185,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shelbi-agent",
+ "shelbi-app",
  "shelbi-core",
  "shelbi-orchestrator",
  "shelbi-palette",

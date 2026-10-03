@@ -128,8 +128,18 @@ impl Command {
     /// input; `AddProject` yields [`Effect::AddProject`] (the host runs the
     /// form, then issues [`Mutation::AddProject`]).
     pub fn effect(&self, project: &str) -> Effect {
+        self.kind.effect_with_project(project)
+    }
+}
+
+impl CommandKind {
+    /// Build the [`Effect`] for this kind, binding `project` where the
+    /// effect needs the current project. This is the half of dispatch a
+    /// host reaches after [`CommandKind::from_id`] has recovered the typed
+    /// command from an entry id.
+    pub fn effect_with_project(&self, project: &str) -> Effect {
         let p = || project.to_string();
-        match &self.kind {
+        match self {
             CommandKind::ShowView(v) => Effect::ShowView(v.clone()),
             CommandKind::FocusWorkspace { workspace } => Effect::FocusWorkspace {
                 project: p(),
@@ -189,7 +199,9 @@ impl Command {
             }),
         }
     }
+}
 
+impl Command {
     /// Convert to a palette [`Entry`]. The entry's `label` is the title;
     /// the fuzzy matcher runs over it.
     pub fn to_entry(&self) -> Entry {
@@ -499,6 +511,68 @@ impl CommandRegistry {
     }
 }
 
+impl CommandKind {
+    /// Parse a palette entry `id` back into a typed [`CommandKind`] — the
+    /// inverse of the registry's id scheme. This is what lets a palette's
+    /// dispatch read the registry instead of its own `strip_prefix` ladder:
+    /// an id string becomes a typed command with its arguments recovered,
+    /// and [`Command::effect`] turns that into the effect to run.
+    ///
+    /// Returns `None` for an unrecognized id. Note the order of the checks:
+    /// the longer `action:switch-project:<slug>` and `edit:agent:<name>`
+    /// prefixes are tried before their bare forms.
+    pub fn from_id(id: &str) -> Option<CommandKind> {
+        if let Some(name) = id.strip_prefix("view:") {
+            return Some(CommandKind::ShowView(View::from_view_id(name)));
+        }
+        if let Some(name) = id.strip_prefix("workspace:") {
+            return Some(CommandKind::FocusWorkspace {
+                workspace: name.to_string(),
+            });
+        }
+        if let Some(task_id) = id.strip_prefix("review:") {
+            return Some(CommandKind::LoadReview {
+                task_id: task_id.to_string(),
+            });
+        }
+        if let Some(session) = id.strip_prefix("agent:") {
+            return Some(CommandKind::FocusSession {
+                session: session.to_string(),
+            });
+        }
+        if let Some(slug) = id.strip_prefix("action:switch-project:") {
+            return Some(CommandKind::SwitchProject {
+                project: slug.to_string(),
+            });
+        }
+        if let Some(agent) = id.strip_prefix("edit:agent:") {
+            return Some(CommandKind::OpenEditor {
+                target: EditTarget::Agent(agent.to_string()),
+            });
+        }
+        match id {
+            "action:toggle-zen" => Some(CommandKind::ToggleZen),
+            "action:error-log" => Some(CommandKind::OpenErrorLog),
+            "action:switch-project" => Some(CommandKind::SwitchProject {
+                project: String::new(),
+            }),
+            "action:add-project" => Some(CommandKind::AddProject),
+            "action:quit-project" => Some(CommandKind::QuitProject),
+            "action:quit-shelbi" => Some(CommandKind::QuitShelbi),
+            "edit:project" => Some(CommandKind::OpenEditor {
+                target: EditTarget::Project,
+            }),
+            "edit:zenmode" => Some(CommandKind::OpenEditor {
+                target: EditTarget::ZenMode,
+            }),
+            "edit:workflows" => Some(CommandKind::OpenEditor {
+                target: EditTarget::Workflows,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// The palette id for an edit target, preserving the historical scheme.
 fn edit_id(target: &EditTarget) -> String {
     match target {
@@ -713,6 +787,27 @@ mod tests {
         assert!(!ids.contains(&"action:quit-project"));
         // Quit Shelbi is always offered.
         assert!(ids.contains(&"action:quit-shelbi"));
+    }
+
+    #[test]
+    fn from_id_recovers_every_registry_command_kind() {
+        // For every command the registry emits, parsing its id back must
+        // reproduce the same typed kind — this is the registry-driven
+        // replacement for the palette's `strip_prefix` dispatch ladder. The
+        // bare `action:switch-project` entry carries an empty target, which
+        // matches the registry's placeholder.
+        let reg = CommandRegistry::new();
+        for cmd in reg.commands(&model()) {
+            let parsed = CommandKind::from_id(cmd.id())
+                .unwrap_or_else(|| panic!("from_id failed for {}", cmd.id()));
+            assert_eq!(&parsed, cmd.kind(), "kind mismatch for id {}", cmd.id());
+        }
+    }
+
+    #[test]
+    fn from_id_rejects_unknown_ids() {
+        assert!(CommandKind::from_id("not-a-command").is_none());
+        assert!(CommandKind::from_id("bogus:thing").is_none());
     }
 
     #[test]
