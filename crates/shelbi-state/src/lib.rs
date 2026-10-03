@@ -21,7 +21,9 @@ use shelbi_core::{
 
 mod agent_workspaces;
 pub mod board_index;
+pub mod change_bus;
 mod daemon_lifecycle;
+mod daemon_poller;
 pub mod done_history;
 pub mod error_log;
 mod event_log;
@@ -119,6 +121,10 @@ pub use hub_config::{
 };
 pub use daemon_lifecycle::{
     daemon_lock_held, ensure_daemon_running, hub_lock_path, stop_daemon,
+};
+pub use change_bus::{publish_change, subscribe_changes, ChangeNotification, ChangeSubscription};
+pub use daemon_poller::{
+    acquire_poller_lock, daemon_poller_enabled, poller_lock_path, PollerLock, DAEMON_POLLER_ENV,
 };
 pub use hub_version::{
     classify_daemon_version, daemon_version_status, ensure_daemon_matches_for_mutation,
