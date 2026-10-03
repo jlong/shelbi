@@ -77,7 +77,8 @@ pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Ou
 
     // Global chords fire next so a remapped Ctrl+C / Alt+Z can't be
     // shadowed by a kanban binding sharing the same chord.
-    if let Some(global) = km.global.dispatch(key) {
+    let chord = crate::keymap::chord_from_event(key);
+    if let Some(global) = chord.and_then(|c| km.global.dispatch(c)) {
         return match global {
             GlobalAction::Quit => Outcome::Quit,
             // Zen toggle is sidebar-owned (the kanban view doesn't carry
@@ -87,7 +88,7 @@ pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Ou
         };
     }
 
-    match km.kanban.dispatch(key) {
+    match chord.and_then(|c| km.kanban.dispatch(c)) {
         Some(KanbanAction::NavLeft) => app.nav_left(),
         Some(KanbanAction::NavRight) => app.nav_right(),
         Some(KanbanAction::NavUp) => app.nav_up(),
@@ -199,7 +200,7 @@ pub fn handle_popover_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) {
     // The popover is a modal — `km.global` is intentionally NOT consulted
     // so a Ctrl+P or Alt+Z from inside the popover does not leak through
     // to the global handlers. Close the popover first to use them.
-    match km.popover.dispatch(key) {
+    match crate::keymap::chord_from_event(key).and_then(|c| km.popover.dispatch(c)) {
         Some(PopoverAction::Close) => app.close_popover(),
         Some(PopoverAction::ScrollUp) => app.popover_scroll_up(),
         Some(PopoverAction::ScrollDown) => app.popover_scroll_down(),
@@ -588,22 +589,22 @@ mod tests {
 
         assert_eq!(
             km.kanban
-                .dispatch(key_with(KeyCode::Char('K'), KeyModifiers::SHIFT)),
+                .dispatch(crate::keymap::chord_from_event(key_with(KeyCode::Char('K'), KeyModifiers::SHIFT)).unwrap()),
             Some(KanbanAction::ReorderUp)
         );
         assert_eq!(
             km.kanban
-                .dispatch(key_with(KeyCode::Up, KeyModifiers::SHIFT)),
+                .dispatch(crate::keymap::chord_from_event(key_with(KeyCode::Up, KeyModifiers::SHIFT)).unwrap()),
             Some(KanbanAction::ReorderUp)
         );
         assert_eq!(
             km.kanban
-                .dispatch(key_with(KeyCode::Char('J'), KeyModifiers::SHIFT)),
+                .dispatch(crate::keymap::chord_from_event(key_with(KeyCode::Char('J'), KeyModifiers::SHIFT)).unwrap()),
             Some(KanbanAction::ReorderDown)
         );
         assert_eq!(
             km.kanban
-                .dispatch(key_with(KeyCode::Down, KeyModifiers::SHIFT)),
+                .dispatch(crate::keymap::chord_from_event(key_with(KeyCode::Down, KeyModifiers::SHIFT)).unwrap()),
             Some(KanbanAction::ReorderDown)
         );
 
@@ -662,29 +663,29 @@ mod tests {
 
         assert_eq!(
             km.popover
-                .dispatch(key_with(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+                .dispatch(crate::keymap::chord_from_event(key_with(KeyCode::Char('H'), KeyModifiers::SHIFT)).unwrap()),
             Some(PopoverAction::MoveLeft)
         );
         assert_eq!(
             km.popover
-                .dispatch(key_with(KeyCode::Left, KeyModifiers::SHIFT)),
+                .dispatch(crate::keymap::chord_from_event(key_with(KeyCode::Left, KeyModifiers::SHIFT)).unwrap()),
             Some(PopoverAction::MoveLeft)
         );
         assert_eq!(
             km.popover
-                .dispatch(key_with(KeyCode::Char('L'), KeyModifiers::SHIFT)),
+                .dispatch(crate::keymap::chord_from_event(key_with(KeyCode::Char('L'), KeyModifiers::SHIFT)).unwrap()),
             Some(PopoverAction::MoveRight)
         );
         assert_eq!(
             km.popover
-                .dispatch(key_with(KeyCode::Right, KeyModifiers::SHIFT)),
+                .dispatch(crate::keymap::chord_from_event(key_with(KeyCode::Right, KeyModifiers::SHIFT)).unwrap()),
             Some(PopoverAction::MoveRight)
         );
 
         // Plain arrows / h / l stay unbound in the popover — nav must
         // not accidentally relocate a task while the user is reading.
-        assert_eq!(km.popover.dispatch(key(KeyCode::Left)), None);
-        assert_eq!(km.popover.dispatch(key(KeyCode::Right)), None);
+        assert_eq!(km.popover.dispatch(crate::keymap::chord_from_event(key(KeyCode::Left)).unwrap()), None);
+        assert_eq!(km.popover.dispatch(crate::keymap::chord_from_event(key(KeyCode::Right)).unwrap()), None);
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -747,7 +748,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let km = fresh_keymaps();
         assert_eq!(
-            km.kanban.dispatch(key(KeyCode::Tab)),
+            km.kanban.dispatch(crate::keymap::chord_from_event(key(KeyCode::Tab)).unwrap()),
             Some(KanbanAction::CycleWorkflowFilter)
         );
 
@@ -794,13 +795,13 @@ mod tests {
 
         assert_eq!(
             km.kanban
-                .dispatch(key_with(KeyCode::Char('h'), KeyModifiers::ALT)),
+                .dispatch(crate::keymap::chord_from_event(key_with(KeyCode::Char('h'), KeyModifiers::ALT)).unwrap()),
             Some(KanbanAction::MoveCardLeft)
         );
         // Bare `H` is no longer the binding.
         assert_eq!(
             km.kanban
-                .dispatch(key_with(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+                .dispatch(crate::keymap::chord_from_event(key_with(KeyCode::Char('H'), KeyModifiers::SHIFT)).unwrap()),
             None
         );
 

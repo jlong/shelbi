@@ -9,6 +9,7 @@ members = [
     "crates/shelbi-orchestrator",
     "crates/shelbi-tui",
     "crates/shelbi-palette",
+    "crates/shelbi-app",
     "crates/shelbi-cli",
     "crates/shelbi-proto",
     "crates/shelbi-client",
@@ -76,6 +77,7 @@ shelbi-agent = { path = "crates/shelbi-agent" }
 shelbi-orchestrator = { path = "crates/shelbi-orchestrator" }
 shelbi-tui = { path = "crates/shelbi-tui" }
 shelbi-palette = { path = "crates/shelbi-palette" }
+shelbi-app = { path = "crates/shelbi-app" }
 shelbi-proto = { path = "crates/shelbi-proto" }
 shelbi-client = { path = "crates/shelbi-client" }
 shelbi-term = { path = "crates/shelbi-term" }
