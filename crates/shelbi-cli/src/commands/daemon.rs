@@ -25,6 +25,7 @@
 //!   `retire_supervisor_units` upgrade step [`serve`] calls on startup.
 
 mod board;
+mod control;
 mod lifecycle;
 mod poller;
 mod serve;

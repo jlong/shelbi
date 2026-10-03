@@ -116,8 +116,8 @@ pub use agent_workspaces::{
     SHARED_AGENT_DIR, SHARED_PREAMBLE_FILE, STALE_HOOK_COMMAND_MARKER,
 };
 pub use hub_config::{
-    hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
-    HubConfig, ProjectMeta, ProjectSummary,
+    daemon_mutations_enabled, hub_config_path, list_projects, load_hub_config, save_hub_config,
+    touch_project_launched, DevConfig, HubConfig, ProjectMeta, ProjectSummary,
 };
 pub use daemon_lifecycle::{
     daemon_lock_held, ensure_daemon_running, hub_lock_path, stop_daemon,
@@ -186,7 +186,7 @@ pub use event_log::{
 };
 pub use workspace_status::{
     clear_expected_teardown, clear_review_serve_pgid, clear_workspace_status,
-    consume_expected_teardown, expected_teardown_marker_path, hub_socket_path,
+    consume_expected_teardown, control_socket_path, expected_teardown_marker_path, hub_socket_path,
     load_workspace_status, mark_expected_teardown, parse_pane_title_marker, parse_pane_title_state,
     read_review_serve_pgid, review_serve_pgid_path, save_workspace_status, supervision_shutdown_key,
     workspace_status_path, workspaces_dir, PaneMarker, WorkspaceState, WorkspaceStatus,

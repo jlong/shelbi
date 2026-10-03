@@ -26,12 +26,54 @@ pub struct ProjectMeta {
     pub last_launched: Option<DateTime<Utc>>,
 }
 
+/// Hidden developer settings for the in-progress "removing tmux" migration.
+/// Not surfaced in the wizard or any user-facing config edit; present only so
+/// the new daemon-owned paths can be exercised before cutover. At cutover these
+/// fold into the unified session-backend selector and this struct goes away.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevConfig {
+    /// Route issue mutations (`move`/`start`/`assign`/`edit`/`add` and review
+    /// approve/reject) through the daemon's control socket instead of running
+    /// them in-process. Off by default: the CLI calls the library directly,
+    /// byte-identical to today. See [`daemon_mutations_enabled`].
+    #[serde(default)]
+    pub daemon_mutations: bool,
+}
+
+impl DevConfig {
+    fn is_default(&self) -> bool {
+        self == &DevConfig::default()
+    }
+}
+
 /// The single hub-wide config at `~/.shelbi/shelbi.yaml`. Optional —
 /// absence is treated as default-empty.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HubConfig {
     #[serde(default)]
     pub projects: BTreeMap<String, ProjectMeta>,
+    /// Hidden dev settings (see [`DevConfig`]). Omitted from the file entirely
+    /// when at defaults so an untouched config stays clean.
+    #[serde(default, skip_serializing_if = "DevConfig::is_default")]
+    pub dev: DevConfig,
+}
+
+/// Whether issue mutations should be routed through the daemon control socket.
+///
+/// `$SHELBI_DAEMON_MUTATIONS` wins when set (`1`/`true` on, `0`/`false` off) so
+/// tests and quick local toggling need not touch the config file; otherwise the
+/// hidden [`DevConfig::daemon_mutations`] flag in `~/.shelbi/shelbi.yaml`
+/// decides, defaulting to off. A config read error is treated as off — the
+/// daemon path is the opt-in, so the safe fallback is the in-process path.
+pub fn daemon_mutations_enabled() -> bool {
+    match std::env::var("SHELBI_DAEMON_MUTATIONS").ok().as_deref() {
+        Some("1") | Some("true") => return true,
+        Some("0") | Some("false") => return false,
+        _ => {}
+    }
+    load_hub_config()
+        .map(|c| c.dev.daemon_mutations)
+        .unwrap_or(false)
 }
 
 pub fn hub_config_path() -> Result<PathBuf> {

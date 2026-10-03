@@ -34,6 +34,7 @@
 //! [`shelbi-term`]: https://docs.rs/shelbi-term
 
 pub mod capability;
+pub mod control;
 pub mod error;
 pub mod frame;
 pub mod message;

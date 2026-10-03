@@ -42,9 +42,11 @@
 //! shape.
 
 pub mod connect;
+pub mod control;
 pub mod discovery;
 pub mod error;
 pub mod reader;
 pub mod spawn;
 
+pub use control::{ControlClient, Subscription};
 pub use error::ClientError;

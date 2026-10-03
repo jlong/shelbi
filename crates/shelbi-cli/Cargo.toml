@@ -22,6 +22,8 @@ shelbi-orchestrator = { workspace = true }
 shelbi-tui = { workspace = true }
 shelbi-palette = { workspace = true }
 shelbi-app = { workspace = true }
+shelbi-proto = { workspace = true }
+shelbi-client = { workspace = true }
 
 # clap derive needs to be visible in the orchestrate args struct
 
@@ -46,6 +48,10 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# The control-socket integration test (`tests/control_socket.rs`) drives a real
+# daemon over the mutation control protocol via the typed client.
+shelbi-proto = { workspace = true }
+shelbi-client = { workspace = true }
 # The GitHub-backend command tests resolve a store from project config and need
 # to inject a canned `gh` runner (no network / real repo); this feature exposes
 # `shelbi_state::set_test_gh_runner` for that. Dev-only — never in the shipped bin.

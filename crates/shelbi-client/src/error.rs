@@ -17,4 +17,18 @@ pub enum ClientError {
     /// An underlying I/O error (socket, spawn, directory scan).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The peer closed the connection before sending an expected frame.
+    #[error("connection closed before a reply was received")]
+    UnexpectedEof,
+
+    /// The daemon and client speak incompatible control protocols; relaunch.
+    #[error("hub daemon control protocol {daemon} != client {client}; run `shelbi daemon restart`")]
+    ControlProtocolMismatch { daemon: u32, client: u32 },
+
+    /// A mutation the daemon ran (or refused) returned this failure. Carries the
+    /// daemon's typed [`MutationError`](shelbi_proto::control::MutationError) so
+    /// the caller can render it exactly and set the right exit code.
+    #[error("{0}")]
+    Mutation(shelbi_proto::control::MutationError),
 }

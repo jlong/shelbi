@@ -16,6 +16,10 @@ description = "Shared application model (navigation, command registry, view mode
 shelbi-core = { workspace = true }
 shelbi-state = { workspace = true }
 shelbi-palette = { workspace = true }
+# The mutation control protocol + its blocking client. Both are UI-toolkit-free
+# (serde/std only), so the `no_ui_deps` guard still holds.
+shelbi-proto = { workspace = true }
+shelbi-client = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }

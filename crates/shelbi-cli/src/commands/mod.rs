@@ -21,6 +21,7 @@ pub mod list;
 pub mod machine;
 pub mod merge;
 pub mod message;
+pub mod mutate_client;
 pub mod open;
 pub mod orchestrate;
 pub mod orchestrator;

@@ -1,0 +1,782 @@
+//! The daemon's **mutation control socket** (`control.sock`), the one owner of
+//! issue mutations. See the "Removing tmux" plan, "The daemon executes
+//! mutations", and [`shelbi_proto::control`] for the wire protocol.
+//!
+//! A client connects, says hello, then either runs one mutation or subscribes
+//! to change notifications. For a mutation the daemon:
+//!
+//! - runs **one mutation per issue at a time**, queued — a per-`(project, id)`
+//!   mutex each job holds for its duration, so mutations on *different* issues
+//!   run concurrently;
+//! - takes an **expected state** (`status` + `updated_at`) and rejects the job
+//!   if the issue has already moved on, and **rechecks** it immediately before
+//!   the irreversible step (via the `recheck` closure `mutate::apply` invokes);
+//! - **finishes even if the client disconnects** — the job runs on a detached
+//!   thread holding its own output channel clone, so a closed socket only makes
+//!   the output sends no-op; the merge/dispatch still completes;
+//! - streams progress and the result to the requesting client and **announces
+//!   the change to every other connected client**.
+//!
+//! All std threads, no async — matching the hub socket next door. The hub
+//! socket's worker/event protocol is untouched.
+
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use shelbi_orchestrator::mutate::{self, MutateError, OutputSink};
+use shelbi_proto::control::{
+    self, ChangeNote, ClientMsg, MutationError, MutationKind, MutationRequest, ServerMsg, Stream,
+    CONTROL_PROTOCOL_VERSION,
+};
+use shelbi_state::CLIENT_VERSION;
+
+/// Shared control-socket state: per-issue serialization locks and the set of
+/// connected subscribers to notify of changes. Cheap to clone (`Arc`).
+#[derive(Clone)]
+pub(super) struct ControlState {
+    inner: Arc<Inner>,
+}
+
+/// Key into the per-issue lock table: `(project, issue id)`.
+type IssueKey = (String, String);
+
+/// The mutation executor the daemon runs under the per-issue lock. Defaults to
+/// [`mutate::apply`]; a test substitutes a stub so no real git/`gh`/agent runs.
+/// Signature mirrors [`mutate::apply`].
+type ApplyFn = dyn Fn(
+        &str,
+        &str,
+        &MutationKind,
+        &mut dyn OutputSink,
+        &mut dyn FnMut() -> Result<(), MutateError>,
+    ) -> Result<ChangeNote, MutateError>
+    + Send
+    + Sync;
+
+struct Inner {
+    /// One mutex per `(project, id)`. A mutation job holds its issue's mutex for
+    /// its whole duration; different issues use different mutexes and run
+    /// concurrently. Entries are never removed — there are only as many as there
+    /// are distinct issues touched in a daemon's lifetime.
+    issue_locks: Mutex<HashMap<IssueKey, Arc<Mutex<()>>>>,
+    /// Connected subscriber connections, keyed by connection id, each with the
+    /// sender feeding its writer thread.
+    subscribers: Mutex<HashMap<u64, Sender<ServerMsg>>>,
+    next_conn_id: AtomicU64,
+    /// The mutation executor (see [`ApplyFn`]).
+    apply: Box<ApplyFn>,
+}
+
+impl ControlState {
+    pub(super) fn new() -> Self {
+        // The production executor is `mutate::apply` itself.
+        Self::with_apply(Box::new(|project, id, kind, sink, recheck| {
+            mutate::apply(project, id, kind, sink, recheck)
+        }))
+    }
+
+    fn with_apply(apply: Box<ApplyFn>) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                issue_locks: Mutex::new(HashMap::new()),
+                subscribers: Mutex::new(HashMap::new()),
+                next_conn_id: AtomicU64::new(1),
+                apply,
+            }),
+        }
+    }
+
+    fn issue_lock(&self, project: &str, id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.inner.issue_locks.lock().unwrap();
+        locks
+            .entry((project.to_string(), id.to_string()))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn register(&self, conn_id: u64, tx: Sender<ServerMsg>) {
+        self.inner.subscribers.lock().unwrap().insert(conn_id, tx);
+    }
+
+    fn unregister(&self, conn_id: u64) {
+        self.inner.subscribers.lock().unwrap().remove(&conn_id);
+    }
+
+    /// Announce `note` to every subscriber except `origin` (which gets the
+    /// mutation's own `Done`). A dead subscriber's send just fails and is
+    /// ignored; its handler unregisters it on disconnect.
+    fn broadcast(&self, origin: u64, note: &ChangeNote) {
+        let subs = self.inner.subscribers.lock().unwrap();
+        for (&conn_id, tx) in subs.iter() {
+            if conn_id == origin {
+                continue;
+            }
+            let _ = tx.send(ServerMsg::Changed(note.clone()));
+        }
+    }
+}
+
+/// Bind the control socket (0600, like the hub socket). Returns the listener for
+/// [`serve`] to run on its own thread.
+pub(super) fn bind(path: &std::path::Path) -> anyhow::Result<UnixListener> {
+    use anyhow::Context;
+    use std::os::unix::fs::PermissionsExt;
+    // A stale socket from a crashed daemon blocks bind; the hub's single-instance
+    // lock guarantees we are the only daemon, so removing it is safe.
+    let _ = std::fs::remove_file(path);
+    let prev_umask = unsafe { libc::umask(0o177) };
+    let bind_result = UnixListener::bind(path);
+    unsafe { libc::umask(prev_umask) };
+    let listener =
+        bind_result.with_context(|| format!("binding control socket at {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 600 {}", path.display()))?;
+    Ok(listener)
+}
+
+/// Accept loop for the control socket. Polls `stop` between accepts (nonblocking
+/// listener) so a SIGTERM stops it without a self-connect wake. Detached job
+/// threads a connection spawned keep running to completion past this returning.
+pub(super) fn serve(listener: UnixListener, state: ControlState, stop: Arc<AtomicBool>) {
+    if listener.set_nonblocking(true).is_err() {
+        eprintln!("shelbi daemon: control socket could not enter nonblocking mode; not serving");
+        return;
+    }
+    while !stop.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // The listener is nonblocking so we can poll `stop` between
+                // accepts; on macOS/BSD an accepted socket *inherits* that flag,
+                // which would make the per-connection blocking read loop treat a
+                // momentary WouldBlock as EOF. Force each connection back to
+                // blocking.
+                let _ = stream.set_nonblocking(false);
+                let state = state.clone();
+                thread::spawn(move || handle_client(stream, state));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                eprintln!("shelbi daemon: control accept error: {e}");
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// Handle one control connection: hello, then a mix of mutate / subscribe
+/// requests until the client goes away.
+fn handle_client(stream: UnixStream, state: ControlState) {
+    let conn_id = state.inner.next_conn_id.fetch_add(1, Ordering::SeqCst);
+    let Ok(write_half) = stream.try_clone() else {
+        return;
+    };
+
+    // One writer thread owns the socket write-half; job threads and the
+    // broadcaster push whole `ServerMsg`s through this channel, so frames are
+    // never interleaved mid-write.
+    let (tx, rx): (Sender<ServerMsg>, Receiver<ServerMsg>) = std::sync::mpsc::channel();
+    let writer = thread::spawn(move || writer_loop(write_half, rx));
+
+    let mut reader = FrameReader::new(stream);
+    loop {
+        let msg = match reader.read_frame::<ClientMsg>() {
+            Ok(Some(m)) => m,
+            Ok(None) => break,  // clean EOF
+            Err(_) => break,    // framing/io error: drop the connection
+        };
+        match msg {
+            ClientMsg::Hello { .. } => {
+                let _ = tx.send(ServerMsg::Hello {
+                    protocol: CONTROL_PROTOCOL_VERSION,
+                    daemon_version: CLIENT_VERSION.to_string(),
+                });
+            }
+            ClientMsg::Subscribe => {
+                state.register(conn_id, tx.clone());
+            }
+            ClientMsg::Mutate(req) => {
+                // Detached: the job outlives this connection so a client that
+                // closes mid-merge doesn't abandon the work half-done.
+                let state = state.clone();
+                let tx = tx.clone();
+                thread::spawn(move || run_job(conn_id, req, state, tx));
+            }
+        }
+    }
+
+    // The client is gone. Stop announcing to it and drop our sender so the
+    // writer thread finishes once in-flight job threads release their clones.
+    state.unregister(conn_id);
+    drop(tx);
+    let _ = writer.join();
+}
+
+/// Drain `rx`, encoding each message to a frame on the socket. Exits when the
+/// channel closes (all senders dropped) or a write fails (client gone).
+fn writer_loop(mut sock: UnixStream, rx: Receiver<ServerMsg>) {
+    while let Ok(msg) = rx.recv() {
+        let Ok(bytes) = control::encode(&msg) else {
+            continue;
+        };
+        if sock.write_all(&bytes).is_err() || sock.flush().is_err() {
+            // Client gone — keep draining so senders don't block, but stop
+            // writing. (The channel is unbounded, so recv never blocks a sender.)
+            break;
+        }
+    }
+    // Drain any remaining queued messages so job-thread sends return promptly.
+    while rx.recv().is_ok() {}
+}
+
+/// Run one mutation under its per-issue lock, with the expected-state gate and
+/// the recheck closure, then report the result and broadcast the change.
+fn run_job(origin: u64, req: MutationRequest, state: ControlState, tx: Sender<ServerMsg>) {
+    let request_id = req.request_id;
+
+    // Serialize per issue. `add` with no explicit id uses an empty key — those
+    // can't collide meaningfully (the store's create is exclusive), so they
+    // share one lock harmlessly.
+    let lock = state.issue_lock(&req.project, &req.id);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Expected-state gate: refuse up front if the issue already moved on.
+    if let Some(expected) = req.expected.clone() {
+        match mutate::current_state(&req.project, &req.id) {
+            Ok(actual) if actual != expected => {
+                let _ = tx.send(ServerMsg::Failed {
+                    request_id,
+                    error: MutationError::Stale { expected, actual },
+                });
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let _ = tx.send(ServerMsg::Failed {
+                    request_id,
+                    error: e.into(),
+                });
+                return;
+            }
+        }
+    }
+
+    let mut sink = DaemonSink {
+        tx: tx.clone(),
+        request_id,
+    };
+    // Recheck closure: re-read current state and compare to `expected`,
+    // immediately before the irreversible step `mutate::apply` performs.
+    let project = req.project.clone();
+    let id = req.id.clone();
+    let expected = req.expected.clone();
+    let mut recheck = move || -> Result<(), mutate::MutateError> {
+        let Some(expected) = expected.clone() else {
+            return Ok(());
+        };
+        let actual = mutate::current_state(&project, &id)?;
+        if actual != expected {
+            return Err(mutate::MutateError::Stale { expected, actual });
+        }
+        Ok(())
+    };
+
+    match (state.inner.apply)(&req.project, &req.id, &req.kind, &mut sink, &mut recheck) {
+        Ok(note) => {
+            let _ = tx.send(ServerMsg::Done { request_id });
+            // Announce to the other connected clients.
+            state.broadcast(origin, &note);
+        }
+        Err(e) => {
+            let _ = tx.send(ServerMsg::Failed {
+                request_id,
+                error: e.into(),
+            });
+        }
+    }
+}
+
+/// An [`OutputSink`] that streams each line to the requesting client as a
+/// [`ServerMsg::Line`]. A failed send (client gone) is ignored — the mutation
+/// still runs to completion.
+struct DaemonSink {
+    tx: Sender<ServerMsg>,
+    request_id: u64,
+}
+
+impl OutputSink for DaemonSink {
+    fn emit(&mut self, stream: Stream, text: &str) {
+        let _ = self.tx.send(ServerMsg::Line {
+            request_id: self.request_id,
+            stream,
+            text: text.to_string(),
+        });
+    }
+}
+
+/// Reads length-prefixed control frames off a blocking socket, buffering partial
+/// reads. (A sibling of the client's reader; kept local so the daemon doesn't
+/// depend on `shelbi-client`.)
+struct FrameReader {
+    inner: UnixStream,
+    buf: Vec<u8>,
+    start: usize,
+}
+
+impl FrameReader {
+    fn new(inner: UnixStream) -> Self {
+        Self {
+            inner,
+            buf: Vec::with_capacity(4096),
+            start: 0,
+        }
+    }
+
+    fn read_frame<T: serde::de::DeserializeOwned>(
+        &mut self,
+    ) -> Result<Option<T>, shelbi_proto::ProtoError> {
+        loop {
+            match control::decode::<T>(&self.buf[self.start..]) {
+                Ok((msg, consumed)) => {
+                    self.start += consumed;
+                    if self.start > 1 << 16 {
+                        self.buf.drain(..self.start);
+                        self.start = 0;
+                    }
+                    return Ok(Some(msg));
+                }
+                Err(shelbi_proto::ProtoError::Incomplete { .. }) => {
+                    let mut chunk = [0u8; 4096];
+                    // A read error (reset, timeout) is treated like EOF: the
+                    // handler drops the connection either way.
+                    let n = match self.inner.read(&mut chunk) {
+                        Ok(n) => n,
+                        Err(_) => return Ok(None),
+                    };
+                    if n == 0 {
+                        // EOF, whole or partial frame — a clean close.
+                        return Ok(None);
+                    }
+                    self.buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issue_lock_is_shared_per_key_and_distinct_across_keys() {
+        let state = ControlState::new();
+        let a1 = state.issue_lock("p", "t1");
+        let a2 = state.issue_lock("p", "t1");
+        let b = state.issue_lock("p", "t2");
+        // Same key → same mutex (so same-issue mutations serialize).
+        assert!(Arc::ptr_eq(&a1, &a2));
+        // Different key → different mutex (so different issues run concurrently).
+        assert!(!Arc::ptr_eq(&a1, &b));
+    }
+
+    #[test]
+    fn broadcast_reaches_other_subscribers_but_not_the_origin() {
+        let state = ControlState::new();
+        let (tx1, rx1) = std::sync::mpsc::channel();
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        state.register(1, tx1);
+        state.register(2, tx2);
+
+        let note = ChangeNote {
+            project: "p".into(),
+            id: "t1".into(),
+            verb: "move".into(),
+            status: "todo".into(),
+            updated_at: String::new(),
+        };
+        state.broadcast(1, &note);
+
+        // Origin (conn 1) is not notified of its own change.
+        assert!(rx1.try_recv().is_err());
+        // The other subscriber is.
+        match rx2.try_recv() {
+            Ok(ServerMsg::Changed(got)) => assert_eq!(got, note),
+            other => panic!("expected a Changed note, got {other:?}"),
+        }
+
+        // After unregister, a subscriber stops receiving.
+        state.unregister(2);
+        state.broadcast(1, &note);
+        assert!(rx2.try_recv().is_err());
+    }
+
+    // --- in-process control-socket tests with a STUB executor ----------------
+    //
+    // These drive the real control server (ControlState + serve + run_job) over
+    // a real socket, in-process, with `mutate::apply` replaced by a stub so no
+    // git/`gh`/agent runs. The stub performs the status move through the real
+    // filesystem store (so the expected-state gate sees the change) and records
+    // whether it "merged"/"started an agent"; one stub can block on a barrier to
+    // model a mutation still running when the client disconnects.
+
+    use crate::commands::test_support::ENV_LOCK;
+    use shelbi_client::ControlClient;
+    use shelbi_core::Column;
+    use shelbi_proto::control::{ExpectedState, MutationKind};
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AOrd};
+    use std::sync::Barrier;
+    use std::time::{Duration, Instant};
+
+    const T0: &str = "2026-01-01T00:00:00+00:00";
+
+    fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            if cond() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    /// An isolated `SHELBI_HOME` with a filesystem project `p`. Holds the env
+    /// lock for the whole test (the daemon job threads read `SHELBI_HOME`).
+    struct Home {
+        path: PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Home {
+        fn new(tag: &str) -> Self {
+            let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let path = std::env::temp_dir().join(format!(
+                "shb-ctl-unit-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(path.join("projects/p/tasks")).unwrap();
+            std::fs::write(
+                path.join("projects/p.yaml"),
+                "name: p\nrepo: /tmp/p\ndefault_branch: main\n\
+                 orchestrator:\n  runner: claude\n\
+                 agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+                 machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/p\n\
+                 workspaces:\n  - { name: dev, machine: local, runner: claude }\n",
+            )
+            .unwrap();
+            std::env::set_var("SHELBI_HOME", &path);
+            Self { path, _guard: guard }
+        }
+
+        fn write_issue(&self, id: &str, column: &str) {
+            std::fs::write(
+                self.path.join(format!("projects/p/tasks/{id}.md")),
+                format!(
+                    "---\nid: {id}\ntitle: {id}\ncolumn: {column}\npriority: 0\n\
+                     created_at: {T0}\nupdated_at: {T0}\n---\nbody\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        fn column_of(&self, id: &str) -> String {
+            std::fs::read_to_string(self.path.join(format!("projects/p/tasks/{id}.md")))
+                .unwrap_or_default()
+                .lines()
+                .find_map(|l| l.strip_prefix("column:"))
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default()
+        }
+    }
+
+    impl Drop for Home {
+        fn drop(&mut self) {
+            std::env::remove_var("SHELBI_HOME");
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Records what the stub executor did, so a test can assert that the loser of
+    /// a race never ran (no merge / no second agent) and that a job finished.
+    #[derive(Default)]
+    struct Recorder {
+        calls: Mutex<Vec<(String, String)>>,
+        merges: AtomicUsize,
+        agent_starts: AtomicUsize,
+        started: AtomicBool,
+        finished: AtomicBool,
+    }
+
+    /// A [`ControlState`] whose executor is a stub: it honors the recheck, records
+    /// the call, simulates the side effect (merge / agent start) without touching
+    /// git/`gh`/tmux, optionally blocks on `gate`, then performs the real status
+    /// move through the filesystem store so the next request's gate sees it.
+    fn stub_state(rec: Arc<Recorder>, gate: Option<Arc<Barrier>>) -> ControlState {
+        ControlState::with_apply(Box::new(move |project, id, kind, _sink, recheck| {
+            recheck()?;
+            rec.started.store(true, AOrd::SeqCst);
+            rec.calls
+                .lock()
+                .unwrap()
+                .push((id.to_string(), kind.verb().to_string()));
+            match kind {
+                MutationKind::Approve => {
+                    rec.merges.fetch_add(1, AOrd::SeqCst);
+                }
+                MutationKind::Start { .. } => {
+                    rec.agent_starts.fetch_add(1, AOrd::SeqCst);
+                }
+                _ => {}
+            }
+            if let Some(b) = &gate {
+                b.wait();
+            }
+            let target_name = match kind {
+                MutationKind::Move { to, .. } => to.as_str(),
+                MutationKind::Approve => "done",
+                MutationKind::Reject { .. } => "todo",
+                MutationKind::Start { .. } => "in-progress",
+                _ => "todo",
+            };
+            let target = Column::from_status_id(target_name);
+            let store = shelbi_state::issue_store_for(project).map_err(MutateError::backend)?;
+            store
+                .move_status(id, &target, "test:stub")
+                .map_err(MutateError::backend)?;
+            rec.finished.store(true, AOrd::SeqCst);
+            Ok(ChangeNote {
+                project: project.to_string(),
+                id: id.to_string(),
+                verb: kind.verb().to_string(),
+                status: target.as_str().to_string(),
+                updated_at: String::new(),
+            })
+        }))
+    }
+
+    /// A control server running on a real socket in a background thread.
+    struct Served {
+        sock: PathBuf,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    fn serve_bg(state: ControlState, tag: &str) -> Served {
+        let sock = PathBuf::from(format!("/tmp/shb-ctlu-{}-{tag}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = bind(&sock).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let stop = stop.clone();
+            thread::spawn(move || serve(listener, state, stop))
+        };
+        assert!(
+            wait_until(Duration::from_secs(5), || ControlClient::connect(
+                &sock,
+                "test"
+            )
+            .is_ok()),
+            "control server never came up"
+        );
+        Served {
+            sock,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    impl Drop for Served {
+        fn drop(&mut self) {
+            self.stop.store(true, AOrd::SeqCst);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+            let _ = std::fs::remove_file(&self.sock);
+        }
+    }
+
+    fn req(request_id: u64, id: &str, kind: MutationKind, expected: ExpectedState) -> MutationRequest {
+        MutationRequest {
+            request_id,
+            project: "p".into(),
+            id: id.into(),
+            expected: Some(expected),
+            kind,
+        }
+    }
+
+    fn at_review() -> ExpectedState {
+        ExpectedState {
+            status: "review".into(),
+            updated_at: T0.into(),
+        }
+    }
+
+    fn at_todo() -> ExpectedState {
+        ExpectedState {
+            status: "todo".into(),
+            updated_at: T0.into(),
+        }
+    }
+
+    fn is_stale(r: &Result<(), shelbi_client::ClientError>) -> bool {
+        matches!(
+            r,
+            Err(shelbi_client::ClientError::Mutation(MutationError::Stale { .. }))
+        )
+    }
+
+    /// Run `kind` against the server at `sock` on its own thread/connection.
+    fn fire(
+        sock: &std::path::Path,
+        request_id: u64,
+        kind: MutationKind,
+        expected: ExpectedState,
+    ) -> thread::JoinHandle<Result<(), shelbi_client::ClientError>> {
+        let sock = sock.to_path_buf();
+        thread::spawn(move || {
+            let mut client = ControlClient::connect(&sock, "test").unwrap();
+            client.mutate(&req(request_id, "t1", kind, expected), &mut |_s, _t| {})
+        })
+    }
+
+    #[test]
+    fn approve_against_reject_from_two_clients_one_wins_the_other_is_stale_with_no_merge() {
+        let home = Home::new("appvrej");
+        home.write_issue("t1", "review");
+        let rec = Arc::new(Recorder::default());
+        let served = serve_bg(stub_state(rec.clone(), None), "appvrej");
+
+        let a = fire(&served.sock, 1, MutationKind::Approve, at_review());
+        let r = fire(
+            &served.sock,
+            2,
+            MutationKind::Reject {
+                reason: "no".into(),
+            },
+            at_review(),
+        );
+        let ra = a.join().unwrap();
+        let rr = r.join().unwrap();
+
+        let oks = [&ra, &rr].iter().filter(|x| x.is_ok()).count();
+        let stales = [&ra, &rr].iter().filter(|x| is_stale(x)).count();
+        assert_eq!(oks, 1, "exactly one of approve/reject wins: {ra:?} {rr:?}");
+        assert_eq!(stales, 1, "the loser is rejected as stale: {ra:?} {rr:?}");
+        // The loser never reached the executor — so it ran no merge.
+        assert_eq!(
+            rec.calls.lock().unwrap().len(),
+            1,
+            "only the winner executed"
+        );
+        assert!(
+            rec.merges.load(AOrd::SeqCst) <= 1,
+            "the loser performed no merge"
+        );
+    }
+
+    #[test]
+    fn the_same_issue_started_twice_at_once_starts_exactly_one_agent() {
+        let home = Home::new("dbldisp");
+        home.write_issue("t1", "todo");
+        let rec = Arc::new(Recorder::default());
+        let served = serve_bg(stub_state(rec.clone(), None), "dbldisp");
+
+        let start = || MutationKind::Start {
+            workspace: Some("dev".into()),
+            branch: None,
+            reason: None,
+            force: false,
+        };
+        let a = fire(&served.sock, 1, start(), at_todo());
+        let b = fire(&served.sock, 2, start(), at_todo());
+        let ra = a.join().unwrap();
+        let rb = b.join().unwrap();
+
+        assert_eq!(
+            [&ra, &rb].iter().filter(|x| x.is_ok()).count(),
+            1,
+            "exactly one dispatch wins: {ra:?} {rb:?}"
+        );
+        assert_eq!([&ra, &rb].iter().filter(|x| is_stale(x)).count(), 1);
+        assert_eq!(
+            rec.agent_starts.load(AOrd::SeqCst),
+            1,
+            "exactly one agent is started"
+        );
+        // The canonical on-disk spelling of the active status.
+        assert_eq!(home.column_of("t1"), "in_progress");
+    }
+
+    #[test]
+    fn a_merge_crossing_mutation_finishes_after_the_client_disconnects() {
+        let home = Home::new("midmerge");
+        home.write_issue("t1", "review");
+        let rec = Arc::new(Recorder::default());
+        // The approve stub blocks at this barrier, so the "merge" is still in
+        // flight when we close the client below.
+        let gate = Arc::new(Barrier::new(2));
+        let served = serve_bg(stub_state(rec.clone(), Some(gate.clone())), "midmerge");
+
+        // Send approve on a raw connection, then close it WITHOUT reading the
+        // reply, while the stub is blocked mid-merge.
+        {
+            let mut raw = UnixStream::connect(&served.sock).unwrap();
+            raw.write_all(
+                &control::encode(&ClientMsg::Hello {
+                    protocol: CONTROL_PROTOCOL_VERSION,
+                    client_version: "test".into(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            raw.write_all(
+                &control::encode(&ClientMsg::Mutate(req(
+                    1,
+                    "t1",
+                    MutationKind::Approve,
+                    at_review(),
+                )))
+                .unwrap(),
+            )
+            .unwrap();
+            raw.flush().unwrap();
+            // Wait until the job is inside the (blocked) merge, then leave.
+            assert!(
+                wait_until(Duration::from_secs(5), || rec.started.load(AOrd::SeqCst)),
+                "the job never started the merge"
+            );
+            raw.shutdown(Shutdown::Both).unwrap();
+        }
+
+        // The client is gone; now let the merge proceed. It must finish and the
+        // status must be written even though no one is listening.
+        gate.wait();
+        assert!(
+            wait_until(Duration::from_secs(5), || rec.finished.load(AOrd::SeqCst)),
+            "the merge did not finish after the client left"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || home.column_of("t1") == "done"),
+            "the status was not written (got `{}`)",
+            home.column_of("t1")
+        );
+        assert_eq!(rec.merges.load(AOrd::SeqCst), 1);
+    }
+}
