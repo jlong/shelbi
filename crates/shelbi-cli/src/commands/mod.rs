@@ -18,6 +18,7 @@ pub mod init;
 pub mod issue;
 pub mod issue_store;
 pub mod list;
+pub mod machine;
 pub mod merge;
 pub mod message;
 pub mod open;
