@@ -39,11 +39,12 @@ pub fn activity_loop<B: Backend>(term: &mut Terminal<B>, app: &mut ActivityApp) 
 /// (Ctrl+C / the Zen-toggle chord / Ctrl+P) win over activity chords so
 /// a user can't accidentally shadow a quit binding with a local nav key.
 pub fn handle_activity_key(app: &mut ActivityApp, key: KeyEvent, km: &Keymaps) {
-    if let Some(global) = km.global.dispatch(key) {
+    let chord = crate::keymap::chord_from_event(key);
+    if let Some(global) = chord.and_then(|c| km.global.dispatch(c)) {
         dispatch_global(app, global);
         return;
     }
-    match km.activity.dispatch(key) {
+    match chord.and_then(|c| km.activity.dispatch(c)) {
         Some(ActivityAction::ScrollUp) => app.scroll_up(),
         Some(ActivityAction::ScrollDown) => app.scroll_down(),
         Some(ActivityAction::PageUp) => app.scroll_page_up(),

@@ -25,7 +25,7 @@ use ratatui::{
 use shelbi_core::StatusCategory;
 use shelbi_palette::{Entry, EntryKind};
 use shelbi_state::keymap::{
-    load_keymaps, GlobalAction, KeyChord, KeymapDiagnostic, Keymaps, PaletteAction,
+    load_keymaps, GlobalAction, KeymapDiagnostic, Keymaps, PaletteAction,
 };
 use shelbi_state::{load_user_config, ProjectSummary, ZenModeState, ZenToggleChord};
 use shelbi_tui::{decoration_to_color, App, Row, View, WorkspaceOverview};
@@ -388,7 +388,7 @@ fn picker_loop<B: ratatui::backend::Backend>(
                     continue;
                 }
                 if let Some(c) = opener_close {
-                    if c == KeyChord::from_event(k) {
+                    if crate::keys::chord_from_event(k) == Some(c) {
                         return Ok(None);
                     }
                 }
@@ -420,7 +420,7 @@ fn picker_loop<B: ratatui::backend::Backend>(
                     }
                     _ => {}
                 }
-                match keymaps.palette.dispatch(k) {
+                match crate::keys::chord_from_event(k).and_then(|c| keymaps.palette.dispatch(c)) {
                     Some(PaletteAction::Close) => return Ok(None),
                     Some(PaletteAction::Activate) => {
                         if state.focus == Focus::Projects && state.projects_column_visible() {
@@ -1255,7 +1255,7 @@ fn run_zen_intro_popover<B: ratatui::backend::Backend>(
                     continue;
                 }
                 if let Some(c) = opener_close {
-                    if c == KeyChord::from_event(k) {
+                    if crate::keys::chord_from_event(k) == Some(c) {
                         return Ok(ZenIntroResult {
                             confirmed: false,
                             dont_show_again: state.dont_show_again,
@@ -1338,11 +1338,11 @@ fn run_project_picker<B: ratatui::backend::Backend>(
                     continue;
                 }
                 if let Some(c) = opener_close {
-                    if c == KeyChord::from_event(k) {
+                    if crate::keys::chord_from_event(k) == Some(c) {
                         return Ok(None);
                     }
                 }
-                match keymaps.palette.dispatch(k) {
+                match crate::keys::chord_from_event(k).and_then(|c| keymaps.palette.dispatch(c)) {
                     Some(PaletteAction::Close) => return Ok(None),
                     Some(PaletteAction::Activate) => {
                         if let Some(p) = results.get(selected) {
@@ -1627,7 +1627,7 @@ fn run_quit_shelbi_confirm<B: ratatui::backend::Backend>(
                     continue;
                 }
                 if let Some(c) = opener_close {
-                    if c == KeyChord::from_event(k) {
+                    if crate::keys::chord_from_event(k) == Some(c) {
                         return Ok(false);
                     }
                 }
@@ -1641,7 +1641,7 @@ fn run_quit_shelbi_confirm<B: ratatui::backend::Backend>(
                     }
                     _ => {}
                 }
-                match keymaps.palette.dispatch(k) {
+                match crate::keys::chord_from_event(k).and_then(|c| keymaps.palette.dispatch(c)) {
                     Some(PaletteAction::Close) => return Ok(false),
                     Some(PaletteAction::Activate) => return Ok(focus_quit),
                     // NavUp / NavDown / Backspace have no meaningful
@@ -1685,7 +1685,7 @@ fn run_quit_project_confirm<B: ratatui::backend::Backend>(
                     continue;
                 }
                 if let Some(c) = opener_close {
-                    if c == KeyChord::from_event(k) {
+                    if crate::keys::chord_from_event(k) == Some(c) {
                         return Ok(false);
                     }
                 }
@@ -1699,7 +1699,7 @@ fn run_quit_project_confirm<B: ratatui::backend::Backend>(
                     }
                     _ => {}
                 }
-                match keymaps.palette.dispatch(k) {
+                match crate::keys::chord_from_event(k).and_then(|c| keymaps.palette.dispatch(c)) {
                     Some(PaletteAction::Close) => return Ok(false),
                     Some(PaletteAction::Activate) => return Ok(focus_quit),
                     Some(_) | None => {}

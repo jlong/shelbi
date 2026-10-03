@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 mod issue_tracker_setup;
+mod keys;
 mod project_root;
 mod wizard;
 
