@@ -56,7 +56,7 @@ fixable, plus the emulator decision.
 | Subtask | Scope | Status |
 | --- | --- | --- |
 | `rt-spike-emulator-replay` | Serialize full emulator state and rebuild it in a second emulator; **decides the emulator crate** | Landed — see [`phase0/emulator-replay.md`](phase0/emulator-replay.md); chose vendored `alacritty_terminal` |
-| `rt-spike-agents` | Claude Code (full-screen + inline) and Codex in a PTY rendered by a ratatui widget: keys incl. Shift+Enter, mouse, paste, wide chars, redraw cost | Pending |
+| `rt-spike-agents` | Claude Code (full-screen + inline) and Codex in a PTY rendered by a ratatui widget: keys incl. Shift+Enter, mouse, paste, wide chars, redraw cost | Landed ([findings](phase0/agents.md)) |
 | `rt-spike-runtime` | Process survival (outliving the launcher on macOS and Linux/logind; child group dies on kill), the startup query responder, and nesting inside tmux and Screen | Landed (macOS + ssh + `portable-pty` verified; Linux/logind untested, no reachable host; see [`phase0/runtime.md`](phase0/runtime.md)) |
 
 ### Phase 1 — Session process, protocol, attach
