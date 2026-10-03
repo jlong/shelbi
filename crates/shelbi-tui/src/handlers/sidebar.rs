@@ -30,6 +30,11 @@ pub fn sidebar_loop<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> Result
     let keymaps = app.keymaps().clone();
     while !app.should_quit {
         app.maybe_refresh().ok();
+        // Apply any pushed layout events (`rt-daemon-layout-split`): the daemon's
+        // poller drives the session half of a split and publishes a layout event
+        // the sidebar reacts to, doing the pane/window work the poller used to do
+        // inline. Non-blocking drain, so a quiet bus costs nothing.
+        app.poll_layout_events();
         // Drain any in-flight background review load so the spinner/outcome
         // shows up on the next frame without the UI thread ever blocking.
         app.poll_review_load();

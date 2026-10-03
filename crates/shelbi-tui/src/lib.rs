@@ -25,6 +25,7 @@ mod error_report;
 mod handlers;
 mod kanban;
 mod keymap;
+mod layout_sub;
 mod markdown;
 mod review_panel;
 mod sidebar;
@@ -253,6 +254,30 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     let _poller = (!shelbi_state::daemon_poller_enabled())
         .then(|| WorkspacePoller::start(project_name));
 
+    // Subscribe to pushed layout events (`rt-daemon-layout-split`). Two sources
+    // feed one handling path in the sidebar loop:
+    //   * the in-process change bus, for the setting-off case where the poller
+    //     runs *here* and publishes in-process (subscribed before the poller
+    //     above starts, so none of its events are missed), and
+    //   * the hub socket, for the default case where the poller runs in the
+    //     daemon and the daemon forwards layout notifications to this client.
+    // The socket subscriber's RAII handle stops its thread when this function
+    // returns, like the poller handle.
+    let layout_bus = shelbi_state::subscribe_changes();
+    let (_layout_sub, layout_rx) = layout_sub::spawn(project_name);
+    app.set_layout_sources(layout_rx, layout_bus);
+
+    // Lay out from current state, once: a sidebar that connected *after* a
+    // layout event fired isn't sent a backlog (the events are deltas), so it
+    // reads the durable review state and builds the panels an already-running
+    // sidebar would have (`docs/removing-tmux/phase3-daemon.md`, "No client
+    // attached"). Only when the daemon drives the poller — with the in-sidebar
+    // poller, this process produced the events itself and nothing was missed.
+    // Idempotent and best-effort: a slot whose window isn't up yet is a no-op.
+    if shelbi_state::daemon_poller_enabled() {
+        lay_out_review_from_state(project_name);
+    }
+
     // Route panic diagnostics to `tui.log`. The render loop catches a
     // render-pass panic and repaints (see `draw_sidebar_self_healing`), but
     // the panic hook still runs first — the *default* hook writes to stderr,
@@ -267,6 +292,34 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
 
     restore_terminal(&mut term).context("restoring terminal")?;
     result
+}
+
+/// Build the review panel for every review slot the durable state says should
+/// have one (`rt-daemon-layout-split`). The state query
+/// ([`shelbi_orchestrator::review_ui::review_layout_state`]) is backend-only (no
+/// tmux); each build is the same no-focus panel split the poller's resume event
+/// drives, idempotent and best-effort so a slot whose window isn't live yet is
+/// simply skipped until it is.
+fn lay_out_review_from_state(project_name: &str) {
+    match shelbi_orchestrator::review_ui::review_layout_state(project_name) {
+        Ok(slots) => {
+            for slot in slots {
+                if let Err(e) = shelbi_orchestrator::review_ui::build_review_panel_no_focus(
+                    project_name,
+                    &slot.task,
+                ) {
+                    tracing::debug!(
+                        project = %project_name, task = %slot.task, error = %e,
+                        "startup layout: review panel not built yet (window not up?)"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::debug!(
+            project = %project_name, error = %e,
+            "startup layout: could not read review layout state"
+        ),
+    }
 }
 
 /// Run the Kanban tasks view in the current pane. Meant to be hosted in

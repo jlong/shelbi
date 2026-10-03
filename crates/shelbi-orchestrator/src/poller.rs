@@ -685,18 +685,20 @@ fn maybe_github_reconcile(
         Ok(reconciled) => {
             for r in reconciled {
                 // The task is now done; free the review slot that was serving it
-                // so the auto-loader can hand the slot its next task. Mirrors the
-                // accept flow (approve → close_review_window). Best-effort and
-                // scoped to a review-tagged slot inside the call, so a task on a
-                // non-review workspace (or none) is a clean no-op.
-                if let Err(e) =
-                    crate::review_ui::close_review_window(&project.name, &r.task_id)
-                {
-                    tracing::debug!(
-                        project = %project.name, task = %r.task_id, pr = r.pr, error = %e,
-                        "github-merge reconcile: freeing the review slot failed (task already advanced to done)"
-                    );
-                }
+                // so the auto-loader can hand the slot its next task. The poller
+                // makes no tmux layout / `review_ui` pane call
+                // (`rt-daemon-layout-split`): it publishes the layout event a
+                // client reacts to. On tmux the always-present dashboard sidebar
+                // runs `close_review_window` — killing the slot pane and clearing
+                // its status, exactly the accept flow's teardown — and a task on a
+                // non-review slot (or none) stays a client-side no-op.
+                shelbi_state::publish_layout(
+                    &project.name,
+                    shelbi_state::LayoutEvent::ReviewClosed {
+                        workspace: r.workspace.clone().unwrap_or_default(),
+                        task: r.task_id.clone(),
+                    },
+                );
             }
         }
         Err(e) => tracing::warn!(
@@ -4011,6 +4013,43 @@ fn redispatch_workspace(
 /// is [`ensure_dashboard`], whose `__zen-orch-start` step keeps the Zen
 /// crash-recovery downgrade intact — a restarted orchestrator still comes up
 /// with Zen off.
+/// Whether review slot `workspace`'s agent is alive but **parked** outside a
+/// window — a View Diff / editor swap collapsed its window while the agent kept
+/// running in the stash ([`crate::review_ui::recover_parked_review_agent`]).
+///
+/// A read-only probe over the [`SessionBackend`] seam: the review interface's
+/// session env records which slot it is bound to ([`crate::review_ui::WS_KEY`])
+/// and the agent's chat pane id ([`crate::review_ui::CHAT_KEY`]); the slot is
+/// parked when the interface is bound to *this* window and that chat pane is
+/// still live. It makes no tmux layout call and no `review_ui` pane call
+/// (`rt-daemon-layout-split`), so the daemon poller can decide *not* to relaunch
+/// — the break-pane recovery itself is a client's reaction to the published
+/// `ReviewAgentRecovered` event. Conservative: any missing var or probe
+/// uncertainty reads as "not parked", so a genuinely dead slot still resumes.
+fn parked_review_agent_present(project: &Project, workspace: &str) -> bool {
+    let Some(hub) = project
+        .machines
+        .iter()
+        .find(|m| matches!(m.kind, shelbi_core::MachineKind::Local))
+    else {
+        return false;
+    };
+    let host = hub.host();
+    let session = SessionTarget::session(format!("shelbi-{}", project.name));
+    // The interface must be bound to THIS slot's window…
+    match backend().get_env(&host, &session, crate::review_ui::WS_KEY) {
+        Ok(Some(ws)) if ws == workspace => {}
+        _ => return false,
+    }
+    // …and its agent (chat) pane must still be alive somewhere on the server.
+    let Ok(Some(chat)) = backend().get_env(&host, &session, crate::review_ui::CHAT_KEY) else {
+        return false;
+    };
+    backend()
+        .probe(&host, &SessionTarget::pane(chat), None)
+        .is_alive()
+}
+
 fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState) {
     let alive = crate::orchestrator_pane_alive(&project.name).unwrap_or(true);
     let inputs = SupervisionInputs {
@@ -4020,27 +4059,46 @@ fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState)
     };
     match state.decide(&inputs, Instant::now()) {
         SupervisionAction::None => {}
-        SupervisionAction::Restart => match crate::ensure_dashboard(&project.name) {
-            Ok(_) => {
-                if let Err(e) =
-                    shelbi_state::append_supervision_event(&project.name, None, "restart", "crash")
-                {
-                    tracing::warn!(project = %project.name, error = %e, "append_supervision_event failed");
+        SupervisionAction::Restart => {
+            // The session half: restart the orchestrator through the
+            // `SessionBackend` seam, with no tmux layout call
+            // (`rt-daemon-layout-split`). The layout half — placing/rebuilding the
+            // dashboard — is the published `OrchestratorRestarted` event a client
+            // reacts to (on tmux the always-present sidebar re-runs
+            // `ensure_dashboard`, which re-splits the orchestrator pane if the
+            // crash collapsed it). The event fires whether or not the in-place
+            // respawn landed, so a client always heals the view; the respawn
+            // succeeding is the no-client-attached restart the daemon owns.
+            let outcome = crate::supervise_restart_orchestrator(&backend(), &project.name);
+            shelbi_state::publish_layout(
+                &project.name,
+                shelbi_state::LayoutEvent::OrchestratorRestarted,
+            );
+            match outcome {
+                Ok(_) => {
+                    if let Err(e) = shelbi_state::append_supervision_event(
+                        &project.name,
+                        None,
+                        "restart",
+                        "crash",
+                    ) {
+                        tracing::warn!(project = %project.name, error = %e, "append_supervision_event failed");
+                    }
+                    tracing::info!(project = %project.name, "supervisor relaunched crashed orchestrator pane");
                 }
-                tracing::info!(project = %project.name, "supervisor relaunched crashed orchestrator pane");
-            }
-            Err(e) => {
-                if let Err(le) = shelbi_state::append_supervision_event(
-                    &project.name,
-                    None,
-                    "restart-failed",
-                    &e.to_string(),
-                ) {
-                    tracing::warn!(project = %project.name, error = %le, "append_supervision_event failed");
+                Err(e) => {
+                    if let Err(le) = shelbi_state::append_supervision_event(
+                        &project.name,
+                        None,
+                        "restart-failed",
+                        &e.to_string(),
+                    ) {
+                        tracing::warn!(project = %project.name, error = %le, "append_supervision_event failed");
+                    }
+                    tracing::warn!(project = %project.name, error = %e, "supervisor orchestrator relaunch failed");
                 }
-                tracing::warn!(project = %project.name, error = %e, "supervisor orchestrator relaunch failed");
             }
-        },
+        }
         SupervisionAction::GiveUp => {
             if let Err(e) =
                 shelbi_state::append_supervision_event(&project.name, None, "gave-up", "crash-loop")
@@ -4356,8 +4414,17 @@ fn maybe_resume_stranded_review_slots(
         // stash by a View Diff / editor swap whose content pane (and the panel)
         // since exited. Bring that agent back instead of relaunching: a relaunch
         // reseeds a second agent into a bare window and strands the parked one
-        // as a zombie.
-        if crate::review_ui::recover_parked_review_agent(&project.name, &ws.name) {
+        // as a zombie. The poller only *detects* the parked agent (a read-only
+        // probe over the `SessionBackend` seam — no tmux layout, no `review_ui`
+        // pane call, `rt-daemon-layout-split`); the break-pane recovery is a
+        // client's reaction to the published `ReviewAgentRecovered` event.
+        if parked_review_agent_present(project, &ws.name) {
+            shelbi_state::publish_layout(
+                &project.name,
+                shelbi_state::LayoutEvent::ReviewAgentRecovered {
+                    workspace: ws.name.clone(),
+                },
+            );
             if let Err(e) = shelbi_state::append_workspace_pane_event(
                 &project.name,
                 &ws.name,
@@ -4429,33 +4496,24 @@ fn maybe_resume_stranded_review_slots(
                             workspace = %ws.name,
                             "resumed stranded review slot",
                         );
-                        // The relaunch brings the slot's window back as a bare
-                        // agent/server pane; build its review panel beside it so
-                        // the resumed window matches a fresh load's layout
-                        // (`panel | agent`) without the human having to select
-                        // the task in the sidebar. No-focus: the poller runs in
-                        // the background and must never switch the user's active
-                        // window. `resume_review_task` returns only once the
-                        // relaunch's window is live, so the split lands now; a
-                        // `NeedsLaunch`/`Loading` outcome (window/assignment not
-                        // ready yet) is reported back and left for a later tick,
-                        // never kicking off a second load, and a build error is
-                        // surfaced without counting as a resume crash.
-                        match crate::review_ui::build_review_panel_no_focus(
+                        // The relaunch (the session half — `resume_review_task`
+                        // returns only once the slot's window is live again)
+                        // brings the slot back as a bare agent/server pane. The
+                        // layout half — building the review panel beside it so the
+                        // resumed window matches a fresh load's `panel | agent`
+                        // without the human selecting the task — is the published
+                        // `ReviewOpened` event a client reacts to
+                        // (`rt-daemon-layout-split`): the poller makes no tmux
+                        // split / `review_ui` pane call. On tmux the always-present
+                        // sidebar builds the panel no-focus, so the background
+                        // resume never steals the user's active window.
+                        shelbi_state::publish_layout(
                             &project.name,
-                            &task_id,
-                        ) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    project = %project.name,
-                                    task = %task_id,
-                                    workspace = %ws.name,
-                                    error = %e,
-                                    "building the review panel after resume failed",
-                                );
-                            }
-                        }
+                            shelbi_state::LayoutEvent::ReviewOpened {
+                                workspace: ws.name.clone(),
+                                task: task_id.clone(),
+                            },
+                        );
                     }
                     Err(e) => {
                         // Observable failure (the gap the bug called out): a

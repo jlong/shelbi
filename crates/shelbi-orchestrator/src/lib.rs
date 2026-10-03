@@ -365,6 +365,88 @@ fn pane_in_list_output(out: &std::process::Output, pane_id: &str) -> bool {
         .any(|p| p.trim() == pane_id)
 }
 
+/// Restart a crashed orchestrator — the **session half** of the supervision
+/// relaunch, split out of [`ensure_dashboard`] for the daemon
+/// (`rt-daemon-layout-split`; `docs/removing-tmux/phase3-daemon.md`, "Layout
+/// leaves the poller").
+///
+/// The daemon's poller owns detecting the crash ([`orchestrator_pane_alive`])
+/// and driving the session back up, but it must make no tmux *layout* call and
+/// no `review_ui` pane call. So the restart goes through the
+/// [`SessionBackend`](session_backend::SessionBackend) seam: it rebuilds the
+/// orchestrator's launch command (the same wrapper [`ensure_dashboard`] splits
+/// in, minus the first-launch greeting) and asks the backend to **respawn the
+/// pinned orchestrator session in place**. The poller then publishes a
+/// [`LayoutEvent::OrchestratorRestarted`](shelbi_state::LayoutEvent) so a client
+/// — on tmux the always-present dashboard sidebar pane — arranges the view
+/// (re-running [`ensure_dashboard`] if the pane had vanished entirely, which is
+/// the tmux layout the daemon no longer does itself).
+///
+/// Generic over the backend so supervision is testable with a stub that records
+/// the respawn without a tmux server (the "restart with no client attached"
+/// test): `backend()` returns the tmux backend in production, where respawn maps
+/// to `respawn-pane -k` and `get_env` to `show-environment`.
+///
+/// Returns the backend's [`RespawnOutcome`](session_backend::RespawnOutcome). A
+/// session with no pinned orchestrator pane id (a pre-pin or still-bootstrapping
+/// session) comes back [`Failed`](session_backend::RespawnOutcome::Failed) — the
+/// in-place restart had no target — and the caller leans on the published event
+/// to let a client rebuild the dashboard from scratch.
+pub fn supervise_restart_orchestrator<B: session_backend::SessionBackend>(
+    backend: &B,
+    project_name: &str,
+) -> Result<session_backend::RespawnOutcome> {
+    use session_backend::{RespawnOutcome, SessionTarget};
+
+    let project = shelbi_state::load_project(project_name)?;
+    let hub = project
+        .machines
+        .iter()
+        .find(|m| matches!(m.kind, MachineKind::Local))
+        .ok_or_else(|| {
+            Error::Other(format!("project `{project_name}` has no local hub machine"))
+        })?;
+    let host = hub.host();
+    let runner_spec = project
+        .runner(&project.orchestrator.runner)
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "orchestrator runner `{}` not declared in project `{project_name}`",
+                project.orchestrator.runner
+            ))
+        })?
+        .clone();
+
+    let session = dashboard_addr(project_name).session;
+    let session_target = SessionTarget::session(session.clone());
+
+    // The pinned orchestrator pane id (stashed by `ensure_dashboard` as
+    // `SHELBI_PANE_orch`). A session that never pinned one has nothing to
+    // respawn in place — report that and let the event drive a full rebuild.
+    let Some(pane_id) = backend.get_env(&host, &session_target, "SHELBI_PANE_orch")? else {
+        return Ok(RespawnOutcome::Failed {
+            target: session,
+            reason: "no pinned orchestrator pane to respawn in place".into(),
+        });
+    };
+
+    // Rebuild the same launch wrapper `ensure_dashboard` splits in, with no
+    // first-launch greeting (a crash recovery is never the first project open).
+    let shelbi_bin = current_exe_string()?;
+    let workdir = shelbi_state::project_dir(project_name)?;
+    let launch =
+        orchestrator_launch_command(&shelbi_bin, &runner_spec, project_name, &workdir, None);
+    let orch_cmd = orchestrator_pane_cmd(
+        &shelbi_bin,
+        project_name,
+        &session,
+        &workdir.to_string_lossy(),
+        &launch,
+    );
+
+    Ok(backend.respawn(&SessionTarget::pane(pane_id), &orch_cmd))
+}
+
 /// Swap the named view's pane into the dashboard's right slot. `view` is
 /// one of `orch`, `tasks`, `machines`, `activity`. Reads the
 /// stored pane id from the session's tmux environment.
@@ -4580,5 +4662,211 @@ mod reload_workspace_tmux_tests {
         kill_session(&vis);
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod supervise_restart_orchestrator_tests {
+    //! The session half of the supervision relaunch
+    //! ([`supervise_restart_orchestrator`]) must restart a crashed orchestrator
+    //! through the [`SessionBackend`](session_backend::SessionBackend) seam, with
+    //! no tmux server and no attached client — the daemon's
+    //! "restart with no client attached" path (`rt-daemon-layout-split`). A stub
+    //! backend records the calls so the behavior is asserted without tmux.
+    use super::*;
+    use session_backend::{
+        InjectionGuard, Liveness, RespawnOutcome, SessionBackend, SessionTarget, SlotInfo,
+    };
+    use shelbi_core::{Host, Result};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// A `SessionBackend` that answers `get_env` from a canned value and records
+    /// every `respawn`. Every other method is unreachable here — the restart path
+    /// touches only `get_env` and `respawn` — so they panic if a future change
+    /// starts calling them, flagging that the test needs widening.
+    struct StubBackend {
+        /// The `SHELBI_PANE_orch` value `get_env` returns (`None` = unpinned).
+        orch_pane: Option<String>,
+        /// `(target label, command)` of each `respawn`, in call order.
+        respawns: Mutex<Vec<(String, String)>>,
+    }
+
+    impl StubBackend {
+        fn with_pane(pane: Option<&str>) -> Self {
+            Self {
+                orch_pane: pane.map(str::to_string),
+                respawns: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SessionBackend for StubBackend {
+        fn get_env(&self, _host: &Host, _t: &SessionTarget, var: &str) -> Result<Option<String>> {
+            assert_eq!(var, "SHELBI_PANE_orch", "restart only reads the orch pane pin");
+            Ok(self.orch_pane.clone())
+        }
+
+        fn respawn(&self, target: &SessionTarget, cmd: &str) -> RespawnOutcome {
+            self.respawns
+                .lock()
+                .unwrap()
+                .push((target.label(), cmd.to_string()));
+            RespawnOutcome::Respawned {
+                target: target.label(),
+            }
+        }
+
+        fn spawn(&self, _h: &Host, _t: &SessionTarget, _c: Option<&str>) -> Result<()> {
+            unreachable!("spawn not used by the restart path")
+        }
+        fn kill(&self, _h: &Host, _t: &SessionTarget) -> Result<()> {
+            unreachable!("kill not used by the restart path")
+        }
+        fn probe(&self, _h: &Host, _t: &SessionTarget, _d: Option<Duration>) -> Liveness {
+            unreachable!("probe not used by the restart path")
+        }
+        fn send_text(&self, _h: &Host, _t: &SessionTarget, _x: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn send_enter(&self, _h: &Host, _t: &SessionTarget) -> Result<()> {
+            unreachable!()
+        }
+        fn send_line(&self, _h: &Host, _t: &SessionTarget, _x: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn snapshot(&self, _h: &Host, _t: &SessionTarget) -> Result<String> {
+            unreachable!()
+        }
+        fn history(&self, _h: &Host, _t: &SessionTarget, _n: usize) -> Result<String> {
+            unreachable!()
+        }
+        fn final_screen(&self, _h: &Host, _t: &SessionTarget) -> Result<String> {
+            unreachable!()
+        }
+        fn title(&self, _h: &Host, _t: &SessionTarget) -> Result<String> {
+            unreachable!()
+        }
+        fn get_metadata(
+            &self,
+            _h: &Host,
+            _t: &SessionTarget,
+            _k: &str,
+            _d: Option<Duration>,
+        ) -> Result<Option<String>> {
+            unreachable!()
+        }
+        fn set_metadata(&self, _h: &Host, _t: &SessionTarget, _k: &str, _v: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn enumerate_slots(
+            &self,
+            _h: &Host,
+            _t: &SessionTarget,
+            _d: Option<Duration>,
+        ) -> std::io::Result<Option<Vec<SlotInfo>>> {
+            unreachable!()
+        }
+        fn resize(&self, _h: &Host, _t: &SessionTarget, _c: u16, _r: u16) -> Result<()> {
+            unreachable!()
+        }
+        fn injection_lock(&self, target: &SessionTarget) -> InjectionGuard {
+            // The injection lock is a pure process-global mutex with no tmux
+            // dependency, so the real backend's is reused rather than minting a
+            // second guard type. Unused by the restart path regardless.
+            session_backend::backend().injection_lock(target)
+        }
+    }
+
+    /// Write a minimal local-hub project with a declared `claude` orchestrator
+    /// runner under a fresh `$SHELBI_HOME`, returning the home guard + lock.
+    fn seed_project(
+        name: &str,
+    ) -> (super::tests_support_restart::Fixture, std::sync::MutexGuard<'static, ()>) {
+        let lock = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-orch-restart-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::write(
+            home.join("projects").join(format!("{name}.yaml")),
+            format!(
+                "name: {name}\nrepo: /tmp/{name}\ndefault_branch: main\n\
+                 orchestrator:\n  runner: claude\n\
+                 agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+                 machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/{name}\n\
+                 workspaces:\n  - {{ name: dev, machine: local, runner: claude }}\n"
+            ),
+        )
+        .unwrap();
+        let prev = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+        (super::tests_support_restart::Fixture { home, prev }, lock)
+    }
+
+    #[test]
+    fn restarts_the_pinned_orchestrator_session_in_place_via_the_backend() {
+        let (_fx, _lock) = seed_project("alpha");
+        let backend = StubBackend::with_pane(Some("%42"));
+
+        let outcome = supervise_restart_orchestrator(&backend, "alpha").unwrap();
+
+        // The restart respawned exactly the pinned orchestrator pane…
+        assert_eq!(
+            outcome,
+            RespawnOutcome::Respawned {
+                target: "%42".into()
+            }
+        );
+        let respawns = backend.respawns.lock().unwrap();
+        assert_eq!(respawns.len(), 1, "exactly one respawn");
+        assert_eq!(respawns[0].0, "%42", "respawned the pinned pane id");
+        // …with the real orchestrator launch wrapper, not a bare command: the
+        // zen-crash-recovery start hook and the project name are both present.
+        assert!(
+            respawns[0].1.contains("__zen-orch-start alpha"),
+            "respawn cmd carries the orchestrator wrapper: {}",
+            respawns[0].1
+        );
+    }
+
+    #[test]
+    fn reports_failed_when_no_orchestrator_pane_is_pinned() {
+        let (_fx, _lock) = seed_project("beta");
+        let backend = StubBackend::with_pane(None);
+
+        let outcome = supervise_restart_orchestrator(&backend, "beta").unwrap();
+
+        // Nothing to respawn in place → a Failed outcome and no respawn call; the
+        // caller leans on the published OrchestratorRestarted event to let a
+        // client rebuild the dashboard.
+        assert!(matches!(outcome, RespawnOutcome::Failed { .. }));
+        assert!(backend.respawns.lock().unwrap().is_empty(), "no respawn attempted");
+    }
+}
+
+#[cfg(test)]
+mod tests_support_restart {
+    //! Teardown helper for the restart tests' fixture home. Kept in its own
+    //! module so the `Drop` lives beside the backend stub without widening the
+    //! crate's shared test support.
+    pub(super) struct Fixture {
+        pub(super) home: std::path::PathBuf,
+        pub(super) prev: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("SHELBI_HOME", v),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
     }
 }
