@@ -581,6 +581,11 @@ where
     }
     tracing::debug!(?cmd, host = ?host, ?deadline, "ssh::run_with_deadline");
     let mut child = cmd.spawn()?;
+    // Capture the pid now, while the child is unreaped, so the normal-exit
+    // branch below can signal its process group without first re-reading an
+    // id the reap may have freed.
+    #[cfg(unix)]
+    let pid = child.id();
 
     let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
@@ -600,6 +605,20 @@ where
     let start = std::time::Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait()? {
+            // The direct child — our process-group leader — has exited and
+            // been reaped. A grandchild it backgrounded can still hold the
+            // write ends of our stdout/stderr pipes, so the `read_to_end`
+            // calls in the reader threads would never see EOF and the joins
+            // below would block for that grandchild's entire lifetime — an
+            // unbounded hang the deadline loop can no longer catch, since it
+            // has already exited. Reap any such survivor by signalling the
+            // child's process group (pgid == the leader's pid, captured above;
+            // `ESRCH` when the group is already empty, which is the common
+            // clean case). The pattern mirrors the timeout branch below.
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
             break status;
         }
         if start.elapsed() >= deadline {
@@ -655,6 +674,39 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_capture_inner(host, argv, None)
+}
+
+/// Like [`run_capture`], but bound the child's total wall-clock time via
+/// [`run_with_deadline`]: a command that hasn't finished within `deadline` is
+/// killed (whole process group) and surfaced as an `Error::Io(TimedOut)`.
+///
+/// Used by callers that must never block indefinitely on a single capture —
+/// e.g. Zen's probe primitives, which shell out to `git`/`sh` while a worker's
+/// (or `shelbi zen probe`'s) own test run loads the machine. Without a bound a
+/// single wedged child stalls the whole probe (and, in the test suite, every
+/// other test queued behind the shared lock).
+pub fn run_capture_with_deadline<I, S>(
+    host: &Host,
+    argv: I,
+    deadline: Duration,
+) -> shelbi_core::Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_capture_inner(host, argv, Some(deadline))
+}
+
+fn run_capture_inner<I, S>(
+    host: &Host,
+    argv: I,
+    deadline: Option<Duration>,
+) -> shelbi_core::Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let argv: Vec<_> = argv.into_iter().collect();
     let cmd_str = argv
         .iter()
@@ -662,7 +714,11 @@ where
         .collect::<Vec<_>>()
         .join(" ");
 
-    let output = run(host, &argv).map_err(shelbi_core::Error::Io)?;
+    let output = match deadline {
+        Some(deadline) => run_with_deadline(host, &argv, deadline),
+        None => run(host, &argv),
+    }
+    .map_err(shelbi_core::Error::Io)?;
     if !output.status.success() {
         return Err(shelbi_core::Error::Command {
             cmd: cmd_str,
@@ -1813,6 +1869,34 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "group kill must not block on the orphaned grandchild; took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_deadline_does_not_block_on_a_backgrounded_grandchild() {
+        // The complement of the process-group test: the direct child exits
+        // *cleanly and immediately*, but leaves a grandchild that inherited
+        // our stdout/stderr pipes and keeps running. Before the fix the
+        // reader joins on the normal-exit path blocked until that grandchild
+        // finished (here a 30s sleep), hanging a call the deadline loop had
+        // already left. The deadline is generous (30s) so a regression shows
+        // up as a real multi-second hang, not as a timeout.
+        let start = std::time::Instant::now();
+        let out = run_with_deadline(
+            &Host::Local,
+            // The shell is the group leader; it backgrounds `sleep 30`
+            // (which inherits the pipes) and exits 0 right away.
+            ["sh", "-c", "sleep 30 & exit 0"],
+            Duration::from_secs(30),
+        )
+        .expect("child exited cleanly");
+        assert_eq!(out.status.code(), Some(0));
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "a backgrounded grandchild must not hold the pipe open after the \
+             child exits; took {:?}",
             start.elapsed()
         );
     }

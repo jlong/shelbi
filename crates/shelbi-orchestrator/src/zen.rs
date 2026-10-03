@@ -6512,7 +6512,7 @@ fn add_probe_worktree(
 ) -> Result<()> {
     let anchor = repository_anchor.to_string_lossy().into_owned();
     let probe = probe_worktree.to_string_lossy().into_owned();
-    let out = shelbi_ssh::run(
+    let out = probe_run(
         host,
         [
             "git", "-C", &anchor, "worktree", "add", "--detach", &probe, head_sha,
@@ -6539,7 +6539,7 @@ fn scrub_isolated_probe_worktree(host: &Host, probe_worktree: &std::path::Path) 
         vec!["git", "-C", probe.as_str(), "reset", "--hard", "HEAD"],
         vec!["git", "-C", probe.as_str(), "clean", "-ffdx"],
     ] {
-        let out = shelbi_ssh::run(host, &args).map_err(Error::Io)?;
+        let out = probe_run(host, &args).map_err(Error::Io)?;
         if !out.status.success() {
             return Err(Error::Command {
                 cmd: args.join(" "),
@@ -6558,7 +6558,7 @@ fn remove_probe_worktree(
 ) -> Result<()> {
     let anchor = repository_anchor.to_string_lossy().into_owned();
     let probe = probe_worktree.to_string_lossy().into_owned();
-    let out = shelbi_ssh::run(
+    let out = probe_run(
         host,
         [
             "git", "-C", &anchor, "worktree", "remove", "--force", &probe,
@@ -6637,7 +6637,7 @@ fn finalize_probed_task_ref_after_scan<F: FnOnce()>(
         // and verification finish under the lock.
         after_scan();
 
-        let out = shelbi_ssh::run(
+        let out = probe_run(
             host,
             [
                 "git",
@@ -6684,7 +6684,7 @@ fn task_ref_checkout_paths(
     task_ref: &str,
 ) -> Result<Vec<String>> {
     let anchor = repository_anchor.to_string_lossy().into_owned();
-    let porcelain = shelbi_ssh::run_capture(
+    let porcelain = probe_run_capture(
         host,
         ["git", "-C", &anchor, "worktree", "list", "--porcelain"],
     )?;
@@ -6715,7 +6715,7 @@ fn probe_main_worktree_path(
     repository_anchor: &std::path::Path,
 ) -> Result<String> {
     let anchor = repository_anchor.to_string_lossy().into_owned();
-    let porcelain = shelbi_ssh::run_capture(
+    let porcelain = probe_run_capture(
         host,
         ["git", "-C", &anchor, "worktree", "list", "--porcelain"],
     )?;
@@ -6801,7 +6801,7 @@ fn detach_primary_checkout_for_probe(
     primary: &str,
     branch: &str,
 ) -> Result<()> {
-    let dirty = shelbi_ssh::run_capture(
+    let dirty = probe_run_capture(
         host,
         ["git", "-C", primary, "status", "--porcelain", "-z"],
     )?;
@@ -6815,7 +6815,7 @@ fn detach_primary_checkout_for_probe(
         )));
     }
 
-    let out = shelbi_ssh::run(host, ["git", "-C", primary, "checkout", "--detach"])
+    let out = probe_run(host, ["git", "-C", primary, "checkout", "--detach"])
         .map_err(Error::Io)?;
     if !out.status.success() {
         return Err(Error::Command {
@@ -6831,7 +6831,7 @@ fn detach_primary_checkout_for_probe(
 /// safe under both rebase policies.
 fn probe_head_sha(host: &Host, worktree: &std::path::Path, branch: &str) -> Result<String> {
     let wt = worktree.to_string_lossy().into_owned();
-    let stdout = shelbi_ssh::run_capture(host, ["git", "-C", wt.as_str(), "rev-parse", branch])?;
+    let stdout = probe_run_capture(host, ["git", "-C", wt.as_str(), "rev-parse", branch])?;
     Ok(stdout.trim().to_string())
 }
 
@@ -6854,7 +6854,7 @@ fn fetch_probe_base_after_fetch<F: FnOnce()>(
 ) -> Result<String> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let wt = worktree.to_string_lossy().into_owned();
-    let remotes = shelbi_ssh::run_capture(host, ["git", "-C", wt.as_str(), "remote"])?;
+    let remotes = probe_run_capture(host, ["git", "-C", wt.as_str(), "remote"])?;
     if !remotes.lines().any(|remote| remote == "origin") {
         return probe_head_sha(host, worktree, &format!("{base}^{{commit}}"));
     }
@@ -6863,7 +6863,7 @@ fn fetch_probe_base_after_fetch<F: FnOnce()>(
     let remote_ref = format!("refs/heads/{base}");
     let probe_ref = format!("refs/shelbi/probe-base/{}-{seq}", std::process::id());
     let refspec = format!("{remote_ref}:{probe_ref}");
-    let fetch = shelbi_ssh::run(
+    let fetch = probe_run(
         host,
         [
             "git",
@@ -6878,7 +6878,7 @@ fn fetch_probe_base_after_fetch<F: FnOnce()>(
     )
     .map_err(Error::Io)?;
     if !fetch.status.success() {
-        let _ = shelbi_ssh::run(
+        let _ = probe_run(
             host,
             ["git", "-C", wt.as_str(), "update-ref", "-d", &probe_ref],
         );
@@ -6891,7 +6891,7 @@ fn fetch_probe_base_after_fetch<F: FnOnce()>(
 
     after_fetch();
     let base_sha = probe_head_sha(host, worktree, &format!("{probe_ref}^{{commit}}"))?;
-    let cleanup = shelbi_ssh::run(
+    let cleanup = probe_run(
         host,
         [
             "git",
@@ -7059,7 +7059,7 @@ fn verify_check_checkout(
 ) -> Result<bool> {
     let wt = worktree.to_string_lossy().into_owned();
     let actual_head = probe_head_sha(host, worktree, "HEAD^{commit}")?;
-    let status = shelbi_ssh::run_capture(
+    let status = probe_run_capture(
         host,
         [
             "git",
@@ -7153,7 +7153,7 @@ fn bootstrap_isolated_node_dependencies(
     )?;
 
     let probe = probe_worktree.to_string_lossy().into_owned();
-    let tracked_metadata = shelbi_ssh::run_capture(
+    let tracked_metadata = probe_run_capture(
         host,
         [
             "git",
@@ -7337,7 +7337,7 @@ fn bootstrap_isolated_node_dependencies(
     clear_untracked_node_modules(host, probe_worktree)?;
 
     let cache = shared_node_cache.to_string_lossy().into_owned();
-    let mkdir = shelbi_ssh::run(host, ["mkdir", "-p", cache.as_str()]).map_err(Error::Io)?;
+    let mkdir = probe_run(host, ["mkdir", "-p", cache.as_str()]).map_err(Error::Io)?;
     if !mkdir.status.success() {
         return Err(Error::Command {
             cmd: format!("mkdir -p {cache}"),
@@ -7423,9 +7423,9 @@ fn bootstrap_isolated_node_dependencies(
     {
         let dependency_text = dependency.to_string_lossy().into_owned();
         let exists =
-            shelbi_ssh::run(host, ["test", "-e", dependency_text.as_str()]).map_err(Error::Io)?;
+            probe_run(host, ["test", "-e", dependency_text.as_str()]).map_err(Error::Io)?;
         let is_link =
-            shelbi_ssh::run(host, ["test", "-L", dependency_text.as_str()]).map_err(Error::Io)?;
+            probe_run(host, ["test", "-L", dependency_text.as_str()]).map_err(Error::Io)?;
         if exists.status.success() || is_link.status.success() {
             dependency_roots.push(dependency);
         }
@@ -7456,7 +7456,7 @@ fn reviewed_file_text(
 ) -> Result<String> {
     let revision = format!("HEAD:{}", path.to_string_lossy());
     let probe = probe_worktree.to_string_lossy().into_owned();
-    shelbi_ssh::run_capture(
+    probe_run_capture(
         host,
         ["git", "-C", probe.as_str(), "show", revision.as_str()],
     )
@@ -7672,7 +7672,7 @@ fn executable_version_from_package_manager(version: &str) -> &str {
 
 fn clear_untracked_node_modules(host: &Host, probe_worktree: &std::path::Path) -> Result<()> {
     let probe = probe_worktree.to_string_lossy().into_owned();
-    let clean = shelbi_ssh::run(
+    let clean = probe_run(
         host,
         [
             "git",
@@ -7699,7 +7699,7 @@ fn clear_untracked_node_modules(host: &Host, probe_worktree: &std::path::Path) -
 
 fn clear_isolated_dependency_tree(host: &Host, dependencies: &std::path::Path) -> Result<()> {
     let dependencies = dependencies.to_string_lossy().into_owned();
-    let remove = shelbi_ssh::run(host, ["rm", "-rf", dependencies.as_str()]).map_err(Error::Io)?;
+    let remove = probe_run(host, ["rm", "-rf", dependencies.as_str()]).map_err(Error::Io)?;
     if !remove.status.success() {
         return Err(Error::Command {
             cmd: format!("rm -rf {dependencies}"),
@@ -7715,7 +7715,7 @@ fn discover_isolated_node_modules(
     probe_worktree: &std::path::Path,
 ) -> Result<Vec<PathBuf>> {
     let probe = probe_worktree.to_string_lossy().into_owned();
-    let find = shelbi_ssh::run(
+    let find = probe_run(
         host,
         [
             "find",
@@ -7759,7 +7759,7 @@ fn clear_untracked_yarn_runtime_cache(
     let cache = relative_cache.to_string_lossy().into_owned();
     // Remove hook-injected ignored/untracked archives while preserving every
     // reviewed zero-install archive already tracked at HEAD.
-    let clean = shelbi_ssh::run(
+    let clean = probe_run(
         host,
         [
             "git",
@@ -7927,7 +7927,7 @@ fn verify_dependency_bootstrap_checkout(
 ) -> Result<()> {
     let actual_head = probe_head_sha(host, probe_worktree, "HEAD^{commit}")?;
     let probe = probe_worktree.to_string_lossy().into_owned();
-    let status = shelbi_ssh::run_capture(
+    let status = probe_run_capture(
         host,
         [
             "git",
@@ -7971,7 +7971,7 @@ for link do
     printf "\\000" || exit 1
 done
 ' sh {} +"#;
-    let out = shelbi_ssh::run(host, ["sh", "-c", scan_script, "sh", probe.as_str()])
+    let out = probe_run(host, ["sh", "-c", scan_script, "sh", probe.as_str()])
         .map_err(Error::Io)?;
     if !out.status.success() {
         return Err(Error::Command {
@@ -8268,6 +8268,44 @@ fn local_check_timeout() -> Duration {
     }
 }
 
+/// Wall-clock ceiling on a single probe-internal subprocess (a `git`, `sh`,
+/// `mkdir`, `test`, `find`, or `rm` invocation routed through [`probe_run`] /
+/// [`probe_run_capture`]). Matches `git.rs`'s `GIT_OP_DEADLINE`: generous
+/// enough that no healthy single git/sh op brushes it, low enough that a
+/// wedged one fails the probe in a couple of minutes instead of freezing it.
+///
+/// The user-supplied *local checks* keep their own, much larger budget
+/// ([`local_check_timeout`]); this bounds only the fixed plumbing Zen runs
+/// around them. Without it a single stuck child — on a machine already loaded
+/// by a worker's or `shelbi zen probe`'s own `cargo test --workspace` — stalls
+/// the probe indefinitely, and in the test suite parks every probe test queued
+/// behind the shared lock. The long dependency *install* is not routed here;
+/// it goes through `run_in_dir`, which carries its own deadline.
+const PROBE_OP_DEADLINE: Duration = Duration::from_secs(120);
+
+/// [`shelbi_ssh::run`] with a [`PROBE_OP_DEADLINE`] wall-clock bound. Every
+/// probe primitive shells out through this (never `shelbi_ssh::run` directly)
+/// so no probe subprocess can hang the probe. A timeout surfaces as
+/// `ErrorKind::TimedOut`, which callers already map to `Error::Io`.
+fn probe_run<I, S>(host: &Host, argv: I) -> std::io::Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    shelbi_ssh::run_with_deadline(host, argv, PROBE_OP_DEADLINE)
+}
+
+/// [`shelbi_ssh::run_capture`] with a [`PROBE_OP_DEADLINE`] wall-clock bound.
+/// Same rationale as [`probe_run`]; preserves `run_capture`'s `Error::Command`
+/// / ControlMaster-annotation contract on non-zero exit.
+fn probe_run_capture<I, S>(host: &Host, argv: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    shelbi_ssh::run_capture_with_deadline(host, argv, PROBE_OP_DEADLINE)
+}
+
 /// If the check exited 127 (POSIX "command not found"), append a shelbi
 /// hint that names the first token tried and what was searched. The hint
 /// is templated on the user's actual command — no specific tool name is
@@ -8393,7 +8431,7 @@ fn probe_merge_conflict(
     // dramatically simpler than spinning up a temp worktree, and has no
     // cleanup obligation — the spirit of "abort regardless of outcome" is
     // satisfied because nothing was ever mutated.
-    let out = shelbi_ssh::run(
+    let out = probe_run(
         host,
         [
             "git",
@@ -8476,7 +8514,7 @@ fn probe_rebase_would_conflict(
     // rebase would be a no-op. Skip the worktree churn for the common
     // up-to-date case (and for a stale base that is itself the merge-base,
     // where there is nothing to replay and nothing to detect).
-    let ancestor = shelbi_ssh::run(
+    let ancestor = probe_run(
         host,
         [
             "git",
@@ -8515,7 +8553,7 @@ fn probe_rebase_would_conflict_in(
     let wt = scratch.to_string_lossy().into_owned();
     // `--no-update-refs` so a user's `rebase.updateRefs=true` never rewrites a
     // sibling ref that happens to point into this detached history.
-    let out = shelbi_ssh::run(
+    let out = probe_run(
         host,
         [
             "git",
@@ -8533,7 +8571,7 @@ fn probe_rebase_would_conflict_in(
 
     // Capture the unmerged paths before aborting — `git rebase --abort` forgets
     // them. `--diff-filter=U` lists exactly the conflicted files.
-    let files: Vec<String> = shelbi_ssh::run_capture(
+    let files: Vec<String> = probe_run_capture(
         host,
         [
             "git",
@@ -8553,7 +8591,7 @@ fn probe_rebase_would_conflict_in(
     .unwrap_or_default();
 
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    let _ = shelbi_ssh::run(host, ["git", "-C", wt.as_str(), "rebase", "--abort"]);
+    let _ = probe_run(host, ["git", "-C", wt.as_str(), "rebase", "--abort"]);
 
     if files.is_empty() {
         // A non-zero rebase with no unmerged paths is not a content conflict —
@@ -8590,7 +8628,7 @@ fn probe_diff_size(
     // `main...branch` diffs against the *merge base*, which is exactly
     // what a squash-merge of this branch will apply.
     let range = format!("{main}...{branch}");
-    let stdout = shelbi_ssh::run_capture(
+    let stdout = probe_run_capture(
         host,
         [
             "git",
@@ -8666,7 +8704,7 @@ fn probe_branch_divergence(
     // commits reachable from `base` but not `head` (behind), right = commits
     // reachable from `head` but not `base` (ahead).
     let range = format!("{base}...{head}");
-    let counts = shelbi_ssh::run_capture(
+    let counts = probe_run_capture(
         host,
         [
             "git",
@@ -8695,7 +8733,7 @@ fn probe_branch_divergence(
     // commits are patch-id equivalent and show up as `-` even though their OIDs
     // differ. Counting the `-` lines tells us how much of the branch's content
     // the base already carries.
-    let cherry = shelbi_ssh::run_capture(host, ["git", "-C", wt.as_str(), "cherry", base, head])?;
+    let cherry = probe_run_capture(host, ["git", "-C", wt.as_str(), "cherry", base, head])?;
     let ahead_already_in_base = cherry
         .lines()
         .filter(|line| line.trim_start().starts_with('-'))
@@ -8734,7 +8772,7 @@ fn probe_danger_paths(
     // Two-dot would surface files touched on `base` after the branch was
     // cut and wrongly flag the branch for danger paths it never touched.
     let range = format!("{base}...{branch}");
-    let stdout = shelbi_ssh::run_capture(
+    let stdout = probe_run_capture(
         host,
         [
             "git",
@@ -8783,7 +8821,6 @@ pub fn match_danger_paths(patterns: &[String], changed: &[&str]) -> DangerPaths 
 #[cfg(test)]
 mod probe_tests {
     use super::*;
-    use std::process::Command;
 
     // --- diff_size parsing -------------------------------------------------
 
@@ -8976,22 +9013,46 @@ mod probe_tests {
         (tmp, repo)
     }
 
+    /// Wall-clock ceiling on a single `git` invocation a probe test runs to
+    /// build or inspect a fixture repo. These tests spawn dozens of `git`
+    /// children while — under the scenario this suite guards against — a
+    /// worker's or `shelbi zen probe`'s own `cargo test --workspace` loads the
+    /// machine. A raw `Command` has no bound, so one child that wedges (or
+    /// blocks on an inherited stdin prompt) hangs the test forever while it
+    /// holds the shared `test_lock`, parking every other probe test behind it.
+    /// Routing through [`shelbi_ssh::run_with_deadline`] closes both holes: the
+    /// child's stdin is `/dev/null` and a timeout fails the test fast.
+    const PROBE_TEST_GIT_DEADLINE: Duration = Duration::from_secs(120);
+
+    /// Run `git -C <cwd> <args>` under [`PROBE_TEST_GIT_DEADLINE`]. Panics
+    /// (fails the test) on launch failure or timeout; returns the captured
+    /// [`Output`] otherwise so callers can assert on status/stdout.
+    fn bounded_git(cwd: &std::path::Path, args: &[&str]) -> Output {
+        let cwd_str = cwd.to_str().expect("fixture repo path is UTF-8");
+        let mut argv = vec!["git", "-C", cwd_str];
+        argv.extend_from_slice(args);
+        shelbi_ssh::run_with_deadline(&Host::Local, argv, PROBE_TEST_GIT_DEADLINE)
+            .unwrap_or_else(|e| panic!("git {args:?} did not complete in {}: {e}", cwd.display()))
+    }
+
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(cwd)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?} failed in {}", cwd.display());
+        let out = bounded_git(cwd, args);
+        assert!(
+            out.status.success(),
+            "git {args:?} failed in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn git_stdout(cwd: &std::path::Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .current_dir(cwd)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?} failed in {}", cwd.display());
+        let out = bounded_git(cwd, args);
+        assert!(
+            out.status.success(),
+            "git {args:?} failed in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -9120,12 +9181,10 @@ mod probe_tests {
         );
 
         // Worktree must be clean — nothing was checked out.
-        let status_out = Command::new("git")
-            .current_dir(repo)
-            .args(["status", "--porcelain"])
-            .output()
-            .unwrap();
-        assert!(status_out.stdout.is_empty(), "worktree must be clean");
+        assert!(
+            probe_git_stdout(repo, &["status", "--porcelain"]).is_empty(),
+            "worktree must be clean"
+        );
     }
 
     /// The core regression: a multi-commit branch whose *net* change is benign
@@ -9842,24 +9901,11 @@ mod probe_tests {
     }
 
     fn head_sha(repo: &std::path::Path) -> String {
-        String::from_utf8_lossy(
-            &Command::new("git")
-                .current_dir(repo)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .trim()
-        .to_string()
+        probe_git_stdout(repo, &["rev-parse", "HEAD"])
     }
 
     fn probe_git_stdout(repo: &std::path::Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .current_dir(repo)
-            .args(args)
-            .output()
-            .unwrap();
+        let out = bounded_git(repo, args);
         assert!(
             out.status.success(),
             "git {} failed in {}: {}",
@@ -10274,13 +10320,8 @@ mod probe_tests {
 
         // The conflict and abort happened only in the temporary worktree.
         // The detached assigned workspace remains clean and unchanged.
-        let status = Command::new("git")
-            .current_dir(&wt)
-            .args(["status", "--porcelain"])
-            .output()
-            .unwrap();
         assert!(
-            status.stdout.is_empty(),
+            probe_git_stdout(&wt, &["status", "--porcelain"]).is_empty(),
             "worktree must be clean after the aborted rebase"
         );
     }
