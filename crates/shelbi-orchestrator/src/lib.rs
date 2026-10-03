@@ -526,6 +526,21 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
         )?;
     }
 
+    // Past the runner-transition guards, we are committed to bringing the
+    // dashboard up, so record the project as open. This is the single source of
+    // truth for "open" in the on-demand-daemon lifecycle
+    // (`docs/removing-tmux/phase3-daemon.md`): the daemon's idle-exit monitor and
+    // per-project poller manager key off it, and it deliberately outlives the
+    // orchestrator process so supervision can restart a dead orchestrator in a
+    // still-open project. Set here (not at function entry) so a *rejected* cold
+    // launch stays side-effect-free. Idempotent (already-open is a no-op) and
+    // best-effort — a state-write hiccup must not block the bootstrap. The
+    // launching command separately starts the daemon (`ensure_daemon_running`);
+    // this only records intent.
+    if let Err(e) = shelbi_state::set_project_open(project_name, true) {
+        tracing::warn!(project = project_name, error = %e, "failed to mark project open");
+    }
+
     // Install the session-closed cleanup hook before doing anything else.
     // Idempotent and project-agnostic — set every ensure_dashboard call so
     // it survives shelbi upgrades and tmux-server restarts.

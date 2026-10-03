@@ -155,6 +155,14 @@ pub fn run_main(project_name: &str) -> Result<()> {
     // not block launching.
     let _ = shelbi_state::touch_project_launched(project_name);
 
+    // Opening a project starts the on-demand hub daemon if it isn't already
+    // running (`docs/removing-tmux/phase3-daemon.md`). Best-effort: a daemon
+    // that won't start shouldn't block attaching, and the mutation/version gate
+    // reports a genuinely broken daemon on first use.
+    if let Err(e) = shelbi_state::ensure_daemon_running() {
+        eprintln!("shelbi: warning: could not start the hub daemon: {e}");
+    }
+
     shelbi_orchestrator::ensure_dashboard(project_name)
         .with_context(|| format!("setting up dashboard for `{project_name}`"))?;
 

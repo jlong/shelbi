@@ -73,6 +73,10 @@ pub fn run(project_opt: Option<String>, yes: bool) -> Result<()> {
     // `shelbi quit` was itself run from inside the dashboard session, killing
     // it below SIGHUPs this process, so everything user-visible and durable
     // must already be flushed by the time that kill fires.
+    // Clear the open flag so the on-demand daemon's idle-exit monitor stops
+    // supervising this project and exits once it's the last one closed
+    // (`docs/removing-tmux/phase3-daemon.md`).
+    let _ = shelbi_state::set_project_open(&project_name, false);
     let _ = shelbi_state::append_project_event(&project_name, "closed", "user:quit-cli");
     println!(
         "shelbi: quit \"{project_name}\" — orchestrator + TUI panes closed and both tmux \

@@ -102,5 +102,6 @@ workflow `GITHUB_TOKEN` do not start new workflow runs.) The publish path:
 7. Commits and pushes the static repository.
 8. Verifies Ubuntu can install with `apt update && apt install shelbi`.
 
-Daemon/service auto-install is intentionally out of scope. The package installs
-the `shelbi` binary; users explicitly opt into `shelbi daemon install`.
+Daemon/service auto-install is out of scope, and there is nothing to install:
+the package ships the `shelbi` binary, and the hub daemon is started on demand
+the first time a project is opened.

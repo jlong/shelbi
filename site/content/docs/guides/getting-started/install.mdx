@@ -54,9 +54,9 @@ The APT key fingerprint is published at:
 curl -fsSL https://apt.shelbi.dev/shelbi-archive-keyring.fingerprint
 ```
 
-The package installs the `shelbi` binary only. It does not install or enable
-the daemon; run `shelbi daemon install` later if you want the hub daemon managed
-by your user service supervisor.
+The package installs the `shelbi` binary only. The hub daemon is started on
+demand the first time you open a project and exits when no project is open, so
+there is nothing to install or enable.
 
 If you're hacking on Shelbi or testing unreleased changes, use the
 [source-build path](#install-from-source-for-development) instead.
