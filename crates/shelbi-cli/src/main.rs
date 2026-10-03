@@ -472,6 +472,14 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__error-log")]
     ErrorLog { project: String },
+    /// (internal) The per-session process (remove-tmux backend): own one PTY
+    /// and one headless terminal emulator, answer terminal queries with no
+    /// client attached, serve clients on a Unix socket, and on child exit write
+    /// `exit.json` + `final.txt`. Normally launched detached by a client via
+    /// `shelbi_session::spawn_detached`, never run by hand. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__session")]
+    Session(commands::session::Args),
 }
 
 fn main() -> Result<()> {
@@ -615,6 +623,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::ReviewServe { cmd }) => commands::review_serve::run(cmd),
         Some(Cmd::ErrorLog { project }) => commands::error_log::run(project),
+        Some(Cmd::Session(args)) => commands::session::run(args),
         Some(Cmd::ZenOrchStart { project }) => commands::zen_lifecycle::orch_start(&project),
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),
         Some(Cmd::EnsureDaemon) => {

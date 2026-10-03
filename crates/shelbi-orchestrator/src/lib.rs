@@ -3778,7 +3778,7 @@ mod reload_target_tmux_tests {
         project_name: &str,
         hub_work_dir: &std::path::Path,
     ) -> shelbi_core::Project {
-        shelbi_core::Project {
+        shelbi_core::Project { session: Default::default(),
             name: project_name.into(),
             label: None,
             display_name: None,
@@ -4580,7 +4580,7 @@ mod reload_workspace_tmux_tests {
                 integration: None,
             },
         );
-        let project = Project {
+        let project = Project { session: Default::default(),
             name: name.into(),
             label: None,
             display_name: None,

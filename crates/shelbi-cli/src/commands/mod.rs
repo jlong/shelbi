@@ -36,6 +36,7 @@ pub mod review_confirm;
 pub mod review_reject;
 pub mod review_serve;
 pub mod send;
+pub mod session;
 pub mod spawn;
 pub mod status;
 pub mod tail;
@@ -450,7 +451,7 @@ pub(crate) mod test_support {
                 integration: None,
             },
         );
-        let project = Project {
+        let project = Project { session: Default::default(),
             name: project_name.into(),
             label: None,
             display_name: None,

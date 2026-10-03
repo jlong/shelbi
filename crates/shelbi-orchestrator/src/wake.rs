@@ -3783,7 +3783,7 @@ mod tests {
         let previous_home = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", temp.path());
 
-        let project = Project {
+        let project = Project { session: Default::default(),
             name: "demo".into(),
             label: None,
             display_name: None,

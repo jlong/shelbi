@@ -6848,7 +6848,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "demo".into(),
             label: None,
             display_name: None,

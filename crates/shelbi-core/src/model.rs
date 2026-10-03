@@ -148,6 +148,14 @@ pub struct Project {
     /// [`Project::review_diff_command`].
     #[serde(default, skip_serializing_if = "ReviewConfig::is_default")]
     pub review: ReviewConfig,
+    /// Config for the `shelbi __session` process (remove-tmux session backend).
+    /// Today just the opt-in full raw output log
+    /// ([`SessionConfig::raw_output_log`]). Absent on existing projects, in
+    /// which case the raw log stays off. Elided from the wire form when it is
+    /// the default so existing project YAMLs don't grow a key on round-trip.
+    /// See [`SessionConfig`].
+    #[serde(default, skip_serializing_if = "SessionConfig::is_default")]
+    pub session: SessionConfig,
     /// Which board backend this project's issues live in. Absent ⇒
     /// [`IssueTrackerBackend::FileSystem`] (today's markdown-on-disk board),
     /// so every existing project keeps working untouched. Only
@@ -243,6 +251,7 @@ pub const SHARED_PROJECT_FIELDS: &[&str] = &[
     "heartbeat",
     "git",
     "review",
+    "session",
     "issue_tracker",
     "runners",
     "agents",
@@ -695,6 +704,37 @@ impl ReviewConfig {
     /// configured it and existing YAMLs round-trip without growing a key.
     pub fn is_default(&self) -> bool {
         *self == ReviewConfig::default()
+    }
+}
+
+/// Project-level config for the `shelbi __session` process (the remove-tmux
+/// session backend). Stored under the `session:` key in the project YAML;
+/// absent altogether on existing projects, in which case every field falls
+/// back to its default.
+///
+/// This block is **additive and backward-compatible**: a project YAML with no
+/// `session:` key deserializes to [`SessionConfig::default`] (the raw log off),
+/// so existing installs need no config-upgrade self-heal — there is no shipped
+/// template to re-sync, only a new optional key a user opts into.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionConfig {
+    /// Keep a **full raw output log** of every byte a session's child writes,
+    /// at `~/.shelbi/sessions/<id>/raw.log`. Off by default: for full-screen
+    /// agents the raw stream is mostly repaint noise and it captures anything
+    /// pasted into the pane, so it is a deliberate per-project opt-in for
+    /// debugging. The in-memory scrollback and the bounded recent-bytes ring
+    /// are always kept regardless of this flag; only the unbounded on-disk log
+    /// is gated here.
+    #[serde(default)]
+    pub raw_output_log: bool,
+}
+
+impl SessionConfig {
+    /// Whether this block is entirely default, so the serializer can elide the
+    /// `session:` key on a project that never configured it and existing YAMLs
+    /// round-trip without growing a key.
+    pub fn is_default(&self) -> bool {
+        *self == SessionConfig::default()
     }
 }
 
@@ -3932,7 +3972,7 @@ workspace_settings_template: /etc/shelbi/p.json
                 integration: None,
             },
         );
-        let project = Project {
+        let project = Project { session: Default::default(),
             name: "p".into(),
             label: None,
             display_name: None,
@@ -4044,7 +4084,7 @@ workspaces:
             tags: Vec::new(),
             forward: None,
         };
-        Project {
+        Project { session: Default::default(),
             name: "p".into(),
             label: None,
             display_name: None,
@@ -4342,7 +4382,7 @@ workspaces:
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "p".into(),
             label: None,
             display_name: None,
@@ -5691,7 +5731,7 @@ git:
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "shelbi".into(),
             label: Some("Shelbi".into()),
             display_name: None,
@@ -6149,6 +6189,33 @@ agent_runners:
 
         let back = serde_yaml::to_string(&p).unwrap();
         assert!(!back.contains("issue_tracker"), "got: {back}");
+    }
+
+    #[test]
+    fn session_config_absent_defaults_to_raw_log_off_and_omits_key() {
+        // An old project YAML with no `session:` block parses to the default
+        // (raw log off) and must not grow the key on re-serialization, so
+        // existing installs need no migration.
+        let p = project_with_issue_tracker_yaml("");
+        assert!(!p.session.raw_output_log);
+        assert!(p.session.is_default());
+        let back = serde_yaml::to_string(&p).unwrap();
+        assert!(!back.contains("session"), "got: {back}");
+    }
+
+    #[test]
+    fn session_config_parses_the_per_project_raw_log_opt_in() {
+        let p =
+            project_with_issue_tracker_yaml("session:\n  raw_output_log: true\n");
+        assert!(
+            p.session.raw_output_log,
+            "a project can enable the raw output log"
+        );
+        assert!(!p.session.is_default());
+        // Round-trips: re-serializing keeps the opt-in.
+        let back = serde_yaml::to_string(&p).unwrap();
+        let reparsed = Project::from_yaml_str(&back).unwrap();
+        assert!(reparsed.session.raw_output_log);
     }
 
     /// Read cost is what `is_remote` gates: a local board can be listed on a

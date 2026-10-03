@@ -2439,7 +2439,7 @@ mod tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "demo".into(),
             label: None,
             display_name: None,

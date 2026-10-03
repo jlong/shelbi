@@ -6294,7 +6294,7 @@ mod tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "myapp".into(),
             label: None,
             display_name: None,
@@ -11282,7 +11282,7 @@ mod sync_worktree_git_tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "sync-test".into(),
             label: None,
             display_name: None,
@@ -12169,7 +12169,7 @@ mod sync_worktree_freshcut_tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "synccut".into(),
             label: None,
             display_name: None,
@@ -12540,7 +12540,7 @@ mod sync_worktree_freshcut_tests {
                 integration: None,
             },
         );
-        let project = Project {
+        let project = Project { session: Default::default(),
             name: "synccut".into(),
             label: None,
             display_name: None,

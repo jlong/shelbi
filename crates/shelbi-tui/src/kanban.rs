@@ -4815,7 +4815,7 @@ transitions:
         std::env::set_var("SHELBI_HOME", &home);
 
         // Project needs to exist so refresh() can populate workspaces.
-        let project = shelbi_core::Project {
+        let project = shelbi_core::Project { session: Default::default(),
             name: "demo".into(),
             label: None,
             display_name: None,
@@ -6611,7 +6611,7 @@ transitions:
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("SHELBI_HOME", &home);
 
-        let project = shelbi_core::Project {
+        let project = shelbi_core::Project { session: Default::default(),
             name: "demo".into(),
             label: None,
             display_name: None,

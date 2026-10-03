@@ -435,7 +435,7 @@ mod tests {
     }
 
     fn project_with_runner(name: &str, command: &str) -> shelbi_core::Project {
-        shelbi_core::Project {
+        shelbi_core::Project { session: Default::default(),
             name: "demo".into(),
             label: None,
             display_name: None,
