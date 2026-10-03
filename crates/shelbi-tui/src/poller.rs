@@ -72,6 +72,7 @@ use shelbi_core::{
     default_workflow, Column, IssueTrackerBackend, Project, StatusCategory, Workflow,
     DEFAULT_WORKFLOW_NAME,
 };
+use shelbi_orchestrator::session_backend::{backend, SessionBackend, SessionTarget};
 use shelbi_orchestrator::supervision::{
     SupervisionAction, SupervisionInputs, SupervisionState, BASE_BACKOFF, CRASH_LOOP_WINDOW,
     MAX_RESTARTS_IN_WINDOW, STABLE_RECOVERY,
@@ -1497,7 +1498,9 @@ fn poll_one(
     // stale `shelbi:working` title — no hook fires — so the title path alone
     // can't see it. Best-effort: a capture failure leaves both untouched and
     // we fall through to the title path.
-    let screen = shelbi_tmux::capture(&host, &addr).ok();
+    let screen = backend()
+        .snapshot(&host, &SessionTarget::from_tmux_addr(&addr))
+        .ok();
 
     // Usage-limit *pause* takes priority. Matched structurally against
     // claude's modal chrome (see `ready::detect_usage_limit`) rather than a
@@ -1744,7 +1747,7 @@ fn poll_one(
         // busy/ready sample once the human answers.
         None if dialog.is_some() => WorkspaceState::Blocked,
         None => {
-            let title = match shelbi_tmux::pane_title(&host, &addr) {
+            let title = match backend().title(&host, &SessionTarget::from_tmux_addr(&addr)) {
                 Ok(t) => t,
                 Err(_) => return,
             };

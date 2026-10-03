@@ -75,8 +75,42 @@ fixable, plus the emulator decision.
 | Subtask | Scope | Status |
 | --- | --- | --- |
 | `rt-backend-trait-tmux` | `SessionBackend` trait (session operations only), keyed on a backend-neutral `SessionTarget`, implemented over `shelbi-tmux` with no behavior change; migrated `workspace.rs`, `submit.rs`, `ready.rs`, `handoff.rs`, `load.rs` | Landed |
-| `rt-backend-callers` | Move call sites (`workspace.rs`, `submit.rs`, `ready.rs`, `handoff.rs`, `load.rs`, `issue.rs`, `send.rs`, `open.rs`, `open/pane.rs`, `wake.rs`, poller probes) onto the trait | Pending |
+| `rt-backend-callers` | Move call sites (`workspace.rs`, `submit.rs`, `ready.rs`, `handoff.rs`, `load.rs`, `issue.rs`, `send.rs`, `open.rs`, `open/pane.rs`, `wake.rs`, poller probes) onto the trait | Landed |
 | `rt-backend-sessions` | Implement `SessionBackend` over session processes; hidden backend-select setting | Pending |
+
+#### Session-op seam gate (`rt-backend-callers`)
+
+After `rt-backend-callers`, production code performs **session operations**
+through `SessionBackend` (`backend()` + a `SessionTarget`), never through the
+low-level `shelbi_tmux::` session-op functions. A guard test,
+`crates/shelbi-cli/tests/session_op_seam_gate.rs`, parses the three consumer
+crates with `syn` and fails the build if a direct
+`shelbi_tmux::{new_session, has_session, has_session_with_deadline, send_text,
+send_enter, send_line, capture, capture_history, pane_title}` call appears in
+production (non-`#[cfg(test)]`) code outside the allowlist below. `#[cfg(test)]`
+code is skipped: the integration tests that drive a real tmux server are deleted
+at cutover with the `tmux_available()` guards.
+
+Still permitted direct session-op calls (keep in sync with the gate's `ALLOWED`
+list):
+
+| File | Why exempt | Loses exemption |
+| --- | --- | --- |
+| `shelbi-orchestrator/src/session_backend.rs` | The tmux backend *is* the seam — these calls are the delegation every other caller routes through | Never (replaced by `rt-backend-sessions`' second backend) |
+| `shelbi-orchestrator/src/lib.rs` | Orchestrator bootstrap + stash-session probes; not in the Phase 2 caller scope | Phase 3 (poller/supervision move to the daemon) |
+| `shelbi-cli/src/commands/spawn.rs`, `tail.rs`, `merge.rs` | Legacy agent commands | Phase 6 cutover (deleted wholesale) |
+
+**Session ops vs. layout.** Only session operations move behind the seam.
+tmux *layout* (`new-window`, `select-window`, `split-window`, `swap-pane`,
+`join-pane`, `break-pane`, `kill-window`, `kill-pane`, the `-e` env-injecting
+pane spawn, and the `ssh … tmux attach` proxy window) is **not** abstracted —
+it stays as raw `["tmux", …]` argv and is **deleted by Phase 4** when the
+single-process TUI replaces what it does. These are the ~200 raw layout calls
+(`lib.rs`, `review_ui.rs`, `workspace.rs`, `open.rs`'s shell/proxy windows, and
+others); the gate does not police them. The tmux-topology-only session-ish
+operations that have no non-tmux analogue (`kill_window`, `kill_pane`,
+`live_pane_ids`, `spawn_local_pane`) live as inherent methods on `TmuxBackend`,
+reached through the concretely-typed `backend()`.
 
 ### Phase 3 — Poller and supervision move to the daemon
 
