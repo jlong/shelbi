@@ -1,16 +1,18 @@
 //! Daemon-poller dev setting and the per-project poller lock (Phase 3,
 //! `rt-daemon-poller`).
 //!
-//! The workspace poller can run in one of two places: the sidebar process (the
-//! default) or `shelbi daemon` (one poller per open project). A hidden dev
-//! setting selects which, and a per-project lock guarantees that exactly one
-//! poller ever runs for a project — so a stale sidebar that outlives the switch
-//! can't poll beside the daemon that has taken over
+//! The workspace poller can run in one of two places: `shelbi daemon` (one
+//! poller per open project — the default on this branch) or the sidebar process.
+//! A hidden dev setting selects which, and a per-project lock guarantees that
+//! exactly one poller ever runs for a project — so a stale sidebar that outlives
+//! the switch can't poll beside the daemon that has taken over
 //! (`docs/removing-tmux/phase3-daemon.md`, "Per-project pollers").
 //!
-//! Dev-only for now: the default stays the sidebar poller until
-//! `rt-daemon-layout-split` lands, because the poller still makes tmux layout
-//! calls that belong in a client, not a hub-global daemon.
+//! The daemon poller became the default once `rt-daemon-layout-split` moved the
+//! poller's tmux layout calls out into client-reacted events (the poller now
+//! drives only sessions and publishes layout notifications), so a hub-global
+//! daemon no longer reshapes panes. The setting is kept so it can be turned back
+//! off, which restores the in-sidebar poller.
 
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -19,23 +21,27 @@ use shelbi_core::Result;
 
 use crate::project_dir;
 
-/// Environment variable that turns the daemon poller on. Truthy values (`1`,
-/// `true`, `yes`, `on`, case-insensitive) enable it; anything else — including
-/// absence — leaves the sidebar poller as the default.
+/// Environment variable that selects where the poller runs. Falsy values (`0`,
+/// `false`, `no`, `off`, case-insensitive) force the in-sidebar poller; anything
+/// else — including absence — leaves the daemon poller on, which is the default.
 pub const DAEMON_POLLER_ENV: &str = "SHELBI_DAEMON_POLLER";
 
-/// Whether the daemon-poller dev setting is on. When true the daemon runs one
-/// poller per open project and the sidebar runs none; when false (the default)
-/// the sidebar runs the poller and the daemon's poller manager starts nothing.
+/// Whether the daemon-poller dev setting is on. When true (the default) the
+/// daemon runs one poller per open project and the sidebar runs none; only an
+/// explicit falsy value turns it off, restoring the in-sidebar poller while the
+/// daemon's poller manager starts nothing. Defaulting to on is what makes the
+/// hub-global daemon the source of supervision on this branch
+/// (`rt-daemon-layout-split`): the poller no longer makes tmux layout calls, so
+/// it is safe to run off any attached UI.
 pub fn daemon_poller_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var(DAEMON_POLLER_ENV)
             .ok()
             .as_deref()
             .map(str::trim)
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("1" | "true" | "yes" | "on")
+        Some("0" | "false" | "no" | "off")
     )
 }
 
@@ -162,16 +168,19 @@ mod tests {
     }
 
     #[test]
-    fn setting_defaults_off_and_reads_truthy_values() {
+    fn setting_defaults_on_and_only_explicit_falsy_turns_it_off() {
         let _g = EnvGuard::set(None);
-        assert!(!daemon_poller_enabled(), "absent → off");
-        for on in ["1", "true", "TRUE", "yes", "On", " on "] {
-            std::env::set_var(DAEMON_POLLER_ENV, on);
-            assert!(daemon_poller_enabled(), "`{on}` → on");
-        }
-        for off in ["0", "false", "no", "", "nope"] {
+        assert!(daemon_poller_enabled(), "absent → on (the default)");
+        // Only an explicit falsy value restores the in-sidebar poller.
+        for off in ["0", "false", "FALSE", "no", "Off", " off "] {
             std::env::set_var(DAEMON_POLLER_ENV, off);
             assert!(!daemon_poller_enabled(), "`{off}` → off");
+        }
+        // Everything else — truthy words, empty, or an unrecognized value —
+        // leaves the daemon poller on.
+        for on in ["1", "true", "yes", "on", "", "nope"] {
+            std::env::set_var(DAEMON_POLLER_ENV, on);
+            assert!(daemon_poller_enabled(), "`{on}` → on");
         }
     }
 

@@ -18,6 +18,33 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+/// A layout change the daemon's poller/supervision produces as the *session*
+/// half of a split operation (`rt-daemon-layout-split`;
+/// `docs/removing-tmux/phase3-daemon.md`, "Layout leaves the poller"). The
+/// daemon drives the session (start/stop/restart) and then emits one of these so
+/// a client arranges its own view — on the tmux runtime the sidebar reacts by
+/// doing today's pane/window work; the single-process TUI will do the same
+/// layout in-process. It deliberately carries **no tmux details**: only what a
+/// client needs to place the session. A client that was not connected when the
+/// event fired is not sent a backlog — it reads current layout state on connect
+/// (see [`crate`]-external `review_layout_state`) and lays itself out from that.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "layout", rename_all = "kebab-case")]
+pub enum LayoutEvent {
+    /// Supervision restarted a crashed orchestrator session. A client places or
+    /// heals the dashboard (on tmux, re-runs `ensure_dashboard`).
+    OrchestratorRestarted,
+    /// A resumed/loaded review slot's panel should be built beside its agent
+    /// pane (the layout half of the poller's stranded-slot resume).
+    ReviewOpened { workspace: String, task: String },
+    /// An accepted/out-of-band-merged review task's slot should be closed and
+    /// freed in the UI (the layout half of freeing the slot).
+    ReviewClosed { workspace: String, task: String },
+    /// A review agent found alive but parked outside a window (a diff/editor
+    /// swap collapsed its window) should be recovered into a fresh window.
+    ReviewAgentRecovered { workspace: String },
+}
+
 /// A change the daemon pushes to subscribed clients so a UI can refresh the
 /// affected view without polling. Serialized as one NDJSON line on the hub
 /// socket; `change` tags the variant so a client can switch on it.
@@ -28,6 +55,10 @@ pub enum ChangeNotification {
     Board { project: String },
     /// `workspace`'s observed status changed in `project`.
     Workspace { project: String, workspace: String },
+    /// A layout change in `project` the daemon produced; `event` says what a
+    /// client should place. Nested rather than flattened so the layout variants
+    /// evolve independently of the top-level `change` tag.
+    Layout { project: String, event: LayoutEvent },
 }
 
 impl ChangeNotification {
@@ -38,6 +69,17 @@ impl ChangeNotification {
         match self {
             ChangeNotification::Board { project } => project,
             ChangeNotification::Workspace { project, .. } => project,
+            ChangeNotification::Layout { project, .. } => project,
+        }
+    }
+
+    /// The layout event this notification carries, if it is a layout change.
+    /// `None` for board/workspace changes, so a client that only arranges layout
+    /// can ignore the rest with one match.
+    pub fn layout(&self) -> Option<&LayoutEvent> {
+        match self {
+            ChangeNotification::Layout { event, .. } => Some(event),
+            _ => None,
         }
     }
 
@@ -49,6 +91,15 @@ impl ChangeNotification {
         let mut s = serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string());
         s.push('\n');
         s
+    }
+
+    /// Parse one NDJSON line (as written by [`to_line`](Self::to_line)) back into
+    /// a notification; `None` on a malformed line so a subscribing client can
+    /// skip noise without erroring. Keeps the wire parse here beside `to_line`
+    /// and the enum so a client crate (the sidebar) need not depend on
+    /// `serde_json`. Leading/trailing whitespace (the newline) is tolerated.
+    pub fn from_line(line: &str) -> Option<Self> {
+        serde_json::from_str(line.trim()).ok()
     }
 }
 
@@ -100,6 +151,16 @@ pub fn publish_change(change: ChangeNotification) {
     subs.retain(|tx| tx.send(change.clone()).is_ok());
 }
 
+/// Publish a [`LayoutEvent`] for `project`. The convenience wrapper the poller
+/// and supervision use so a layout split reads as one call; a no-op when no
+/// client is subscribed, exactly like [`publish_change`].
+pub fn publish_layout(project: impl Into<String>, event: LayoutEvent) {
+    publish_change(ChangeNotification::Layout {
+        project: project.into(),
+        event,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +198,78 @@ mod tests {
         assert_eq!(line.trim(), r#"{"change":"board","project":"p"}"#);
         let round: ChangeNotification = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(round, ChangeNotification::Board { project: "p".into() });
+    }
+
+    #[test]
+    fn layout_event_round_trips_as_nested_ndjson() {
+        // The layout variant nests its typed event under `event` rather than
+        // flattening it, so the top-level `change` tag and the inner `layout`
+        // tag never collide and each evolves independently.
+        let n = ChangeNotification::Layout {
+            project: "p".into(),
+            event: LayoutEvent::ReviewOpened {
+                workspace: "rev".into(),
+                task: "t-1".into(),
+            },
+        };
+        let line = n.to_line();
+        assert!(line.ends_with('\n'));
+        assert_eq!(
+            line.trim(),
+            r#"{"change":"layout","project":"p","event":{"layout":"review-opened","workspace":"rev","task":"t-1"}}"#
+        );
+        let round: ChangeNotification = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(round, n);
+        assert_eq!(round.project(), "p");
+        assert_eq!(
+            round.layout(),
+            Some(&LayoutEvent::ReviewOpened {
+                workspace: "rev".into(),
+                task: "t-1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn non_layout_changes_carry_no_layout_event() {
+        assert_eq!(
+            ChangeNotification::Board { project: "p".into() }.layout(),
+            None
+        );
+    }
+
+    #[test]
+    fn orchestrator_restarted_serializes_without_fields() {
+        // A fieldless layout variant is just its tag — the client switches on it.
+        let line = ChangeNotification::Layout {
+            project: "p".into(),
+            event: LayoutEvent::OrchestratorRestarted,
+        }
+        .to_line();
+        assert_eq!(
+            line.trim(),
+            r#"{"change":"layout","project":"p","event":{"layout":"orchestrator-restarted"}}"#
+        );
+    }
+
+    #[test]
+    fn publish_layout_reaches_a_subscriber() {
+        let project = "change-bus-layout-publish";
+        let sub = subscribe_changes();
+        publish_layout(
+            project,
+            LayoutEvent::ReviewAgentRecovered {
+                workspace: "rev".into(),
+            },
+        );
+        let got = recv_for(&sub, project, Duration::from_secs(1))
+            .expect("subscriber receives the layout change");
+        assert_eq!(
+            got.layout(),
+            Some(&LayoutEvent::ReviewAgentRecovered {
+                workspace: "rev".into()
+            })
+        );
     }
 
     #[test]

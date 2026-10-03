@@ -61,13 +61,20 @@ const EDITOR_KEY: &str = "SHELBI_REVIEW_EDITOR";
 /// Session env var holding the lazily-created diff-tool pane id.
 const DIFF_KEY: &str = "SHELBI_REVIEW_DIFF";
 /// Session env var holding the review agent's chat pane id.
-const CHAT_KEY: &str = "SHELBI_REVIEW_CHAT";
+///
+/// `pub(crate)` so the daemon poller can read it over the `SessionBackend` seam
+/// to decide whether a window-less review slot is actually a *parked* (still
+/// alive) agent, without calling into this module's pane plumbing
+/// (`rt-daemon-layout-split`).
+pub(crate) const CHAT_KEY: &str = "SHELBI_REVIEW_CHAT";
 /// Session env var holding the task id the interface is currently open on.
 const TASK_KEY: &str = "SHELBI_REVIEW_TASK";
 /// Session env var naming the review slot (its workspace window) the interface
 /// is built in. Lets a slot teardown ([`release_slot_review_interface`]) tell
 /// whether the session's interface state belongs to the slot being killed.
-const WS_KEY: &str = "SHELBI_REVIEW_WS";
+///
+/// `pub(crate)` for the same parked-agent probe as [`CHAT_KEY`].
+pub(crate) const WS_KEY: &str = "SHELBI_REVIEW_WS";
 /// Every `SHELBI_REVIEW_*` session var the interface sets, cleared on teardown.
 const INTERFACE_KEYS: [&str; 7] = [
     MID_KEY, PANEL_KEY, EDITOR_KEY, DIFF_KEY, CHAT_KEY, TASK_KEY, WS_KEY,
@@ -1225,6 +1232,68 @@ pub fn reject_review(project_name: &str, task_id: &str, reason: &str) -> Result<
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Layout state query (for a late-connecting client)
+
+/// One review slot a client should lay out: a review-column task pinned to a
+/// review-tagged workspace, with its panel/agent interface expected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSlotLayout {
+    /// The review slot's workspace name.
+    pub workspace: String,
+    /// The task loaded on that slot.
+    pub task: String,
+}
+
+/// The review slots a client should show the interface for, derived purely from
+/// durable state (the board + the project's workspace tags) — **no tmux**.
+///
+/// The layout events ([`shelbi_state::LayoutEvent`]) are deltas the daemon
+/// pushes and does not queue, so a client that was not connected when one fired
+/// reads this on connect and lays itself out from current state
+/// (`rt-daemon-layout-split`; `docs/removing-tmux/phase3-daemon.md`, "No client
+/// attached"). It returns every review-column task assigned to a review-tagged
+/// slot — the set whose windows should carry the `panel | agent` interface — so
+/// a freshly started sidebar builds exactly the panels an already-running one
+/// would have, and closes any review window whose slot is absent here.
+///
+/// Ownership resolves the same way the dispatch/reap passes do: through the
+/// local assignment overlay for a remote backend (assignment lives in the hub's
+/// overlay, never on the remote), and the card's `assigned_to` for a
+/// `file_system` backend.
+pub fn review_layout_state(project_name: &str) -> Result<Vec<ReviewSlotLayout>> {
+    let project = shelbi_state::load_project(project_name)?;
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let overlay = if project.issue_tracker.backend.is_remote() {
+        shelbi_state::task_assignments(project_name).unwrap_or_default()
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    let mut out = Vec::new();
+    for tf in store.list()? {
+        if tf.task.column != Column::review() {
+            continue;
+        }
+        let owner = if project.issue_tracker.backend.is_remote() {
+            overlay.get(&tf.task.id).map(String::as_str)
+        } else {
+            tf.task.assigned_to.as_deref()
+        };
+        let Some(ws_name) = owner else { continue };
+        let Some(ws) = project.workspace(ws_name) else {
+            continue;
+        };
+        if !project.effective_tags(ws).contains("review") {
+            continue;
+        }
+        out.push(ReviewSlotLayout {
+            workspace: ws_name.to_string(),
+            task: tf.task.id.clone(),
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1338,6 +1407,51 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), keys.len(), "review session keys must be unique");
+    }
+
+    // -- review_layout_state (the late-connecting client's state query) -----
+
+    /// A client that connects after the layout events have fired reads
+    /// [`review_layout_state`] and lays itself out from current state — no tmux
+    /// involved. It must return exactly the review-column tasks pinned to a
+    /// review-tagged slot, and nothing else: not a dev-column task, not a done
+    /// task, and not a review-column task parked on a non-review slot.
+    #[test]
+    fn review_layout_state_lists_only_review_column_tasks_on_review_slots() {
+        let _lock = crate::test_lock::acquire();
+        let proj = format!("review-layout-state-{}", std::process::id());
+        let home = std::env::temp_dir().join(format!("shelbi-rls-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        shelbi_state::save_project(&demo_project(&proj)).unwrap();
+        // The one slot a client should lay out: a review-column task on the
+        // review-tagged slot.
+        shelbi_state::save_task(&proj, &task_on("t-rev", "review-1", Column::review()), "b").unwrap();
+        // Excluded: a dev-column task on the dev slot…
+        shelbi_state::save_task(&proj, &task_on("t-dev", "alpha", Column::in_progress()), "b").unwrap();
+        // …a finished task still pinned to the review slot (it left review)…
+        shelbi_state::save_task(&proj, &task_on("t-done", "review-1", Column::done()), "b").unwrap();
+        // …and a review-column task parked on a NON-review slot (its window is a
+        // plain dev pane, never the embedded interface).
+        shelbi_state::save_task(&proj, &task_on("t-misowned", "alpha", Column::review()), "b").unwrap();
+
+        let state = review_layout_state(&proj).unwrap();
+        assert_eq!(
+            state,
+            vec![ReviewSlotLayout {
+                workspace: "review-1".into(),
+                task: "t-rev".into(),
+            }],
+            "only the review-column task on the review-tagged slot is laid out"
+        );
+
+        match prev_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // -- close_review_window (accept teardown) ------------------------------

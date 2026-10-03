@@ -283,6 +283,18 @@ pub struct App {
     /// *change* re-seats the highlight, so plain cursor-preview navigation
     /// (which doesn't swap the pane) is never snapped back.
     last_current_view: Option<String>,
+    /// Pushed layout events from the daemon's poller over the hub socket
+    /// (`rt-daemon-layout-split`). When the daemon runs the poller (the default),
+    /// it drives the session half of a layout split and publishes a
+    /// [`shelbi_state::LayoutEvent`]; the sidebar — the always-present layout
+    /// client on the tmux runtime — drains this each tick and does the pane work.
+    /// `None` in a bare test [`App`] (no subscription wired).
+    layout_rx: Option<Receiver<shelbi_state::LayoutEvent>>,
+    /// The same layout events from this process's *own* change bus, for the
+    /// setting-off fallback where the poller runs in the sidebar and publishes
+    /// in-process rather than through the daemon. `None` until a subscription is
+    /// wired.
+    layout_bus: Option<shelbi_state::ChangeSubscription>,
 }
 
 /// A review load running on a worker thread. Holds the channel the thread
@@ -326,7 +338,25 @@ impl App {
             last_collapse_warn: None,
             last_active_window: None,
             last_current_view: None,
+            layout_rx: None,
+            layout_bus: None,
         }
+    }
+
+    /// Wire the pushed-layout-event sources this sidebar reacts to
+    /// (`rt-daemon-layout-split`): `rx` is the hub-socket subscriber's channel
+    /// (events the daemon's poller published) and `bus` is a subscription to
+    /// this process's own change bus (events an in-sidebar poller published).
+    /// Both are drained by [`App::poll_layout_events`]. Called once by
+    /// `run_sidebar` after it starts the subscriber; a plain test [`App`] leaves
+    /// them unset.
+    pub fn set_layout_sources(
+        &mut self,
+        rx: Receiver<shelbi_state::LayoutEvent>,
+        bus: shelbi_state::ChangeSubscription,
+    ) {
+        self.layout_rx = Some(rx);
+        self.layout_bus = Some(bus);
     }
 
     /// Probe the hub daemon and precompute the footer version segment. A match
@@ -1089,6 +1119,93 @@ impl App {
                 let idx = (job.started.elapsed().as_millis() / 100) as usize % FRAMES.len();
                 self.status_line =
                     format!("{} loading {} onto {}…", FRAMES[idx], job.task_id, job.workspace);
+            }
+        }
+    }
+
+    /// Drain and apply any pending pushed layout events
+    /// (`rt-daemon-layout-split`). Runs each sidebar tick, non-blocking, from
+    /// both sources — the hub-socket subscriber (`layout_rx`, events the daemon's
+    /// poller published) and this process's own change bus (`layout_bus`, events
+    /// an in-sidebar poller published). A given poller runs in exactly one
+    /// process (its per-project lock guarantees it), so an event arrives on
+    /// exactly one source — never both — and no event is handled twice.
+    pub fn poll_layout_events(&mut self) {
+        let mut events = Vec::new();
+        let mut rx_disconnected = false;
+        if let Some(rx) = self.layout_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => events.push(ev),
+                    Err(TryRecvError::Empty) => break,
+                    // The subscriber thread exited; drop the dead receiver.
+                    Err(TryRecvError::Disconnected) => {
+                        rx_disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if rx_disconnected {
+            self.layout_rx = None;
+        }
+        if let Some(bus) = self.layout_bus.as_ref() {
+            while let Some(change) = bus.try_recv() {
+                if change.project() == self.project_name {
+                    if let Some(ev) = change.layout() {
+                        events.push(ev.clone());
+                    }
+                }
+            }
+        }
+        for ev in events {
+            self.apply_layout_event(ev);
+        }
+    }
+
+    /// Perform the layout half of one split the daemon's poller produced
+    /// (`rt-daemon-layout-split`). These reproduce the exact tmux pane/window
+    /// work the poller used to do inline, so the visible behavior is unchanged;
+    /// they are the same `review_ui` / `ensure_dashboard` calls, now driven by an
+    /// event instead of a direct call from the poller. Best-effort: a layout that
+    /// can't be built (a window not up yet, a slot already freed) is logged, not
+    /// fatal — the next event or a client reconnect reconciles it.
+    fn apply_layout_event(&self, event: shelbi_state::LayoutEvent) {
+        use shelbi_state::LayoutEvent::*;
+        let project = &self.project_name;
+        match event {
+            OrchestratorRestarted => {
+                // Place/heal the dashboard: on tmux this re-splits the
+                // orchestrator pane if the crash collapsed it. Idempotent on an
+                // already-two-pane dashboard.
+                if let Err(e) = shelbi_orchestrator::ensure_dashboard(project) {
+                    tracing::warn!(project = %project, error = %e, "layout: ensure_dashboard after orchestrator restart failed");
+                }
+            }
+            ReviewOpened { task, .. } => {
+                // Build the review panel beside the resumed agent pane, no focus
+                // steal (the resume ran in the background).
+                if let Err(e) =
+                    shelbi_orchestrator::review_ui::build_review_panel_no_focus(project, &task)
+                {
+                    tracing::warn!(project = %project, task = %task, error = %e, "layout: building the resumed review panel failed");
+                }
+            }
+            ReviewClosed { task, .. } => {
+                // Free the slot in the UI: kill its pane and clear its status.
+                // Debug-level — a task already advanced to done is a benign race.
+                if let Err(e) =
+                    shelbi_orchestrator::review_ui::close_review_window(project, &task)
+                {
+                    tracing::debug!(project = %project, task = %task, error = %e, "layout: freeing the review slot failed (already advanced?)");
+                }
+            }
+            ReviewAgentRecovered { workspace } => {
+                // Break the parked agent back into a fresh window. Returns false
+                // when there was nothing to recover (already healed) — benign.
+                let _ = shelbi_orchestrator::review_ui::recover_parked_review_agent(
+                    project, &workspace,
+                );
             }
         }
     }

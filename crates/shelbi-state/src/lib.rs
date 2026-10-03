@@ -122,7 +122,10 @@ pub use hub_config::{
 pub use daemon_lifecycle::{
     daemon_lock_held, ensure_daemon_running, hub_lock_path, stop_daemon,
 };
-pub use change_bus::{publish_change, subscribe_changes, ChangeNotification, ChangeSubscription};
+pub use change_bus::{
+    publish_change, publish_layout, subscribe_changes, ChangeNotification, ChangeSubscription,
+    LayoutEvent,
+};
 pub use daemon_poller::{
     acquire_poller_lock, daemon_poller_enabled, poller_lock_path, PollerLock, DAEMON_POLLER_ENV,
 };
