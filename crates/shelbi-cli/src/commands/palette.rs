@@ -25,7 +25,7 @@ use ratatui::{
 use shelbi_core::StatusCategory;
 use shelbi_palette::{Entry, EntryKind};
 use shelbi_state::keymap::{
-    load_keymaps, GlobalAction, KeyChord, KeymapDiagnostic, Keymaps, PaletteAction,
+    load_keymaps, GlobalAction, KeymapDiagnostic, Keymaps, PaletteAction,
 };
 use shelbi_state::{load_user_config, ProjectSummary, ZenModeState, ZenToggleChord};
 use shelbi_tui::{decoration_to_color, App, Row, View, WorkspaceOverview};
@@ -388,7 +388,7 @@ fn picker_loop<B: ratatui::backend::Backend>(
                     continue;
                 }
                 if let Some(c) = opener_close {
-                    if c == KeyChord::from_event(k) {
+                    if crate::keys::chord_from_event(k) == Some(c) {
                         return Ok(None);
                     }
                 }
@@ -420,7 +420,7 @@ fn picker_loop<B: ratatui::backend::Backend>(
                     }
                     _ => {}
                 }
-                match keymaps.palette.dispatch(k) {
+                match crate::keys::chord_from_event(k).and_then(|c| keymaps.palette.dispatch(c)) {
                     Some(PaletteAction::Close) => return Ok(None),
                     Some(PaletteAction::Activate) => {
                         if state.focus == Focus::Projects && state.projects_column_visible() {
@@ -1096,54 +1096,127 @@ fn zen_toggle_entry(current: ZenModeState, chord: ZenToggleChord) -> Entry {
     }
 }
 
+/// Dispatch an activated palette entry.
+///
+/// The former hand-rolled `strip_prefix` ladder is now driven by the
+/// `shelbi-app` command registry: the entry's id is parsed into a typed
+/// [`shelbi_app::CommandKind`], turned into the [`shelbi_app::Effect`] it
+/// produces, and handed to [`PaletteExecutor`] — the local implementation
+/// of the registry's [`shelbi_app::Executor`] seam, which runs exactly the
+/// library / CLI paths this function used to call inline. `rt-mutations-daemon`
+/// will later swap in an executor that routes the mutating effects to the
+/// daemon without touching this call site.
+///
+/// Only the "fire and exit" commands reach here. The interactive ones
+/// (`action:switch-project*`, `action:add-project`, `action:quit-project`,
+/// and the Zen first-enable intro) are gated by the outer `run` flow behind
+/// their popovers/forms before dispatch, so routing them here would bypass
+/// that UI — [`PaletteExecutor`] treats their effects as no-ops, matching
+/// the old ladder's final `Ok(())`.
 fn dispatch(project: &str, entry: &Entry) -> Result<()> {
-    if let Some(view) = entry.id.strip_prefix("view:") {
-        shelbi_orchestrator::show_view(project, view).map_err(|e| anyhow::anyhow!(e))?;
+    let Some(kind) = shelbi_app::CommandKind::from_id(&entry.id) else {
+        // Unknown id: nothing to do, as before.
         return Ok(());
+    };
+    let effect = kind.effect_with_project(project);
+    // Route through the registry's `Executor` seam. The local executor runs
+    // today's paths; the `ExecError` it reports is adapted back to `anyhow`
+    // so the palette's callers see the same error flow as before.
+    shelbi_app::Executor::run(&mut PaletteExecutor { project }, effect)
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// The local executor for palette effects. Implements the registry's
+/// [`shelbi_app::Executor`] seam by calling the same orchestrator / state /
+/// CLI paths the palette has always used. Errors surface as `anyhow`
+/// through [`PaletteExecutor::run_anyhow`]; the trait method adapts them
+/// into [`shelbi_app::ExecError`] so the seam stays backend-agnostic.
+struct PaletteExecutor<'a> {
+    project: &'a str,
+}
+
+impl shelbi_app::Executor for PaletteExecutor<'_> {
+    fn run(&mut self, effect: shelbi_app::Effect) -> shelbi_app::ExecOutcome {
+        self.run_effect(effect)
+            .map_err(|e| shelbi_app::ExecError::Backend(e.to_string()))
     }
-    if let Some(workspace) = entry.id.strip_prefix("workspace:") {
-        shelbi_orchestrator::focus_workspace(project, workspace).map_err(|e| anyhow::anyhow!(e))?;
-        return Ok(());
+}
+
+impl PaletteExecutor<'_> {
+    fn run_effect(&mut self, effect: shelbi_app::Effect) -> Result<()> {
+        use shelbi_app::{Effect, Mutation};
+        match effect {
+            Effect::ShowView(view) => {
+                shelbi_orchestrator::show_view(self.project, &view.as_view_id())
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            }
+            Effect::FocusWorkspace { workspace, .. } => {
+                shelbi_orchestrator::focus_workspace(self.project, &workspace)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            }
+            Effect::LoadReview { task_id, .. } => {
+                // Review-specific loader: reuse the task's own review slot,
+                // else a free one. Never re-seeds the dev slot a handoff
+                // task is pinned to, and dispatches the Review agent onto
+                // the slot (not the review status's Zen agent).
+                let target = shelbi_orchestrator::load::load_task_for_review(self.project, &task_id)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                super::run_tmux(["select-window", "-t", &exact_window_target(&target)]);
+            }
+            Effect::FocusSession { session } => {
+                super::run_tmux([
+                    "select-window",
+                    "-t",
+                    &format!("shelbi-{}:={session}", self.project),
+                ]);
+            }
+            Effect::OpenEditor { target } => {
+                // Config opener. `run` has already restored the terminal
+                // before dispatch, so the editor inherits a clean
+                // normal-mode terminal and the palette process closes once
+                // it returns.
+                return open_edit_target(self.project, &edit_target_id(&target));
+            }
+            Effect::OpenErrorLog { .. } => {
+                // `run` has already restored the terminal before dispatch,
+                // so the viewer sets up its own alt-screen inside the
+                // palette's popup pane and closes the palette process when
+                // it returns — no nested `display-popup`.
+                return super::error_log::run(self.project.to_string());
+            }
+            Effect::Mutate(Mutation::ToggleZen { .. }) => {
+                // Shares the read/write/log path with the TUI's Alt+Z
+                // handler and the CLI's `shelbi zen on|off` — only the
+                // source tag differs (`user:palette`) so the activity feed
+                // can attribute the toggle back to the palette.
+                shelbi_state::toggle_zen_mode(self.project, "user:palette")
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            }
+            // The interactive / gated effects never reach dispatch (the
+            // outer `run` flow handles them behind their popovers), and the
+            // issue mutations aren't surfaced in the tmux palette yet. Both
+            // are no-ops here, matching the old ladder's trailing `Ok(())`.
+            Effect::SwitchProject { .. }
+            | Effect::AddProject
+            | Effect::QuitProject { .. }
+            | Effect::QuitShelbi
+            | Effect::Mutate(_) => {}
+        }
+        Ok(())
     }
-    if let Some(task_id) = entry.id.strip_prefix("review:") {
-        // Review-specific loader: reuse the task's own review slot, else a free
-        // one. Never re-seeds the dev slot a handoff task is pinned to, and
-        // dispatches the Review agent onto the slot (not the review status's
-        // Zen agent).
-        let target = shelbi_orchestrator::load::load_task_for_review(project, task_id)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        super::run_tmux(["select-window", "-t", &exact_window_target(&target)]);
-        return Ok(());
+}
+
+/// The historical palette id for an edit target — the inverse the registry
+/// uses — so [`open_edit_target`] keeps receiving the exact id strings it
+/// parses today.
+fn edit_target_id(target: &shelbi_app::EditTarget) -> String {
+    use shelbi_app::EditTarget;
+    match target {
+        EditTarget::Project => "edit:project".to_string(),
+        EditTarget::Agent(a) => format!("edit:agent:{a}"),
+        EditTarget::ZenMode => "edit:zenmode".to_string(),
+        EditTarget::Workflows => "edit:workflows".to_string(),
     }
-    if let Some(id) = entry.id.strip_prefix("agent:") {
-        super::run_tmux(["select-window", "-t", &format!("shelbi-{project}:={id}")]);
-        return Ok(());
-    }
-    if entry.id.starts_with("edit:") {
-        // Config opener. `run` has already restored the terminal before
-        // dispatch, so the editor inherits a clean normal-mode terminal and
-        // the palette process closes once it returns.
-        return open_edit_target(project, &entry.id);
-    }
-    if entry.id == "action:error-log" {
-        // `run` has already restored the terminal before dispatch, so the viewer
-        // sets up its own alt-screen inside the palette's popup pane and closes
-        // the palette process when it returns — no nested `display-popup`.
-        return super::error_log::run(project.to_string());
-    }
-    if entry.id == "action:toggle-zen" {
-        // Shares the read/write/log path with the TUI's Alt+Z handler
-        // and the CLI's `shelbi zen on|off` — only the source tag
-        // differs (`user:palette`) so the activity feed can attribute
-        // the toggle back to the palette.
-        shelbi_state::toggle_zen_mode(project, "user:palette").map_err(|e| anyhow::anyhow!(e))?;
-        return Ok(());
-    }
-    // `action:quit-project` is intentionally not handled here — the
-    // outer `run` flow gates it behind a confirmation popover and
-    // invokes `super::quit_project::run` directly on confirm. Routing
-    // it through `dispatch` would bypass the popover.
-    Ok(())
 }
 
 /// Anchor the window-name half of a `session:window` tmux target with `=`
@@ -1255,7 +1328,7 @@ fn run_zen_intro_popover<B: ratatui::backend::Backend>(
                     continue;
                 }
                 if let Some(c) = opener_close {
-                    if c == KeyChord::from_event(k) {
+                    if crate::keys::chord_from_event(k) == Some(c) {
                         return Ok(ZenIntroResult {
                             confirmed: false,
                             dont_show_again: state.dont_show_again,
@@ -1338,11 +1411,11 @@ fn run_project_picker<B: ratatui::backend::Backend>(
                     continue;
                 }
                 if let Some(c) = opener_close {
-                    if c == KeyChord::from_event(k) {
+                    if crate::keys::chord_from_event(k) == Some(c) {
                         return Ok(None);
                     }
                 }
-                match keymaps.palette.dispatch(k) {
+                match crate::keys::chord_from_event(k).and_then(|c| keymaps.palette.dispatch(c)) {
                     Some(PaletteAction::Close) => return Ok(None),
                     Some(PaletteAction::Activate) => {
                         if let Some(p) = results.get(selected) {
@@ -1627,7 +1700,7 @@ fn run_quit_shelbi_confirm<B: ratatui::backend::Backend>(
                     continue;
                 }
                 if let Some(c) = opener_close {
-                    if c == KeyChord::from_event(k) {
+                    if crate::keys::chord_from_event(k) == Some(c) {
                         return Ok(false);
                     }
                 }
@@ -1641,7 +1714,7 @@ fn run_quit_shelbi_confirm<B: ratatui::backend::Backend>(
                     }
                     _ => {}
                 }
-                match keymaps.palette.dispatch(k) {
+                match crate::keys::chord_from_event(k).and_then(|c| keymaps.palette.dispatch(c)) {
                     Some(PaletteAction::Close) => return Ok(false),
                     Some(PaletteAction::Activate) => return Ok(focus_quit),
                     // NavUp / NavDown / Backspace have no meaningful
@@ -1685,7 +1758,7 @@ fn run_quit_project_confirm<B: ratatui::backend::Backend>(
                     continue;
                 }
                 if let Some(c) = opener_close {
-                    if c == KeyChord::from_event(k) {
+                    if crate::keys::chord_from_event(k) == Some(c) {
                         return Ok(false);
                     }
                 }
@@ -1699,7 +1772,7 @@ fn run_quit_project_confirm<B: ratatui::backend::Backend>(
                     }
                     _ => {}
                 }
-                match keymaps.palette.dispatch(k) {
+                match crate::keys::chord_from_event(k).and_then(|c| keymaps.palette.dispatch(c)) {
                     Some(PaletteAction::Close) => return Ok(false),
                     Some(PaletteAction::Activate) => return Ok(focus_quit),
                     Some(_) | None => {}

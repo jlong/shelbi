@@ -144,7 +144,8 @@ pub fn handle_sidebar_key(app: &mut App, key: KeyEvent, km: &Keymaps) -> Outcome
     // The review-load confirm now runs as a modal tmux popup that blocks the
     // sidebar loop while it's open (see `App::open_review_load_prompt`), so
     // there's no in-TUI overlay left to swallow keys for here.
-    if let Some(global) = km.global.dispatch(key) {
+    let chord = crate::keymap::chord_from_event(key);
+    if let Some(global) = chord.and_then(|c| km.global.dispatch(c)) {
         return match global {
             GlobalAction::Quit => Outcome::Quit,
             GlobalAction::ZenToggle => {
@@ -154,7 +155,7 @@ pub fn handle_sidebar_key(app: &mut App, key: KeyEvent, km: &Keymaps) -> Outcome
             GlobalAction::OpenPalette => Outcome::OpenPalette,
         };
     }
-    match km.sidebar.dispatch(key) {
+    match chord.and_then(|c| km.sidebar.dispatch(c)) {
         Some(SidebarAction::Quit) => Outcome::Quit,
         Some(SidebarAction::NavUp) => {
             app.nav_up();
@@ -319,7 +320,7 @@ mod tests {
         // keyboard.
         assert_eq!(
             km.sidebar
-                .dispatch(ev(KeyCode::Char(' '), KeyModifiers::NONE)),
+                .dispatch(crate::keymap::chord_from_event(ev(KeyCode::Char(' '), KeyModifiers::NONE)).unwrap()),
             Some(SidebarAction::Activate)
         );
         assert_eq!(
@@ -369,7 +370,7 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         assert_eq!(
             km.sidebar
-                .dispatch(ev(KeyCode::Char('w'), KeyModifiers::NONE)),
+                .dispatch(crate::keymap::chord_from_event(ev(KeyCode::Char('w'), KeyModifiers::NONE)).unwrap()),
             Some(SidebarAction::NavUp)
         );
         // `w` flows through the dispatcher into NavUp (Outcome::Continue,
@@ -383,11 +384,11 @@ mod tests {
         // `k` / Up under the sidebar mode.
         assert_eq!(
             km.sidebar
-                .dispatch(ev(KeyCode::Char('k'), KeyModifiers::NONE)),
+                .dispatch(crate::keymap::chord_from_event(ev(KeyCode::Char('k'), KeyModifiers::NONE)).unwrap()),
             None
         );
         assert_eq!(
-            km.sidebar.dispatch(ev(KeyCode::Up, KeyModifiers::NONE)),
+            km.sidebar.dispatch(crate::keymap::chord_from_event(ev(KeyCode::Up, KeyModifiers::NONE)).unwrap()),
             None
         );
 

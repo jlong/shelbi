@@ -1185,6 +1185,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shelbi-agent",
+ "shelbi-app",
  "shelbi-core",
  "shelbi-orchestrator",
  "shelbi-palette",
@@ -1206,6 +1207,18 @@ name = "shelbi-agent"
 version = "0.9.0"
 dependencies = [
  "shelbi-core",
+]
+
+[[package]]
+name = "shelbi-app"
+version = "0.9.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "shelbi-core",
+ "shelbi-palette",
+ "shelbi-state",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1285,7 +1298,6 @@ name = "shelbi-state"
 version = "0.9.0"
 dependencies = [
  "chrono",
- "crossterm 0.28.1",
  "dirs",
  "libc",
  "serde",
