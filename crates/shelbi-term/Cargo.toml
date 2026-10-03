@@ -10,3 +10,8 @@ description = "UI-toolkit-agnostic terminal view for shelbi sessions (emulator, 
 
 [dependencies]
 shelbi-proto = { workspace = true }
+# The client-side emulator crate chosen in `rt-spike-emulator-replay` (vendored
+# fork under `vendor/alacritty_terminal`). Present so this crate and the session
+# process can build against it; no product code uses it yet (`rt-term` wires the
+# `emulator` seam to it).
+alacritty_terminal = { workspace = true }

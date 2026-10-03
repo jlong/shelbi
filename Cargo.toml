@@ -17,7 +17,13 @@ members = [
 default-members = ["crates/shelbi-cli"]
 # Throwaway prototypes for the "removing tmux" work. Excluded so they never
 # affect `cargo build --workspace`, `test`, or `clippy`; deleted at cutover.
-exclude = ["spikes"]
+#
+# `vendor/*` holds vendored third-party forks (e.g. `alacritty_terminal`, the
+# client-side terminal emulator chosen in the `rt-spike-emulator-replay`
+# spike). They are path dependencies of workspace crates but NOT workspace
+# members, so `cargo clippy --workspace -- -D warnings` never lints upstream
+# code and `cargo test --workspace` never runs their suites.
+exclude = ["spikes", "vendor"]
 
 [workspace.package]
 version = "0.9.0"
@@ -54,6 +60,12 @@ unicode-width = "0.1"
 libc = "0.2"
 regex = "1"
 tungstenite = "0.29"
+
+# Client-side terminal emulator, vendored under `vendor/` (Apache-2.0). Chosen
+# in the `rt-spike-emulator-replay` Phase 0 spike as a fork because attach
+# replay needs full access to state the upstream crate keeps private. A
+# dependency only for now; `shelbi-term` / `rt-term` wire it to real rendering.
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
 
 # internal crates
 shelbi-core = { path = "crates/shelbi-core" }

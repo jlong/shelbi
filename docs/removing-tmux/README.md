@@ -55,7 +55,7 @@ fixable, plus the emulator decision.
 
 | Subtask | Scope | Status |
 | --- | --- | --- |
-| `rt-spike-emulator-replay` | Serialize full emulator state and rebuild it in a second emulator; **decides the emulator crate** | Pending |
+| `rt-spike-emulator-replay` | Serialize full emulator state and rebuild it in a second emulator; **decides the emulator crate** | Landed — see [`phase0/emulator-replay.md`](phase0/emulator-replay.md); chose vendored `alacritty_terminal` |
 | `rt-spike-agents` | Claude Code (full-screen + inline) and Codex in a PTY rendered by a ratatui widget: keys incl. Shift+Enter, mouse, paste, wide chars, redraw cost | Pending |
 | `rt-spike-runtime` | Process survival (outliving the launcher on macOS and Linux/logind; child group dies on kill), the startup query responder, and nesting inside tmux and Screen | Landed (macOS + ssh + `portable-pty` verified; Linux/logind untested, no reachable host; see [`phase0/runtime.md`](phase0/runtime.md)) |
 
@@ -123,6 +123,7 @@ Copied from the plan's decisions table.
 
 | Question | Decision |
 | --- | --- |
+| Terminal emulator crate | Vendored `alacritty_terminal` (`vendor/alacritty_terminal/`, Apache-2.0). It is the only candidate that models both screen buffers, saved cursors, scroll region, tab stops, charsets, the kitty keyboard protocol, and history; vendored because that state is private upstream and the crate is pre-1.0. Decided in `rt-spike-emulator-replay` ([`phase0/emulator-replay.md`](phase0/emulator-replay.md)). |
 | Persistence | Agents survive quitting or crashing the UI. Clients attach and detach. |
 | Who owns the PTYs | One small process per session. No shared host. Chosen because it is the most reliable shape: a bug can cost one agent at most, and upgrades never touch running agents. |
 | Remote machines | The `shelbi` binary is installed on each remote. Agents survive SSH drops. |
