@@ -355,6 +355,12 @@ fn refresh_with_store(
 
     if changed > 0 {
         emit_board_refreshed(project, &fetched_at_return, changed, remaining_return, rest_fallback);
+        // Push a change notification to any subscribed client so a UI can
+        // refresh its board without polling (Phase 3 pushed notifications). A
+        // no-op when nobody is subscribed, so a quiet sidebar pays nothing.
+        shelbi_state::publish_change(shelbi_state::ChangeNotification::Board {
+            project: project.to_string(),
+        });
     }
     // Announce each newly-observed reopen, independent of `changed`. Best-effort,
     // and no store call — the loop stays read-only against GitHub.

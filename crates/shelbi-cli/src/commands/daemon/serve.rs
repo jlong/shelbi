@@ -26,6 +26,10 @@
 //!   event when the worker never confirms delivery.
 //! - `message-ack` (Phase 9) — emitted by the worker after it processes a
 //!   message; appends an `ack=worker` event and clears the pending entry.
+//! - `subscribe` (Phase 3, remove-tmux) — hands the connection to a streaming
+//!   loop that pushes change notifications (board and workspace changes) to the
+//!   client until it disconnects, so a UI need not poll. One-way: no ack, and
+//!   the existing one-shot verbs above are untouched.
 //!
 //! Unknown verbs and malformed payloads are logged to stderr
 //! (debug-escaped, so client-controlled bytes can't smuggle ANSI
@@ -198,14 +202,19 @@ struct Daemon {
     /// so a `refresh-board` socket request and a scheduled tick single-flight
     /// through the same per-project lock. See [`super::board`].
     board: super::board::BoardRefresher,
+    /// The shared shutdown flag. A `subscribe` handler blocks streaming change
+    /// notifications and watches this so SIGTERM stops it within a poll slice
+    /// instead of leaving it parked past the shutdown drain.
+    stop: Arc<AtomicBool>,
 }
 
 impl Daemon {
-    fn new(ack_timeout: Duration) -> Self {
+    fn new(ack_timeout: Duration, stop: Arc<AtomicBool>) -> Self {
         Self {
             pending: Arc::new(Mutex::new(PendingMap::new())),
             ack_timeout,
             board: super::board::BoardRefresher::default(),
+            stop,
         }
     }
 }
@@ -269,19 +278,23 @@ pub(super) fn run_foreground() -> Result<()> {
         eprintln!("shelbi daemon: failed to write PID file: {e}");
     }
 
-    let daemon = Daemon::new(ack_timeout_from_env());
+    let stop = Arc::new(AtomicBool::new(false));
+    let daemon = Daemon::new(ack_timeout_from_env(), stop.clone());
     eprintln!(
         "shelbi daemon: listening at {} (ack timeout {}s)",
         sock.display(),
         daemon.ack_timeout.as_secs()
     );
 
-    let stop = Arc::new(AtomicBool::new(false));
     install_shutdown_listener(stop.clone(), sock.clone())?;
     spawn_reaper(daemon.clone(), stop.clone());
     // The single board reader per hub: one refresh loop per open project,
     // publishing `board-index.json` on each project's configured cadence.
     super::board::spawn_refresh_manager(daemon.board.clone(), stop.clone());
+    // The per-project workspace-poller manager: one poller per open project when
+    // the hidden `SHELBI_DAEMON_POLLER` dev setting is on; a no-op otherwise (the
+    // sidebar owns the poller by default). Phase 3, `rt-daemon-poller`.
+    super::poller::spawn_poller_manager(stop.clone());
     // Exit when no project is open (the on-demand lifecycle: nothing to serve,
     // and the next open restarts us). A short minimum-lifetime debounce keeps a
     // just-started daemon alive long enough for the opener to record its open
@@ -779,6 +792,14 @@ fn handle_client(stream: UnixStream, daemon: &Daemon) {
         if line.trim().is_empty() {
             continue;
         }
+        // `subscribe` is not a one-shot request: it hands the connection over to
+        // a streaming loop that pushes change notifications until the client
+        // disconnects or the daemon shuts down. It takes over this connection, so
+        // the per-line read loop ends here.
+        if let Some(project_filter) = subscribe_project_filter(line) {
+            stream_changes(&stream, &daemon.stop, project_filter.as_deref());
+            return;
+        }
         match dispatch(line, daemon) {
             // A verb with a custom reply (e.g. `refresh-board` → the new
             // `fetched_at`) writes that reply, newline-terminated, in place of
@@ -796,6 +817,65 @@ fn handle_client(stream: UnixStream, daemon: &Daemon) {
                 // multi-message client connection. No ack — the sender
                 // must not mistake a rejection for delivery.
                 eprintln!("shelbi daemon: rejected message: {e}: {line:?}");
+            }
+        }
+    }
+}
+
+/// How long [`stream_changes`] blocks for the next notification before looping
+/// to re-check the shutdown flag. Short enough that SIGTERM stops a parked
+/// subscriber well within the shutdown drain.
+const SUBSCRIBE_POLL_SLICE: Duration = Duration::from_millis(250);
+
+/// If `line` is a `subscribe` frame, returns its optional project filter:
+/// `Some(None)` subscribes to every project's changes, `Some(Some(p))` to only
+/// project `p`'s. Returns `None` when the frame is not a subscribe, so it falls
+/// through to `dispatch`, which reports the real parse error.
+///
+/// Parsed separately from the full [`Message`] so the streaming decision in
+/// [`handle_client`] doesn't have to grow the one-shot dispatch path a sentinel
+/// return. A per-project client (a sidebar watching one board) passes its
+/// `project` so the daemon only wakes it for that project's churn; a client
+/// omits it to see everything.
+fn subscribe_project_filter(line: &str) -> Option<Option<String>> {
+    #[derive(Deserialize)]
+    struct SubFrame {
+        verb: String,
+        #[serde(default)]
+        project: Option<String>,
+    }
+    serde_json::from_str::<SubFrame>(line)
+        .ok()
+        .filter(|m| m.verb == "subscribe")
+        .map(|m| m.project)
+}
+
+/// Stream change notifications to a subscribed client until it disconnects or
+/// the daemon shuts down (Phase 3 pushed change notifications,
+/// `docs/removing-tmux/phase3-daemon.md`).
+///
+/// The client subscribes once and then only reads; the daemon pushes one NDJSON
+/// [`shelbi_state::ChangeNotification`] line per change (board moves, workspace
+/// status changes) that the board refresher and the poller publish to the
+/// in-process change bus. A failed write means the client is gone, so the loop
+/// exits and drops the subscription (pruned from the bus on the next publish).
+/// The connection carries no `ok` ack — it is a one-way push channel, distinct
+/// from the one-shot event/message verbs and from the mutation control socket
+/// `rt-mutations-daemon` adds.
+///
+/// `project`, when set, filters the stream to that one project: the daemon is
+/// hub-global and the bus carries every open project's changes, so a sidebar
+/// watching one board subscribes with its `project` and is woken only by its
+/// own churn, not a sibling project's.
+fn stream_changes(mut stream: &UnixStream, stop: &Arc<AtomicBool>, project: Option<&str>) {
+    let sub = shelbi_state::subscribe_changes();
+    while !stop.load(Ordering::SeqCst) {
+        if let Some(change) = sub.recv_timeout(SUBSCRIBE_POLL_SLICE) {
+            if project.is_some_and(|p| change.project() != p) {
+                continue; // another project's change — not this subscriber's
+            }
+            if stream.write_all(change.to_line().as_bytes()).is_err() {
+                return; // client disconnected
             }
         }
     }
@@ -990,7 +1070,7 @@ mod tests {
         // Tests that exercise the timeout branch override `ack_timeout`
         // locally; everything else uses the production default so the
         // unit tests reflect real config.
-        Daemon::new(DEFAULT_ACK_TIMEOUT)
+        Daemon::new(DEFAULT_ACK_TIMEOUT, Arc::new(AtomicBool::new(false)))
     }
 
     /// RAII guard: point `$SHELBI_HOME` at a fresh temp dir for the
@@ -1608,5 +1688,133 @@ mod tests {
             "drained event must land exactly once: {log}"
         );
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn a_subscribed_client_receives_a_pushed_change_notification() {
+        // Phase 3 pushed notifications: a `subscribe` frame hands the connection
+        // to the streaming loop, and a change published to the in-process bus
+        // (as the board refresher and poller do) is written to the client as one
+        // NDJSON line. The client never polls.
+        let stop = Arc::new(AtomicBool::new(false));
+        let d = Daemon::new(DEFAULT_ACK_TIMEOUT, stop.clone());
+        let (client, server) = UnixStream::pair().unwrap();
+        let handler = thread::spawn(move || handle_client(server, &d));
+
+        // Subscribe to one project unique to this test. The bus is
+        // process-global, so a concurrent test's publish (the board refresher,
+        // `append_workspace_event`) also reaches this subscriber; the
+        // server-side `project` filter drops those, so the only line that comes
+        // back is the one this test publishes. No race on which lands first.
+        let project = "serve-subscribe-test";
+        (&client)
+            .write_all(format!("{{\"verb\":\"subscribe\",\"project\":\"{project}\"}}\n").as_bytes())
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        // Publish on a short retry loop so the first publishes that race the
+        // handler's subscribe aren't lost — once it has subscribed, the queued
+        // notification reads back immediately. Deterministic within ~1s.
+        let mut reader = BufReader::new(&client);
+        let mut line = String::new();
+        let mut got = false;
+        for _ in 0..50 {
+            shelbi_state::publish_change(shelbi_state::ChangeNotification::Board {
+                project: project.into(),
+            });
+            match reader.read_line(&mut line) {
+                Ok(n) if n > 0 => {
+                    got = true;
+                    break;
+                }
+                _ => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        assert!(got, "subscriber received a change line");
+        assert_eq!(
+            line.trim(),
+            format!(r#"{{"change":"board","project":"{project}"}}"#)
+        );
+
+        // Stop flag unblocks the streaming loop within a poll slice.
+        stop.store(true, Ordering::SeqCst);
+        handler.join().unwrap();
+    }
+
+    #[test]
+    fn a_project_scoped_subscriber_ignores_other_projects_changes() {
+        // A client that subscribes with a `project` is woken only by that
+        // project's changes. A sibling project's churn is dropped server-side,
+        // so a per-project sidebar isn't refreshed for a board it isn't showing.
+        let stop = Arc::new(AtomicBool::new(false));
+        let d = Daemon::new(DEFAULT_ACK_TIMEOUT, stop.clone());
+        let (client, server) = UnixStream::pair().unwrap();
+        let handler = thread::spawn(move || handle_client(server, &d));
+
+        let mine = "serve-filter-mine";
+        let other = "serve-filter-other";
+        (&client)
+            .write_all(format!("{{\"verb\":\"subscribe\",\"project\":\"{mine}\"}}\n").as_bytes())
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        let mut reader = BufReader::new(&client);
+        let mut line = String::new();
+        let mut got = false;
+        for _ in 0..50 {
+            // Publish the other project's change first every iteration: if the
+            // filter leaked, it would arrive before mine and fail the assert.
+            shelbi_state::publish_change(shelbi_state::ChangeNotification::Board {
+                project: other.into(),
+            });
+            shelbi_state::publish_change(shelbi_state::ChangeNotification::Workspace {
+                project: mine.into(),
+                workspace: "alpha".into(),
+            });
+            match reader.read_line(&mut line) {
+                Ok(n) if n > 0 => {
+                    got = true;
+                    break;
+                }
+                _ => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        assert!(got, "project-scoped subscriber received its own change");
+        assert_eq!(
+            line.trim(),
+            format!(r#"{{"change":"workspace","project":"{mine}","workspace":"alpha"}}"#),
+            "only the subscriber's own project is streamed"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        handler.join().unwrap();
+    }
+
+    #[test]
+    fn subscribe_project_filter_parses_optional_project() {
+        assert_eq!(
+            subscribe_project_filter(r#"{"verb":"subscribe"}"#),
+            Some(None),
+            "subscribe with no project = all projects"
+        );
+        assert_eq!(
+            subscribe_project_filter(r#"{"verb":"subscribe","project":"p"}"#),
+            Some(Some("p".to_string())),
+            "subscribe with a project = that project only"
+        );
+        assert_eq!(
+            subscribe_project_filter(r#"{"verb":"event","project":"p"}"#),
+            None,
+            "a non-subscribe verb is not a subscribe frame"
+        );
+        assert_eq!(
+            subscribe_project_filter("not json"),
+            None,
+            "a malformed frame is not a subscribe frame"
+        );
     }
 }

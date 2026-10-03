@@ -249,9 +249,12 @@ stable (tested by the existing worker-hook tests). On top of it, the daemon
 pushes change notifications to connected clients so they do not have to poll:
 board changes, workspace-status changes, and the layout events from the
 layout split. Clients subscribe on connect and react; a client that is not
-connected simply reads state on its next open, exactly as today. The mutation
-control socket (`rt-mutations-daemon`) is a separate channel from this event
-socket.
+connected simply reads state on its next open, exactly as today. A `subscribe`
+frame may carry a `project`: the daemon is hub-global but a UI client is
+per-project, so a subscriber that names its project is streamed only that
+project's changes, not a sibling's; omitting `project` streams every project's
+changes. The mutation control socket (`rt-mutations-daemon`) is a separate
+channel from this event socket.
 
 ## Interfaces the subtasks build against
 

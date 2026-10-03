@@ -1,5 +1,10 @@
-//! Background workspace-state poller. Lives in the sidebar process and is
-//! the only place the hub talks to workspace panes for observability.
+//! Background workspace-state poller. Runs either in the sidebar process or,
+//! when the hidden `SHELBI_DAEMON_POLLER` dev setting is on, in `shelbi daemon`
+//! (one [`WorkspacePoller`] per open project, started by the daemon's poller
+//! manager). It is the only place the hub talks to workspace panes for
+//! observability. A per-project lock ([`shelbi_state::acquire_poller_lock`])
+//! guarantees exactly one poller runs for a project even if a stale sidebar
+//! overlaps a daemon that has taken over.
 //!
 //! Cadence: per-project `workspace_poll_interval_secs` (default 5s). The
 //! poller spawns ONE thread per declared workspace — each running its own
@@ -25,7 +30,7 @@
 //! so the title path alone can't see the stall:
 //!
 //! - **Usage-limit pause.** If the sample shows the runner stalled on its
-//!   usage/session limit (`shelbi_orchestrator::ready::detect_usage_limit`,
+//!   usage/session limit (`crate::ready::detect_usage_limit`,
 //!   anchored on claude's actual modal chrome — *not* a bare substring, so a
 //!   pane that merely mentions the phrase doesn't trip it) the workspace is
 //!   marked [`WorkspaceState::Paused`] (⏸ badge) and a `-> paused
@@ -72,8 +77,8 @@ use shelbi_core::{
     default_workflow, Column, IssueTrackerBackend, Project, StatusCategory, Workflow,
     DEFAULT_WORKFLOW_NAME,
 };
-use shelbi_orchestrator::session_backend::{backend, SessionBackend, SessionTarget};
-use shelbi_orchestrator::supervision::{
+use crate::session_backend::{backend, SessionBackend, SessionTarget};
+use crate::supervision::{
     SupervisionAction, SupervisionInputs, SupervisionState, BASE_BACKOFF, CRASH_LOOP_WINDOW,
     MAX_RESTARTS_IN_WINDOW, STABLE_RECOVERY,
 };
@@ -100,18 +105,71 @@ const FORWARD_RECHECK_INTERVAL: Duration = Duration::from_secs(120);
 pub struct WorkspacePoller {
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    /// Whether this handle actually started a poll loop. `false` when the
+    /// per-project poller lock was already held (another poller — a daemon, or
+    /// a stale sidebar — is running), in which case the handle is inert.
+    active: bool,
 }
 
 impl WorkspacePoller {
+    /// Start a poller for `project_name`, after taking the project's poller lock
+    /// so exactly one poller ever runs for a project. If the lock is already
+    /// held — a daemon has taken over, or a stale sidebar still holds it — the
+    /// returned handle is inert ([`is_active`](Self::is_active) is `false`) and
+    /// starts no thread, so the caller can simply drop it and retry later.
     pub fn start(project_name: impl Into<String>) -> Self {
         let project_name = project_name.into();
+        let lock = match shelbi_state::acquire_poller_lock(&project_name) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                tracing::info!(
+                    project = %project_name,
+                    "poller lock held elsewhere; not starting a second poller",
+                );
+                return Self::inert();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    project = %project_name,
+                    error = %e,
+                    "could not acquire poller lock; not starting poller",
+                );
+                return Self::inert();
+            }
+        };
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let handle = thread::Builder::new()
             .name(format!("shelbi-poller-{project_name}"))
-            .spawn(move || run_poller_loop(project_name, shutdown_clone))
+            .spawn(move || {
+                // Hold the per-project lock for the whole poll loop; it releases
+                // when the thread exits (or the process dies), freeing the next
+                // poller to take over.
+                let _lock = lock;
+                run_poller_loop(project_name, shutdown_clone)
+            })
             .ok();
-        Self { shutdown, handle }
+        let active = handle.is_some();
+        Self {
+            shutdown,
+            handle,
+            active,
+        }
+    }
+
+    /// An inert handle that started no thread (lock held, or spawn failed).
+    fn inert() -> Self {
+        Self {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            handle: None,
+            active: false,
+        }
+    }
+
+    /// Whether this handle owns a running poll loop. A daemon manager keeps only
+    /// active handles and retries an inert one on its next reconcile tick.
+    pub fn is_active(&self) -> bool {
+        self.active
     }
 }
 
@@ -170,7 +228,7 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     // poller restart re-seeds it to empty on purpose — the first sweep then
     // re-emits each in-review PR's terminal verdict, reconciling any `ci` event
     // missed while the hub was down.
-    let mut ci_poll = shelbi_orchestrator::zen::ScopedCiState::new();
+    let mut ci_poll = crate::zen::ScopedCiState::new();
     let mut last_ci_poll: Option<Instant> = None;
 
     // GitHub-merge reconcile clock. Project-wide (needs the whole review
@@ -412,7 +470,7 @@ fn run_workspace_poll_loop(
     // Auto-restart supervision bookkeeping for this workspace's pane. Same
     // per-thread lifetime as `last_dialog` / `last_known`: a poller restart
     // re-seeds it, which at worst re-arms one restart for a pane that was
-    // already mid-crash-loop. See `shelbi_orchestrator::supervision`.
+    // already mid-crash-loop. See `crate::supervision`.
     let mut supervision = SupervisionState::default();
 
     // Usage-limit auto-resume schedule for this workspace's pane. Same
@@ -552,13 +610,13 @@ struct HeartbeatSchedule {
 /// board with an in-review PR awaiting CI polls GitHub gently — CI checks take
 /// minutes, so a per-tick round-trip would be wasteful and rate-limit-hostile.
 /// The sweep is *also* conditional inside
-/// [`shelbi_orchestrator::zen::scoped_ci_poll`]: it makes no gh call at all when
+/// [`crate::zen::scoped_ci_poll`]: it makes no gh call at all when
 /// nothing is in review, so a quiet board pays nothing.
 const CI_POLL_CADENCE: Duration = Duration::from_secs(30);
 
 /// Run one scoped CI sweep for `project` when the cadence is due and the box is
 /// online. On any in-review PR's pass/fail transition this emits a `ci` event
-/// into the unified stream (see [`shelbi_orchestrator::zen::scoped_ci_poll`]),
+/// into the unified stream (see [`crate::zen::scoped_ci_poll`]),
 /// which the orchestrator reacts to like a review marker (merge on success,
 /// bounce on failure). Best-effort: a sweep error is logged, never fatal.
 ///
@@ -567,7 +625,7 @@ const CI_POLL_CADENCE: Duration = Duration::from_secs(30);
 /// once connectivity returns.
 fn maybe_poll_ci(
     project: &Project,
-    state: &mut shelbi_orchestrator::zen::ScopedCiState,
+    state: &mut crate::zen::ScopedCiState,
     last_poll: &mut Option<Instant>,
     is_online: impl Fn() -> bool,
 ) {
@@ -582,7 +640,7 @@ fn maybe_poll_ci(
         return;
     }
     *last_poll = Some(now);
-    if let Err(e) = shelbi_orchestrator::zen::scoped_ci_poll(project, state) {
+    if let Err(e) = crate::zen::scoped_ci_poll(project, state) {
         tracing::warn!(project = %project.name, error = %e, "scoped CI poll failed");
     }
 }
@@ -591,7 +649,7 @@ fn maybe_poll_ci(
 /// and the box is online. Advances any review-category task whose PR was merged
 /// on GitHub out-of-band straight to done (skipping the local merge), then frees
 /// the review slot that was serving it. See
-/// [`shelbi_orchestrator::zen::github_merge_reconcile`].
+/// [`crate::zen::github_merge_reconcile`].
 ///
 /// Cadence is `project.github_reconcile_interval_secs` (default 15 min); a `0`
 /// interval disables the pass entirely (`github_reconcile_interval()` yields
@@ -623,7 +681,7 @@ fn maybe_github_reconcile(
         return;
     }
     *last_poll = Some(now);
-    match shelbi_orchestrator::zen::github_merge_reconcile(project) {
+    match crate::zen::github_merge_reconcile(project) {
         Ok(reconciled) => {
             for r in reconciled {
                 // The task is now done; free the review slot that was serving it
@@ -632,7 +690,7 @@ fn maybe_github_reconcile(
                 // scoped to a review-tagged slot inside the call, so a task on a
                 // non-review workspace (or none) is a clean no-op.
                 if let Err(e) =
-                    shelbi_orchestrator::review_ui::close_review_window(&project.name, &r.task_id)
+                    crate::review_ui::close_review_window(&project.name, &r.task_id)
                 {
                     tracing::debug!(
                         project = %project.name, task = %r.task_id, pr = r.pr, error = %e,
@@ -1166,7 +1224,7 @@ fn maybe_emit_heartbeat(
     // A read failure shouldn't sink the heartbeat — `zen_eligible` falls back to
     // 0, which the orchestrator treats as "nothing to do" (a silent ack), the
     // same as a genuinely quiet board.
-    let zen_eligible = shelbi_orchestrator::zen::mechanically_eligible(project)
+    let zen_eligible = crate::zen::mechanically_eligible(project)
         .map(|ids| ids.len())
         .unwrap_or(0);
     // `idle_workspaces` is read through the cached issue store and gated on
@@ -1406,7 +1464,7 @@ fn poll_one(
         return;
     };
     let host = machine.host();
-    let Ok(addr) = shelbi_orchestrator::workspace::workspace_tmux_addr(project, workspace) else {
+    let Ok(addr) = crate::workspace::workspace_tmux_addr(project, workspace) else {
         return;
     };
 
@@ -1448,7 +1506,7 @@ fn poll_one(
 
     // No pane → no marker. The display-message call would fail anyway,
     // but checking up-front keeps stderr noise out of the log.
-    let alive = shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(false);
+    let alive = crate::workspace::workspace_pane_alive(&host, &addr).unwrap_or(false);
 
     // Auto-restart supervision runs off this same liveness read (it's the
     // backstop for a lost `pane_alive=false` event): a pane that crashed with
@@ -1538,7 +1596,7 @@ fn poll_one(
     // stale `working` title.
     if runner_is_claude {
         if let Some(screen) = screen.as_deref() {
-            if shelbi_orchestrator::ready::detect_agent_exited(screen) {
+            if crate::ready::detect_agent_exited(screen) {
                 if let Some(task_id) = current_task_for(project, &workspace.name) {
                     if !*last_agent_exited {
                         if let Err(e) = shelbi_state::append_supervision_event(
@@ -1607,7 +1665,7 @@ fn poll_one(
         .then(|| {
             screen
                 .as_deref()
-                .and_then(shelbi_orchestrator::ready::detect_usage_limit)
+                .and_then(crate::ready::detect_usage_limit)
         })
         .flatten();
     if let Some(stall) = limit_stall {
@@ -1943,12 +2001,12 @@ fn maybe_emit_dialog_event(
     // A known signature wins outright and resets the unknown streak. Only when
     // no named modal matches do we consider the generic unrecognized-menu shape,
     // gated behind a short persistence streak so a transient menu isn't surfaced.
-    let detected = match shelbi_orchestrator::ready::detect_blocking_dialog(screen, &signatures) {
+    let detected = match crate::ready::detect_blocking_dialog(screen, &signatures) {
         Some(kind) => {
             *unknown_dialog_streak = 0;
             Some(kind)
         }
-        None if shelbi_orchestrator::ready::is_unknown_selection_dialog(screen) => {
+        None if crate::ready::is_unknown_selection_dialog(screen) => {
             *unknown_dialog_streak = unknown_dialog_streak.saturating_add(1);
             (*unknown_dialog_streak >= UNKNOWN_DIALOG_MIN_STREAK).then(|| "unknown".to_string())
         }
@@ -2099,10 +2157,10 @@ fn record_limit_recovery_from_screen(
     if !workspace_is_paused(&workspace.name, last_known) {
         return false;
     }
-    let observed = if shelbi_orchestrator::ready::is_claude_working(screen) {
+    let observed = if crate::ready::is_claude_working(screen) {
         Some(WorkspaceState::Working)
-    } else if shelbi_orchestrator::ready::is_input_ready(screen)
-        && !shelbi_orchestrator::submit::input_holds_unsubmitted_prompt(screen, LIMIT_RESUME_PROMPT)
+    } else if crate::ready::is_input_ready(screen)
+        && !crate::submit::input_holds_unsubmitted_prompt(screen, LIMIT_RESUME_PROMPT)
     {
         Some(WorkspaceState::AwaitingInput)
     } else {
@@ -2156,8 +2214,8 @@ struct LimitResumeIncident {
 }
 
 impl LimitResumeIncident {
-    fn stall(&self) -> shelbi_orchestrator::ready::UsageLimitStall {
-        shelbi_orchestrator::ready::UsageLimitStall {
+    fn stall(&self) -> crate::ready::UsageLimitStall {
+        crate::ready::UsageLimitStall {
             banner: self.banner.clone(),
             reset: self.reset_hint.clone(),
         }
@@ -2293,7 +2351,7 @@ fn advance_limit_resume(
         // `7:20am` reset on that occurrence instead of rolling to tomorrow.
         let reference = stalled_at - chrono::Duration::seconds(LIMIT_RESUME_GRACE_SECS);
         return match incident.reset_hint.as_deref().and_then(|hint| {
-            shelbi_orchestrator::ready::next_reset_instant(hint, reference, allow_local_implied)
+            crate::ready::next_reset_instant(hint, reference, allow_local_implied)
         }) {
             Some(reset) => {
                 let due = reset + chrono::Duration::seconds(LIMIT_RESUME_GRACE_SECS);
@@ -2351,7 +2409,7 @@ fn advance_limit_resume(
 /// detects the stall banner (right after [`record_usage_limit_pause`]):
 /// advance the schedule and act on its verdict — emit the scheduled /
 /// needs-human events.log lines, or fire the resume nudge
-/// ([`shelbi_orchestrator::workspace::resume_limit_stalled_pane`]) and
+/// ([`crate::workspace::resume_limit_stalled_pane`]) and
 /// record how it went. Every emitted line carries
 /// `supervision=limit-resume` so the orchestrator and the activity feed can
 /// follow the cycle.
@@ -2396,11 +2454,11 @@ fn handle_limit_stall(
             );
         }
         LimitResumeAction::Attempt { incident } => {
-            use shelbi_orchestrator::workspace::LimitResumeOutcome;
+            use crate::workspace::LimitResumeOutcome;
             let project_name = project.name.clone();
             let workspace_name = workspace.name.clone();
             let task_id = incident.task_id.clone();
-            let Ok(addr) = shelbi_orchestrator::workspace::workspace_tmux_addr(project, workspace)
+            let Ok(addr) = crate::workspace::workspace_tmux_addr(project, workspace)
             else {
                 append("needs-human", &[("reason", "invalid-pane-address")]);
                 *state = LimitResumeState::NeedsHuman {
@@ -2419,7 +2477,7 @@ fn handle_limit_stall(
                 };
                 return;
             }
-            match shelbi_orchestrator::workspace::resume_limit_stalled_pane(
+            match crate::workspace::resume_limit_stalled_pane(
                 host,
                 &addr,
                 &incident.stall(),
@@ -2529,7 +2587,7 @@ fn handle_limit_stall(
     }
 }
 
-fn limit_banner_key(stall: &shelbi_orchestrator::ready::UsageLimitStall) -> String {
+fn limit_banner_key(stall: &crate::ready::UsageLimitStall) -> String {
     format!(
         "{}\nreset={}",
         stall.banner,
@@ -2589,7 +2647,7 @@ fn limit_resume_eligible_now(project_name: &str, workspace_name: &str, task_id: 
 /// its in-progress task to the workflow's handoff status. The marker is the
 /// workspace's "I'm done" signal — it writes its task id into
 /// `<worktree>/.claude/shelbi-ready` when done (see
-/// `shelbi_orchestrator::workspace::workspace_ready_marker`).
+/// `crate::workspace::workspace_ready_marker`).
 ///
 /// The forward target is resolved generically from the task's workflow: the
 /// first status in the workflow's [`StatusCategory::Handoff`] category, not a
@@ -2623,10 +2681,10 @@ fn maybe_apply_ready_handoff(
     host: &shelbi_core::Host,
     addr: &shelbi_core::TmuxAddr,
 ) {
-    let marker = shelbi_orchestrator::workspace::workspace_ready_marker(machine, workspace);
+    let marker = crate::workspace::workspace_ready_marker(machine, workspace);
     let deferred_marker =
-        shelbi_orchestrator::workspace::workspace_ready_deferred_marker(machine, workspace);
-    let task_id = match shelbi_orchestrator::workspace::read_ready_marker(host, &marker) {
+        crate::workspace::workspace_ready_deferred_marker(machine, workspace);
+    let task_id = match crate::workspace::read_ready_marker(host, &marker) {
         Ok(Some(id)) => id,
         Ok(None) => return,
         Err(e) => {
@@ -2654,7 +2712,7 @@ fn maybe_apply_ready_handoff(
     // sidecar (best-effort) — the next outage should log afresh.
     if loaded.is_ok() {
         if let Err(e) =
-            shelbi_orchestrator::workspace::clear_deferred_marker(host, &deferred_marker)
+            crate::workspace::clear_deferred_marker(host, &deferred_marker)
         {
             tracing::debug!(workspace = %workspace.name, error = %e, "clear_deferred_marker failed");
         }
@@ -2725,7 +2783,7 @@ fn maybe_apply_ready_handoff(
                 ) {
                     tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_marker_skipped_event failed");
                 }
-                let _ = shelbi_orchestrator::workspace::clear_ready_marker(host, &marker);
+                let _ = crate::workspace::clear_ready_marker(host, &marker);
                 return;
             };
             let to_column = Column::from_status_id(&to_status);
@@ -2775,7 +2833,7 @@ fn maybe_apply_ready_handoff(
                     .and_then(|g| g.base_branch)
                     .unwrap_or_else(|| project.base_branch().to_string());
                 detach_workspace_worktree_after_handoff(workspace, machine, host, &task_id);
-                match shelbi_orchestrator::transition::execute_merge_action(
+                match crate::transition::execute_merge_action(
                     project,
                     &project.name,
                     &tf.task,
@@ -2843,7 +2901,7 @@ fn maybe_apply_ready_handoff(
                 // `push_branch` (pushes `refs/heads/<branch>`) and `open_pr`
                 // (`gh pr create --head <branch>`) are independent of the
                 // worktree's HEAD, so the held branch doesn't matter here.
-                match shelbi_orchestrator::transition::execute_transition_reporting(
+                match crate::transition::execute_transition_reporting(
                     project,
                     &project.name,
                     &tf.task,
@@ -2926,7 +2984,7 @@ fn maybe_apply_ready_handoff(
                 // the merge so it isn't re-run (a second merge would fail "no
                 // commits beyond target" and short-circuit before cleanup).
                 // Best-effort — the move already happened.
-                match shelbi_orchestrator::transition::execute_transition_except(
+                match crate::transition::execute_transition_except(
                     project,
                     &project.name,
                     &tf.task,
@@ -2969,7 +3027,7 @@ fn maybe_apply_ready_handoff(
             // a loaded task, not a just-finished in-progress one).
             if !project.effective_tags(workspace).contains("review") {
                 if let Err(e) =
-                    shelbi_orchestrator::workspace::kill_workspace_pane(host, addr, &workspace.name)
+                    crate::workspace::kill_workspace_pane(host, addr, &workspace.name)
                 {
                     tracing::warn!(
                         workspace = %workspace.name,
@@ -3020,7 +3078,7 @@ fn maybe_apply_ready_handoff(
             // class via the sidecar, rather than every tick.
             let class = classify_load_error(&e);
             let already =
-                shelbi_orchestrator::workspace::read_deferred_marker(host, &deferred_marker)
+                crate::workspace::read_deferred_marker(host, &deferred_marker)
                     .ok()
                     .flatten();
             if already.as_deref() != Some(class) {
@@ -3032,7 +3090,7 @@ fn maybe_apply_ready_handoff(
                 ) {
                     tracing::warn!(workspace = %workspace.name, task = %task_id, error = %ev, "append_marker_deferred_event failed");
                 }
-                if let Err(w) = shelbi_orchestrator::workspace::write_deferred_marker(
+                if let Err(w) = crate::workspace::write_deferred_marker(
                     host,
                     &deferred_marker,
                     class,
@@ -3048,7 +3106,7 @@ fn maybe_apply_ready_handoff(
         }
     }
 
-    if let Err(e) = shelbi_orchestrator::workspace::clear_ready_marker(host, &marker) {
+    if let Err(e) = crate::workspace::clear_ready_marker(host, &marker) {
         tracing::warn!(workspace = %workspace.name, error = %e, "clear_ready_marker failed");
     }
 }
@@ -3213,7 +3271,7 @@ fn decide_transition(
 /// workspace's own task and requests an edge the workflow permits, apply the
 /// move. The generalization of [`maybe_apply_ready_handoff`] to arbitrary
 /// (including backward) status transitions — see
-/// [`shelbi_orchestrator::workspace::workspace_transition_marker`] for the
+/// [`crate::workspace::workspace_transition_marker`] for the
 /// marker path + format.
 ///
 /// Best-effort and idempotent, matching the review-marker contract:
@@ -3238,8 +3296,8 @@ fn maybe_apply_transition(
     host: &shelbi_core::Host,
     addr: &shelbi_core::TmuxAddr,
 ) {
-    let marker = shelbi_orchestrator::workspace::workspace_transition_marker(machine, workspace);
-    let req = match shelbi_orchestrator::workspace::read_transition_marker(host, &marker) {
+    let marker = crate::workspace::workspace_transition_marker(machine, workspace);
+    let req = match crate::workspace::read_transition_marker(host, &marker) {
         Ok(Some(r)) => r,
         Ok(None) => return,
         Err(e) => {
@@ -3301,7 +3359,7 @@ fn maybe_apply_transition(
                             // workflow engine walks. Best-effort — the move
                             // already happened, so an action failure logs but
                             // doesn't roll it back.
-                            match shelbi_orchestrator::transition::execute_transition(
+                            match crate::transition::execute_transition(
                                 project,
                                 &project.name,
                                 &tf.task,
@@ -3339,7 +3397,7 @@ fn maybe_apply_transition(
                             // event. Best-effort and idempotent — a pane already
                             // gone is a silent no-op — and it runs only AFTER the
                             // move so work is never stranded.
-                            if let Err(e) = shelbi_orchestrator::workspace::kill_workspace_pane(
+                            if let Err(e) = crate::workspace::kill_workspace_pane(
                                 host,
                                 addr,
                                 &workspace.name,
@@ -3373,7 +3431,7 @@ fn maybe_apply_transition(
         }
     }
 
-    if let Err(e) = shelbi_orchestrator::workspace::clear_transition_marker(host, &marker) {
+    if let Err(e) = crate::workspace::clear_transition_marker(host, &marker) {
         tracing::warn!(workspace = %workspace.name, error = %e, "clear_transition_marker failed");
     }
 }
@@ -3383,7 +3441,7 @@ fn maybe_apply_transition(
 /// into — e.g. `feature/{{feature}}` for a subtask flow), falling back to the
 /// project's default branch when the workflow declares none. The base is
 /// freshened from origin first (see
-/// [`shelbi_orchestrator::workspace::fetch_origin_base_ref`]) so the ancestry
+/// [`crate::workspace::fetch_origin_base_ref`]) so the ancestry
 /// check compares against `origin/<base>` rather than a stale local ref that
 /// would wrongly skip the rebase. Records one `rebase` line in `events.log`
 /// naming the base branch and the outcome (ok / up-to-date / conflict /
@@ -3412,7 +3470,7 @@ fn rebase_workspace_branch_before_handoff(
             return;
         }
     };
-    let branch = match shelbi_orchestrator::branch::branch_name_for_task(
+    let branch = match crate::branch::branch_name_for_task(
         project,
         Some(&workflow),
         &task_file.task,
@@ -3439,13 +3497,13 @@ fn rebase_workspace_branch_before_handoff(
         }
     };
 
-    let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
+    let worktree = crate::workspace::workspace_worktree(machine, workspace);
     // Compare/rebase against origin's tip of the base, not the hub's local ref
     // (which can lag origin and wrongly report "already up-to-date"). Falls
     // back to the local base name for a repo with no origin.
     let rebase_ref =
-        shelbi_orchestrator::workspace::fetch_origin_base_ref(host, &worktree, &base_branch);
-    let outcome = shelbi_orchestrator::workspace::rebase_workspace_branch_onto_default(
+        crate::workspace::fetch_origin_base_ref(host, &worktree, &base_branch);
+    let outcome = crate::workspace::rebase_workspace_branch_onto_default(
         host,
         &worktree,
         &rebase_ref,
@@ -3463,7 +3521,7 @@ fn rebase_workspace_branch_before_handoff(
         );
     }
     match &outcome {
-        shelbi_orchestrator::workspace::RebaseOutcome::Conflict { .. } => {
+        crate::workspace::RebaseOutcome::Conflict { .. } => {
             tracing::warn!(
                 workspace = %workspace.name,
                 task = %task_id,
@@ -3473,7 +3531,7 @@ fn rebase_workspace_branch_before_handoff(
                 "auto-rebase onto base branch conflicted; worktree returned to pre-rebase state",
             );
         }
-        shelbi_orchestrator::workspace::RebaseOutcome::Skipped { .. } => {
+        crate::workspace::RebaseOutcome::Skipped { .. } => {
             tracing::info!(
                 workspace = %workspace.name,
                 task = %task_id,
@@ -3530,7 +3588,7 @@ fn push_workspace_branch_before_handoff(
     // thing that can legitimately skip the push.
     let workflow = shelbi_state::load_task_workflow(&project.name, project, &task_file.task)
         .unwrap_or_else(|_| default_workflow());
-    let branch = match shelbi_orchestrator::branch::branch_name_for_task(
+    let branch = match crate::branch::branch_name_for_task(
         project,
         Some(&workflow),
         &task_file.task,
@@ -3542,8 +3600,8 @@ fn push_workspace_branch_before_handoff(
         }
     };
 
-    let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
-    let outcome = shelbi_orchestrator::workspace::push_workspace_branch_to_origin(
+    let worktree = crate::workspace::workspace_worktree(machine, workspace);
+    let outcome = crate::workspace::push_workspace_branch_to_origin(
         host, &worktree, &branch,
     );
 
@@ -3593,9 +3651,9 @@ fn detach_workspace_worktree_after_handoff(
     host: &shelbi_core::Host,
     task_id: &str,
 ) {
-    let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
-    match shelbi_orchestrator::workspace::detach_workspace_worktree(host, &worktree) {
-        shelbi_orchestrator::workspace::DetachOutcome::Detached { from_branch } => {
+    let worktree = crate::workspace::workspace_worktree(machine, workspace);
+    match crate::workspace::detach_workspace_worktree(host, &worktree) {
+        crate::workspace::DetachOutcome::Detached { from_branch } => {
             let branch = from_branch.as_deref().unwrap_or("(already-detached)");
             if let Err(e) = append_worktree_detach_event(task_id, &workspace.name, branch, true, "")
             {
@@ -3608,12 +3666,12 @@ fn detach_workspace_worktree_after_handoff(
                 "detached worker worktree from task branch; branch free for review checkout / merge",
             );
         }
-        shelbi_orchestrator::workspace::DetachOutcome::NoWorktree => {
+        crate::workspace::DetachOutcome::NoWorktree => {
             // No worktree to release (never created or already torn down) — the
             // branch isn't held, so there's nothing to trace. Debug-only.
             tracing::debug!(workspace = %workspace.name, task = %task_id, "no worktree to detach on handoff");
         }
-        shelbi_orchestrator::workspace::DetachOutcome::Failed { reason } => {
+        crate::workspace::DetachOutcome::Failed { reason } => {
             if let Err(e) =
                 append_worktree_detach_event(task_id, &workspace.name, "?", false, &reason)
             {
@@ -3661,9 +3719,9 @@ struct PollOutcome {
 /// from their compact spinner (`✻ Crunching… (1m · ↓ 39k tokens)`), so the
 /// live spinner row — not the footer alone — is what proves a turn is running.
 fn live_workspace_state(screen: &str) -> Option<WorkspaceState> {
-    if shelbi_orchestrator::ready::is_claude_working(screen) {
+    if crate::ready::is_claude_working(screen) {
         Some(WorkspaceState::Working)
-    } else if shelbi_orchestrator::ready::is_input_ready(screen) {
+    } else if crate::ready::is_input_ready(screen) {
         Some(WorkspaceState::AwaitingInput)
     } else {
         None
@@ -3814,9 +3872,9 @@ fn review_slot_has_loaded_marker(
         return false;
     }
     let marker =
-        shelbi_orchestrator::workspace::workspace_review_loaded_marker(machine, workspace);
+        crate::workspace::workspace_review_loaded_marker(machine, workspace);
     matches!(
-        shelbi_orchestrator::workspace::read_review_loaded_marker(host, &marker),
+        crate::workspace::read_review_loaded_marker(host, &marker),
         Ok(Some(_))
     )
 }
@@ -3927,11 +3985,11 @@ fn redispatch_workspace(
     let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
         .map_err(|e| e.to_string())?;
     let branch =
-        shelbi_orchestrator::branch::branch_name_for_task(project, Some(&workflow), &tf.task)
+        crate::branch::branch_name_for_task(project, Some(&workflow), &tf.task)
             .map_err(|e| e.to_string())?;
-    let agent = shelbi_orchestrator::dispatch::resolve_active_agent(&project.name, &tf.task);
-    shelbi_orchestrator::workspace::start_workspace_on_task(
-        shelbi_orchestrator::workspace::StartSpec {
+    let agent = crate::dispatch::resolve_active_agent(&project.name, &tf.task);
+    crate::workspace::start_workspace_on_task(
+        crate::workspace::StartSpec {
             project,
             workspace,
             task_id,
@@ -3954,7 +4012,7 @@ fn redispatch_workspace(
 /// crash-recovery downgrade intact — a restarted orchestrator still comes up
 /// with Zen off.
 fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState) {
-    let alive = shelbi_orchestrator::orchestrator_pane_alive(&project.name).unwrap_or(true);
+    let alive = crate::orchestrator_pane_alive(&project.name).unwrap_or(true);
     let inputs = SupervisionInputs {
         alive,
         intentional_shutdown: false,
@@ -3962,7 +4020,7 @@ fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState)
     };
     match state.decide(&inputs, Instant::now()) {
         SupervisionAction::None => {}
-        SupervisionAction::Restart => match shelbi_orchestrator::ensure_dashboard(&project.name) {
+        SupervisionAction::Restart => match crate::ensure_dashboard(&project.name) {
             Ok(_) => {
                 if let Err(e) =
                     shelbi_state::append_supervision_event(&project.name, None, "restart", "crash")
@@ -3997,7 +4055,7 @@ fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState)
 /// Auto-load queued review tasks onto idle review slots, once per supervisor
 /// tick. The headless counterpart to a human pressing Enter on a
 /// Queued-for-Review row: while a task sits in Review and a `review`-tagged
-/// slot is idle, [`shelbi_orchestrator::load::autoload_review_queue`] claims
+/// slot is idle, [`crate::load::autoload_review_queue`] claims
 /// the slot and boots the Review agent — the same dispatch and events as the
 /// manual path. Re-derives everything from disk, so it fires correctly on the
 /// first tick after start / `shelbi reload` / `quit`+restart without any live
@@ -4005,7 +4063,7 @@ fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState)
 /// lock across the batch, so a concurrent manual Enter can't double-load a slot.
 /// Best-effort: a failure is logged, not fatal — the next tick retries.
 fn maybe_autoload_review_queue(project: &Project) {
-    match shelbi_orchestrator::load::autoload_review_queue(&project.name) {
+    match crate::load::autoload_review_queue(&project.name) {
         Ok(loaded) => {
             for l in loaded {
                 tracing::info!(
@@ -4044,7 +4102,7 @@ fn maybe_autoload_review_queue(project: &Project) {
 /// Warm-board gated (no dispatch off an untrusted stale/cold snapshot, matching
 /// every other dispatching poller path) and operator-park aware. The actual
 /// launch, workspace selection, and prior-slot release live in
-/// [`shelbi_orchestrator::load::dispatch_active_gate`]; a re-dispatch of an
+/// [`crate::load::dispatch_active_gate`]; a re-dispatch of an
 /// already-served gate is prevented by the served check here plus the
 /// dispatch-confirm grace, so the pass is idempotent across ticks.
 fn maybe_dispatch_parked_active_gates(project: &Project) {
@@ -4078,7 +4136,7 @@ fn maybe_dispatch_parked_active_gates(project: &Project) {
             continue;
         }
 
-        match shelbi_orchestrator::load::dispatch_active_gate(&project.name, &tf.task.id) {
+        match crate::load::dispatch_active_gate(&project.name, &tf.task.id) {
             Ok(g) => tracing::info!(
                 project = %project.name,
                 task = %g.task_id,
@@ -4133,10 +4191,10 @@ fn gate_task_is_served(project: &Project, task: &shelbi_core::Issue) -> bool {
         return false;
     };
     let host = machine.host();
-    let Ok(addr) = shelbi_orchestrator::workspace::workspace_tmux_addr(project, ws) else {
+    let Ok(addr) = crate::workspace::workspace_tmux_addr(project, ws) else {
         return false;
     };
-    shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true)
+    crate::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true)
 }
 
 /// What the resume pass should do for one stranded review slot this tick.
@@ -4154,7 +4212,7 @@ enum ReviewResumeAction {
 /// Per-review-slot crash-loop bookkeeping for [`maybe_resume_stranded_review_slots`].
 ///
 /// A deliberately thinner cousin of
-/// [`shelbi_orchestrator::supervision::SupervisionState`]: it shares the same
+/// [`crate::supervision::SupervisionState`]: it shares the same
 /// crash-loop cap + exponential backoff, but has **no** "don't adopt a
 /// pre-existing dead pane" guard. Adopting a slot that was already dead when
 /// the poller started is exactly the point here — a `quit`+restart leaves the
@@ -4257,7 +4315,7 @@ fn maybe_resume_stranded_review_slots(
         if !matches!(host, shelbi_core::Host::Local) {
             continue;
         }
-        let Ok(addr) = shelbi_orchestrator::workspace::workspace_tmux_addr(project, ws) else {
+        let Ok(addr) = crate::workspace::workspace_tmux_addr(project, ws) else {
             continue;
         };
         let now = Instant::now();
@@ -4266,7 +4324,7 @@ fn maybe_resume_stranded_review_slots(
         // Uncertainty (a probe error) reads as ALIVE so a transient tmux hiccup
         // never triggers a resume that would clobber a serving review agent.
         let alive =
-            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true);
+            crate::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true);
         if alive {
             entry.note_alive(now);
             continue;
@@ -4299,7 +4357,7 @@ fn maybe_resume_stranded_review_slots(
         // since exited. Bring that agent back instead of relaunching: a relaunch
         // reseeds a second agent into a bare window and strands the parked one
         // as a zombie.
-        if shelbi_orchestrator::review_ui::recover_parked_review_agent(&project.name, &ws.name) {
+        if crate::review_ui::recover_parked_review_agent(&project.name, &ws.name) {
             if let Err(e) = shelbi_state::append_workspace_pane_event(
                 &project.name,
                 &ws.name,
@@ -4346,7 +4404,7 @@ fn maybe_resume_stranded_review_slots(
                 // resume variant re-checks liveness under the review-load lock,
                 // so a load already in flight on this slot (its assignment
                 // written before its pane exists) isn't killed and reseeded.
-                match shelbi_orchestrator::load::resume_review_task(
+                match crate::load::resume_review_task(
                     &project.name,
                     &task_id,
                     &ws.name,
@@ -4383,7 +4441,7 @@ fn maybe_resume_stranded_review_slots(
                         // ready yet) is reported back and left for a later tick,
                         // never kicking off a second load, and a build error is
                         // surfaced without counting as a resume crash.
-                        match shelbi_orchestrator::review_ui::build_review_panel_no_focus(
+                        match crate::review_ui::build_review_panel_no_focus(
                             &project.name,
                             &task_id,
                         ) {
@@ -4556,7 +4614,7 @@ fn assigned_dev_task_for(project: &Project, workspace_name: &str) -> AssignedDev
 /// review cousin doesn't need: an `ever_alive` latch. A dev slot's `in_progress`
 /// task is *active*, so the ordinary per-workspace pane supervisor
 /// ([`maybe_supervise_workspace`], backed by
-/// [`shelbi_orchestrator::supervision::SupervisionState`]) already relaunches it
+/// [`crate::supervision::SupervisionState`]) already relaunches it
 /// with a fresh context-clearing dispatch when it crashes after coming up. This
 /// pass exists only for the case that supervisor deliberately refuses: a slot
 /// whose pane is dead *from the poller's first sighting* — a `quit`+reopen — has
@@ -4672,7 +4730,7 @@ fn maybe_resume_stranded_dev_slots(
         if !matches!(host, shelbi_core::Host::Local) {
             continue;
         }
-        let Ok(addr) = shelbi_orchestrator::workspace::workspace_tmux_addr(project, ws) else {
+        let Ok(addr) = crate::workspace::workspace_tmux_addr(project, ws) else {
             continue;
         };
         let now = Instant::now();
@@ -4681,7 +4739,7 @@ fn maybe_resume_stranded_dev_slots(
         // Uncertainty (a probe error) reads as ALIVE so a transient tmux hiccup
         // never triggers a resume that would clobber a genuinely working slot.
         let alive =
-            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true);
+            crate::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true);
         if alive {
             entry.note_alive(now);
             continue;
@@ -4763,7 +4821,7 @@ fn maybe_resume_stranded_dev_slots(
         // has since come alive. A probe error still reads as ALIVE, and the
         // re-probe runs before `decide_dead` so a slot found alive here doesn't
         // pollute the crash-loop history.
-        if shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true)
+        if crate::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true)
             || shelbi_state::recent_dispatch_active(&project.name, &ws.name, DISPATCH_CONFIRM_GRACE)
         {
             entry.note_alive(now);
@@ -4839,11 +4897,11 @@ fn resume_dev_workspace(
     let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
         .map_err(|e| e.to_string())?;
     let branch =
-        shelbi_orchestrator::branch::branch_name_for_task(project, Some(&workflow), &tf.task)
+        crate::branch::branch_name_for_task(project, Some(&workflow), &tf.task)
             .map_err(|e| e.to_string())?;
-    let agent = shelbi_orchestrator::dispatch::resolve_active_agent(&project.name, &tf.task);
-    shelbi_orchestrator::workspace::resume_workspace_on_task(
-        shelbi_orchestrator::workspace::StartSpec {
+    let agent = crate::dispatch::resolve_active_agent(&project.name, &tf.task);
+    crate::workspace::resume_workspace_on_task(
+        crate::workspace::StartSpec {
             project,
             workspace,
             task_id,
@@ -4881,10 +4939,10 @@ fn handle_review_slot(
     last_known: &mut Option<WorkspaceState>,
 ) -> bool {
     let marker =
-        shelbi_orchestrator::workspace::workspace_review_loaded_marker(machine, workspace);
+        crate::workspace::workspace_review_loaded_marker(machine, workspace);
     match assigned_review_task_for(project, &workspace.name) {
         AssignedReviewTask::Assigned(task_id) => {
-            match shelbi_orchestrator::workspace::probe_review_slot_serving(
+            match crate::workspace::probe_review_slot_serving(
                 project, workspace, &task_id,
             ) {
                 Some(serving) => {
@@ -4930,11 +4988,11 @@ fn ensure_review_marker_and_serving_state(
     last_known: &mut Option<WorkspaceState>,
 ) {
     let already_marked = matches!(
-        shelbi_orchestrator::workspace::read_review_loaded_marker(host, marker),
+        crate::workspace::read_review_loaded_marker(host, marker),
         Ok(Some(m)) if m == task_id
     );
     if !already_marked {
-        match shelbi_orchestrator::workspace::write_review_loaded_marker(
+        match crate::workspace::write_review_loaded_marker(
             host, marker, task_id, url,
         ) {
             Ok(()) => tracing::info!(
@@ -5019,8 +5077,8 @@ fn emit_review_ready(
         return;
     };
     let worktree =
-        shelbi_orchestrator::workspace::workspace_worktree(machine, workspace).to_string_lossy().into_owned();
-    let pane = match shelbi_orchestrator::workspace::workspace_tmux_addr(project, workspace) {
+        crate::workspace::workspace_worktree(machine, workspace).to_string_lossy().into_owned();
+    let pane = match crate::workspace::workspace_tmux_addr(project, workspace) {
         Ok(addr) => addr.target(),
         Err(e) => {
             tracing::warn!(workspace = %workspace.name, error = %e, "review-ready: tmux addr resolution failed");
@@ -5034,7 +5092,7 @@ fn emit_review_ready(
     let (title, notes) = match load_issue(project, task_id) {
         Ok(tf) => (
             tf.task.title.clone(),
-            shelbi_orchestrator::workspace::review_ready_notes(&tf.body),
+            crate::workspace::review_ready_notes(&tf.body),
         ),
         Err(e) => {
             tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "review-ready: task load failed; emitting location only");
@@ -5098,11 +5156,11 @@ fn maybe_reap_orphaned_review_slot(
     // Clear any stale marker first so the Ready row drops even if the reap below
     // can't run (a probe hiccup, or a pane already gone).
     let had_marker = matches!(
-        shelbi_orchestrator::workspace::read_review_loaded_marker(host, marker),
+        crate::workspace::read_review_loaded_marker(host, marker),
         Ok(Some(_))
     );
     if had_marker {
-        if let Err(e) = shelbi_orchestrator::workspace::clear_review_loaded_marker(host, marker) {
+        if let Err(e) = crate::workspace::clear_review_loaded_marker(host, marker) {
             tracing::warn!(workspace = %workspace.name, error = %e, "clear_review_loaded_marker failed");
         }
     }
@@ -5110,17 +5168,17 @@ fn maybe_reap_orphaned_review_slot(
     // path uses so a user shell opened on the idle slot is never reaped. On a
     // dead / unreachable / user-shell verdict there's nothing to reap: report
     // whether the marker clear above already made this an authoritative tick.
-    match shelbi_orchestrator::workspace::probe_workspace_slot(
+    match crate::workspace::probe_workspace_slot(
         host,
         addr,
-        shelbi_orchestrator::workspace::probe_deadline(),
+        crate::workspace::probe_deadline(),
     ) {
-        shelbi_orchestrator::workspace::SlotProbe::Alive { user_shell: false } => {}
-        shelbi_orchestrator::workspace::SlotProbe::Alive { user_shell: true }
-        | shelbi_orchestrator::workspace::SlotProbe::Dead
-        | shelbi_orchestrator::workspace::SlotProbe::Unreachable { .. } => return had_marker,
+        crate::workspace::SlotProbe::Alive { user_shell: false } => {}
+        crate::workspace::SlotProbe::Alive { user_shell: true }
+        | crate::workspace::SlotProbe::Dead
+        | crate::workspace::SlotProbe::Unreachable { .. } => return had_marker,
     }
-    match shelbi_orchestrator::workspace::kill_workspace_pane(host, addr, &workspace.name) {
+    match crate::workspace::kill_workspace_pane(host, addr, &workspace.name) {
         Ok(()) => {
             // Drop the now-idle slot's stale status.yaml so `shelbi workspace
             // status` stops reporting the agent's last observed state (a killed
@@ -5261,8 +5319,8 @@ fn maybe_reconcile_orphaned_pane(
     // brought up by the dispatch path) carries no age and falls through to the
     // normal probe. The grace clock is left armed, so once the pane ages past
     // the deadline a genuine orphan is still reclaimed on a later tick.
-    if let Some(age) = shelbi_orchestrator::workspace::workspace_launch_age(host, addr) {
-        if age < shelbi_orchestrator::workspace::launch_timeout() {
+    if let Some(age) = crate::workspace::workspace_launch_age(host, addr) {
+        if age < crate::workspace::launch_timeout() {
             return false;
         }
     }
@@ -5274,15 +5332,15 @@ fn maybe_reconcile_orphaned_pane(
     // than the sidebar's deliberate user shell? Reap ONLY on a live,
     // non-user-shell slot; a dead / unreachable / user-shell verdict leaves it
     // untouched.
-    match shelbi_orchestrator::workspace::probe_workspace_slot(
+    match crate::workspace::probe_workspace_slot(
         host,
         addr,
-        shelbi_orchestrator::workspace::probe_deadline(),
+        crate::workspace::probe_deadline(),
     ) {
-        shelbi_orchestrator::workspace::SlotProbe::Alive { user_shell: false } => {}
-        shelbi_orchestrator::workspace::SlotProbe::Alive { user_shell: true }
-        | shelbi_orchestrator::workspace::SlotProbe::Dead
-        | shelbi_orchestrator::workspace::SlotProbe::Unreachable { .. } => return false,
+        crate::workspace::SlotProbe::Alive { user_shell: false } => {}
+        crate::workspace::SlotProbe::Alive { user_shell: true }
+        | crate::workspace::SlotProbe::Dead
+        | crate::workspace::SlotProbe::Unreachable { .. } => return false,
     }
 
     // Orphan confirmed. Close the slot and record the reap. `kill_workspace_pane`
@@ -5290,7 +5348,7 @@ fn maybe_reconcile_orphaned_pane(
     // spurious `pane_alive=false reason=signal:SIGHUP`; our own
     // `pane_alive=false reason=orphaned-slot-reaped` is the trail the
     // orchestrator (and `shelbi events tail`) sees for the freed slot.
-    match shelbi_orchestrator::workspace::kill_workspace_pane(host, addr, &workspace.name) {
+    match crate::workspace::kill_workspace_pane(host, addr, &workspace.name) {
         Ok(()) => {
             // Drop the freed slot's stale status.yaml (a killed pane emits no
             // further markers, so the poller can't refresh it) so it returns to
@@ -5490,9 +5548,7 @@ mod tests {
         // Removing the guard — or narrowing it back to `status=confirmed` only —
         // makes this test fail (the sweep resumes), which is exactly the hole the
         // confirmation-only guard left open.
-        let _env = crate::test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = crate::test_lock::acquire();
         let home = gh_guard_home("review-inflight-race");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -5659,7 +5715,7 @@ mod tests {
         // Criterion 1: a serving review slot is polled to a `serving` sub-state
         // (not "hasn't been polled"), and while it stays serving only last_seen
         // moves — the ordinary decide() dedupe, so the feed isn't spammed.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = review_serving_home();
         let prior_home = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", &home);
@@ -5703,7 +5759,7 @@ mod tests {
         // into serving — and carries the task title + notes + pane/worktree/url
         // location. A second (deduped) tick emits no further review-ready line,
         // so the pending/steady-state case stays silent.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = review_serving_home();
         let prior_home = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", &home);
@@ -5792,7 +5848,7 @@ Intro prose.
         // the sidebar drops the phantom Ready row. (Pane teardown needs a live
         // tmux; here the bogus addr probes Dead, so we assert the marker clear,
         // which happens before any kill.)
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = review_serving_home();
         let prior_home = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", &home);
@@ -5842,7 +5898,7 @@ Intro prose.
         // (and keeps `last_seen` advancing) instead of returning early on a
         // markerless title and freezing status.yaml. A benign screen must report
         // no dialog so the live/title path keeps owning the state.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = review_serving_home();
         let prior_home = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", &home);
@@ -5903,7 +5959,7 @@ Intro prose.
         // reported as `dialog:unknown` — but only after it persists across
         // `UNKNOWN_DIALOG_MIN_STREAK` polls, so a menu that flashes for one
         // sample (or an ordinary pause, which draws no menu) never fires.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = review_serving_home();
         let prior_home = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", &home);
@@ -6885,7 +6941,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
 
     #[test]
     fn assigned_review_task_for_is_unknown_on_a_cold_or_failed_board() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = gh_guard_home("art-cold");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -6910,7 +6966,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
 
     #[test]
     fn assigned_review_task_for_resolves_definitely_on_a_warm_board() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = gh_guard_home("art-warm");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -6955,9 +7011,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         // never rides a delta tick). Reading only the index resolved the booting
         // review slot as idle and the reaper killed its pane. Resolving through
         // the overlay — as `issue show` does — must report the review slot.
-        let _g = crate::test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = gh_guard_home("art-overlay");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -7003,9 +7057,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         // overlay marker cleared, so the slot must still resolve None (idle) even
         // if a stale index momentarily still names it — the reaper must reclaim
         // the pane it left listening.
-        let _g = crate::test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = gh_guard_home("art-cleared");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -7032,7 +7084,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
 
     #[test]
     fn warm_board_is_none_on_a_cold_board_and_some_when_warm() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = gh_guard_home("wb");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -7076,7 +7128,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         // The stale-skip case: on a rate-limit park (or any non-warm read) the
         // dev-slot resume gate must resolve to Unknown, so the pass resumes
         // nothing and leaves its crash history untouched.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_lock::acquire();
         let home = gh_guard_home("adt-cold");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -7103,7 +7155,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         // The warm-resume case: an `in_progress` (active-category) task pinned to
         // the slot on a warm board resolves to Assigned, so the pass resumes it
         // exactly as before the gate.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_lock::acquire();
         let home = gh_guard_home("adt-warm");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -7144,7 +7196,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         // does nothing and drops the slot's crash history. (The open index would
         // not normally carry a done card; a warm index that still does must
         // resolve None, not Assigned.)
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let _g = crate::test_lock::acquire();
         let home = gh_guard_home("adt-done");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -7190,9 +7242,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         // On current `main` (`recent_dispatch_confirmed`, which matches
         // `status=confirmed` only) this test fails: the guard sees no confirmation
         // and the pass resumes the slot.
-        let _g = crate::test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = gh_guard_home("dev-inflight-race");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -7254,9 +7304,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         // board, so the attempt surfaces as a single `dev-resume-failed` — the
         // point is that the pass ACTS rather than standing down, proving the
         // in-flight guard is scoped to a fresh launch, not a blanket mute.
-        let _g = crate::test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = gh_guard_home("dev-strand-resumes");
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = home.join("repo");
@@ -7357,7 +7405,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         let timeout = std::time::Duration::from_secs(3);
         while start.elapsed() < timeout {
             let screen = shelbi_tmux::capture(host, addr).unwrap_or_default();
-            if shelbi_orchestrator::ready::detect_usage_limit(&screen).is_some() {
+            if crate::ready::detect_usage_limit(&screen).is_some() {
                 return screen;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -7368,17 +7416,6 @@ Auto mode works better when it knows your environment. Takes about a minute.
         );
     }
 
-    fn sidebar_badge(project: &str, workspace: &str) -> crate::WorkspaceBadge {
-        let mut app = crate::App::new_sidebar(project);
-        app.refresh().unwrap();
-        app.rows()
-            .into_iter()
-            .find_map(|row| match row {
-                crate::Row::Workspace { name, badge, .. } if name == workspace => Some(badge),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("workspace `{workspace}` missing from sidebar rows"))
-    }
 
     struct LimitResumeTmuxCleanup {
         session: String,
@@ -7406,7 +7443,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
 
     #[test]
     fn limit_resume_eligibility_is_task_runner_and_workflow_bound() {
-        let _env = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = crate::test_lock::acquire();
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -7507,7 +7544,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
             return;
         }
 
-        let _env = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = crate::test_lock::acquire();
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -7645,9 +7682,6 @@ while :; do sleep 60; done
         let paused = load_workspace_status("alpha").unwrap().unwrap();
         assert_eq!(paused.state, WorkspaceState::Paused);
         assert_eq!(paused.current_task.as_deref(), Some(task_id));
-        let badge = sidebar_badge(&project.name, "alpha");
-        assert_eq!(badge, crate::WorkspaceBadge::Paused);
-        assert_eq!(badge.glyph(), "⏸");
         assert!(!receipt.exists(), "the modal was touched before due");
 
         let due = match &mut limit_resume {
@@ -7711,9 +7745,6 @@ while :; do sleep 60; done
         let working = load_workspace_status("alpha").unwrap().unwrap();
         assert_eq!(working.state, WorkspaceState::Working);
         assert_eq!(working.current_task.as_deref(), Some(task_id));
-        let badge = sidebar_badge(&project.name, "alpha");
-        assert_eq!(badge, crate::WorkspaceBadge::Working);
-        assert_eq!(badge.glyph(), "⏵");
         assert!(matches!(limit_resume, LimitResumeState::Resumed { .. }));
 
         let stale_screen = shelbi_tmux::capture(&host, &addr).unwrap();
@@ -7758,10 +7789,6 @@ while :; do sleep 60; done
             WorkspaceState::Working
         );
         assert_eq!(
-            sidebar_badge(&project.name, "alpha"),
-            crate::WorkspaceBadge::Working
-        );
-        assert_eq!(
             std::fs::read_to_string(&receipt).unwrap(),
             format!("dismissed=\nprompt={LIMIT_RESUME_PROMPT}\n")
         );
@@ -7793,7 +7820,7 @@ while :; do sleep 60; done
     }
 
     fn write_marker(project: &Project, body: &str) -> std::path::PathBuf {
-        let marker = shelbi_orchestrator::workspace::workspace_ready_marker(
+        let marker = crate::workspace::workspace_ready_marker(
             &project.machines[0],
             &project.workspaces[0],
         );
@@ -7807,7 +7834,7 @@ while :; do sleep 60; done
         use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
 
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -7825,7 +7852,7 @@ while :; do sleep 60; done
         shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
 
         let ready_marker = write_marker(&project, "fix-login\n");
-        let transition_marker = shelbi_orchestrator::workspace::workspace_transition_marker(
+        let transition_marker = crate::workspace::workspace_transition_marker(
             &project.machines[0],
             &project.workspaces[0],
         );
@@ -7904,7 +7931,7 @@ while :; do sleep 60; done
 
     #[test]
     fn review_marker_promotes_in_progress_task_then_clears_itself() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-promote-{}-{}",
             std::process::id(),
@@ -8015,7 +8042,7 @@ while :; do sleep 60; done
     /// the card the rest of the way to `review`.
     #[test]
     fn ready_marker_routes_through_an_agent_owned_active_gate_then_to_review() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-gate-{}-{}",
             std::process::id(),
@@ -8056,7 +8083,7 @@ statuses:
         // command `cd`s there first), so create the worktree dir. It is not a
         // git repo, so the pre-handoff push resolves to `NoRemote` (local-only,
         // nothing to hand off) and does not block the move.
-        let worktree = shelbi_orchestrator::workspace::workspace_worktree(
+        let worktree = crate::workspace::workspace_worktree(
             &project.machines[0],
             &project.workspaces[0],
         );
@@ -8139,7 +8166,7 @@ transitions:
         // The gate's agent completing writes a transition marker requesting the
         // human `review` handoff. `move_status` above left the card assigned to
         // `alpha` (it does not unassign), so the transition applies in place.
-        let transition_marker = shelbi_orchestrator::workspace::workspace_transition_marker(
+        let transition_marker = crate::workspace::workspace_transition_marker(
             &project.machines[0],
             &project.workspaces[0],
         );
@@ -8174,7 +8201,7 @@ transitions:
         // backend error (network / GitHub 403 / timeout / malformed), the ready
         // marker must NOT be cleared. Clearing it strands a finished task
         // in-progress forever, because the worker wrote the marker exactly once.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-defer-{}-{}",
             std::process::id(),
@@ -8270,7 +8297,7 @@ transitions:
         // shows no such task (Ok(None)) is real proof the task is gone, so the
         // marker is still cleared (with the existing warning) — a stale marker
         // must not linger forever.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-gone-{}-{}",
             std::process::id(),
@@ -8323,7 +8350,7 @@ transitions:
         // workspace — an out-of-band board move raced the worker's marker write.
         // Clearing is correct (the marker is stale), but it must be EXPLAINED on
         // the event stream so a written handoff marker is never silently dropped.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-skip-{}-{}",
             std::process::id(),
@@ -8388,7 +8415,7 @@ transitions:
         // pins that independence: with a reconcile event already on the stream for
         // the task, the very next handoff tick still promotes and consumes the
         // marker.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-reconcile-race-{}-{}",
             std::process::id(),
@@ -8475,7 +8502,7 @@ transitions:
             eprintln!("skipping: git not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-detach-{}-{}",
             std::process::id(),
@@ -8501,7 +8528,7 @@ transitions:
             .success());
 
         let project = local_project(&work_dir);
-        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+        let wt = crate::workspace::workspace_worktree(
             &project.machines[0],
             &project.workspaces[0],
         );
@@ -8601,7 +8628,7 @@ transitions:
             eprintln!("skipping: git not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-pushfail-{}-{}",
             std::process::id(),
@@ -8643,7 +8670,7 @@ transitions:
         // Workspace worktree checked out on the task branch, then pushed so
         // origin has the branch and the worktree has a remote-tracking ref.
         let project = local_project(&work_dir);
-        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+        let wt = crate::workspace::workspace_worktree(
             &project.machines[0],
             &project.workspaces[0],
         );
@@ -8765,7 +8792,7 @@ transitions:
             eprintln!("skipping: git not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-detachfail-{}-{}",
             std::process::id(),
@@ -8784,7 +8811,7 @@ transitions:
         // A worktree dir whose `.git` is present-but-invalid: the existence
         // probe passes, but `git checkout --detach` fails — simulating a broken
         // worktree the handoff must survive.
-        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+        let wt = crate::workspace::workspace_worktree(
             &project.machines[0],
             &project.workspaces[0],
         );
@@ -8840,7 +8867,7 @@ transitions:
             eprintln!("skipping: git not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-openprfail-{}-{}",
             std::process::id(),
@@ -8878,7 +8905,7 @@ transitions:
         // pushed here — the handoff push publishes it, after which the
         // transition's `push_branch` no-ops and only `open_pr` runs.
         let project = local_project(&work_dir);
-        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+        let wt = crate::workspace::workspace_worktree(
             &project.machines[0],
             &project.workspaces[0],
         );
@@ -9068,7 +9095,7 @@ transitions:
             eprintln!("skipping: git not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-automerge-{}-{}",
             std::process::id(),
@@ -9117,7 +9144,7 @@ transitions:
         // Workspace worktree cut from feature/x, on the task branch, with a
         // commit of its own. push_branch (in the handoff) puts it on origin.
         let project = local_project(&work_dir);
-        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+        let wt = crate::workspace::workspace_worktree(
             &project.machines[0],
             &project.workspaces[0],
         );
@@ -9231,7 +9258,7 @@ transitions:
             eprintln!("skipping: git not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-mergefail-{}-{}",
             std::process::id(),
@@ -9267,7 +9294,7 @@ transitions:
         assert!(git_in(&work_dir, &["checkout", "-q", "main"]).status.success());
 
         let project = local_project(&work_dir);
-        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+        let wt = crate::workspace::workspace_worktree(
             &project.machines[0],
             &project.workspaces[0],
         );
@@ -9357,7 +9384,7 @@ transitions:
         // Neither a handoff status nor a merge-firing edge out of the
         // active status — still a misconfiguration: the task stays put and
         // the marker is consumed so it doesn't re-log every tick.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-deadend-{}-{}",
             std::process::id(),
@@ -9417,7 +9444,7 @@ transitions:
 
     #[test]
     fn absent_review_marker_is_a_noop() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-noop-{}-{}",
             std::process::id(),
@@ -9463,7 +9490,7 @@ transitions:
         // after start never fires (one full interval must pass first).
         // The second consideration, well past the interval and with no
         // recent events.log activity, emits exactly one heartbeat line.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-emit-{}-{}",
             std::process::id(),
@@ -9520,7 +9547,7 @@ transitions:
     fn zen_heartbeat_cue_only_fires_when_zen_is_on() {
         // Zen off (no state.json) → no cue at all, and any stale Zen cadence
         // counters are cleared so a later off→on re-enable starts fresh.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-zencue-off-{}-{}",
             std::process::id(),
@@ -9550,7 +9577,7 @@ transitions:
 
     #[test]
     fn zen_heartbeat_cue_summary_and_reread_cadences() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-zencue-on-{}-{}",
             std::process::id(),
@@ -9614,7 +9641,7 @@ transitions:
         // Zen on but no zenmode.md on disk (e.g. before the next reload
         // materializes it): the summary tick degrades to a bare `zen=on`
         // rather than dropping the heartbeat.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-zencue-missing-{}-{}",
             std::process::id(),
@@ -9653,7 +9680,7 @@ transitions:
         // A workspace transition lands in events.log moments before the
         // heartbeat attempt — the heartbeat must skip this consideration
         // so active boards don't get padded with no-op lines.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-debounce-{}-{}",
             std::process::id(),
@@ -9702,7 +9729,7 @@ transitions:
         // standard interval, but it must never silence the emitter. Live, the
         // heartbeat was observed to go quiet right after a zen toggle; this
         // pins the bound so a regression can't reintroduce a permanent stall.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-zen-{}-{}",
             std::process::id(),
@@ -9751,7 +9778,7 @@ transitions:
         // Project sets `heartbeat: off`: the function must clear any
         // outstanding schedule (so flipping it back on later starts a
         // fresh interval) and never append to events.log.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-off-{}-{}",
             std::process::id(),
@@ -9794,7 +9821,7 @@ transitions:
         // the feed must stay silent — no padding lines during the
         // offline window. The schedule still advances each attempt, and
         // once the probe flips back to true the next due tick emits.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-offline-{}-{}",
             std::process::id(),
@@ -9854,7 +9881,7 @@ transitions:
         // declared machine's health check just wedged the link). The offline
         // defer must be bounded by `standard`, not the current (max) interval —
         // otherwise one blip suppresses the heartbeat for a whole `max`.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-blip-{}-{}",
             std::process::id(),
@@ -10268,7 +10295,7 @@ transitions:
         // `workflow: None` task falls back to the built-in default even without
         // a project on disk — but pin SHELBI_HOME so the resolution is
         // deterministic regardless of the ambient environment.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-orphan-board-{}-{}",
             std::process::id(),
@@ -10338,7 +10365,7 @@ transitions:
     /// board hasn't caught up to the cross-process `in_progress` move yet.
     #[test]
     fn orphan_reaper_debounces_before_reaping() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -10424,7 +10451,7 @@ transitions:
             eprintln!("skipping: tmux not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -10468,7 +10495,7 @@ transitions:
             window: "alpha".into(),
         };
         assert!(
-            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
             "the orphaned agent pane must be alive before the reap",
         );
 
@@ -10490,7 +10517,7 @@ transitions:
             "a completed reap must clear the grace clock so a re-dispatch starts fresh",
         );
         assert!(
-            !shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            !crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
             "the pane must be gone after the reap",
         );
 
@@ -10535,7 +10562,7 @@ transitions:
             eprintln!("skipping: tmux not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -10598,13 +10625,13 @@ transitions:
         let start = std::time::Instant::now();
         while start.elapsed() < std::time::Duration::from_secs(3) {
             let screen = shelbi_tmux::capture(&host, &addr).unwrap_or_default();
-            if shelbi_orchestrator::ready::detect_agent_exited(&screen) {
+            if crate::ready::detect_agent_exited(&screen) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(
-            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
             "the pane must be alive even though the agent exited",
         );
 
@@ -10684,7 +10711,7 @@ transitions:
             eprintln!("skipping: tmux not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -10728,7 +10755,7 @@ transitions:
             window: "alpha".into(),
         };
         assert!(
-            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
             "the freshly-launched pane must be alive before the checks",
         );
 
@@ -10744,25 +10771,25 @@ transitions:
 
         // Stamp the launch as happening now: the pane is inside its launch-age
         // grace, so it must NOT be reaped, and it stays alive.
-        shelbi_orchestrator::workspace::stamp_launch_epoch(&host, &addr).unwrap();
+        crate::workspace::stamp_launch_epoch(&host, &addr).unwrap();
         let mut orphan_since = elapsed();
         assert!(
             !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan_since),
             "a pane launched inside the launch-age grace must be left alone",
         );
         assert!(
-            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
             "the still-settling pane must survive the launch-age grace",
         );
 
         // Age the launch past the deadline: the same pane is now a genuine
         // orphan and is reaped as today.
         let past = chrono::Utc::now().timestamp()
-            - shelbi_orchestrator::workspace::launch_timeout().as_secs() as i64
+            - crate::workspace::launch_timeout().as_secs() as i64
             - 5;
         let set = std::process::Command::new("tmux")
             .args(["set-option", "-w", "-t", &shelbi_tmux::command_target(&addr)])
-            .arg(shelbi_orchestrator::workspace::LAUNCH_EPOCH_OPTION)
+            .arg(crate::workspace::LAUNCH_EPOCH_OPTION)
             .arg(past.to_string())
             .status()
             .unwrap();
@@ -10774,7 +10801,7 @@ transitions:
             "a pane whose launch aged past the deadline must be reaped",
         );
         assert!(
-            !shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            !crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
             "the aged-out orphan pane must be gone after the reap",
         );
     }
@@ -10791,7 +10818,7 @@ transitions:
             eprintln!("skipping: tmux not on PATH");
             return;
         }
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -10847,12 +10874,12 @@ transitions:
             window: "alpha".into(),
         };
         assert!(
-            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
             "the orphaned review agent pane must be alive before the reap",
         );
 
         let marker =
-            shelbi_orchestrator::workspace::workspace_review_loaded_marker(
+            crate::workspace::workspace_review_loaded_marker(
                 project.machine(&ws.machine).unwrap(),
                 &ws,
             );
@@ -10861,7 +10888,7 @@ transitions:
         let acted = maybe_reap_orphaned_review_slot(&project, &ws, &host, &addr, &marker);
         assert!(acted, "a live markerless review pane must be reaped");
         assert!(
-            !shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap(),
+            !crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
             "the pane must be gone after the reap",
         );
         assert!(
@@ -10902,7 +10929,7 @@ transitions:
 
     #[test]
     fn maybe_emit_heartbeat_backs_off_exponentially_while_quiescent() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-backoff-{}-{}",
             std::process::id(),
@@ -10952,7 +10979,7 @@ transitions:
 
     #[test]
     fn maybe_emit_heartbeat_holds_standard_while_work_in_flight() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-inflight-{}-{}",
             std::process::id(),
@@ -10998,7 +11025,7 @@ transitions:
         // history must still emit its first heartbeat — the seed captures the
         // existing mtime as the baseline, so stale history isn't mistaken for a
         // fresh event and the sweep isn't permanently debounced.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-history-{}-{}",
             std::process::id(),
@@ -11039,7 +11066,7 @@ transitions:
 
     #[test]
     fn maybe_emit_heartbeat_resets_to_standard_on_event_mid_backoff() {
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-reset-{}-{}",
             std::process::id(),
@@ -11100,7 +11127,7 @@ transitions:
         // where events never stop — went silent for over a day. The bounded
         // `window_start + standard` deadline guarantees a heartbeat still lands
         // at roughly the standard cadence while work flows.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-busy-{}-{}",
             std::process::id(),
@@ -11153,7 +11180,7 @@ transitions:
         // resumed clock oddity) must not permanently block emission. The clamp
         // pulls it back to within `max`, so the emitter recovers on its own —
         // no manual state edit.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-hb-wedge-{}-{}",
             std::process::id(),
@@ -11379,7 +11406,7 @@ transitions:
     fn gate_task_is_served_is_false_for_an_unassigned_gate() {
         // A gate with no assignment has no worker — the parked case the pass
         // dispatches. Deterministic: no assignment, so no pane is probed.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let work_dir = std::env::temp_dir();
         let project = local_project(&work_dir);
         assert!(!gate_task_is_served(
@@ -11394,7 +11421,7 @@ transitions:
         // released developer workspace) is treated as parked, not served — the
         // stale value must never suppress the gate dispatch. Deterministic: an
         // unknown workspace resolves to no machine/addr, so no pane is probed.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-gate-ghost-{}-{}",
             std::process::id(),
@@ -11422,7 +11449,7 @@ transitions:
         // the gate is served (its agent is booting/running), so the pass leaves
         // it alone and never re-dispatches it. Deterministic: the confirmation
         // short-circuits before any pane probe.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-poller-gate-served-{}-{}",
             std::process::id(),

@@ -19,11 +19,14 @@
 //!   shutdown. This is what a bare `shelbi daemon` runs.
 //! - [`board`] — the hub-owned board-index refresh loop (one per open project)
 //!   and the `refresh-board` hub verb.
+//! - [`poller`] — the per-project workspace-poller manager (one poller per open
+//!   project), gated on the hidden `SHELBI_DAEMON_POLLER` dev setting.
 //! - [`lifecycle`] — `restart` and `status` without a supervisor, plus the
 //!   `retire_supervisor_units` upgrade step [`serve`] calls on startup.
 
 mod board;
 mod lifecycle;
+mod poller;
 mod serve;
 
 use anyhow::Result;

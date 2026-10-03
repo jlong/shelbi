@@ -1233,7 +1233,14 @@ pub fn append_workspace_event(
     let prev_str = prev.map(|s| s.as_str()).unwrap_or("none");
     append_event_line(&format!(
         "{ts} project={project} workspace={workspace} {prev_str} -> {new}"
-    ))
+    ))?;
+    // Push a change notification to any subscribed client so a UI can refresh
+    // the affected workspace row without polling (Phase 3 pushed notifications,
+    // `rt-daemon-poller`). A no-op when nobody is subscribed. `append_workspace_
+    // event` is called exactly on a real pane-title state transition, so this
+    // fires once per workspace change and no more.
+    crate::publish_change(crate::ChangeNotification::Workspace { project, workspace });
+    Ok(())
 }
 
 /// Append a blocking-dialog transition line to `~/.shelbi/events.log`:

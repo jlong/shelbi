@@ -174,3 +174,13 @@ Copied from the plan's decisions table.
 | Platforms | macOS and Linux now. New code is Windows-ready: session transport, locking, and PTYs sit behind abstractions (`portable-pty` covers ConPTY; a named pipe can stand in for the socket). Existing Unix-only code is not ported here. |
 | Legacy agent commands | `shelbi spawn`, `archive`, `tail`, the old `attach`, and `merge` are removed at cutover. |
 | Desktop | Sibling of the TUI at feature parity. The shared app model is built here, in Phase 4. |
+
+## Dev settings
+
+Hidden, dev-only toggles that gate in-progress remove-tmux work. They are
+environment variables (not surfaced in `shelbi config`) and default off, so a
+normal install behaves exactly as before. They go away as each phase stabilizes.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `SHELBI_DAEMON_POLLER` | off | When on, `shelbi daemon` runs the workspace poller (one poller per open project) and the sidebar runs none; off, the sidebar runs the poller as today. A per-project lock guarantees the two never run at once. Dev-only until `rt-daemon-layout-split` lands, because the poller still makes tmux layout calls that belong in a client. (`rt-daemon-poller`.) |

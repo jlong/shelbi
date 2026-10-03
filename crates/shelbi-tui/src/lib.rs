@@ -26,7 +26,6 @@ mod handlers;
 mod kanban;
 mod keymap;
 mod markdown;
-mod poller;
 mod review_panel;
 mod sidebar;
 pub mod theme;
@@ -136,8 +135,11 @@ pub(crate) mod test_support {
 pub use activity::ActivityApp;
 pub use app::{App, Row, View, WorkspaceBadge, WorkspaceOverview};
 pub use kanban::KanbanApp;
-pub use poller::WorkspacePoller;
 pub use sidebar::decoration_to_color;
+// The poller moved out of this crate into `shelbi-orchestrator` (Phase 3,
+// `rt-daemon-poller`) so it can run either here (the sidebar) or in
+// `shelbi daemon`. Re-exported at the old path so existing callers don't churn.
+pub use shelbi_orchestrator::poller::WorkspacePoller;
 
 /// Exact one-time orientation copy shown in the sidebar after the first
 /// project scaffold. Kept as one constant so persistence tests and the
@@ -241,7 +243,15 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     // and `~/.shelbi/events.log`. The handle's Drop joins the thread,
     // so it shuts down when this function returns regardless of which
     // exit path we took.
-    let _poller = WorkspacePoller::start(project_name);
+    //
+    // The poller runs *here* only while the hidden `SHELBI_DAEMON_POLLER` dev
+    // setting is off (the default). When it is on, `shelbi daemon` runs one
+    // poller per open project and the sidebar runs none, so the two never
+    // overlap (Phase 3, `rt-daemon-poller`). `WorkspacePoller::start` also takes
+    // the project's poller lock as a backstop, so even a stale sidebar racing a
+    // daemon that already holds the lock self-disables rather than double-polls.
+    let _poller = (!shelbi_state::daemon_poller_enabled())
+        .then(|| WorkspacePoller::start(project_name));
 
     // Route panic diagnostics to `tui.log`. The render loop catches a
     // render-pass panic and repaints (see `draw_sidebar_self_healing`), but
