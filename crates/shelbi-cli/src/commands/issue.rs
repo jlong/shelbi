@@ -855,162 +855,29 @@ fn move_to(
     reason: Option<&str>,
     skip_transition_actions: bool,
 ) -> Result<()> {
-    let tf = load_issue(project, id)?;
-    let workflow = resolve_task_workflow(project, &tf.task)?;
-    // Resolve the destination against the issue's workflow. An issue's position
-    // is a status id, so ANY status the workflow declares is a valid target
-    // — including `canceled` / archived and any status a user adds. A target
-    // the workflow doesn't declare errors, naming the declared statuses.
-    let column = resolve_move_target(&workflow, to)?;
-
-    // Status ids for the edge we're crossing (used to fire the edge's
-    // transition actions below). `column` is the target, `tf.task.column`
-    // the current position.
-    let from_status = tf.task.column.as_str().to_string();
-    let to_status = column.as_str().to_string();
-    // Does this edge declare a `merge`? An accept move (e.g. `review -> done`)
-    // must actually integrate the branch, not just re-color the card. The
-    // merge is GATED before the column move (below) so a failed or absent
-    // merge never leaves the board reading the target status with an open PR
-    // / unmerged branch, and the edge's remaining actions (`delete_branch`,
-    // …) fire after the move.
-    //
-    // `--skip-transition-actions` forces this off: the recovery escape hatch
-    // advances the card WITHOUT running the merge (or any other action), for
-    // when the git work already landed out of band and the merge would
-    // re-fail. `declares_merge` gates the gated-merge block AND the post-move
-    // cleanup below, so clearing it here is enough to bypass the whole action
-    // list — the move is stamped `actions=skipped` in the event log instead.
-    let declares_merge = !skip_transition_actions
-        && column != tf.task.column
-        && workflow
-            .actions_for_transition(&from_status, &to_status)
-            .contains(&shelbi_core::TransitionAction::Merge);
-
-    // Lifecycle hook: a move INTO `in_progress` cuts the issue's branch on
-    // the hub (with depends_on awareness — see
-    // `shelbi_orchestrator::lifecycle`) and persists `branch:` onto the
-    // issue. Skip when the destination matches the current column (the
-    // `shelbi_state::move_task` short-circuit would treat it as a no-op
-    // anyway) and when no column change is actually happening — that
-    // keeps `issue move ... --to in_progress` on an already-in-progress
-    // issue from running the cut for no reason. A failure inside the cut
-    // (e.g. depends_on names a branch that hasn't been pushed yet) DOES
-    // abort the move — silently dropping the depends_on intent and
-    // shipping the card to in_progress without a usable branch would be
-    // the worst of both worlds.
-    if column == Column::in_progress() && tf.task.column != Column::in_progress() {
-        let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-        shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress(&project_yaml, id)
-            .map_err(|e| anyhow!(e))?;
-    }
-
-    // Gated merge for an accept edge. Integrate the branch (via the PR when
-    // one is open — the path a protected `main` accepts) BEFORE the card
-    // moves. A failed merge emits a `merge … status=failed` event and aborts
-    // the move: the issue stays put rather than showing the target status with
-    // nothing merged. Loaded once here and reused for the post-move cleanup.
-    let project_yaml_for_actions = if declares_merge {
-        let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-        let ws_label = tf
-            .task
-            .assigned_to
-            .clone()
-            .unwrap_or_else(|| "cli".to_string());
-        let gated = shelbi_orchestrator::transition::run_gated_merge(
-            &project_yaml,
+    // The move itself — target resolution, the in-progress branch cut, the
+    // edge's gated merge, the status write + event, the post-merge cleanup —
+    // is `shelbi_orchestrator::transition::move_issue`, shared with the TUI
+    // board so a transition's actions run the same from either surface. This
+    // wrapper only owns the terminal output.
+    use shelbi_orchestrator::transition::{move_issue, MoveError, MoveRequest};
+    let outcome = move_issue(
+        &MoveRequest {
             project,
-            &tf.task,
-            &tf.body,
-            &workflow,
-            &from_status,
-            &to_status,
-            &ws_label,
-        )
-        .map_err(|e| {
-            anyhow!(
-                "merge for `{id}` failed; leaving it in `{from_status}` \
-                 (NOT advancing to `{to_status}`): {e}"
-            )
-        })?;
-        // The gate ran the pre-merge prefix (e.g. `push_branch`) plus `merge`;
-        // the post-move cleanup below must skip exactly those so none re-runs.
-        // `declares_merge` guarantees `Some` here, but fall back to skipping
-        // just `merge` rather than unwrapping.
-        let skip = gated
-            .map(|gm| gm.ran)
-            .unwrap_or_else(|| vec![shelbi_core::TransitionAction::Merge]);
-        Some((project_yaml, skip))
-    } else {
-        None
-    };
+            id,
+            to,
+            reason: reason.unwrap_or("user:cli"),
+            workspace_fallback: "cli",
+            skip_transition_actions,
+        },
+        &mut |w| eprintln!("warning: {w}"),
+    )
+    .map_err(|e| match e {
+        MoveError::Move(e) | MoveError::LoadProject(e) | MoveError::BranchCut(e) => anyhow!(e),
+        e @ (MoveError::Merge { .. } | MoveError::EventAppend { .. }) => anyhow!("{e}"),
+    })?;
 
-    // Route the status change through the board seam. `move_status` returns a
-    // `StatusMove`; unpack it back into the `(from, to, workflow)` tuple the
-    // event-append + rollback logic below already speaks.
-    let store = cached_issue_store(project)?;
-    let moved = store
-        .move_status(id, &column, reason.unwrap_or("user:cli"))
-        .map_err(|e| anyhow!(e))?
-        .map(|m| (m.from, m.to, m.workflow));
-    if let Some((from, to_col, moved_wf)) = &moved {
-        let reason = reason.unwrap_or("user:cli");
-        // Stamp `actions=skipped` on the line when the escape hatch bypassed
-        // the transition's actions, so the board history stays honest that
-        // side effects were NOT run — kept distinct from the user's `reason`.
-        let append = if skip_transition_actions {
-            shelbi_state::append_task_event_actions_skipped
-        } else {
-            shelbi_state::append_task_event
-        };
-        if let Err(e) = append(project, id, moved_wf, from.clone(), to_col.clone(), reason) {
-            match store.move_status(id, from, "rollback:event-append-failed") {
-                Ok(_) => {
-                    return Err(anyhow!(
-                        "moved {id} to {to_col}, but failed to append issue event ({e}); \
-                         rolled back to {from}. Fix events.log permissions or restart the \
-                         Shelbi daemon, then retry the move"
-                    ));
-                }
-                Err(re) => {
-                    return Err(anyhow!(
-                        "moved {id} to {to_col}, but failed to append issue event ({e}); \
-                         rollback to {from} also failed ({re}). Fix events.log permissions, \
-                         then run `shelbi issue move {id} --to {from}` or retry the intended move"
-                    ));
-                }
-            }
-        }
-    }
-
-    // Merge already landed and gated the move above; now fire the edge's
-    // remaining actions (`delete_branch`, `run:`/`ready:`), skipping the ones
-    // the gate already ran (the pre-merge prefix plus `merge`) so none is
-    // re-run. Best-effort — the move already happened, so a cleanup failure
-    // warns rather than rolling it back.
-    if let (Some((project_yaml, skip)), Some(_)) =
-        (project_yaml_for_actions.as_ref(), moved.as_ref())
-    {
-        match shelbi_orchestrator::transition::execute_transition_except(
-            project_yaml,
-            project,
-            &tf.task,
-            &tf.body,
-            &workflow,
-            &from_status,
-            &to_status,
-            skip,
-        ) {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!(
-                    "warning: post-merge cleanup for `{id}` failed (merge already landed): {e}"
-                );
-            }
-        }
-    }
-
-    println!("✓ {id} → {column}");
+    println!("✓ {id} → {}", outcome.column);
     Ok(())
 }
 
@@ -1044,42 +911,6 @@ fn resolve_task_workflow(project: &str, issue: &Issue) -> Result<Workflow> {
             Ok(default_workflow())
         }
     }
-}
-
-/// Resolve a `issue move --to <STATUS>` argument against the issue's
-/// workflow, returning the target position (a status id).
-///
-/// An issue's position is a status id, so any status the workflow declares
-/// is a reachable target — including `canceled` / archived statuses and
-/// any status a user adds later. `to` is matched against the declared
-/// status ids, first through the same alias normalization a stored
-/// position gets (so `wip` / `in_progress` resolve onto `in-progress`),
-/// then verbatim against the raw declared ids (for custom ids the
-/// normalizer passes through untouched). A `to` the workflow doesn't
-/// declare errors, listing the ids it does.
-fn resolve_move_target(workflow: &Workflow, to: &str) -> Result<Column> {
-    // Alias-normalized lookup: folds the friendly CLI spellings onto the
-    // canonical id before checking the workflow.
-    let normalized = Column::from_status_id(to);
-    if let Some(status) = workflow.status(normalized.as_str()) {
-        return Ok(Column::from_status_id(&status.id));
-    }
-    // Verbatim lookup: a custom id the normalizer left untouched still has
-    // to match a declared status id exactly (modulo surrounding whitespace).
-    if let Some(status) = workflow.statuses.iter().find(|s| s.id == to.trim()) {
-        return Ok(Column::from_status_id(&status.id));
-    }
-
-    let valid = workflow
-        .statuses
-        .iter()
-        .map(|s| s.id.clone())
-        .collect::<Vec<_>>()
-        .join(", ");
-    bail!(
-        "`{to}` is not a status in workflow `{}` (valid: {valid})",
-        workflow.name,
-    );
 }
 
 /// Resolve which agent should drive the workspace once it lands in the
@@ -1296,18 +1127,36 @@ fn unassign(project: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn prio(project: &str, args: PrioArgs) -> Result<()> {
-    let tf = load_issue(project, &args.id)?;
-    let col = cached_issue_store(project)?
-        .list_in_status(&tf.task.column)
-        .map_err(|e| anyhow!(e))?;
-    let pos = col
-        .iter()
-        .position(|x| x.task.id == args.id)
-        .ok_or_else(|| anyhow!("issue `{}` not found in column listing", args.id))?;
-    let last = col.len().saturating_sub(1);
+/// Sort a single column's listing into the canonical board order the stores use
+/// *within* a column — priority ascending, then id — the final two keys of both
+/// `list_tasks` (filesystem) and `sort_board` (github). `prio` applies it to the
+/// index-derived listing so the position it computes is the position the store
+/// re-derives under its lock from `list_in_status`: an index published out of
+/// order (or a terminal page returned in some other order) can't then make the
+/// CLI resolve a slot against a different ordering than the store acts on, which
+/// would move the wrong card. The id tiebreak is what makes two cards that share
+/// a priority reorder deterministically — both sides break the tie the same way.
+fn sort_column_canonically(col: &mut [shelbi_state::IssueFile]) {
+    col.sort_by(|a, b| {
+        a.task
+            .priority
+            .cmp(&b.task.priority)
+            .then_with(|| a.task.id.cmp(&b.task.id))
+    });
+}
 
-    let new_pos: usize = if args.up {
+/// Resolve the absolute destination slot a prio move lands `id` at within `col`
+/// — the card's column, already in canonical order. Returns `Ok(None)` when
+/// `col` doesn't contain `id` (the caller turns that into a column/workflow-named
+/// error), or `Err` when no move flag was given. The slot is what `prio` hands
+/// the store as `PrioMove::Set`; the store re-clamps it against its own live
+/// column under the lock, so this never has to be the final word.
+fn prio_slot_in(col: &[shelbi_state::IssueFile], id: &str, args: &PrioArgs) -> Result<Option<usize>> {
+    let Some(pos) = col.iter().position(|x| x.task.id == id) else {
+        return Ok(None);
+    };
+    let last = col.len().saturating_sub(1);
+    let slot = if args.up {
         pos.saturating_sub(1)
     } else if args.down {
         (pos + 1).min(last)
@@ -1320,12 +1169,62 @@ fn prio(project: &str, args: PrioArgs) -> Result<()> {
     } else {
         bail!("specify one of --up, --down, --top, --bottom, --set N");
     };
+    Ok(Some(slot))
+}
+
+fn prio(project: &str, args: PrioArgs) -> Result<()> {
+    let tf = load_issue(project, &args.id)?;
+    let status = &tf.task.column;
+    // Build the column listing from the SAME source `issue list` / `show` read —
+    // the daemon-owned `board-index.json` (via `read_open_board_for_cli`), never
+    // the per-process `board-snapshot.json` that `list_in_status` serves on a
+    // remote backend. That snapshot is only rewritten by a *dispatch*: `issue
+    // move` patches the daemon index (so `list`/`show` show the card in its new
+    // column at once) but never the snapshot, so a short-lived CLI one-shot right
+    // after a move serves the stale copy — still placing the card in its old
+    // column — and kicks only a background refresh it exits before finishing.
+    // `prio` then couldn't reorder a card `list` plainly showed, on any workflow,
+    // until the snapshot happened to refresh. Reading the index closes that
+    // divergence (the same fix `workspace_occupied_by` got). A terminal
+    // (`done`/`canceled`) column lives in the on-demand closed history the open
+    // index omits, so that one case still reads through the store. Both sources
+    // apply the same `sort_board` order (column, then priority, then id), so the
+    // position lookup is deterministic even when two cards share a priority.
+    let mut col: Vec<shelbi_state::IssueFile> = if is_terminal_status(status) {
+        cached_issue_store(project)?
+            .list_in_status(status)
+            .map_err(|e| anyhow!(e))?
+    } else {
+        super::read_open_board_for_cli(project)?
+            .into_iter()
+            .filter(|f| &f.task.column == status)
+            .collect()
+    };
+    // Resolve the slot against the same canonical within-column order the store
+    // re-derives under its lock, so the two can't diverge and move the wrong card.
+    sort_column_canonically(&mut col);
+    let new_pos = prio_slot_in(&col, &args.id, &args)?.ok_or_else(|| {
+        // The card resolved to `status` through its own live `get`, yet the
+        // listing for that column doesn't contain it — a genuinely cold or
+        // lagging board index, not a routing mismatch. Name the column and
+        // workflow the lookup used so the operator can see where it looked.
+        let workflow = shelbi_state::load_project(project)
+            .ok()
+            .map(|p| shelbi_state::resolve_task_workflow_name(&p, &tf.task).to_string())
+            .unwrap_or_else(|| tf.task.workflow_or_default().to_string());
+        anyhow!(
+            "issue `{}` is in column `{status}` (workflow `{workflow}`) but that column's \
+             listing doesn't contain it — the board index may be cold or lagging; retry once \
+             the hub daemon has published it",
+            args.id
+        )
+    })?;
 
     let store = cached_issue_store(project)?;
     store
         .set_priority(&args.id, shelbi_state::PrioMove::Set(new_pos as u32))
         .map_err(|e| anyhow!(e))?;
-    println!("✓ {} now at slot {new_pos} in {}", args.id, tf.task.column);
+    println!("✓ {} now at slot {new_pos} in {status}", args.id);
     Ok(())
 }
 
@@ -4763,5 +4662,210 @@ workspaces:
         shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // --- prio: reorder from the live index, on any workflow ------------------
+
+    /// A fully-defaulted [`PrioArgs`] with the one chosen move set — the shape
+    /// `clap` produces once its `conflicts_with_all` groups are satisfied.
+    fn prio_args(id: &str, up: bool, down: bool, top: bool, bottom: bool, set: Option<u32>) -> PrioArgs {
+        PrioArgs { id: id.into(), up, down, top, bottom, set }
+    }
+
+    /// The reported bug: `shelbi issue prio` couldn't reorder a card that `issue
+    /// list` / `show` plainly placed in a column, right after `issue move`, on a
+    /// non-default workflow. Root cause: `prio` built its column listing from
+    /// `list_in_status` — the per-process `board-snapshot.json`, which only a
+    /// *dispatch* rewrites — while `list` / `show` read the daemon-owned
+    /// `board-index.json` that `issue move` patches at once. Here the snapshot is
+    /// stale (card still in `backlog`) while the index is current (card in the
+    /// custom `qa-review` status, a status id no default workflow declares). The
+    /// old code filtered the stale snapshot for `qa-review`, found nothing, and
+    /// failed `not found in column listing`; the fix reads the index and reorders
+    /// it — proving the path is workflow-agnostic and move-fresh.
+    #[test]
+    fn prio_reorders_from_the_live_index_not_the_stale_snapshot() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+
+        // The live backend `get` (prio's `load_issue`) and `set_priority`'s
+        // column read both resolve the card into the custom `qa-review` status.
+        install_gh_issue_runner(gh_issue_json("rt-daemon-lifecycle", "qa-review"));
+
+        // Dispatch-only snapshot still shows the pre-move `backlog` column — the
+        // shape right after an `issue move` the snapshot never saw. The OLD prio
+        // filtered THIS for `qa-review` and found nothing.
+        shelbi_state::seed_board_snapshot_for_test(
+            "gh",
+            &[issue_file(task_in(
+                Column::from_status_id("backlog"),
+                "rt-daemon-lifecycle",
+            ))],
+        );
+        // The daemon index is current — exactly what `issue list` / `show` render.
+        write_gh_index(vec![issue_file(task_in(
+            Column::from_status_id("qa-review"),
+            "rt-daemon-lifecycle",
+        ))]);
+
+        for args in [
+            prio_args("rt-daemon-lifecycle", false, false, true, false, None), // --top
+            prio_args("rt-daemon-lifecycle", true, false, false, false, None), // --up
+            prio_args("rt-daemon-lifecycle", false, true, false, false, None), // --down
+            prio_args("rt-daemon-lifecycle", false, false, false, true, None), // --bottom
+            prio_args("rt-daemon-lifecycle", false, false, false, false, Some(1)), // --set 1
+        ] {
+            prio("gh", args)
+                .expect("prio reorders a card the live index shows, despite a stale snapshot");
+        }
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// One card in `column` with an explicit priority — the shape a column
+    /// listing carries, so a reorder has real positions to resolve against.
+    fn card_in(column: Column, id: &str, priority: u32) -> shelbi_state::IssueFile {
+        issue_file(Issue {
+            priority,
+            ..task_in(column, id)
+        })
+    }
+
+    /// Mirror of the store's documented reorder (`set_priority`: remove the card
+    /// from its current slot, insert it at `slot`) so a test can assert the id
+    /// order a computed slot produces — `prio` hands this exact slot to the store
+    /// as `PrioMove::Set`, and the store re-derives the same index under its lock.
+    fn order_after(col: &[shelbi_state::IssueFile], id: &str, slot: usize) -> Vec<String> {
+        let mut ids: Vec<String> = col.iter().map(|f| f.task.id.clone()).collect();
+        let idx = ids.iter().position(|x| x == id).expect("card is in the column");
+        let moved = ids.remove(idx);
+        ids.insert(slot, moved);
+        ids
+    }
+
+    /// Point 1 of the fix's contract: every move resolves to a real, distinct
+    /// slot in a column of three, and the slot is the one the store will act on.
+    /// Uses the custom `qa-review` status (no default workflow declares it) so the
+    /// move is also proven workflow-agnostic at the arithmetic layer.
+    #[test]
+    fn prio_slot_in_resolves_every_move_in_a_three_card_column() {
+        let col_in = Column::from_status_id("qa-review");
+        // Built deliberately out of priority order; `prio` sorts canonically first.
+        let mut col = vec![
+            card_in(col_in.clone(), "c", 2),
+            card_in(col_in.clone(), "a", 0),
+            card_in(col_in.clone(), "b", 1),
+        ];
+        sort_column_canonically(&mut col);
+        assert_eq!(
+            col.iter().map(|f| f.task.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"],
+            "canonical order is priority asc, then id"
+        );
+
+        // Move the middle card `b` (slot 1 of 0..=2) each way.
+        let slot = |up, down, top, bottom, set| {
+            prio_slot_in(&col, "b", &prio_args("b", up, down, top, bottom, set))
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(slot(false, false, true, false, None), 0, "--top → slot 0");
+        assert_eq!(slot(true, false, false, false, None), 0, "--up from slot 1 → 0");
+        assert_eq!(slot(false, true, false, false, None), 2, "--down from slot 1 → 2");
+        assert_eq!(slot(false, false, false, true, None), 2, "--bottom → last slot 2");
+        assert_eq!(slot(false, false, false, false, Some(0)), 0, "--set 0 → 0");
+        assert_eq!(
+            slot(false, false, false, false, Some(9)),
+            2,
+            "--set past the end clamps to the last slot"
+        );
+
+        // The resulting id order those slots produce, so the reorder — not just
+        // the arithmetic — is observed.
+        assert_eq!(order_after(&col, "b", 0), ["b", "a", "c"], "--top/--up lands b first");
+        assert_eq!(order_after(&col, "b", 2), ["a", "c", "b"], "--down/--bottom lands b last");
+    }
+
+    /// Point 3 of the fix's contract: two cards that share a priority reorder
+    /// deterministically. Both the index-derived listing `prio` reads and the
+    /// store's own `list_in_status` break the tie on id (the final key of
+    /// `sort_board` / `list_tasks`), so the slot `prio` computes is the slot the
+    /// store acts on — the ordering can't diverge and move the wrong card. The ids
+    /// are the two `priority: 13` cards from the original report.
+    #[test]
+    fn prio_slot_in_breaks_a_priority_tie_on_id_matching_the_store() {
+        let col_in = Column::from_status_id("qa-review");
+        let make = || {
+            vec![
+                card_in(col_in.clone(), "rt-daemon-lifecycle", 13),
+                card_in(col_in.clone(), "rt-app-model", 13),
+            ]
+        };
+        // Canonical order is id-stable regardless of the order the index lists
+        // the tied cards in — so an index published in either tie order resolves
+        // the same slot the store (which sorts the same way) will act on.
+        let mut forward = make();
+        sort_column_canonically(&mut forward);
+        let mut reversed = make();
+        reversed.reverse();
+        sort_column_canonically(&mut reversed);
+        let ids = |c: &[shelbi_state::IssueFile]| {
+            c.iter().map(|f| f.task.id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&forward), ids(&reversed), "tie order is id-stable, input-independent");
+        assert_eq!(
+            ids(&forward),
+            ["rt-app-model", "rt-daemon-lifecycle"],
+            "`rt-app-model` sorts before `rt-daemon-lifecycle` by id"
+        );
+
+        // `rt-daemon-lifecycle` sits at slot 1 by the tie; moving it up/top lands
+        // it at slot 0, exactly where `issue list` (same ordering) would show it.
+        let args = prio_args("rt-daemon-lifecycle", true, false, false, false, None);
+        let slot = prio_slot_in(&forward, "rt-daemon-lifecycle", &args).unwrap().unwrap();
+        assert_eq!(slot, 0, "--up on the second tied card → slot 0");
+        assert_eq!(
+            order_after(&forward, "rt-daemon-lifecycle", slot),
+            ["rt-daemon-lifecycle", "rt-app-model"],
+        );
+    }
+
+    /// Point 2 of the fix's contract (terminal branch): `prio` routes a
+    /// `done`/`canceled`/archived status through `list_in_status` (the on-demand
+    /// closed history the open index omits), and a non-terminal custom status
+    /// through the daemon index. The slot arithmetic is shared (`prio_slot_in`)
+    /// and covered above, so this pins only the branch selection — the one bit
+    /// that differs between a terminal and a live column.
+    #[test]
+    fn prio_routes_terminal_statuses_through_the_store_listing() {
+        assert!(is_terminal_status(&Column::from_status_id("done")), "done is terminal");
+        assert!(
+            is_terminal_status(&Column::from_status_id("canceled")),
+            "canceled is terminal"
+        );
+        assert!(
+            !is_terminal_status(&Column::from_status_id("qa-review")),
+            "a custom active status reads the live index, not the closed history"
+        );
+        assert!(
+            !is_terminal_status(&Column::from_status_id("todo")),
+            "todo reads the live index"
+        );
+    }
+
+    /// The missing-card path names the column and workflow it looked in instead
+    /// of a bare message, so an operator can see where the lookup landed.
+    #[test]
+    fn prio_slot_in_reports_a_missing_card_as_none() {
+        let col = vec![card_in(Column::from_status_id("qa-review"), "a", 0)];
+        let args = prio_args("absent", false, false, true, false, None);
+        assert!(
+            prio_slot_in(&col, "absent", &args).unwrap().is_none(),
+            "a card the listing doesn't contain resolves to None, not a slot"
+        );
     }
 }
