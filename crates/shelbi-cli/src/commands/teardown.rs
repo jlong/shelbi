@@ -370,6 +370,10 @@ fn teardown_project(progress: &Progress, pi: usize, project: &str, reason: &str)
     // reads cleanly — the `-b` script runs within the second.
     progress.set_main(pi, Step::Done);
 
+    // Clear the open flag alongside the `closed` event so the on-demand
+    // daemon's idle-exit monitor stops supervising this project and exits once
+    // it's the last one closed (`docs/removing-tmux/phase3-daemon.md`).
+    let _ = shelbi_state::set_project_open(project, false);
     let _ = shelbi_state::append_project_event(project, "closed", reason);
 }
 

@@ -1,6 +1,7 @@
 pub mod agent_manifest;
 pub mod error;
 pub mod integration;
+pub mod login_env;
 pub mod model;
 pub mod placeholders;
 pub mod scaffold;
@@ -16,6 +17,7 @@ pub use agent_manifest::{
 };
 pub use error::{Error, GhTokenProbeFailure, Result};
 pub use integration::{CapabilityLadder, IntegrationMode};
+pub use login_env::login_shell_env;
 pub use model::{
     checks_for_task, checks_for_task_in_workflow, ci_timeout_for_workflow,
     danger_paths_for_project, danger_paths_for_workflow, default_dialog_signatures,
