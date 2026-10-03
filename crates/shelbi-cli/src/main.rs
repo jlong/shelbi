@@ -215,6 +215,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::agent::AgentCmd,
     },
+    /// Find or install a compatible `shelbi` binary on the project's remote
+    /// machines: `setup <name>`, `status [<name>]`.
+    Machine {
+        #[command(subcommand)]
+        cmd: commands::machine::MachineCmd,
+    },
     /// Manage the project's workflow definitions (status sets).
     Workflow {
         #[command(subcommand)]
@@ -527,6 +533,7 @@ fn main() -> Result<()> {
             commands::workspace::run(cli.project, cmd)
         }
         Some(Cmd::Agent { cmd }) => commands::agent::run(cli.project, cmd),
+        Some(Cmd::Machine { cmd }) => commands::machine::run(cli.project, cmd),
         Some(Cmd::Workflow { cmd }) => commands::workflow::run(cli.project, cmd),
         Some(Cmd::Project { cmd }) => commands::project::run(cli.project, cmd),
         Some(Cmd::Config { cmd }) => {
