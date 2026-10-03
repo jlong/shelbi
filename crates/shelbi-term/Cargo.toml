@@ -1,0 +1,12 @@
+[package]
+name = "shelbi-term"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "UI-toolkit-agnostic terminal view for shelbi sessions (emulator, scrollback, selection, search, input encoding)"
+
+[dependencies]
+shelbi-proto = { workspace = true }

@@ -10,8 +10,14 @@ members = [
     "crates/shelbi-tui",
     "crates/shelbi-palette",
     "crates/shelbi-cli",
+    "crates/shelbi-proto",
+    "crates/shelbi-client",
+    "crates/shelbi-term",
 ]
 default-members = ["crates/shelbi-cli"]
+# Throwaway prototypes for the "removing tmux" work. Excluded so they never
+# affect `cargo build --workspace`, `test`, or `clippy`; deleted at cutover.
+exclude = ["spikes"]
 
 [workspace.package]
 version = "0.9.0"
@@ -58,6 +64,9 @@ shelbi-agent = { path = "crates/shelbi-agent" }
 shelbi-orchestrator = { path = "crates/shelbi-orchestrator" }
 shelbi-tui = { path = "crates/shelbi-tui" }
 shelbi-palette = { path = "crates/shelbi-palette" }
+shelbi-proto = { path = "crates/shelbi-proto" }
+shelbi-client = { path = "crates/shelbi-client" }
+shelbi-term = { path = "crates/shelbi-term" }
 
 [profile.release]
 lto = "thin"
