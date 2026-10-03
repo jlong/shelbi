@@ -27,6 +27,7 @@ pub mod handoff;
 pub mod lifecycle;
 pub mod load;
 pub mod machine;
+pub mod mutate;
 pub mod poller;
 pub mod ready;
 pub mod review_ui;

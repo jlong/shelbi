@@ -30,12 +30,14 @@
 
 pub mod command;
 pub mod exec;
+pub mod exec_daemon;
 pub mod nav;
 pub mod refresh;
 pub mod view;
 
 pub use command::{Command, CommandKind, CommandModel, CommandRegistry};
 pub use exec::{EditTarget, Effect, ExecError, ExecOutcome, Executor, Mutation};
+pub use exec_daemon::execute_mutation;
 pub use nav::{ClientState, Focus, GlobalFlags, Overlay, View};
 pub use refresh::{spawn_refresher, RefreshHandle, Snapshot};
 pub use view::{

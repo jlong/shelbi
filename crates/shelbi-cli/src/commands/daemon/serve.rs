@@ -301,8 +301,22 @@ pub(super) fn run_foreground() -> Result<()> {
     // flag and for a restart to verify, and avoids thrash on project switches.
     spawn_idle_monitor(stop.clone(), sock.clone());
 
+    // The mutation control socket, bound and accepting BEFORE the hub serve loop
+    // below starts answering hellos — so a client that waits on hub.sock and
+    // then connects to control.sock never races the bind. Its accept loop runs
+    // on its own thread (the hub serve below blocks this one) and watches the
+    // same `stop` flag, so SIGTERM stops both.
+    let control_sock = shelbi_state::control_socket_path().map_err(|e| anyhow!(e))?;
+    let control_listener = super::control::bind(&control_sock)?;
+    {
+        let control_state = super::control::ControlState::new();
+        let stop = stop.clone();
+        thread::spawn(move || super::control::serve(control_listener, control_state, stop));
+    }
+
     serve(&listener, &daemon, &stop);
 
+    let _ = fs::remove_file(&control_sock);
     let _ = fs::remove_file(&sock);
     // Best-effort: drop the PID file so the next start's cleanup
     // doesn't see us as a (now-dead) live daemon. The read path is
