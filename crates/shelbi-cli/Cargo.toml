@@ -21,6 +21,7 @@ shelbi-agent = { workspace = true }
 shelbi-orchestrator = { workspace = true }
 shelbi-tui = { workspace = true }
 shelbi-palette = { workspace = true }
+shelbi-app = { workspace = true }
 
 # clap derive needs to be visible in the orchestrate args struct
 

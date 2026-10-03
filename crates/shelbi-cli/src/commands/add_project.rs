@@ -33,7 +33,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
-use shelbi_state::keymap::{GlobalAction, KeyChord, Keymaps};
+use shelbi_state::keymap::{GlobalAction, Keymaps};
 
 use super::init::InitMode;
 use crate::project_root::{
@@ -340,7 +340,7 @@ pub fn run<B: ratatui::backend::Backend>(
                     continue;
                 }
                 if let Some(c) = opener_close {
-                    if c == KeyChord::from_event(k) {
+                    if crate::keys::chord_from_event(k) == Some(c) {
                         return Ok(None);
                     }
                 }

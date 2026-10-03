@@ -93,7 +93,7 @@ fixable, plus the emulator decision.
 
 | Subtask | Scope | Status |
 | --- | --- | --- |
-| `rt-app-model` | **4a** `shelbi-app`: navigation, typed command registry, view models, background refresh; move the chord type off crossterm | Pending |
+| `rt-app-model` | **4a** `shelbi-app`: navigation, typed command registry, view models, background refresh; move the chord type off crossterm | Landed |
 | `rt-tui-shell` | **4b** One event loop, sidebar, terminal-view widget, focus/mouse model, scrollback, selection, search | Pending |
 | `rt-tui-native-views` | **4c** Issues and activity in-process; the new machines view | Pending |
 | `rt-tui-overlays` | **4d** Port the five popup processes (palette, review confirm, reject reason, error log, zen intro) to in-process overlays | Pending |
