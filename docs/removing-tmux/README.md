@@ -57,7 +57,7 @@ fixable, plus the emulator decision.
 | --- | --- | --- |
 | `rt-spike-emulator-replay` | Serialize full emulator state and rebuild it in a second emulator; **decides the emulator crate** | Pending |
 | `rt-spike-agents` | Claude Code (full-screen + inline) and Codex in a PTY rendered by a ratatui widget: keys incl. Shift+Enter, mouse, paste, wide chars, redraw cost | Pending |
-| `rt-spike-runtime` | Process survival (outliving the launcher on macOS and Linux/logind; child group dies on kill), the startup query responder, and nesting inside tmux and Screen | Pending |
+| `rt-spike-runtime` | Process survival (outliving the launcher on macOS and Linux/logind; child group dies on kill), the startup query responder, and nesting inside tmux and Screen | Landed (macOS + ssh + `portable-pty` verified; Linux/logind untested, no reachable host; see [`phase0/runtime.md`](phase0/runtime.md)) |
 
 ### Phase 1 — Session process, protocol, attach
 
