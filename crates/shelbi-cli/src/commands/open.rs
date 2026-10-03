@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
 use shelbi_core::{Host, Machine, Project, WorkspaceSpec};
+use shelbi_orchestrator::session_backend::{backend, SessionBackend, SessionTarget};
 use shelbi_orchestrator::workspace as orch_workspace;
 
 use super::require_project;
@@ -234,13 +235,20 @@ fn open_idle_shell(
         Host::Ssh { host: ssh_host } => {
             let addr = orch_workspace::workspace_tmux_addr(project, workspace)
                 .map_err(|e| anyhow!(e))?;
-            if !shelbi_tmux::has_session(host, &addr.session).map_err(|e| anyhow!(e))? {
+            let target = SessionTarget::from_tmux_addr(&addr);
+            if !backend()
+                .probe(host, &SessionTarget::session(&addr.session), None)
+                .into_exists()
+                .map_err(|e| anyhow!(e))?
+            {
                 // No pane command → the remote session's default shell, so
                 // the user's login rc files run — same reason the remote
                 // worker launch creates an empty session first.
-                shelbi_tmux::new_session(host, &addr.session, &addr.window, None)
+                backend()
+                    .spawn(host, &target, None)
                     .map_err(|e| anyhow!(e))?;
-                shelbi_tmux::send_line(host, &addr, &shell_cd_line(&worktree, &machine.work_dir))
+                backend()
+                    .send_line(host, &target, &shell_cd_line(&worktree, &machine.work_dir))
                     .map_err(|e| anyhow!(e))?;
             }
             // Same proxy-window mechanism as the remote worker arm — the
