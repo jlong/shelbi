@@ -14,6 +14,8 @@
 
 use shelbi_core::{Host, Result, TmuxAddr};
 
+use crate::session_backend::{backend, SessionBackend, SessionTarget};
+
 /// How long to wait for claude's input box to appear before giving up and
 /// sending the prompt anyway.
 pub const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -79,25 +81,26 @@ pub fn wait_for_claude_ready(
     addr: &TmuxAddr,
     timeout: std::time::Duration,
 ) -> Result<bool> {
+    let target = SessionTarget::from_tmux_addr(addr);
     let mut deadline = std::time::Instant::now() + timeout;
     let mut trust_dismissed = false;
     let mut resume_summary_answered = false;
     while std::time::Instant::now() < deadline {
         // A capture failure here is transient (pane still spinning up); keep
         // polling rather than aborting the whole task start.
-        let screen = shelbi_tmux::capture(host, addr).unwrap_or_default();
+        let screen = backend().snapshot(host, &target).unwrap_or_default();
         if is_input_ready(&screen) {
             return Ok(true);
         }
         if !trust_dismissed && is_trust_dialog(&screen) {
-            shelbi_tmux::send_enter(host, addr)?;
+            backend().send_enter(host, &target)?;
             trust_dismissed = true;
         }
         // Answer the resume-from-summary dialog once, then extend the deadline
         // to cover the compaction it kicks off. Latched so a capture taken
         // before Claude has consumed the Enter can't double-answer.
         if !resume_summary_answered && is_resume_summary_dialog(&screen) {
-            shelbi_tmux::send_enter(host, addr)?;
+            backend().send_enter(host, &target)?;
             resume_summary_answered = true;
             deadline = std::time::Instant::now() + RESUME_COMPACTION_GRACE;
         }
