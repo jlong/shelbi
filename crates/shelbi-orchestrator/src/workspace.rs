@@ -6318,8 +6318,12 @@ pub enum DetachOutcome {
 pub fn detach_workspace_worktree(host: &Host, worktree: &Path) -> DetachOutcome {
     let wt_str = worktree.to_string_lossy().into_owned();
 
-    // Nothing to free if the worktree was never materialized.
-    match shelbi_ssh::run(host, ["test", "-e", &format!("{wt_str}/.git")]) {
+    // Nothing to free if the worktree was never materialized. Each step is
+    // bounded by `POLLER_GIT_DEADLINE` (via `run_git_bounded` /
+    // `run_capture_with_deadline`): detach runs on the poller thread *and* in
+    // the Zen probe test setup, so an unbounded `test`/`git` child here could
+    // freeze a poll loop or hang a probe test on a loaded machine.
+    match run_git_bounded(host, ["test", "-e", &format!("{wt_str}/.git")]) {
         Ok(o) if o.status.success() => {}
         Ok(_) => return DetachOutcome::NoWorktree,
         Err(e) => {
@@ -6331,15 +6335,16 @@ pub fn detach_workspace_worktree(host: &Host, worktree: &Path) -> DetachOutcome 
 
     // Record the branch we're releasing, for the event. An already-detached
     // HEAD reports the literal `HEAD`, which we normalize to `None`.
-    let from_branch = shelbi_ssh::run_capture(
+    let from_branch = shelbi_ssh::run_capture_with_deadline(
         host,
         ["git", "-C", &wt_str, "rev-parse", "--abbrev-ref", "HEAD"],
+        POLLER_GIT_DEADLINE,
     )
     .ok()
     .map(|s| s.trim().to_string())
     .filter(|b| !b.is_empty() && b != "HEAD");
 
-    let out = match shelbi_ssh::run(host, ["git", "-C", &wt_str, "checkout", "--detach"]) {
+    let out = match run_git_bounded(host, ["git", "-C", &wt_str, "checkout", "--detach"]) {
         Ok(o) => o,
         Err(e) => {
             return DetachOutcome::Failed {
