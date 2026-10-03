@@ -1091,7 +1091,7 @@ workspaces: []\n",
         let runner_key = shelbi_core::RunnerKind::detect(&runner).as_str().to_string();
         let mut runners = BTreeMap::new();
         runners.insert(runner_key.clone(), runner);
-        Project {
+        Project { session: Default::default(),
             name: name.into(),
             label: None,
             display_name: None,

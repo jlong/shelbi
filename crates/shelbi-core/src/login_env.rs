@@ -13,11 +13,22 @@
 //! without a shell.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// Process-lifetime cache for [`login_shell_env`].
 static CACHE: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+
+/// Hard deadline for the login-shell capture. An interactive login shell on a
+/// headless host (a CI runner, for one) can wedge — a slow rc, a prompt with no
+/// tty, or a background process started by the rc that inherits our capture pipe
+/// and never closes it, which would otherwise leave us blocked reading stdout
+/// *forever* even after the shell itself exits. The capture must never take
+/// longer than this.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The user's interactive login-shell environment, captured once and cached.
 ///
@@ -32,19 +43,142 @@ pub fn login_shell_env() -> &'static BTreeMap<String, String> {
 /// `/bin/sh` when unset. stdin is `/dev/null` so an interactive shell can't
 /// block waiting for input, and stderr is discarded so prompt/rc noise never
 /// reaches the caller's output.
+///
+/// Returns an empty map on any failure *or* if the capture exceeds
+/// [`CAPTURE_TIMEOUT`]; callers overlay the result, so an empty map leaves their
+/// environment untouched rather than clobbering it, and the process is never
+/// left hanging on a wedged shell.
 fn capture_login_shell_env() -> BTreeMap<String, String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let output = Command::new(&shell)
-        .args(["-l", "-i", "-c", "env"])
+    capture_env_bounded(&shell, CAPTURE_TIMEOUT).unwrap_or_default()
+}
+
+/// Run `shell -l -i -c env` with a hard deadline and parse its output.
+///
+/// Why this isn't a plain [`Command::output`]: `output()` reads stdout to EOF,
+/// and EOF only arrives once *every* writer of the pipe is closed. An
+/// interactive login shell's rc can start a background process that inherits the
+/// pipe and outlives the shell, so `output()` could block forever even after the
+/// shell exits. Instead we:
+///
+/// * put the shell in its own process group (so job-control noise and any
+///   children stay isolated from ours),
+/// * read stdout on a detached thread that hands the bytes back over a channel,
+///   and
+/// * wait on that channel with a deadline — on timeout we kill the shell and
+///   give up with an empty map rather than block.
+fn capture_env_bounded(shell: &str, timeout: Duration) -> Option<BTreeMap<String, String>> {
+    let mut cmd = Command::new(shell);
+    cmd.args(["-l", "-i", "-c", "env"]);
+    bounded_capture_stdout(cmd, timeout).map(|out| parse_env_output(&out))
+}
+
+/// Run `cmd` to completion with a hard deadline and return its stdout if it
+/// exits successfully in time.
+///
+/// Why this isn't a plain [`Command::output`]: `output()` reads stdout to EOF,
+/// and EOF only arrives once *every* writer of the pipe is closed. An
+/// interactive login shell's rc can start a background process that inherits the
+/// pipe and outlives the shell, so `output()` could block forever even after the
+/// shell exits. Instead we:
+///
+/// * put the child in its own process group (so job-control noise and any
+///   children stay isolated from ours),
+/// * read stdout on a detached thread that hands the bytes back over a channel,
+///   and
+/// * wait on that channel with a deadline — on timeout we kill the child and
+///   give up rather than block.
+///
+/// `stdin`/`stderr` are forced to `/dev/null` (an interactive shell can't block
+/// on input, and rc/prompt noise never reaches us); stdout is captured.
+fn bounded_capture_stdout(mut cmd: Command, timeout: Duration) -> Option<String> {
+    use std::os::unix::process::CommandExt;
+
+    let mut child = cmd
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output();
-    match output {
-        Ok(out) if out.status.success() => {
-            parse_env_output(&String::from_utf8_lossy(&out.stdout))
+        // A fresh process group (pgid = child pid): the child can't touch our
+        // group, and anything it spawns is contained with it.
+        .process_group(0)
+        .spawn()
+        .ok()?;
+
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    // Wait for the child to exit, bounded by the deadline.
+    let deadline = Instant::now() + timeout;
+    let exited_ok = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if Instant::now() >= deadline => {
+                // Wedged: kill the child and bail. (We can't reach a lingering
+                // grandchild without libc, but the read below is bounded so we
+                // never block on the pipe it may still hold.)
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => break false,
         }
-        _ => BTreeMap::new(),
+    };
+
+    if !exited_ok {
+        return None;
     }
+
+    // The child exited cleanly; collect its output, but never block past the
+    // deadline (a lingering grandchild could still hold the pipe open).
+    let grace = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(500));
+    rx.recv_timeout(grace).ok()
+}
+
+/// Terminal-identity variables scrubbed from a session child's environment.
+///
+/// A `shelbi __session` process owns its own fresh PTY, so any multiplexer or
+/// terminal identity inherited through the login-shell capture (or leaked from
+/// whatever launched the spawner) would be a lie to the child. Per the
+/// remove-tmux plan's "Spawn" section these are stripped before Shelbi sets its
+/// own terminal variables.
+pub const SCRUBBED_TERMINAL_VARS: &[&str] = &["TMUX", "TMUX_PANE", "TERM_PROGRAM", "STY"];
+
+/// Build the **explicit** environment for a `shelbi __session` child.
+///
+/// The session process never inherits the environment of whatever launched it;
+/// it is handed this map instead. The map is the user's interactive
+/// login-shell environment ([`login_shell_env`]) with:
+///
+/// * the terminal-identity variables in [`SCRUBBED_TERMINAL_VARS`] removed, and
+/// * Shelbi's own terminal identity set: `TERM=xterm-256color`,
+///   `COLORTERM=truecolor`, `TERM_PROGRAM=shelbi`.
+///
+/// No custom terminfo is used (`xterm-256color` is present everywhere), so there
+/// is nothing to install on a remote host. This is the shared helper the daemon
+/// and the session spawner both build the child environment from.
+pub fn session_child_env() -> BTreeMap<String, String> {
+    build_session_env(login_shell_env().clone())
+}
+
+/// The pure transform [`session_child_env`] applies to a captured environment:
+/// scrub the terminal-identity variables, then set Shelbi's own. Split out from
+/// the shell capture so it is testable without running a shell.
+pub fn build_session_env(mut env: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    for key in SCRUBBED_TERMINAL_VARS {
+        env.remove(*key);
+    }
+    env.insert("TERM".to_string(), "xterm-256color".to_string());
+    env.insert("COLORTERM".to_string(), "truecolor".to_string());
+    env.insert("TERM_PROGRAM".to_string(), "shelbi".to_string());
+    env
 }
 
 /// Parse the newline-separated `KEY=VALUE` output of `env` into a map.
@@ -147,6 +281,68 @@ mod tests {
         let map = parse_env_output("welcome banner\nPATH=/bin\n");
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("PATH").map(String::as_str), Some("/bin"));
+    }
+
+    #[test]
+    fn session_env_scrubs_terminal_identity_and_sets_shelbi_vars() {
+        let mut base = BTreeMap::new();
+        base.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        base.insert("TMUX".to_string(), "/tmp/tmux-501/default,1,0".to_string());
+        base.insert("TMUX_PANE".to_string(), "%3".to_string());
+        base.insert("STY".to_string(), "12345.pts-0.host".to_string());
+        base.insert("TERM_PROGRAM".to_string(), "iTerm.app".to_string());
+        base.insert("TERM".to_string(), "screen-256color".to_string());
+
+        let env = build_session_env(base);
+
+        // Multiplexer / terminal identity scrubbed.
+        assert!(!env.contains_key("TMUX"));
+        assert!(!env.contains_key("TMUX_PANE"));
+        assert!(!env.contains_key("STY"));
+        // Shelbi's own terminal identity set (overriding any inherited value).
+        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
+        assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("shelbi"));
+        // Unrelated variables survive untouched.
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn bounded_capture_returns_stdout_for_a_quick_command() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "echo PATH=/usr/bin:/bin"]);
+        let out = bounded_capture_stdout(cmd, Duration::from_secs(5));
+        assert_eq!(out.as_deref().map(str::trim), Some("PATH=/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn bounded_capture_does_not_hang_when_a_background_child_holds_the_pipe() {
+        // The shell prints its output and exits, but leaves a long-lived
+        // background process that inherited the stdout pipe. A plain
+        // `Command::output()` would block on EOF for the full `sleep` here; the
+        // bounded capture must return promptly instead (this is the exact
+        // 35-minute CI-hang shape the timeout guards against).
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "echo X=1; sleep 120 &"]);
+        let start = Instant::now();
+        let out = bounded_capture_stdout(cmd, Duration::from_secs(2));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "capture must not block on the lingering pipe holder (took {elapsed:?})"
+        );
+        // Whatever it returns (the line, or nothing after the deadline), it must
+        // not have hung. If it did return output, it must be the printed line.
+        if let Some(text) = out {
+            assert!(text.contains("X=1"), "unexpected capture output: {text:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_capture_reports_failure_for_a_nonzero_exit() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 3"]);
+        assert_eq!(bounded_capture_stdout(cmd, Duration::from_secs(5)), None);
     }
 
     #[test]

@@ -92,7 +92,7 @@ pub(crate) mod test_support {
                 integration: None,
             },
         );
-        let project = Project {
+        let project = Project { session: Default::default(),
             name: project_name.into(),
             label: None,
             display_name: None,

@@ -17,7 +17,7 @@ pub use agent_manifest::{
 };
 pub use error::{Error, GhTokenProbeFailure, Result};
 pub use integration::{CapabilityLadder, IntegrationMode};
-pub use login_env::login_shell_env;
+pub use login_env::{build_session_env, login_shell_env, session_child_env, SCRUBBED_TERMINAL_VARS};
 pub use model::{
     checks_for_task, checks_for_task_in_workflow, ci_timeout_for_workflow,
     danger_paths_for_project, danger_paths_for_workflow, default_dialog_signatures,
@@ -28,7 +28,7 @@ pub use model::{
     HeartbeatConfig, GithubConnection, Host, IssueTrackerBackend, IssueTrackerConfig, JiraConnection,
     LinearConnection, Machine, MachineKind, MergeStrategy, OrchestratorSpec, ParamDiagnostic,
     Project, ProjectAgentConfig, ProjectRunnerConfig, ProjectShape,
-    PromptInjectionKind, PromptInjectionSpec, ReviewConfig, RunnerKind, Session, SessionProject, Status, Issue,
+    PromptInjectionKind, PromptInjectionSpec, ReviewConfig, RunnerKind, Session, SessionConfig, SessionProject, Status, Issue,
     IssueLaunchConfig, IssueZenConfig,
     TmuxAddr, WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS,
     DEFAULT_BUDGET_GRAPHQL_HIGH, DEFAULT_BUDGET_GRAPHQL_LOW, DEFAULT_BUDGET_GRAPHQL_MEDIUM,

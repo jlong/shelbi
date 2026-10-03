@@ -24,6 +24,7 @@ shelbi-palette = { workspace = true }
 shelbi-app = { workspace = true }
 shelbi-proto = { workspace = true }
 shelbi-client = { workspace = true }
+shelbi-session = { workspace = true }
 
 # clap derive needs to be visible in the orchestrate args struct
 
@@ -49,7 +50,9 @@ libc = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 # The control-socket integration test (`tests/control_socket.rs`) drives a real
-# daemon over the mutation control protocol via the typed client.
+# daemon over the mutation control protocol via the typed client; the
+# session-survival test (`tests/session_survival.rs`) speaks the session
+# protocol directly over `shelbi-proto`.
 shelbi-proto = { workspace = true }
 shelbi-client = { workspace = true }
 # The GitHub-backend command tests resolve a store from project config and need

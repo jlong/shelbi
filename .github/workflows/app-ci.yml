@@ -61,16 +61,25 @@ jobs:
       # test fails both attempts and still reddens the job; a retried flake is
       # surfaced as a warning so it stays visible rather than silently masked.
       # Safe to drop once the suite has proven stable across many runs.
+      #
+      # Each attempt runs under a hard `timeout`: a wedged test (a detached
+      # session that never detaches, a shell capture that never returns) must
+      # fail the step fast, never hang the runner for the job's full length.
       - name: Test
         run: |
           for attempt in 1 2; do
             echo "::group::cargo test --workspace (attempt $attempt)"
-            if cargo test --workspace; then
-              echo "::endgroup::"
+            timeout --signal=KILL 600 cargo test --workspace
+            rc=$?
+            echo "::endgroup::"
+            if [ "$rc" = 0 ]; then
               exit 0
             fi
-            echo "::endgroup::"
-            echo "::warning::cargo test --workspace failed on attempt $attempt"
+            if [ "$rc" = 137 ]; then
+              echo "::warning::cargo test --workspace hit the 600s timeout on attempt $attempt (hang)"
+            else
+              echo "::warning::cargo test --workspace failed on attempt $attempt (exit $rc)"
+            fi
           done
-          echo "::error::cargo test --workspace failed after 2 attempts"
+          echo "::error::cargo test --workspace did not pass after 2 attempts"
           exit 1

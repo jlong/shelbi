@@ -216,7 +216,7 @@ impl DetectedSetupPlan {
             })
             .collect::<BTreeMap<_, _>>();
 
-        let project = Project {
+        let project = Project { session: Default::default(),
             // `name` is the machine id (the registration filename); the
             // free-form human label (present only when the entered name was
             // slugified) is serialized under the YAML `name:` key via `label`.

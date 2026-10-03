@@ -14,6 +14,7 @@ members = [
     "crates/shelbi-proto",
     "crates/shelbi-client",
     "crates/shelbi-term",
+    "crates/shelbi-session",
 ]
 default-members = ["crates/shelbi-cli"]
 # Throwaway prototypes for the "removing tmux" work. Excluded so they never
@@ -61,6 +62,11 @@ unicode-width = "0.1"
 libc = "0.2"
 regex = "1"
 tungstenite = "0.29"
+# PTY ownership for the `shelbi __session` process. Chosen in the remove-tmux
+# plan (covers ConPTY on Windows behind the same API); the Phase 0 runtime
+# spike proved controlling-terminal, group-kill, and no-descriptor-leak
+# behavior against this exact version.
+portable-pty = "0.9"
 
 # Client-side terminal emulator, vendored under `vendor/` (Apache-2.0). Chosen
 # in the `rt-spike-emulator-replay` Phase 0 spike as a fork because attach
@@ -81,6 +87,7 @@ shelbi-app = { path = "crates/shelbi-app" }
 shelbi-proto = { path = "crates/shelbi-proto" }
 shelbi-client = { path = "crates/shelbi-client" }
 shelbi-term = { path = "crates/shelbi-term" }
+shelbi-session = { path = "crates/shelbi-session" }
 
 [profile.release]
 lto = "thin"
