@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::{
@@ -33,6 +34,9 @@ use shelbi_core::{
     Workflow, DEFAULT_WORKFLOW_NAME,
 };
 use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps, PopoverAction};
+use shelbi_orchestrator::transition::{
+    move_issue_with, GitTransitionRunner, MoveError, MoveRequest, MoveWarning, TransitionRunner,
+};
 use shelbi_state::{KanbanColumnOverride, IssueFile};
 
 use crate::keymap::format_chord_or_unbound;
@@ -190,7 +194,28 @@ pub struct KanbanApp {
     /// to the next queued hop on success, rolling the card back on failure. See
     /// [`PendingMove`].
     pub(crate) pending_moves: HashMap<String, PendingMove>,
+    /// Runs the git / GitHub side of a card move's workflow transition (the
+    /// in-progress branch cut, a merge edge's gated merge and cleanup) on the
+    /// background persistence thread. The live runner outside tests.
+    transition_runner: SharedTransitionRunner,
 }
+
+/// A [`TransitionRunner`] the background persistence threads can share.
+type SharedTransitionRunner = Arc<dyn TransitionRunner + Send + Sync>;
+
+/// What a card move's background persistence reports back on success.
+#[derive(Debug, Default)]
+pub(crate) struct PersistedMove {
+    /// The gated merge's result line, when the edge crossed declares `merge`.
+    merged: Option<String>,
+    /// The merge landed and the card moved, but a remaining edge action
+    /// (`delete_branch`, a `run:` command) failed.
+    cleanup_error: Option<String>,
+}
+
+/// The result of one background persistence step: the settled move, or a
+/// ready-to-display error.
+type PersistResult = std::result::Result<PersistedMove, String>;
 
 /// One task's in-flight optimistic move. The card is already shown in
 /// `shown_status_id`'s column; this tracks what still has to land on disk and
@@ -213,7 +238,7 @@ pub(crate) struct PendingMove {
     /// The target of the write currently running, paired with its result
     /// receiver. `None` once every queued hop has landed and the entry is only
     /// waiting for a refresh to confirm `shown_status_id` on disk.
-    rx: Option<(Column, Receiver<std::result::Result<(), String>>)>,
+    rx: Option<(Column, Receiver<PersistResult>)>,
     /// Further targets to persist, in press order, once the in-flight write
     /// finishes. Coalescing happens naturally: the screen already shows the
     /// latest hop, and each queued write runs in turn.
@@ -456,6 +481,7 @@ impl KanbanApp {
             closed_more: Vec::new(),
             refresh_errors: crate::error_report::TransientErrorLog::new("github"),
             pending_moves: HashMap::new(),
+            transition_runner: Arc::new(GitTransitionRunner),
         }
     }
 
@@ -1566,15 +1592,17 @@ impl KanbanApp {
 
     /// Move card `id` to column `new_col_idx` **optimistically**: the card
     /// jumps on screen (and the selection follows) this frame, before any
-    /// filesystem / GitHub / git work runs. The daemon check, in-progress
-    /// branch-cut, `move_status` write and `append_task_event` then run on a
-    /// background thread in that order — see [`persist_move_step`] — and their
-    /// outcome is applied by [`poll_pending_moves`](Self::poll_pending_moves):
-    /// a success advances to the next queued hop (or settles the entry), a
-    /// failure snaps the card back and surfaces the error on the status line.
+    /// filesystem / GitHub / git work runs. The daemon check and the move
+    /// itself — the same `transition::move_issue` `shelbi issue move` runs:
+    /// in-progress branch-cut, a merge edge's gated merge, the `move_status`
+    /// write, `append_task_event`, post-merge cleanup — then run on a
+    /// background thread, see [`persist_move_step`], and their outcome is
+    /// applied by [`poll_pending_moves`](Self::poll_pending_moves): a success
+    /// advances to the next queued hop (or settles the entry), a failure snaps
+    /// the card back and surfaces the error on the status line.
     ///
-    /// Only the on-screen position is optimistic; a stale daemon or failed
-    /// branch cut still leaves the task file, GitHub and git refs untouched.
+    /// Only the on-screen position is optimistic; a stale daemon, failed
+    /// branch cut or failed merge still leaves the task file untouched.
     ///
     /// Both move entry points funnel here — the board keys
     /// ([`move_card_left`](Self::move_card_left) /
@@ -1624,7 +1652,12 @@ impl KanbanApp {
             None => {
                 // First hop of a fresh chain: `pre_move` is the real disk
                 // position, so it is the rollback target. Spawn the write.
-                let rx = spawn_persist_move(&self.project_name, id, target.clone());
+                let rx = spawn_persist_move(
+                    &self.project_name,
+                    id,
+                    target.clone(),
+                    self.transition_runner.clone(),
+                );
                 self.pending_moves.insert(
                     id.to_string(),
                     PendingMove {
@@ -1672,7 +1705,12 @@ impl KanbanApp {
             pm.queue.pop_front()
         };
         if let Some(target) = target {
-            let rx = spawn_persist_move(&self.project_name, id, target.clone());
+            let rx = spawn_persist_move(
+                &self.project_name,
+                id,
+                target.clone(),
+                self.transition_runner.clone(),
+            );
             if let Some(pm) = self.pending_moves.get_mut(id) {
                 pm.rx = Some((target, rx));
             }
@@ -1687,7 +1725,9 @@ impl KanbanApp {
     /// until a poll's raw board agrees (so a lagging index can't bounce the
     /// card). On failure the card snaps back to the last position that actually
     /// reached disk, the queue is dropped, and the error shows on the status
-    /// line. Nothing was persisted for the failed hop, exactly as before.
+    /// line. Nothing was persisted for the failed hop — a failed gated merge
+    /// merged nothing and wrote nothing. A hop that crossed a merge edge
+    /// reports the merge's result on the status line when it lands.
     pub fn poll_pending_moves(&mut self) {
         let ids: Vec<String> = self.pending_moves.keys().cloned().collect();
         for id in ids {
@@ -1706,15 +1746,37 @@ impl KanbanApp {
                 None => continue,
             };
             match result {
-                Ok(()) => {
+                Ok(done) => {
                     // The in-flight hop landed. Advance the rollback target to it,
                     // clear the in-flight slot, then start the next queued hop (or
                     // leave the entry settled for `reconcile_pending_moves` to
                     // hold until the raw board catches up).
+                    let mut landed = None;
                     if let Some(pm) = self.pending_moves.get_mut(&id) {
-                        if let Some((landed, _)) = pm.rx.take() {
-                            pm.confirmed = landed;
+                        if let Some((target, _)) = pm.rx.take() {
+                            pm.confirmed = target.clone();
+                            landed = Some(target);
                         }
+                    }
+                    // A merge edge ran its gated merge before the card moved:
+                    // say what it merged. A cleanup action that failed after
+                    // the merge (`delete_branch`, …) is a real error even though
+                    // the move stands, so it goes to the error log too.
+                    if let Some(detail) = &done.merged {
+                        let name = landed
+                            .as_ref()
+                            .and_then(|c| {
+                                self.all_columns
+                                    .iter()
+                                    .find(|col| col.status_id == c.as_str())
+                                    .map(|col| col.status_name.clone())
+                            })
+                            .or_else(|| landed.as_ref().map(|c| c.as_str().to_string()))
+                            .unwrap_or_default();
+                        self.status_line = format!("{id} → {name} · merged {detail}");
+                    }
+                    if let Some(e) = done.cleanup_error {
+                        self.fail_status(e);
                     }
                     self.start_next_hop_if_idle(&id);
                 }
@@ -1731,7 +1793,7 @@ impl KanbanApp {
                         // unread-errors button, not just the transient status
                         // line. The message already carries the historical
                         // `move blocked:` / `branch cut failed:` / `move failed:`
-                        // prefix from `persist_move_step`.
+                        // (or `merge failed:`) prefix from `persist_move_step`.
                         self.fail_status(e);
                         self.follow_card(&id);
                     }
@@ -3071,85 +3133,82 @@ fn resolve_task_status(task: &Issue, workflow: &Workflow) -> String {
 
 /// Spawn one card-move persistence step on a background thread and hand back the
 /// receiver its result will arrive on. The UI thread never blocks on the daemon
-/// probe, the branch cut, or the `move_status` write; [`poll_pending_moves`]
-/// drains the receiver each tick.
+/// probe, the branch cut, a gated merge, or the `move_status` write;
+/// [`poll_pending_moves`] drains the receiver each tick.
 ///
 /// [`poll_pending_moves`]: KanbanApp::poll_pending_moves
 fn spawn_persist_move(
     project_name: &str,
     id: &str,
     target: Column,
-) -> Receiver<std::result::Result<(), String>> {
+    runner: SharedTransitionRunner,
+) -> Receiver<PersistResult> {
     let (tx, rx) = std::sync::mpsc::channel();
     let project = project_name.to_string();
     let id = id.to_string();
     std::thread::spawn(move || {
-        let _ = tx.send(persist_move_step(&project, &id, &target));
+        let _ = tx.send(persist_move_step(&project, &id, &target, runner.as_ref()));
     });
     rx
 }
 
-/// Persist a single card move to `target`, off the UI thread. Runs the same
-/// steps, in the same order, the synchronous `move_card` used to run inline
-/// (daemon check, in-progress branch cut, `move_status`, `append_task_event`),
-/// so a successful move's on-disk state, event line and branch-cut behavior are
-/// identical to before. Any failure returns a ready-to-display message (keeping
-/// the historical `move blocked:` / `branch cut failed:` / `move failed:`
-/// prefixes) and leaves the task file, GitHub and git refs untouched.
+/// Persist a single card move to `target`, off the UI thread: the daemon check,
+/// then [`move_issue_with`] — the same library function behind
+/// `shelbi issue move`, so every action the workflow declares on the edge runs
+/// from the board exactly as it does from the CLI (in-progress branch cut, a
+/// merge edge's gated merge BEFORE the status write, `move_status`,
+/// `append_task_event`, post-merge cleanup).
+///
+/// Any failure returns a ready-to-display message (keeping the historical
+/// `move blocked:` / `branch cut failed:` / `move failed:` prefixes, plus
+/// `merge failed:` for a merge edge) and leaves the card where it was: a failed
+/// gated merge merges nothing and writes nothing.
 fn persist_move_step(
     project_name: &str,
     id: &str,
     target: &Column,
-) -> std::result::Result<(), String> {
+    runner: &dyn TransitionRunner,
+) -> PersistResult {
     // Gate before the in-progress lifecycle can create a git branch. A stale
     // daemon must leave both disk and the repository untouched.
     if let Err(e) = shelbi_state::ensure_daemon_matches_for_mutation() {
         return Err(format!("move blocked: {e}"));
     }
-    // Lifecycle hook: a move that actually transitions a task INTO
-    // `in_progress` cuts its branch on the hub (depends_on aware) and persists
-    // `branch:` first — see `shelbi_orchestrator::lifecycle`. Read the task's
-    // current (on-disk) column to decide, so a serialized chain only cuts on the
-    // hop that crosses into `in_progress`, exactly as the inline path did.
-    if *target == Column::in_progress() {
-        match shelbi_state::issue_store_for(project_name).and_then(|s| s.get(id)) {
-            Ok(Some(tf)) if tf.task.column != Column::in_progress() => {
-                match shelbi_state::load_project(project_name) {
-                    Ok(project) => {
-                        if let Err(e) =
-                            shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress(
-                                &project, id,
-                            )
-                        {
-                            return Err(format!("branch cut failed: {e}"));
-                        }
-                    }
-                    Err(e) => return Err(format!("load project failed: {e}")),
-                }
+    let store =
+        shelbi_state::issue_store_for(project_name).map_err(|e| format!("move failed: {e}"))?;
+    let mut cleanup_error = None;
+    let outcome = move_issue_with(
+        store.as_ref(),
+        runner,
+        &MoveRequest {
+            project: project_name,
+            id,
+            to: target.as_str(),
+            reason: "user:tui",
+            workspace_fallback: "board",
+            skip_transition_actions: false,
+        },
+        &mut |w| match w {
+            // The CLI prints this to stderr; here the board already renders
+            // the card under the fallback workflow, so it only goes to the log.
+            MoveWarning::WorkflowFallback { .. } => {
+                tracing::warn!(task = %id, "{w}");
             }
-            Ok(_) => {}
-            Err(e) => return Err(format!("move failed: {e}")),
+            MoveWarning::PostMergeCleanup { .. } => cleanup_error = Some(w.to_string()),
+        },
+    )
+    .map_err(|e| match e {
+        MoveError::BranchCut(e) => format!("branch cut failed: {e}"),
+        MoveError::LoadProject(e) => format!("load project failed: {e}"),
+        MoveError::Merge { from, error, .. } => {
+            format!("merge failed: {id} stays in {from}: {error}")
         }
-    }
-    match shelbi_state::issue_store_for(project_name)
-        .and_then(|s| s.move_status(id, target, "user:tui"))
-    {
-        Ok(Some(mv)) => {
-            if let Err(e) = shelbi_state::append_task_event(
-                project_name,
-                id,
-                &mv.workflow,
-                mv.from,
-                mv.to,
-                "user:tui",
-            ) {
-                tracing::warn!(task = %id, error = %e, "append_task_event failed");
-            }
-            Ok(())
-        }
-        Ok(None) => Ok(()),
-        Err(e) => Err(format!("move failed: {e}")),
-    }
+        e @ (MoveError::Move(_) | MoveError::EventAppend { .. }) => format!("move failed: {e}"),
+    })?;
+    Ok(PersistedMove {
+        merged: outcome.merge.map(|gm| gm.detail),
+        cleanup_error,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4161,6 +4220,207 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         );
     }
 
+    /// Stands in for git / `gh` on the board's background move thread: records
+    /// each transition call (and the card's on-disk status when the gated merge
+    /// ran) instead of merging anything.
+    #[derive(Default)]
+    struct RecordingRunner {
+        calls: std::sync::Mutex<Vec<String>>,
+        fail_merge: bool,
+    }
+
+    impl RecordingRunner {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl TransitionRunner for RecordingRunner {
+        fn cut_branch(&self, _project: &shelbi_core::Project, task_id: &str) -> shelbi_core::Result<()> {
+            self.calls.lock().unwrap().push(format!("cut_branch {task_id}"));
+            Ok(())
+        }
+
+        fn gated_merge(
+            &self,
+            edge: &shelbi_orchestrator::transition::TransitionEdge<'_>,
+            workspace_label: &str,
+        ) -> shelbi_core::Result<Option<shelbi_orchestrator::transition::GatedMerge>> {
+            let id = &edge.issue.task.id;
+            let on_disk = shelbi_state::load_task(edge.project_name, id)?.task.column;
+            self.calls.lock().unwrap().push(format!(
+                "gated_merge {id} {} -> {} workspace={workspace_label} on_disk={}",
+                edge.from,
+                edge.to,
+                on_disk.as_str()
+            ));
+            if self.fail_merge {
+                return Err(shelbi_core::Error::Other("PR #42 is not mergeable".into()));
+            }
+            Ok(Some(shelbi_orchestrator::transition::GatedMerge {
+                detail: "pr:42:abc123".into(),
+                ran: vec![shelbi_core::TransitionAction::Merge],
+            }))
+        }
+
+        fn remaining_actions(
+            &self,
+            edge: &shelbi_orchestrator::transition::TransitionEdge<'_>,
+            skip: &[shelbi_core::TransitionAction],
+        ) -> shelbi_core::Result<Vec<shelbi_orchestrator::transition::ActionOutcome>> {
+            let run: Vec<String> = edge
+                .workflow
+                .actions_for_transition(edge.from, edge.to)
+                .iter()
+                .filter(|a| !skip.contains(a))
+                .map(|a| a.to_string())
+                .collect();
+            self.calls.lock().unwrap().push(format!(
+                "remaining_actions {} {} -> {} run=[{}]",
+                edge.issue.task.id,
+                edge.from,
+                edge.to,
+                run.join(", ")
+            ));
+            Ok(Vec::new())
+        }
+    }
+
+    /// A board holding one `review` card whose workflow's `review -> done` edge
+    /// declares `[merge, delete_branch]`, with the card selected and `runner`
+    /// installed in place of the live git runner.
+    fn board_with_card_on_a_merge_edge(
+        env: &IsolatedKanbanEnv,
+        runner: Arc<RecordingRunner>,
+    ) -> KanbanApp {
+        crate::test_support::provision_hub_repo_for_project(&env.home, "demo");
+        let wf_dir = shelbi_state::workflows_dir("demo").unwrap();
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("mergewf.yaml"),
+            r#"name: mergewf
+statuses:
+  - { id: backlog,     owner: user                       }
+  - { id: todo,        owner: agent, agent: orchestrator  }
+  - { id: in-progress, owner: agent, agent: developer     }
+  - { id: review,      owner: user                        }
+  - { id: done,        owner: user                        }
+transitions:
+  - { from: review, to: done, actions: [merge, delete_branch] }
+"#,
+        )
+        .unwrap();
+        let mut task = task_file("fix-login", Column::review(), 0, "2026-07-13T12:00:00Z");
+        task.task.workflow = Some("mergewf".into());
+        shelbi_state::save_task("demo", &task.task, &task.body).unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.transition_runner = runner;
+        app.refresh();
+        app.follow_card("fix-login");
+        assert_eq!(
+            app.selected_task().map(|tf| tf.task.id.as_str()),
+            Some("fix-login"),
+            "the review card is selected"
+        );
+        app
+    }
+
+    /// Dragging a card across a merge edge runs the workflow's gated merge and
+    /// its cleanup — the same `transition::move_issue` `shelbi issue move`
+    /// runs — rather than only re-coloring the card. The merge runs while the
+    /// card is still `review` on disk; the status is written only after it.
+    #[test]
+    fn move_card_across_a_merge_edge_runs_the_gated_merge_and_cleanup() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = IsolatedKanbanEnv::new("merge-edge");
+        let runner = Arc::new(RecordingRunner::default());
+        let mut app = board_with_card_on_a_merge_edge(&env, runner.clone());
+
+        app.move_card_right();
+        // Optimistic as ever: the card is in `done` on screen while the merge
+        // runs off the UI thread.
+        assert_eq!(
+            app.tasks.iter().find(|tf| tf.task.id == "fix-login").unwrap().task.column,
+            Column::done(),
+        );
+        app.block_on_pending_moves();
+
+        assert_eq!(
+            runner.calls(),
+            vec![
+                "gated_merge fix-login review -> done workspace=board on_disk=review",
+                "remaining_actions fix-login review -> done run=[delete_branch]",
+            ],
+        );
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login").unwrap().task.column,
+            Column::done(),
+            "the move persisted after the merge"
+        );
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1, "log: {log:?}");
+        assert!(lines[0].contains(" review -> done "), "line: {}", lines[0]);
+        assert!(lines[0].contains(" reason=user:tui "), "line: {}", lines[0]);
+        // The merge's result is reported on the status line.
+        assert_eq!(app.status_line, "fix-login → Done · merged pr:42:abc123");
+        assert!(shelbi_state::read_errors("demo").unwrap().is_empty());
+    }
+
+    /// A failed gated merge rolls the optimistic card back to its original
+    /// column, writes nothing, and reports through the persistent error log.
+    #[test]
+    fn failed_gated_merge_rolls_the_card_back_and_logs_the_error() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = IsolatedKanbanEnv::new("merge-edge-fails");
+        let runner = Arc::new(RecordingRunner {
+            fail_merge: true,
+            ..Default::default()
+        });
+        let mut app = board_with_card_on_a_merge_edge(&env, runner.clone());
+
+        app.move_card_right();
+        app.block_on_pending_moves();
+
+        // Only the gate ran: no cleanup, so no branch was deleted.
+        assert_eq!(
+            runner.calls(),
+            vec!["gated_merge fix-login review -> done workspace=board on_disk=review"],
+        );
+        assert_eq!(
+            app.tasks.iter().find(|tf| tf.task.id == "fix-login").unwrap().task.column,
+            Column::review(),
+            "the card snaps back to review on screen"
+        );
+        assert_eq!(
+            app.selected_task().map(|tf| tf.task.id.as_str()),
+            Some("fix-login"),
+            "selection follows the card back"
+        );
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login").unwrap().task.column,
+            Column::review(),
+            "nothing was written"
+        );
+        assert!(
+            !shelbi_state::events_log_path().unwrap().exists(),
+            "no move event for a move that didn't happen"
+        );
+        let errors = shelbi_state::read_errors("demo").unwrap();
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].source.as_deref(), Some("kanban"));
+        assert_eq!(
+            errors[0].message,
+            "merge failed: fix-login stays in review: PR #42 is not mergeable"
+        );
+        assert_eq!(app.status_line, errors[0].message);
+    }
+
     /// A refresh that lands while a move's write is still in flight must not
     /// snap the card back to its old column: the pending overlay holds it in the
     /// optimistic column until the write is confirmed.
@@ -4182,7 +4442,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         // Model an in-flight move to in-progress. A live (never-fired) channel so
         // reconcile sees `rx.is_some()` — i.e. not yet settled. `_tx` is held so
         // the receiver isn't disconnected.
-        let (_tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+        let (_tx, rx) = std::sync::mpsc::channel::<PersistResult>();
         app.pending_moves.insert(
             "fix-login".to_string(),
             PendingMove {

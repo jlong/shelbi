@@ -855,162 +855,29 @@ fn move_to(
     reason: Option<&str>,
     skip_transition_actions: bool,
 ) -> Result<()> {
-    let tf = load_issue(project, id)?;
-    let workflow = resolve_task_workflow(project, &tf.task)?;
-    // Resolve the destination against the issue's workflow. An issue's position
-    // is a status id, so ANY status the workflow declares is a valid target
-    // — including `canceled` / archived and any status a user adds. A target
-    // the workflow doesn't declare errors, naming the declared statuses.
-    let column = resolve_move_target(&workflow, to)?;
-
-    // Status ids for the edge we're crossing (used to fire the edge's
-    // transition actions below). `column` is the target, `tf.task.column`
-    // the current position.
-    let from_status = tf.task.column.as_str().to_string();
-    let to_status = column.as_str().to_string();
-    // Does this edge declare a `merge`? An accept move (e.g. `review -> done`)
-    // must actually integrate the branch, not just re-color the card. The
-    // merge is GATED before the column move (below) so a failed or absent
-    // merge never leaves the board reading the target status with an open PR
-    // / unmerged branch, and the edge's remaining actions (`delete_branch`,
-    // …) fire after the move.
-    //
-    // `--skip-transition-actions` forces this off: the recovery escape hatch
-    // advances the card WITHOUT running the merge (or any other action), for
-    // when the git work already landed out of band and the merge would
-    // re-fail. `declares_merge` gates the gated-merge block AND the post-move
-    // cleanup below, so clearing it here is enough to bypass the whole action
-    // list — the move is stamped `actions=skipped` in the event log instead.
-    let declares_merge = !skip_transition_actions
-        && column != tf.task.column
-        && workflow
-            .actions_for_transition(&from_status, &to_status)
-            .contains(&shelbi_core::TransitionAction::Merge);
-
-    // Lifecycle hook: a move INTO `in_progress` cuts the issue's branch on
-    // the hub (with depends_on awareness — see
-    // `shelbi_orchestrator::lifecycle`) and persists `branch:` onto the
-    // issue. Skip when the destination matches the current column (the
-    // `shelbi_state::move_task` short-circuit would treat it as a no-op
-    // anyway) and when no column change is actually happening — that
-    // keeps `issue move ... --to in_progress` on an already-in-progress
-    // issue from running the cut for no reason. A failure inside the cut
-    // (e.g. depends_on names a branch that hasn't been pushed yet) DOES
-    // abort the move — silently dropping the depends_on intent and
-    // shipping the card to in_progress without a usable branch would be
-    // the worst of both worlds.
-    if column == Column::in_progress() && tf.task.column != Column::in_progress() {
-        let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-        shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress(&project_yaml, id)
-            .map_err(|e| anyhow!(e))?;
-    }
-
-    // Gated merge for an accept edge. Integrate the branch (via the PR when
-    // one is open — the path a protected `main` accepts) BEFORE the card
-    // moves. A failed merge emits a `merge … status=failed` event and aborts
-    // the move: the issue stays put rather than showing the target status with
-    // nothing merged. Loaded once here and reused for the post-move cleanup.
-    let project_yaml_for_actions = if declares_merge {
-        let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-        let ws_label = tf
-            .task
-            .assigned_to
-            .clone()
-            .unwrap_or_else(|| "cli".to_string());
-        let gated = shelbi_orchestrator::transition::run_gated_merge(
-            &project_yaml,
+    // The move itself — target resolution, the in-progress branch cut, the
+    // edge's gated merge, the status write + event, the post-merge cleanup —
+    // is `shelbi_orchestrator::transition::move_issue`, shared with the TUI
+    // board so a transition's actions run the same from either surface. This
+    // wrapper only owns the terminal output.
+    use shelbi_orchestrator::transition::{move_issue, MoveError, MoveRequest};
+    let outcome = move_issue(
+        &MoveRequest {
             project,
-            &tf.task,
-            &tf.body,
-            &workflow,
-            &from_status,
-            &to_status,
-            &ws_label,
-        )
-        .map_err(|e| {
-            anyhow!(
-                "merge for `{id}` failed; leaving it in `{from_status}` \
-                 (NOT advancing to `{to_status}`): {e}"
-            )
-        })?;
-        // The gate ran the pre-merge prefix (e.g. `push_branch`) plus `merge`;
-        // the post-move cleanup below must skip exactly those so none re-runs.
-        // `declares_merge` guarantees `Some` here, but fall back to skipping
-        // just `merge` rather than unwrapping.
-        let skip = gated
-            .map(|gm| gm.ran)
-            .unwrap_or_else(|| vec![shelbi_core::TransitionAction::Merge]);
-        Some((project_yaml, skip))
-    } else {
-        None
-    };
+            id,
+            to,
+            reason: reason.unwrap_or("user:cli"),
+            workspace_fallback: "cli",
+            skip_transition_actions,
+        },
+        &mut |w| eprintln!("warning: {w}"),
+    )
+    .map_err(|e| match e {
+        MoveError::Move(e) | MoveError::LoadProject(e) | MoveError::BranchCut(e) => anyhow!(e),
+        e @ (MoveError::Merge { .. } | MoveError::EventAppend { .. }) => anyhow!("{e}"),
+    })?;
 
-    // Route the status change through the board seam. `move_status` returns a
-    // `StatusMove`; unpack it back into the `(from, to, workflow)` tuple the
-    // event-append + rollback logic below already speaks.
-    let store = cached_issue_store(project)?;
-    let moved = store
-        .move_status(id, &column, reason.unwrap_or("user:cli"))
-        .map_err(|e| anyhow!(e))?
-        .map(|m| (m.from, m.to, m.workflow));
-    if let Some((from, to_col, moved_wf)) = &moved {
-        let reason = reason.unwrap_or("user:cli");
-        // Stamp `actions=skipped` on the line when the escape hatch bypassed
-        // the transition's actions, so the board history stays honest that
-        // side effects were NOT run — kept distinct from the user's `reason`.
-        let append = if skip_transition_actions {
-            shelbi_state::append_task_event_actions_skipped
-        } else {
-            shelbi_state::append_task_event
-        };
-        if let Err(e) = append(project, id, moved_wf, from.clone(), to_col.clone(), reason) {
-            match store.move_status(id, from, "rollback:event-append-failed") {
-                Ok(_) => {
-                    return Err(anyhow!(
-                        "moved {id} to {to_col}, but failed to append issue event ({e}); \
-                         rolled back to {from}. Fix events.log permissions or restart the \
-                         Shelbi daemon, then retry the move"
-                    ));
-                }
-                Err(re) => {
-                    return Err(anyhow!(
-                        "moved {id} to {to_col}, but failed to append issue event ({e}); \
-                         rollback to {from} also failed ({re}). Fix events.log permissions, \
-                         then run `shelbi issue move {id} --to {from}` or retry the intended move"
-                    ));
-                }
-            }
-        }
-    }
-
-    // Merge already landed and gated the move above; now fire the edge's
-    // remaining actions (`delete_branch`, `run:`/`ready:`), skipping the ones
-    // the gate already ran (the pre-merge prefix plus `merge`) so none is
-    // re-run. Best-effort — the move already happened, so a cleanup failure
-    // warns rather than rolling it back.
-    if let (Some((project_yaml, skip)), Some(_)) =
-        (project_yaml_for_actions.as_ref(), moved.as_ref())
-    {
-        match shelbi_orchestrator::transition::execute_transition_except(
-            project_yaml,
-            project,
-            &tf.task,
-            &tf.body,
-            &workflow,
-            &from_status,
-            &to_status,
-            skip,
-        ) {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!(
-                    "warning: post-merge cleanup for `{id}` failed (merge already landed): {e}"
-                );
-            }
-        }
-    }
-
-    println!("✓ {id} → {column}");
+    println!("✓ {id} → {}", outcome.column);
     Ok(())
 }
 
@@ -1044,42 +911,6 @@ fn resolve_task_workflow(project: &str, issue: &Issue) -> Result<Workflow> {
             Ok(default_workflow())
         }
     }
-}
-
-/// Resolve a `issue move --to <STATUS>` argument against the issue's
-/// workflow, returning the target position (a status id).
-///
-/// An issue's position is a status id, so any status the workflow declares
-/// is a reachable target — including `canceled` / archived statuses and
-/// any status a user adds later. `to` is matched against the declared
-/// status ids, first through the same alias normalization a stored
-/// position gets (so `wip` / `in_progress` resolve onto `in-progress`),
-/// then verbatim against the raw declared ids (for custom ids the
-/// normalizer passes through untouched). A `to` the workflow doesn't
-/// declare errors, listing the ids it does.
-fn resolve_move_target(workflow: &Workflow, to: &str) -> Result<Column> {
-    // Alias-normalized lookup: folds the friendly CLI spellings onto the
-    // canonical id before checking the workflow.
-    let normalized = Column::from_status_id(to);
-    if let Some(status) = workflow.status(normalized.as_str()) {
-        return Ok(Column::from_status_id(&status.id));
-    }
-    // Verbatim lookup: a custom id the normalizer left untouched still has
-    // to match a declared status id exactly (modulo surrounding whitespace).
-    if let Some(status) = workflow.statuses.iter().find(|s| s.id == to.trim()) {
-        return Ok(Column::from_status_id(&status.id));
-    }
-
-    let valid = workflow
-        .statuses
-        .iter()
-        .map(|s| s.id.clone())
-        .collect::<Vec<_>>()
-        .join(", ");
-    bail!(
-        "`{to}` is not a status in workflow `{}` (valid: {valid})",
-        workflow.name,
-    );
 }
 
 /// Resolve which agent should drive the workspace once it lands in the
