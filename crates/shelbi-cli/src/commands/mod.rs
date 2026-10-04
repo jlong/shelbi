@@ -38,6 +38,8 @@ pub mod review_reject;
 pub mod review_serve;
 pub mod send;
 pub mod session;
+pub mod session_attach;
+pub mod session_cli;
 pub mod spawn;
 pub mod status;
 pub mod tail;
