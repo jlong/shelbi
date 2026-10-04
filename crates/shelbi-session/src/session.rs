@@ -10,34 +10,56 @@
 //!    explicit, scrubbed login environment,
 //! 3. runs a reader thread that feeds the emulator, answers terminal queries off
 //!    it (the [`responder`](crate::responder)), retains recent bytes, optionally
-//!    logs raw output, and broadcasts output to attached clients,
-//! 4. serves clients on a Unix socket (hello / attach / input / resize /
-//!    snapshot / kill — the frozen-core subset this task needs), and
+//!    logs raw output, surfaces title/bell events, and broadcasts sequenced
+//!    output to attached clients,
+//! 4. serves clients on a Unix socket (the full session protocol — see
+//!    [`crate::transport`]), with a debounced PTY resize that follows the most
+//!    recently active client and a keepalive ping, and
 //! 5. on child exit (or SIGTERM/SIGHUP) kills the child's **process group**,
-//!    writes `exit.json` and `final.txt`, and exits.
+//!    pushes the `exited` event, writes `exit.json` and `final.txt`, and exits.
+//!
+//! ## Output ordering and sizing
+//!
+//! Every output chunk and every in-band `resized` marker is assigned a sequence
+//! number under one gate ([`Shared::output`]) and enqueued to clients while the
+//! gate is held, so the two travel in one totally ordered stream. The PTY takes
+//! the size of the most recently active client (last to send input), debounced
+//! by [`RESIZE_DEBOUNCE`] so a drag of the window does not thrash the child.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use shelbi_proto::{Frame, Output};
+use shelbi_proto::{ExtFrame, Frame, Output, Resized};
 
-use crate::emulator::Emulator;
+use crate::emulator::{EmuEvent, Emulator};
 use crate::history::{RawLog, RawRing};
 use crate::layout::SessionPaths;
 use crate::lock::SessionLock;
 use crate::meta::{ExitRecord, Meta};
 use crate::responder::{ColorState, CursorSource, FixedCursor, KittyFlags, Responder};
-use crate::transport::{serve_client, ClientRegistry};
+use crate::transport::{info_data, serve_client, ClientRegistry};
 
 /// Lines of scrollback included (above the last screen) in `final.txt`.
 const FINAL_HISTORY_LINES: usize = 1000;
+
+/// How long a size must hold steady before the PTY is resized to it. Coalesces a
+/// burst of resizes (a window drag) into one child resize.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(20);
+
+/// How often the session sends a keepalive `ping` to connected clients.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Grace period after the child exits for client writers to flush the pushed
+/// `exited` event before the process tears down.
+const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(100);
 
 /// Set by the SIGTERM/SIGHUP handler to ask the main loop to shut down.
 static TERMINATE: AtomicBool = AtomicBool::new(false);
@@ -67,10 +89,37 @@ pub struct RunArgs {
     pub child_argv: Vec<String>,
 }
 
-/// State shared between the PTY reader thread and the per-client threads.
+/// The monotonic output-stream gate: it hands out a sequence number for each
+/// output chunk and in-band resize marker, held across the enqueue so the two
+/// travel in one totally ordered stream.
+#[derive(Default)]
+struct OutputGate {
+    next_seq: u64,
+}
+
+/// Which client's size the PTY should take, and the debounce bookkeeping.
+#[derive(Default)]
+struct Sizing {
+    /// The last client to send input; the PTY follows its viewport.
+    active: Option<u64>,
+    /// Each connected client's last reported viewport.
+    per_client: HashMap<u64, (u16, u16)>,
+    /// The size the debouncer should settle on, if different from `applied`.
+    target: Option<(u16, u16)>,
+    /// Bumped on every resize request so the debouncer can tell a burst from a
+    /// settled value.
+    generation: u64,
+    /// The size currently applied to the PTY.
+    applied: (u16, u16),
+    /// Set on teardown so the debounce thread exits.
+    closed: bool,
+}
+
+/// State shared between the PTY reader thread, the resize debouncer, the
+/// keepalive timer, and the per-client threads.
 pub struct Shared {
-    /// The authoritative emulator (also the cursor source for query replies and
-    /// the text source for snapshots / `final.txt`).
+    /// The authoritative emulator (cursor source for query replies, text source
+    /// for snapshots / `final.txt`, and the title/mode source for `info`).
     pub emu: Mutex<Emulator>,
     /// Default colors answered to OSC 10/11 queries (dark until a client reports).
     pub colors: ColorState,
@@ -78,39 +127,50 @@ pub struct Shared {
     pub kitty: KittyFlags,
     /// Recent raw output bytes.
     pub ring: Mutex<RawRing>,
-    /// Monotonic output sequence number.
-    pub seq: AtomicU64,
+    /// The output-stream gate (sequence numbers; ordered broadcast).
+    output: Mutex<OutputGate>,
+    /// Size arbitration + debounce state.
+    sizing: Mutex<Sizing>,
+    /// Wakes the resize debouncer.
+    sizing_cv: Condvar,
+    /// The session's metadata (`meta.json`), mutable via `set-meta`.
+    pub meta: Mutex<Meta>,
+    /// Where `meta.json` and friends live.
+    paths: SessionPaths,
     /// The PTY master, kept for `resize`.
     master: Mutex<Box<dyn MasterPty + Send>>,
     /// The child's stdin (PTY master write side). Responder replies and client
-    /// input both go here; the mutex keeps each write whole (input arbitration).
+    /// input/paste both go here; the mutex keeps each write whole (input
+    /// arbitration).
     writer: Mutex<Box<dyn Write + Send>>,
     /// The child's process group id, for group kill.
     child_pgid: libc::pid_t,
-    /// Attached clients the reader broadcasts output to.
+    /// Connected clients the reader broadcasts output to.
     pub clients: ClientRegistry,
 }
 
 impl Shared {
-    /// Write raw bytes to the child (responder replies and client input). Each
-    /// call is whole and ordered relative to others.
+    /// Write raw bytes to the child (responder replies, client input, paste).
+    /// Each call is whole and ordered relative to others (input arbitration).
     pub fn write_to_child(&self, bytes: &[u8]) {
         let mut w = self.writer.lock().unwrap();
         let _ = w.write_all(bytes);
         let _ = w.flush();
     }
 
-    /// Resize the PTY and the emulator to a new viewport.
-    pub fn resize(&self, cols: u16, rows: u16) {
-        if let Ok(master) = self.master.lock() {
-            let _ = master.resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
+    /// Deliver `text` as a paste, wrapping it in bracketed-paste markers when the
+    /// program enabled that mode, and writing it whole against other input.
+    pub fn paste(&self, text: &str) {
+        let bracketed = self.emu.lock().unwrap().bracketed_paste_active();
+        let mut bytes = Vec::with_capacity(text.len() + 12);
+        if bracketed {
+            bytes.extend_from_slice(b"\x1b[200~");
         }
-        self.emu.lock().unwrap().resize(cols, rows);
+        bytes.extend_from_slice(text.as_bytes());
+        if bracketed {
+            bytes.extend_from_slice(b"\x1b[201~");
+        }
+        self.write_to_child(&bytes);
     }
 
     /// Render the screen (optionally with `history_lines` of scrollback) to text.
@@ -120,6 +180,141 @@ impl Shared {
             Some(n) => emu.screen_with_history(n as usize),
             None => emu.visible_text(),
         }
+    }
+
+    /// The [`InfoData`](shelbi_proto::InfoData) reply for an `info` request.
+    pub fn info_data(&self) -> shelbi_proto::InfoData {
+        info_data(self)
+    }
+
+    /// Update `meta.json`: set `name` and/or `task` (`Some("")` clears the task),
+    /// leaving a `None` field unchanged. Best-effort write — a failure is logged
+    /// and does not take down the session.
+    pub fn set_meta(&self, name: Option<String>, task: Option<String>) {
+        let json = {
+            let mut meta = self.meta.lock().unwrap();
+            if let Some(name) = name {
+                meta.name = name;
+            }
+            if let Some(task) = task {
+                meta.task = if task.is_empty() { None } else { Some(task) };
+            }
+            meta.to_json()
+        };
+        if let Ok(json) = json {
+            let _ = std::fs::write(self.paths.meta(), json);
+        }
+    }
+
+    /// Subscribe a client to the output stream, gaplessly: under the output gate
+    /// (so no output slips between the snapshot and the subscription) send the
+    /// initial [`Resync`](shelbi_proto::Resync) snapshot, then mark it attached.
+    pub fn attach(&self, ch: &Arc<crate::transport::ClientChannel>) {
+        let gate = self.output.lock().unwrap();
+        if ch.wants_resync() {
+            let seq = gate.next_seq;
+            let screen = self.snapshot_text(None);
+            if let Ok(bytes) = ExtFrame::Resync(shelbi_proto::Resync { seq, screen }).encode() {
+                ch.enqueue_priority(&bytes);
+            }
+        }
+        ch.mark_attached(true);
+        drop(gate);
+    }
+
+    /// Unsubscribe a client from the output stream, dropping its queued output.
+    pub fn detach(&self, ch: &Arc<crate::transport::ClientChannel>) {
+        ch.mark_attached(false);
+        ch.clear();
+    }
+
+    /// Record a client sending input: it becomes the active (sizing) client, and
+    /// the PTY is asked to follow its viewport.
+    pub fn on_input(&self, client_id: u64) {
+        let mut st = self.sizing.lock().unwrap();
+        if st.active != Some(client_id) {
+            st.active = Some(client_id);
+            if let Some(&size) = st.per_client.get(&client_id) {
+                request_resize(&mut st, &self.sizing_cv, size);
+            }
+        }
+    }
+
+    /// Record a client's reported viewport. If it is (or becomes, when none is)
+    /// the active client, the PTY is asked to follow it.
+    pub fn on_resize(&self, client_id: u64, cols: u16, rows: u16) {
+        let mut st = self.sizing.lock().unwrap();
+        st.per_client.insert(client_id, (cols, rows));
+        if st.active.is_none() || st.active == Some(client_id) {
+            request_resize(&mut st, &self.sizing_cv, (cols, rows));
+        }
+    }
+
+    /// Forget a disconnected client's sizing state.
+    pub fn forget_client(&self, client_id: u64) {
+        let mut st = self.sizing.lock().unwrap();
+        st.per_client.remove(&client_id);
+        if st.active == Some(client_id) {
+            st.active = None;
+        }
+    }
+
+    /// Resize the PTY and emulator, then announce the new size: an in-band
+    /// [`Resized`] marker in the output stream (sequenced, so client emulators
+    /// reflow at the same point) and an out-of-band `event-resized`.
+    fn apply_resize(&self, cols: u16, rows: u16) {
+        if let Ok(master) = self.master.lock() {
+            let _ = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
+        self.emu.lock().unwrap().resize(cols, rows);
+        // In-band marker (ordered with output).
+        {
+            let mut gate = self.output.lock().unwrap();
+            let seq = gate.next_seq;
+            gate.next_seq += 1;
+            if self.clients.has_attached() {
+                if let Ok(bytes) = ExtFrame::Resized(Resized { seq, cols, rows }).encode() {
+                    self.clients.enqueue_inband_resized(&bytes);
+                }
+            }
+        }
+        // Out-of-band event.
+        self.clients.push_event_resized(cols, rows);
+    }
+
+    /// Emit a chunk of PTY output into the ordered stream: allocate its sequence
+    /// number and enqueue it to attached clients, all under the output gate so
+    /// output and in-band resize markers stay totally ordered.
+    fn emit_output(&self, data: &[u8]) {
+        let mut gate = self.output.lock().unwrap();
+        let seq = gate.next_seq;
+        gate.next_seq += 1;
+        if self.clients.has_attached() {
+            if let Ok(bytes) = Frame::Output(Output {
+                seq,
+                data: data.to_vec(),
+            })
+            .encode()
+            {
+                self.clients.enqueue_output(&bytes);
+            }
+        }
+    }
+
+    /// The `(base_seq, screen)` a backpressure [`Resync`](shelbi_proto::Resync)
+    /// resumes from: the sequence the next output will carry, plus the current
+    /// visible screen. Read without holding both the gate and the emulator lock
+    /// at once, so it cannot deadlock the reader (see the lock-order note in
+    /// [`crate::transport`]).
+    pub fn resync_base(&self) -> (u64, String) {
+        let seq = self.output.lock().unwrap().next_seq;
+        let screen = self.snapshot_text(None);
+        (seq, screen)
     }
 
     /// Signal the child's whole process group (default SIGTERM).
@@ -144,6 +339,17 @@ impl Shared {
     }
 }
 
+/// Request that the PTY settle on `size`, waking the debouncer. A no-op if it
+/// already matches the applied size.
+fn request_resize(st: &mut Sizing, cv: &Condvar, size: (u16, u16)) {
+    if st.applied == size && st.target.is_none() {
+        return;
+    }
+    st.target = Some(size);
+    st.generation += 1;
+    cv.notify_one();
+}
+
 /// Run the session to completion. Returns when the child has exited (or a
 /// terminating signal was received) and `exit.json` / `final.txt` are written.
 pub fn run(args: RunArgs) -> Result<()> {
@@ -157,7 +363,16 @@ pub fn run(args: RunArgs) -> Result<()> {
     // session dead.
     let _lock = SessionLock::acquire(&paths.lock())?;
 
-    write_meta(&paths, &args)?;
+    let meta = Meta {
+        id: args.id.clone(),
+        name: args.name.clone(),
+        argv: args.child_argv.clone(),
+        cwd: args.cwd.clone(),
+        task: args.task.clone(),
+        launched_at: chrono::Utc::now().to_rfc3339(),
+        protocol_version: shelbi_proto::PROTOCOL_VERSION,
+    };
+    write_meta(&paths, &meta)?;
 
     install_signal_handlers();
 
@@ -216,7 +431,14 @@ pub fn run(args: RunArgs) -> Result<()> {
         colors: ColorState::default(),
         kitty: KittyFlags::default(),
         ring: Mutex::new(RawRing::default()),
-        seq: AtomicU64::new(0),
+        output: Mutex::new(OutputGate::default()),
+        sizing: Mutex::new(Sizing {
+            applied: (args.cols, args.rows),
+            ..Sizing::default()
+        }),
+        sizing_cv: Condvar::new(),
+        meta: Mutex::new(meta),
+        paths: paths.clone(),
         master: Mutex::new(pair.master),
         writer: Mutex::new(writer),
         child_pgid,
@@ -225,17 +447,17 @@ pub fn run(args: RunArgs) -> Result<()> {
 
     // Optional raw output log (owned by the reader thread).
     let raw_log = if args.raw_output_log {
-        RawLog::enabled(&paths.raw_log())
-            .with_context(|| "enabling raw output log")?
+        RawLog::enabled(&paths.raw_log()).with_context(|| "enabling raw output log")?
     } else {
         RawLog::disabled()
     };
 
-    // --- reader thread ---------------------------------------------------
+    // --- background threads ---------------------------------------------
     spawn_reader_thread(shared.clone(), reader, raw_log);
+    spawn_resize_debouncer(shared.clone());
+    spawn_keepalive_thread(shared.clone());
 
     // --- socket server ---------------------------------------------------
-    // Remove any stale socket from a previous (dead) session at this id.
     let sock_path = paths.sock();
     let _ = std::fs::remove_file(&sock_path);
     let listener = UnixListener::bind(&sock_path)
@@ -248,6 +470,22 @@ pub fn run(args: RunArgs) -> Result<()> {
     // --- teardown --------------------------------------------------------
     // Reap the whole group in case the child left anything behind.
     shared.kill_child_group(Some(libc::SIGTERM));
+
+    // Push the frozen-core `exited` event, then give writers a moment to flush.
+    shared.clients.broadcast_exited(shelbi_proto::Exited {
+        code: exit.code,
+        signal: exit.signal,
+        reason: exit.reason.clone(),
+    });
+    thread::sleep(EXIT_FLUSH_GRACE);
+
+    // Stop the debouncer and wind down client writers.
+    {
+        let mut st = shared.sizing.lock().unwrap();
+        st.closed = true;
+        shared.sizing_cv.notify_all();
+    }
+    shared.clients.close_all();
 
     write_final(&paths, &shared);
     write_exit(&paths, &exit)?;
@@ -298,14 +536,10 @@ fn wait_for_child(
     }
 }
 
-/// Read the PTY master forever: feed the emulator, answer queries, retain bytes,
-/// optionally log, and broadcast to clients. Runs until the PTY closes (child
-/// exit), after which the thread ends.
-fn spawn_reader_thread(
-    shared: Arc<Shared>,
-    mut reader: Box<dyn Read + Send>,
-    mut raw_log: RawLog,
-) {
+/// Read the PTY master forever: feed the emulator, answer queries, surface
+/// title/bell events, retain bytes, optionally log, and emit sequenced output.
+/// Runs until the PTY closes (child exit), after which the thread ends.
+fn spawn_reader_thread(shared: Arc<Shared>, mut reader: Box<dyn Read + Send>, mut raw_log: RawLog) {
     thread::spawn(move || {
         let mut responder = Responder::new(shared.kitty.clone(), shared.colors.clone());
         let mut chunk = [0u8; 8192];
@@ -317,37 +551,87 @@ fn spawn_reader_thread(
             let data = &chunk[..n];
 
             // Feed the emulator first so the cursor the responder reports is
-            // current, then answer any queries in this chunk.
-            let (cursor_row, cursor_col) = {
+            // current, then answer any queries in this chunk. The emulator lock
+            // is released before the output gate is taken (emit_output), so the
+            // reader never holds both at once — see the lock-order note in
+            // `transport`.
+            let (cursor, events) = {
                 let mut emu = shared.emu.lock().unwrap();
                 emu.feed(data);
-                emu.cursor_1based()
+                (emu.cursor_1based(), emu.drain_events())
             };
-            let answers = responder.scan(data, &FixedCursor(cursor_row, cursor_col));
+            let answers = responder.scan(data, &FixedCursor(cursor.0, cursor.1));
             for answer in answers {
                 shared.write_to_child(&answer.reply);
+            }
+
+            // Surface title/bell as pushed events.
+            for event in events {
+                match event {
+                    EmuEvent::Title(title) => shared.clients.push_event_title(&title),
+                    EmuEvent::Bell => shared.clients.push_event_bell(),
+                }
             }
 
             // Retain recent bytes and (optionally) log the raw stream.
             shared.ring.lock().unwrap().push(data);
             raw_log.write(data);
 
-            // Broadcast sequenced output to attached clients.
-            if !shared.clients.is_empty() {
-                let seq = shared.seq.fetch_add(1, Ordering::Relaxed);
-                if let Ok(bytes) = Frame::Output(Output {
-                    seq,
-                    data: data.to_vec(),
-                })
-                .encode()
-                {
-                    shared.clients.broadcast(&bytes);
-                }
-            } else {
-                // Keep the sequence advancing so a later attach is monotonic.
-                shared.seq.fetch_add(1, Ordering::Relaxed);
-            }
+            // Emit sequenced output into the ordered stream.
+            shared.emit_output(data);
         }
+    });
+}
+
+/// Apply the most-recently-active client's size to the PTY, debounced so a burst
+/// of resizes settles into one child resize.
+fn spawn_resize_debouncer(shared: Arc<Shared>) {
+    thread::spawn(move || loop {
+        let gen0 = {
+            let mut st = shared.sizing.lock().unwrap();
+            while st.target.is_none() && !st.closed {
+                st = shared.sizing_cv.wait(st).unwrap();
+            }
+            if st.closed {
+                return;
+            }
+            st.generation
+        };
+
+        thread::sleep(RESIZE_DEBOUNCE);
+
+        let settled = {
+            let mut st = shared.sizing.lock().unwrap();
+            if st.closed {
+                return;
+            }
+            if st.generation != gen0 {
+                // A newer request arrived during the wait; re-debounce.
+                continue;
+            }
+            match st.target.take() {
+                Some(size) if size != st.applied => {
+                    st.applied = size;
+                    Some(size)
+                }
+                _ => None,
+            }
+        };
+
+        if let Some((cols, rows)) = settled {
+            shared.apply_resize(cols, rows);
+        }
+    });
+}
+
+/// Periodically ping connected clients so a dead connection is noticed.
+fn spawn_keepalive_thread(shared: Arc<Shared>) {
+    thread::spawn(move || loop {
+        thread::sleep(KEEPALIVE_INTERVAL);
+        if shared.sizing.lock().unwrap().closed {
+            return;
+        }
+        shared.clients.send_keepalives();
     });
 }
 
@@ -373,16 +657,7 @@ fn install_signal_handlers() {
     }
 }
 
-fn write_meta(paths: &SessionPaths, args: &RunArgs) -> Result<()> {
-    let meta = Meta {
-        id: args.id.clone(),
-        name: args.name.clone(),
-        argv: args.child_argv.clone(),
-        cwd: args.cwd.clone(),
-        task: args.task.clone(),
-        launched_at: chrono::Utc::now().to_rfc3339(),
-        protocol_version: shelbi_proto::PROTOCOL_VERSION,
-    };
+fn write_meta(paths: &SessionPaths, meta: &Meta) -> Result<()> {
     let json = meta.to_json().context("serializing meta.json")?;
     std::fs::write(paths.meta(), json)
         .with_context(|| format!("writing {}", paths.meta().display()))?;

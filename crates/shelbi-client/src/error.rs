@@ -31,4 +31,19 @@ pub enum ClientError {
     /// the caller can render it exactly and set the right exit code.
     #[error("{0}")]
     Mutation(shelbi_proto::control::MutationError),
+
+    /// A request needs an additive capability the session did not announce, and
+    /// there is no frozen-core fallback (e.g. `info`). A caller that can degrade
+    /// should check [`Connection::supports`](crate::connect::Connection::supports)
+    /// first; this is the error when it cannot.
+    #[error("session does not support the `{0}` capability")]
+    Unsupported(&'static str),
+
+    /// The reader thread ended, so the connection can no longer deliver replies.
+    #[error("the session connection reader has stopped")]
+    ReaderGone,
+
+    /// Spawning a session failed.
+    #[error("spawning session: {0}")]
+    Spawn(String),
 }
