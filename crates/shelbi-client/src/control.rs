@@ -23,6 +23,16 @@ use shelbi_proto::control::{
 
 use crate::error::ClientError;
 
+/// A push a subscribed connection receives from the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+    /// Another client changed an issue.
+    Changed(ChangeNote),
+    /// The daemon asked this client to re-exec (a TUI) or prompt for relaunch
+    /// (the desktop app) and stop sending commands. `reason` is operator-facing.
+    Reexec { reason: String },
+}
+
 /// A connection to the daemon's mutation control socket, past the hello
 /// handshake.
 pub struct ControlClient {
@@ -104,30 +114,89 @@ impl ControlClient {
         }
     }
 
-    /// Subscribe this connection to change notifications and return a blocking
-    /// iterator of [`ChangeNote`]s. The iterator ends when the daemon closes the
-    /// connection.
+    /// Quit a project (Phase 4f): the daemon ends its sessions, cancels its
+    /// in-flight jobs through the quit barrier, and marks it closed. Blocks
+    /// until the daemon reports done.
+    pub fn quit_project(&mut self, project: &str) -> Result<(), ClientError> {
+        self.lifecycle(ClientMsg::QuitProject {
+            request_id: 1,
+            project: project.to_string(),
+        })
+    }
+
+    /// Quit Shelbi (Phase 4f): the daemon closes every project, ends all
+    /// sessions, acknowledges, and then stops. Blocks until the acknowledgement;
+    /// the daemon may close the connection as it stops, which counts as done.
+    pub fn quit_shelbi(&mut self) -> Result<(), ClientError> {
+        self.lifecycle(ClientMsg::QuitShelbi { request_id: 1 })
+    }
+
+    /// Ask the daemon to tell every subscribed client to re-exec (the reload
+    /// signal). Blocks until the daemon acknowledges.
+    pub fn reload_clients(&mut self) -> Result<(), ClientError> {
+        self.lifecycle(ClientMsg::ReloadClients { request_id: 1 })
+    }
+
+    /// Send a lifecycle request (quit/reload) and wait for its `Done`/`Failed`.
+    /// A clean EOF before either — the daemon stopping as part of the action —
+    /// is treated as success, so `quit_shelbi` doesn't error on the race between
+    /// the ack and the shutdown.
+    fn lifecycle(&mut self, msg: ClientMsg) -> Result<(), ClientError> {
+        let request_id = match &msg {
+            ClientMsg::QuitProject { request_id, .. }
+            | ClientMsg::QuitShelbi { request_id }
+            | ClientMsg::ReloadClients { request_id } => *request_id,
+            _ => 0,
+        };
+        self.write.write_all(&control::encode(&msg)?)?;
+        self.write.flush()?;
+        loop {
+            match self.read.read_frame::<ServerMsg>() {
+                Ok(Some(ServerMsg::Done { request_id: id })) if id == request_id => return Ok(()),
+                Ok(Some(ServerMsg::Failed { request_id: id, error })) if id == request_id => {
+                    return Err(ClientError::Mutation(error))
+                }
+                // A frame for something else (a stray broadcast) — keep reading.
+                Ok(Some(_)) => {}
+                // The daemon closed as it stopped: the action took effect.
+                Ok(None) | Err(ClientError::UnexpectedEof) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Subscribe this connection to change / re-exec notifications and return a
+    /// blocking iterator of [`Notice`]s. The iterator ends when the daemon closes
+    /// the connection.
     pub fn subscribe(mut self) -> Result<Subscription, ClientError> {
         self.write
             .write_all(&control::encode(&ClientMsg::Subscribe)?)?;
         self.write.flush()?;
         Ok(Subscription { read: self.read })
     }
+
+    /// Whether the daemon this client connected to runs a different version than
+    /// `client_version` — i.e. this client is out of date and should re-exec /
+    /// relaunch rather than send mutations.
+    pub fn is_out_of_date(&self, client_version: &str) -> bool {
+        self.daemon_version != client_version
+    }
 }
 
-/// A blocking stream of [`ChangeNote`]s from a subscribed connection.
+/// A blocking stream of [`Notice`]s from a subscribed connection.
 pub struct Subscription {
     read: FrameReader<BufReader<UnixStream>>,
 }
 
 impl Subscription {
-    /// Block for the next change notification. `Ok(None)` when the daemon closed
-    /// the connection.
-    pub fn recv(&mut self) -> Result<Option<ChangeNote>, ClientError> {
+    /// Block for the next notification (a change or a re-exec push). `Ok(None)`
+    /// when the daemon closed the connection.
+    pub fn recv(&mut self) -> Result<Option<Notice>, ClientError> {
         loop {
             match self.read.read_frame::<ServerMsg>()? {
-                Some(ServerMsg::Changed(note)) => return Ok(Some(note)),
-                Some(_) => continue, // ignore any non-Changed traffic
+                Some(ServerMsg::Changed(note)) => return Ok(Some(Notice::Changed(note))),
+                Some(ServerMsg::Reexec { reason }) => return Ok(Some(Notice::Reexec { reason })),
+                Some(_) => continue, // ignore mutation-stream traffic
                 None => return Ok(None),
             }
         }

@@ -145,6 +145,16 @@ fn route(
     let mut client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)
         .map_err(|e| ExecError::Backend(e.to_string()))?;
 
+    // Out-of-date gate (removing-tmux Phase 4f, "Versions and upgrades"): if the
+    // daemon answered its hello with a different version than ours, this client
+    // is out of date and must NOT send a mutation — it should re-exec / relaunch
+    // first. Refusing here, after the hello but before the `Mutate` frame, is
+    // what makes "an out-of-date client sends no mutations before it re-execs"
+    // hold for the daemon-routed path.
+    if let Some(err) = out_of_date_gate(&client.daemon_version, shelbi_state::CLIENT_VERSION) {
+        return Err(err);
+    }
+
     let req = MutationRequest {
         request_id: 1,
         project: project.to_string(),
@@ -153,6 +163,20 @@ fn route(
         kind,
     };
     client.mutate(&req, on_line).map_err(map_client_err)
+}
+
+/// The out-of-date mutation gate: `Some(err)` when `daemon_version` differs
+/// from `client_version`, so the caller refuses the mutation before sending it.
+/// Pure so "an out-of-date client sends no mutations before it re-execs" is
+/// unit-testable without a daemon.
+fn out_of_date_gate(daemon_version: &str, client_version: &str) -> Option<ExecError> {
+    if daemon_version == client_version {
+        return None;
+    }
+    Some(ExecError::Backend(format!(
+        "hub daemon is {daemon_version} but this client is {client_version} — \
+         relaunch to continue; no change was made"
+    )))
 }
 
 fn read_expected(project: &str, id: &str) -> Option<ExpectedState> {
@@ -177,5 +201,26 @@ fn map_client_err(e: shelbi_client::ClientError) -> ExecError {
             ExecError::NotFound(id)
         }
         other => ExecError::Backend(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn out_of_date_gate_refuses_a_version_mismatch_and_allows_a_match() {
+        // AC7: an out-of-date client sends no mutations before it re-execs. A
+        // version mismatch yields a refusal (returned before the Mutate frame),
+        // while a matching version lets the mutation through.
+        assert!(out_of_date_gate("0.9.0", "0.9.0").is_none(), "a match sends");
+        let err = out_of_date_gate("0.10.0", "0.9.0").expect("a mismatch refuses");
+        match err {
+            ExecError::Backend(msg) => {
+                assert!(msg.contains("0.10.0") && msg.contains("0.9.0"), "msg: {msg}");
+                assert!(msg.contains("no change was made"), "msg names the no-op: {msg}");
+            }
+            other => panic!("expected a Backend refusal, got {other:?}"),
+        }
     }
 }

@@ -28,6 +28,7 @@ mod terminal_view;
 mod pty_input_tests;
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -104,8 +105,19 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
     // the periodic request below is the fallback for a hubless project.
     let (_changes, change_rx) = changes::spawn(project);
 
-    // Start on the orchestrator chat, focused.
-    state.show(RowTarget::Session(SessionRef::Orchestrator));
+    // Re-exec listener (Phase 4f): a background subscription to the daemon that
+    // flips this flag when the daemon pushes a re-exec (this client is out of
+    // date after an upgrade, or a `shelbi reload` signalled a re-exec). The loop
+    // observes the flag and exits into the re-exec path below.
+    let reexec = Arc::new(AtomicBool::new(false));
+    spawn_reexec_listener(reexec.clone());
+
+    // Start on the restored view (set by a prior re-exec) or the orchestrator
+    // chat, focused.
+    match reexec_restored_view() {
+        Some(view) => state.apply_restored_view(view),
+        None => state.show(RowTarget::Session(SessionRef::Orchestrator)),
+    }
 
     let mut last_draw = Instant::now()
         .checked_sub(FRAME)
@@ -114,6 +126,12 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
     loop {
         if state.should_quit {
             break;
+        }
+        // A pushed re-exec ends the loop and re-execs on the way out.
+        if reexec.load(Ordering::SeqCst) && !state.should_reexec {
+            state.should_reexec = true;
+            state.should_quit = true;
+            continue;
         }
 
         // Pace the loop on local input; this bounds the redraw rate too.
@@ -177,7 +195,104 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         }
     }
 
+    // Re-exec on the way out, if the daemon asked us to. Restore the terminal
+    // first (the RAII guard would do it on drop, but `exec` replaces the process
+    // so Drop never runs), carry the current view forward so the fresh TUI lands
+    // where this one was, then replace this process with the installed binary.
+    if state.should_reexec {
+        let view = state.client.view().clone();
+        drop(term);
+        drop(_guard); // restores the terminal
+        reexec_into_current_binary(&view);
+        // `reexec_into_current_binary` only returns if exec failed; fall through
+        // to a clean exit so the shell doesn't hang in a broken terminal.
+    }
+
     Ok(())
+}
+
+/// Env var carrying the view to restore across a re-exec, so an out-of-date TUI
+/// that re-execs lands back on the view it was showing (per-client state).
+const REEXEC_VIEW_ENV: &str = "SHELBI_REEXEC_VIEW";
+
+/// The view a prior re-exec asked to restore, consumed once. `None` on a normal
+/// start.
+fn reexec_restored_view() -> Option<View> {
+    let raw = std::env::var(REEXEC_VIEW_ENV).ok()?;
+    std::env::remove_var(REEXEC_VIEW_ENV);
+    if raw.is_empty() {
+        return None;
+    }
+    Some(View::from_view_id(&raw))
+}
+
+/// Re-exec the installed `shelbi` with this process's own arguments, carrying
+/// `view` forward in [`REEXEC_VIEW_ENV`]. Repeating the original argv restores
+/// the project (it was on the command line); the env var restores the view. On
+/// a non-Unix target, or if `exec` fails, this returns and the caller exits.
+fn reexec_into_current_binary(view: &View) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    std::env::set_var(REEXEC_VIEW_ENV, view.as_view_id());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // `exec` only returns on failure.
+        let _ = std::process::Command::new(exe).args(&args).exec();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::process::Command::new(exe).args(&args).status();
+    }
+}
+
+/// Spawn the background re-exec listener: subscribe to the daemon's control
+/// socket and flip `reexec` on a [`Notice::Reexec`] push. If the subscription
+/// drops (the daemon restarted), re-probe the daemon version: a mismatch means
+/// this client is now out of date, so flip the flag; otherwise reconnect. All
+/// best-effort — a daemon that is simply absent leaves the flag clear, and the
+/// shell keeps running (read-only session viewing is unaffected).
+fn spawn_reexec_listener(reexec: Arc<AtomicBool>) {
+    std::thread::Builder::new()
+        .name("shelbi-shell-reexec".into())
+        .spawn(move || loop {
+            if reexec.load(Ordering::SeqCst) {
+                return;
+            }
+            match connect_control() {
+                Some(client) => {
+                    let Ok(mut sub) = client.subscribe() else {
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    };
+                    loop {
+                        match sub.recv() {
+                            Ok(Some(shelbi_client::Notice::Reexec { .. })) => {
+                                reexec.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                            Ok(Some(_)) => {} // a change note — ignored here
+                            Ok(None) | Err(_) => break, // daemon closed / error
+                        }
+                    }
+                    // The connection dropped. If the daemon came back on a new
+                    // version, we are out of date → re-exec.
+                    if matches!(
+                        shelbi_state::daemon_version_status(),
+                        shelbi_state::DaemonVersionStatus::Mismatch { .. }
+                    ) {
+                        reexec.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                None => {
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+        })
+        .ok();
 }
 
 /// What the main area is currently showing.
@@ -188,9 +303,64 @@ enum MainView {
     Review(String),
 }
 
+/// The three ways to leave the TUI (plan, "Quit semantics"):
+///
+/// - [`QuitAction::CloseUi`] — the default for `q`. Agents keep running; the
+///   shell just stops rendering and drops its (detaching, not killing) session
+///   connections, so reopening `shelbi` reattaches.
+/// - [`QuitAction::QuitProject`] — end this project's sessions and mark it
+///   closed, through the daemon's quit barrier.
+/// - [`QuitAction::QuitShelbi`] — end all sessions and stop the daemon.
+///
+/// `CloseUi` is bound to `q`; `QuitProject`/`QuitShelbi` are invoked from the
+/// command palette (`dispatch_effect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuitAction {
+    CloseUi,
+    QuitProject,
+    QuitShelbi,
+}
+
+/// The project/shelbi quit operations the shell drives through the daemon's
+/// control socket, behind a trait so the shell's quit routing is testable
+/// without a daemon (and so a `CloseUi` can be proven to touch neither).
+trait ShellLifecycle: Send + Sync {
+    fn quit_project(&self, project: &str);
+    fn quit_shelbi(&self);
+}
+
+/// The production [`ShellLifecycle`]: connect to the daemon's control socket and
+/// send the lifecycle command. Best-effort — a daemon that is already gone means
+/// the sessions are already down, which is the desired end state anyway.
+struct DaemonLifecycle;
+
+impl ShellLifecycle for DaemonLifecycle {
+    fn quit_project(&self, project: &str) {
+        if let Some(mut client) = connect_control() {
+            let _ = client.quit_project(project);
+        }
+    }
+    fn quit_shelbi(&self) {
+        if let Some(mut client) = connect_control() {
+            let _ = client.quit_shelbi();
+        }
+    }
+}
+
+/// Connect to the daemon's control socket, or `None` if it isn't reachable.
+fn connect_control() -> Option<shelbi_client::ControlClient> {
+    let sock = shelbi_state::control_socket_path().ok()?;
+    shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION).ok()
+}
+
 struct ShellState {
     client: ClientState,
     sessions: SessionManager,
+    /// The connector, kept so a project switch can rebuild the session manager
+    /// for the new project.
+    connector: Arc<dyn session::Connector>,
+    /// The project/shelbi quit operations (daemon control socket in production).
+    lifecycle: Arc<dyn ShellLifecycle>,
     caps: Caps,
     sidebar_model: Option<SidebarModel>,
     /// The embedded native views. They share their rendering (`render_full`) and
@@ -211,6 +381,10 @@ struct ShellState {
     reported_main: Option<Size>,
     /// When `Some`, the user is typing a scrollback search query.
     search_input: Option<String>,
+    /// Set when the shell should re-exec itself on exit (the daemon told it it
+    /// is out of date, or a `shelbi reload` signalled a re-exec). Checked by
+    /// [`run_with`] after the event loop ends.
+    should_reexec: bool,
     /// The one-time keyboard-protocol notice: shown from startup until its
     /// deadline, then cleared and never re-armed (see [`ShellState::notice_text`]).
     notice: Option<Notice>,
@@ -240,6 +414,15 @@ struct Notice {
 
 impl ShellState {
     fn new(project: &str, connector: Arc<dyn session::Connector>, caps: Caps) -> Self {
+        Self::new_with(project, connector, caps, Arc::new(DaemonLifecycle))
+    }
+
+    fn new_with(
+        project: &str,
+        connector: Arc<dyn session::Connector>,
+        caps: Caps,
+        lifecycle: Arc<dyn ShellLifecycle>,
+    ) -> Self {
         let notice = caps.keyboard_notice().map(|text| Notice {
             text,
             until: Instant::now() + Duration::from_secs(NOTICE_SECS),
@@ -260,7 +443,9 @@ impl ShellState {
         kanban.move_persister = Some(Arc::new(ExecutorMovePersister));
         Self {
             client: ClientState::new(project),
-            sessions: SessionManager::new(project, connector),
+            sessions: SessionManager::new(project, connector.clone()),
+            connector,
+            lifecycle,
             caps,
             sidebar_model: None,
             kanban,
@@ -272,6 +457,7 @@ impl ShellState {
             main_rect: Rect::default(),
             reported_main: None,
             search_input: None,
+            should_reexec: false,
             notice,
             overlay: None,
             palette_chord,
@@ -356,10 +542,16 @@ impl ShellState {
 
     /// Open a sidebar target: a session shows in the main area and takes focus;
     /// a native view just swaps the main area (focus stays on the sidebar until
-    /// the user steps in with Ctrl+Space). The chosen view is recorded in the
-    /// client state so it becomes this project's remembered view — what a later
-    /// project switch restores.
+    /// the user steps in with Ctrl+Space). Records the target as the current
+    /// project's remembered view (via [`ClientState::set_view`]) so a later
+    /// [`switch_project`](Self::switch_project) back to this project restores it
+    /// — the per-client last-view-per-project memory the plan wants.
     fn show(&mut self, target: RowTarget) {
+        // Record the view first (a Review target has no `View` and is transient,
+        // so it is deliberately not remembered).
+        if let Some(view) = row_target_to_view(&target) {
+            self.client.set_view(view);
+        }
         match target {
             RowTarget::Session(r) => {
                 self.main_view = MainView::Session;
@@ -384,6 +576,62 @@ impl ShellState {
             }
         }
         self.dirty = true;
+    }
+
+    /// Switch this client to another open project, restoring the view it last
+    /// had there (its default view the first time). The session manager is
+    /// rebuilt for the new project and the restored view is applied to the main
+    /// area. Agents in the old project keep running — switching is a view
+    /// change, not a quit. Invoked from the command palette (`dispatch_effect`).
+    fn switch_project(&mut self, project: &str) {
+        // `ClientState::switch_project` records the current project's view and
+        // restores the new project's remembered (or default) view.
+        self.client.switch_project(project);
+        // Rebuild the session manager for the new project (dropping the old
+        // project's connection detaches, never kills).
+        self.sessions = SessionManager::new(project, self.connector.clone());
+        self.reported_main = None;
+        // Apply the restored view to the main area.
+        let restored = self.client.view().clone();
+        self.apply_restored_view(restored);
+        self.dirty = true;
+    }
+
+    /// Apply a [`View`] (as restored by a project switch) to the main area
+    /// without re-recording it (it is already the client's current view).
+    fn apply_restored_view(&mut self, view: View) {
+        match view_to_row_target(&view) {
+            RowTarget::Session(r) => {
+                self.main_view = MainView::Session;
+                self.sessions.show(r);
+                // A restored session view keeps sidebar focus — a switch lands
+                // the user on the sidebar (see `ClientState::switch_project`).
+            }
+            RowTarget::Native(v) => self.main_view = MainView::Native(v),
+            RowTarget::Review(id) => self.main_view = MainView::Review(id),
+        }
+    }
+
+    /// Leave the TUI via `action`. `CloseUi` touches no sessions (they outlive
+    /// the client); `QuitProject`/`QuitShelbi` go through the daemon's control
+    /// socket. All three stop the event loop.
+    fn quit(&mut self, action: QuitAction) {
+        match action {
+            QuitAction::CloseUi => {
+                // Nothing to do to the sessions: dropping the shell detaches
+                // (never kills) its connections, so agents keep running and a
+                // reopen reattaches.
+            }
+            QuitAction::QuitProject => {
+                if let Some(project) = self.client.project() {
+                    self.lifecycle.quit_project(project);
+                }
+            }
+            QuitAction::QuitShelbi => {
+                self.lifecycle.quit_shelbi();
+            }
+        }
+        self.should_quit = true;
     }
 
     fn activate_selection(&mut self) {
@@ -578,20 +826,18 @@ impl ShellState {
                     "edit {target:?} — opening an external editor lands in a later Phase 4 subtask"
                 ))
             }
-            Effect::SwitchProject { project } => {
-                self.status = Some(format!(
-                    "switch to {project} — project switching lands in Phase 4f"
-                ))
-            }
+            Effect::SwitchProject { project } => self.switch_project(&project),
             Effect::AddProject => {
-                self.status = Some("Add project lands in Phase 4f".into())
+                // Switching between already-open projects is this subtask's
+                // scope; creating a new one needs an in-process add-project
+                // form plus a shared creation path (the CLI's `add_project`
+                // lives in shelbi-cli, which shelbi-tui can't depend on), so it
+                // ports in its own overlay/creation subtask, not Phase 4f.
+                self.status =
+                    Some("Add project opens the add-project form (ported in its own subtask)".into())
             }
-            Effect::QuitProject { .. } => {
-                self.status = Some("Quit Project lands in Phase 4f".into())
-            }
-            Effect::QuitShelbi => {
-                self.status = Some("Quit Shelbi lands in Phase 4f".into())
-            }
+            Effect::QuitProject { .. } => self.quit(QuitAction::QuitProject),
+            Effect::QuitShelbi => self.quit(QuitAction::QuitShelbi),
             Effect::Mutate(Mutation::ToggleZen { project }) => self.toggle_zen(project),
             Effect::Mutate(other) => {
                 self.status = Some(format!("mutation {other:?} is not reachable from the palette"))
@@ -686,7 +932,10 @@ impl ShellState {
             KeyCode::Down | KeyCode::Tab => self.client.select_down(count),
             KeyCode::BackTab => self.client.select_up(),
             KeyCode::Enter => self.activate_selection(),
-            KeyCode::Char('q') => self.should_quit = true,
+            // `q` closes the UI (the default quit): agents keep running and a
+            // reopen reattaches. Quit-project / quit-Shelbi are the palette's
+            // (Phase 4d) job, routed through [`ShellState::quit`].
+            KeyCode::Char('q') => self.quit(QuitAction::CloseUi),
             _ => {}
         }
         self.dirty = true;
@@ -1149,6 +1398,31 @@ fn layout(area: Rect, sidebar_width: u16) -> (Rect, Rect) {
     let sidebar = Rect::new(area.x, area.y, w, area.height);
     let main = Rect::new(area.x + w, area.y, area.width.saturating_sub(w), area.height);
     (sidebar, main)
+}
+
+/// The session name the orchestrator chat is bound to in a `View::Session`.
+const ORCH_VIEW: &str = "orch";
+
+/// Map a sidebar [`RowTarget`] to the [`View`] it corresponds to, for recording
+/// the client's per-project last view. A `Review` target is transient and has
+/// no `View`, so it returns `None`.
+fn row_target_to_view(target: &RowTarget) -> Option<View> {
+    match target {
+        RowTarget::Session(SessionRef::Orchestrator) => Some(View::Session(ORCH_VIEW.to_string())),
+        RowTarget::Session(SessionRef::Workspace(w)) => Some(View::Session(w.clone())),
+        RowTarget::Native(v) => Some(v.clone()),
+        RowTarget::Review(_) => None,
+    }
+}
+
+/// The inverse of [`row_target_to_view`], for applying a restored view. A
+/// `View::Session` names the session to bind (`orch` is the orchestrator chat).
+fn view_to_row_target(view: &View) -> RowTarget {
+    match view {
+        View::Issues | View::Activity | View::Machines => RowTarget::Native(view.clone()),
+        View::Session(name) if name == ORCH_VIEW => RowTarget::Session(SessionRef::Orchestrator),
+        View::Session(name) => RowTarget::Session(SessionRef::Workspace(name.clone())),
+    }
 }
 
 fn render_placeholder(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
@@ -1673,5 +1947,147 @@ mod tests {
             state: KeyEventState::NONE,
         };
         assert!(!terminal_view::is_actionable(&release));
+    }
+
+    // --- Phase 4f: project switching, quit actions, re-exec ------------------
+
+    use std::sync::Mutex;
+
+    /// Records the project/shelbi quit calls the shell makes.
+    #[derive(Default)]
+    struct RecordingLifecycle {
+        calls: Mutex<Vec<String>>,
+    }
+    impl ShellLifecycle for RecordingLifecycle {
+        fn quit_project(&self, project: &str) {
+            self.calls.lock().unwrap().push(format!("quit_project:{project}"));
+        }
+        fn quit_shelbi(&self) {
+            self.calls.lock().unwrap().push("quit_shelbi".into());
+        }
+    }
+
+    fn test_state_with(lifecycle: Arc<RecordingLifecycle>) -> ShellState {
+        let caps = Caps {
+            kitty: true,
+            truecolor: true,
+            nested: None,
+        };
+        ShellState::new_with("proj", Arc::new(NoopConnector), caps, lifecycle)
+    }
+
+    #[test]
+    fn view_target_mapping_round_trips() {
+        for view in [
+            View::Issues,
+            View::Activity,
+            View::Machines,
+            View::Session("orch".into()),
+            View::Session("alpha".into()),
+        ] {
+            let rt = view_to_row_target(&view);
+            assert_eq!(row_target_to_view(&rt), Some(view));
+        }
+        // The orchestrator chat maps to the Orchestrator session ref.
+        assert_eq!(
+            view_to_row_target(&View::Session("orch".into())),
+            RowTarget::Session(SessionRef::Orchestrator)
+        );
+    }
+
+    #[test]
+    fn switching_projects_restores_each_projects_last_view() {
+        // AC1: switching projects restores each project's last view for this
+        // client. Drive the shell as a user would: open views, switch away,
+        // switch back, and confirm the main area lands where it was left.
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        // On `proj`, open the Activity view.
+        st.show(RowTarget::Native(View::Activity));
+        assert!(matches!(st.main_view, MainView::Native(View::Activity)));
+
+        // Switch to `beta`: lands on beta's default (Issues), not proj's.
+        st.switch_project("beta");
+        assert_eq!(st.client.project(), Some("beta"));
+        assert!(matches!(st.main_view, MainView::Native(View::Issues)));
+        // On beta, open Machines.
+        st.show(RowTarget::Native(View::Machines));
+
+        // Back to proj: the Activity view is restored.
+        st.switch_project("proj");
+        assert!(
+            matches!(st.main_view, MainView::Native(View::Activity)),
+            "proj's last view (Activity) must be restored"
+        );
+        // Back to beta: Machines is restored.
+        st.switch_project("beta");
+        assert!(matches!(st.main_view, MainView::Native(View::Machines)));
+    }
+
+    #[test]
+    fn close_ui_quits_without_touching_sessions() {
+        // AC2: `q` closes the UI and every session keeps running. The close-UI
+        // path must invoke NO lifecycle (quit-project/quit-shelbi) operation —
+        // that is what leaves the agents alive for a reopen to reattach to.
+        let life = Arc::new(RecordingLifecycle::default());
+        let mut st = test_state_with(life.clone());
+        st.quit(QuitAction::CloseUi);
+        assert!(st.should_quit, "close-UI ends the loop");
+        assert!(!st.should_reexec);
+        assert!(
+            life.calls.lock().unwrap().is_empty(),
+            "close-UI must not end any sessions: {:?}",
+            life.calls.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn q_in_the_sidebar_closes_the_ui() {
+        let life = Arc::new(RecordingLifecycle::default());
+        let mut st = test_state_with(life.clone());
+        st.client.focus_sidebar();
+        st.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(st.should_quit);
+        assert!(life.calls.lock().unwrap().is_empty(), "`q` is close-UI, not a quit-project");
+    }
+
+    #[test]
+    fn quit_project_and_quit_shelbi_route_through_the_lifecycle() {
+        let life = Arc::new(RecordingLifecycle::default());
+        let mut st = test_state_with(life.clone());
+        st.quit(QuitAction::QuitProject);
+        assert!(st.should_quit);
+        st.should_quit = false;
+        st.quit(QuitAction::QuitShelbi);
+        assert_eq!(
+            *life.calls.lock().unwrap(),
+            vec!["quit_project:proj".to_string(), "quit_shelbi".to_string()],
+        );
+    }
+
+    #[test]
+    fn palette_quit_project_reaches_the_daemon_command() {
+        // Rework: selecting "Quit project" in the command palette must reach the
+        // daemon lifecycle command, not just set a status note. Drive the exact
+        // path the palette takes when a user runs that entry — `run_entry`
+        // resolves the id to its command effect and dispatches it — and confirm
+        // it lands on the lifecycle seam (the daemon control socket in
+        // production). The id↔kind mapping is owned by `shelbi_app::command`.
+        let life = Arc::new(RecordingLifecycle::default());
+        let mut st = test_state_with(life.clone());
+        st.run_entry(&shelbi_palette::Entry {
+            id: "action:quit-project".to_string(),
+            label: "Quit project".to_string(),
+            kind: shelbi_palette::EntryKind::Action,
+            subtitle: None,
+            shortcut: None,
+            decoration: None,
+            hidden_until_query: false,
+        });
+        assert!(st.should_quit, "a palette quit-project ends the loop");
+        assert_eq!(
+            *life.calls.lock().unwrap(),
+            vec!["quit_project:proj".to_string()],
+            "the palette's quit-project must reach the daemon lifecycle command",
+        );
     }
 }

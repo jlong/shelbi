@@ -309,7 +309,13 @@ pub(super) fn run_foreground() -> Result<()> {
     let control_sock = shelbi_state::control_socket_path().map_err(|e| anyhow!(e))?;
     let control_listener = super::control::bind(&control_sock)?;
     {
-        let control_state = super::control::ControlState::new();
+        // The lifecycle ops carry the shared stop flag + hub socket so a
+        // `QuitShelbi` control command can stop this daemon (Phase 4f).
+        let lifecycle = std::sync::Arc::new(super::control::DaemonLifecycle {
+            stop: stop.clone(),
+            hub_sock: sock.clone(),
+        });
+        let control_state = super::control::ControlState::production(lifecycle);
         let stop = stop.clone();
         thread::spawn(move || super::control::serve(control_listener, control_state, stop));
     }

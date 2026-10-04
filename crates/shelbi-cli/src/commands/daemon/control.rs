@@ -59,6 +59,77 @@ type ApplyFn = dyn Fn(
     + Send
     + Sync;
 
+/// The project/shelbi quit and daemon-stop operations behind the control
+/// socket's lifecycle commands (removing-tmux Phase 4f). Behind a trait so the
+/// in-process control-socket tests can assert the wiring (which command ran,
+/// whether the daemon was asked to stop) without ending real sessions or
+/// killing the test's own process. The production impl composes
+/// [`shelbi_orchestrator::quit`] and the daemon's shutdown.
+pub(super) trait LifecycleOps: Send + Sync {
+    /// Quit one project: end its sessions, drain the quit barrier, mark closed.
+    fn quit_project(&self, project: &str);
+    /// Quit Shelbi: close every project and end all sessions (but do NOT stop
+    /// the daemon yet — the handler acks the client first, then calls
+    /// [`stop_daemon`](Self::stop_daemon)).
+    fn quit_shelbi(&self);
+    /// Stop the daemon: flip the shared stop flag and wake the hub accept loop
+    /// so the process drains and exits. Nothing restarts it (the projects are
+    /// already closed).
+    fn stop_daemon(&self);
+    /// This daemon's version, for the out-of-date check against a subscriber's
+    /// announced client version.
+    fn daemon_version(&self) -> String;
+}
+
+/// The production [`LifecycleOps`]: real quit composition + daemon shutdown.
+pub(super) struct DaemonLifecycle {
+    /// The daemon's shared stop flag (shared with the hub + control accept
+    /// loops and the idle monitor).
+    pub stop: Arc<AtomicBool>,
+    /// The hub socket path — a self-connect to it wakes the blocking hub accept
+    /// loop so a stop takes effect promptly (the same wake the idle monitor and
+    /// signal path use).
+    pub hub_sock: std::path::PathBuf,
+}
+
+impl LifecycleOps for DaemonLifecycle {
+    fn quit_project(&self, project: &str) {
+        let _ = shelbi_orchestrator::quit::quit_project(project);
+    }
+
+    fn quit_shelbi(&self) {
+        let _ = shelbi_orchestrator::quit::quit_shelbi();
+    }
+
+    fn stop_daemon(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Wake the blocking hub accept loop; the control accept loop polls the
+        // flag on its own 50ms cadence so it needs no wake.
+        let _ = UnixStream::connect(&self.hub_sock);
+    }
+
+    fn daemon_version(&self) -> String {
+        CLIENT_VERSION.to_string()
+    }
+}
+
+/// An inert [`LifecycleOps`] for the unit tests that never exercise the quit
+/// path: quitting is a no-op and the daemon is never stopped, so a test that
+/// only checks the mutation / broadcast behavior can't accidentally kill the
+/// test process.
+#[cfg(test)]
+struct InertLifecycle;
+
+#[cfg(test)]
+impl LifecycleOps for InertLifecycle {
+    fn quit_project(&self, _project: &str) {}
+    fn quit_shelbi(&self) {}
+    fn stop_daemon(&self) {}
+    fn daemon_version(&self) -> String {
+        CLIENT_VERSION.to_string()
+    }
+}
+
 struct Inner {
     /// One mutex per `(project, id)`. A mutation job holds its issue's mutex for
     /// its whole duration; different issues use different mutexes and run
@@ -71,23 +142,45 @@ struct Inner {
     next_conn_id: AtomicU64,
     /// The mutation executor (see [`ApplyFn`]).
     apply: Box<ApplyFn>,
+    /// The quit/stop operations behind the lifecycle commands.
+    lifecycle: Arc<dyn LifecycleOps>,
 }
 
 impl ControlState {
+    /// Production state: the real `mutate::apply` executor and the given
+    /// lifecycle ops (which capture the daemon's stop flag + hub socket).
+    pub(super) fn production(lifecycle: Arc<dyn LifecycleOps>) -> Self {
+        Self::with_apply_and_lifecycle(
+            Box::new(|project, id, kind, sink, recheck| {
+                mutate::apply(project, id, kind, sink, recheck)
+            }),
+            lifecycle,
+        )
+    }
+
+    /// Test/default state: production executor, inert lifecycle ops (no project
+    /// is quit and the daemon is never stopped). Used by the broadcast/lock
+    /// unit tests that never exercise the lifecycle path.
+    #[cfg(test)]
     pub(super) fn new() -> Self {
-        // The production executor is `mutate::apply` itself.
         Self::with_apply(Box::new(|project, id, kind, sink, recheck| {
             mutate::apply(project, id, kind, sink, recheck)
         }))
     }
 
+    #[cfg(test)]
     fn with_apply(apply: Box<ApplyFn>) -> Self {
+        Self::with_apply_and_lifecycle(apply, Arc::new(InertLifecycle))
+    }
+
+    fn with_apply_and_lifecycle(apply: Box<ApplyFn>, lifecycle: Arc<dyn LifecycleOps>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 issue_locks: Mutex::new(HashMap::new()),
                 subscribers: Mutex::new(HashMap::new()),
                 next_conn_id: AtomicU64::new(1),
                 apply,
+                lifecycle,
             }),
         }
     }
@@ -118,6 +211,16 @@ impl ControlState {
                 continue;
             }
             let _ = tx.send(ServerMsg::Changed(note.clone()));
+        }
+    }
+
+    /// Push `msg` to *every* subscriber (the reload re-exec signal, which must
+    /// reach all attached clients including whoever asked for the reload if it
+    /// happens to be subscribed). A dead subscriber's send just fails.
+    fn broadcast_all(&self, msg: &ServerMsg) {
+        let subs = self.inner.subscribers.lock().unwrap();
+        for tx in subs.values() {
+            let _ = tx.send(msg.clone());
         }
     }
 }
@@ -185,6 +288,10 @@ fn handle_client(stream: UnixStream, state: ControlState) {
     let (tx, rx): (Sender<ServerMsg>, Receiver<ServerMsg>) = std::sync::mpsc::channel();
     let writer = thread::spawn(move || writer_loop(write_half, rx));
 
+    // The version the client announced in its hello, so a `Subscribe` can be
+    // told straight away that it is out of date (Phase 4f).
+    let mut client_version: Option<String> = None;
+
     let mut reader = FrameReader::new(stream);
     loop {
         let msg = match reader.read_frame::<ClientMsg>() {
@@ -193,14 +300,32 @@ fn handle_client(stream: UnixStream, state: ControlState) {
             Err(_) => break,    // framing/io error: drop the connection
         };
         match msg {
-            ClientMsg::Hello { .. } => {
+            ClientMsg::Hello {
+                client_version: cv,
+                ..
+            } => {
+                client_version = Some(cv);
                 let _ = tx.send(ServerMsg::Hello {
                     protocol: CONTROL_PROTOCOL_VERSION,
-                    daemon_version: CLIENT_VERSION.to_string(),
+                    daemon_version: state.inner.lifecycle.daemon_version(),
                 });
             }
             ClientMsg::Subscribe => {
                 state.register(conn_id, tx.clone());
+                // If this subscriber announced a different version than ours it
+                // is out of date: tell it to re-exec (a TUI) / prompt for
+                // relaunch (the desktop app) right away, so it stops sending
+                // commands before it does anything else.
+                if let Some(cv) = &client_version {
+                    if *cv != state.inner.lifecycle.daemon_version() {
+                        let _ = tx.send(ServerMsg::Reexec {
+                            reason: format!(
+                                "client {cv} is out of date (daemon {})",
+                                state.inner.lifecycle.daemon_version()
+                            ),
+                        });
+                    }
+                }
             }
             ClientMsg::Mutate(req) => {
                 // Detached: the job outlives this connection so a client that
@@ -208,6 +333,31 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 let state = state.clone();
                 let tx = tx.clone();
                 thread::spawn(move || run_job(conn_id, req, state, tx));
+            }
+            ClientMsg::QuitProject {
+                request_id,
+                project,
+            } => {
+                // Runs inline on this connection's handler thread (other clients
+                // have their own threads). Ends the project's sessions, drains
+                // its quit barrier, marks it closed, then acks.
+                state.inner.lifecycle.quit_project(&project);
+                let _ = tx.send(ServerMsg::Done { request_id });
+            }
+            ClientMsg::QuitShelbi { request_id } => {
+                // Close every project and end all sessions, ACK the client, then
+                // stop the daemon — acking before the stop so the reply isn't
+                // lost to the shutdown race.
+                state.inner.lifecycle.quit_shelbi();
+                let _ = tx.send(ServerMsg::Done { request_id });
+                state.inner.lifecycle.stop_daemon();
+            }
+            ClientMsg::ReloadClients { request_id } => {
+                // Tell every attached client to re-exec, then ack the requester.
+                state.broadcast_all(&ServerMsg::Reexec {
+                    reason: "shelbi reload".to_string(),
+                });
+                let _ = tx.send(ServerMsg::Done { request_id });
             }
         }
     }
@@ -778,5 +928,133 @@ mod tests {
             home.column_of("t1")
         );
         assert_eq!(rec.merges.load(AOrd::SeqCst), 1);
+    }
+
+    // --- lifecycle commands (Phase 4f) ---------------------------------------
+    //
+    // These drive the real control server with a RECORDING LifecycleOps so the
+    // wiring (which command ran, in what order, whether the daemon was asked to
+    // stop) is asserted without ending real sessions or killing the test
+    // process. The quit *composition* (ordering, scoping, barrier) is tested in
+    // `shelbi_orchestrator::quit`.
+
+    use shelbi_client::Notice;
+
+    /// Records the lifecycle operations the control handler invokes.
+    #[derive(Default)]
+    struct RecordingLifecycle {
+        calls: Mutex<Vec<String>>,
+        version: String,
+    }
+
+    impl RecordingLifecycle {
+        fn new(version: &str) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                version: version.to_string(),
+            })
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl LifecycleOps for RecordingLifecycle {
+        fn quit_project(&self, project: &str) {
+            self.calls.lock().unwrap().push(format!("quit_project:{project}"));
+        }
+        fn quit_shelbi(&self) {
+            self.calls.lock().unwrap().push("quit_shelbi".into());
+        }
+        fn stop_daemon(&self) {
+            self.calls.lock().unwrap().push("stop_daemon".into());
+        }
+        fn daemon_version(&self) -> String {
+            self.version.clone()
+        }
+    }
+
+    /// A control server with a recording lifecycle and the production mutation
+    /// executor (never reached by these tests).
+    fn serve_lifecycle(life: Arc<RecordingLifecycle>, tag: &str) -> Served {
+        let state = ControlState::with_apply_and_lifecycle(
+            Box::new(|project, id, kind, sink, recheck| mutate::apply(project, id, kind, sink, recheck)),
+            life,
+        );
+        serve_bg(state, tag)
+    }
+
+    #[test]
+    fn quit_project_command_runs_quit_project_and_acks() {
+        let life = RecordingLifecycle::new("v1");
+        let served = serve_lifecycle(life.clone(), "qp-cmd");
+        let mut client = ControlClient::connect(&served.sock, "v1").unwrap();
+        client.quit_project("alpha").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || life.calls()
+                == vec!["quit_project:alpha".to_string()]),
+            "quit_project was invoked for the right project: {:?}",
+            life.calls()
+        );
+    }
+
+    #[test]
+    fn quit_shelbi_command_acks_then_stops_the_daemon() {
+        // AC4: quit shelbi ends everything and stops the daemon. The handler
+        // must ack BEFORE stopping (so the reply isn't lost), so the recorded
+        // order is quit_shelbi → stop_daemon and the client's call returns Ok.
+        let life = RecordingLifecycle::new("v1");
+        let served = serve_lifecycle(life.clone(), "qs-cmd");
+        let mut client = ControlClient::connect(&served.sock, "v1").unwrap();
+        client.quit_shelbi().unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || life.calls()
+                == vec!["quit_shelbi".to_string(), "stop_daemon".to_string()]),
+            "quit_shelbi then stop_daemon, in that order: {:?}",
+            life.calls()
+        );
+    }
+
+    #[test]
+    fn reload_broadcasts_reexec_to_a_subscriber() {
+        // AC5: `shelbi reload` signals attached clients to re-exec. A subscribed
+        // client receives a Reexec push when another client sends reload.
+        let life = RecordingLifecycle::new("v1");
+        let served = serve_lifecycle(life, "reload");
+
+        // Subscriber A.
+        let a = ControlClient::connect(&served.sock, "v1").unwrap();
+        let mut sub = a.subscribe().unwrap();
+        // Give the daemon a moment to register A before B triggers the reload.
+        thread::sleep(Duration::from_millis(150));
+
+        // Client B triggers the reload.
+        let mut b = ControlClient::connect(&served.sock, "v1").unwrap();
+        b.reload_clients().unwrap();
+
+        match sub.recv() {
+            Ok(Some(Notice::Reexec { reason })) => {
+                assert!(reason.contains("reload"), "reason names the reload: {reason}")
+            }
+            other => panic!("subscriber A should receive a Reexec push, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_out_of_date_subscriber_is_told_to_reexec_immediately() {
+        // AC6/AC7: a client whose version differs from the daemon's is out of
+        // date. On subscribe the daemon pushes Reexec straight away so the
+        // client re-execs / relaunches and sends no mutations.
+        let life = RecordingLifecycle::new("daemon-NEW");
+        let served = serve_lifecycle(life, "stale-sub");
+        let a = ControlClient::connect(&served.sock, "client-OLD").unwrap();
+        assert!(a.is_out_of_date("client-OLD"), "daemon reports a newer version");
+        let mut sub = a.subscribe().unwrap();
+        match sub.recv() {
+            Ok(Some(Notice::Reexec { reason })) => {
+                assert!(reason.contains("out of date"), "reason: {reason}")
+            }
+            other => panic!("an out-of-date subscriber must be told to re-exec, got {other:?}"),
+        }
     }
 }

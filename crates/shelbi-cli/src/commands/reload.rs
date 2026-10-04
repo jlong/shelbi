@@ -34,6 +34,26 @@ pub fn run(
     let target =
         ReloadTarget::parse(target.as_deref(), name.as_deref()).map_err(|e| anyhow!(e))?;
 
+    // Removing-tmux Phase 4f: with the session backend on, `reload` is redefined
+    // (restart the daemon, re-exec attached clients, replace the orchestrator
+    // *session*, leave workers running) rather than respawning tmux panes. A
+    // whole-hub `reload` routes to that path; a targeted pane reload has no
+    // meaning without panes, so it falls through to the (tmux) handling, which
+    // reports "no stored pane id" harmlessly.
+    if matches!(target, ReloadTarget::All) && shelbi_state::session_backend_enabled() {
+        let project_name = require_project(project_opt)?;
+        let ops = super::reload_session::LiveReload {
+            project: project_name.clone(),
+        };
+        let report = super::reload_session::run(&ops)?;
+        println!("reload · {project_name} (session runtime)");
+        println!("  · handoff   {}", report.handoff_status);
+        println!("  ✓ clients   signalled to re-exec");
+        println!("  ✓ daemon    restarted on the current binary");
+        println!("  ✓ orch      session replaced (workers left running)");
+        return Ok(());
+    }
+
     // A targeted pane reload respawns one pane in place and deliberately
     // skips the whole-hub self-heal (root/subdir re-materialization,
     // workflow + statuses compatibility migration, agent-workspace and
