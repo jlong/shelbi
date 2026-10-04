@@ -47,8 +47,9 @@ use shelbi_core::StatusCategory;
 
 use super::config_surfaces::{live_entries, InventoryEntry, SurfaceFormat};
 use super::config_upgrade::{
-    get, is_inert, legacy_status_id, scope_label, Classification, UpgradeFinding, UpgradeReport,
-    PR_TEMPLATE_MISSING, REMOVED_PROJECT_KEYS,
+    cargo_test_without_no_fail_fast, get, insert_no_fail_fast, is_inert, legacy_status_id,
+    scope_label, Classification, UpgradeFinding, UpgradeReport, PR_TEMPLATE_MISSING,
+    REMOVED_PROJECT_KEYS,
 };
 
 /// One auto-heal write-back that landed on disk this run. Returned to the
@@ -197,6 +198,14 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
         heal_missing_pr_template(entry, applied);
     }
 
+    // Add `--no-fail-fast` to fail-fast `cargo test` local checks. A surgical,
+    // surface-agnostic line edit (registration YAML and per-workflow YAML
+    // alike), so it's handled independently of the format-specific content
+    // healers below and preserves authored comments.
+    if codes.contains("ZEN_CARGO_TEST_NO_FAIL_FAST") {
+        heal_zen_cargo_test_fail_fast(entry, applied);
+    }
+
     let id = entry.logical_id.as_str();
     if id.ends_with(".registration")
         || id.ends_with(".registration.shared")
@@ -237,6 +246,116 @@ fn heal_registration(entry: &InventoryEntry, codes: &BTreeSet<&str>, applied: &m
     for (code, detail) in changes {
         record(applied, entry, code, path, detail);
     }
+}
+
+// ---------------------------------------------------------------------------
+// zen.checks.local — surgical line edit (comment-preserving, surface-agnostic)
+
+/// Heal a `ZEN_CARGO_TEST_NO_FAIL_FAST` finding: add `--no-fail-fast` to every
+/// fail-fast `cargo test` command in the surface's `zen.checks.local` list.
+///
+/// A surgical, line-oriented rewrite (not a `serde_yaml` round-trip) so authored
+/// comments survive — and so it heals the project-registration YAML and a
+/// per-workflow YAML with one code path. We re-parse to confirm which commands
+/// genuinely live under `zen.checks.local`, then rewrite only the raw lines
+/// whose sequence-item value is exactly one of those commands. Safe-skip (leave
+/// the finding reported) if the file doesn't parse or no line matches a parsed
+/// command — nothing is ever mangled.
+fn heal_zen_cargo_test_fail_fast(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
+    let path = &entry.canonical_path;
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+        return;
+    };
+    // The exact command strings that need rewriting, taken from the surface's
+    // `zen.checks.local` list (top-level `zen:` on both registration and
+    // per-workflow files).
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(local) = get(&value, "zen")
+        .and_then(|z| get(z, "checks"))
+        .and_then(|c| get(c, "local"))
+        .and_then(Value::as_sequence)
+    {
+        for cmd in local.iter().filter_map(Value::as_str) {
+            if cargo_test_without_no_fail_fast(cmd) {
+                targets.push(cmd.to_string());
+            }
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
+
+    let mut healed = 0usize;
+    let rewritten_lines: Vec<String> = text
+        .lines()
+        .map(|line| match rewrite_cargo_test_line(line, &targets) {
+            Some(new_line) => {
+                healed += 1;
+                new_line
+            }
+            None => line.to_string(),
+        })
+        .collect();
+    if healed == 0 {
+        return;
+    }
+    let mut new_text = rewritten_lines.join("\n");
+    if text.ends_with('\n') {
+        new_text.push('\n');
+    }
+    if new_text == text {
+        return;
+    }
+    if let Err(e) = write_atomic(path, &new_text) {
+        eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
+        return;
+    }
+    record(
+        applied,
+        entry,
+        "ZEN_CARGO_TEST_NO_FAIL_FAST",
+        path,
+        format!("cargo-test+no-fail-fast:{healed}"),
+    );
+}
+
+/// If `line` is a YAML sequence item (`<indent>- <value>`) whose scalar value is
+/// one of the fail-fast `cargo test` `targets`, return the line with
+/// `--no-fail-fast` inserted — preserving the indent, the list marker, any
+/// surrounding quotes, and a trailing inline comment. `None` otherwise.
+fn rewrite_cargo_test_line(line: &str, targets: &[String]) -> Option<String> {
+    let indent_len = line.len() - line.trim_start().len();
+    let (indent, rest) = line.split_at(indent_len);
+    let value_part = rest.strip_prefix("- ")?;
+
+    // Quoted scalar: `'cmd'` / `"cmd"`, with anything after the closing quote
+    // (e.g. an inline comment) preserved verbatim.
+    if let Some(q) = value_part.chars().next().filter(|c| *c == '\'' || *c == '"') {
+        let body = value_part.strip_prefix(q)?;
+        let end = body.find(q)?;
+        let inner = &body[..end];
+        if !targets.iter().any(|t| t == inner) {
+            return None;
+        }
+        let rewritten = insert_no_fail_fast(inner)?;
+        return Some(format!("{indent}- {q}{rewritten}{q}{}", &body[end + 1..]));
+    }
+
+    // Unquoted scalar, possibly with a trailing ` # comment` (YAML starts an
+    // inline comment at whitespace + `#`).
+    let (cmd_part, comment) = match value_part.find(" #") {
+        Some(i) => (&value_part[..i], &value_part[i..]),
+        None => (value_part, ""),
+    };
+    let cmd = cmd_part.trim_end();
+    if !targets.iter().any(|t| t == cmd) {
+        return None;
+    }
+    let rewritten = insert_no_fail_fast(cmd)?;
+    Some(format!("{indent}- {rewritten}{comment}"))
 }
 
 /// Apply the registration auto-heals present in `codes` to a parsed YAML value,
@@ -1163,6 +1282,79 @@ workspaces:
         assert_eq!(report2.auto_heal_count(), 0, "residual auto-heal: {report2:?}");
         let applied2 = apply_auto_heal(&["demo".to_string()], &report2);
         assert!(applied2.is_empty(), "second pass wrote: {applied2:?}");
+    }
+
+    #[test]
+    fn zen_cargo_test_check_gains_no_fail_fast_and_keeps_comments() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        // A fail-fast `cargo test` local check (the live-config shape), with a
+        // commented sibling build check to prove the surgical edit preserves
+        // authored comments and every other line.
+        let cfg = "\
+repo: /tmp/demo
+zen:
+  checks:
+    local:
+    - cargo build --workspace   # fast; full cargo test runs in CI
+    - cargo test --workspace
+  ci_timeout: 900
+";
+        let path = home.join("projects/demo.yaml");
+        std::fs::write(&path, cfg).unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            report.findings.iter().any(|f| f.code == "ZEN_CARGO_TEST_NO_FAIL_FAST"
+                && f.classification == Classification::AutoHeal),
+            "expected an AutoHeal cargo-test finding: {report:?}"
+        );
+
+        let applied = apply_auto_heal(&["demo".to_string()], &report);
+        assert!(
+            applied.iter().any(|c| c.code == "ZEN_CARGO_TEST_NO_FAIL_FAST"),
+            "nothing applied: {applied:?}"
+        );
+
+        let healed = std::fs::read_to_string(&path).unwrap();
+        // The test check gained --no-fail-fast right after the `test` token...
+        assert!(
+            healed.contains("- cargo test --no-fail-fast --workspace"),
+            "cargo test check not healed: {healed}"
+        );
+        // ...the build check and its inline comment are byte-for-byte intact...
+        assert!(
+            healed.contains("- cargo build --workspace   # fast; full cargo test runs in CI"),
+            "build check / comment not preserved: {healed}"
+        );
+        // ...and the rest of the file still parses with ci_timeout intact.
+        let v: Value = serde_yaml::from_str(&healed).unwrap();
+        assert_eq!(
+            get(&v, "zen")
+                .and_then(|z| get(z, "ci_timeout"))
+                .and_then(Value::as_u64),
+            Some(900)
+        );
+
+        // Disclosed on events.log, and idempotent (a second pass is clean).
+        let events = shelbi_state::events_log_path().unwrap();
+        let log = std::fs::read_to_string(&events).unwrap_or_default();
+        assert!(
+            log.contains("ZEN_CARGO_TEST_NO_FAIL_FAST"),
+            "no disclosure line: {log}"
+        );
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report2
+                .findings
+                .iter()
+                .any(|f| f.code == "ZEN_CARGO_TEST_NO_FAIL_FAST"),
+            "residual after heal: {report2:?}"
+        );
     }
 
     #[test]

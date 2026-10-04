@@ -8197,21 +8197,22 @@ fn run_one_check_with_shared_cargo_target(
     let output = run_check_script(host, &script);
     let elapsed = started.elapsed();
 
-    let (exit_code, combined) = match output {
+    let (exit_code, stdout, stderr) = match output {
         Ok(o) => {
             let code = o.status.code().unwrap_or(-1);
-            let mut buf = String::new();
-            buf.push_str(&String::from_utf8_lossy(&o.stdout));
-            if !o.stderr.is_empty() {
-                if !buf.is_empty() && !buf.ends_with('\n') {
-                    buf.push('\n');
-                }
-                buf.push_str(&String::from_utf8_lossy(&o.stderr));
-            }
-            (code, buf)
+            (
+                code,
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
         }
+        // The timeout / launch-failure notes are shelbi diagnostics, not tool
+        // output; route them through the stderr slot so they tail like any
+        // single-stream failure (there is no real stdout report to preserve
+        // alongside them in these cases).
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => (
             LOCAL_CHECK_TIMED_OUT_EXIT,
+            String::new(),
             format!(
                 "(shelbi: check exceeded the {}s local-check timeout and was terminated. \
                  This bound keeps a wedged check from stalling `shelbi zen probe` on a \
@@ -8220,10 +8221,14 @@ fn run_one_check_with_shared_cargo_target(
                 local_check_timeout().as_secs()
             ),
         ),
-        Err(e) => (-1, format!("(shelbi: failed to launch command: {e})\n")),
+        Err(e) => (
+            -1,
+            String::new(),
+            format!("(shelbi: failed to launch command: {e})\n"),
+        ),
     };
 
-    let tail = tail_lines(&combined, OUTPUT_TAIL_LINES);
+    let tail = build_output_tail(&stdout, &stderr, OUTPUT_TAIL_LINES);
     let tail = augment_command_not_found(host, cmd, exit_code, tail);
 
     LocalCheck {
@@ -8354,6 +8359,31 @@ fn ms_truncating(d: Duration) -> u64 {
     // by ~10 orders of magnitude; this is just defensive against
     // pathological `Duration` values from tests.
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Build a check's `output_tail` from its captured streams, keeping the tail of
+/// each independently when both carried output.
+///
+/// A check's actionable detail doesn't always live on the same stream. `cargo
+/// build` and `cargo clippy` write their errors to stderr, but `cargo test`
+/// prints the failing test's name, its `---- <test> stdout ----` block, the
+/// `failures:` summary, and each binary's `test result: FAILED` line to
+/// *stdout* — stderr carries only the `Running <binary>` lines and the trailing
+/// `error: test failed`. A single concatenated tail (stdout then stderr, last
+/// `n` lines) therefore buries the whole stdout failure report behind that
+/// trailing stderr noise, so the log ends up unable to say which test failed or
+/// why — the visibility bug this guards against. When both streams carried
+/// output we keep the tail of *each*, labeled, so neither is lost; when only one
+/// did we keep just that one, header-free (the common single-stream case).
+fn build_output_tail(stdout: &str, stderr: &str, n: usize) -> String {
+    let out = tail_lines(stdout, n);
+    let err = tail_lines(stderr, n);
+    match (out.is_empty(), err.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => out,
+        (true, false) => err,
+        (false, false) => format!("---- stdout ----\n{out}\n---- stderr ----\n{err}"),
+    }
 }
 
 /// Return the last `n` non-empty trailing lines of `s`, joined with `\n`.
@@ -9558,6 +9588,58 @@ mod probe_tests {
         assert_eq!(line_count, OUTPUT_TAIL_LINES);
         // Last line is line-199.
         assert!(res.output_tail.ends_with("line-199"));
+    }
+
+    #[test]
+    fn stdout_failure_detail_survives_a_stderr_flood() {
+        // The cargo-test visibility bug in miniature: the actionable failure
+        // report is on stdout (one distinctive line here; in `cargo test` it's
+        // the `---- <test> stdout ----` panic block and `failures:` summary),
+        // while stderr carries far more than `OUTPUT_TAIL_LINES` of trailing
+        // noise (cargo's per-binary `Running ...` + `error: test failed`). The
+        // old single-tail-of-concatenated-output dropped the stdout line
+        // entirely; the per-stream tail must keep it.
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path();
+        let flood = OUTPUT_TAIL_LINES * 2;
+        let res = run_one_check(
+            &Host::Local,
+            wt,
+            &format!(
+                "echo DISTINCTIVE_STDOUT_FAILURE; \
+                 i=0; while [ $i -lt {flood} ]; do echo noise-$i 1>&2; i=$((i+1)); done; \
+                 exit 1"
+            ),
+        );
+        assert_eq!(res.exit_code, 1);
+        assert!(
+            res.output_tail.contains("DISTINCTIVE_STDOUT_FAILURE"),
+            "stdout failure detail must survive a stderr flood; got: {}",
+            res.output_tail
+        );
+        // Both streams are labeled when both carried output, and the trailing
+        // stderr is still there too (the last noise line).
+        assert!(res.output_tail.contains("---- stdout ----"), "{}", res.output_tail);
+        assert!(res.output_tail.contains("---- stderr ----"), "{}", res.output_tail);
+        assert!(
+            res.output_tail.contains(&format!("noise-{}", flood - 1)),
+            "last stderr line must survive too; got: {}",
+            res.output_tail
+        );
+    }
+
+    #[test]
+    fn build_output_tail_keeps_single_stream_header_free() {
+        // Single-stream output (the build/clippy case) stays header-free and
+        // identical to a plain tail, so nothing downstream that reads a lone
+        // stream's tail changes shape.
+        assert_eq!(build_output_tail("a\nb\nc", "", 2), "b\nc");
+        assert_eq!(build_output_tail("", "x\ny\nz", 2), "y\nz");
+        assert_eq!(build_output_tail("", "", 5), "");
+        assert_eq!(
+            build_output_tail("out1\nout2", "err1\nerr2", 5),
+            "---- stdout ----\nout1\nout2\n---- stderr ----\nerr1\nerr2"
+        );
     }
 
     // --- rebase-onto-default before probing -------------------------------

@@ -737,6 +737,7 @@ fn sniff_project_registration(
     if let Some(zen) = get(&value, "zen") {
         sniff_zen_danger_paths(entry, text, zen, out);
         sniff_zen_checks_msrv(entry, text, zen, out);
+        sniff_zen_cargo_test_no_fail_fast(entry, text, zen, out);
     }
 }
 
@@ -1080,6 +1081,91 @@ fn sniff_zen_checks_msrv(entry: &InventoryEntry, text: &str, zen: &Value, out: &
     ));
 }
 
+/// The flag that makes `cargo test` run every test binary instead of aborting
+/// at the first failing one. Shared by the detect-side matcher and the
+/// apply-side rewrite ([`super::config_upgrade_apply`]) so the two can't
+/// disagree on its spelling.
+pub(crate) const CARGO_TEST_NO_FAIL_FAST_FLAG: &str = "--no-fail-fast";
+
+/// True when `cmd` is a `cargo test` invocation that would stop at the first
+/// failing test binary — i.e. it runs `cargo test` and doesn't already pass
+/// `--no-fail-fast`. On a loaded hub one failing binary otherwise hides every
+/// crate after it from the Zen probe (and the probe log can't say which test
+/// failed), so a local `cargo test` check wants `--no-fail-fast`.
+///
+/// Deliberately narrow: only a command whose first two whitespace tokens are
+/// exactly `cargo` then `test` matches, so a `cargo build`, a `cargo nextest
+/// run`, or a command that merely mentions cargo in an argument is never
+/// touched.
+pub(crate) fn cargo_test_without_no_fail_fast(cmd: &str) -> bool {
+    let mut tokens = cmd.split_whitespace();
+    if tokens.next() != Some("cargo") || tokens.next() != Some("test") {
+        return false;
+    }
+    !cmd.split_whitespace()
+        .any(|t| t == CARGO_TEST_NO_FAIL_FAST_FLAG)
+}
+
+/// Rewrite a fail-fast `cargo test` command to run every binary by inserting
+/// `--no-fail-fast` immediately after the `test` subcommand token, preserving
+/// the author's exact spacing elsewhere. Inserting it there (not appending)
+/// keeps it ahead of any `--` libtest separator and any shell continuation, so
+/// `cargo test --workspace -- --nocapture` and `cargo test --workspace && echo
+/// ok` both rewrite correctly. Returns `None` when `cmd` isn't a fail-fast
+/// `cargo test` (so the caller can safe-skip).
+pub(crate) fn insert_no_fail_fast(cmd: &str) -> Option<String> {
+    if !cargo_test_without_no_fail_fast(cmd) {
+        return None;
+    }
+    // `cargo` then `test` are the first two whitespace tokens, so the first
+    // `cargo` and the first `test` after it bound the subcommand token.
+    let cargo_end = cmd.find("cargo")? + "cargo".len();
+    let test_rel = cmd[cargo_end..].find("test")?;
+    let insert_at = cargo_end + test_rel + "test".len();
+    Some(format!(
+        "{} {CARGO_TEST_NO_FAIL_FAST_FLAG}{}",
+        &cmd[..insert_at],
+        &cmd[insert_at..]
+    ))
+}
+
+/// Flag a `zen.checks.local` list that carries a `cargo test` check without
+/// `--no-fail-fast` (see [`cargo_test_without_no_fail_fast`]). One finding per
+/// surface — the healer rewrites every matching line on that surface in a
+/// single pass, so a surface with several such checks surfaces (and heals)
+/// once. Shared by the project-registration and per-workflow `zen:` blocks.
+fn sniff_zen_cargo_test_no_fail_fast(
+    entry: &InventoryEntry,
+    text: &str,
+    zen: &Value,
+    out: &mut Vec<UpgradeFinding>,
+) {
+    let Some(local) = get(zen, "checks")
+        .and_then(|c| get(c, "local"))
+        .and_then(Value::as_sequence)
+    else {
+        return;
+    };
+    let Some(cmd) = local
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|c| cargo_test_without_no_fail_fast(c))
+    else {
+        return;
+    };
+    out.push(finding(
+        entry,
+        Classification::AutoHeal,
+        "ZEN_CARGO_TEST_NO_FAIL_FAST",
+        "a `zen.checks.local` `cargo test` check has no `--no-fail-fast`, so it stops at the \
+         first failing test binary — hiding every crate after it from the Zen probe and leaving \
+         the probe log unable to say which test failed",
+        "Add `--no-fail-fast` to the `cargo test` check so every binary runs and each failure is \
+         reported.",
+        locate_line_containing(text, cmd),
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // statuses.yaml
 
@@ -1155,10 +1241,12 @@ fn sniff_workflow(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFindi
         }
     }
 
-    // Per-workflow `zen.checks.local` override (the `app` / `remove-tmux-subtask`
-    // Rust tracks): same MSRV gap as the project-level checks.
+    // A per-workflow `zen:` block may override the project's local checks:
+    // same MSRV gap as the project-level checks (the `app` /
+    // `remove-tmux-subtask` Rust tracks) and the same `cargo test` fail-fast gap.
     if let Some(zen) = get(&value, "zen") {
         sniff_zen_checks_msrv(entry, text, zen, out);
+        sniff_zen_cargo_test_no_fail_fast(entry, text, zen, out);
     }
 }
 
@@ -2659,6 +2747,80 @@ mod tests {
         // The current single-key form is clean.
         let ok = project_findings("zen:\n  danger_paths:\n    extend: [.env]\n");
         assert!(codes(&ok).iter().all(|c| !c.starts_with("ZEN_DANGER")));
+    }
+
+    // ---- zen cargo-test --no-fail-fast ----------------------------------
+
+    #[test]
+    fn cargo_test_matcher_is_narrow() {
+        assert!(cargo_test_without_no_fail_fast("cargo test --workspace"));
+        assert!(cargo_test_without_no_fail_fast("cargo test"));
+        assert!(cargo_test_without_no_fail_fast("cargo test --workspace -- --nocapture"));
+        // Already fail-fast-proof, or a different subcommand/tool — never matched.
+        assert!(!cargo_test_without_no_fail_fast("cargo test --workspace --no-fail-fast"));
+        assert!(!cargo_test_without_no_fail_fast("cargo build --workspace"));
+        assert!(!cargo_test_without_no_fail_fast("cargo nextest run"));
+        assert!(!cargo_test_without_no_fail_fast("npm test"));
+        assert!(!cargo_test_without_no_fail_fast(""));
+    }
+
+    #[test]
+    fn insert_no_fail_fast_goes_after_the_test_token() {
+        assert_eq!(
+            insert_no_fail_fast("cargo test --workspace").unwrap(),
+            "cargo test --no-fail-fast --workspace"
+        );
+        // Stays ahead of a `--` libtest separator and a shell continuation.
+        assert_eq!(
+            insert_no_fail_fast("cargo test --workspace -- --nocapture").unwrap(),
+            "cargo test --no-fail-fast --workspace -- --nocapture"
+        );
+        assert_eq!(
+            insert_no_fail_fast("cargo test --workspace && echo ok").unwrap(),
+            "cargo test --no-fail-fast --workspace && echo ok"
+        );
+        assert!(insert_no_fail_fast("cargo build --workspace").is_none());
+    }
+
+    #[test]
+    fn zen_cargo_test_without_no_fail_fast_is_auto_heal() {
+        // The exact live-config shape: a build check (fine) plus a fail-fast
+        // `cargo test` check (flagged).
+        let fs = project_findings(
+            "zen:\n  checks:\n    local:\n    - cargo build --workspace\n    - cargo test --workspace\n",
+        );
+        let f = find(&fs, "ZEN_CARGO_TEST_NO_FAIL_FAST").expect("finding");
+        assert_eq!(f.classification, Classification::AutoHeal);
+    }
+
+    #[test]
+    fn zen_cargo_test_with_no_fail_fast_is_clean() {
+        let fs = project_findings(
+            "zen:\n  checks:\n    local:\n    - cargo test --workspace --no-fail-fast\n",
+        );
+        assert!(find(&fs, "ZEN_CARGO_TEST_NO_FAIL_FAST").is_none());
+    }
+
+    #[test]
+    fn workflow_zen_cargo_test_is_also_flagged() {
+        // A per-workflow `zen:` override carrying a fail-fast cargo test.
+        let e = entry(
+            "project.demo.workflow.task",
+            "project:demo",
+            SurfaceFormat::Yaml,
+        );
+        let mut out = Vec::new();
+        sniff_workflow(
+            &e,
+            "name: task\nstatuses: []\nzen:\n  checks:\n    local:\n    - cargo test --workspace\n",
+            &mut out,
+        );
+        assert_eq!(
+            find(&out, "ZEN_CARGO_TEST_NO_FAIL_FAST")
+                .expect("finding")
+                .classification,
+            Classification::AutoHeal
+        );
     }
 
     // ---- statuses --------------------------------------------------------
