@@ -1965,6 +1965,13 @@ pub fn resolve_workspace_launch(
 /// needed), and start the runner with an initial prompt. Bails on a dirty
 /// worktree so the user doesn't silently lose work.
 pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
+    // Cutover gate (`rt-cutover-migration`): on the session backend, never start
+    // an agent in a worktree that hasn't finished migrating off tmux — a
+    // surviving tmux agent may still hold it. A no-op on the tmux runtime. This
+    // is the chokepoint every dispatch path funnels through (CLI `task start`,
+    // the review/sidebar loader, and the poller's supervised redispatch), so
+    // the gate here covers them all.
+    crate::migration::ensure_workspace_dispatchable(&spec.project.name, &spec.workspace.name)?;
     let machine = spec
         .project
         .machine(&spec.workspace.machine)
@@ -2186,6 +2193,10 @@ fn cancelled_launch(task_id: &str, workspace: &str) -> Error {
 /// stale pane before the fresh one comes up), and the dispatch is still
 /// serialized against concurrent starts for the same workspace.
 pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
+    // Cutover gate (`rt-cutover-migration`), same as `start_workspace_on_task`:
+    // a resume is still a fresh agent in the worktree, so a pending workspace is
+    // refused until its tmux session is confirmed gone.
+    crate::migration::ensure_workspace_dispatchable(&spec.project.name, &spec.workspace.name)?;
     let machine = spec
         .project
         .machine(&spec.workspace.machine)

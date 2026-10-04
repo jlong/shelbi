@@ -28,6 +28,7 @@ pub mod handoff;
 pub mod lifecycle;
 pub mod load;
 pub mod machine;
+pub mod migration;
 pub mod mutate;
 pub mod poller;
 pub mod project_create;
