@@ -9178,8 +9178,11 @@ transitions:
         let feature_log =
             String::from_utf8_lossy(&git_in(&bare, &["log", "feature/x", "--format=%s"]).stdout)
                 .to_string();
+        // The squash is now titled after the branch's first commit (the
+        // feature it introduces: `task work`), not the generic
+        // `shelbi: merge <task> from <branch>` shape.
         assert!(
-            feature_log.contains("shelbi: merge subtask-a from subtask/subtask-a"),
+            feature_log.contains("task work"),
             "origin/feature/x must carry the squash merge; log: {feature_log:?}"
         );
         assert_eq!(

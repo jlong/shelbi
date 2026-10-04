@@ -55,8 +55,8 @@ use crate::git::{
     commit_subject, compose_pr_body, gh_pr_merge, locate_hub_workdir, locate_workspace_worktree,
     login_shell_prefix, lookup_merged_pr, lookup_open_pr_in_repository, lookup_origin_repository,
     lookup_origin_repository_selector, lookup_origin_repository_with_push_target,
-    lookup_pr_identity, parse_pr_number_from_url, run_in_dir,
-    run_login_shell_script_with_deadline, MergedPr, RepositoryIdentity,
+    lookup_pr_identity, parse_pr_number_from_url, pr_title, run_in_dir,
+    run_login_shell_script_with_deadline, squash_merge_subject, MergedPr, RepositoryIdentity,
 };
 use crate::workspace::{rebase_workspace_branch_onto_default, workspace_worktree, RebaseOutcome};
 
@@ -1998,13 +1998,20 @@ fn merge_via_pull_request(
 ) -> Result<PrMergeOutcome> {
     // Shares the exact `gh pr merge` primitive with the per-workflow `merge`
     // action and `shelbi merge`; here we pin the repo and the reviewed head so
-    // GitHub can only act on the commit Zen verified.
+    // GitHub can only act on the commit Zen verified. We also pin the squash
+    // title to the PR title so a feature-plus-fixup branch isn't retitled
+    // after the last commit (see `git::squash_merge_subject`).
+    let subject = squash_merge_subject(
+        &pr_title(host, wt, pr, Some(&repository.selector))?,
+        pr,
+    );
     let merge = gh_pr_merge(
         host,
         wt,
         pr,
         MergeStrategy::Squash,
         Some(&repository.selector),
+        Some(&subject),
         Some(&expected.integration_sha),
     )?;
     if !merge.status.success() {
@@ -3457,6 +3464,9 @@ case "$1 $2" in
         ;;
       *mergeCommit*)
         cat {merge_commit}
+        ;;
+      *"--json title"*)
+        printf 'reviewed feature title\n'
         ;;
       *headRefName*)
         printf '%s\n' {task_branch}

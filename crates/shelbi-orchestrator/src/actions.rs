@@ -47,7 +47,8 @@ use shelbi_core::{validate_branch, Column, Error, Host, MergeStrategy, Project, 
 use crate::git::{
     compose_pr_body, gh_pr_merge, head_commit_subject, locate_hub_workdir,
     locate_workspace_worktree, lookup_merged_pr, lookup_open_pr, lookup_pr_base,
-    parse_pr_number_from_url, run_in_dir, wait_for_merge_commit_sha,
+    parse_pr_number_from_url, pr_title, run_in_dir, squash_merge_subject,
+    wait_for_merge_commit_sha,
 };
 use crate::workspace::workspace_worktree;
 
@@ -1073,7 +1074,15 @@ fn sanitize_path_segment(s: &str) -> String {
 /// the merge commit yet after the polling window — see
 /// [`wait_for_merge_commit_sha`].
 fn merge_via_pr(host: &Host, wt: &str, pr: u64, strategy: MergeStrategy) -> Result<Option<String>> {
-    let out = gh_pr_merge(host, wt, pr, strategy, None, None)?;
+    // Pin the squash commit's title to the PR title so a bounce-and-rework
+    // cycle (feature commit + later fix-up) can't let GitHub title the merge
+    // after whichever commit landed last. Only squash needs it — a `--merge`
+    // keeps every commit, so there's no single title to get wrong.
+    let subject = match strategy {
+        MergeStrategy::Squash => Some(squash_merge_subject(&pr_title(host, wt, pr, None)?, pr)),
+        _ => None,
+    };
+    let out = gh_pr_merge(host, wt, pr, strategy, None, subject.as_deref(), None)?;
     if !out.status.success() {
         return Err(Error::Command {
             cmd: format!("gh pr merge {pr} {}", strategy.gh_flag()),
@@ -1244,11 +1253,16 @@ fn merge_and_push_in_worktree(
             if !worktree_has_staged_changes(host, tmp)? {
                 return Ok(HubMerge::AlreadyIntegrated);
             }
-            // `--squash` only stages; we still owe a commit. The message
-            // matches the legacy `shelbi merge` shape so log readers see
-            // the same prefix regardless of which path produced the
-            // commit.
-            let msg = format!("shelbi: merge {task_id} from {branch}");
+            // `--squash` only stages; we still owe a commit. Title it after
+            // the branch's *first* commit — the feature it introduces — not
+            // whichever commit happened to land last. A bounce-and-rework
+            // cycle (feature commit + later fix-up) must not retitle the
+            // merged change after the fix-up, mirroring the PR path's pinned
+            // `--subject`. Fall back to the legacy `shelbi merge` shape only
+            // if the first subject can't be read (it always can here: the
+            // branch is ahead of the target and staged changes exist).
+            let msg = first_commit_subject(host, tmp, target, &origin_branch)?
+                .unwrap_or_else(|| format!("shelbi: merge {task_id} from {branch}"));
             run_or_command_err(host, tmp, &["git", "commit", "-m", &msg], || {
                 format!("git -C {tmp} commit -m \"{msg}\"")
             })?;
@@ -1296,6 +1310,30 @@ fn merge_and_push_in_worktree(
 fn worktree_has_staged_changes(host: &Host, tmp: &str) -> Result<bool> {
     let out = run_in_dir(host, tmp, &["git", "diff", "--cached", "--quiet"])?;
     Ok(!out.status.success())
+}
+
+/// Subject of the *first* (oldest) commit the branch adds over the target —
+/// the feature it introduces. Used to title the hub-side squash commit so a
+/// feature-plus-fixup branch keeps the feature's title rather than the fix-up
+/// commit that landed last. `origin_branch` is `origin/<branch>`; the range
+/// `origin/<target>..origin/<branch>` is exactly the commits
+/// [`merge_hub_side`] already counted as "ahead". Returns `None` only when the
+/// range is somehow empty (every reachable commit already on the target),
+/// letting the caller fall back to a generic message.
+fn first_commit_subject(
+    host: &Host,
+    tmp: &str,
+    target: &str,
+    origin_branch: &str,
+) -> Result<Option<String>> {
+    let range = format!("origin/{target}..{origin_branch}");
+    // `--reverse` puts the oldest commit first; take its subject.
+    let out = run_capture_stdout(
+        host,
+        tmp,
+        &["git", "log", "--reverse", "--no-merges", "--format=%s", &range],
+    )?;
+    Ok(out.lines().next().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string))
 }
 
 /// Ancestry guard for [`merge_hub_side`]: refuse to squash-merge a branch
@@ -2761,9 +2799,9 @@ mod tests {
                 .to_string();
         assert_eq!(remote_sha, sha);
 
-        // The squash commit is a single new commit on origin/main (the
-        // message is shelbi's, not the workspace's), so log shape: init,
-        // then merge.
+        // The squash commit is a single new commit on origin/main, titled
+        // after the branch's first (only) commit, so log shape: init, then
+        // the squashed feature.
         let log = run_capture_stdout(
             &Host::Local,
             &wt,
@@ -2772,7 +2810,7 @@ mod tests {
         .unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 2, "{log}");
-        assert_eq!(lines[0], "shelbi: merge t from feature");
+        assert_eq!(lines[0], "feature work");
         assert_eq!(lines[1], "init");
 
         // The hub work_dir's checkout never moved — like the ViaPr path.
@@ -2859,7 +2897,44 @@ mod tests {
         )
         .unwrap();
         let dev_lines: Vec<&str> = dev_log.lines().collect();
-        assert_eq!(dev_lines[0], "shelbi: merge t from feature");
+        assert_eq!(dev_lines[0], "feature work");
+    }
+
+    /// The bug this task fixes, on the no-PR (hub-side) path: a branch with a
+    /// feature commit *and* a later fix-up commit must squash-merge under the
+    /// feature's title, not whichever commit landed last.
+    #[test]
+    fn hub_side_squash_titles_from_first_commit_not_fixup() {
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        // Feature commit first, then a fix-up on top — the shape that
+        // mistitled the merge after the fix-up.
+        run_git(&local, &["checkout", "feature"]);
+        std::fs::write(local.join("feature.txt"), "from feature\n").unwrap();
+        run_git(&local, &["add", "feature.txt"]);
+        run_git(&local, &["commit", "-q", "-m", "feat: implement the widget"]);
+        std::fs::write(local.join("feature.txt"), "from feature, fixed\n").unwrap();
+        run_git(&local, &["add", "feature.txt"]);
+        run_git(&local, &["commit", "-q", "-m", "fix: pin a dependency for MSRV"]);
+        run_git(&local, &["push", "origin", "feature"]);
+        run_git(&local, &["checkout", "main"]);
+        let wt = local.to_string_lossy().into_owned();
+
+        expect_merged_sha(
+            merge_hub_side(&Host::Local, &wt, "feature", "main", MergeStrategy::Squash, "t")
+                .unwrap(),
+        );
+
+        let log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "origin/main", "--format=%s"],
+        )
+        .unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        // One squash commit on top of init, titled after the feature commit.
+        assert_eq!(lines.len(), 2, "{log}");
+        assert_eq!(lines[0], "feat: implement the widget", "{log}");
+        assert_eq!(lines[1], "init");
     }
 
     #[test]
@@ -4075,6 +4150,7 @@ case "$*" in
   *"pr list"*"--head parent"*) echo 7 ;;
   *"pr list"*) : ;;
   *"baseRefName"*) echo develop ;;
+  *"--json title"*) echo "squash parent feature" ;;
   *"pr merge"*) : ;;
   *"state,mergeCommit"*) echo "MERGED feedfacecafebeef" ;;
 esac
@@ -4278,8 +4354,9 @@ transitions:
         )
         .unwrap();
         assert!(
-            feature_log.contains("shelbi: merge t from topic"),
-            "origin/feature must carry the squash merge; log: {feature_log}"
+            feature_log.contains("topic work"),
+            "origin/feature must carry the squash merge titled after topic's \
+             first commit; log: {feature_log}"
         );
         let main_after = run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/main"])
             .unwrap()
