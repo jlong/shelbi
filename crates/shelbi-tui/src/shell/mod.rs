@@ -17,6 +17,7 @@
 //! shelbi-app's [`ClientState`]. This crate adds no model logic.
 
 mod caps;
+mod overlays;
 mod session;
 mod sidebar;
 mod terminal_view;
@@ -47,14 +48,21 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::Terminal;
 
+use shelbi_app::command::CommandRegistry;
+use shelbi_app::exec::{Effect, Mutation};
 use shelbi_app::nav::{ClientState, Focus, View};
 use shelbi_app::refresh::{spawn_refresher, Snapshot};
 use shelbi_app::view::SidebarModel;
+use shelbi_app::CommandKind;
+use shelbi_state::keymap::{load_keymaps, GlobalAction, KeyChord, Keymaps};
 use shelbi_term::Size;
 
 use caps::Caps;
+use overlays::{ActiveOverlay, OverlayEvent};
 use session::{LiveConnector, MainState, SessionManager, SessionRef};
 use sidebar::{RowTarget, SidebarView};
+
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 /// The frame budget: redraws are capped at roughly 60 per second.
 const FRAME: Duration = Duration::from_millis(16);
@@ -127,6 +135,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         if state.sessions.poll() {
             state.dirty = true;
         }
+        if state.poll_job() {
+            state.dirty = true;
+        }
         if ring {
             let mut out = io::stdout();
             let _ = out.write_all(b"\x07");
@@ -168,6 +179,23 @@ struct ShellState {
     /// The one-time keyboard-protocol notice: shown from startup until its
     /// deadline, then cleared and never re-armed (see [`ShellState::notice_text`]).
     notice: Option<Notice>,
+    /// The open in-process overlay (removing-tmux Phase 4d), if any. Only one is
+    /// open at a time; while open it captures input and draws over the main area.
+    overlay: Option<ActiveOverlay>,
+    /// The user's keymaps (with this project's overrides), for the palette's
+    /// bindings and resolving the palette-open chord.
+    keymaps: Keymaps,
+    /// The configured palette-open chord (`GlobalAction::OpenPalette`). The
+    /// palette also always opens on Ctrl+Space (the plan's reserved key), so the
+    /// opener is the union of this chord and Ctrl+Space.
+    palette_chord: Option<KeyChord>,
+    /// A transient status line shown at the bottom of the main area (effect
+    /// results, deferred-feature notes, background-job outcomes).
+    status: Option<String>,
+    /// A pending off-UI-thread job; its `String` is the status to show when it
+    /// finishes. Blocking commands (e.g. the Zen toggle) run here so they never
+    /// freeze the one event loop.
+    job: Option<Receiver<String>>,
     should_quit: bool,
     dirty: bool,
 }
@@ -184,6 +212,13 @@ impl ShellState {
             text,
             until: Instant::now() + Duration::from_secs(NOTICE_SECS),
         });
+        // Load the keymaps once (the palette's bindings and the opener chord come
+        // from here); a load failure degrades to the embedded defaults.
+        let (keymaps, _diags) = load_keymaps(Some(project));
+        let palette_chord = keymaps
+            .global
+            .first_chord_for(GlobalAction::OpenPalette)
+            .copied();
         Self {
             client: ClientState::new(project),
             sessions: SessionManager::new(project, connector),
@@ -195,6 +230,11 @@ impl ShellState {
             reported_main: None,
             search_input: None,
             notice,
+            overlay: None,
+            keymaps,
+            palette_chord,
+            status: None,
+            job: None,
             should_quit: false,
             dirty: true,
         }
@@ -221,8 +261,28 @@ impl ShellState {
             let view = SidebarView::build(&sidebar);
             self.client.clamp_selection(view.selectable_count());
             self.sidebar_model = Some(sidebar);
+            // Keep an open palette's command list warm as the board refreshes.
+            // Compute the entries first so the `&mut self.overlay` borrow doesn't
+            // overlap the `&self` read in `palette_entries_from_model`.
+            if self.overlay.is_some() {
+                let entries = self.palette_entries_from_model();
+                if let Some(ov) = &mut self.overlay {
+                    ov.refresh_palette(entries);
+                }
+            }
             self.dirty = true;
         }
+    }
+
+    /// Build the palette's entries from the current sidebar model via the
+    /// shelbi-app command registry. Empty before the first snapshot lands.
+    fn palette_entries_from_model(&self) -> Vec<shelbi_palette::Entry> {
+        let (Some(project), Some(sidebar)) = (self.client.project(), self.sidebar_model.as_ref())
+        else {
+            return Vec::new();
+        };
+        let model = overlays::build_command_model(project, sidebar);
+        CommandRegistry::new().entries(&model)
     }
 
     fn sidebar_view(&self) -> Option<SidebarView> {
@@ -268,6 +328,32 @@ impl ShellState {
     // --- event handling ----------------------------------------------------
 
     fn handle_event(&mut self, ev: Event) {
+        // An open overlay captures input: keys and clicks drive it, not the
+        // sidebar or the agent beneath it.
+        if self.overlay.is_some() {
+            match ev {
+                Event::Key(k) if terminal_view::is_actionable(&k) => {
+                    let outcome = self
+                        .overlay
+                        .as_mut()
+                        .unwrap()
+                        .handle_key(k, &self.keymaps);
+                    self.apply_overlay_event(outcome);
+                    self.dirty = true;
+                }
+                Event::Mouse(m) => {
+                    let area = self.main_rect;
+                    let outcome = self.overlay.as_mut().unwrap().handle_mouse(m, area);
+                    self.apply_overlay_event(outcome);
+                    self.dirty = true;
+                }
+                Event::Resize(_, _) => self.dirty = true,
+                // Bracketed paste, focus changes, and key releases are ignored
+                // while an overlay is up.
+                _ => {}
+            }
+            return;
+        }
         match ev {
             Event::Key(k) => self.handle_key(k),
             Event::Mouse(m) => self.handle_mouse(m),
@@ -291,11 +377,234 @@ impl ShellState {
         if !terminal_view::is_actionable(&k) {
             return;
         }
+        // The palette-open chord opens the command palette from anywhere — a
+        // focused terminal view or the sidebar. This replaces the interim
+        // Ctrl+Space focus-toggle from rt-tui-shell.
+        if self.is_palette_open(&k) {
+            self.open_palette();
+            self.dirty = true;
+            return;
+        }
         if self.focus_is_main() {
             self.handle_main_key(k);
         } else {
             self.handle_sidebar_key(k);
         }
+    }
+
+    /// Whether `k` opens the palette: the configured `OpenPalette` chord, or
+    /// Ctrl+Space (the plan's permanent reserved key; also delivered as Ctrl+@
+    /// by many terminals).
+    fn is_palette_open(&self, k: &KeyEvent) -> bool {
+        if terminal_view::is_focus_key(k) {
+            return true;
+        }
+        match self.palette_chord {
+            Some(chord) => crate::keymap::chord_from_event(*k) == Some(chord),
+            None => false,
+        }
+    }
+
+    /// Open the command palette over the current registry entries.
+    fn open_palette(&mut self) {
+        let label = self
+            .sidebar_model
+            .as_ref()
+            .map(|s| s.project_label.clone())
+            .or_else(|| self.client.project().map(str::to_string))
+            .unwrap_or_default();
+        let entries = self.palette_entries_from_model();
+        self.overlay = Some(ActiveOverlay::palette(&label, entries));
+    }
+
+    /// Act on what the active overlay yielded.
+    fn apply_overlay_event(&mut self, event: OverlayEvent) {
+        match event {
+            OverlayEvent::Stay => {}
+            OverlayEvent::Close => {
+                self.overlay = None;
+                self.client.focus_main();
+            }
+            OverlayEvent::FocusSidebar => {
+                self.overlay = None;
+                self.client.focus_sidebar();
+            }
+            OverlayEvent::RunEntry(entry) => {
+                // Close the palette first; the command's effect may open a
+                // different overlay (error log / Zen intro) in its place.
+                self.overlay = None;
+                self.client.focus_main();
+                self.run_entry(&entry);
+            }
+            OverlayEvent::ReviewConfirmed { task_id, slot } => {
+                self.overlay = None;
+                self.client.focus_main();
+                // The confirm dialog returns the chosen slot as a value; wiring
+                // it to the load-for-review transition is the review interface
+                // (rt-tui-review, Phase 4e).
+                self.status = Some(format!(
+                    "Load {task_id} onto {slot} — review loading lands in the review interface"
+                ));
+            }
+            OverlayEvent::ReviewCancelled => {
+                self.overlay = None;
+                self.client.focus_main();
+            }
+            OverlayEvent::Rejected { task_id, reason } => {
+                self.overlay = None;
+                self.client.focus_main();
+                let _ = &reason;
+                self.status = Some(format!(
+                    "Reject {task_id} — submitting the reason lands in the review interface"
+                ));
+            }
+            OverlayEvent::ZenResult {
+                project,
+                confirmed,
+                dont_show_again,
+            } => {
+                self.overlay = None;
+                self.client.focus_main();
+                self.apply_zen_intro(project, confirmed, dont_show_again);
+            }
+        }
+    }
+
+    /// Resolve a palette entry to its command effect and dispatch it.
+    fn run_entry(&mut self, entry: &shelbi_palette::Entry) {
+        let Some(project) = self.client.project().map(str::to_string) else {
+            return;
+        };
+        match CommandKind::from_id(&entry.id) {
+            Some(kind) => {
+                let effect = kind.effect_with_project(&project);
+                self.dispatch_effect(effect);
+            }
+            None => self.status = Some(format!("unknown command: {}", entry.id)),
+        }
+    }
+
+    /// Carry out a command [`Effect`]. Navigation effects change the main view
+    /// directly; the error log and Zen intro open as overlays; the Zen toggle
+    /// runs off the UI thread. Effects whose home is a later Phase 4 subtask
+    /// (switch/add/quit project, opening an external editor, loading a review)
+    /// surface a status note rather than silently doing nothing.
+    fn dispatch_effect(&mut self, effect: Effect) {
+        match effect {
+            Effect::ShowView(v) => self.show_view_effect(v),
+            Effect::FocusWorkspace { workspace, .. } => {
+                self.show(RowTarget::Session(SessionRef::Workspace(workspace)))
+            }
+            Effect::LoadReview { task_id, .. } => self.show(RowTarget::Review(task_id)),
+            Effect::FocusSession { session } => {
+                self.status = Some(format!(
+                    "focus session {session} — legacy spawned agents aren't shown here yet"
+                ))
+            }
+            Effect::OpenErrorLog { project } => {
+                self.overlay = Some(ActiveOverlay::error_log(project));
+            }
+            Effect::OpenEditor { target } => {
+                self.status = Some(format!(
+                    "edit {target:?} — opening an external editor lands in a later Phase 4 subtask"
+                ))
+            }
+            Effect::SwitchProject { project } => {
+                self.status = Some(format!(
+                    "switch to {project} — project switching lands in Phase 4f"
+                ))
+            }
+            Effect::AddProject => {
+                self.status = Some("Add project lands in Phase 4f".into())
+            }
+            Effect::QuitProject { .. } => {
+                self.status = Some("Quit Project lands in Phase 4f".into())
+            }
+            Effect::QuitShelbi => {
+                self.status = Some("Quit Shelbi lands in Phase 4f".into())
+            }
+            Effect::Mutate(Mutation::ToggleZen { project }) => self.toggle_zen(project),
+            Effect::Mutate(other) => {
+                self.status = Some(format!("mutation {other:?} is not reachable from the palette"))
+            }
+        }
+    }
+
+    /// Navigate to a view. Native views swap the main area; the orchestrator
+    /// "chat" and workspace session views bind a terminal view.
+    fn show_view_effect(&mut self, v: View) {
+        match v {
+            View::Issues | View::Activity | View::Machines => self.show(RowTarget::Native(v)),
+            View::Session(name) if name == "orch" => {
+                self.show(RowTarget::Session(SessionRef::Orchestrator))
+            }
+            View::Session(name) => self.show(RowTarget::Session(SessionRef::Workspace(name))),
+        }
+    }
+
+    /// Toggle Zen Mode. On a first off→on transition the intro overlay shows
+    /// first (and performs the toggle on confirm); otherwise the toggle runs off
+    /// the UI thread.
+    fn toggle_zen(&mut self, project: String) {
+        if overlays::should_show_zen_intro(&project) {
+            self.overlay = Some(ActiveOverlay::zen_intro(project));
+            return;
+        }
+        self.spawn_job(move || match toggle_zen_blocking(&project) {
+            Ok(msg) => msg,
+            Err(e) => format!("Zen toggle failed: {e}"),
+        });
+    }
+
+    /// Apply the Zen-intro result off the UI thread: persist the "don't show
+    /// again" flag, and toggle Zen on confirm. Mirrors the tmux palette's
+    /// `apply_zen_intro_result`.
+    fn apply_zen_intro(&mut self, project: String, confirmed: bool, dont_show_again: bool) {
+        self.spawn_job(move || {
+            if dont_show_again {
+                let _ = shelbi_state::mark_zen_intro_seen();
+            }
+            if !confirmed {
+                return "Zen Mode: cancelled".to_string();
+            }
+            match toggle_zen_blocking(&project) {
+                Ok(msg) => msg,
+                Err(e) => format!("Zen toggle failed: {e}"),
+            }
+        });
+    }
+
+    /// Spawn `f` on a worker thread; its returned string becomes the status line
+    /// when it finishes. Blocking commands run here so they never freeze the one
+    /// event loop (plan: "commands that can block run off the UI thread").
+    fn spawn_job(&mut self, f: impl FnOnce() -> String + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if std::thread::Builder::new()
+            .name("shelbi-shell-job".into())
+            .spawn(move || {
+                let _ = tx.send(f());
+            })
+            .is_ok()
+        {
+            self.status = Some("working…".to_string());
+            self.job = Some(rx);
+        }
+    }
+
+    /// Poll a pending off-thread job without blocking. Returns `true` when it
+    /// finished (so the caller redraws the status line).
+    fn poll_job(&mut self) -> bool {
+        let done = match &self.job {
+            Some(rx) => match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => "job stopped unexpectedly".to_string(),
+            },
+            None => return false,
+        };
+        self.job = None;
+        self.status = Some(done);
+        true
     }
 
     fn handle_sidebar_key(&mut self, k: KeyEvent) {
@@ -308,8 +617,6 @@ impl ShellState {
             KeyCode::Down | KeyCode::Tab => self.client.select_down(count),
             KeyCode::BackTab => self.client.select_up(),
             KeyCode::Enter => self.activate_selection(),
-            // Ctrl+Space toggles back to the main area.
-            _ if terminal_view::is_focus_key(&k) => self.client.focus_main(),
             KeyCode::Char('q') => self.should_quit = true,
             _ => {}
         }
@@ -317,13 +624,6 @@ impl ShellState {
     }
 
     fn handle_main_key(&mut self, k: KeyEvent) {
-        // Ctrl+Space always returns focus to the sidebar (until overlays land).
-        if terminal_view::is_focus_key(&k) {
-            self.client.focus_sidebar();
-            self.dirty = true;
-            return;
-        }
-
         // A scrollback search prompt captures typing.
         if let Some(mut buf) = self.search_input.take() {
             match k.code {
@@ -499,6 +799,21 @@ fn contains(area: Rect, x: u16, y: u16) -> bool {
     x >= area.left() && x < area.right() && y >= area.top() && y < area.bottom()
 }
 
+/// Toggle Zen Mode for `project` (a blocking call: it reconciles the daemon
+/// version first). Returns a status string; errors are stringified so the
+/// worker closure stays self-contained.
+fn toggle_zen_blocking(project: &str) -> Result<String, String> {
+    shelbi_state::ensure_daemon_matches_for_mutation().map_err(|e| e.to_string())?;
+    let state =
+        shelbi_state::toggle_zen_mode(project, "user:palette").map_err(|e| e.to_string())?;
+    let word = if matches!(state, shelbi_state::ZenModeState::Off) {
+        "disabled"
+    } else {
+        "enabled"
+    };
+    Ok(format!("Zen Mode {word}"))
+}
+
 // --- rendering -------------------------------------------------------------
 
 fn draw(
@@ -532,6 +847,11 @@ fn draw(
     // cleared for good (so it is emitted exactly once per run).
     let notice = state.notice_text(Instant::now());
     let searching = state.search_input.clone();
+    let status = state.status.clone();
+    // Take the overlay out so the draw closure can render it with a mutable
+    // borrow while it holds shared borrows of the rest of `state`; it is put
+    // back right after the draw.
+    let mut overlay = state.overlay.take();
 
     // Borrow what the closure needs.
     let sidebar_view = state.sidebar_view();
@@ -579,6 +899,10 @@ fn draw(
         // Scrollback search prompt (bottom of the main area).
         if let Some(q) = &searching {
             render_search_prompt(buf, main_rect, q);
+        } else if let Some(s) = &status {
+            // A one-line status note on the main area's bottom row (effect
+            // results, deferred-feature notes, background-job outcomes).
+            render_status(buf, main_rect, s);
         }
 
         // One-time keyboard-protocol notice.
@@ -586,15 +910,55 @@ fn draw(
             render_notice(buf, area, text);
         }
 
-        if let Some((x, y)) = cursor {
+        // Dim the main area under an open overlay so the modal reads as on top
+        // (the overlay's own `Clear` un-dims the cells it occupies).
+        if overlay.is_some() {
+            dim_area(buf, main_rect);
+        }
+
+        // An open overlay draws over the dimmed main area and owns the cursor.
+        if let Some(ov) = overlay.as_mut() {
+            ov.render(frame, main_rect);
+        } else if let Some((x, y)) = cursor {
             frame.set_cursor_position(Position::new(x, y));
         }
     });
+    state.overlay = overlay;
     if begin.is_ok() {
         let _ = execute!(io::stdout(), EndSynchronizedUpdate);
     }
     res.context("drawing the shell")?;
     Ok(())
+}
+
+/// Dim every cell in `area` (the terminal view behind an open overlay) so the
+/// modal on top reads as focused. The overlay's own `Clear` restores full
+/// brightness within its rect.
+fn dim_area(buf: &mut ratatui::buffer::Buffer, area: Rect) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_style(Style::default().add_modifier(Modifier::DIM));
+            }
+        }
+    }
+}
+
+fn render_status(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let y = area.bottom() - 1;
+    let style = Style::default()
+        .bg(Color::Rgb(40, 40, 50))
+        .fg(Color::Gray);
+    let label = format!(" {text} ");
+    for (x, ch) in (area.left()..area.right()).zip(label.chars().chain(std::iter::repeat(' '))) {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_char(ch);
+            cell.set_style(style);
+        }
+    }
 }
 
 /// Split `area` into (sidebar, main). The sidebar is clamped to leave room for
@@ -845,16 +1209,61 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_space_toggles_focus_between_main_and_sidebar() {
+    fn ctrl_space_opens_the_palette_from_the_terminal_view() {
+        // rt-tui-overlays replaces the interim focus-toggle: Ctrl+Space from a
+        // focused terminal view opens the command palette overlay.
         let mut st = test_state();
         st.client.focus_main();
-        assert!(st.focus_is_main());
-        // Ctrl+Space from the main area moves focus to the sidebar.
+        assert!(st.overlay.is_none());
         st.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
-        assert_eq!(st.client.focus(), Focus::Sidebar);
-        // And back again.
+        assert!(
+            matches!(st.overlay, Some(ActiveOverlay::Palette(_))),
+            "Ctrl+Space opens the palette"
+        );
+    }
+
+    #[test]
+    fn ctrl_space_opens_the_palette_from_the_sidebar_too() {
+        let mut st = test_state();
+        st.client.focus_sidebar();
         st.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
-        assert!(st.focus_is_main());
+        assert!(matches!(st.overlay, Some(ActiveOverlay::Palette(_))));
+    }
+
+    #[test]
+    fn palette_esc_returns_to_the_agent_and_tab_focuses_the_sidebar() {
+        // Esc closes the palette and returns focus to the main terminal view.
+        let mut st = test_state();
+        st.client.focus_main();
+        st.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        assert!(st.overlay.is_some());
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(st.overlay.is_none(), "Esc closes the palette");
+        assert!(st.focus_is_main(), "focus returns to the agent");
+
+        // Tab closes the palette and moves focus to the sidebar.
+        st.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        assert!(st.overlay.is_some());
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(st.overlay.is_none(), "Tab closes the palette");
+        assert_eq!(st.client.focus(), Focus::Sidebar, "Tab moves focus to the sidebar");
+    }
+
+    #[test]
+    fn palette_lists_the_registry_commands_from_the_sidebar_model() {
+        // The open palette's entries come from the shelbi-app command registry,
+        // built from the shell's sidebar model — so the nav views, the Zen
+        // toggle, workspaces, and the error-log action are all reachable.
+        let mut st = test_state();
+        st.open_palette();
+        let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+            panic!("palette should be open");
+        };
+        let ids: Vec<String> = p.results().into_iter().map(|(e, _)| e.id).collect();
+        assert!(ids.contains(&"view:tasks".to_string()), "Issues view reachable");
+        assert!(ids.contains(&"action:toggle-zen".to_string()), "Zen toggle reachable");
+        assert!(ids.contains(&"workspace:alpha".to_string()), "workspace reachable");
+        assert!(ids.contains(&"action:error-log".to_string()), "error log reachable");
     }
 
     #[test]

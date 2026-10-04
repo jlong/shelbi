@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use shelbi_app::nav::Focus;
 use shelbi_client::{Connection, SessionEvent, SessionEvents};
 use shelbi_proto::capability;
 use shelbi_session::layout::SessionPaths;
@@ -232,12 +231,11 @@ fn every_key_but_ctrl_space_reaches_the_agent_over_a_real_pty() {
         "Shift+Enter under the kitty protocol should reach the agent as ESC[13;2u: {out:?}"
     );
 
-    // --- Ctrl+Space is reserved: it never reaches the agent -------------------
+    // --- Ctrl+Space is reserved: it opens the palette, never reaching the agent
     st.handle_key(KeyEvent::new(KeyCode::Char(' '), CTRL));
-    assert_eq!(
-        st.client.focus(),
-        Focus::Sidebar,
-        "Ctrl+Space moves focus to the sidebar instead of going to the agent"
+    assert!(
+        matches!(st.overlay, Some(super::ActiveOverlay::Palette(_))),
+        "Ctrl+Space opens the command palette instead of going to the agent"
     );
     // Give any (erroneously) forwarded byte time to echo back, then confirm the
     // agent never saw the NUL that Ctrl+Space would encode to.

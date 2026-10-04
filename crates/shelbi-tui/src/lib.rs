@@ -27,6 +27,7 @@ mod kanban;
 mod keymap;
 mod layout_sub;
 mod markdown;
+pub mod overlay;
 mod review_panel;
 mod shell;
 mod sidebar;
