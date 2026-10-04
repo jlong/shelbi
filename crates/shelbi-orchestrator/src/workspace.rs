@@ -1871,11 +1871,15 @@ const REVIEW_SERVER_TERM_GRACE: std::time::Duration = std::time::Duration::from_
 /// It only ever signals a pgid our own wrapper wrote — never "whatever holds
 /// the port" — so a server the user started by hand is never touched. A
 /// `kill(-pgid, 0)` liveness probe guards against a recycled pid whose group is
-/// already gone, and the `> 1` floor in [`shelbi_state::read_review_serve_pgid`]
-/// makes it impossible to target init / every process. A missing record is a
-/// no-op, which is why this is safe on every `kill_workspace_pane` (dev slots
-/// and remote review slots simply have no record). Best-effort throughout: a
-/// read error degrades to the pre-fix behavior rather than blocking teardown.
+/// already gone, the `> 1` floor in [`shelbi_state::read_review_serve_pgid`]
+/// makes it impossible to target init / every process, and
+/// [`terminate_process_group`] additionally refuses our *own* process group so a
+/// pid-recycled record that collides with it (e.g. under `shelbi zen probe`,
+/// where the whole `cargo test --workspace` suite shares one group) can never
+/// turn teardown into a SIGTERM of the caller. A missing record is a no-op,
+/// which is why this is safe on every `kill_workspace_pane` (dev slots and
+/// remote review slots simply have no record). Best-effort throughout: a read
+/// error degrades to the pre-fix behavior rather than blocking teardown.
 pub(crate) fn stop_review_server(workspace: &str) {
     let pgid = match shelbi_state::read_review_serve_pgid(workspace) {
         Ok(Some(p)) => p,
@@ -1891,14 +1895,39 @@ pub(crate) fn stop_review_server(workspace: &str) {
     let _ = shelbi_state::clear_review_serve_pgid(workspace);
 }
 
+/// May we `kill(-pgid, …)` `pgid` from a process whose own group is `own_pgid`?
+///
+/// Refuses two classes of target, both of which would signal far more than the
+/// review server this is meant to reap:
+///
+/// * `pgid <= 1` — `kill(-0, …)` addresses the caller's own group and
+///   `kill(-1, …)` every process the caller may signal.
+/// * `pgid == own_pgid` — our own process group. This is the guard that keeps
+///   `shelbi zen probe` safe: the probe runs `cargo test --workspace` through
+///   [`shelbi_ssh::run_with_deadline`], which puts the whole suite in one
+///   process group, so every test binary shares that group. A stale or
+///   pid-recycled review-serve pgid record that happens to name it would
+///   otherwise make `terminate_process_group` SIGTERM the entire test run
+///   mid-flight (observed as the orchestrator lib binary dying with signal 15).
+///   A real review server is always `setsid`'d into its *own* group, so it can
+///   never equal ours — this never skips a legitimate teardown.
+#[cfg(unix)]
+fn pgid_is_safe_to_signal(pgid: i32, own_pgid: i32) -> bool {
+    pgid > 1 && pgid != own_pgid
+}
+
 /// SIGTERM → brief wait → SIGKILL the process group `pgid`. Returns whether a
 /// live group was found (and thus signaled).
 ///
-/// Hard safety bound: a `pgid <= 1` or an already-dead group is a no-op, since
-/// `kill(-pgid, …)` with `0`/`1` would target the caller's own group or init.
+/// Hard safety bound: anything [`pgid_is_safe_to_signal`] rejects (a `pgid <= 1`
+/// or our own process group) and an already-dead group are no-ops, so this can
+/// never signal the caller's own group — see that function for why the probe
+/// depends on it.
 #[cfg(unix)]
 fn terminate_process_group(pgid: i32) -> bool {
-    if pgid <= 1 {
+    // Safety: `getpgrp()` only reads the caller's process-group id.
+    let own_pgid = unsafe { libc::getpgrp() } as i32;
+    if !pgid_is_safe_to_signal(pgid, own_pgid) {
         return false;
     }
     // Safety: `kill(2)` touches no memory. A negative pid addresses the whole
@@ -10122,6 +10151,53 @@ mod user_shell_tmux_tests {
         std::env::set_var("SHELBI_HOME", &home);
         // No pgid file written → must not panic and must leave no record.
         stop_review_server("rev");
+        assert!(shelbi_state::read_review_serve_pgid("rev").unwrap().is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// `terminate_process_group` must never signal the caller's own process
+    /// group or the `0`/`1` wildcards, regardless of how such a value reached
+    /// the pgid record. Pure decision check — no signals are sent — so it can
+    /// state the invariant without any risk of killing the test runner.
+    #[cfg(unix)]
+    #[test]
+    fn pgid_is_safe_to_signal_rejects_our_own_group_and_wildcards() {
+        let own = 4242;
+        // Our own group: under `shelbi zen probe` the whole `cargo test
+        // --workspace` tree shares one group, so signaling it would terminate
+        // the probe mid-run. This is the regression guard.
+        assert!(!pgid_is_safe_to_signal(own, own));
+        // `kill(-0, …)` hits the caller's group, `kill(-1, …)` every process.
+        assert!(!pgid_is_safe_to_signal(0, own));
+        assert!(!pgid_is_safe_to_signal(1, own));
+        // A real, foreign pgid (a `setsid`'d review server) is still signalable.
+        assert!(pgid_is_safe_to_signal(own + 1, own));
+        assert!(pgid_is_safe_to_signal(999_999, own));
+    }
+
+    /// End-to-end guard: a pgid record that collides with our own process group
+    /// (the pid-recycling hazard that kills a `shelbi zen probe`) makes
+    /// `stop_review_server` a no-op rather than a SIGTERM of the test binary.
+    /// If the own-group guard regresses, this call SIGTERMs the whole
+    /// `cargo test` group and the run dies here — a loud, intentional tripwire.
+    #[cfg(unix)]
+    #[test]
+    fn stop_review_server_refuses_a_record_that_names_our_own_group() {
+        let _g = crate::test_lock::acquire();
+        let tmp = review_server_test_tmpdir("stop-review-server-self-group");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Safety: `getpgrp()` only reads our process-group id.
+        let own_pgid = unsafe { libc::getpgrp() } as i32;
+        let path = shelbi_state::review_serve_pgid_path("rev").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{own_pgid}\n")).unwrap();
+
+        // Must not signal our own group; still clears the (bogus) record.
+        stop_review_server("rev");
+
         assert!(shelbi_state::read_review_serve_pgid("rev").unwrap().is_none());
         std::env::remove_var("SHELBI_HOME");
     }
