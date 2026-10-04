@@ -28,6 +28,9 @@
 //!   protocol enabled, 10,000 lines of scrollback.
 //! - [`history`] — the bounded recent-bytes ring and the optional raw output log.
 //! - [`transport`] — the Unix-socket frame server (frozen-core subset).
+//! - [`daemon_watchdog`] — a background thread that restarts a crashed hub
+//!   daemon while this session's project is open (the service units are retired,
+//!   so sessions are the watchers).
 //!
 //! ## What this crate does *not* do
 //!
@@ -37,6 +40,7 @@
 //! kill, and the cheap resize/snapshot/input/live-output) to run a session end
 //! to end and to test it.
 
+pub mod daemon_watchdog;
 pub mod emulator;
 pub mod history;
 pub mod layout;
