@@ -67,6 +67,10 @@ impl Session {
             task: None,
             raw_output_log: false,
             child_argv: child_argv.iter().map(|s| s.to_string()).collect(),
+            // No daemon watchdog in-process: it loops reading the global
+            // `$SHELBI_HOME` this harness mutates per test, which would be a
+            // data race (see `RunArgs::manage_daemon`).
+            manage_daemon: false,
         };
         let handle = std::thread::spawn(move || shelbi_session::run(args));
         wait_for(Duration::from_secs(5), || paths.sock().exists().then_some(()))
@@ -196,6 +200,16 @@ fn attach_replays_a_snapshot_then_streams_live_output() {
         &["/bin/sh", "-c", "printf READYMARK; exec sleep 30"],
     );
     let (conn, events) = sess.client();
+
+    // The reader thread feeds the child's first output into the emulator a short
+    // moment after the socket appears — longer when the machine is loaded (the
+    // reader is just another thread competing to be scheduled). Wait for the
+    // marker to be drawn *before* attaching so the resync replay is guaranteed to
+    // carry it; otherwise a snapshot raced in that window is legitimately empty.
+    wait_for(Duration::from_secs(5), || {
+        conn.snapshot(None).ok().filter(|s| s.text.contains("READYMARK"))
+    })
+    .expect("child output should be drawn into the session");
     conn.attach(None).unwrap();
 
     // The attach replay is a byte stream reconstructing the emulator; the cells
@@ -495,8 +509,15 @@ fn info_snapshot_setmeta_and_detach_work() {
     assert!(info.child_running);
     assert_eq!(info.argv.first().map(String::as_str), Some("/bin/sh"));
 
-    // snapshot: the visible screen text.
-    let snap = conn.snapshot(None).expect("snapshot");
+    // snapshot: the visible screen text. Poll rather than taking a single shot:
+    // the reader thread may not have fed the child's first output into the
+    // emulator yet at this instant, especially under load (it did within ~16ms in
+    // practice). The marker is delivered reliably — the test just has to wait for
+    // it instead of racing the reader.
+    let snap = wait_for(Duration::from_secs(5), || {
+        conn.snapshot(None).ok().filter(|s| s.text.contains("HELLOINFO"))
+    })
+    .expect("snapshot should show child output");
     assert!(snap.text.contains("HELLOINFO"), "snapshot should show child output: {:?}", snap.text);
 
     // set-meta: update name + task, reflected in meta.json and a later info.

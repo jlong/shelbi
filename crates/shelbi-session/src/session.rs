@@ -87,6 +87,16 @@ pub struct RunArgs {
     pub raw_output_log: bool,
     /// The child program and its arguments.
     pub child_argv: Vec<String>,
+    /// Whether this session acts as a daemon watchdog (see
+    /// [`crate::daemon_watchdog`]). True for a real `shelbi __session`; set
+    /// `false` by in-process tests that drive [`run`] on a thread. The watchdog
+    /// loops for the life of the process reading the global `$SHELBI_HOME`, so a
+    /// test that mutates that env var per case (the standard per-test temp-home
+    /// pattern) would otherwise race the watchdog's reads — a data race that
+    /// stays hidden while a short run finishes before the first ~15s tick, but
+    /// surfaces under a long, loaded `cargo test --workspace` where a tick lands
+    /// mid-suite. A test session also has no daemon to keep alive.
+    pub manage_daemon: bool,
 }
 
 /// The monotonic output-stream gate: it hands out a sequence number for each
@@ -406,7 +416,11 @@ pub fn run(args: RunArgs) -> Result<()> {
 
     // Watch the hub daemon: with the service units retired, an open project's
     // sessions are what bring a crashed daemon back (see `daemon_watchdog`).
-    crate::daemon_watchdog::spawn(&args.name);
+    // In-process tests opt out (`manage_daemon: false`): the watchdog's
+    // long-lived env reads would race their per-test `$SHELBI_HOME` mutation.
+    if args.manage_daemon {
+        crate::daemon_watchdog::spawn(&args.name);
+    }
 
     // --- PTY + child -----------------------------------------------------
     let pty = native_pty_system();
