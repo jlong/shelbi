@@ -478,6 +478,29 @@ fn run_review_session_job(req: ReviewSessionRequest, tx: Sender<ServerMsg>) {
             review_session::ensure_content_session(&req.project, &req.task, role)
         }
         ReviewSessionOp::Close => review_session::close_review(&req.project, &req.task),
+        ReviewSessionOp::Load { workspace } => {
+            // Load a queued review task onto the chosen (free) slot — the same
+            // path the tmux review-load Enter runs: check out the branch, run
+            // the status's enter transition to boot and health-check the dev
+            // server, and start the review agent. On success publish the
+            // `ReviewOpened` layout event so subscribed clients open the native
+            // review interface now the slot is serving
+            // (`rt-tui-review-load-queued`). The load is self-locking (the
+            // project-scoped review-load lock) and non-evicting, so a busy slot
+            // is rejected rather than evicted.
+            let loaded =
+                shelbi_orchestrator::load::load_review_task(&req.project, &req.task, &workspace);
+            if loaded.is_ok() {
+                shelbi_state::publish_layout(
+                    &req.project,
+                    shelbi_state::LayoutEvent::ReviewOpened {
+                        workspace: workspace.clone(),
+                        task: req.task.clone(),
+                    },
+                );
+            }
+            loaded.map(|_| ())
+        }
     };
     match result {
         Ok(()) => {

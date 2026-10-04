@@ -106,6 +106,9 @@ pub enum Step {
     Done(Outcome),
 }
 
+/// The default no-slots line: the project declares no `review`-tagged workspace.
+const NO_WORKSPACE: &str = "No review workspace is configured.";
+
 /// The interactive dialog state.
 pub struct Dialog {
     title: String,
@@ -114,6 +117,11 @@ pub struct Dialog {
     /// non-empty; ignored for the confirm/informational variants).
     selected: usize,
     focus: Focus,
+    /// The line shown in the no-slots informational variant. `None` falls back
+    /// to [`NO_WORKSPACE`]; the single-process TUI overrides it with "every
+    /// review slot is busy" when slots exist but none are free
+    /// (`rt-tui-review-load-queued`). Unused by the slot-bearing variants.
+    empty_message: Option<String>,
 }
 
 impl Dialog {
@@ -127,6 +135,21 @@ impl Dialog {
             slots,
             selected: 0,
             focus: if is_picker { Focus::List } else { Focus::Load },
+            empty_message: None,
+        }
+    }
+
+    /// Build the no-slots informational variant with a custom line — "every
+    /// review slot is busy", as opposed to the default "no review workspace is
+    /// configured". Any key dismisses it and nothing loads (the all-busy report
+    /// of `rt-tui-review-load-queued`).
+    pub fn informational(title: impl Into<String>, message: impl Into<String>) -> Self {
+        Dialog {
+            title: title.into(),
+            slots: Vec::new(),
+            selected: 0,
+            focus: Focus::Load,
+            empty_message: Some(message.into()),
         }
     }
 
@@ -342,7 +365,7 @@ fn render(f: &mut Frame, area: Rect, dialog: &Dialog) {
     let mut body: Vec<Line> = vec![title_line, Line::raw("")];
     if !dialog.has_slots() {
         body.push(Line::from(Span::styled(
-            "No review workspace is configured.",
+            dialog.empty_message.as_deref().unwrap_or(NO_WORKSPACE),
             Style::default().fg(Color::Yellow),
         )));
         body.push(Line::raw(""));
@@ -523,6 +546,21 @@ mod tests {
     fn handle_key_on_no_slots_dismisses() {
         let mut d = dialog(0);
         assert_eq!(d.handle_key(KeyCode::Char('x')), Step::Done(Outcome::Cancel));
+    }
+
+    #[test]
+    fn informational_variant_has_no_slots_and_dismisses_on_any_key() {
+        // The "every review slot is busy" report (rt-tui-review-load-queued):
+        // no slots, so it's neither a picker nor a confirm, and any key just
+        // dismisses it — nothing can be loaded.
+        let d = Dialog::informational("Fix login", "Every review slot is busy.");
+        assert!(!d.has_slots());
+        assert!(!d.is_picker());
+        assert_eq!(d.empty_message.as_deref(), Some("Every review slot is busy."));
+        for code in [KeyCode::Enter, KeyCode::Char('l'), KeyCode::Esc, KeyCode::Char('x')] {
+            let mut d = Dialog::informational("t", "busy");
+            assert_eq!(d.handle_key(code), Step::Done(Outcome::Cancel), "{code:?}");
+        }
     }
 
     #[test]

@@ -202,6 +202,14 @@ pub enum ReviewSessionOp {
     /// dev-server sessions and free the slot's port. The agent (chat) session
     /// is left for the slot's normal teardown. Idempotent.
     Close,
+    /// Load a *queued* review-column task onto the (free) review slot
+    /// `workspace`: check out the branch there, run the status's enter
+    /// transition to boot and health-check the dev server, and start the review
+    /// agent session — the same load `shelbi`'s tmux review-load Enter performs
+    /// (`shelbi_orchestrator::load::load_review_task`). On success the daemon
+    /// publishes a `ReviewOpened` layout event so the client opens the native
+    /// review interface now the slot is serving (`rt-tui-review-load-queued`).
+    Load { workspace: String },
 }
 
 /// Client → daemon request to manage a review slot's content sessions

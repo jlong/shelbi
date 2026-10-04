@@ -67,16 +67,10 @@ pub enum OverlayEvent {
 /// The overlay currently drawn over the main area, with its runtime state.
 pub enum ActiveOverlay {
     Palette(overlay::palette::Palette),
-    // The two review overlays are opened by the review interface (rt-tui-review,
-    // Phase 4e), which isn't wired in this subtask; they are complete and
-    // unit-tested here (they return their result as a value), so the
-    // not-yet-constructed warning is expected until 4e lands.
-    #[allow(dead_code)]
     ReviewConfirm {
         task_id: String,
         dialog: overlay::review_confirm::Dialog,
     },
-    #[allow(dead_code)]
     RejectReason {
         task_id: String,
         prompt: overlay::review_reject::RejectPrompt,
@@ -100,9 +94,10 @@ impl ActiveOverlay {
         ActiveOverlay::Palette(overlay::palette::Palette::new(project_label, entries))
     }
 
-    /// Open the "Load for review" dialog for `task_id` over the given slots.
-    /// Opened by the review interface (Phase 4e); see the enum note.
-    #[allow(dead_code)]
+    /// Open the "Load for review" dialog for `task_id` over the given (free)
+    /// slots. Enter on a queued review / the palette's load-review action opens
+    /// this (`rt-tui-review-load-queued`); the review interface's reject path
+    /// opens the sibling [`reject_reason`](Self::reject_reason).
     pub fn review_confirm(
         task_id: impl Into<String>,
         title: impl Into<String>,
@@ -114,9 +109,22 @@ impl ActiveOverlay {
         }
     }
 
+    /// Open the "Load for review" dialog as a no-slots report — every review
+    /// slot is busy, so there is nothing free to load onto and any key just
+    /// dismisses it (`rt-tui-review-load-queued`).
+    pub fn review_busy_report(
+        task_id: impl Into<String>,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        ActiveOverlay::ReviewConfirm {
+            task_id: task_id.into(),
+            dialog: overlay::review_confirm::Dialog::informational(title, message),
+        }
+    }
+
     /// Open the reject-reason prompt for `task_id`. Opened by the review
-    /// interface (Phase 4e); see the enum note.
-    #[allow(dead_code)]
+    /// interface's reject action (`rt-tui-review`).
     pub fn reject_reason(task_id: impl Into<String>) -> Self {
         ActiveOverlay::RejectReason {
             task_id: task_id.into(),
