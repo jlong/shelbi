@@ -35,6 +35,11 @@ mod hub_config;
 mod hub_version;
 mod issue_cache;
 pub mod machine_state;
+pub mod migration;
+pub use migration::{
+    all_workspace_migration_states, set_workspace_migration_state, workspace_migrated,
+    workspace_migration_state, MigrationState,
+};
 pub use issue_cache::BOARD_CACHE_TTL;
 #[cfg(any(test, feature = "test-support"))]
 pub use issue_cache::seed_board_snapshot_for_test;
@@ -166,7 +171,7 @@ pub use event_log::{
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
     append_limit_resume_event, append_marker_deferred_event, append_marker_skipped_event,
     append_github_merge_reconcile_event, append_merge_event, append_message_ack_event,
-    append_message_event, append_project_event,
+    append_message_event, append_migration_event, append_project_event,
     append_push_event,
     append_rebase_event, append_review_ready_event, append_review_slot_override_event,
     append_send_event, append_settings_selfheal_event, append_supervision_event,
@@ -1485,6 +1490,17 @@ pub struct State {
     /// existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub open: bool,
+    /// Per-workspace tmux → session-backend migration state for the Phase 6
+    /// cutover (`rt-cutover-migration`), keyed by workspace name. A workspace is
+    /// [`MigrationState::Pending`] until its legacy tmux session is proven gone,
+    /// then [`MigrationState::Migrated`]; dispatch to a pending workspace is
+    /// refused so the new backend never starts a second agent in a worktree a
+    /// surviving tmux agent still holds. Empty (and omitted from the file) on
+    /// the tmux runtime and for a freshly-migrated install, so an untouched
+    /// `state.json` stays byte-identical to before this field existed. See
+    /// [`crate::migration`]; `rt-cutover-delete` removes it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace_migration: BTreeMap<String, MigrationState>,
     /// Forward-compat catch-all: any `state.json` key this binary doesn't
     /// recognize (a field a newer binary added) is captured here and written
     /// back verbatim, instead of being silently dropped on the next
@@ -2648,6 +2664,44 @@ pub fn parse_agent_file(text: &str) -> Result<AgentFile> {
         agent,
         body: body.to_string(),
     })
+}
+
+#[cfg(test)]
+mod agent_tmux_addr_load_tests {
+    use super::*;
+
+    /// Cutover (`rt-cutover-migration`): a persisted agent record written by the
+    /// tmux runtime carries a `tmux:` address. After the flip the new backend
+    /// ignores it, but such a record must still *load without error* — `Agent`
+    /// has no `deny_unknown_fields`, so the field is preserved and any key the
+    /// struct doesn't know is simply dropped rather than failing the parse.
+    #[test]
+    fn agent_record_with_tmux_address_loads() {
+        let text = "\
+---
+id: feat-x
+project: demo
+machine: hub
+runner: claude
+branch: jlong/feat-x
+worktree: /tmp/wt/feat-x
+status: running
+created: 2026-01-01T00:00:00Z
+updated: 2026-01-01T00:00:00Z
+tmux:
+  session: shelbi-w-feat-x
+  window: agent
+legacy_backend_field: whatever
+---
+body
+";
+        let parsed = parse_agent_file(text).expect("tmux-addr agent record must load");
+        assert_eq!(parsed.agent.id, "feat-x");
+        // The address is preserved on load (the tmux runtime still reads it; the
+        // session backend simply doesn't consult it).
+        assert_eq!(parsed.agent.tmux.session, "shelbi-w-feat-x");
+        assert_eq!(parsed.body.trim(), "body");
+    }
 }
 
 /// Append a line to the agent's `.log.md`. Each line is timestamped.

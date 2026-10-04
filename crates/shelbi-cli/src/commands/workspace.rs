@@ -344,6 +344,35 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
     {
         println!("{line}");
     }
+
+    // Cutover (`rt-cutover-migration`): call out workspaces still pending the
+    // tmux→session-backend migration, so the user can see why dispatch to them
+    // is paused. Only surfaced on the session backend and when something is
+    // actually pending, so the table is unchanged on the tmux runtime and for a
+    // fully-migrated install.
+    if shelbi_state::session_backend_enabled() {
+        if let Ok(states) = shelbi_state::all_workspace_migration_states(project) {
+            let pending: Vec<&str> = p
+                .workspaces
+                .iter()
+                .filter(|w| {
+                    matches!(
+                        states.get(&w.name),
+                        Some(shelbi_state::MigrationState::Pending)
+                    )
+                })
+                .map(|w| w.name.as_str())
+                .collect();
+            if !pending.is_empty() {
+                println!(
+                    "\nmigration pending: {} — dispatch paused until each workspace's \
+                     previous-runtime tmux session is confirmed gone (reopen the project \
+                     to re-run migration)",
+                    pending.join(", ")
+                );
+            }
+        }
+    }
     Ok(())
 }
 

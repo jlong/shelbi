@@ -47,6 +47,15 @@ pub(crate) fn use_private_tmux_server() {
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("TMUX_TMPDIR", &dir);
     });
+    // Cutover (`rt-cutover-migration`) flipped the default backend to the
+    // session-process runtime, but these round-trip tests exercise the *tmux*
+    // backend specifically (`backend()` must return `TmuxBackend`). Pin it off
+    // here so every real-tmux test drives tmux regardless of the new default.
+    // Re-asserted on every call (not inside the `Once`) so a sibling test that
+    // set and then restored/cleared the var can't leave a later tmux test on
+    // the session backend. Callers hold `test_lock`, so this `set_var` can't
+    // race another env reader.
+    std::env::set_var("SHELBI_SESSION_BACKEND", "0");
 }
 
 /// Try to create a detached `sleep`-holding session on the private server,

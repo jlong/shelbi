@@ -1839,6 +1839,31 @@ pub fn append_project_event(project: &str, action: &str, reason: &str) -> Result
     append_event_line(&format!("{ts} project={project} {action} reason={reason}"))
 }
 
+/// Append `<rfc3339> project=<project> migration workspace=<ws> outcome=<outcome> detail=<detail>`
+/// to `~/.shelbi/events.log`. Emitted for every step of the Phase 6 tmux →
+/// session-backend migration (`rt-cutover-migration`): a workspace marked
+/// `migrated` (local session gone / tmux absent, remote `shelbi-w-<ws>`
+/// confirmed absent), left `pending` (remote unreachable, or a kill that could
+/// not be verified), and a consented remote kill (`killed`). `outcome` is a
+/// short stable token; `detail` carries the session name or the reason
+/// (`-` when there's nothing extra to say). Both fold to single tokens so the
+/// line stays parseable.
+pub fn append_migration_event(
+    project: &str,
+    workspace: &str,
+    outcome: &str,
+    detail: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let workspace = sanitize_field(workspace);
+    let outcome = sanitize_reason(outcome);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} project={project} migration workspace={workspace} outcome={outcome} detail={detail}"
+    ))
+}
+
 /// Append `<rfc3339> project=<project> handoff outcome=<outcome> detail=<detail>`
 /// to `~/.shelbi/events.log`. Emitted once per orchestrator handoff attempt on
 /// every teardown/reload path (quit, quit-project, reload), so a failed or

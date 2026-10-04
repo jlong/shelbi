@@ -108,6 +108,14 @@ pub(crate) fn start(
     // Refuse to clobber another in-flight issue on the same workspace.
     ensure_workspace_dispatchable(project, &workspace_name, id)?;
 
+    // Cutover gate (`rt-cutover-migration`): on the session backend, refuse to
+    // dispatch onto a workspace whose tmux→session migration hasn't completed,
+    // with a message that says why and how to resolve it. `start_workspace_on_task`
+    // re-checks this as a backstop, but surfacing it here keeps the message
+    // synchronous for `task start` rather than buried in a worker-thread error.
+    crate::migration::ensure_workspace_dispatchable(project, &workspace_name)
+        .map_err(MutateError::backend)?;
+
     // Cut the branch on the hub if it hasn't been already (depends_on aware). An
     // explicit `--branch` override bypasses the cut and points sync at that ref.
     if branch_arg.is_none() {

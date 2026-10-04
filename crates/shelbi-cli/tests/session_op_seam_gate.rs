@@ -69,6 +69,12 @@ const ALLOWED: &[&str] = &[
     // The tmux backend *is* the seam: these calls are the delegation every
     // other caller now routes through.
     "shelbi-orchestrator/src/session_backend.rs",
+    // The Phase 6 cutover migration pass (`rt-cutover-migration`) must query the
+    // *legacy tmux* runtime directly: after the flip, the `SessionBackend` seam
+    // resolves to the session-process backend, which knows nothing about the old
+    // `shelbi-<p>` / `shelbi-w-<ws>` tmux sessions it is the pass's whole job to
+    // find and confirm gone. Removed with the module at `rt-cutover-delete`.
+    "shelbi-orchestrator/src/migration.rs",
     // Orchestrator bootstrap + stash-session probes. Not in the Phase 2
     // caller-migration scope; moves behind the seam when the poller and
     // supervision move to the daemon (Phase 3).

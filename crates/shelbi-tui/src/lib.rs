@@ -156,6 +156,14 @@ pub(crate) const FIRST_RUN_HINT: &str = "Ctrl+P palette · type E to edit settin
 /// inside a tmux client, use `switch-client` instead of `attach` (tmux
 /// refuses to nest, modern tmux supports switching).
 pub fn run_main(project_name: &str) -> Result<()> {
+    // Cutover gate (`rt-cutover-migration`): on the session backend, refuse to
+    // open a project whose legacy `shelbi-<p>` / `_shelbi-<p>` tmux session is
+    // still running — opening the new runtime beside it would run two pollers at
+    // once and could start a second agent in the hub worktree. A no-op on the
+    // tmux runtime (a live `shelbi-<p>` is the normal open state there). Checked
+    // first, before we touch the daemon or bootstrap the dashboard.
+    shelbi_orchestrator::migration::ensure_project_openable(project_name)?;
+
     // Bump the recently-used timestamp before bootstrapping the session
     // so the picker's recency sort reflects this launch even if the
     // tmux exec below replaces the process before normal shutdown.
@@ -173,6 +181,17 @@ pub fn run_main(project_name: &str) -> Result<()> {
 
     shelbi_orchestrator::ensure_dashboard(project_name)
         .with_context(|| format!("setting up dashboard for `{project_name}`"))?;
+
+    // Cutover migration pass (`rt-cutover-migration`): now that the open gate
+    // proved the local tmux session gone, record each workspace's migration
+    // state so dispatch knows which worktrees are proven idle. Local workspaces
+    // migrate; a remote stays pending until the hub reaches its machine and
+    // confirms (killing a surviving `shelbi-w-<ws>` only with the user's
+    // agreement). Best-effort and only on the session backend — a pending
+    // workspace doesn't block opening; dispatch to it is what's refused.
+    if shelbi_state::session_backend_enabled() {
+        run_open_migration_pass(project_name);
+    }
 
     // Remove-tmux Phase 4b: with the session backend on, `ensure_dashboard`
     // above has already brought up the orchestrator *session* (not a tmux
@@ -212,6 +231,70 @@ pub fn run_main(project_name: &str) -> Result<()> {
             anyhow::bail!("tmux exited with {status}");
         }
         Ok(())
+    }
+}
+
+/// Run the cutover migration pass for `project_name` at open, prompting on
+/// stderr for consent before killing any surviving remote `shelbi-w-<ws>`
+/// session. Runs before the alt-screen is entered (from `run_main`), so a
+/// `[y/N]` prompt is safe. Best-effort: a probe or state-write failure is
+/// logged and leaves the affected workspace pending, which is the safe
+/// direction (dispatch to a pending workspace is refused, not silently run).
+fn run_open_migration_pass(project_name: &str) {
+    use std::io::{IsTerminal, Write};
+
+    let project = match shelbi_state::load_project(project_name) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(project = %project_name, error = %e, "migration pass: load_project failed");
+            return;
+        }
+    };
+
+    // Consent prompt for a surviving remote session. A non-interactive stdin
+    // declines (leaves the workspace pending) rather than killing silently.
+    let mut consent = |kill: &shelbi_orchestrator::migration::MigrationKill<'_>| -> bool {
+        if !std::io::stdin().is_terminal() {
+            eprintln!(
+                "shelbi: workspace `{}` on machine `{}` still has a tmux session \
+                 `{}` from the previous runtime; not killing it (no terminal to \
+                 confirm). It stays pending — rerun `shelbi {}` in a terminal to \
+                 migrate it.",
+                kill.workspace, kill.machine, kill.session, kill.project
+            );
+            return false;
+        }
+        eprint!(
+            "shelbi: workspace `{}` on machine `{}` still has a tmux session `{}` \
+             from the previous runtime. Kill it so the new runtime can take over \
+             this workspace? [y/N] ",
+            kill.workspace, kill.machine, kill.session
+        );
+        let _ = std::io::stderr().flush();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            return false;
+        }
+        matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    };
+
+    match shelbi_orchestrator::migration::run_migration_pass(&project, &mut consent) {
+        Ok(report) => {
+            let pending: Vec<&str> = report.pending().map(|w| w.workspace.as_str()).collect();
+            if !pending.is_empty() {
+                eprintln!(
+                    "shelbi: {} workspace(s) still pending migration: {}. Dispatch to \
+                     them is paused until their tmux session is confirmed gone; the \
+                     rest of `{}` works normally.",
+                    pending.len(),
+                    pending.join(", "),
+                    project_name
+                );
+            }
+        }
+        Err(e) => {
+            tracing::debug!(project = %project_name, error = %e, "migration pass failed");
+        }
     }
 }
 
