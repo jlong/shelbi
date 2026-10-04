@@ -326,6 +326,18 @@ impl SshExec {
             deadline: ssh_deadline(),
         }
     }
+
+    /// Build an exec with an explicit per-call wall-clock deadline, for callers
+    /// that want a tighter bound than the install-sized [`ssh_deadline`]
+    /// default — e.g. the machines view's reachability probe, which should fail
+    /// fast into [`Reachability::Unreachable`] rather than hang on a wedged host.
+    pub fn with_deadline(host: Host, label: impl Into<String>, deadline: Duration) -> Self {
+        Self {
+            host,
+            label: label.into(),
+            deadline,
+        }
+    }
 }
 
 impl RemoteExec for SshExec {
@@ -504,6 +516,23 @@ pub enum MachineProbe {
     /// SSH ran our probe. Carries the platform (or why it is unusable) and the
     /// binaries found on the PATH and under `~/.shelbi/bin`.
     Reachable(ReachableProbe),
+}
+
+/// Live reachability of a remote machine, surfaced in the machines view next to
+/// its `ssh <host>` label. Produced by the background prober
+/// ([`probe_reachability`]); a local machine is always reachable and never
+/// probed, so this only ever describes a remote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Reachability {
+    /// Not probed yet (startup), or a probe is in flight — the initial state the
+    /// view shows as "checking".
+    #[default]
+    Unknown,
+    /// The last probe connected and the host answered.
+    Reachable,
+    /// The last probe failed; carries a short human reason (SSH timeout, auth
+    /// failure, connection refused, …) so the view can show *why*.
+    Unreachable { error: String },
 }
 
 /// What a successful probe found on a reachable machine.
@@ -685,6 +714,40 @@ pub fn probe_machine(exec: &dyn RemoteExec, hub: &Version) -> MachineProbe {
                 return failure;
             }
             MachineProbe::Reachable(parse_probe_output(&out.stdout, hub))
+        }
+    }
+}
+
+/// A lightweight "is this host answering right now" probe for the machines
+/// view's background prober. It runs a trivial `true` over the remote through
+/// the [`RemoteExec`] seam — the same SSH host-routing (ControlMaster + reverse
+/// forward) the poller uses — and classifies the result into a [`Reachability`].
+///
+/// Deliberately much cheaper than [`probe_machine`]: it does *not* load the
+/// interactive login shell or resolve binaries, because reachability is a
+/// liveness question, not a resolution one, and it runs on a short cadence. For
+/// the view's purposes an auth refusal and a connect-level failure are both
+/// "not reachable" (each keeps its own diagnostic); only a clean exit is
+/// [`Reachability::Reachable`]. Pure over the seam, so it is testable with a
+/// fake and needs no real host.
+pub fn probe_reachability(exec: &dyn RemoteExec) -> Reachability {
+    match exec.run_script("true") {
+        // The transport itself failed or timed out (an unreachable host, or a
+        // Tailscale-SSH wedge the deadline killed): unreachable, IO error as the
+        // reason.
+        Err(e) => Reachability::Unreachable {
+            error: first_nonempty_line(&e.to_string()),
+        },
+        Ok(out) if out.success() => Reachability::Reachable,
+        Ok(out) => {
+            let error = match classify_probe_failure(&out) {
+                Some(MachineProbe::Unreachable { detail })
+                | Some(MachineProbe::AuthDenied { detail }) => detail,
+                // Ran but failed for some other reason — a bare `true` that
+                // doesn't exit 0 still means the host isn't usably answering.
+                _ => first_nonempty_line(&out.stderr),
+            };
+            Reachability::Unreachable { error }
         }
     }
 }
@@ -1275,6 +1338,42 @@ mod tests {
         ));
         // A clean run is not a failure.
         assert!(classify_probe_failure(&out(0, "ok", "")).is_none());
+    }
+
+    #[test]
+    fn reachability_probe_classifies() {
+        // A clean `true` is reachable.
+        let up = FakeExec::new(vec![Ok(out(0, "", ""))]);
+        assert_eq!(probe_reachability(&up), Reachability::Reachable);
+
+        // A connect-level failure is unreachable, keeping its diagnostic.
+        let down = FakeExec::new(vec![Ok(out(
+            255,
+            "",
+            "ssh: connect to host gpu port 22: Connection refused",
+        ))]);
+        match probe_reachability(&down) {
+            Reachability::Unreachable { error } => assert!(error.contains("Connection refused")),
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+
+        // An auth refusal also reads as unreachable (the view only cares whether
+        // the host is usably answering).
+        let auth = FakeExec::new(vec![Ok(out(255, "", "Permission denied (publickey)."))]);
+        assert!(matches!(
+            probe_reachability(&auth),
+            Reachability::Unreachable { .. }
+        ));
+
+        // A transport error (timeout) surfaces as unreachable, not a panic.
+        let timeout = FakeExec::new(vec![Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "command did not finish within 10s",
+        ))]);
+        assert!(matches!(
+            probe_reachability(&timeout),
+            Reachability::Unreachable { .. }
+        ));
     }
 
     #[test]

@@ -20,7 +20,7 @@
 //!
 //! [`rt-machine-setup`]: shelbi_state::machine_state
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -28,11 +28,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
-use shelbi_core::{Machine, MachineKind};
+use shelbi_core::{Host, Machine, MachineKind};
+use shelbi_orchestrator::machine::{probe_reachability, Reachability, SshExec};
 use shelbi_state::machine_state::MachineRecord;
 use shelbi_state::WorkspaceState;
 
+use crate::reachability::{ReachabilityProber, REACHABILITY_BACKOFF_MAX, REACHABILITY_CADENCE};
 use crate::theme;
+
+/// Wall-clock bound on one reachability probe. Short so a wedged host fails fast
+/// into [`Reachability::Unreachable`] rather than holding the prober thread for
+/// the install-sized default `SshExec` deadline.
+const REACHABILITY_PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// One machine and the workspaces that live on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +55,10 @@ pub struct MachineEntry {
     /// run for this machine. `None` for a local machine or a remote that has not
     /// been set up yet.
     pub remote: Option<MachineRecord>,
+    /// Live reachability of a remote, published by the background prober and
+    /// folded in on refresh. A local machine is always reachable and never
+    /// probed, so this stays [`Reachability::Reachable`] for it and is not shown.
+    pub reachability: Reachability,
     pub workspaces: Vec<WorkspaceRow>,
 }
 
@@ -84,6 +95,11 @@ pub struct MachinesApp {
     selected: usize,
     status_line: String,
     last_refresh: Instant,
+    /// Background reachability prober, when live-reachability is enabled
+    /// ([`enable_reachability`](Self::enable_reachability)). `None` keeps the
+    /// view entirely probe-free (unit tests, and any caller that doesn't want
+    /// SSH traffic).
+    prober: Option<ReachabilityProber>,
     /// Set by the standalone process's quit chord; the shell ignores it (its
     /// own event loop owns quit).
     pub should_quit: bool,
@@ -99,8 +115,35 @@ impl MachinesApp {
             selected: 0,
             status_line: String::new(),
             last_refresh: Instant::now(),
+            prober: None,
             should_quit: false,
         }
+    }
+
+    /// Turn on live reachability probing with the real SSH probe. Both runtimes
+    /// (the standalone `__machines` process and the in-process shell) call this
+    /// once, right after construction; from then on every refresh folds the
+    /// prober's latest results into the remote machines' headers. The probe runs
+    /// on the prober's own thread, never the UI thread or the shell's refresh
+    /// worker.
+    pub fn enable_reachability(&mut self) {
+        self.enable_reachability_with(
+            REACHABILITY_CADENCE,
+            REACHABILITY_BACKOFF_MAX,
+            real_reachability_probe,
+        );
+    }
+
+    /// Enable reachability with an explicit cadence/backoff and an injected probe
+    /// — the seam the tests drive with a deterministic stub instead of real SSH.
+    pub fn enable_reachability_with<F>(&mut self, cadence: Duration, backoff_max: Duration, probe: F)
+    where
+        F: Fn(&str, &str) -> Reachability + Send + Sync + 'static,
+    {
+        self.prober = Some(ReachabilityProber::spawn(cadence, backoff_max, probe));
+        // Seed targets from whatever we already hold so a probe starts without
+        // waiting for the next refresh.
+        self.push_prober_targets();
     }
 
     /// Refresh at most every 500ms — the standalone loop's cadence, matching the
@@ -164,6 +207,14 @@ impl MachinesApp {
                     is_local,
                     tags: m.tags.clone(),
                     remote,
+                    // A local machine is the hub itself — always reachable, never
+                    // probed. A remote starts Unknown ("checking") until the
+                    // background prober's first result folds in on a later refresh.
+                    reachability: if is_local {
+                        Reachability::Reachable
+                    } else {
+                        Reachability::Unknown
+                    },
                     workspaces,
                 }
             })
@@ -181,7 +232,50 @@ impl MachinesApp {
         self.display_name = data.display_name;
         self.machines = data.machines;
         self.rebuild_selectable();
+        // Keep the prober's target set current (cheap, a no-op when unchanged),
+        // then fold its latest results into the remote headers. Both touch only
+        // in-memory state — no SSH on this path.
+        self.push_prober_targets();
+        self.fold_reachability();
         self.last_refresh = Instant::now();
+    }
+
+    /// Hand the prober the current set of remote `(machine, ssh_host)` targets.
+    /// Local machines are deliberately excluded, so they are never probed and
+    /// generate no SSH traffic.
+    fn push_prober_targets(&self) {
+        let Some(prober) = &self.prober else {
+            return;
+        };
+        let targets = self
+            .machines
+            .iter()
+            .filter(|m| !m.is_local)
+            .map(|m| {
+                // Mirror `Machine::host()`: an ssh machine with no explicit host
+                // is reached by its name.
+                let host = m.host.clone().unwrap_or_else(|| m.name.clone());
+                (m.name.clone(), host)
+            })
+            .collect();
+        prober.set_targets(targets);
+    }
+
+    /// Overlay the prober's latest reachability onto the remote machines. A
+    /// remote with no result yet keeps its `Unknown` ("checking") state.
+    fn fold_reachability(&mut self) {
+        let Some(prober) = &self.prober else {
+            return;
+        };
+        let snapshot = prober.snapshot();
+        for m in &mut self.machines {
+            if m.is_local {
+                continue;
+            }
+            if let Some(r) = snapshot.get(&m.name) {
+                m.reachability = r.clone();
+            }
+        }
     }
 
     /// Refresh in place (read + apply). Used by the standalone process, whose own
@@ -248,9 +342,34 @@ impl MachinesApp {
     }
 }
 
+/// The real reachability probe: an SSH `true` to the host with a short
+/// deadline, through the orchestrator's probe + the shared `shelbi_ssh`
+/// transport (same ControlMaster + reverse forward the poller uses). Runs on
+/// the prober thread.
+fn real_reachability_probe(_machine: &str, host: &str) -> Reachability {
+    let target = Host::Ssh {
+        host: host.to_string(),
+    };
+    let exec = SshExec::with_deadline(target, host.to_string(), REACHABILITY_PROBE_DEADLINE);
+    probe_reachability(&exec)
+}
+
 // ---------------------------------------------------------------------------
 // Rendering (shared by the standalone process and the in-process shell)
 // ---------------------------------------------------------------------------
+
+/// The reachability badge shown next to a remote machine's `ssh <host>` label.
+/// One span so both runtimes render it identically through [`machine_header_line`].
+fn reachability_span(r: &Reachability) -> Span<'static> {
+    let (text, color) = match r {
+        Reachability::Reachable => ("● reachable".to_string(), Color::Green),
+        Reachability::Unknown => ("○ checking…".to_string(), Color::DarkGray),
+        Reachability::Unreachable { error } => {
+            (format!("● unreachable: {}", truncate(error, 40)), Color::Red)
+        }
+    };
+    Span::styled(format!("  {text}"), Style::default().fg(color))
+}
 
 /// A short badge for an observed workspace state.
 fn state_badge(state: Option<WorkspaceState>) -> (&'static str, Color) {
@@ -350,6 +469,11 @@ fn machine_header_line(m: &MachineEntry) -> Line<'static> {
         format!("  {loc}"),
         Style::default().fg(Color::DarkGray),
     ));
+    // Live reachability sits right next to the `ssh <host>` label — remotes only;
+    // a local machine is the hub and is never probed.
+    if !m.is_local {
+        spans.push(reachability_span(&m.reachability));
+    }
     if !m.tags.is_empty() {
         spans.push(Span::styled(
             format!("  [{}]", m.tags.join(", ")),
@@ -451,6 +575,7 @@ mod tests {
             is_local: kind == MachineKind::Local,
             tags: vec![],
             remote: None,
+            reachability: Reachability::Unknown,
             workspaces,
         }
     }
@@ -553,6 +678,143 @@ mod tests {
         ] {
             let (label, _) = state_badge(st);
             assert!(!label.is_empty());
+        }
+    }
+
+    // ---- reachability --------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn ssh_entry(name: &str) -> MachineEntry {
+        entry(name, MachineKind::Ssh, vec![ws("w1", None, None)])
+    }
+
+    /// Concatenate a header line's span text, so a test can assert what the one
+    /// shared renderer ([`machine_header_line`], used by both runtimes) emits.
+    fn header_text(m: &MachineEntry) -> String {
+        machine_header_line(m)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn remote_header_shows_each_reachability_state() {
+        let mut m = ssh_entry("gpu");
+
+        m.reachability = Reachability::Unknown;
+        assert!(header_text(&m).contains("checking"));
+
+        m.reachability = Reachability::Reachable;
+        let t = header_text(&m);
+        assert!(t.contains("ssh gpu.local"), "keeps the ssh host label: {t}");
+        assert!(t.contains("reachable"));
+
+        m.reachability = Reachability::Unreachable {
+            error: "connection refused".to_string(),
+        };
+        let t = header_text(&m);
+        assert!(t.contains("unreachable"));
+        assert!(t.contains("connection refused"), "surfaces the error: {t}");
+    }
+
+    #[test]
+    fn local_header_has_no_reachability_badge() {
+        let m = entry("hub", MachineKind::Local, vec![]);
+        let t = header_text(&m);
+        assert!(t.contains("local"));
+        assert!(!t.contains("reachable"));
+        assert!(!t.contains("checking"));
+    }
+
+    #[test]
+    fn remote_reachability_folds_in_and_recovers() {
+        // A stub probe that reports down until the flag flips.
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let up_probe = Arc::clone(&up);
+        let mut app = MachinesApp::new("demo");
+        app.enable_reachability_with(
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            move |_m, _h| {
+                if up_probe.load(Ordering::Acquire) {
+                    Reachability::Reachable
+                } else {
+                    Reachability::Unreachable {
+                        error: "connection refused".to_string(),
+                    }
+                }
+            },
+        );
+
+        let data = || MachinesData {
+            display_name: Some("Demo".into()),
+            machines: vec![ssh_entry("gpu")],
+        };
+
+        // Re-applying the read (as the real refresh loop does) folds the latest
+        // probe result into the entry. Poll until it shows the host down.
+        let down = wait_for_reachability(&mut app, data, |r| {
+            matches!(r, Reachability::Unreachable { .. })
+        });
+        match down {
+            Reachability::Unreachable { error } => assert!(error.contains("refused")),
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+
+        // Bring the host back; the next refresh folds in Reachable.
+        up.store(true, Ordering::Release);
+        wait_for_reachability(&mut app, data, |r| matches!(r, Reachability::Reachable));
+    }
+
+    #[test]
+    fn local_machines_are_never_probed() {
+        // The probe stub counts its calls; a local-only project must trigger
+        // none (and no SSH traffic).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = Arc::clone(&calls);
+        let mut app = MachinesApp::new("demo");
+        app.enable_reachability_with(
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            move |_m, _h| {
+                probe_calls.fetch_add(1, Ordering::AcqRel);
+                Reachability::Reachable
+            },
+        );
+        app.apply_data(MachinesData {
+            display_name: Some("Demo".into()),
+            machines: vec![entry("hub", MachineKind::Local, vec![ws("w", None, None)])],
+        });
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            0,
+            "a local-only project must not probe anything"
+        );
+    }
+
+    /// Re-apply `data` on a short poll until the first machine's reachability
+    /// satisfies `pred`, returning it (panics on timeout). Models the refresh
+    /// loop that folds prober results in on each `apply_data`.
+    fn wait_for_reachability(
+        app: &mut MachinesApp,
+        data: impl Fn() -> MachinesData,
+        pred: impl Fn(&Reachability) -> bool,
+    ) -> Reachability {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            app.apply_data(data());
+            let r = app.machines()[0].reachability.clone();
+            if pred(&r) {
+                return r;
+            }
+            if Instant::now() >= deadline {
+                panic!("reachability did not satisfy predicate within 2s (was {r:?})");
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
