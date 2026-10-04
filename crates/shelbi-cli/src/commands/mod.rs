@@ -32,6 +32,7 @@ pub mod quit;
 pub mod quit_project;
 pub mod quit_shelbi;
 pub mod reload;
+pub mod reload_session;
 pub mod review_confirm;
 pub mod relay;
 pub mod review_reject;

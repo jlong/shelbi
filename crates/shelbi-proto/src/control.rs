@@ -171,10 +171,25 @@ pub enum ClientMsg {
         protocol: u32,
         client_version: String,
     },
-    /// Subscribe this connection to [`ServerMsg::Changed`] notifications.
+    /// Subscribe this connection to [`ServerMsg::Changed`] (and
+    /// [`ServerMsg::Reexec`]) notifications.
     Subscribe,
     /// Run a mutation.
     Mutate(MutationRequest),
+    /// Quit a project (removing-tmux Phase 4f): end that project's sessions,
+    /// cancel its in-flight daemon jobs through the quit barrier, and mark it
+    /// closed. The daemon replies [`ServerMsg::Done`] once the project has
+    /// drained (or [`ServerMsg::Failed`]). Other projects are untouched.
+    QuitProject { request_id: u64, project: String },
+    /// Quit Shelbi entirely (Phase 4f): mark every open project closed, end all
+    /// sessions, reply [`ServerMsg::Done`], then stop the daemon. Nothing
+    /// restarts it — the projects are closed before the sessions end, so no
+    /// session watchdog resurrects the daemon.
+    QuitShelbi { request_id: u64 },
+    /// Ask the daemon to tell every *subscribed* client to re-exec — the
+    /// `shelbi reload` signal. The daemon broadcasts [`ServerMsg::Reexec`] to
+    /// its subscribers and replies [`ServerMsg::Done`] to the requester.
+    ReloadClients { request_id: u64 },
 }
 
 /// Why a mutation did not run (or could not be accepted). `Display` is the
@@ -252,6 +267,13 @@ pub enum ServerMsg {
     },
     /// A change made by another client (broadcast; no `request_id`).
     Changed(ChangeNote),
+    /// The client should re-exec (a TUI) or prompt for relaunch and send no
+    /// further commands (the desktop app). Pushed to a subscriber when the
+    /// daemon reloads ([`ClientMsg::ReloadClients`]) or when the subscriber's
+    /// hello announced a version different from the daemon's (it is out of
+    /// date). `reason` is a short operator-facing phrase. Broadcast; no
+    /// `request_id`.
+    Reexec { reason: String },
 }
 
 /// Encode a message to its full wire bytes (`[len: u32 BE][json]`).
@@ -328,6 +350,33 @@ mod tests {
         // The whole frame decodes.
         let (_m, n): (ServerMsg, usize) = decode(&bytes).unwrap();
         assert_eq!(n, bytes.len());
+    }
+
+    #[test]
+    fn round_trips_the_lifecycle_messages() {
+        // The Phase 4f additions must survive a wire round-trip like every other
+        // control message, so a quit/reload is never misparsed.
+        let msgs = [
+            ClientMsg::QuitProject {
+                request_id: 3,
+                project: "alpha".into(),
+            },
+            ClientMsg::QuitShelbi { request_id: 4 },
+            ClientMsg::ReloadClients { request_id: 5 },
+        ];
+        for msg in msgs {
+            let bytes = encode(&msg).unwrap();
+            let (back, n): (ClientMsg, usize) = decode(&bytes).unwrap();
+            assert_eq!(n, bytes.len());
+            assert_eq!(back, msg);
+        }
+        let reexec = ServerMsg::Reexec {
+            reason: "daemon reloaded".into(),
+        };
+        let bytes = encode(&reexec).unwrap();
+        let (back, n): (ServerMsg, usize) = decode(&bytes).unwrap();
+        assert_eq!(n, bytes.len());
+        assert_eq!(back, reexec);
     }
 
     #[test]

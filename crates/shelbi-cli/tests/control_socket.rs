@@ -129,7 +129,11 @@ impl Drop for Home {
 }
 
 fn connect(sock: &Path) -> Result<ControlClient, shelbi_client::ClientError> {
-    ControlClient::connect(sock, "test-client")
+    // Connect as a current-version client: the daemon now tells a version-
+    // mismatched subscriber to re-exec straight away (Phase 4f out-of-date
+    // handling), which would pre-empt the change notifications these tests
+    // assert. `CARGO_PKG_VERSION` here is the same version the daemon reports.
+    ControlClient::connect(sock, env!("CARGO_PKG_VERSION"))
 }
 
 fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
@@ -299,10 +303,14 @@ fn other_connected_clients_are_notified_of_a_change() {
         .unwrap();
 
     // The subscriber is told about it.
-    let note = sub
+    let notice = sub
         .recv()
         .expect("subscription read")
         .expect("a change notification");
+    let note = match notice {
+        shelbi_client::Notice::Changed(note) => note,
+        other => panic!("expected a change notification, got {other:?}"),
+    };
     assert_eq!(note.id, "t1");
     assert_eq!(note.verb, "move");
     assert_eq!(note.status, "todo");

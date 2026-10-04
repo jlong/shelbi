@@ -57,7 +57,7 @@ pub mod spawn;
 pub mod transport;
 
 pub use connect::{Connection, SessionEvents};
-pub use control::{ControlClient, Subscription};
+pub use control::{ControlClient, Notice, Subscription};
 pub use discovery::{list, reap_dead, DiscoveredSession};
 pub use error::ClientError;
 pub use reader::SessionEvent;
