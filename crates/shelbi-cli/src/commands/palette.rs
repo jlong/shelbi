@@ -19,7 +19,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use shelbi_core::StatusCategory;
@@ -28,7 +28,8 @@ use shelbi_state::keymap::{
     load_keymaps, GlobalAction, KeymapDiagnostic, Keymaps, PaletteAction,
 };
 use shelbi_state::{load_user_config, ProjectSummary, ZenModeState, ZenToggleChord};
-use shelbi_tui::{decoration_to_color, App, Row, View, WorkspaceOverview};
+use shelbi_tui::overlay::palette::{project_indicator, project_status_style, pulse_phase};
+use shelbi_tui::{App, Row, View, WorkspaceOverview};
 
 use super::zen_intro::{render_intro, step_intro, IntroOutcome, IntroState};
 
@@ -482,225 +483,58 @@ fn picker_loop<B: ratatui::backend::Backend>(
     }
 }
 
+/// Render the palette through the single shared implementation in
+/// `shelbi_tui::overlay::palette`, which the single-process TUI overlay uses
+/// too. This adapter just projects the tmux palette's `State` (including its
+/// empty-query projects column) into the shared `PaletteView`.
 fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)], phase: f32) {
-    let area = f.area();
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(2),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    // Title. A cold palette (board still loading, no snapshot yet) tacks on a
-    // dim "loading board…" hint so the missing workspace / review rows read as
-    // "still fetching", not "none exist".
-    let mut title_spans = vec![Span::styled(
-        format!("shelbi · {}", state.project),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )];
-    if state.board_loading {
-        title_spans.push(Span::styled(
-            "  · loading board…",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        ));
-    }
-    f.render_widget(Paragraph::new(Line::from(title_spans)), layout[0]);
-
-    // Search input.
-    let prompt = Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::DarkGray)),
-        Span::raw(state.query.clone()),
-        Span::styled("▏", Style::default().fg(Color::Cyan)),
-    ]);
-    f.render_widget(Paragraph::new(vec![prompt, Line::raw("")]), layout[1]);
-
-    // Results area. With an empty query and at least one other project, the
-    // area splits into a Commands column (left, the full list) and a Projects
-    // column (right). The moment the query is non-empty the projects column
-    // drops and the commands list reclaims the whole width — a single-column
-    // completion list exactly as before. Percent-of-width, clamped, keeps the
-    // split responsive inside the 70%×60% popup and degrades to a thin (but
-    // never negative) projects column on a narrow terminal without panicking.
-    let (commands_area, projects_area) = if state.projects_column_visible() {
-        let proj_w = (layout[2].width / 3).clamp(18, 28);
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(proj_w)])
-            .split(layout[2]);
-        (cols[0], Some(cols[1]))
-    } else {
-        (layout[2], None)
-    };
-
-    // Result list. List row width matches the list pane so we can pad
-    // out to the right edge and tuck the shortcut hint flush against
-    // it; falls back to no padding when the area is narrower than the
-    // content (the shortcut still appears, just not right-aligned).
-    let row_width = commands_area.width as usize;
-    let items: Vec<ListItem> = results
-        .iter()
-        .map(|(e, _)| {
-            let (glyph, glyph_color) = match &e.decoration {
-                Some(d) => (d.glyph.as_str(), decoration_to_color(d.color)),
-                None => (e.kind.icon(), Color::DarkGray),
-            };
-            let prefix = format!(" {glyph} ");
-            let label = format!("{:<22}", e.label);
-            let mut content_width = prefix.chars().count() + label.chars().count();
-            let mut spans = vec![
-                Span::styled(prefix, Style::default().fg(glyph_color)),
-                Span::raw(label),
-            ];
-            if let Some(sub) = &e.subtitle {
-                let s = format!("  {sub}");
-                content_width += s.chars().count();
-                spans.push(Span::styled(s, Style::default().fg(Color::DarkGray)));
-            }
-            if let Some(short) = &e.shortcut {
-                let sw = short.chars().count();
-                // 1-col right margin keeps the glyph off the pane edge.
-                let pad = row_width
-                    .saturating_sub(content_width)
-                    .saturating_sub(sw)
-                    .saturating_sub(1);
-                if pad > 0 {
-                    spans.push(Span::raw(" ".repeat(pad)));
-                } else {
-                    spans.push(Span::raw("  "));
-                }
-                spans.push(Span::styled(
-                    short.clone(),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            ListItem::new(Line::from(spans))
+    use shelbi_tui::overlay::palette as shared;
+    let projects = if state.projects_column_visible() {
+        let rows = state
+            .projects
+            .iter()
+            .map(|p| shared::ProjectRow {
+                label: p.display_label().to_string(),
+                indicator: shared::project_indicator(
+                    state.loaded_projects.contains(&p.name),
+                    state.active_projects.contains(&p.name),
+                ),
+            })
+            .collect();
+        let selected = if state.focus == Focus::Projects {
+            Some(
+                state
+                    .project_selected
+                    .min(state.sidebar_len().saturating_sub(1)),
+            )
+        } else {
+            None
+        };
+        Some(shared::ProjectsColumn {
+            rows,
+            selected,
+            phase,
         })
-        .collect();
-
-    // The commands column loses its bright selection highlight when focus is
-    // in the projects column, so only one column ever reads as "active".
-    let commands_focused = projects_area.is_none() || state.focus == Focus::Commands;
-    let list = List::new(items).highlight_style(selection_style(commands_focused));
-    let mut s = ListState::default();
-    if !results.is_empty() {
-        s.select(Some(state.selected.min(results.len().saturating_sub(1))));
-    }
-    f.render_stateful_widget(list, commands_area, &mut s);
-
-    // Second column: the other registered projects. Rendered only on an empty
-    // query (see `projects_column_visible`).
-    if let Some(area) = projects_area {
-        render_projects_column(f, area, state, phase);
-    }
-
-    // Footer. The projects-column hint only shows while that column is up so
-    // the empty-query palette advertises the switch shortcut without cluttering
-    // the completion view.
-    let footer_text = if state.projects_column_visible() {
+    } else {
+        None
+    };
+    let footer = if state.projects_column_visible() {
         "↑↓ navigate · → projects · Enter activate · Esc / Ctrl+P close"
     } else {
         "↑↓ navigate · Enter activate · Esc / Ctrl+P close"
     };
-    let footer = Paragraph::new(Line::from(vec![Span::styled(
-        footer_text,
-        Style::default().fg(Color::DarkGray),
-    )]));
-    f.render_widget(footer, layout[3]);
-}
-
-/// Highlight style for a list's selected row. The focused column gets the
-/// bright selection bar; an unfocused column keeps a visible but dim marker so
-/// the user can still see where its selection sits without it competing with
-/// the active column.
-fn selection_style(focused: bool) -> Style {
-    if focused {
-        Style::default()
-            .bg(shelbi_tui::theme::SELECTION_BG)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Gray)
-            .add_modifier(Modifier::DIM)
-    }
-}
-
-/// Render the empty-query second column of other projects into `area`. A left
-/// border acts as the divider from the commands column, a dim "Projects"
-/// header labels it, and each row carries the same loaded/unloaded glyph the
-/// switch-project sub-picker paints. The projects column is narrow, so rows are
-/// glyph + label only; ratatui clips a label too wide for the column rather
-/// than overflowing the popup.
-fn render_projects_column(f: &mut Frame, area: Rect, state: &State, phase: f32) {
-    let block = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(inner);
-
-    let header = Paragraph::new(Line::from(Span::styled(
-        " Projects",
-        Style::default().fg(Color::DarkGray),
-    )));
-    f.render_widget(header, rows[0]);
-
-    let mut items: Vec<ListItem> = state
-        .projects
-        .iter()
-        .map(|p| {
-            let indicator = project_indicator(
-                state.loaded_projects.contains(&p.name),
-                state.active_projects.contains(&p.name),
-            );
-            let (glyph, glyph_color) = project_status_style(indicator, phase);
-            ListItem::new(Line::from(vec![
-                Span::styled(format!(" {glyph} "), Style::default().fg(glyph_color)),
-                Span::raw(p.display_label()),
-            ]))
-        })
-        .collect();
-    // Trailing "Add project" affordance — the last row of the sidebar. Its `+`
-    // glyph occupies the same fixed ` X ` slot as the project glyphs so rows
-    // stay aligned, and Enter here opens the Add project dialog (see the
-    // `Activate` branch in `picker_loop`, which mints the `action:add-project`
-    // entry for this row).
-    items.push(ListItem::new(Line::from(vec![
-        Span::styled(" + ", Style::default().fg(Color::DarkGray)),
-        Span::raw("Add project"),
-    ])));
-
-    let focused = state.focus == Focus::Projects;
-    // Selection highlight patches background + weight only, never a foreground
-    // color, so a loaded project's green `●` keeps its status color under the
-    // bar instead of being repainted white/gray. We also only paint the
-    // selection while the column is focused: an unfocused column shows no
-    // selected row, so the first project never renders in the dim/gray
-    // unfocused-selection style on initial load (focus starts on Commands).
-    let highlight = Style::default()
-        .bg(shelbi_tui::theme::SELECTION_BG)
-        .add_modifier(Modifier::BOLD);
-    let list = List::new(items).highlight_style(highlight);
-    let mut s = ListState::default();
-    if focused {
-        s.select(Some(
-            state
-                .project_selected
-                .min(state.sidebar_len().saturating_sub(1)),
-        ));
-    }
-    f.render_stateful_widget(list, rows[1], &mut s);
+    let view = shared::PaletteView {
+        project_label: &state.project,
+        query: &state.query,
+        board_loading: state.board_loading,
+        results,
+        selected: state.selected,
+        commands_focused: state.focus == Focus::Commands,
+        projects,
+        footer,
+    };
+    let area = f.area();
+    shared::render(f, area, &view);
 }
 
 // ---------------------------------------------------------------------------
@@ -1474,50 +1308,6 @@ fn filter_projects(projects: &[ProjectSummary], query: &str) -> Vec<ProjectSumma
     hits.into_iter().map(|(p, _)| p).collect()
 }
 
-/// The three live states the project-status indicator can be in, in
-/// precedence order. Not-loaded wins first (an unloaded project can't be
-/// running live work), then active work, then plain loaded-idle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectIndicator {
-    /// Loaded and has active-category work in progress — pulsing green fill.
-    Active,
-    /// Loaded but no active work — green ring, no fill.
-    LoadedIdle,
-    /// Not loaded — neutral/gray ring, no fill.
-    Unloaded,
-}
-
-/// Resolve a project's indicator from its two live inputs. Not-loaded
-/// dominates: a project with no live `shelbi-<name>` session shows the
-/// neutral ring even if a stale active-category task lingers on disk, because
-/// nothing is actually progressing it.
-fn project_indicator(loaded: bool, active: bool) -> ProjectIndicator {
-    if !loaded {
-        ProjectIndicator::Unloaded
-    } else if active {
-        ProjectIndicator::Active
-    } else {
-        ProjectIndicator::LoadedIdle
-    }
-}
-
-/// Leading status glyph + color for a project row, given its live indicator
-/// and the current pulse `phase`:
-///
-/// - Active — a filled `●` whose green fill breathes (transparent-green ⇄
-///   full-green) via [`shelbi_tui::theme::project_pulse_color`].
-/// - Loaded-idle — a hollow `○` ring in the palette green token.
-/// - Unloaded — a small filled `•` dot in the neutral token.
-///
-/// All three glyphs are single display cells, so the leading ` X ` slot keeps
-/// a fixed width and rows stay aligned regardless of state.
-fn project_status_style(indicator: ProjectIndicator, phase: f32) -> (&'static str, Color) {
-    match indicator {
-        ProjectIndicator::Active => ("●", shelbi_tui::theme::project_pulse_color(phase)),
-        ProjectIndicator::LoadedIdle => ("○", shelbi_tui::theme::PROJECT_STATUS_GREEN),
-        ProjectIndicator::Unloaded => ("•", shelbi_tui::theme::PROJECT_STATUS_NEUTRAL),
-    }
-}
 
 /// The set of projects that currently have active work in progress — at least
 /// one task in the `active` [`StatusCategory`]. Each project's tasks and
@@ -1562,13 +1352,6 @@ fn project_has_active_work(project: &str) -> bool {
     })
 }
 
-/// Current pulse phase in `[0.0, 1.0)`, derived from how long the picker has
-/// been open. Feeds [`project_status_style`] so the active indicator breathes
-/// as the render loop repaints.
-fn pulse_phase(start: Instant) -> f32 {
-    let period = shelbi_tui::theme::PROJECT_PULSE_PERIOD.as_secs_f32();
-    (start.elapsed().as_secs_f32() / period).fract()
-}
 
 #[allow(clippy::too_many_arguments)]
 fn render_project_picker(
@@ -2105,54 +1888,6 @@ mod tests {
     }
 
     #[test]
-    fn project_indicator_resolves_the_three_states_in_precedence_order() {
-        // Not-loaded dominates — even a stale on-disk active task can't light
-        // the pulse for a project with no live session.
-        assert_eq!(
-            project_indicator(false, false),
-            ProjectIndicator::Unloaded
-        );
-        assert_eq!(project_indicator(false, true), ProjectIndicator::Unloaded);
-        // Loaded + active work → the pulsing indicator; loaded + idle → ring.
-        assert_eq!(project_indicator(true, true), ProjectIndicator::Active);
-        assert_eq!(
-            project_indicator(true, false),
-            ProjectIndicator::LoadedIdle
-        );
-    }
-
-    #[test]
-    fn project_status_style_paints_each_state() {
-        // Active: filled disc, green fill (pulse color varies with phase but
-        // stays a green Rgb). Loaded-idle: green ring. Unloaded: small filled
-        // neutral dot. All three are single display cells so rows stay aligned.
-        let (active_glyph, active_color) = project_status_style(ProjectIndicator::Active, 0.5);
-        assert_eq!(active_glyph, "●");
-        assert!(matches!(active_color, Color::Rgb(0, _, 0)));
-
-        let (idle_glyph, idle_color) = project_status_style(ProjectIndicator::LoadedIdle, 0.0);
-        assert_eq!(idle_glyph, "○");
-        assert_eq!(idle_color, shelbi_tui::theme::PROJECT_STATUS_GREEN);
-
-        let (unloaded_glyph, unloaded_color) =
-            project_status_style(ProjectIndicator::Unloaded, 0.0);
-        assert_eq!(unloaded_glyph, "•");
-        assert_eq!(unloaded_color, shelbi_tui::theme::PROJECT_STATUS_NEUTRAL);
-
-        assert_eq!(active_glyph.chars().count(), idle_glyph.chars().count());
-        assert_eq!(idle_glyph.chars().count(), unloaded_glyph.chars().count());
-    }
-
-    #[test]
-    fn active_pulse_fill_breathes_across_the_cycle() {
-        // The filled disc's fill must actually change between phases so the
-        // pulse is visible; the trough and peak differ in the green channel.
-        let (_, trough) = project_status_style(ProjectIndicator::Active, 0.0);
-        let (_, peak) = project_status_style(ProjectIndicator::Active, 0.5);
-        assert_ne!(trough, peak, "the fill must cycle between phases");
-    }
-
-    #[test]
     fn zen_toggle_entry_label_and_subtitle_flip_with_current_state() {
         let on = zen_toggle_entry(ZenModeState::On, ZenToggleChord::AltZ);
         assert_eq!(on.label, "Turn Zen Mode off");
@@ -2342,139 +2077,6 @@ mod tests {
         assert_eq!(entry.id, "action:switch-project:web");
         assert_eq!(switch_target_from_id(&entry.id), Some("web"));
         assert_eq!(entry.label, "Switch to Website project");
-    }
-
-    /// Build a projects-sidebar [`State`] with a single loaded project and the
-    /// given focus/selection, for the `render_projects_column` render tests.
-    /// The project is loaded-but-idle (no active work), so it renders the
-    /// green ring rather than the pulse.
-    fn projects_column_state(focus: Focus, project_selected: usize) -> State {
-        let mut loaded = std::collections::HashSet::new();
-        loaded.insert("web".to_string());
-        State {
-            query: String::new(),
-            selected: 0,
-            all_entries: Vec::new(),
-            project: "portal".into(),
-            projects: vec![ProjectSummary {
-                name: "web".into(),
-                display_name: Some("Website".into()),
-                repo_path: "/tmp/web".into(),
-                machine_count: 1,
-                workspace_count: 0,
-                last_launched: None,
-            }],
-            loaded_projects: loaded,
-            active_projects: std::collections::HashSet::new(),
-            project_selected,
-            focus,
-            app: App::new_sidebar("portal"),
-            zen_chord: ZenToggleChord::AltZ,
-            board_loading: false,
-            last_board_poll: Instant::now(),
-        }
-    }
-
-    fn draw_projects_column(state: &State) -> ratatui::buffer::Buffer {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        // Phase 0.0 keeps any pulse deterministic for the render assertions.
-        term.draw(|f| render_projects_column(f, f.area(), state, 0.0))
-            .unwrap();
-        term.backend().buffer().clone()
-    }
-
-    fn dump_buffer(buf: &ratatui::buffer::Buffer) -> String {
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().to_string())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    #[test]
-    fn projects_column_keeps_the_loaded_glyph_green_when_its_row_is_selected() {
-        // Focused + selected on the loaded-but-idle project: the selection bar
-        // must not repaint the green ring `○` white/gray — the highlight
-        // patches bg + weight only, so the glyph keeps its status color.
-        let state = projects_column_state(Focus::Projects, 0);
-        let buf = draw_projects_column(&state);
-        let mut found = false;
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                let cell = &buf[(x, y)];
-                if cell.symbol() == "○" {
-                    assert_eq!(
-                        cell.fg,
-                        shelbi_tui::theme::PROJECT_STATUS_GREEN,
-                        "the selected loaded-idle ring must stay green"
-                    );
-                    found = true;
-                }
-            }
-        }
-        assert!(found, "the loaded project's green ring should render");
-    }
-
-    #[test]
-    fn projects_column_pulses_a_filled_green_disc_for_active_work() {
-        // A loaded project with active work renders the filled `●` disc in a
-        // green Rgb pulse fill — distinct from the loaded-idle ring.
-        let mut state = projects_column_state(Focus::Commands, 0);
-        state.active_projects.insert("web".to_string());
-        let buf = draw_projects_column(&state);
-        let mut found = false;
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                let cell = &buf[(x, y)];
-                if cell.symbol() == "●" {
-                    assert!(
-                        matches!(cell.fg, Color::Rgb(0, _, 0)),
-                        "the active disc must render a green pulse fill"
-                    );
-                    found = true;
-                }
-            }
-        }
-        assert!(found, "an active project should render the filled disc");
-    }
-
-    #[test]
-    fn projects_column_renders_the_add_row_and_never_dims_the_first_row_unfocused() {
-        // Initial-load shape: focus on Commands (column unfocused), selection at
-        // row 0. The first project must render in normal text (no dim/gray
-        // unfocused-selection styling), and the trailing "+ Add project" row
-        // must be present.
-        let state = projects_column_state(Focus::Commands, 0);
-        let buf = draw_projects_column(&state);
-
-        let dumped = dump_buffer(&buf);
-        assert!(dumped.contains("Website"), "project row should render");
-        assert!(dumped.contains("Add project"), "Add project row should render");
-        assert!(dumped.contains('+'), "Add row should carry a `+` glyph");
-
-        // No cell on the first project's label may be dimmed or gray — the
-        // unfocused column shows no selection at all.
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                let cell = &buf[(x, y)];
-                if "Website".contains(cell.symbol()) && cell.symbol() != " " {
-                    assert!(
-                        !cell.modifier.contains(Modifier::DIM),
-                        "first project label must not be dimmed on initial load"
-                    );
-                    assert_ne!(
-                        cell.fg,
-                        Color::Gray,
-                        "first project label must not render gray on initial load"
-                    );
-                }
-            }
-        }
     }
 
     #[test]
