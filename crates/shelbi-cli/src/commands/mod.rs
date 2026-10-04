@@ -1,5 +1,4 @@
 pub mod action;
-pub mod add_project;
 pub mod agent;
 pub mod archive;
 pub mod attach;

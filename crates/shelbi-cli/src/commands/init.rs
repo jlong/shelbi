@@ -7,6 +7,10 @@ use inquire::Select;
 use shelbi_state::AgentMaterializeOutcome;
 
 use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig};
+use shelbi_orchestrator::project_create::{
+    self, render_project_yaml, render_split_project_yaml, write_new_project_registration,
+    write_workspace_settings_template, ScaffoldReporter,
+};
 
 use crate::issue_tracker_setup::{self, RealGhProbe};
 use crate::project_root::{
@@ -14,6 +18,32 @@ use crate::project_root::{
     ResolvedProjectRoot, RootValidation,
 };
 use crate::wizard::{self, Runner, SetupPlanOverrides};
+
+/// Prints scaffold progress to the terminal — the CLI's [`ScaffoldReporter`],
+/// byte-identical to the pre-move inline `println!` / `eprintln!` wording the
+/// `project_create` engine used to emit directly.
+struct StdoutReporter;
+
+impl ScaffoldReporter for StdoutReporter {
+    fn note(&mut self, line: &str) {
+        println!("{line}");
+    }
+    fn warn(&mut self, line: &str) {
+        eprintln!("{line}");
+    }
+}
+
+/// Scaffold a project through the shared [`project_create`] engine, printing its
+/// progress to the terminal. One call site for both `shelbi init` and the
+/// init-path tests, so the CLI keeps `InitMode` while the engine speaks
+/// [`shelbi_core::ConfigMode`].
+fn scaffold_project(
+    resolved: &ResolvedProjectRoot,
+    mode: InitMode,
+    issue_tracker: &IssueTrackerConfig,
+) -> Result<()> {
+    project_create::scaffold_project(resolved, mode.config_mode(), issue_tracker, &mut StdoutReporter)
+}
 
 pub mod heuristic;
 
@@ -73,6 +103,14 @@ impl InitMode {
         match self {
             InitMode::InRepo => "in-repo",
             InitMode::Global => "global",
+        }
+    }
+
+    /// Map the CLI's init-mode flag to the shared engine's config-mode enum.
+    fn config_mode(self) -> shelbi_core::ConfigMode {
+        match self {
+            InitMode::InRepo => shelbi_core::ConfigMode::InRepo,
+            InitMode::Global => shelbi_core::ConfigMode::Global,
         }
     }
 }
@@ -525,448 +563,6 @@ impl std::fmt::Display for ModeChoice {
     }
 }
 
-/// Minimal serialization shape for the user-local project YAML. Kept
-/// separate from [`shelbi_core::Project`] on purpose: that struct has
-/// grown a dozen optional fields, and `shelbi init` wants to emit only
-/// the small, stable starter surface (the loader fills the rest from
-/// serde defaults). Building it with `serde_yaml` instead of `format!`
-/// means a `work_dir` containing ` #` (would truncate as a comment) or a
-/// name containing `: ` (would break parsing) is quoted/escaped by the
-/// serializer rather than silently corrupting the file.
-#[derive(serde::Serialize)]
-struct ProjectYaml<'a> {
-    /// Free-form human display **label**. The project **id** is the config
-    /// file's basename (`~/.shelbi/projects/<id>.yaml`), so this key never
-    /// carries the id — it is emitted only when the entered name was slugified
-    /// into a different id (e.g. `ContextStore` → id `contextstore`, label
-    /// `ContextStore`). A name that is already a clean slug supplies no label,
-    /// so the key is elided and the id doubles as the display label.
-    #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
-    label: Option<&'a str>,
-    repo: &'a str,
-    default_branch: &'a str,
-    /// Emitted only for in-repo projects (`config_mode: in-repo`). Global
-    /// projects omit the key — matching the loader's `None`-is-Global
-    /// default, so the file stays byte-identical to the pre-mode shape.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    config_mode: Option<&'a str>,
-    /// The default workflow a task lands on when its frontmatter omits
-    /// `workflow:`. Fresh projects ship `task` (the review-gated default);
-    /// `workflows/task.yaml` and `workflows/subtask.yaml` are materialized
-    /// alongside.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    default_workflow: Option<&'a str>,
-    machines: Vec<MachineYaml<'a>>,
-    orchestrator: OrchestratorYaml<'a>,
-    /// Starter pool. Serialized between `orchestrator:` and `agent_runners:`
-    /// so [`shelbi_core::scaffold::decorate_project_yaml`] can splice its
-    /// "add more workspaces" example as an extra commented list item.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    workspaces: Vec<WorkspaceYaml<'a>>,
-    agent_runners: std::collections::BTreeMap<&'a str, RunnerYaml<'a>>,
-    /// The chosen board backend. An all-default `file_system` block is elided
-    /// (matching [`shelbi_core::Project`]'s own `skip_serializing_if`), so a
-    /// File-system project's YAML stays byte-identical to the pre-choice shape;
-    /// a GitHub choice writes the `backend: github` + `github.repo` block.
-    #[serde(skip_serializing_if = "IssueTrackerConfig::is_default")]
-    issue_tracker: &'a IssueTrackerConfig,
-}
-
-#[derive(serde::Serialize)]
-struct MachineYaml<'a> {
-    name: &'a str,
-    kind: &'a str,
-    work_dir: &'a str,
-}
-
-#[derive(serde::Serialize)]
-struct OrchestratorYaml<'a> {
-    runner: &'a str,
-}
-
-#[derive(serde::Serialize)]
-struct WorkspaceYaml<'a> {
-    name: &'a str,
-    machine: &'a str,
-    runner: &'a str,
-    /// Routing tags — `[review]` on the review slot the `task` workflow's
-    /// review status requires. Elided when empty so a tag-less slot stays
-    /// lean.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tags: Vec<&'a str>,
-}
-
-#[derive(serde::Serialize)]
-struct RunnerYaml<'a> {
-    command: &'a str,
-    flags: Vec<&'a str>,
-}
-
-/// Render the starter project YAML via serde (never string
-/// interpolation). Validates `name` first so a value that can't
-/// round-trip through the filesystem path or YAML — the F1 charset gate —
-/// can never reach disk.
-fn render_project_yaml(
-    name: &str,
-    display_name: Option<&str>,
-    repo: &str,
-    work_dir: &Path,
-    config_mode: Option<&str>,
-    issue_tracker: &IssueTrackerConfig,
-) -> Result<String> {
-    validate_project_name(name)?;
-    let work_dir = work_dir.to_string_lossy();
-    let mut agent_runners = std::collections::BTreeMap::new();
-    agent_runners.insert(
-        "claude",
-        RunnerYaml {
-            command: "claude",
-            flags: vec![],
-        },
-    );
-    agent_runners.insert(
-        "codex",
-        RunnerYaml {
-            command: "codex",
-            flags: vec![],
-        },
-    );
-    let doc = ProjectYaml {
-        // `name` is the id — it becomes the filename, not a YAML key. The
-        // optional human label (present only when the entered name was
-        // slugified) is written under the `name:` key.
-        label: display_name,
-        repo,
-        default_branch: "main",
-        config_mode,
-        // Fresh projects default to the review-gated `task` workflow; the
-        // `subtask` workflow ships alongside for parent/child work.
-        default_workflow: Some(shelbi_core::TASK_WORKFLOW_NAME),
-        machines: vec![MachineYaml {
-            name: "hub",
-            kind: "local",
-            work_dir: &work_dir,
-        }],
-        orchestrator: OrchestratorYaml { runner: "claude" },
-        // Provision a starter pool: a dev slot plus a `review`-tagged slot on
-        // the hub so the `task` workflow's `review` status (which requires the
-        // `review` tag) has somewhere to run.
-        workspaces: vec![
-            WorkspaceYaml {
-                name: "dev",
-                machine: "hub",
-                runner: "claude",
-                tags: vec![],
-            },
-            WorkspaceYaml {
-                name: "review",
-                machine: "hub",
-                runner: "claude",
-                tags: vec!["review"],
-            },
-        ],
-        agent_runners,
-        issue_tracker,
-    };
-    let active = serde_yaml::to_string(&doc).context("serializing project YAML")?;
-    // Wrap the serde-rendered required fields with the docs-linked header and
-    // commented-out examples for every optional feature. The dynamic values
-    // (name/repo/work_dir) still go through serde above — the decoration only
-    // appends static, struct-grounded comment blocks.
-    Ok(shelbi_core::scaffold::decorate_project_yaml(&active))
-}
-
-/// Render the two halves of an in-repo project's config: the committed shared
-/// half (`<repo>/.shelbi/project.yaml`) and the user-local half
-/// (`~/.shelbi/projects/<id>/local.yaml`). Returns `(shared_body, local_body)`.
-///
-/// Both halves are produced from the same starter surface
-/// [`render_project_yaml`] emits — re-parsed into a [`shelbi_core::Project`]
-/// and re-serialized through the SHARED/LOCAL field partition the migration
-/// path uses ([`shelbi_core::Project::to_shared_yaml_string`] /
-/// [`to_local_yaml_string`](shelbi_core::Project::to_local_yaml_string)) — so
-/// `init` and `migrate-to-in-repo` emit byte-compatible splits from one writer.
-///
-/// The committed `name:` is deliberately the project **id** (a valid slug),
-/// not the free-form display label: `shelbi init --pick-up` reads it back as
-/// the canonical name to seed a teammate's local alias, so it must clear the
-/// same charset gate as any other id. The human label, when the entered name
-/// was slugified, rides along in the shared half under `display_name:` —
-/// exactly as the pre-split committed file emitted it.
-fn render_split_project_yaml(
-    name: &str,
-    display_name: Option<&str>,
-    repo: &str,
-    work_dir: &Path,
-    issue_tracker: &IssueTrackerConfig,
-) -> Result<(String, String)> {
-    let flat = render_project_yaml(name, None, repo, work_dir, Some("in-repo"), issue_tracker)?;
-    let mut project = shelbi_core::Project::from_yaml_str(&flat).map_err(|e| anyhow!(e))?;
-    // The id lives in the filename/registry dir, never a YAML key, but the
-    // committed file's `name:` is pick-up's anchor — force it to the id.
-    project.name = name.to_string();
-    project.label = Some(name.to_string());
-    project.display_name = display_name.map(str::to_string);
-    project.config_mode = Some(shelbi_core::ConfigMode::InRepo);
-    let shared = project.to_shared_yaml_string().map_err(|e| anyhow!(e))?;
-    let local = project.to_local_yaml_string().map_err(|e| anyhow!(e))?;
-    Ok((shared, local))
-}
-
-/// Publish a new local registry entry while atomically arming its first-launch
-/// greeting with respect to dashboard bootstrap.
-///
-/// `registration_path` is the file that makes the project discoverable: the
-/// flat `~/.shelbi/projects/<name>.yaml` for a global project, or the split
-/// `~/.shelbi/projects/<name>/local.yaml` for an in-repo one. Either way the
-/// under-lock existence check considers *both* shapes, so a project already
-/// registered in one layout is never double-registered in the other.
-fn write_new_project_registration(
-    project: &str,
-    registration_path: &Path,
-    body: &str,
-) -> Result<bool> {
-    use std::io::Write;
-
-    // The split registration lives one directory deeper
-    // (`projects/<name>/local.yaml`); its parent may not exist yet on a fresh
-    // in-repo init. Materialize it before staging the temp sibling.
-    if let Some(parent) = registration_path.parent() {
-        shelbi_state::ensure_dir(parent).map_err(|e| anyhow!(e))?;
-    }
-
-    // Build the complete registration under a sibling temp name first. A
-    // process crash at any point before the final hard link therefore leaves
-    // no discoverable partial or fully written-but-unarmed project.
-    let (temp_path, mut temp_file) = crate::wizard::create_sibling_temp(registration_path)?;
-    if let Err(error) = temp_file.write_all(body.as_bytes()) {
-        drop(temp_file);
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(error).with_context(|| format!("writing {}", temp_path.display()));
-    }
-    drop(temp_file);
-
-    // Registration publication and the first-launch latch share the same
-    // lock as dashboard bootstrap. Arm first, then atomically publish the
-    // already-complete inode without replacing any existing registration.
-    // If the process dies between those two steps, retry sees no registration
-    // and completes the pending publication safely.
-    let _dashboard_lock = shelbi_state::lock_dashboard(project).map_err(|e| anyhow!(e))?;
-    let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
-    let flat_registration = projects_dir.join(format!("{project}.yaml"));
-    let split_registration = projects_dir.join(project).join("local.yaml");
-    if flat_registration.exists() || split_registration.exists() {
-        let _ = std::fs::remove_file(&temp_path);
-        return Ok(false);
-    }
-    shelbi_state::arm_contextual_greeting(project).map_err(|e| anyhow!(e))?;
-    let publish = std::fs::hard_link(&temp_path, registration_path);
-    let _ = std::fs::remove_file(&temp_path);
-    match publish {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // A non-cooperating publisher raced the under-lock existence
-            // check. It owns the registration, so clear our latch instead of
-            // allowing a delayed greeting on one of its later launches.
-            shelbi_state::claim_contextual_greeting(project).map_err(|e| anyhow!(e))?;
-            Ok(false)
-        }
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "publishing {} as {}",
-                temp_path.display(),
-                registration_path.display()
-            )
-        }),
-    }
-}
-
-/// Write the project YAML, workspace-settings template, default agents, and
-/// project-wide statuses catalogue. Every step is individually idempotent so
-/// a run interrupted after registration can finish materializing on retry.
-/// In-repo mode also writes the committed `<repo>/.shelbi/project.yaml` that
-/// `shelbi init --pick-up` consumes on another clone.
-fn scaffold_project(
-    resolved: &ResolvedProjectRoot,
-    mode: InitMode,
-    issue_tracker: &IssueTrackerConfig,
-) -> Result<()> {
-    let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
-    let _scaffold_lock = shelbi_state::lock_project_scaffold().map_err(|e| anyhow!(e))?;
-    let yaml_path = projects_dir.join(format!("{}.yaml", resolved.name));
-    let registration_exists =
-        shelbi_state::has_project_registration(&resolved.name).map_err(|e| anyhow!(e))?;
-    let is_first_registration =
-        !shelbi_state::has_any_project_registration().map_err(|e| anyhow!(e))?;
-
-    // Seed runtime onboarding before publishing the registration. If this
-    // process stops between these steps, the project is still undiscoverable
-    // and a retry idempotently reuses the same fixed Welcome task. Conversely,
-    // a registration that already existed at function entry is user-owned and
-    // must never gain or resurrect onboarding state.
-    if !registration_exists {
-        let _ = shelbi_state::scaffold_welcome_task(&resolved.name).map_err(|e| anyhow!(e))?;
-        if is_first_registration {
-            shelbi_state::arm_first_run_hint().map_err(|e| anyhow!(e))?;
-        }
-    }
-
-    // In-repo projects are born as a two-file split; render both halves up
-    // front so the fresh-registration branch (local.yaml) and the committed
-    // shared write below draw from the same source.
-    let in_repo_split = if mode == InitMode::InRepo {
-        Some(render_split_project_yaml(
-            &resolved.name,
-            resolved.display_name.as_deref(),
-            &resolved.path.to_string_lossy(),
-            &resolved.path,
-            issue_tracker,
-        )?)
-    } else {
-        None
-    };
-
-    if registration_exists {
-        let existing_path = if yaml_path.is_file() {
-            yaml_path.clone()
-        } else {
-            projects_dir.join(&resolved.name).join("local.yaml")
-        };
-        println!(
-            "(project registration already exists at {})",
-            existing_path.display()
-        );
-    } else {
-        match mode {
-            InitMode::InRepo => {
-                // No flat `<name>.yaml` — the registration IS the user-local
-                // half at `~/.shelbi/projects/<name>/local.yaml`. The loader
-                // treats a present `local.yaml` as authoritative in-repo state
-                // (see `shelbi_state::load_project`), so the split is what
-                // subsequent opens read.
-                let (_shared, local) =
-                    in_repo_split.as_ref().expect("in-repo split rendered above");
-                let local_path = projects_dir.join(&resolved.name).join("local.yaml");
-                if write_new_project_registration(&resolved.name, &local_path, local)? {
-                    println!("✓ registered project (in-repo): {}", local_path.display());
-                } else {
-                    println!(
-                        "(project registration already exists at {})",
-                        local_path.display()
-                    );
-                }
-            }
-            InitMode::Global => {
-                // Global mode leaves `repo` empty and keeps the flat layout.
-                let yaml = render_project_yaml(
-                    &resolved.name,
-                    resolved.display_name.as_deref(),
-                    "",
-                    &resolved.path,
-                    None,
-                    issue_tracker,
-                )?;
-                if write_new_project_registration(&resolved.name, &yaml_path, &yaml)? {
-                    println!("✓ wrote project: {}", yaml_path.display());
-                } else {
-                    println!("(project YAML already exists at {})", yaml_path.display());
-                }
-            }
-        }
-    }
-
-    // In-repo mode: write the committed shared half. Idempotent — a
-    // pre-existing committed file (a teammate's, or a prior run's) is left
-    // untouched — so a re-run that finds the local.yaml already published but
-    // the repo file missing still heals the split.
-    if let Some((shared, _local)) = in_repo_split.as_ref() {
-        write_in_repo_shared(&resolved.path, shared)?;
-    }
-
-    write_workspace_settings_template(&resolved.name)?;
-
-    // Init is idempotent for an existing project. Use the same provenance-
-    // aware self-heal as reload so an upgrade cannot leave stock unpinned Zen
-    // commands in an already-materialized orchestrator prompt.
-    let outcomes =
-        shelbi_state::self_heal_default_agents(&resolved.name).map_err(|e| anyhow!(e))?;
-    for outcome in outcomes {
-        print_agent_materialize_outcome(&outcome);
-    }
-
-    // Materialize the starter workflow files (task.yaml + subtask.yaml) so
-    // `shelbi init`'s post-condition is self-contained. Each is written only
-    // when absent; ordinary project loads do not recreate them after a project
-    // intentionally removes one.
-    for path in shelbi_state::scaffold_project_workflow(&resolved.name).map_err(|e| anyhow!(e))? {
-        println!("✓ wrote project workflow: {}", path.display());
-    }
-    let statuses_path = shelbi_state::statuses_path(&resolved.name).map_err(|e| anyhow!(e))?;
-    if !statuses_path.exists() {
-        shelbi_state::scaffold_project_statuses(&resolved.name).map_err(|e| anyhow!(e))?;
-        println!("✓ wrote project statuses: {}", statuses_path.display());
-    }
-    // The user-owned Zen policy definition. Custom prose survives re-runs;
-    // exact legacy unpinned PR commands are migrated in place so automation
-    // cannot keep following an unsafe stock sequence after an upgrade.
-    match shelbi_state::scaffold_zenmode(&resolved.name).map_err(|e| anyhow!(e))? {
-        shelbi_state::ZenmodeOutcome::Created => {
-            let path = shelbi_state::zenmode_path(&resolved.name).map_err(|e| anyhow!(e))?;
-            println!("✓ wrote Zen policy: {}", path.display());
-        }
-        shelbi_state::ZenmodeOutcome::Migrated => {
-            let path = shelbi_state::zenmode_path(&resolved.name).map_err(|e| anyhow!(e))?;
-            println!(
-                "✓ pinned legacy Zen PR commands in {} (custom prose preserved)",
-                path.display()
-            );
-        }
-        shelbi_state::ZenmodeOutcome::Unchanged => {}
-    }
-
-    // The user-editable PR-description template the developer worker follows
-    // when authoring a PR body. Custom edits survive re-runs.
-    if let shelbi_state::PrTemplateOutcome::Created =
-        shelbi_state::scaffold_pr_template(&resolved.name).map_err(|e| anyhow!(e))?
-    {
-        let path = shelbi_state::pr_template_path(&resolved.name).map_err(|e| anyhow!(e))?;
-        println!("✓ wrote PR template: {}", path.display());
-    }
-
-    // Disclose and install the context-scoped default-branch commit guard now,
-    // with the user's knowledge — this is the consented install. Project open
-    // only *refreshes* an already-installed hook, so it's never created
-    // silently behind the user's back ([[feedback-no-silent-git-hook-install]]).
-    // Best-effort: a non-git root or a foreign hook degrades quietly, and the
-    // user can always add it later with `shelbi guard install`.
-    if let Ok(project) = shelbi_state::load_project(&resolved.name) {
-        crate::commands::guard::install_at_init(&project, &resolved.path);
-    }
-    Ok(())
-}
-
-/// Write the committed shared half to `<repo>/.shelbi/project.yaml`.
-/// Idempotent — a pre-existing file is left alone (a previous run, or a
-/// teammate committed it): the committed config is a git-tracked contract
-/// with every future clone, so init never clobbers one it finds.
-///
-/// The body is the shared half of the split ([`render_split_project_yaml`]):
-/// the canonical `name:` (the pick-up anchor) plus every shared field
-/// ([`shelbi_core::SHARED_PROJECT_FIELDS`]) — `config_mode: in-repo`,
-/// `default_branch`, `orchestrator`, `agent_runners`, and so on.
-fn write_in_repo_shared(root: &Path, shared_body: &str) -> Result<()> {
-    let dir = root.join(".shelbi");
-    let path = dir.join("project.yaml");
-    if path.exists() {
-        println!("(in-repo config already exists at {})", path.display());
-        return Ok(());
-    }
-    shelbi_state::ensure_dir(&dir).map_err(|e| anyhow!(e))?;
-    std::fs::write(&path, shared_body)?;
-    println!("✓ wrote in-repo config: {}", path.display());
-    Ok(())
-}
-
 /// Best-effort read of the canonical `name:` from a committed
 /// `<repo>/.shelbi/project.yaml`. Returns `Ok(None)` when the file
 /// isn't a YAML map with a `name` key — we don't want a malformed
@@ -1147,7 +743,7 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
         yaml_path
     };
 
-    write_workspace_settings_template(&local_alias)?;
+    write_workspace_settings_template(&local_alias, &mut StdoutReporter)?;
     let outcomes = shelbi_state::self_heal_default_agents(&local_alias).map_err(|e| anyhow!(e))?;
     for outcome in outcomes {
         print_agent_materialize_outcome(&outcome);
@@ -1295,80 +891,11 @@ fn next_available_alias(canonical: &str) -> Result<(String, Option<String>)> {
     )
 }
 
-fn write_workspace_settings_template(project: &str) -> Result<()> {
-    // Config path — mode-aware. For an in-repo project this lands under
-    // `<repo>/.shelbi/`; for a global project under
-    // `~/.shelbi/projects/<name>/`. The project YAML has already been
-    // written by the time this runs, so `config_project_dir` can read the
-    // mode back off disk.
-    let template_path = shelbi_state::config_project_dir(project)
-        .map_err(|e| anyhow!(e))?
-        .join("workspace-settings.json.template");
-    if template_path.exists() {
-        println!(
-            "(workspace settings template already exists at {})",
-            template_path.display()
-        );
-        return Ok(());
-    }
-    shelbi_state::ensure_dir(template_path.parent().unwrap()).map_err(|e| anyhow!(e))?;
-    std::fs::write(
-        &template_path,
-        shelbi_state::DEFAULT_WORKSPACE_SETTINGS_TEMPLATE,
-    )?;
-    println!(
-        "✓ wrote workspace settings template: {}",
-        template_path.display()
-    );
-    Ok(())
-}
-
-/// Stringify a [`shelbi_state::AgentMaterializeOutcome`] for the init /
-/// reload report. Same renderer used by both commands so the user sees
-/// the same wording for the same outcome regardless of which path
-/// touched the agent workspace.
+/// Print a [`shelbi_state::AgentMaterializeOutcome`] for the init / reload
+/// report. Delegates to the shared [`project_create::render_agent_materialize_outcome`]
+/// renderer so init and reload show the same wording for the same outcome.
 pub(super) fn print_agent_materialize_outcome(outcome: &AgentMaterializeOutcome) {
-    match outcome {
-        AgentMaterializeOutcome::Created { agent } => {
-            println!("✓ created agent workspace: agents/{agent}/");
-        }
-        AgentMaterializeOutcome::Unchanged { agent } => {
-            println!("(agent workspace already exists: agents/{agent}/)");
-        }
-        AgentMaterializeOutcome::Upgraded { agent } => {
-            println!(
-                "✓ upgraded agents/{agent}/instructions.md to the new bundled default \
-                 (was the previous default, untouched — nothing to preserve)"
-            );
-        }
-        AgentMaterializeOutcome::Preserved {
-            agent,
-            first_notice,
-        } => {
-            if *first_notice {
-                println!(
-                    "(preserved your custom agents/{agent}/instructions.md — \
-                     differs from the bundled default; the project owns the override)"
-                );
-            } else {
-                println!("(preserved your custom agents/{agent}/instructions.md)");
-            }
-        }
-        AgentMaterializeOutcome::MigratedZenCommands { agent, .. } => {
-            println!(
-                "✓ pinned legacy Zen PR commands in custom agents/{agent}/instructions.md \
-                 (all other prose preserved)"
-            );
-        }
-        AgentMaterializeOutcome::RepairedRequiredSections {
-            agent, sections, ..
-        } => {
-            println!(
-                "✓ repaired custom agents/{agent}/instructions.md — added required section(s): {}",
-                sections.join(", ")
-            );
-        }
-    }
+    println!("{}", project_create::render_agent_materialize_outcome(outcome));
 }
 
 #[cfg(test)]

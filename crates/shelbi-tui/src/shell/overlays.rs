@@ -16,11 +16,14 @@ use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
+use std::path::Path;
+
 use shelbi_app::command::{
     CommandModel, EditItem, ProjectItem, ReviewItem, ViewItem, WorkspaceItem,
 };
 use shelbi_app::exec::EditTarget;
 use shelbi_app::view::SidebarModel;
+use shelbi_core::ConfigMode;
 use shelbi_palette::Entry;
 use shelbi_state::keymap::Keymaps;
 
@@ -49,6 +52,16 @@ pub enum OverlayEvent {
         confirmed: bool,
         dont_show_again: bool,
     },
+    /// The Add-project form submitted; the shell validates these values and
+    /// either scaffolds the project (off-thread) or stashes an inline error
+    /// back on the form.
+    AddProjectSubmit {
+        name: String,
+        root: String,
+        mode: ConfigMode,
+    },
+    /// The Add-project form was cancelled.
+    AddProjectCancel,
 }
 
 /// The overlay currently drawn over the main area, with its runtime state.
@@ -75,6 +88,9 @@ pub enum ActiveOverlay {
     ZenIntro {
         project: String,
         state: overlay::zen_intro::IntroState,
+    },
+    AddProject {
+        form: overlay::add_project::Form,
     },
 }
 
@@ -127,6 +143,13 @@ impl ActiveOverlay {
         ActiveOverlay::ZenIntro {
             project: project.into(),
             state: overlay::zen_intro::IntroState::default(),
+        }
+    }
+
+    /// Open the Add-project form, prefilling the repo path from `cwd`.
+    pub fn add_project(cwd: &Path) -> Self {
+        ActiveOverlay::AddProject {
+            form: overlay::add_project::Form::new(cwd),
         }
     }
 
@@ -193,6 +216,15 @@ impl ActiveOverlay {
                     },
                 }
             }
+            ActiveOverlay::AddProject { form } => match form.handle_key(ev) {
+                overlay::add_project::Step::Continue => OverlayEvent::Stay,
+                overlay::add_project::Step::Cancel => OverlayEvent::AddProjectCancel,
+                overlay::add_project::Step::Submit => OverlayEvent::AddProjectSubmit {
+                    name: form.name().to_string(),
+                    root: form.root().to_string(),
+                    mode: form.mode(),
+                },
+            },
         }
     }
 
@@ -253,6 +285,10 @@ impl ActiveOverlay {
                 centered_rect(area, 60, h)
             }
             ActiveOverlay::ZenIntro { .. } => centered_rect(area, 64, 16),
+            // The form fills a generous share of the main area so long repo
+            // paths and validation messages never truncate (the tmux dialog
+            // filled the whole palette window for the same reason).
+            ActiveOverlay::AddProject { .. } => centered_pct(area, 70, 60, 48, 14),
         }
     }
 
@@ -269,6 +305,7 @@ impl ActiveOverlay {
             ActiveOverlay::ZenIntro { state, .. } => {
                 overlay::zen_intro::render_intro(f, rect, state)
             }
+            ActiveOverlay::AddProject { form } => form.render(f, rect),
         }
     }
 }

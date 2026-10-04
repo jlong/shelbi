@@ -30,6 +30,7 @@ pub mod load;
 pub mod machine;
 pub mod mutate;
 pub mod poller;
+pub mod project_create;
 pub mod quit;
 pub mod ready;
 pub mod remote_session;

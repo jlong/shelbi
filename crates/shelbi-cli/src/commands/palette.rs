@@ -5,7 +5,7 @@
 //! action and exits.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -22,7 +22,8 @@ use ratatui::{
     widgets::{List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
-use shelbi_core::StatusCategory;
+use shelbi_core::{ConfigMode, IssueTrackerConfig, StatusCategory};
+use shelbi_orchestrator::project_create::{self, ResolvedProjectRoot, ScaffoldReporter};
 use shelbi_palette::{Entry, EntryKind};
 use shelbi_state::keymap::{
     load_keymaps, GlobalAction, KeymapDiagnostic, Keymaps, PaletteAction,
@@ -75,18 +76,19 @@ pub fn run(project: String) -> Result<()> {
         let chosen = picker_loop(&mut term, &mut state, &keymaps);
         match &chosen {
             Ok(Some(entry)) if entry.id == "action:add-project" => {
-                // Native ratatui form in the palette's own alt-screen. On a
-                // valid confirm it returns the collected values; on cancel it
-                // returns None and we bounce back into the main picker (state
-                // preserved) so a mis-selection doesn't kick the user out.
+                // The shared in-process form (rendered in the palette's own
+                // alt-screen) collects + validates the values; on a valid
+                // confirm it returns them, on cancel None and we bounce back
+                // into the main picker (state preserved) so a mis-selection
+                // doesn't kick the user out.
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                match super::add_project::run(&mut term, &keymaps, &cwd)? {
-                    Some(form) => {
+                match run_add_project_form(&mut term, &keymaps, &cwd)? {
+                    Some((resolved, mode)) => {
                         // Creation prints to stdout and then opens the new
                         // project's dashboard, so hand the terminal back first
                         // (mirrors the edit-dispatch / teardown ownership).
                         restore_terminal(&mut term)?;
-                        create_and_open_project(form)?;
+                        create_and_open_project(resolved, mode)?;
                         return Ok(());
                     }
                     None => continue,
@@ -1766,35 +1768,85 @@ fn format_active_workspaces(n: usize) -> String {
     }
 }
 
-/// Create + register the project the Add-Project dialog collected, then open
-/// its dashboard. Drives the exact `shelbi init` scaffolder
-/// ([`super::init::scaffold_with_prompt`]) non-interactively — root, name, and
-/// config mode are all pinned, so it takes the scripted branches (no prompt)
-/// and the on-disk result is identical to a command-line `shelbi init
-/// --project … --root … --mode …`. On success we open the new project right
-/// away (the natural next step after explicitly adding it), reusing the same
-/// [`switch_to_project`] path the Switch-Project action uses.
+/// A [`ScaffoldReporter`] that prints the scaffold engine's progress to the
+/// terminal — the palette's Add-project flow restores the terminal first, so
+/// these land on a clean normal-mode screen (byte-identical to a command-line
+/// `shelbi init`'s output).
+struct StdoutReporter;
+
+impl ScaffoldReporter for StdoutReporter {
+    fn note(&mut self, line: &str) {
+        println!("{line}");
+    }
+    fn warn(&mut self, line: &str) {
+        eprintln!("{line}");
+    }
+}
+
+/// Drive the shared Add-project form in the palette's alt-screen. Returns the
+/// validated [`ResolvedProjectRoot`] + chosen [`ConfigMode`] on confirm,
+/// `Ok(None)` on cancel (Esc, or re-pressing the palette chord as a close).
+/// Validation (via [`project_create::validate_add_project`]) runs on submit; a
+/// failure stays in the form with an inline error rather than exiting.
+fn run_add_project_form<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    keymaps: &Keymaps,
+    cwd: &Path,
+) -> Result<Option<(ResolvedProjectRoot, ConfigMode)>> {
+    use shelbi_tui::overlay::add_project::{Form, Step};
+
+    // Opener-as-close: re-pressing the palette chord dismisses the form, the
+    // same convention the Quit / Zen-intro popovers follow.
+    let opener_close = keymaps
+        .global
+        .first_chord_for(GlobalAction::OpenPalette)
+        .copied();
+
+    let mut form = Form::new(cwd);
+    loop {
+        term.draw(|f| form.render(f, f.area()))?;
+
+        if !event::poll(Duration::from_millis(150))? {
+            continue;
+        }
+        if let Event::Key(k) = event::read()? {
+            if k.kind != KeyEventKind::Press {
+                continue;
+            }
+            if let Some(c) = opener_close {
+                if crate::keys::chord_from_event(k) == Some(c) {
+                    return Ok(None);
+                }
+            }
+            match form.handle_key(k) {
+                Step::Continue => {}
+                Step::Cancel => return Ok(None),
+                Step::Submit => match project_create::validate_add_project(form.name(), form.root(), cwd) {
+                    Ok(resolved) => return Ok(Some((resolved, form.mode()))),
+                    Err(msg) => form.set_error(msg),
+                },
+            }
+        }
+    }
+}
+
+/// Create + register the project the Add-project form collected, then open its
+/// dashboard. Drives the shared [`project_create::scaffold_project`] engine —
+/// the exact path `shelbi init` takes — with a `file_system` board (the palette
+/// dialog never reaches an interactive tracker prompt; the user can switch it
+/// later via `shelbi init` or `shelbi issue-store migrate`). On success we open
+/// the new project right away, reusing the same [`switch_to_project`] path the
+/// Switch-Project action uses.
 ///
 /// Runs after the terminal has been restored, so the scaffolder's progress
 /// lines land on a clean normal-mode terminal.
-fn create_and_open_project(form: super::add_project::AddProjectForm) -> Result<()> {
-    let args = super::init::Args {
-        project: Some(form.name),
-        root: Some(form.root),
-        mode: Some(form.mode),
-        runner: None,
-        default_branch: None,
-        github_url: None,
-        orchestrator_runner: None,
-        // The palette "Add project" dialog runs inside the TUI alt-screen, so it
-        // must not reach an inquire prompt. Pin the board to file_system
-        // non-interactively; the user can switch it later via `shelbi init` or
-        // `shelbi issue-store migrate`.
-        issue_tracker: Some(super::init::IssueTrackerArg::FileSystem),
-        github_repo: None,
-        pick_up: false,
-    };
-    let resolved = super::init::scaffold_with_prompt(args)?;
+fn create_and_open_project(resolved: ResolvedProjectRoot, mode: ConfigMode) -> Result<()> {
+    project_create::scaffold_project(
+        &resolved,
+        mode,
+        &IssueTrackerConfig::default(),
+        &mut StdoutReporter,
+    )?;
     switch_to_project(&resolved.name)
 }
 
