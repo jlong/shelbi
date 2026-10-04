@@ -161,6 +161,10 @@ pub fn run(args: RunArgs) -> Result<()> {
 
     install_signal_handlers();
 
+    // Watch the hub daemon: with the service units retired, an open project's
+    // sessions are what bring a crashed daemon back (see `daemon_watchdog`).
+    crate::daemon_watchdog::spawn(&args.name);
+
     // --- PTY + child -----------------------------------------------------
     let pty = native_pty_system();
     let pair = pty
