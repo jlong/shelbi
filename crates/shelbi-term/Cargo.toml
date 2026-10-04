@@ -11,7 +11,9 @@ description = "UI-toolkit-agnostic terminal view for shelbi sessions (emulator, 
 [dependencies]
 shelbi-proto = { workspace = true }
 # The client-side emulator crate chosen in `rt-spike-emulator-replay` (vendored
-# fork under `vendor/alacritty_terminal`). Present so this crate and the session
-# process can build against it; no product code uses it yet (`rt-term` wires the
-# `emulator` seam to it).
+# fork under `vendor/alacritty_terminal`). `shelbi-term` drives it headless as
+# the client-side emulator and reads its grid/mode for rendering.
 alacritty_terminal = { workspace = true }
+# Key-input encoder (MIT). Used only for its `input` encode tables; wrapped
+# behind this crate's neutral key types so no termwiz type is in the public API.
+termwiz = { workspace = true }
