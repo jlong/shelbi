@@ -94,6 +94,11 @@ impl Home {
             .env("SHELBI_HUB_SOCK", &self.hub)
             .env("SHELBI_CONTROL_SOCK", &self.control)
             .env_remove("SHELBI_ROOT")
+            // Belt-and-braces: this harness sets a temp SHELBI_HOME but inherits
+            // the developer's real $HOME, so a retire would have hit the live
+            // ~/Library/LaunchAgents plist. The default-root gate already skips
+            // retire here; this makes the hermeticity explicit and local.
+            .env("SHELBI_NO_RETIRE_UNITS", "1")
             .env("SHELBI_DAEMON_IDLE_GRACE_MS", "3000")
             .env("SHELBI_DAEMON_IDLE_POLL_MS", "500")
             .env("SHELBI_YES", "0")

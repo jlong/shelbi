@@ -65,6 +65,10 @@ impl Home {
             .env("SHELBI_HOME", &self.path)
             .env_remove("SHELBI_ROOT")
             .env_remove("SHELBI_HUB_SOCK")
+            // Belt-and-braces hermeticity: never touch the real user's
+            // launchd/systemd supervisor unit from a test (the default-root gate
+            // already skips it, since SHELBI_HOME is set).
+            .env("SHELBI_NO_RETIRE_UNITS", "1")
             .env("SHELBI_DAEMON_IDLE_GRACE_MS", "400")
             .env("SHELBI_DAEMON_IDLE_POLL_MS", "200")
             // The version gate and board refresh never need a real `gh`; keep
