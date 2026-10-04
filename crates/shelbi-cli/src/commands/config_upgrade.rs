@@ -204,6 +204,9 @@ pub fn detect(projects: &[String]) -> Result<UpgradeReport> {
     // prose surface with the project's workflow transitions), so it also runs
     // over the whole entry set rather than one surface at a time.
     sniff_zen_finalize(&entries, &mut findings);
+    // Rust-track developer prose missing the MSRV-check reminder — cross-surface
+    // because the Rust gate is derived from the project's other surfaces.
+    sniff_dev_msrv_guidance(&entries, &mut findings);
     // Missing lifecycle-owned shipped defaults added in a newer release —
     // materialize them into projects that predate the addition.
     sniff_missing_lifecycle_defaults(&entries, &mut findings);
@@ -593,6 +596,15 @@ fn sniff_review_instructions(entry: &InventoryEntry, text: &str, out: &mut Vec<U
 const FRESH_PRIMARY_MARKERS: &[&str] =
     &["git fetch origin", "origin/<primary>", "fresh primary"];
 
+/// Distinctive phrases the "run the MSRV check when `Cargo.lock` changes"
+/// guidance introduces. A developer `instructions.md` carrying any one already
+/// teaches it; a file with none predates it. Keyed on the cargo command the
+/// worker runs (workspaces never run the `shelbi` binary, so the dev prose
+/// points at a plain `cargo +<msrv> check ...` instead of `shelbi msrv-check`).
+/// Kept in sync with the shipped default template by the drift guard in this
+/// module's tests.
+const DEV_MSRV_MARKERS: &[&str] = &["--all-targets --locked", "cargo +"];
+
 /// Sniff a developer `instructions.md` for the "start every branch from a fresh
 /// primary" base discipline (Rule 1).
 ///
@@ -610,21 +622,26 @@ const FRESH_PRIMARY_MARKERS: &[&str] =
 /// local edits.
 fn sniff_developer_instructions(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
     let lower = text.to_ascii_lowercase();
-    if FRESH_PRIMARY_MARKERS.iter().any(|m| lower.contains(m)) {
-        return;
+
+    // Rule 1: fresh-primary base discipline (applies to every project).
+    if !FRESH_PRIMARY_MARKERS.iter().any(|m| lower.contains(m)) {
+        out.push(finding(
+            entry,
+            Classification::NeedsJudgment,
+            "DEV_INSTRUCTIONS_FRESH_PRIMARY_MISSING",
+            "developer agent prose doesn't teach starting every branch from a fresh primary \
+             (`git fetch origin` + base on `origin/<primary>`) — a stale local base silently \
+             omits (and can revert) a just-merged sibling's work",
+            "Add a `Start every branch from a fresh primary` section: always `git fetch origin` \
+             before cutting or rebasing a branch and base work on `origin/<primary>`, never the \
+             local primary ref — mirror the shipped default template.",
+            Location { line: 1, column: 1 },
+        ));
     }
-    out.push(finding(
-        entry,
-        Classification::NeedsJudgment,
-        "DEV_INSTRUCTIONS_FRESH_PRIMARY_MISSING",
-        "developer agent prose doesn't teach starting every branch from a fresh primary \
-         (`git fetch origin` + base on `origin/<primary>`) — a stale local base silently \
-         omits (and can revert) a just-merged sibling's work",
-        "Add a `Start every branch from a fresh primary` section: always `git fetch origin` \
-         before cutting or rebasing a branch and base work on `origin/<primary>`, never the \
-         local primary ref — mirror the shipped default template.",
-        Location { line: 1, column: 1 },
-    ));
+
+    // The MSRV-check reminder is Rust-gated, so it can't be decided from this
+    // surface alone — it runs as a cross-surface sniffer ([`sniff_dev_msrv_guidance`])
+    // that correlates the dev prose with whether the project is a Rust track.
 }
 
 // ---------------------------------------------------------------------------
@@ -719,6 +736,7 @@ fn sniff_project_registration(
     }
     if let Some(zen) = get(&value, "zen") {
         sniff_zen_danger_paths(entry, text, zen, out);
+        sniff_zen_checks_msrv(entry, text, zen, out);
     }
 }
 
@@ -1008,6 +1026,60 @@ fn sniff_zen_danger_paths(
     }
 }
 
+/// Distinctive token of the shipped MSRV local check. A `zen.checks.local`
+/// list that already carries it needs no upgrade. Kept in sync with the shipped
+/// scaffold default and the `shelbi msrv-check` subcommand by the drift guard in
+/// this module's tests.
+const MSRV_CHECK_MARKER: &str = "msrv-check";
+
+/// Sniff a `zen.checks.local` block (project- or workflow-level) for a Rust
+/// track that runs `cargo` checks but has no MSRV check. CI's `msrv` job builds
+/// the workspace on the declared `rust-version`; the probe's stable-toolchain
+/// checks don't, so a lockfile bump pulling in a dependency that needs a newer
+/// Rust passes the probe and review and only fails in CI after handoff
+/// (`uuid@1.27.0 requires rustc 1.89.0`, PR #1465). The shipped default now
+/// lists `shelbi msrv-check`; existing projects carry their own forked checks,
+/// so this hands the orchestrator a finding to add it.
+///
+/// Rust-gated by the presence of a `cargo` command so a non-Rust track is never
+/// flagged. Routed to [`Classification::NeedsJudgment`]: the check list is
+/// user-customizable and a registration/workflow auto-heal re-serializes the
+/// YAML (dropping comments), so the orchestrator adds the entry to its own copy
+/// rather than a lossy mechanical rewrite — per the AGENTS.md guardrail.
+fn sniff_zen_checks_msrv(entry: &InventoryEntry, text: &str, zen: &Value, out: &mut Vec<UpgradeFinding>) {
+    let Some(local) = get(zen, "checks")
+        .and_then(|c| get(c, "local"))
+        .and_then(Value::as_sequence)
+    else {
+        return;
+    };
+    let cmds: Vec<&str> = local.iter().filter_map(Value::as_str).collect();
+    // Only a Rust track (one whose first token is `cargo`) needs the MSRV guard.
+    let is_rust = cmds
+        .iter()
+        .any(|c| c.split_whitespace().next() == Some("cargo"));
+    if !is_rust {
+        return;
+    }
+    // Already carries an MSRV check (`shelbi msrv-check`, or a hand-rolled
+    // `cargo +<ver> check`): nothing to add.
+    if cmds.iter().any(|c| c.contains(MSRV_CHECK_MARKER)) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        "ZEN_CHECKS_MSRV_MISSING",
+        "`zen.checks.local` runs cargo but has no MSRV check — a lockfile bump that needs a \
+         newer Rust than the declared `rust-version` passes the probe and review, then fails \
+         CI's `msrv` job after handoff",
+        "Add a `shelbi msrv-check` entry to `zen.checks.local`: it builds the workspace on the \
+         declared MSRV (Cargo.toml `rust-version`), mirroring CI's `msrv` job, and skips cleanly \
+         when the toolchain can't be provisioned.",
+        locate_key(text, "checks"),
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // statuses.yaml
 
@@ -1081,6 +1153,12 @@ fn sniff_workflow(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFindi
         for item in statuses {
             sniff_workflow_status(entry, text, item, out);
         }
+    }
+
+    // Per-workflow `zen.checks.local` override (the `app` / `remove-tmux-subtask`
+    // Rust tracks): same MSRV gap as the project-level checks.
+    if let Some(zen) = get(&value, "zen") {
+        sniff_zen_checks_msrv(entry, text, zen, out);
     }
 }
 
@@ -1817,6 +1895,102 @@ fn sniff_zen_finalize(entries: &[InventoryEntry], out: &mut Vec<UpgradeFinding>)
     }
 }
 
+/// Cross-surface sniff: a Rust project whose developer `instructions.md`
+/// doesn't tell the worker to run the MSRV check when `Cargo.lock` changes.
+///
+/// Rust-gated so a non-Rust project's generic dev prose is never flagged, and
+/// the gate is hermetic (derived from the project's own surfaces, not a project
+/// load or a repo stat): a project counts as a Rust track when any of its
+/// registration- or workflow-level `zen.checks.local` lists runs a `cargo`
+/// command — the same signal [`sniff_zen_checks_msrv`] uses, so the two agree
+/// on what "Rust track" means.
+///
+/// Routed to [`Classification::NeedsJudgment`]: the dev prose is
+/// user-customizable, so the orchestrator merges the reminder into its own copy.
+fn sniff_dev_msrv_guidance(entries: &[InventoryEntry], out: &mut Vec<UpgradeFinding>) {
+    let mut by_project: std::collections::BTreeMap<&str, Vec<&InventoryEntry>> =
+        std::collections::BTreeMap::new();
+    for e in entries {
+        if e.scope.starts_with("project:") {
+            by_project.entry(e.scope.as_str()).or_default().push(e);
+        }
+    }
+
+    for project_entries in by_project.values() {
+        if !project_is_rust_track(project_entries) {
+            continue;
+        }
+        for entry in project_entries {
+            if !entry.exists || !entry.logical_id.ends_with(".agent.developer.instructions") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&entry.canonical_path) else {
+                continue;
+            };
+            let lower = text.to_ascii_lowercase();
+            if DEV_MSRV_MARKERS.iter().any(|m| lower.contains(m)) {
+                continue;
+            }
+            out.push(finding(
+                entry,
+                Classification::NeedsJudgment,
+                "DEV_INSTRUCTIONS_MSRV_CHECK_MISSING",
+                "developer agent prose doesn't tell the worker to run the MSRV check when \
+                 `Cargo.lock` changes — a lockfile bump that needs a newer Rust than the declared \
+                 `rust-version` passes the local build and only fails in CI's `msrv` job after \
+                 handoff",
+                "Add guidance to the `Verifying your work` section: when a change touches \
+                 `Cargo.lock`, read `rust-version` from `Cargo.toml` and run `cargo +<that \
+                 version> check --workspace --all-targets --locked` before handoff (it builds on \
+                 the declared MSRV, mirroring CI) — mirror the shipped default template. Don't \
+                 point the worker at `shelbi msrv-check`; workspaces never run the `shelbi` \
+                 binary.",
+                Location { line: 1, column: 1 },
+            ));
+        }
+    }
+}
+
+/// Whether a project is a Rust track, decided from its own `zen.checks.local`
+/// surfaces (project registration + per-workflow overrides): true when any such
+/// list runs a `cargo` command. Reads only the inventory's surface files, so it
+/// stays hermetic (no project load / repo stat) and consistent with
+/// [`sniff_zen_checks_msrv`]'s Rust signal.
+fn project_is_rust_track(entries: &[&InventoryEntry]) -> bool {
+    entries.iter().any(|e| {
+        let is_reg = e.logical_id.ends_with(".registration")
+            || e.logical_id.ends_with(".registration.shared")
+            || e.logical_id.ends_with(".registration.local");
+        let is_workflow = e.logical_id.contains(".workflow.");
+        if !(is_reg || is_workflow) || !matches!(e.format, SurfaceFormat::Yaml) || !e.exists {
+            return false;
+        }
+        let Ok(text) = std::fs::read_to_string(&e.canonical_path) else {
+            return false;
+        };
+        zen_checks_runs_cargo(&text)
+    })
+}
+
+/// Whether a config surface's top-level `zen.checks.local` runs a `cargo`
+/// command. Shared by the Rust-track gate so the definition lives in one place.
+fn zen_checks_runs_cargo(text: &str) -> bool {
+    let Ok(value) = serde_yaml::from_str::<Value>(text) else {
+        return false;
+    };
+    let Some(local) = get(&value, "zen")
+        .and_then(|z| get(z, "checks"))
+        .and_then(|c| get(c, "local"))
+        .and_then(Value::as_sequence)
+    else {
+        return false;
+    };
+    local
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|c| c.split_whitespace().next() == Some("cargo"))
+}
+
 /// True when any of `project`'s workflows declares a transition from a
 /// **handoff**-category status to a **done**-category status whose actions
 /// include `merge` — the "review -> done transition already merges" precondition
@@ -2081,6 +2255,16 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
             "These are prose instructions a project may have forked and customized, so the \
              fresh-primary base discipline can't be merged in mechanically without risking \
              local edits — the orchestrator refreshes its own copy instead."
+        }
+        "DEV_INSTRUCTIONS_MSRV_CHECK_MISSING" => {
+            "These are prose instructions a project may have forked and customized, so the \
+             MSRV-check reminder can't be merged in mechanically without risking local edits — \
+             the orchestrator refreshes its own copy instead."
+        }
+        "ZEN_CHECKS_MSRV_MISSING" => {
+            "The check list is user-customizable, and a mechanical YAML rewrite would \
+             re-serialize the file and drop its comments — so the orchestrator adds the \
+             `shelbi msrv-check` entry to its own copy instead of a lossy auto-heal."
         }
         "REVIEW_INSTRUCTIONS_NO_HUMAN_AUTHORIZED_REBASE" => {
             "These are prose instructions a project may have forked and customized, so the \
@@ -3004,6 +3188,196 @@ mod tests {
             "shipped default developer template trips the fresh-primary sniffer: {:?}",
             codes(&out)
         );
+    }
+
+    // ---- MSRV check: zen.checks.local (project + workflow) --------------
+
+    #[test]
+    fn zen_checks_cargo_without_msrv_check_is_needs_judgment() {
+        let fs = project_findings(
+            "name: demo\nzen:\n  checks:\n    local:\n      - cargo build --workspace\n      \
+             - cargo clippy --workspace\n",
+        );
+        let f = find(&fs, "ZEN_CHECKS_MSRV_MISSING").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+    }
+
+    #[test]
+    fn zen_checks_with_msrv_check_present_is_clean() {
+        let fs = project_findings(
+            "name: demo\nzen:\n  checks:\n    local:\n      - cargo build --workspace\n      \
+             - shelbi msrv-check\n",
+        );
+        assert!(
+            find(&fs, "ZEN_CHECKS_MSRV_MISSING").is_none(),
+            "a checks list already carrying the MSRV check was flagged: {:?}",
+            codes(&fs)
+        );
+    }
+
+    #[test]
+    fn zen_checks_without_cargo_are_not_flagged() {
+        // A non-Rust track (npm/go/…) has no MSRV concept — never flag it.
+        let fs = project_findings(
+            "name: demo\nzen:\n  checks:\n    local:\n      - npm run lint\n      - npm test\n",
+        );
+        assert!(
+            find(&fs, "ZEN_CHECKS_MSRV_MISSING").is_none(),
+            "a non-Rust checks list was flagged: {:?}",
+            codes(&fs)
+        );
+    }
+
+    #[test]
+    fn workflow_zen_checks_cargo_without_msrv_is_flagged() {
+        // The per-workflow `zen.checks.local` override on a Rust track (the
+        // `app` / `remove-tmux-subtask` shape) gets the same treatment.
+        let e = entry(
+            "project.demo.workflow.app",
+            "project:demo",
+            SurfaceFormat::Yaml,
+        );
+        let mut out = Vec::new();
+        sniff_workflow(
+            &e,
+            "name: app\nzen:\n  checks:\n    local:\n      - cargo test --workspace\n",
+            &mut out,
+        );
+        assert_eq!(
+            find(&out, "ZEN_CHECKS_MSRV_MISSING")
+                .expect("finding")
+                .classification,
+            Classification::NeedsJudgment
+        );
+    }
+
+    /// Drift guard: the shipped scaffold's `zen.checks.local` example must list
+    /// the MSRV check, so the documented default and the sniffer's marker never
+    /// disagree.
+    #[test]
+    fn shipped_scaffold_zen_example_lists_the_msrv_check() {
+        let decorated = shelbi_core::scaffold::decorate_project_yaml("name: demo\n");
+        assert!(
+            decorated.contains(MSRV_CHECK_MARKER) && decorated.contains("shelbi msrv-check"),
+            "scaffold zen.checks.local example no longer lists `shelbi msrv-check`",
+        );
+    }
+
+    // ---- MSRV check: developer instructions (cross-surface) -------------
+
+    /// Build a project surface set on disk: a registration YAML (with the given
+    /// checks list) plus a developer instructions file (with the given prose).
+    /// Returns the two entries pointing at the real files and a guard dir.
+    fn rust_project_surfaces(
+        checks_yaml: &str,
+        dev_prose: &str,
+    ) -> (std::path::PathBuf, Vec<InventoryEntry>) {
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-msrv-dev-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg_path = dir.join("demo.yaml");
+        let dev_path = dir.join("instructions.md");
+        std::fs::write(&reg_path, checks_yaml).unwrap();
+        std::fs::write(&dev_path, dev_prose).unwrap();
+        let mk = |id: &str, path: &std::path::Path, fmt: SurfaceFormat| InventoryEntry {
+            logical_id: id.to_string(),
+            scope: "project:demo".to_string(),
+            canonical_path: path.to_path_buf(),
+            candidate_path: path.to_path_buf(),
+            format: fmt,
+            exists: true,
+            lifecycle_owned: false,
+        };
+        let entries = vec![
+            mk("project.demo.registration", &reg_path, SurfaceFormat::Yaml),
+            mk(
+                "project.demo.agent.developer.instructions",
+                &dev_path,
+                SurfaceFormat::Markdown,
+            ),
+        ];
+        (dir, entries)
+    }
+
+    #[test]
+    fn rust_project_dev_instructions_without_msrv_guidance_is_flagged() {
+        let (dir, entries) = rust_project_surfaces(
+            "name: demo\nzen:\n  checks:\n    local:\n      - cargo build --workspace\n",
+            "# Developer\n\n## Verifying your work\n\nRun cargo build and cargo clippy.\n",
+        );
+        let mut out = Vec::new();
+        sniff_dev_msrv_guidance(&entries, &mut out);
+        let f = find(&out, "DEV_INSTRUCTIONS_MSRV_CHECK_MISSING").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_rust_project_dev_instructions_are_not_flagged_for_msrv() {
+        // No cargo in any checks list → not a Rust track → generic dev prose
+        // isn't nagged about an MSRV check it has no use for.
+        let (dir, entries) = rust_project_surfaces(
+            "name: demo\nzen:\n  checks:\n    local:\n      - npm test\n",
+            "# Developer\n\n## Verifying your work\n\nRun npm test.\n",
+        );
+        let mut out = Vec::new();
+        sniff_dev_msrv_guidance(&entries, &mut out);
+        assert!(
+            find(&out, "DEV_INSTRUCTIONS_MSRV_CHECK_MISSING").is_none(),
+            "a non-Rust project's dev instructions were flagged: {:?}",
+            codes(&out)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_project_dev_instructions_with_msrv_guidance_are_clean() {
+        let (dir, entries) = rust_project_surfaces(
+            "name: demo\nzen:\n  checks:\n    local:\n      - cargo build --workspace\n",
+            "# Developer\n\n## Verifying your work\n\nWhen Cargo.lock changes, run \
+             `cargo +<msrv> check --workspace --all-targets --locked` before handoff.\n",
+        );
+        let mut out = Vec::new();
+        sniff_dev_msrv_guidance(&entries, &mut out);
+        assert!(
+            find(&out, "DEV_INSTRUCTIONS_MSRV_CHECK_MISSING").is_none(),
+            "dev prose already carrying the MSRV reminder was flagged: {:?}",
+            codes(&out)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Drift guard: the shipped default developer template must carry the MSRV
+    /// guidance, so a freshly-materialized Rust project never trips this sniffer.
+    #[test]
+    fn shipped_default_developer_template_carries_msrv_guidance() {
+        let (dir, entries) = rust_project_surfaces(
+            "name: demo\nzen:\n  checks:\n    local:\n      - cargo build --workspace\n",
+            "placeholder\n",
+        );
+        // Point the developer surface at the shipped template content.
+        let dev_path = entries
+            .iter()
+            .find(|e| e.logical_id.ends_with(".agent.developer.instructions"))
+            .map(|e| e.canonical_path.clone())
+            .unwrap();
+        std::fs::write(&dev_path, shelbi_state::DEFAULT_DEVELOPER_INSTRUCTIONS).unwrap();
+        let mut out = Vec::new();
+        sniff_dev_msrv_guidance(&entries, &mut out);
+        assert!(
+            find(&out, "DEV_INSTRUCTIONS_MSRV_CHECK_MISSING").is_none(),
+            "shipped default developer template trips the MSRV-guidance sniffer: {:?}",
+            codes(&out)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- orchestrator instructions.md -----------------------------------

@@ -20,6 +20,7 @@ pub mod issue_store;
 pub mod list;
 pub mod merge;
 pub mod message;
+pub mod msrv_check;
 pub mod open;
 pub mod orchestrate;
 pub mod orchestrator;
