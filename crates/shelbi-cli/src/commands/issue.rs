@@ -435,6 +435,110 @@ fn workspace_occupied_by(
         }))
 }
 
+/// The issue — other than `exclude_id` — that `workspace_name` is actively
+/// assigned to right now, decided from **local, authoritative** state rather
+/// than the daemon's published index.
+///
+/// This is the release guard behind the supplant decision: a dispatch tears down
+/// the card's prior assignee only when that workspace is still on THIS card (or
+/// idle). If it has since been re-dispatched to another issue this returns that
+/// issue, so the release is skipped rather than killing a live worker mid-task on
+/// an unrelated card.
+///
+/// Why not the published index: on a remote (GitHub) backend `read_board` serves
+/// the daemon's `board-index.json`, which lags local routing — an assignment
+/// write never bumps a GitHub `updatedAt`, and a parked or dead daemon stops
+/// republishing entirely. In the 2026-10-04 incident the prior assignee had been
+/// re-dispatched to another card *after* the last refresh and the daemon then
+/// died: the index still showed that card in `todo` (and the old guard only
+/// counted `in_progress`/`review`), so the workspace read as idle and its live
+/// worker was killed. Assignment for a remote backend lives only in the local
+/// overlay (`assignments/<id>`), which every dispatch writes synchronously
+/// (`set_fields` → `set_task_assignment`) and `read_board`'s overlay re-resolve
+/// folds in. That overlay is the authoritative routing record here: any
+/// non-terminal issue other than `exclude_id` routed to the workspace counts as
+/// busy, whatever column a stale index shows it in.
+///
+/// Returns:
+/// - `Ok(Some(issue))` — the workspace is busy on another non-terminal issue;
+///   the caller skips the release and logs it.
+/// - `Ok(None)` — the workspace is definitively free (on THIS card or idle);
+///   the caller releases its pane.
+/// - `Err(_)` — can't confirm (the overlay read failed, or local state names
+///   another issue but the board isn't `Warm` enough to rule out that it has
+///   since gone terminal). The caller errs toward NOT releasing.
+fn workspace_busy_with_other(
+    project: &str,
+    workspace_name: &str,
+    exclude_id: &str,
+) -> Result<Option<Issue>> {
+    let cfg = shelbi_state::load_project(project)
+        .map_err(|e| anyhow!(e))?
+        .issue_tracker;
+    if !cfg.backend.is_remote() {
+        // Local (`file_system`) board: assignment lives in the card frontmatter
+        // and the directory read is always authoritative (`BoardState::Warm`).
+        // The open board is open-only, so every row is non-terminal — any card
+        // assigned to this workspace other than the one being dispatched counts,
+        // whatever column it is parked in.
+        return Ok(shelbi_state::read_board(project)
+            .map_err(|e| anyhow!(e))?
+            .into_issues()
+            .into_iter()
+            .map(|tf| tf.task)
+            .find(|task| {
+                task.assigned_to.as_deref() == Some(workspace_name) && task.id != exclude_id
+            }));
+    }
+
+    // Remote backend: the local assignment overlay is the authoritative routing
+    // record. Every dispatch writes it synchronously, so it never lags the way
+    // the daemon's published index can.
+    let mut others: Vec<String> = shelbi_state::task_assignments(project)
+        .map_err(|e| anyhow!(e))?
+        .into_iter()
+        .filter(|(id, ws)| ws == workspace_name && id != exclude_id)
+        .map(|(id, _)| id)
+        .collect();
+    if others.is_empty() {
+        // Authoritative: nothing else is routed to this workspace, so it is on
+        // THIS card or idle — safe to release.
+        return Ok(None);
+    }
+
+    // At least one other issue is routed here. Confirm it is still non-terminal
+    // before counting it busy: a terminal card's marker can linger, and a stale
+    // marker alone must not block a legitimate release. The open board drops
+    // terminal cards, so presence there is the confirmation — and it holds even
+    // for a `Stale` index, which is exactly the incident shape (the routed card
+    // still listed, in whatever column).
+    let state = shelbi_state::read_board(project).map_err(|e| anyhow!(e))?;
+    if let Some(task) = state
+        .issues()
+        .iter()
+        .find(|tf| others.contains(&tf.task.id))
+        .map(|tf| tf.task.clone())
+    {
+        return Ok(Some(task));
+    }
+
+    // None of the routed issues are in the open board. A `Warm` board is the
+    // current open-only set, so their absence proves they have gone terminal and
+    // the workspace is free. A board that isn't warm (stale, cold, unreachable)
+    // can't prove that, so we can't confirm — err toward NOT releasing.
+    match state {
+        shelbi_state::BoardState::Warm(_) => Ok(None),
+        _ => {
+            others.sort();
+            Err(anyhow!(
+                "the prior assignee `{workspace_name}` is routed to `{}` in the local overlay but \
+                 the board index isn't warm enough to confirm whether it is still active",
+                others.join("`, `"),
+            ))
+        }
+    }
+}
+
 /// Refuse to dispatch or assign onto a workspace already running a *different*
 /// in-flight issue. Shared by `issue assign`, `issue start`, and `issue resume`
 /// so an assignment a dispatch would refuse is refused up front — the two can
@@ -1583,33 +1687,50 @@ fn start(
         }
     }
 
-    // Release the workspace this card was previously assigned to, when a
-    // *different* one is now taking over. A card moved from one agent-owned
-    // active gate to another (`in-progress -> adversarial-review`) leaves its
-    // prior dev pane running against a card it no longer owns; supplanting its
-    // assignment above without this leaves that pane orphaned. Fires only once
-    // the new pane is confirmed up (this block runs after a successful launch),
-    // so a failed dispatch that rolls the card back never strands the prior
-    // worker. Best-effort: a dead/absent pane must not undo the authoritative
-    // reassignment already persisted.
+    // Release the workspace this card was previously assigned to — but ONLY when
+    // that workspace is still working on THIS card (or has gone idle). The
+    // reassignment above already moved the card onto `workspace_name`; the prior
+    // assignee's pane would otherwise be left running against a card it no longer
+    // owns, so a gate-to-gate move (`in-progress -> adversarial-review`) still
+    // needs it torn down. What it must NOT do is tear down a prior assignee that
+    // has since been re-dispatched to a *different* issue — that pane holds a
+    // live worker mid-task on an unrelated card, and releasing on the card's
+    // stale `assigned_to` alone would kill it. Fires only once the new pane is
+    // confirmed up (this block runs after a successful launch), so a failed
+    // dispatch that rolls the card back never strands the prior worker.
+    // Best-effort throughout: a dead/absent pane or a board-read hiccup must not
+    // undo the authoritative reassignment already persisted.
     if let Some(prev_ws_name) =
         supplanted_workspace(original.assigned_to.as_deref(), &workspace_name)
     {
-        if let Some(prev_ws) = project_yaml.workspace(prev_ws_name) {
-            if let Err(e) = teardown_workspace_pane(&project_yaml, prev_ws) {
-                eprintln!(
-                    "warning: releasing the supplanted workspace pane on `{prev_ws_name}` \
-                     failed ({e}) — check it and kill a stale worker by hand if one is left"
-                );
-            } else if let Err(e) = shelbi_state::append_dispatch_event(
-                project,
-                id,
-                prev_ws_name,
-                "released",
-                "supplanted by a new workspace taking over the card's active status",
-            ) {
-                eprintln!("warning: append_dispatch_event failed: {e}");
+        match workspace_busy_with_other(project, prev_ws_name, id) {
+            // Still on this card (or idle) — safe to reclaim its pane.
+            Ok(None) => release_supplanted_pane(project, &project_yaml, prev_ws_name, id),
+            // Re-dispatched elsewhere — leave its live worker alone, and record a
+            // `skipped` line naming the issue it is busy with so the non-release
+            // is visible in `events.log` rather than silent.
+            Ok(Some(busy)) => {
+                if let Err(e) = shelbi_state::append_dispatch_event(
+                    project,
+                    id,
+                    prev_ws_name,
+                    "skipped",
+                    &format!(
+                        "prior assignee is now active on `{}`; its pane was left running",
+                        busy.id
+                    ),
+                ) {
+                    eprintln!("warning: append_dispatch_event failed: {e}");
+                }
             }
+            // Board read failed — err toward NOT releasing. A possibly orphaned
+            // pane on this card is recoverable; killing an unrelated live worker
+            // on a false negative is not.
+            Err(e) => eprintln!(
+                "warning: couldn't check whether the prior assignee `{prev_ws_name}` is still \
+                 on `{id}` ({e}) — leaving its pane alone; kill a stale worker by hand if one \
+                 is left"
+            ),
         }
     }
 
@@ -1707,6 +1828,76 @@ fn teardown_workspace_pane(
         .map_err(|e| anyhow!(e))?;
     shelbi_orchestrator::workspace::kill_workspace_pane(&host, &addr, &workspace.name)
         .map_err(|e| anyhow!(e))
+}
+
+/// Is `workspace`'s tmux slot live right now? Resolves the machine/addr the same
+/// way [`teardown_workspace_pane`] does and asks tmux (local: the window;
+/// remote: the session). Errors on a mis-declared workspace — the addr won't
+/// resolve — which the caller treats as "can't confirm" rather than guessing.
+fn workspace_pane_liveness(
+    project_yaml: &shelbi_core::Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+) -> Result<bool> {
+    let machine = project_yaml.machine(&workspace.machine).ok_or_else(|| {
+        anyhow!(
+            "machine `{}` for workspace `{}` is not declared",
+            workspace.machine,
+            workspace.name
+        )
+    })?;
+    let host = machine.host();
+    let addr = shelbi_orchestrator::workspace::workspace_tmux_addr(project_yaml, workspace)
+        .map_err(|e| anyhow!(e))?;
+    shelbi_orchestrator::workspace::workspace_slot_alive(&host, &addr).map_err(|e| anyhow!(e))
+}
+
+/// Tear down the pane of the card's prior assignee `prev_ws_name` and record a
+/// `released` dispatch event — but only when a live pane is actually taken down.
+/// The caller has already established that `prev_ws_name` is still on THIS card
+/// (or idle), so the teardown can't kill a worker that has moved to another
+/// issue.
+///
+/// An idle slot (no live pane) is a no-op that records nothing: the `released`
+/// line is reserved for a real teardown so it never implies a worker was killed
+/// when none was running. A workspace that won't resolve is left alone (teardown
+/// would hit the same error) and records nothing.
+fn release_supplanted_pane(
+    project: &str,
+    project_yaml: &shelbi_core::Project,
+    prev_ws_name: &str,
+    id: &str,
+) {
+    let Some(prev_ws) = project_yaml.workspace(prev_ws_name) else {
+        return;
+    };
+    match workspace_pane_liveness(project_yaml, prev_ws) {
+        // Idle slot: nothing to reclaim, nothing to record.
+        Ok(false) => {}
+        // A live pane on this card — reclaim it and log the release.
+        Ok(true) => {
+            if let Err(e) = teardown_workspace_pane(project_yaml, prev_ws) {
+                eprintln!(
+                    "warning: releasing the supplanted workspace pane on `{prev_ws_name}` \
+                     failed ({e}) — check it and kill a stale worker by hand if one is left"
+                );
+            } else if let Err(e) = shelbi_state::append_dispatch_event(
+                project,
+                id,
+                prev_ws_name,
+                "released",
+                "supplanted by a new workspace taking over the card's active status",
+            ) {
+                eprintln!("warning: append_dispatch_event failed: {e}");
+            }
+        }
+        // Can't confirm liveness (the addr won't resolve) — teardown would hit
+        // the same error, so leave it and record nothing rather than over-claim
+        // a release that didn't happen.
+        Err(e) => eprintln!(
+            "warning: couldn't probe the supplanted pane on `{prev_ws_name}` ({e}) — left \
+             alone; kill a stale worker by hand if one is left"
+        ),
+    }
 }
 
 /// Poll cadence of [`await_launch`]. Small enough that a completed or
@@ -4519,6 +4710,18 @@ workspaces:
         shelbi_state::write_board_index("gh", &idx).unwrap();
     }
 
+    /// Seed a **stale** daemon index for the `gh` project — the identity still
+    /// matches (so the file serves) but `stale` is flagged, so `read_board` maps
+    /// it to [`shelbi_state::BoardState::Stale`]. Models a parked/dead daemon
+    /// whose last-published board has aged out, the shape of the 2026-10-04
+    /// incident.
+    fn write_gh_index_stale(board: Vec<shelbi_state::IssueFile>) {
+        let mut idx = shelbi_state::BoardIndex::fresh(board);
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        idx.stale = true;
+        shelbi_state::write_board_index("gh", &idx).unwrap();
+    }
+
     /// The incident: a card that finished (its PR merged, moving it to a terminal
     /// column out-of-band) was never cleared from `board-snapshot.json`, so the
     /// stale entry pinned its workspace as `in_progress` and locked it out of
@@ -4586,6 +4789,196 @@ workspaces:
         assert!(
             err.contains("live-1") && err.contains("in_progress"),
             "err should name the blocking card and its real column: {err}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The supplant guard's core case: a dispatch must NOT tear down the prior
+    /// assignee once that workspace has been re-dispatched to a *different*
+    /// issue. `workspace_busy_with_other` surfaces that other issue so the
+    /// release block takes the `skipped` branch — leaving the live worker and
+    /// its issue untouched — instead of killing it mid-task. The decision is read
+    /// from the local assignment overlay (authoritative routing), with the open
+    /// board confirming the routed card is still non-terminal.
+    #[test]
+    fn workspace_busy_with_other_reports_a_different_active_issue() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+
+        // `alpha` was the prior assignee of `handed-off`, but is now routed to
+        // `other-task` in the local overlay, and that card is still open.
+        shelbi_state::set_task_assignment("gh", "other-task", Some("alpha")).unwrap();
+        write_gh_index(vec![issue_file(task_assigned(
+            "other-task",
+            Column::in_progress(),
+            "alpha",
+        ))]);
+
+        let busy = workspace_busy_with_other("gh", "alpha", "handed-off")
+            .unwrap()
+            .expect("alpha is active on a different issue");
+        assert_eq!(busy.id, "other-task");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A workspace serving a `review`-column task on a different issue is just as
+    /// busy as one holding an `in_progress` card — the guard counts any open
+    /// routed issue regardless of column, so a dispatch never tears down a review
+    /// slot serving an unrelated card.
+    #[test]
+    fn workspace_busy_with_other_counts_a_review_slot() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+        shelbi_state::set_task_assignment("gh", "under-review", Some("alpha")).unwrap();
+        write_gh_index(vec![issue_file(task_assigned(
+            "under-review",
+            Column::review(),
+            "alpha",
+        ))]);
+
+        let busy = workspace_busy_with_other("gh", "alpha", "handed-off")
+            .unwrap()
+            .expect("alpha is serving a review on a different issue");
+        assert_eq!(busy.id, "under-review");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The two release-fires cases: the prior assignee is still on THIS card (the
+    /// original gate-to-gate move the release was written for) or has gone idle.
+    /// Both yield `None`, so the release proceeds — a real teardown when a pane
+    /// is up, a no-op when idle. The card being dispatched is excluded by id, so
+    /// an overlay marker that still points at it never reads as "busy elsewhere".
+    #[test]
+    fn workspace_busy_with_other_none_when_on_this_card_or_idle() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+
+        // Still on this card: the overlay routes `handed-off` to alpha and
+        // nothing else. (The gate-to-gate case — alpha is released.)
+        shelbi_state::set_task_assignment("gh", "handed-off", Some("alpha")).unwrap();
+        write_gh_index(vec![issue_file(task_assigned(
+            "handed-off",
+            Column::in_progress(),
+            "alpha",
+        ))]);
+        assert!(
+            workspace_busy_with_other("gh", "alpha", "handed-off")
+                .unwrap()
+                .is_none(),
+            "the card being dispatched is excluded, so the prior assignee reads as free"
+        );
+
+        // Idle: the overlay routes nothing to alpha at all.
+        shelbi_state::set_task_assignment("gh", "handed-off", None).unwrap();
+        write_gh_index(Vec::new());
+        assert!(
+            workspace_busy_with_other("gh", "alpha", "handed-off")
+                .unwrap()
+                .is_none(),
+            "an idle prior assignee has no other active issue"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The incident shape (2026-10-04), the reason the first pass was reworked: the
+    /// prior assignee A was re-dispatched to another card *after* the last board
+    /// refresh, and the daemon then died, so the published index is **stale** and
+    /// still lists that card in `todo`. Reading occupancy from the index alone
+    /// (its old `in_progress`/`review` filter) read A as idle and killed its live
+    /// worker. Deciding from the local overlay — authoritative and never lagged —
+    /// surfaces the routed card from a stale index all the same, so the release is
+    /// skipped and A's pane is left alone.
+    #[test]
+    fn workspace_busy_with_other_reads_the_overlay_past_a_stale_index() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+
+        // Local overlay (authoritative) routes `other-task` to alpha.
+        shelbi_state::set_task_assignment("gh", "other-task", Some("alpha")).unwrap();
+        // The published index is stale and still shows `other-task` in `todo` —
+        // the exact state the old guard misread as "alpha is idle".
+        write_gh_index_stale(vec![issue_file(task_assigned(
+            "other-task",
+            Column::todo(),
+            "alpha",
+        ))]);
+
+        let busy = workspace_busy_with_other("gh", "alpha", "handed-off")
+            .unwrap()
+            .expect("alpha is routed to another open issue, even from a stale index");
+        assert_eq!(
+            busy.id, "other-task",
+            "a todo card from a stale index still counts — the release must be skipped"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The overlay can retain a marker for a card that has since gone terminal
+    /// (its merge cleared the column but not the marker). A `Warm` board is the
+    /// current open-only set, so a routed id absent from it is confirmed terminal
+    /// and the prior assignee reads as free — the release proceeds rather than
+    /// being blocked forever by a lingering marker.
+    #[test]
+    fn workspace_busy_with_other_frees_a_terminal_marker_against_a_warm_board() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+
+        // Overlay still routes `done-task` to alpha, but the card has closed and
+        // the warm index no longer lists it.
+        shelbi_state::set_task_assignment("gh", "done-task", Some("alpha")).unwrap();
+        write_gh_index(Vec::new());
+
+        assert!(
+            workspace_busy_with_other("gh", "alpha", "handed-off")
+                .unwrap()
+                .is_none(),
+            "a routed id absent from a warm (open-only) board is terminal — alpha is free"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// When the overlay routes another issue to A but the board **isn't warm**
+    /// (stale/cold/unreachable) and doesn't list that id, we can't prove whether
+    /// it is still active. The guard returns `Err` so the caller errs toward NOT
+    /// releasing — a possibly-orphaned pane is recoverable; killing an unrelated
+    /// live worker on a false negative is not.
+    #[test]
+    fn workspace_busy_with_other_cant_confirm_on_a_stale_board_missing_the_routed_id() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+
+        // Overlay routes `other-task` to alpha, but the stale index doesn't carry
+        // it (so presence can't confirm it, and staleness can't deny it either).
+        shelbi_state::set_task_assignment("gh", "other-task", Some("alpha")).unwrap();
+        write_gh_index_stale(Vec::new());
+
+        assert!(
+            workspace_busy_with_other("gh", "alpha", "handed-off").is_err(),
+            "an unconfirmable stale board must not authorize a release"
         );
 
         std::env::remove_var("SHELBI_HOME");
