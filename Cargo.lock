@@ -1675,6 +1675,7 @@ dependencies = [
 name = "shelbi"
 version = "0.9.0"
 dependencies = [
+ "alacritty_terminal",
  "anyhow",
  "chrono",
  "clap",
@@ -1700,6 +1701,7 @@ dependencies = [
  "shelbi-session",
  "shelbi-ssh",
  "shelbi-state",
+ "shelbi-term",
  "shelbi-tmux",
  "shelbi-tui",
  "signal-hook 0.3.18",

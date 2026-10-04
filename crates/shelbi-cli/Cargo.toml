@@ -25,6 +25,10 @@ shelbi-app = { workspace = true }
 shelbi-proto = { workspace = true }
 shelbi-client = { workspace = true }
 shelbi-session = { workspace = true }
+# `shelbi session attach` renders a session through the toolkit-neutral client
+# emulator (`shelbi-term`) and reads its alacritty grid/mode to paint cells.
+shelbi-term = { workspace = true }
+alacritty_terminal = { workspace = true }
 
 # clap derive needs to be visible in the orchestrate args struct
 

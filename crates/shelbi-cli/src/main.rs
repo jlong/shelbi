@@ -479,13 +479,21 @@ enum Cmd {
     /// `shelbi_session::spawn_detached`, never run by hand. Not for direct use.
     #[command(hide = true)]
     #[command(name = "__session")]
-    Session(commands::session::Args),
+    SessionProcess(commands::session::Args),
     /// (internal) Bridge one stdio channel to every session on this machine
     /// (remove-tmux remote backend). Started by the hub over `ssh <host> shelbi
     /// relay`; it reads/writes the relay protocol on stdin/stdout and holds no
     /// session state. Not for direct use.
     #[command(hide = true)]
     Relay(commands::relay::Args),
+    /// Inspect and drive the remove-tmux session backend directly: `ls`,
+    /// `new`, `kill`, `send`, `snapshot`, and the rendered `attach` client.
+    /// A debug surface over `shelbi-client` / `shelbi-session`; nothing in the
+    /// product routes through it yet (the tmux backend is still the default).
+    Session {
+        #[command(subcommand)]
+        cmd: commands::session_cli::SessionCmd,
+    },
 }
 
 fn main() -> Result<()> {
@@ -629,8 +637,9 @@ fn main() -> Result<()> {
         }
         Some(Cmd::ReviewServe { cmd }) => commands::review_serve::run(cmd),
         Some(Cmd::ErrorLog { project }) => commands::error_log::run(project),
-        Some(Cmd::Session(args)) => commands::session::run(args),
+        Some(Cmd::SessionProcess(args)) => commands::session::run(args),
         Some(Cmd::Relay(args)) => commands::relay::run(args),
+        Some(Cmd::Session { cmd }) => commands::session_cli::run(cli.project, cmd),
         Some(Cmd::ZenOrchStart { project }) => commands::zen_lifecycle::orch_start(&project),
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),
         Some(Cmd::EnsureDaemon) => {
@@ -1189,6 +1198,74 @@ mod cli_tests {
             }) if name == "alpha" && as_pane && resume => {}
             other => panic!("expected Open {{ alpha, as_pane, resume }}, got {other:?}"),
         }
+    }
+
+    /// The hidden `__session` process entry still parses after being renamed
+    /// off the `Session` variant (now the user-facing `shelbi session` group),
+    /// and it stays out of `--help`.
+    #[test]
+    fn session_process_entry_is_hidden_but_parseable() {
+        let cli = Cli::parse_from([
+            "shelbi",
+            "__session",
+            "--id",
+            "abc",
+            "--name",
+            "demo/orch",
+            "--cwd",
+            "/tmp",
+            "--cols",
+            "80",
+            "--rows",
+            "24",
+            "--",
+            "/bin/sh",
+        ]);
+        assert!(matches!(cli.cmd, Some(Cmd::SessionProcess(_))));
+        let help = Cli::try_parse_from(["shelbi", "--help"])
+            .expect_err("--help exits through clap")
+            .to_string();
+        assert!(!help.contains("__session"), "internal entry leaked into help: {help}");
+    }
+
+    /// The user-facing `shelbi session` group parses each debug subcommand.
+    #[test]
+    fn session_group_parses_its_subcommands() {
+        use commands::session_cli::SessionCmd;
+
+        let ls = Cli::parse_from(["shelbi", "session", "ls"]);
+        assert!(matches!(ls.cmd, Some(Cmd::Session { cmd: SessionCmd::Ls })));
+
+        let attach = Cli::parse_from(["shelbi", "session", "attach", "alpha", "--detach-key", "ctrl-q"]);
+        match attach.cmd {
+            Some(Cmd::Session {
+                cmd: SessionCmd::Attach { session, detach_key },
+            }) => {
+                assert_eq!(session, "alpha");
+                assert_eq!(detach_key, "ctrl-q");
+            }
+            other => panic!("expected session attach, got {other:?}"),
+        }
+
+        let new = Cli::parse_from([
+            "shelbi", "session", "new", "--name", "demo/orch", "--", "/bin/sh", "-c", "exec cat",
+        ]);
+        match new.cmd {
+            Some(Cmd::Session {
+                cmd: SessionCmd::New { name, command, cols, rows, .. },
+            }) => {
+                assert_eq!(name, "demo/orch");
+                assert_eq!(command, vec!["/bin/sh", "-c", "exec cat"]);
+                assert_eq!((cols, rows), (80, 24), "defaults apply");
+            }
+            other => panic!("expected session new, got {other:?}"),
+        }
+
+        let send = Cli::parse_from(["shelbi", "session", "send", "alpha", "hi", "--enter"]);
+        assert!(matches!(
+            send.cmd,
+            Some(Cmd::Session { cmd: SessionCmd::Send { enter: true, .. } })
+        ));
     }
 
     #[test]
