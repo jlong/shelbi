@@ -46,4 +46,15 @@ pub enum ClientError {
     /// Spawning a session failed.
     #[error("spawning session: {0}")]
     Spawn(String),
+
+    /// The relay refused or could not complete a channel operation (e.g. opening
+    /// a stream to a session that does not exist). Carries the relay's reason.
+    #[error("relay: {0}")]
+    Relay(String),
+
+    /// The relay channel went silent past the keepalive deadline: the remote is
+    /// **unreachable**, not necessarily dead. The caller starts a fresh relay
+    /// and reconnects by sequence number.
+    #[error("relay channel is unreachable (no keepalive within the deadline)")]
+    RelayUnreachable,
 }

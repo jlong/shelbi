@@ -27,6 +27,11 @@
 //!   the core is additive. These definitions are **not frozen** and are owned
 //!   by the protocol subtask (`rt-protocol-client`).
 //!
+//! Remote machines add a third, independent layer: the [`relay`] envelope, a
+//! multiplexing channel that bridges one SSH stdio pipe to every session socket
+//! on a host. It carries the frozen-core and additive frames **unchanged**
+//! inside its `Data` frames, so it leaves everything above untouched.
+//!
 //! A CI test runs the current client against session binaries built from each
 //! previous release to keep the frozen core honest.
 //!
@@ -39,13 +44,15 @@ pub mod error;
 pub mod ext;
 pub mod frame;
 pub mod message;
+pub mod relay;
 
 pub use error::ProtoError;
 pub use ext::{
     decode_any, AnyFrame, EventResized, EventTitle, ExtFrame, ExtType, Info, InfoData, Paste,
     Resized, Resync, SetMeta,
 };
-pub use frame::{Frame, FrameType, MAX_FRAME_LEN};
+pub use frame::{frame_boundary, Frame, FrameType, MAX_FRAME_LEN};
+pub use relay::{RelayFrame, RelaySession, RelayType, RELAY_PROTOCOL_VERSION};
 pub use message::{
     Attach, ClientColors, Exited, Hello, Input, Kill, Output, Resize, Rgb, Snapshot, SnapshotData,
 };

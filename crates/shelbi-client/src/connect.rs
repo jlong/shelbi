@@ -34,7 +34,8 @@ use shelbi_proto::{
 };
 
 use crate::error::ClientError;
-use crate::reader::{self, Reply, SessionEvent};
+use crate::reader::{self, Reply, SessionEvent, SharedWrite};
+use crate::transport::{LocalTransport, Transport};
 
 /// The receiving end of the session's output/event stream.
 ///
@@ -67,8 +68,9 @@ impl SessionEvents {
 pub struct Connection {
     /// The write half, shared with the reader thread (which writes keepalive
     /// pongs). A whole frame is written under this lock, so writes never
-    /// interleave mid-frame — the client-side half of input arbitration.
-    write: Arc<Mutex<UnixStream>>,
+    /// interleave mid-frame — the client-side half of input arbitration. Boxed
+    /// so a local socket and a relay stream are the same type.
+    write: SharedWrite,
     /// Serializes request/reply round-trips and owns the reply receiver, so only
     /// one in-flight request waits on a reply at a time.
     replies: Mutex<Receiver<Reply>>,
@@ -94,14 +96,29 @@ impl Connection {
         Self::handshake(stream, colors, capabilities)
     }
 
-    /// Like [`open`](Connection::open) but over an already-connected stream (used
-    /// by the relay transport seam and by tests).
+    /// Like [`open`](Connection::open) but over an already-connected Unix
+    /// socket (used by tests). Equivalent to [`connect`](Connection::connect)
+    /// over a [`LocalTransport`].
     pub fn handshake(
         stream: UnixStream,
         colors: Option<ClientColors>,
         capabilities: &[&str],
     ) -> Result<(Self, SessionEvents), ClientError> {
-        let mut hs = stream.try_clone()?;
+        Self::connect(Box::new(LocalTransport(stream)), colors, capabilities)
+    }
+
+    /// Open a connection over any [`Transport`] — a local socket or one logical
+    /// stream of a [`RelayChannel`](crate::relay::RelayChannel). Exchanges the
+    /// [`Hello`] frames, starts the reader, and returns the connection and event
+    /// stream. This is the single code path both local and remote connections
+    /// share.
+    pub fn connect(
+        transport: Box<dyn Transport>,
+        colors: Option<ClientColors>,
+        capabilities: &[&str],
+    ) -> Result<(Self, SessionEvents), ClientError> {
+        let (mut read_half, mut write_half) = transport.split()?;
+
         // Send our hello.
         let hello = Frame::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
@@ -109,17 +126,16 @@ impl Connection {
             capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
         })
         .encode()?;
-        hs.write_all(&hello)?;
-        hs.flush()?;
+        write_half.write_all(&hello)?;
+        write_half.flush()?;
 
-        // Read the session's hello (frame by frame off a small local buffer; any
-        // output the session sends before we attach cannot arrive yet because we
-        // have not attached, so the first frame is the hello).
-        let (announced, session_protocol_version) = read_session_hello(&mut hs)?;
+        // Read the session's hello off the read half (frame by frame off a small
+        // local buffer; any output the session sends before we attach cannot
+        // arrive yet because we have not attached, so the first frame is the
+        // hello).
+        let (announced, session_protocol_version) = read_session_hello(&mut read_half)?;
 
-        // Split into a shared write half and a reader-owned read half.
-        let write = Arc::new(Mutex::new(hs));
-        let read_half = stream;
+        let write: SharedWrite = Arc::new(Mutex::new(write_half));
         let (event_tx, event_rx) = channel::<SessionEvent>();
         let (reply_tx, reply_rx) = channel::<Reply>();
         let reader = reader::spawn(read_half, write.clone(), event_tx, reply_tx);
@@ -247,7 +263,7 @@ impl Connection {
 
 /// Read frames from `stream` until the session's [`Hello`] arrives, returning the
 /// announced capabilities and the session's protocol version.
-fn read_session_hello(stream: &mut UnixStream) -> Result<(Vec<String>, u16), ClientError> {
+fn read_session_hello(stream: &mut dyn Read) -> Result<(Vec<String>, u16), ClientError> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {

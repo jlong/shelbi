@@ -18,11 +18,15 @@
 //! caller that needs a bound wraps the receiver.
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use shelbi_proto::{decode_any, AnyFrame, ExtFrame, Frame};
+
+/// The write half shared between the request path and the reader thread (which
+/// writes keepalive pongs). Boxed so it is the same type for a local socket or
+/// a relay stream — the transport seam.
+pub(crate) type SharedWrite = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// A request reply routed back to a blocking [`Connection`](crate::connect::Connection)
 /// method. Output and events never travel this way.
@@ -88,8 +92,8 @@ pub enum SessionEvent {
 /// `events`, replies to `replies`, and answers keepalive pings on `write`.
 /// Returns when the stream ends (EOF, error, or after an `exited` event).
 pub(crate) fn spawn(
-    read_half: UnixStream,
-    write: Arc<Mutex<UnixStream>>,
+    read_half: Box<dyn Read + Send>,
+    write: SharedWrite,
     events: Sender<SessionEvent>,
     replies: Sender<Reply>,
 ) -> std::thread::JoinHandle<()> {
@@ -97,8 +101,8 @@ pub(crate) fn spawn(
 }
 
 fn run(
-    mut read_half: UnixStream,
-    write: Arc<Mutex<UnixStream>>,
+    mut read_half: Box<dyn Read + Send>,
+    write: SharedWrite,
     events: Sender<SessionEvent>,
     replies: Sender<Reply>,
 ) {
@@ -130,7 +134,7 @@ fn run(
 /// child exited or a channel receiver was dropped).
 fn route(
     frame: AnyFrame,
-    write: &Arc<Mutex<UnixStream>>,
+    write: &SharedWrite,
     events: &Sender<SessionEvent>,
     replies: &Sender<Reply>,
 ) -> std::ops::ControlFlow<()> {
