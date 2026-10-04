@@ -86,6 +86,10 @@ impl Harness {
             task: None,
             raw_output_log: false,
             child_argv: argv.iter().map(|s| s.to_string()).collect(),
+            // No daemon watchdog in-process: it loops reading the global
+            // `$SHELBI_HOME` this harness mutates per test, which would be a
+            // data race (see `RunArgs::manage_daemon`).
+            manage_daemon: false,
         };
         let handle = std::thread::spawn(move || shelbi_session::run(args));
         wait_for(Duration::from_secs(5), || paths.sock().exists().then_some(()))

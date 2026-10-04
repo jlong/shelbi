@@ -52,5 +52,6 @@ pub fn run(args: Args) -> Result<()> {
         task: args.task,
         raw_output_log: args.raw_log,
         child_argv: args.child_argv,
+        manage_daemon: true,
     })
 }

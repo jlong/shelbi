@@ -121,6 +121,10 @@ impl RunningSession {
             task: None,
             raw_output_log,
             child_argv,
+            // No daemon watchdog in-process: it loops reading the global
+            // `$SHELBI_HOME` this harness mutates per test, which would be a
+            // data race (see `RunArgs::manage_daemon`).
+            manage_daemon: false,
         };
         let handle = std::thread::spawn(move || shelbi_session::run(args));
         // Wait for the socket to be bound.
