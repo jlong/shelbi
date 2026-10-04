@@ -198,13 +198,17 @@ fn attach_replays_a_snapshot_then_streams_live_output() {
     let (conn, events) = sess.client();
     conn.attach(None).unwrap();
 
-    // The attach replay is a fresh snapshot carrying what the child already drew.
-    let screen = recv_until(&events, Duration::from_secs(5), |ev| match ev {
-        SessionEvent::Resync { screen, .. } => Some(screen.clone()),
+    // The attach replay is a byte stream reconstructing the emulator; the cells
+    // the child already drew are painted into it verbatim.
+    let replay = recv_until(&events, Duration::from_secs(5), |ev| match ev {
+        SessionEvent::Resync { replay, .. } => Some(replay.clone()),
         _ => None,
     })
-    .expect("attach should deliver a resync snapshot first");
-    assert!(screen.contains("READYMARK"), "snapshot should show the child output: {screen:?}");
+    .expect("attach should deliver a resync replay first");
+    assert!(
+        replay.windows(9).any(|w| w == b"READYMARK"),
+        "replay should carry the child output: {replay:?}"
+    );
 
     // Live output: typed bytes are echoed by the tty and streamed as Output.
     conn.input(b"echoback").unwrap();

@@ -41,9 +41,10 @@
 //! - [`error`]: the crate's error type.
 //!
 //! The session protocol and the full discover/spawn/connect surface are
-//! `rt-protocol-client`; attach **replay** (a full emulator-state
-//! reconstruction, replacing the current [`SessionEvent::Resync`] snapshot) is
-//! `rt-replay`.
+//! `rt-protocol-client`; attach **replay** delivers a full emulator-state
+//! reconstruction through the [`SessionEvent::Resync`] byte stream (serialized
+//! session-side by `rt-replay`), which a client emulator feeds to end up
+//! identical to the session's.
 
 pub mod connect;
 pub mod control;

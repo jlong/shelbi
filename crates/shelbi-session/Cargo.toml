@@ -29,3 +29,9 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Replay round-trip tests build terminals directly and drive a real PTY; these
+# are regular deps of the crate but integration tests are separate crates, so
+# they must be named again here.
+alacritty_terminal = { workspace = true }
+portable-pty = { workspace = true }
+libc = { workspace = true }

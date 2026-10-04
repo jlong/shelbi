@@ -207,14 +207,17 @@ impl Shared {
     }
 
     /// Subscribe a client to the output stream, gaplessly: under the output gate
-    /// (so no output slips between the snapshot and the subscription) send the
-    /// initial [`Resync`](shelbi_proto::Resync) snapshot, then mark it attached.
+    /// (held across the emulator read, so no output slips between the replay and
+    /// the subscription — see the lock-order note on [`Shared::emit_and_feed`])
+    /// send the initial attach [`Resync`](shelbi_proto::Resync) — a full replay
+    /// of the emulator's state — then mark it attached. Live output then resumes
+    /// at exactly `seq`, with no gap or duplicate.
     pub fn attach(&self, ch: &Arc<crate::transport::ClientChannel>) {
         let gate = self.output.lock().unwrap();
         if ch.wants_resync() {
             let seq = gate.next_seq;
-            let screen = self.snapshot_text(None);
-            if let Ok(bytes) = ExtFrame::Resync(shelbi_proto::Resync { seq, screen }).encode() {
+            let replay = self.emu.lock().unwrap().replay();
+            if let Ok(bytes) = ExtFrame::Resync(shelbi_proto::Resync { seq, replay }).encode() {
                 ch.enqueue_priority(&bytes);
             }
         }
@@ -271,10 +274,13 @@ impl Shared {
                 pixel_height: 0,
             });
         }
-        self.emu.lock().unwrap().resize(cols, rows);
-        // In-band marker (ordered with output).
+        // Resize the emulator and emit the in-band marker under the output gate
+        // (lock order gate -> emu, as in `emit_and_feed`), so the emulator
+        // reflows at exactly the `seq` the marker carries and output/resize stay
+        // totally ordered.
         {
             let mut gate = self.output.lock().unwrap();
+            self.emu.lock().unwrap().resize(cols, rows);
             let seq = gate.next_seq;
             gate.next_seq += 1;
             if self.clients.has_attached() {
@@ -287,13 +293,31 @@ impl Shared {
         self.clients.push_event_resized(cols, rows);
     }
 
-    /// Emit a chunk of PTY output into the ordered stream: allocate its sequence
-    /// number and enqueue it to attached clients, all under the output gate so
-    /// output and in-band resize markers stay totally ordered.
-    fn emit_output(&self, data: &[u8]) {
+    /// Feed one rest-aligned chunk of PTY output into the emulator and emit it as
+    /// one sequenced [`Output`] frame, **atomically under the output gate** (held
+    /// across the emulator feed). Returns the post-feed cursor (for the
+    /// [`responder`](crate::responder)) and the UI events the chunk produced.
+    ///
+    /// The gate is held across the feed so that [`Shared::attach`] and
+    /// [`Shared::resync_base`], which read `(replay, next_seq)` under the same
+    /// gate, always observe an emulator reflecting exactly the frames already
+    /// emitted — the invariant that makes the replay/live boundary gapless and
+    /// duplicate-free. The reader only ever feeds rest-aligned chunks (see
+    /// [`crate::output_split`]), so a frame edge never lands inside a sequence
+    /// and the emulator's state matches the frame boundaries exactly.
+    ///
+    /// Lock order is **gate before emu**, shared with `attach`, `resync_base`,
+    /// and `apply_resize`; nothing acquires them in the opposite order, so there
+    /// is no deadlock.
+    fn emit_and_feed(&self, data: &[u8]) -> ((u16, u16), Vec<EmuEvent>) {
         let mut gate = self.output.lock().unwrap();
         let seq = gate.next_seq;
         gate.next_seq += 1;
+        let result = {
+            let mut emu = self.emu.lock().unwrap();
+            emu.feed(data);
+            (emu.cursor_1based(), emu.drain_events())
+        };
         if self.clients.has_attached() {
             if let Ok(bytes) = Frame::Output(Output {
                 seq,
@@ -304,17 +328,21 @@ impl Shared {
                 self.clients.enqueue_output(&bytes);
             }
         }
+        result
     }
 
-    /// The `(base_seq, screen)` a backpressure [`Resync`](shelbi_proto::Resync)
-    /// resumes from: the sequence the next output will carry, plus the current
-    /// visible screen. Read without holding both the gate and the emulator lock
-    /// at once, so it cannot deadlock the reader (see the lock-order note in
-    /// [`crate::transport`]).
-    pub fn resync_base(&self) -> (u64, String) {
-        let seq = self.output.lock().unwrap().next_seq;
-        let screen = self.snapshot_text(None);
-        (seq, screen)
+    /// The `(resume_seq, replay)` a backpressure [`Resync`](shelbi_proto::Resync)
+    /// recovers a dropped client with: the sequence the next output will carry,
+    /// plus a full replay of the emulator's current state. Read under the output
+    /// gate held across the emulator read (lock order **gate before emu**, as in
+    /// [`Shared::emit_and_feed`]), so the replay reflects exactly the frames with
+    /// `seq < resume_seq` and live output resumes with no gap or duplicate.
+    pub fn resync_base(&self) -> (u64, Vec<u8>) {
+        let gate = self.output.lock().unwrap();
+        let seq = gate.next_seq;
+        let replay = self.emu.lock().unwrap().replay();
+        drop(gate);
+        (seq, replay)
     }
 
     /// Signal the child's whole process group (default SIGTERM).
@@ -536,51 +564,67 @@ fn wait_for_child(
     }
 }
 
-/// Read the PTY master forever: feed the emulator, answer queries, surface
-/// title/bell events, retain bytes, optionally log, and emit sequenced output.
-/// Runs until the PTY closes (child exit), after which the thread ends.
+/// Read the PTY master forever: split the stream at parser-rest boundaries, feed
+/// the emulator, answer queries, surface title/bell events, retain bytes,
+/// optionally log, and emit sequenced output. Runs until the PTY closes (child
+/// exit), after which the thread ends.
 fn spawn_reader_thread(shared: Arc<Shared>, mut reader: Box<dyn Read + Send>, mut raw_log: RawLog) {
     thread::spawn(move || {
         let mut responder = Responder::new(shared.kitty.clone(), shared.colors.clone());
+        // Split the live stream only where the parser is at rest, so every
+        // output frame edge (and the replay/live split a client resumes at)
+        // falls at Ground, never inside a sequence or a UTF-8 char.
+        let mut splitter = crate::output_split::RestSplitter::new();
         let mut chunk = [0u8; 8192];
         loop {
             let n = match reader.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            let data = &chunk[..n];
-
-            // Feed the emulator first so the cursor the responder reports is
-            // current, then answer any queries in this chunk. The emulator lock
-            // is released before the output gate is taken (emit_output), so the
-            // reader never holds both at once — see the lock-order note in
-            // `transport`.
-            let (cursor, events) = {
-                let mut emu = shared.emu.lock().unwrap();
-                emu.feed(data);
-                (emu.cursor_1based(), emu.drain_events())
-            };
-            let answers = responder.scan(data, &FixedCursor(cursor.0, cursor.1));
-            for answer in answers {
-                shared.write_to_child(&answer.reply);
+            let piece = splitter.push(&chunk[..n]);
+            if !piece.is_empty() {
+                process_output(&shared, &mut responder, &mut raw_log, &piece);
             }
-
-            // Surface title/bell as pushed events.
-            for event in events {
-                match event {
-                    EmuEvent::Title(title) => shared.clients.push_event_title(&title),
-                    EmuEvent::Bell => shared.clients.push_event_bell(),
-                }
-            }
-
-            // Retain recent bytes and (optionally) log the raw stream.
-            shared.ring.lock().unwrap().push(data);
-            raw_log.write(data);
-
-            // Emit sequenced output into the ordered stream.
-            shared.emit_output(data);
+        }
+        // EOF: release any held trailing partial so no bytes are dropped (the
+        // child is gone, nothing more can complete the sequence).
+        let tail = splitter.flush();
+        if !tail.is_empty() {
+            process_output(&shared, &mut responder, &mut raw_log, &tail);
         }
     });
+}
+
+/// Process one rest-aligned chunk of child output: emit it as a sequenced frame
+/// while feeding the emulator (atomically, so a concurrent attach/resync stays
+/// gapless), answer any terminal queries it contains, surface title/bell, and
+/// retain/log the bytes.
+fn process_output(
+    shared: &Arc<Shared>,
+    responder: &mut Responder,
+    raw_log: &mut RawLog,
+    data: &[u8],
+) {
+    // Feed the emulator and emit the output frame atomically under the output
+    // gate; the returned cursor is current, so the responder's replies are too.
+    let (cursor, events) = shared.emit_and_feed(data);
+
+    let answers = responder.scan(data, &FixedCursor(cursor.0, cursor.1));
+    for answer in answers {
+        shared.write_to_child(&answer.reply);
+    }
+
+    // Surface title/bell as pushed events.
+    for event in events {
+        match event {
+            EmuEvent::Title(title) => shared.clients.push_event_title(&title),
+            EmuEvent::Bell => shared.clients.push_event_bell(),
+        }
+    }
+
+    // Retain recent bytes and (optionally) log the raw stream.
+    shared.ring.lock().unwrap().push(data);
+    raw_log.write(data);
 }
 
 /// Apply the most-recently-active client's size to the PTY, debounced so a burst

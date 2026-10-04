@@ -11,11 +11,12 @@
 //!
 //! The crate is the vendored `alacritty_terminal` fork chosen in
 //! `rt-spike-emulator-replay`, the only candidate exposing both screen buffers,
-//! saved cursors, modes, and history (which attach-replay, owned by `rt-replay`,
-//! serializes). This module uses only the headless subset: construct, feed,
-//! read cursor, resize, render text. The **kitty keyboard protocol is enabled**
-//! (Claude Code's Shift+Enter rides on it), which on this crate means setting
-//! `Config.kitty_keyboard` at construction.
+//! saved cursors, modes, and history. Attach-replay ([`Emulator::replay`], in
+//! [`crate::replay`]) serializes all of it into a byte stream a fresh client
+//! emulator replays. This module uses the headless subset: construct, feed,
+//! read cursor, resize, render text, serialize for replay. The **kitty keyboard
+//! protocol is enabled** (Claude Code's Shift+Enter rides on it), which on this
+//! crate means setting `Config.kitty_keyboard` at construction.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -194,6 +195,15 @@ impl Emulator {
     /// to confirm the protocol is wired on.
     pub fn kitty_disambiguate_active(&self) -> bool {
         self.term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES)
+    }
+
+    /// Serialize the emulator's **full** state to an attach-replay byte stream:
+    /// feeding the result into a fresh emulator of the same size reproduces this
+    /// one on both screen buffers, with the same scrollback, saved cursors,
+    /// scroll region, tab stops, charsets, modes, and keyboard-protocol stacks.
+    /// See [`crate::replay`].
+    pub fn replay(&self) -> Vec<u8> {
+        crate::replay::serialize(&self.term)
     }
 
     /// The visible screen rendered as text, one line per row, trailing blank

@@ -6,14 +6,14 @@
 //! protocol server: the hello handshake (announcing the session's capabilities),
 //! `attach`/`detach`, `input`, `paste`, `resize`, `snapshot`, `info`,
 //! `set-meta`, `kill`, keepalive `ping`/`pong`, and the pushed events (title,
-//! bell, resized, exited). Attach **replay** is still a full-screen snapshot
-//! (the [`Resync`] stand-in) until `rt-replay` reconstructs full emulator state.
+//! bell, resized, exited). Attach **replay** sends a [`Resync`] carrying a full
+//! replay of the emulator's state (see [`crate::replay`]).
 //!
 //! Each client connection gets two threads: a reader ([`serve_client`]) that
 //! decodes request frames, and a writer ([`client_writer`]) fed by a bounded
 //! per-client [`Outbox`]. A client that falls behind never blocks the PTY
-//! reader: its queued output is dropped and it is sent a fresh [`Resync`]
-//! snapshot (if it negotiated the capability) or disconnected (if it did not).
+//! reader: its queued output is dropped and it is sent a fresh [`Resync`] replay
+//! (if it negotiated the capability) or disconnected (if it did not).
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -67,7 +67,7 @@ struct Outbox {
     /// Encoded frames waiting to go out, oldest first.
     queue: VecDeque<Vec<u8>>,
     /// Set when the queue overflowed and was dropped: the writer refreshes the
-    /// client with a fresh [`Resync`] before resuming live output.
+    /// client with a fresh [`Resync`] replay before resuming live output.
     resync: bool,
     /// Set on disconnect (either side) so both threads wind down.
     closed: bool,
@@ -121,9 +121,9 @@ impl ClientChannel {
     fn enqueue(&self, bytes: &[u8]) {
         let mut st = self.out.lock().unwrap();
         if st.closed || st.resync {
-            // While a resync is pending, drop everything: the writer will refresh
-            // the whole screen, so queuing stale bytes behind it is pointless and
-            // would re-apply output the snapshot already reflects.
+            // While a resync is pending, drop everything: the writer will send a
+            // fresh replay, so queuing stale bytes behind it is pointless and
+            // would re-apply output the replay already reflects.
             return;
         }
         if st.queue.len() >= CLIENT_QUEUE_LIMIT {
@@ -324,7 +324,7 @@ pub fn serve_client(stream: UnixStream, shared: Arc<Shared>) {
 }
 
 /// The per-client writer: drain the outbox to the socket, refreshing a
-/// lagging client with a [`Resync`] snapshot before resuming live output.
+/// lagging client with a [`Resync`] replay before resuming live output.
 fn client_writer(
     ch: Arc<ClientChannel>,
     mut sock: UnixStream,
@@ -350,8 +350,8 @@ fn client_writer(
         };
 
         if do_resync {
-            let (seq, screen) = shared.resync_base();
-            match ExtFrame::Resync(Resync { seq, screen }).encode() {
+            let (seq, replay) = shared.resync_base();
+            match ExtFrame::Resync(Resync { seq, replay }).encode() {
                 Ok(bytes) if sock.write_all(&bytes).is_ok() => {}
                 _ => break,
             }
