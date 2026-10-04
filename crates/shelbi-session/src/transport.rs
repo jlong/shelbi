@@ -1,188 +1,497 @@
 //! The session socket server: one Unix socket, many clients.
 //!
-//! The wire format is `shelbi-proto`'s length-prefixed frames. This module
-//! implements **enough of the frozen core** to exercise a session end to end:
-//! `hello`, `attach` (live output; full replay is `rt-replay`'s job), `input`,
-//! `resize`, `snapshot`, and `kill`. Additive capabilities and attach-replay are
-//! owned by `rt-protocol-client` / `rt-replay`; this is the server seam they
-//! build on, kept deliberately small.
+//! The wire format is `shelbi-proto`'s length-prefixed frames — the frozen core
+//! ([`Frame`]) plus the additive capabilities ([`ExtFrame`]), read off one
+//! stream by [`decode_any`]. This module implements the **full** session
+//! protocol server: the hello handshake (announcing the session's capabilities),
+//! `attach`/`detach`, `input`, `paste`, `resize`, `snapshot`, `info`,
+//! `set-meta`, `kill`, keepalive `ping`/`pong`, and the pushed events (title,
+//! bell, resized, exited). Attach **replay** is still a full-screen snapshot
+//! (the [`Resync`] stand-in) until `rt-replay` reconstructs full emulator state.
 //!
-//! Each client gets two threads: a reader (this module's [`serve_client`]) that
-//! decodes request frames, and a writer fed by a bounded channel so a slow client
-//! never blocks the PTY reader — if its buffer fills it is dropped (the plan's
-//! backpressure rule), to be recovered by a fresh attach.
+//! Each client connection gets two threads: a reader ([`serve_client`]) that
+//! decodes request frames, and a writer ([`client_writer`]) fed by a bounded
+//! per-client [`Outbox`]. A client that falls behind never blocks the PTY
+//! reader: its queued output is dropped and it is sent a fresh [`Resync`]
+//! snapshot (if it negotiated the capability) or disconnected (if it did not).
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
-use shelbi_proto::{Frame, Hello, Resize, SnapshotData};
+use shelbi_proto::{
+    decode_any, AnyFrame, ExtFrame, Frame, Hello, InfoData, Resync, SnapshotData,
+};
 
 use crate::session::Shared;
 
-/// How many output frames a lagging client may queue before it is dropped.
-const CLIENT_BUFFER_FRAMES: usize = 1024;
+/// How many frames a client's outbox may hold before it is considered lagging.
+/// Past this, its queue is dropped and it is recovered by a [`Resync`] (or
+/// disconnected if it did not negotiate `resync`), so the PTY reader never
+/// blocks and memory stays bounded.
+const CLIENT_QUEUE_LIMIT: usize = 2048;
 
-/// A registered client's output channel.
-struct Client {
-    id: u64,
-    tx: SyncSender<Vec<u8>>,
+// Capability bits, derived from a client's hello capability list. Stored in an
+// `AtomicU16` on the channel so the broadcast path reads them lock-free.
+const CAP_OUTPUT_RESIZED: u16 = 1 << 0;
+const CAP_EVENT_TITLE: u16 = 1 << 1;
+const CAP_EVENT_BELL: u16 = 1 << 2;
+const CAP_EVENT_RESIZED: u16 = 1 << 3;
+const CAP_RESYNC: u16 = 1 << 4;
+const CAP_KEEPALIVE: u16 = 1 << 5;
+
+fn caps_from_list(list: &[String]) -> u16 {
+    use shelbi_proto::capability as cap;
+    let mut bits = 0;
+    for name in list {
+        bits |= match name.as_str() {
+            cap::OUTPUT_RESIZED => CAP_OUTPUT_RESIZED,
+            cap::EVENT_TITLE => CAP_EVENT_TITLE,
+            cap::EVENT_BELL => CAP_EVENT_BELL,
+            cap::EVENT_RESIZED => CAP_EVENT_RESIZED,
+            cap::RESYNC => CAP_RESYNC,
+            cap::KEEPALIVE => CAP_KEEPALIVE,
+            _ => 0,
+        };
+    }
+    bits
 }
 
-/// The set of attached clients the PTY reader broadcasts output to.
+/// The queue of encoded frames waiting to be written to one client, plus its
+/// backpressure state.
+#[derive(Default)]
+struct Outbox {
+    /// Encoded frames waiting to go out, oldest first.
+    queue: VecDeque<Vec<u8>>,
+    /// Set when the queue overflowed and was dropped: the writer refreshes the
+    /// client with a fresh [`Resync`] before resuming live output.
+    resync: bool,
+    /// Set on disconnect (either side) so both threads wind down.
+    closed: bool,
+}
+
+/// One connected client: its id, negotiated capabilities, subscription state,
+/// and outbox. Shared (`Arc`) between the reader thread, the writer thread, and
+/// every broadcaster.
+pub struct ClientChannel {
+    /// Stable id, used to deregister and to track the active (sizing) client.
+    pub id: u64,
+    caps: AtomicU16,
+    /// Whether this client is subscribed to the output stream (`attach`).
+    attached: std::sync::atomic::AtomicBool,
+    out: Mutex<Outbox>,
+    cv: Condvar,
+}
+
+impl ClientChannel {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            caps: AtomicU16::new(0),
+            attached: std::sync::atomic::AtomicBool::new(false),
+            out: Mutex::new(Outbox::default()),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn set_caps(&self, list: &[String]) {
+        self.caps.store(caps_from_list(list), Ordering::Relaxed);
+    }
+
+    fn has(&self, bit: u16) -> bool {
+        self.caps.load(Ordering::Relaxed) & bit != 0
+    }
+
+    /// Whether this client negotiated backpressure `resync` (so `attach` knows
+    /// whether it can send the initial snapshot).
+    pub(crate) fn wants_resync(&self) -> bool {
+        self.has(CAP_RESYNC)
+    }
+
+    fn is_attached(&self) -> bool {
+        self.attached.load(Ordering::Relaxed)
+    }
+
+    /// Enqueue an output-stream frame, honoring backpressure. On overflow the
+    /// queue is dropped and the client is flagged for a [`Resync`] (if it
+    /// negotiated the capability) or closed.
+    fn enqueue(&self, bytes: &[u8]) {
+        let mut st = self.out.lock().unwrap();
+        if st.closed || st.resync {
+            // While a resync is pending, drop everything: the writer will refresh
+            // the whole screen, so queuing stale bytes behind it is pointless and
+            // would re-apply output the snapshot already reflects.
+            return;
+        }
+        if st.queue.len() >= CLIENT_QUEUE_LIMIT {
+            st.queue.clear();
+            if self.has(CAP_RESYNC) {
+                st.resync = true;
+            } else {
+                st.closed = true;
+            }
+        } else {
+            st.queue.push_back(bytes.to_vec());
+        }
+        self.cv.notify_one();
+    }
+
+    /// Enqueue a required low-volume frame (a reply or keepalive) past the
+    /// backpressure gate; these are rare and must not be dropped.
+    pub(crate) fn enqueue_priority(&self, bytes: &[u8]) {
+        let mut st = self.out.lock().unwrap();
+        if st.closed {
+            return;
+        }
+        st.queue.push_back(bytes.to_vec());
+        self.cv.notify_one();
+    }
+
+    pub(crate) fn mark_attached(&self, yes: bool) {
+        self.attached.store(yes, Ordering::Relaxed);
+    }
+
+    /// Drop everything queued (used on `detach`).
+    pub(crate) fn clear(&self) {
+        let mut st = self.out.lock().unwrap();
+        st.queue.clear();
+        st.resync = false;
+    }
+
+    /// Ask both threads to wind down.
+    fn close(&self) {
+        let mut st = self.out.lock().unwrap();
+        st.closed = true;
+        self.cv.notify_all();
+    }
+}
+
+/// The set of connected clients the session broadcasts to.
 #[derive(Default)]
 pub struct ClientRegistry {
-    clients: Mutex<Vec<Client>>,
+    clients: Mutex<Vec<Arc<ClientChannel>>>,
     next_id: AtomicU64,
 }
 
 impl ClientRegistry {
-    /// Register a client, returning its id (used to deregister on disconnect).
-    fn register(&self, tx: SyncSender<Vec<u8>>) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.clients.lock().unwrap().push(Client { id, tx });
-        id
+    fn register(&self, ch: Arc<ClientChannel>) {
+        self.clients.lock().unwrap().push(ch);
     }
 
-    /// Remove a client by id.
     fn deregister(&self, id: u64) {
         self.clients.lock().unwrap().retain(|c| c.id != id);
     }
 
-    /// Broadcast already-encoded frame bytes to every attached client, dropping
-    /// any whose buffer is full (it will recover on a fresh attach).
-    pub fn broadcast(&self, frame_bytes: &[u8]) {
-        let mut clients = self.clients.lock().unwrap();
-        clients.retain(|c| c.tx.try_send(frame_bytes.to_vec()).is_ok());
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Number of attached clients (for tests / introspection).
+    /// Whether any client is subscribed to output (so the reader can skip
+    /// encoding when nobody is listening).
+    pub fn has_attached(&self) -> bool {
+        self.clients.lock().unwrap().iter().any(|c| c.is_attached())
+    }
+
+    /// Number of connected clients (for tests / introspection).
     pub fn len(&self) -> usize {
         self.clients.lock().unwrap().len()
     }
 
-    /// Whether any client is attached.
+    /// Whether no client is connected.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Enqueue an [`Output`](shelbi_proto::Output) frame to every attached client.
+    pub fn enqueue_output(&self, bytes: &[u8]) {
+        for c in self.clients.lock().unwrap().iter() {
+            if c.is_attached() {
+                c.enqueue(bytes);
+            }
+        }
+    }
+
+    /// Enqueue an in-band [`Resized`](shelbi_proto::Resized) marker to attached
+    /// clients that negotiated `output-resized`. A client that did not stays on
+    /// the output stream (ordered), it just never reflows.
+    pub fn enqueue_inband_resized(&self, bytes: &[u8]) {
+        for c in self.clients.lock().unwrap().iter() {
+            if c.is_attached() && c.has(CAP_OUTPUT_RESIZED) {
+                c.enqueue(bytes);
+            }
+        }
+    }
+
+    /// Push an event frame to attached clients that negotiated `cap`.
+    fn push_event(&self, cap: u16, bytes: &[u8]) {
+        for c in self.clients.lock().unwrap().iter() {
+            if c.is_attached() && c.has(cap) {
+                c.enqueue(bytes);
+            }
+        }
+    }
+
+    /// Pushed event: the title changed.
+    pub fn push_event_title(&self, title: &str) {
+        if let Ok(bytes) = ExtFrame::EventTitle(shelbi_proto::EventTitle {
+            title: title.to_string(),
+        })
+        .encode()
+        {
+            self.push_event(CAP_EVENT_TITLE, &bytes);
+        }
+    }
+
+    /// Pushed event: the bell rang.
+    pub fn push_event_bell(&self) {
+        if let Ok(bytes) = ExtFrame::EventBell.encode() {
+            self.push_event(CAP_EVENT_BELL, &bytes);
+        }
+    }
+
+    /// Pushed event: the size changed (out-of-band form).
+    pub fn push_event_resized(&self, cols: u16, rows: u16) {
+        if let Ok(bytes) = ExtFrame::EventResized(shelbi_proto::EventResized { cols, rows }).encode()
+        {
+            self.push_event(CAP_EVENT_RESIZED, &bytes);
+        }
+    }
+
+    /// Broadcast the frozen-core [`Exited`](shelbi_proto::Exited) event to every
+    /// connected client (attached or not), as a priority frame so a lagging
+    /// client still learns the session ended.
+    pub fn broadcast_exited(&self, exited: shelbi_proto::Exited) {
+        if let Ok(bytes) = Frame::Exited(exited).encode() {
+            for c in self.clients.lock().unwrap().iter() {
+                c.enqueue_priority(&bytes);
+            }
+        }
+    }
+
+    /// Send a keepalive `ping` to every connected client that negotiated it.
+    pub fn send_keepalives(&self) {
+        if let Ok(bytes) = ExtFrame::Ping.encode() {
+            for c in self.clients.lock().unwrap().iter() {
+                if c.has(CAP_KEEPALIVE) {
+                    c.enqueue_priority(&bytes);
+                }
+            }
+        }
+    }
+
+    /// Close every client (used on session teardown so writer threads wind down).
+    pub fn close_all(&self) {
+        for c in self.clients.lock().unwrap().iter() {
+            c.close();
+        }
     }
 }
 
 /// Serve one client connection to completion (returns when the client
-/// disconnects). Spawns a writer thread for pushed output and handles request
-/// frames on this thread.
+/// disconnects). Registers the client, spawns its writer thread, and handles
+/// request frames on this thread.
 pub fn serve_client(stream: UnixStream, shared: Arc<Shared>) {
-    let (tx, rx) = sync_channel::<Vec<u8>>(CLIENT_BUFFER_FRAMES);
+    let ch = Arc::new(ClientChannel::new(shared.clients.next_id()));
+    shared.clients.register(ch.clone());
 
-    // Writer thread: drain the channel to the socket.
-    let mut write_half = match stream.try_clone() {
+    let write_half = match stream.try_clone() {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => {
+            shared.clients.deregister(ch.id);
+            return;
+        }
     };
-    let writer = std::thread::spawn(move || {
-        for frame in rx.iter() {
-            if write_half.write_all(&frame).is_err() {
+    // A second handle so the writer can unblock a reader parked on `read` when
+    // the connection dies on the write side.
+    let shutdown_half = stream.try_clone().ok();
+
+    let writer = {
+        let ch = ch.clone();
+        let shared = shared.clone();
+        std::thread::spawn(move || client_writer(ch, write_half, shared, shutdown_half))
+    };
+
+    let _ = read_loop(stream, &shared, &ch);
+
+    // Wind down: stop the writer, forget the client, release its sizing slot.
+    ch.close();
+    shared.clients.deregister(ch.id);
+    shared.forget_client(ch.id);
+    let _ = writer.join();
+}
+
+/// The per-client writer: drain the outbox to the socket, refreshing a
+/// lagging client with a [`Resync`] snapshot before resuming live output.
+fn client_writer(
+    ch: Arc<ClientChannel>,
+    mut sock: UnixStream,
+    shared: Arc<Shared>,
+    shutdown_half: Option<UnixStream>,
+) {
+    loop {
+        let (batch, do_resync) = {
+            let mut st = ch.out.lock().unwrap();
+            while st.queue.is_empty() && !st.resync && !st.closed {
+                st = ch.cv.wait(st).unwrap();
+            }
+            if st.closed && st.queue.is_empty() && !st.resync {
+                break;
+            }
+            if st.resync {
+                st.resync = false;
+                st.queue.clear();
+                (Vec::new(), true)
+            } else {
+                (st.queue.drain(..).collect::<Vec<_>>(), false)
+            }
+        };
+
+        if do_resync {
+            let (seq, screen) = shared.resync_base();
+            match ExtFrame::Resync(Resync { seq, screen }).encode() {
+                Ok(bytes) if sock.write_all(&bytes).is_ok() => {}
+                _ => break,
+            }
+            let _ = sock.flush();
+            continue;
+        }
+
+        let mut failed = false;
+        for frame in batch {
+            if sock.write_all(&frame).is_err() {
+                failed = true;
                 break;
             }
         }
-    });
-
-    let mut attached_id: Option<u64> = None;
-    let _ = read_loop(stream, &shared, &tx, &mut attached_id);
-    if let Some(id) = attached_id {
-        shared.clients.deregister(id);
+        if failed {
+            break;
+        }
+        let _ = sock.flush();
     }
-    // Dropping `tx` ends the writer thread.
-    drop(tx);
-    let _ = writer.join();
+
+    // The connection is done on the write side; make sure the reader thread
+    // parked on `read` wakes so `serve_client` can return.
+    ch.close();
+    if let Some(s) = shutdown_half {
+        let _ = s.shutdown(Shutdown::Both);
+    }
 }
 
 /// Read and dispatch request frames until the client disconnects or errors.
 fn read_loop(
     mut stream: UnixStream,
     shared: &Arc<Shared>,
-    tx: &SyncSender<Vec<u8>>,
-    attached_id: &mut Option<u64>,
+    ch: &Arc<ClientChannel>,
 ) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
-        // Drain any whole frames already buffered.
         loop {
-            match Frame::decode(&buf) {
+            match decode_any(&buf) {
                 Ok((frame, consumed)) => {
                     buf.drain(..consumed);
-                    handle_frame(frame, shared, tx, attached_id);
+                    handle_frame(frame, shared, ch);
                 }
                 Err(shelbi_proto::ProtoError::Incomplete { .. }) => break,
-                Err(_) => {
-                    // A malformed/unknown frame from a peer: stop serving it
-                    // rather than risk desyncing the stream.
-                    return Ok(());
-                }
+                Err(_) => return Ok(()), // malformed/unknown: stop serving this peer
             }
         }
         let n = stream.read(&mut chunk)?;
         if n == 0 {
-            return Ok(()); // clean disconnect
+            return Ok(());
         }
         buf.extend_from_slice(&chunk[..n]);
     }
 }
 
-fn handle_frame(
-    frame: Frame,
-    shared: &Arc<Shared>,
-    tx: &SyncSender<Vec<u8>>,
-    attached_id: &mut Option<u64>,
-) {
+fn handle_frame(frame: AnyFrame, shared: &Arc<Shared>, ch: &Arc<ClientChannel>) {
     match frame {
-        Frame::Hello(hello) => {
-            // Adopt the client's reported colors so later color queries use real
-            // values instead of the dark default.
+        AnyFrame::Core(Frame::Hello(hello)) => {
+            ch.set_caps(&hello.capabilities);
             if let Some(colors) = hello.colors {
                 shared.colors.set(
                     (colors.foreground.r, colors.foreground.g, colors.foreground.b),
                     (colors.background.r, colors.background.g, colors.background.b),
                 );
             }
-            // Reply with the session's hello (frozen core; no colors of its own).
+            // Announce every capability this session supports.
             let reply = Hello {
                 protocol_version: shelbi_proto::PROTOCOL_VERSION,
                 colors: None,
-                capabilities: vec![],
+                capabilities: shelbi_proto::capability::ALL
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
             };
-            send(tx, &Frame::Hello(reply));
-        }
-        Frame::Attach(_attach) => {
-            // Live output only; replay reconstruction is `rt-replay`. Register so
-            // the PTY reader starts broadcasting to this client.
-            if attached_id.is_none() {
-                *attached_id = Some(shared.clients.register(tx.clone()));
+            if let Ok(bytes) = Frame::Hello(reply).encode() {
+                ch.enqueue_priority(&bytes);
             }
         }
-        Frame::Input(input) => {
+        AnyFrame::Core(Frame::Attach(_)) => shared.attach(ch),
+        AnyFrame::Core(Frame::Input(input)) => {
+            shared.on_input(ch.id);
             shared.write_to_child(&input.data);
         }
-        Frame::Resize(Resize { cols, rows }) => {
-            shared.resize(cols, rows);
-        }
-        Frame::Snapshot(req) => {
+        AnyFrame::Core(Frame::Resize(r)) => shared.on_resize(ch.id, r.cols, r.rows),
+        AnyFrame::Core(Frame::Snapshot(req)) => {
             let text = shared.snapshot_text(req.history_lines);
-            send(tx, &Frame::SnapshotData(SnapshotData { text }));
+            if let Ok(bytes) = Frame::SnapshotData(SnapshotData { text }).encode() {
+                ch.enqueue_priority(&bytes);
+            }
         }
-        Frame::Kill(kill) => {
-            shared.kill_child_group(kill.signal);
+        AnyFrame::Core(Frame::Kill(kill)) => shared.kill_child_group(kill.signal),
+        AnyFrame::Ext(ExtFrame::Info(_)) => {
+            let info = shared.info_data();
+            if let Ok(bytes) = ExtFrame::InfoData(info).encode() {
+                ch.enqueue_priority(&bytes);
+            }
         }
-        // Server never receives these; ignore.
-        Frame::Output(_) | Frame::SnapshotData(_) | Frame::Exited(_) => {}
+        AnyFrame::Ext(ExtFrame::Paste(p)) => {
+            shared.on_input(ch.id);
+            shared.paste(&p.text);
+        }
+        AnyFrame::Ext(ExtFrame::SetMeta(m)) => shared.set_meta(m.name, m.task),
+        AnyFrame::Ext(ExtFrame::Detach) => shared.detach(ch),
+        AnyFrame::Ext(ExtFrame::Ping) => {
+            if let Ok(bytes) = ExtFrame::Pong.encode() {
+                ch.enqueue_priority(&bytes);
+            }
+        }
+        // Everything else is a reply/event/pong the server never receives, or a
+        // frame it does not act on: ignore.
+        _ => {}
     }
 }
 
-/// Encode `frame` and push it to the client's writer channel (best-effort).
-fn send(tx: &SyncSender<Vec<u8>>, frame: &Frame) {
-    if let Ok(bytes) = frame.encode() {
-        let _ = tx.try_send(bytes);
+/// Build the [`InfoData`] reply from the current session state. Lives here
+/// because it reads several `Shared` pieces; called from [`handle_frame`].
+pub fn info_data(shared: &Shared) -> InfoData {
+    let (title, cols, rows, alt_screen, bracketed_paste) = {
+        let emu = shared.emu.lock().unwrap();
+        let (c, r) = emu.size();
+        (
+            emu.title(),
+            c,
+            r,
+            emu.alt_screen_active(),
+            emu.bracketed_paste_active(),
+        )
+    };
+    let meta = shared.meta.lock().unwrap();
+    InfoData {
+        title,
+        cols,
+        rows,
+        alt_screen,
+        bracketed_paste,
+        kitty_flags: shared.kitty.get(),
+        name: meta.name.clone(),
+        task: meta.task.clone(),
+        argv: meta.argv.clone(),
+        cwd: meta.cwd.to_string_lossy().into_owned(),
+        child_running: true,
     }
 }

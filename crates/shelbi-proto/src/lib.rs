@@ -36,10 +36,15 @@
 pub mod capability;
 pub mod control;
 pub mod error;
+pub mod ext;
 pub mod frame;
 pub mod message;
 
 pub use error::ProtoError;
+pub use ext::{
+    decode_any, AnyFrame, EventResized, EventTitle, ExtFrame, ExtType, Info, InfoData, Paste,
+    Resized, Resync, SetMeta,
+};
 pub use frame::{Frame, FrameType, MAX_FRAME_LEN};
 pub use message::{
     Attach, ClientColors, Exited, Hello, Input, Kill, Output, Resize, Rgb, Snapshot, SnapshotData,

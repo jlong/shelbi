@@ -1,44 +1,32 @@
 //! Spawn a detached `shelbi __session` process.
 //!
 //! A client runs `shelbi __session` detached, passing argv, cwd, initial size,
-//! metadata, and **an explicit environment**. The session process never
-//! inherits the environment of whatever happened to launch it:
-//!
-//! - The environment is the user's interactive login-shell environment,
-//!   captured once (`$SHELL -l -i -c env`) and cached, because `.zshrc` is where
-//!   nvm, fnm, and Homebrew PATH setup usually live and a plain `-l -c` skips
-//!   it.
-//! - Terminal-identity variables are scrubbed (`TMUX`, `TMUX_PANE`,
-//!   `TERM_PROGRAM`, `STY`). The session sets `TERM=xterm-256color`,
-//!   `COLORTERM=truecolor`, and its own `TERM_PROGRAM=shelbi`.
-//! - On Linux the process is started with `systemd-run --user --scope` where
-//!   available (with lingering enabled, so logind's `KillUserProcesses` does not
-//!   reap it at logout); otherwise `setsid`. All stdio is redirected so a
-//!   launching `ssh` does not hang.
-//!
-//! TODO (`rt-session-process`): implement [`spawn`] and the login-shell
-//! environment capture/cache.
+//! metadata, and an explicit, scrubbed environment; the session process never
+//! inherits the environment of whatever launched it. The detach recipe (setsid,
+//! the opt-in Linux `systemd-run --user --scope`, stdio to `/dev/null`) and the
+//! login-shell environment capture live in [`shelbi_session::spawn`]; this crate
+//! re-exports them so a client has one entry point for discover + spawn +
+//! connect. See the plan's "One process per session".
 
-/// Parameters for launching a new session.
-#[derive(Debug, Clone)]
-pub struct SpawnSpec {
-    /// The command and arguments the session should run.
-    pub argv: Vec<String>,
-    /// Working directory for the child.
-    pub cwd: String,
-    /// Initial PTY size, `(cols, rows)`.
-    pub size: (u16, u16),
-    /// Readable session name recorded in `meta.json`.
-    pub name: String,
-    /// Optional task id this session serves.
-    pub task: Option<String>,
+pub use shelbi_session::{SpawnSpec, SpawnedSession};
+
+use crate::error::ClientError;
+
+/// Spawn `spec` as a detached session process and return its handle (short id,
+/// directory, socket path, pid). Finds the running `shelbi` binary via
+/// `current_exe`; the session reparents to init and outlives this caller.
+///
+/// Connect to the returned [`SpawnedSession::sock`] with
+/// [`Connection::open`](crate::connect::Connection::open) once it appears.
+pub fn spawn(spec: &SpawnSpec) -> Result<SpawnedSession, ClientError> {
+    shelbi_session::spawn_detached(spec).map_err(|e| ClientError::Spawn(e.to_string()))
 }
 
-/// Spawn a detached session process and return its short id.
-///
-/// TODO (`rt-session-process`): build the explicit environment, create the
-/// session directory, launch `shelbi __session` detached, and wait for its
-/// socket to appear.
-pub fn spawn(_spec: &SpawnSpec) -> Result<String, crate::ClientError> {
-    unimplemented!("rt-session-process implements detached session spawn")
+/// Like [`spawn`] but with the `shelbi` executable named explicitly — tests
+/// point this at `CARGO_BIN_EXE_shelbi` instead of the test harness binary.
+pub fn spawn_with_exe(
+    exe: &std::path::Path,
+    spec: &SpawnSpec,
+) -> Result<SpawnedSession, ClientError> {
+    shelbi_session::spawn_detached_with_exe(exe, spec).map_err(|e| ClientError::Spawn(e.to_string()))
 }

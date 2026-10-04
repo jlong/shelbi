@@ -15,14 +15,16 @@
 //! newer is gated behind a capability string so an old session simply does not
 //! announce it and the client degrades gracefully.
 //!
-//! ## TODO (owned by `rt-protocol-client`)
+//! ## The capabilities
 //!
-//! The following are planned additive capabilities from the plan's protocol
-//! table. They are listed here as name constants so call sites have a single
-//! source of truth, but their **frames and payloads are not yet defined** —
-//! that is the protocol subtask's work. Define each frame with a type byte at
-//! or above [`FrameType::CAPABILITY_BASE`](crate::FrameType::CAPABILITY_BASE)
-//! and a typed message, mirroring the frozen core's structure.
+//! Each name gates one or more [`ExtFrame`](crate::ExtFrame) kinds, defined in
+//! [`crate::ext`]. A **request** capability ([`INFO`], [`PASTE`], [`SET_META`],
+//! [`DETACH`]) is used by a client only when the *session* announced it, falling
+//! back to the frozen core otherwise. A **pushed** capability ([`EVENT_TITLE`],
+//! [`EVENT_BELL`], [`EVENT_RESIZED`], [`OUTPUT_RESIZED`], [`RESYNC`]) is sent by
+//! the session only to clients that announced understanding it, so an unknown
+//! frame never lands on a peer that would reject it. [`KEEPALIVE`] is symmetric:
+//! either end may `ping` and the other answers `pong`.
 //!
 //! - [`INFO`]: `info` request/reply — title, size, mode flags, metadata, child
 //!   state.
@@ -32,9 +34,15 @@
 //! - [`DETACH`]: `detach` — explicit unsubscribe (the core only has implicit
 //!   detach on disconnect).
 //! - [`EVENT_TITLE`], [`EVENT_BELL`], [`EVENT_RESIZED`]: pushed events for a
-//!   title change, a bell, and a size change. (`resized` also rides the output
-//!   stream inline per the plan; the pushed event is the out-of-band form for
-//!   clients that want it without reading output.)
+//!   title change, a bell, and a size change.
+//! - [`OUTPUT_RESIZED`]: the in-band `resized(seq, cols, rows)` marker that
+//!   rides the output stream so every emulator reflows at the same byte offset;
+//!   [`EVENT_RESIZED`] is the out-of-band form for clients that watch size
+//!   without reading output.
+//! - [`RESYNC`]: backpressure recovery — a dropped-behind client is sent a fresh
+//!   snapshot and the sequence to resume from instead of blocking the PTY.
+//! - [`KEEPALIVE`]: `ping`/`pong`, so a dead connection is noticed (the relay
+//!   depends on it).
 
 /// `info`: request current title, size, mode flags, metadata, and child state.
 pub const INFO: &str = "info";
@@ -54,12 +62,22 @@ pub const EVENT_TITLE: &str = "event-title";
 /// Pushed event: the program rang the bell.
 pub const EVENT_BELL: &str = "event-bell";
 
-/// Pushed event: the session's size changed.
+/// Pushed event: the session's size changed (out-of-band).
 pub const EVENT_RESIZED: &str = "event-resized";
 
+/// In-band `resized` markers riding the output stream (sequenced), so client
+/// emulators reflow at the same point in the byte stream.
+pub const OUTPUT_RESIZED: &str = "output-resized";
+
+/// Backpressure recovery: a lagging client is dropped to a fresh snapshot
+/// (`resync`) rather than blocking the PTY or growing a queue without bound.
+pub const RESYNC: &str = "resync";
+
+/// Keepalive `ping`/`pong`, so a dead connection is noticed.
+pub const KEEPALIVE: &str = "keepalive";
+
 /// Every additive capability name this build knows about, for use in a
-/// [`Hello`](crate::Hello)'s capability list. NOT FROZEN: entries are added as
-/// the protocol subtask defines each frame.
+/// [`Hello`](crate::Hello)'s capability list. NOT FROZEN.
 pub const ALL: &[&str] = &[
     INFO,
     PASTE,
@@ -68,4 +86,7 @@ pub const ALL: &[&str] = &[
     EVENT_TITLE,
     EVENT_BELL,
     EVENT_RESIZED,
+    OUTPUT_RESIZED,
+    RESYNC,
+    KEEPALIVE,
 ];

@@ -27,19 +27,21 @@
 //!
 //! ## Modules
 //!
-//! - [`discovery`]: enumerate sessions by scanning the sessions directory.
+//! - [`discovery`]: enumerate sessions by scanning the sessions directory, and
+//!   reap the directories of dead ones.
 //! - [`spawn`]: launch a detached `shelbi __session` with an explicit
-//!   environment.
+//!   environment (delegates to `shelbi-session`).
 //! - [`connect`]: open a connection, perform the hello handshake, and issue
-//!   blocking requests.
+//!   blocking requests; capability-gated, with frozen-core fallbacks.
 //! - [`reader`]: the background reader that turns the output/event stream into
 //!   channel messages.
+//! - [`control`]: the separate daemon mutation-control client.
 //! - [`error`]: the crate's error type.
 //!
-//! The concrete bodies are filled in by the Phase 1 subtasks
-//! (`rt-session-process`, `rt-protocol-client`, `rt-replay`, `rt-snapshot`);
-//! this foundation establishes the crate, its boundaries, and its dependency
-//! shape.
+//! The session protocol and the full discover/spawn/connect surface are
+//! `rt-protocol-client`; attach **replay** (a full emulator-state
+//! reconstruction, replacing the current [`SessionEvent::Resync`] snapshot) is
+//! `rt-replay`.
 
 pub mod connect;
 pub mod control;
@@ -48,5 +50,9 @@ pub mod error;
 pub mod reader;
 pub mod spawn;
 
+pub use connect::{Connection, SessionEvents};
 pub use control::{ControlClient, Subscription};
+pub use discovery::{list, reap_dead, DiscoveredSession};
 pub use error::ClientError;
+pub use reader::SessionEvent;
+pub use spawn::{spawn, spawn_with_exe, SpawnSpec, SpawnedSession};

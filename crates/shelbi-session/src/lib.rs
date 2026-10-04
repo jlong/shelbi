@@ -27,18 +27,21 @@
 //! - [`emulator`] — the headless `alacritty_terminal` emulator, kitty keyboard
 //!   protocol enabled, 10,000 lines of scrollback.
 //! - [`history`] — the bounded recent-bytes ring and the optional raw output log.
-//! - [`transport`] — the Unix-socket frame server (frozen-core subset).
+//! - [`transport`] — the Unix-socket frame server: the full session protocol
+//!   (frozen core plus every additive capability — `info`, `paste`, `set-meta`,
+//!   `detach`, the pushed title/bell/resized events, in-band sequenced resize,
+//!   backpressure `resync`, and keepalive).
 //! - [`daemon_watchdog`] — a background thread that restarts a crashed hub
 //!   daemon while this session's project is open (the service units are retired,
 //!   so sessions are the watchers).
 //!
 //! ## What this crate does *not* do
 //!
-//! Attach **replay** (reconstructing full emulator state for a new client) is
-//! `rt-replay`; the full protocol and additive capabilities are
-//! `rt-protocol-client`. This crate implements enough of the frozen core (hello,
-//! kill, and the cheap resize/snapshot/input/live-output) to run a session end
-//! to end and to test it.
+//! Attach **replay** — reconstructing *full* emulator state (both buffers, saved
+//! cursors, modes, history) for a new client — is `rt-replay`. Until it lands,
+//! `attach` and the backpressure drop both recover a client with a full-screen
+//! text snapshot (the [`Resync`](shelbi_proto::Resync) stand-in), which is
+//! correct for a repaint but not a byte-exact state restore.
 
 pub mod daemon_watchdog;
 pub mod emulator;

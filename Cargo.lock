@@ -1428,9 +1428,13 @@ dependencies = [
 name = "shelbi-client"
 version = "0.9.0"
 dependencies = [
+ "anyhow",
+ "libc",
  "serde",
  "serde_json",
  "shelbi-proto",
+ "shelbi-session",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 

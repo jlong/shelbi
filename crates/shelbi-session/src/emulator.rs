@@ -17,7 +17,10 @@
 //! (Claude Code's Shift+Enter rides on it), which on this crate means setting
 //! `Config.kitty_keyboard` at construction.
 
-use alacritty_terminal::event::VoidListener;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
@@ -28,6 +31,66 @@ use crate::responder::CursorSource;
 
 /// Scrollback depth kept in memory, per the plan's "History" section.
 pub const SCROLLBACK_LINES: usize = 10_000;
+
+/// A UI-level event the emulator surfaced while being fed, which the session
+/// turns into a pushed protocol event (title changed, bell). The session drains
+/// these after each [`Emulator::feed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmuEvent {
+    /// The program set a new window title (empty string = reset to default).
+    Title(String),
+    /// The program rang the bell.
+    Bell,
+}
+
+/// The sink the emulator's `Term` reports UI events to. `alacritty_terminal`
+/// calls [`EventListener::send_event`] with `&self`, so the state lives behind an
+/// `Arc<Mutex<_>>` and the session holds a clone to read the title and drain the
+/// event queue. Everything the session does not surface (clipboard, color and
+/// cursor queries, `PtyWrite` — all handled by the [`responder`](crate::responder)
+/// instead) is dropped here.
+#[derive(Clone, Default)]
+pub struct EmuSink {
+    inner: Arc<Mutex<SinkState>>,
+}
+
+#[derive(Default)]
+struct SinkState {
+    title: Option<String>,
+    events: VecDeque<EmuEvent>,
+}
+
+impl EmuSink {
+    /// The window title the program last set, if any.
+    pub fn title(&self) -> Option<String> {
+        self.inner.lock().unwrap().title.clone()
+    }
+
+    /// Take the queued events, oldest first, leaving the queue empty.
+    pub fn drain(&self) -> Vec<EmuEvent> {
+        self.inner.lock().unwrap().events.drain(..).collect()
+    }
+}
+
+impl EventListener for EmuSink {
+    fn send_event(&self, event: Event) {
+        let mut st = self.inner.lock().unwrap();
+        match event {
+            Event::Title(title) => {
+                st.title = Some(title.clone());
+                st.events.push_back(EmuEvent::Title(title));
+            }
+            Event::ResetTitle => {
+                st.title = None;
+                st.events.push_back(EmuEvent::Title(String::new()));
+            }
+            Event::Bell => st.events.push_back(EmuEvent::Bell),
+            // The responder answers cursor/DA/color queries off the PTY directly,
+            // so the emulator's own replies and every other UI event are dropped.
+            _ => {}
+        }
+    }
+}
 
 /// A terminal size as the emulator's `Dimensions` trait wants it. `total_lines`
 /// only sets the viewport; scrollback depth comes from `Config.scrolling_history`
@@ -54,9 +117,10 @@ impl Dimensions for Size {
 /// it (the parser buffers partial escape sequences across `feed` calls, so there
 /// must be exactly one for the session's lifetime).
 pub struct Emulator {
-    term: Term<VoidListener>,
+    term: Term<EmuSink>,
     parser: Processor,
     size: Size,
+    sink: EmuSink,
 }
 
 impl Emulator {
@@ -72,17 +136,47 @@ impl Emulator {
             kitty_keyboard: true,
             ..Config::default()
         };
-        let term = Term::new(config, &size, VoidListener);
+        let sink = EmuSink::default();
+        let term = Term::new(config, &size, sink.clone());
         Self {
             term,
             parser: Processor::new(),
             size,
+            sink,
         }
     }
 
     /// Feed a chunk of raw child output into the emulator.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// The window title the program last set, if any.
+    pub fn title(&self) -> Option<String> {
+        self.sink.title()
+    }
+
+    /// Take the UI events (title changes, bells) the program emitted since the
+    /// last drain, oldest first. The session turns these into pushed protocol
+    /// events.
+    pub fn drain_events(&self) -> Vec<EmuEvent> {
+        self.sink.drain()
+    }
+
+    /// Current `(cols, rows)` of the emulator screen.
+    pub fn size(&self) -> (u16, u16) {
+        (self.size.cols as u16, self.size.rows as u16)
+    }
+
+    /// Whether the program is on the alternate screen.
+    pub fn alt_screen_active(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Whether bracketed-paste mode is enabled (so a paste is wrapped in
+    /// `ESC [ 200 ~ … ESC [ 201 ~`).
+    pub fn bracketed_paste_active(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
     /// Resize the screen. No-op if the dimensions are unchanged.
@@ -207,5 +301,39 @@ mod tests {
         e.resize(100, 40);
         assert_eq!(e.size.cols, 100);
         assert_eq!(e.size.rows, 40);
+        assert_eq!(e.size(), (100, 40));
+    }
+
+    #[test]
+    fn captures_title_changes_as_events() {
+        let mut e = Emulator::new(80, 24);
+        // OSC 0 sets both icon name and window title.
+        e.feed(b"\x1b]0;my-agent\x07");
+        assert_eq!(e.title().as_deref(), Some("my-agent"));
+        let events = e.drain_events();
+        assert!(events.contains(&EmuEvent::Title("my-agent".into())));
+        // Draining twice yields nothing the second time.
+        assert!(e.drain_events().is_empty());
+    }
+
+    #[test]
+    fn captures_bell_as_an_event() {
+        let mut e = Emulator::new(80, 24);
+        e.feed(b"ding\x07");
+        assert!(e.drain_events().contains(&EmuEvent::Bell));
+    }
+
+    #[test]
+    fn tracks_bracketed_paste_and_alt_screen_modes() {
+        let mut e = Emulator::new(80, 24);
+        assert!(!e.bracketed_paste_active());
+        assert!(!e.alt_screen_active());
+        // Enable bracketed paste (DECSET 2004) and the alternate screen (1049).
+        e.feed(b"\x1b[?2004h\x1b[?1049h");
+        assert!(e.bracketed_paste_active());
+        assert!(e.alt_screen_active());
+        e.feed(b"\x1b[?2004l\x1b[?1049l");
+        assert!(!e.bracketed_paste_active());
+        assert!(!e.alt_screen_active());
     }
 }
