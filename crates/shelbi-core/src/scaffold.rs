@@ -206,6 +206,8 @@ git:
             "full test suite here hangs workers under concurrent load. Let CI own the",
             "authoritative full suite; a wedged local check is bounded by",
             "SHELBI_LOCAL_CHECK_TIMEOUT_SECS (default 1200) and fails fast.",
+            "On a Rust track, `shelbi msrv-check` builds on the declared minimum Rust",
+            "(Cargo.toml `rust-version`) so an MSRV break is caught here, not in CI.",
         ],
         yaml: "\
 zen:
@@ -213,6 +215,7 @@ zen:
     local:
       - cargo build --workspace   # fast; full `cargo test` runs in CI
       - cargo clippy --workspace --all-targets -- -D warnings
+      - shelbi msrv-check         # Rust only: build on the declared MSRV, mirroring CI's `msrv` job
   ci_timeout: 900            # seconds Zen waits for CI. Default 900 (15m)
   danger_paths:
     extend: [\".env\", \"infra/**\"]   # or `override: [...]`, or a bare list
