@@ -19,6 +19,7 @@ use shelbi_state::keymap::{load_keymaps, GlobalAction};
 
 pub mod actions;
 pub mod branch;
+pub mod cancel;
 pub(crate) mod codex_rpc;
 pub mod dispatch;
 mod git;

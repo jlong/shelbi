@@ -243,6 +243,15 @@ pub(crate) fn start(
                 .map_err(MutateError::backend)?
         }
         LaunchWait::IdleTimeout => {
+            // Bump this workspace's generation before rolling back: the launch
+            // worker thread we're about to abandon is still running
+            // `start_workspace_on_task`, and this trips its cancellation guard
+            // so that if it later unblocks it stands down at its pre-spawn check
+            // instead of starting an agent on a task that's been rolled back and
+            // may since have been redispatched (`rt-daemon-cancellation`,
+            // acceptance criterion 1). A redispatch registers a fresh guard
+            // after this bump, so it is unaffected.
+            crate::cancel::bump_workspace(project, &workspace_name);
             if let Err(le) = shelbi_state::append_dispatch_event(
                 project,
                 id,

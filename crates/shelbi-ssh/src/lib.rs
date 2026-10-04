@@ -5,12 +5,63 @@
 //! like `russh`): we want the user's existing `~/.ssh/config`, `ssh-agent`,
 //! ProxyJump, etc. to "just work" — and we want one less thing to maintain.
 
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use shelbi_core::Host;
+
+/// An ambient cancellation scope installed on a thread for the duration of a
+/// daemon job (`shelbi_orchestrator::cancel`). While it is set, the otherwise
+/// *unbounded* entry points ([`run`], [`run_capture`]) run with the scope's
+/// wall-clock `deadline` and poll its `cancel` flag, killing the child's whole
+/// process group the moment either fires. This is what bounds the poller's
+/// per-cycle SSH reads (snapshot / title / get_env) and lets a project quit
+/// kill a thread wedged on a dead host — without threading a deadline through
+/// every call site. With no scope installed (every non-daemon caller) behavior
+/// is byte-identical to before.
+#[derive(Clone)]
+pub struct CancelScope {
+    /// Wall-clock bound for one subprocess call made under this scope.
+    pub deadline: Duration,
+    /// The owning job's cancel flag; a call under this scope is killed the
+    /// moment it trips.
+    pub cancel: Arc<AtomicBool>,
+}
+
+thread_local! {
+    static CANCEL_SCOPE: RefCell<Option<CancelScope>> = const { RefCell::new(None) };
+}
+
+/// RAII guard that restores the previous scope on drop, so scopes nest without
+/// leaking onto a thread a loop later reuses.
+pub struct CancelScopeGuard {
+    prev: Option<CancelScope>,
+}
+
+impl Drop for CancelScopeGuard {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        CANCEL_SCOPE.with(|s| *s.borrow_mut() = prev);
+    }
+}
+
+/// Install `deadline` + `cancel` as the current thread's ambient cancellation
+/// scope until the returned guard drops.
+pub fn enter_cancel_scope(deadline: Duration, cancel: Arc<AtomicBool>) -> CancelScopeGuard {
+    let prev =
+        CANCEL_SCOPE.with(|s| s.borrow_mut().replace(CancelScope { deadline, cancel }));
+    CancelScopeGuard { prev }
+}
+
+/// The current thread's ambient cancellation scope, if a job installed one.
+pub fn current_cancel_scope() -> Option<CancelScope> {
+    CANCEL_SCOPE.with(|s| s.borrow().clone())
+}
 
 /// How many times to attempt a transient master open before giving up, and the
 /// base backoff between attempts. Both env-overridable so a chronically noisy
@@ -367,6 +418,12 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    // Honor an ambient cancellation scope (a daemon job): bound the call on the
+    // scope's deadline and kill it on cancellation. No scope → unbounded, as
+    // before.
+    if let Some(scope) = current_cancel_scope() {
+        return run_with_deadline_cancellable(host, argv, scope.deadline, Some(&scope.cancel));
+    }
     let mut cmd = build_command(host, argv);
     tracing::debug!(?cmd, host = ?host, "ssh::run");
     cmd.output()
@@ -563,6 +620,26 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_with_deadline_cancellable(host, argv, deadline, None)
+}
+
+/// [`run_with_deadline`] plus optional cooperative cancellation: if `cancel` is
+/// supplied and trips before the child exits, the whole process group is killed
+/// the same way a deadline kills it, and the call returns
+/// [`std::io::ErrorKind::Interrupted`]. This is how a daemon job's in-flight
+/// SSH call is killed the instant its generation is superseded or its project
+/// is quit (`rt-daemon-cancellation`), rather than waiting out the full
+/// deadline.
+pub fn run_with_deadline_cancellable<I, S>(
+    host: &Host,
+    argv: I,
+    deadline: Duration,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut cmd = build_command(host, argv);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -621,13 +698,16 @@ where
             }
             break status;
         }
-        if start.elapsed() >= deadline {
+        let timed_out = start.elapsed() >= deadline;
+        let cancelled = cancel.is_some_and(|c| c.load(Ordering::SeqCst));
+        if timed_out || cancelled {
             // Kill the whole process group (best-effort — the child may have
             // exited in the gap), then reap so the long-lived hub daemon
             // doesn't accumulate zombies. The group signal reaches any
             // grandchildren the child spawned; `child.kill()` is the fallback
             // for the (non-unix / group-setup-failed) case where we only have
-            // the direct child.
+            // the direct child. A cancellation kills the same way a deadline
+            // does — the only difference is the error kind we report.
             #[cfg(unix)]
             {
                 // Safety: `kill(2)` with a negative pid signals the process
@@ -649,6 +729,14 @@ where
             let partial = stderr_reader.join().unwrap_or_default();
             let partial = String::from_utf8_lossy(&partial);
             let partial = partial.trim();
+            if cancelled && !timed_out {
+                let msg = if partial.is_empty() {
+                    "command was cancelled".to_string()
+                } else {
+                    format!("command was cancelled; stderr before kill: {partial}")
+                };
+                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, msg));
+            }
             let msg = if partial.is_empty() {
                 format!("command did not finish within {deadline:?}")
             } else {
@@ -1829,6 +1917,58 @@ mod tests {
             .expect("fast echo must not time out");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "shelbi");
+    }
+
+    #[test]
+    fn run_with_deadline_cancellable_kills_a_hung_child_on_cancellation() {
+        // A daemon job wedged on SSH: the child would run far longer than the
+        // test, but tripping the cancel flag from another thread kills the whole
+        // process group and surfaces `Interrupted` promptly — this is how a
+        // project quit kills a blocked poll/supervision call
+        // (`rt-daemon-cancellation`, acceptance criterion 2).
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let start = std::time::Instant::now();
+        let err = run_with_deadline_cancellable(
+            &Host::Local,
+            ["sleep", "30"],
+            // A deadline far longer than the cancellation, so we prove the
+            // *cancel* path (not the deadline) is what killed the child.
+            Duration::from_secs(30),
+            Some(&cancel),
+        )
+        .expect_err("a cancelled child must not return success");
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted, "err: {err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cancellation took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_honors_an_ambient_cancel_scope() {
+        // A scope installed on the thread makes the otherwise-unbounded `run`
+        // bound + cancellable, so the poller's snapshot/title/get_env reads come
+        // under cancellation without a per-call-site change.
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let _scope = enter_cancel_scope(Duration::from_millis(150), cancel.clone());
+            assert!(current_cancel_scope().is_some());
+            let start = std::time::Instant::now();
+            // No cancellation tripped → the scope's deadline bounds it.
+            let err = run(&Host::Local, ["sleep", "30"]).expect_err("scope deadline must fire");
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "err: {err}");
+            assert!(start.elapsed() < Duration::from_secs(5));
+        }
+        assert!(current_cancel_scope().is_none(), "scope cleared on guard drop");
+        // Outside any scope, `run` is unbounded as before (a fast child is fine).
+        let out = run(&Host::Local, ["echo", "ok"]).expect("unscoped run works");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
     }
 
     #[test]

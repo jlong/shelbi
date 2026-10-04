@@ -79,8 +79,32 @@ fn reconcile(running: &mut HashMap<String, WorkspacePoller>) {
 
     let open = shelbi_state::list_open_projects().unwrap_or_default();
 
-    // Stop pollers for projects that have closed (their `Drop` joins + unlocks).
-    running.retain(|project, _| open.iter().any(|p| p == project));
+    // Stop pollers for projects that have closed. A close is a quit: cancel the
+    // project's in-flight jobs (the poll threads, and any dispatch/launch still
+    // running), drop the poller so its supervisor stops and its threads unwind,
+    // then wait on the quit barrier for them to acknowledge cancellation before
+    // the project is considered torn down — so no thread for a closed project
+    // survives, even one that was wedged on a dead host
+    // (`rt-daemon-cancellation`, acceptance criteria 2 & 6; the per-project
+    // keying means quitting one project never touches another's jobs).
+    let closing: Vec<String> = running
+        .keys()
+        .filter(|p| !open.iter().any(|o| o == *p))
+        .cloned()
+        .collect();
+    for project in &closing {
+        let barrier = shelbi_orchestrator::cancel::quit_project(project);
+        // Drop the poller first (sets its shutdown flag, joins the supervisor),
+        // then wait for the now-cancelled threads to drain.
+        running.remove(project);
+        if !barrier.wait() {
+            tracing::warn!(
+                project = %project,
+                "quit barrier timed out before every job acknowledged cancellation; \
+                 a wedged job is left for the OS to reap at process exit",
+            );
+        }
+    }
 
     // Start a poller for each open project that isn't already running. A start
     // that comes back inert (the per-project lock is still held by a stale
@@ -198,6 +222,59 @@ mod tests {
         reconcile(&mut running);
         let names: Vec<&String> = running.keys().collect();
         assert_eq!(names, vec![&"alpha".to_string()], "closed project's poller stopped");
+    }
+
+    #[test]
+    fn closing_one_project_drains_its_jobs_and_leaves_another_untouched() {
+        // Acceptance criteria 2 & 6 at the manager: closing a project runs the
+        // quit barrier for it (its poll threads drain — no thread survives),
+        // while a sibling project's poller and jobs are untouched.
+        let home = DaemonPollerHome::new("quit-barrier");
+        // A short barrier bound keeps the test snappy; local fixture threads
+        // drain near-instantly, so this only guards against a slow CI.
+        std::env::set_var("SHELBI_QUIT_BARRIER_MS", "4000");
+        std::env::set_var("SHELBI_POLL_SUBPROC_DEADLINE_MS", "200");
+        home.open_project("alpha");
+        home.open_project("beta");
+
+        let mut running: HashMap<String, WorkspacePoller> = HashMap::new();
+        reconcile(&mut running);
+        // Both pollers have spun up their supervisor + per-workspace jobs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline
+            && !(shelbi_orchestrator::cancel::live_job_count("alpha") > 0
+                && shelbi_orchestrator::cancel::live_job_count("beta") > 0)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            shelbi_orchestrator::cancel::live_job_count("alpha") > 0
+                && shelbi_orchestrator::cancel::live_job_count("beta") > 0,
+            "both projects registered their poll jobs"
+        );
+
+        // Close beta: the next reconcile quits it (barrier drains its jobs) and
+        // drops its poller, leaving alpha's poller and jobs alone.
+        shelbi_state::set_project_open("beta", false).unwrap();
+        reconcile(&mut running);
+
+        assert_eq!(
+            running.keys().collect::<Vec<_>>(),
+            vec![&"alpha".to_string()],
+            "beta's poller stopped, alpha's kept"
+        );
+        assert_eq!(
+            shelbi_orchestrator::cancel::live_job_count("beta"),
+            0,
+            "no job for the closed project survives (quit barrier drained)"
+        );
+        assert!(
+            shelbi_orchestrator::cancel::live_job_count("alpha") > 0,
+            "the still-open project's jobs are untouched by the sibling's quit"
+        );
+
+        std::env::remove_var("SHELBI_QUIT_BARRIER_MS");
+        std::env::remove_var("SHELBI_POLL_SUBPROC_DEADLINE_MS");
     }
 
     #[test]
