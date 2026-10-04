@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Flags, LineLength};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 
@@ -210,17 +210,48 @@ impl Emulator {
     }
 
     /// Render `history_lines` of scrollback (clamped to what's retained) plus the
-    /// whole visible screen to text.
+    /// whole visible screen to text, in the shape `tmux capture-pane -p -J`
+    /// produces (see [`crate::emulator`] and the `capture_parity` integration
+    /// test):
+    ///
+    /// * **Wrapped lines are joined.** A physical row whose last cell carries the
+    ///   [`WRAPLINE`](Flags::WRAPLINE) flag flowed into the next row, so the two
+    ///   render as one logical line with no break between them — exactly what
+    ///   `-J` does. The join spans the history/screen boundary, so a line that
+    ///   wrapped at the top of the visible screen still joins with its tail in
+    ///   history.
+    /// * **Trailing whitespace is trimmed per logical line.** Each row's content
+    ///   stops at its [occupied length](LineLength::line_length) (trailing
+    ///   default cells dropped), and the joined line is `trim_end`ed. tmux's `-J`
+    ///   *preserves* trailing spaces, but the screen detectors this feeds
+    ///   ([`crate`] clients, `ready.rs`/`submit.rs`) are trailing-whitespace
+    ///   insensitive, and exact byte parity is unreachable anyway: this crate's
+    ///   emulator and tmux track a line's "used" extent differently once a
+    ///   program issues an erase-to-end-of-line. The parity test normalizes both
+    ///   sides' trailing whitespace for that reason.
+    /// * **Trailing blank rows are dropped**, so a mostly-empty screen does not
+    ///   render as a wall of newlines, and there is no trailing newline.
     fn render(&self, history_lines: usize) -> String {
         let grid = self.term.grid();
         let cols = grid.columns();
         let screen = grid.screen_lines() as i32;
         let hist = (grid.history_size() as i32).min(history_lines as i32);
         let mut out: Vec<String> = Vec::with_capacity((hist + screen) as usize);
+        // The logical line under construction, extended across every physical
+        // row that wrapped into the next (so `-J`'s line joining is reproduced).
+        let mut current = String::with_capacity(cols);
+        let mut joining = false;
         for line in (-hist)..screen {
             let row = &grid[Line(line)];
-            let mut s = String::with_capacity(cols);
-            for col in 0..cols {
+            if !joining {
+                current.clear();
+            }
+            // A wrapped row is full to the edge, so render every column; a
+            // non-wrapped row stops at its occupied length so unused trailing
+            // cells don't become spaces. `line_length()` returns the full width
+            // for a wrapped row, so one bound covers both.
+            let len = row.line_length().0;
+            for col in 0..len {
                 let cell = &row[Column(col)];
                 // The trailing half of a wide glyph (and the padding before a
                 // wide glyph that would overflow the line) is not a real
@@ -232,9 +263,19 @@ impl Emulator {
                     continue;
                 }
                 let c = cell.c;
-                s.push(if c == '\0' { ' ' } else { c });
+                current.push(if c == '\0' { ' ' } else { c });
             }
-            out.push(s.trim_end().to_string());
+            // Does this row flow into the next? The wrap flag lives on the row's
+            // last cell.
+            joining = cols > 0 && row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+            if !joining {
+                out.push(current.trim_end().to_string());
+            }
+        }
+        // A screen that ends mid-wrap (the bottom row wrapped) still has an
+        // unflushed logical line.
+        if joining {
+            out.push(current.trim_end().to_string());
         }
         // Drop trailing blank rows so a mostly-empty screen doesn't render as a
         // wall of newlines.
@@ -282,6 +323,33 @@ mod tests {
         // would be a no-op; it taking effect proves the protocol is enabled.
         e.feed(b"\x1b[>1u");
         assert!(e.kitty_disambiguate_active());
+    }
+
+    #[test]
+    fn wrapped_lines_are_joined_like_capture_pane_j() {
+        // A line longer than the screen width wraps onto the next physical row.
+        // `-J` (and so `visible_text`) joins the two back into one logical line
+        // with no break, rather than emitting the wrap as a newline.
+        let mut e = Emulator::new(10, 4);
+        e.feed(b"abcdefghijXYZ");
+        assert_eq!(e.visible_text(), "abcdefghijXYZ");
+    }
+
+    #[test]
+    fn wrap_join_spans_the_history_boundary() {
+        // A line that wraps right at the top of the visible screen still joins
+        // with the tail that scrolled into history when history is requested.
+        let mut e = Emulator::new(6, 2);
+        // 10 chars on a 6-col, 2-row screen: wraps to row0 "abcdef" + row1
+        // "ghij", then a newline pushes the wrapped pair up so "abcdef" lands in
+        // history while "ghij" stays on the visible screen.
+        e.feed(b"abcdefghij\r\nlast");
+        let joined = e.screen_with_history(10);
+        assert!(
+            joined.contains("abcdefghij"),
+            "wrapped line must rejoin across the history boundary: {joined:?}"
+        );
+        assert!(joined.ends_with("last"));
     }
 
     #[test]
