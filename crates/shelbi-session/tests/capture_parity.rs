@@ -32,6 +32,92 @@ use std::time::{Duration, Instant};
 
 use shelbi_session::emulator::Emulator;
 
+/// Private per-process tmux server + env isolation for the parity tests.
+///
+/// Mirrors the doctrine `shelbi-orchestrator`'s `tmux_test_support` adopted in
+/// #1466: drive a tmux server no one else can see so the tests are deterministic
+/// under CI load and never touch the user's live server (a run inside a Shelbi
+/// worker pane inherits `$TMUX`/`$TMUX_PANE` pointing at it). Integration tests
+/// are separate crates, so that `pub(crate)` helper can't be shared here — this
+/// is the same pattern reimplemented for shelbi-session's one tmux-driving test.
+///
+/// Isolation is by `-L <per-pid socket>` rather than a `TMUX_TMPDIR` pin: tmux's
+/// default socket base (`/tmp/tmux-<uid>/`) keeps the path short enough for
+/// macOS's ~104-char `AF_UNIX` `sun_path` limit, which a private dir under the
+/// long `/var/folders/...` temp dir blows past (`File name too long`). Passing
+/// `-L` and dropping `$TMUX`/`$TMUX_PANE` per-command (never a process-global
+/// `set_var`) also sidesteps a data race with the sibling test's parallel tmux
+/// spawns.
+mod tmux_isolation {
+    use std::process::Command;
+    use std::sync::Once;
+    use std::time::Duration;
+
+    /// A tmux `Command` pinned to this process's private server (`-L`) and
+    /// detached from any ambient one (`$TMUX`/`$TMUX_PANE` dropped). Every tmux
+    /// call these tests make must go through here so none reaches the user's
+    /// default server.
+    pub fn cmd() -> Command {
+        let mut c = Command::new("tmux");
+        c.arg("-L").arg(socket());
+        c.env_remove("TMUX").env_remove("TMUX_PANE");
+        c
+    }
+
+    /// Per-pid private socket name, so parallel test binaries never collide and
+    /// the server is distinct from the user's default one.
+    fn socket() -> String {
+        format!("shelbi-parity-{}", std::process::id())
+    }
+
+    /// Bring the private server up exactly once, before either parity test races
+    /// to create its first session. Both tests compile into one binary and run
+    /// in parallel; two concurrent `new-session -d` calls against a not-yet-forked
+    /// server is a known tmux race (one loses with `server exited unexpectedly`).
+    /// Starting it here (behind a `Once`) means the server already exists by the
+    /// time either test calls `new-session`, and the long-lived holder keeps it
+    /// from emptying — and exiting — between fixtures.
+    pub fn ensure_server() {
+        static INIT: Once = Once::new();
+        INIT.call_once(start_holder);
+    }
+
+    /// Create a detached, long-lived holder session on the private server,
+    /// retrying the lazy-fork cold-start race and confirming liveness via
+    /// `has-session`. Best-effort: if tmux can't create it at all (no tmux, or a
+    /// sandbox that denies socket access) the tests still gate on
+    /// `tmux_available()` and skip, so a silent failure here is harmless.
+    fn start_holder() {
+        let holder = format!("rt-capture-parity-holder-{}", std::process::id());
+        for _ in 0..20 {
+            let started = cmd()
+                .args(["new-session", "-d", "-s", &holder, "sh", "-c", "sleep 600"])
+                .output();
+            if matches!(&started, Ok(out) if out.status.success()) && has_session(&holder) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Poll `has-session` until the freshly-forked server confirms `session` is
+    /// live (`=name` disables fnmatch). Returns whether it came up in budget.
+    fn has_session(session: &str) -> bool {
+        for _ in 0..100 {
+            let up = cmd()
+                .args(["has-session", "-t", &format!("={session}")])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if up {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+}
+
 /// Is a usable `tmux` on PATH? The parity assertions are skipped (not failed)
 /// when it is absent.
 fn tmux_available() -> bool {
@@ -70,27 +156,38 @@ fn normalize(text: &str) -> Vec<String> {
 /// exact bytes the emulator is fed, then holds open on `sleep` so the rendered
 /// screen can be captured.
 fn tmux_capture(bytes: &[u8], cols: u16, rows: u16, history: Option<u32>) -> String {
+    tmux_isolation::ensure_server();
     let session = unique_session();
     let mut file = tempfile::NamedTempFile::new().expect("tempfile");
     file.write_all(bytes).expect("write fixture");
     file.flush().expect("flush fixture");
     let path = file.path().to_string_lossy().into_owned();
 
-    let status = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            &session,
-            "-x",
-            &cols.to_string(),
-            "-y",
-            &rows.to_string(),
-            &format!("stty -onlcr -ocrnl 2>/dev/null; cat {path:?}; sleep 300"),
-        ])
-        .status()
-        .expect("spawn tmux new-session");
-    assert!(status.success(), "tmux new-session failed");
+    // The holder keeps the server up, so this should succeed first try; retry the
+    // transient cold-start race anyway rather than fail a PR on a lost fork.
+    let mut started = false;
+    for _ in 0..20 {
+        let status = tmux_isolation::cmd()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-x",
+                &cols.to_string(),
+                "-y",
+                &rows.to_string(),
+                &format!("stty -onlcr -ocrnl 2>/dev/null; cat {path:?}; sleep 300"),
+            ])
+            .status()
+            .expect("spawn tmux new-session");
+        if status.success() {
+            started = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(started, "tmux new-session failed");
 
     // Poll until the capture stabilizes (cat has rendered), bounded so a wedged
     // pane can't hang the suite.
@@ -102,7 +199,10 @@ fn tmux_capture(bytes: &[u8], cols: u16, rows: u16, history: Option<u32>) -> Str
             argv.extend_from_slice(&["-S", &start]);
         }
         argv.extend_from_slice(&["-t", &session]);
-        let out = Command::new("tmux").args(&argv).output().expect("capture-pane");
+        let out = tmux_isolation::cmd()
+            .args(&argv)
+            .output()
+            .expect("capture-pane");
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -119,8 +219,8 @@ fn tmux_capture(bytes: &[u8], cols: u16, rows: u16, history: Option<u32>) -> Str
         }
     }
 
-    let _ = Command::new("tmux")
-        .args(["kill-session", "-t", &session])
+    let _ = tmux_isolation::cmd()
+        .args(["kill-session", "-t", &format!("={session}")])
         .status();
     last
 }
