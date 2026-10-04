@@ -25,7 +25,13 @@ use crate::error::ProtoError;
 /// Version of the control protocol this build speaks, carried in the hello.
 /// Unlike the session [`crate::PROTOCOL_VERSION`] this is not a frozen core;
 /// a mismatch is surfaced like the daemon-version mutation guard.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 adds [`ClientMsg::ReviewSession`] (the single-process TUI asks the daemon
+/// to start/stop a review's editor/diff sessions — `rt-tui-review`), plus the
+/// project/Shelbi quit and reload-clients messages
+/// ([`ClientMsg::QuitProject`], [`ClientMsg::QuitShelbi`],
+/// [`ClientMsg::ReloadClients`] / [`ServerMsg::Reexec`] — `rt-tui-project-quit`).
+pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
 /// Upper bound on a single control frame. Generous enough for a large issue body
 /// in an `edit`/`add`, far below the session [`crate::MAX_FRAME_LEN`].
@@ -163,6 +169,54 @@ pub struct MutationRequest {
     pub kind: MutationKind,
 }
 
+/// Which content session of a review slot a [`ReviewSessionOp::Ensure`] targets.
+/// The agent (chat) and dev server are spawned by the dispatch/resume path, not
+/// here; this is only the editor and diff tool the review interface shows in a
+/// terminal view, each a session named `<project>/review/<slot>/<role>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewRole {
+    /// `$EDITOR` opened on the review worktree.
+    Editor,
+    /// The configured git difftool over the review branch's changes.
+    Diff,
+}
+
+impl ReviewRole {
+    /// The `<role>` component of the session name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReviewRole::Editor => "editor",
+            ReviewRole::Diff => "diff",
+        }
+    }
+}
+
+/// What the client wants done with a review's content sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewSessionOp {
+    /// Ensure the `role` session for this task's review slot is spawned and
+    /// live, so the client can attach a terminal view to it. Idempotent: a
+    /// live session is left as is.
+    Ensure { role: ReviewRole },
+    /// Tear the review interface for this task down: end its editor, diff, and
+    /// dev-server sessions and free the slot's port. The agent (chat) session
+    /// is left for the slot's normal teardown. Idempotent.
+    Close,
+}
+
+/// Client → daemon request to manage a review slot's content sessions
+/// (`rt-tui-review`). Replies reuse [`ServerMsg::Done`] / [`ServerMsg::Failed`]
+/// keyed by `request_id`, like a mutation; progress lines use
+/// [`ServerMsg::Line`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSessionRequest {
+    pub request_id: u64,
+    pub project: String,
+    /// The review-column task whose slot the sessions belong to.
+    pub task: String,
+    pub op: ReviewSessionOp,
+}
+
 /// Client → daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
@@ -190,6 +244,10 @@ pub enum ClientMsg {
     /// `shelbi reload` signal. The daemon broadcasts [`ServerMsg::Reexec`] to
     /// its subscribers and replies [`ServerMsg::Done`] to the requester.
     ReloadClients { request_id: u64 },
+    /// Start or stop a review slot's editor/diff/server sessions
+    /// (`rt-tui-review`). The daemon owns their lifetime so they outlive a
+    /// client detach; the client only attaches terminal views.
+    ReviewSession(ReviewSessionRequest),
 }
 
 /// Why a mutation did not run (or could not be accepted). `Display` is the

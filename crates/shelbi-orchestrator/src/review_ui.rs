@@ -900,6 +900,41 @@ fn git_config_value(worktree: &std::path::Path, key: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Build the `sh -c` command for a review **editor** content session: `$EDITOR`
+/// opened on the review worktree. Shared with the single-process TUI
+/// (`rt-tui-review`), which spawns this as a `<project>/review/<slot>/editor`
+/// session process instead of a tmux pane; the tmux path builds the identical
+/// line inline in [`ensure_editor_pane`]. `exec` so the session ends when the
+/// editor quits; the worktree is shell-escaped, the editor command is not (it
+/// may carry flags, e.g. `code --wait`).
+pub(crate) fn editor_session_command(worktree: &std::path::Path) -> String {
+    format!(
+        "cd {} && exec {}",
+        shelbi_core::shell_escape(&worktree.to_string_lossy()),
+        shelbi_state::resolve_editor(),
+    )
+}
+
+/// Build the `sh -c` command for a review **diff** content session — the same
+/// `git difftool` (or `review.diff_command` override) invocation
+/// [`ensure_diff_pane`] runs, over `merge-base(base, HEAD)..HEAD`. Shared with
+/// the single-process TUI, which spawns it as a `<project>/review/<slot>/diff`
+/// session. On the default path the tool is resolved first so an unconfigured
+/// `diff.tool` surfaces as an `Err` (a status-line warning) rather than a
+/// session that dies on launch.
+pub(crate) fn diff_session_command(
+    project: &shelbi_core::Project,
+    worktree: &std::path::Path,
+) -> Result<String> {
+    let override_cmd = project.review_diff_command();
+    let use_gui = match override_cmd {
+        Some(_) => false,
+        None => resolve_difftool_gui(worktree)?,
+    };
+    let base = git_capture(worktree, &["merge-base", project.base_branch(), "HEAD"])?;
+    Ok(diff_pane_command(worktree, &base, override_cmd, use_gui))
+}
+
 /// Make sure the hidden stash session `_{session}` exists before we park the
 /// editor window in it. Bootstrap's [`crate::ensure_hidden_views`] builds it,
 /// but the editor view can be opened before/without a full dashboard rebuild,
@@ -1445,6 +1480,84 @@ mod tests {
                 task: "t-rev".into(),
             }],
             "only the review-column task on the review-tagged slot is laid out"
+        );
+
+        match prev_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- review_session::close_review (the native TUI teardown, AC #6) ------
+
+    /// Closing a review (the single-process TUI's teardown, `rt-tui-review`)
+    /// reaps the review slot's dev-server process group — freeing the port it
+    /// held — and clears the pgid record. The editor/diff session kills are
+    /// best-effort over sessions that aren't up in this unit test (a no-op), so
+    /// this focuses on the server+port half, which is the part with a durable
+    /// side effect to assert. (The process-group reap mechanics themselves are
+    /// also covered by `workspace::stop_review_server`'s test.)
+    #[test]
+    fn close_review_reaps_the_dev_server_and_frees_the_port() {
+        use std::os::unix::process::CommandExt;
+
+        let _lock = crate::test_lock::acquire();
+        let proj = format!("close-review-{}", std::process::id());
+        let home = std::env::temp_dir().join(format!("shelbi-closerev-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        shelbi_state::save_project(&demo_project(&proj)).unwrap();
+        // A review-column task loaded on the review-tagged slot `review-1`.
+        shelbi_state::save_task(&proj, &task_on("t-rev", "review-1", Column::review()), "b")
+            .unwrap();
+
+        // Stand in for the `shelbi __review-serve` launch: a setsid session
+        // leader (its own process group) that outlives the call until reaped.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 300");
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // Safety: async-signal-safe `setsid` in the forked child before exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn stub server");
+        let pgid = child.id() as i32;
+        let pgroup_alive = |pgid: i32| unsafe { libc::kill(-pgid, 0) == 0 };
+
+        let path = shelbi_state::review_serve_pgid_path("review-1").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{pgid}\n")).unwrap();
+        assert!(pgroup_alive(pgid), "server group alive before close");
+
+        // Close the review: the daemon's half ends the sessions and frees the
+        // port (reaps the server's process group).
+        crate::review_session::close_review(&proj, "t-rev").unwrap();
+
+        let _ = child.wait();
+        let mut gone = false;
+        for _ in 0..200 {
+            if !pgroup_alive(pgid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(gone, "the dev-server process group must be gone (port freed)");
+        assert!(
+            shelbi_state::read_review_serve_pgid("review-1")
+                .unwrap()
+                .is_none(),
+            "the pgid record must be cleared after close"
         );
 
         match prev_home {
