@@ -30,6 +30,10 @@ libc = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 serde_yaml = { workspace = true }
+# The detector round-trip test (`detector_snapshot_parity`) feeds the ready.rs /
+# submit.rs screen fixtures through the session emulator and asserts the
+# detectors read the rendered snapshot identically to the raw fixture.
+shelbi-session = { workspace = true }
 # The review-autoload freshness-guard test drives `autoload_review_queue` against
 # a `github` board via the injectable fake `gh` runner (behind this feature).
 shelbi-state = { workspace = true, features = ["test-support"] }

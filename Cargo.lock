@@ -1770,6 +1770,7 @@ dependencies = [
  "shelbi-agent",
  "shelbi-core",
  "shelbi-proto",
+ "shelbi-session",
  "shelbi-ssh",
  "shelbi-state",
  "shelbi-tmux",
