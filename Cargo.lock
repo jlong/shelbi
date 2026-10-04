@@ -1770,6 +1770,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shelbi-agent",
+ "shelbi-client",
  "shelbi-core",
  "shelbi-proto",
  "shelbi-session",

@@ -46,6 +46,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use shelbi_core::{Error, Host, Result, TmuxAddr};
+use shelbi_session::SpawnSpec;
 
 /// A backend-neutral handle to a worker's session, or a sub-target within one.
 ///
@@ -151,6 +152,33 @@ impl SessionTarget {
             Inner::Pane { id } => id.clone(),
         }
     }
+
+    /// The target's shape, with its parts cloned out — for a non-tmux backend
+    /// that derives its own addressing (a session directory name) from the
+    /// target. Keeps the private [`Inner`] from leaking while giving the
+    /// session-process backend what it needs. See
+    /// [`session_process_backend::session_name`](crate::session_process_backend::session_name).
+    pub(crate) fn name_parts(&self) -> TargetParts {
+        match &self.0 {
+            Inner::Slot { session, window } => TargetParts::Slot {
+                session: session.clone(),
+                window: window.clone(),
+            },
+            Inner::Session { session } => TargetParts::Session {
+                session: session.clone(),
+            },
+            Inner::Pane { id } => TargetParts::Pane { id: id.clone() },
+        }
+    }
+}
+
+/// The three shapes of a [`SessionTarget`], exposed for a non-tmux backend's
+/// name derivation without leaking the private [`Inner`]. Returned by
+/// [`SessionTarget::name_parts`].
+pub(crate) enum TargetParts {
+    Slot { session: String, window: String },
+    Session { session: String },
+    Pane { id: String },
 }
 
 /// Three-state liveness for the session probe.
@@ -348,10 +376,222 @@ pub trait SessionBackend {
     fn injection_lock(&self, target: &SessionTarget) -> InjectionGuard;
 }
 
-/// The active session backend. Today this is always the tmux backend; a hidden
-/// dev setting selecting a session-process backend arrives in a later subtask.
-pub fn backend() -> TmuxBackend {
-    TmuxBackend
+/// The active session backend, chosen by the hidden
+/// [`session_backend_enabled`](shelbi_state::session_backend_enabled) dev flag.
+///
+/// Off (the default) → [`Backend::Tmux`], which delegates to [`TmuxBackend`]
+/// byte for byte, so nothing changes. On → [`Backend::Session`], the
+/// session-process backend. The flag is dev-only; tmux stays the runtime until
+/// cutover. Every orchestrator call site reaches the active backend through
+/// this one function, so the switch is a single read.
+pub fn backend() -> Backend {
+    if shelbi_state::session_backend_enabled() {
+        Backend::Session(crate::session_process_backend::SessionProcessBackend)
+    } else {
+        Backend::Tmux(TmuxBackend)
+    }
+}
+
+/// The active backend, selected at runtime by [`backend`]. Implements
+/// [`SessionBackend`] by delegating to the chosen variant, and carries the few
+/// tmux-topology-specific inherent methods (`kill_window`, `kill_pane`,
+/// `live_pane_ids`, `spawn_local_pane`) so the handful of call sites that use
+/// them compile against one type. On the session variant those map to the
+/// session-process equivalent (there are no tmux windows or panes): a window /
+/// pane id is a logical session name to kill, the "live pane ids" are the live
+/// session names, and the local dispatch spawns a session process.
+pub enum Backend {
+    Tmux(TmuxBackend),
+    Session(crate::session_process_backend::SessionProcessBackend),
+}
+
+impl Backend {
+    /// tmux-only on the tmux backend; on the session backend, kill the session
+    /// whose logical name is `window_id` (what [`SessionBackend::enumerate_slots`]
+    /// handed back as a slot `id`).
+    pub fn kill_window(&self, host: &Host, window_id: &str) -> Result<()> {
+        match self {
+            Backend::Tmux(b) => b.kill_window(host, window_id),
+            Backend::Session(b) => b.kill_by_name(host, window_id),
+        }
+    }
+
+    /// tmux-only on the tmux backend; on the session backend, best-effort kill
+    /// the session whose logical name is `pane_id`.
+    pub fn kill_pane(&self, host: &Host, pane_id: &str) -> Result<()> {
+        match self {
+            Backend::Tmux(b) => b.kill_pane(host, pane_id),
+            Backend::Session(b) => b.kill_by_name(host, pane_id),
+        }
+    }
+
+    /// tmux-only on the tmux backend; on the session backend, the logical names
+    /// of every live session (so a caller confirming a specific handle can
+    /// still match).
+    pub fn live_pane_ids(&self, host: &Host) -> Result<Vec<String>> {
+        match self {
+            Backend::Tmux(b) => b.live_pane_ids(host),
+            Backend::Session(b) => b.live_session_names(host),
+        }
+    }
+
+    /// Spawn the orchestrator as a detached session process — the
+    /// session-backend branch of [`crate::ensure_dashboard`]
+    /// ([`crate::orchestrator_session_spec`] builds the spec). Only the session
+    /// backend supports it; the tmux backend brings the orchestrator up as a
+    /// dashboard pane (`split-window`) instead and is never called here, so the
+    /// `Tmux` variant surfaces an error rather than silently no-op'ing.
+    pub fn spawn_orchestrator_session(&self, spec: SpawnSpec) -> Result<()> {
+        match self {
+            Backend::Session(b) => b.spawn_session(spec).map(|_| ()),
+            Backend::Tmux(_) => Err(Error::Other(
+                "orchestrator session spawn requires the session backend".into(),
+            )),
+        }
+    }
+
+    /// The local dispatch spawn: a tmux window with `-e` env injection on the
+    /// tmux backend, or a detached session process carrying the same per-dispatch
+    /// environment on the session backend.
+    pub fn spawn_local_pane(
+        &self,
+        host: &Host,
+        args: crate::workspace::LocalPaneTmuxArgs<'_>,
+    ) -> Result<()> {
+        match self {
+            Backend::Tmux(b) => b.spawn_local_pane(host, args),
+            Backend::Session(b) => {
+                if host.is_ssh() {
+                    return Err(Error::Other(
+                        "session backend cannot spawn a local pane on a remote host".into(),
+                    ));
+                }
+                b.spawn_session(args.to_session_spawn_spec()).map(|_| ())
+            }
+        }
+    }
+}
+
+/// Delegate every trait method to the active variant.
+impl SessionBackend for Backend {
+    fn spawn(&self, host: &Host, target: &SessionTarget, command: Option<&str>) -> Result<()> {
+        match self {
+            Backend::Tmux(b) => b.spawn(host, target, command),
+            Backend::Session(b) => b.spawn(host, target, command),
+        }
+    }
+    fn kill(&self, host: &Host, target: &SessionTarget) -> Result<()> {
+        match self {
+            Backend::Tmux(b) => b.kill(host, target),
+            Backend::Session(b) => b.kill(host, target),
+        }
+    }
+    fn probe(&self, host: &Host, target: &SessionTarget, deadline: Option<Duration>) -> Liveness {
+        match self {
+            Backend::Tmux(b) => b.probe(host, target, deadline),
+            Backend::Session(b) => b.probe(host, target, deadline),
+        }
+    }
+    fn send_text(&self, host: &Host, target: &SessionTarget, text: &str) -> Result<()> {
+        match self {
+            Backend::Tmux(b) => b.send_text(host, target, text),
+            Backend::Session(b) => b.send_text(host, target, text),
+        }
+    }
+    fn send_enter(&self, host: &Host, target: &SessionTarget) -> Result<()> {
+        match self {
+            Backend::Tmux(b) => b.send_enter(host, target),
+            Backend::Session(b) => b.send_enter(host, target),
+        }
+    }
+    fn send_line(&self, host: &Host, target: &SessionTarget, text: &str) -> Result<()> {
+        match self {
+            Backend::Tmux(b) => b.send_line(host, target, text),
+            Backend::Session(b) => b.send_line(host, target, text),
+        }
+    }
+    fn snapshot(&self, host: &Host, target: &SessionTarget) -> Result<String> {
+        match self {
+            Backend::Tmux(b) => b.snapshot(host, target),
+            Backend::Session(b) => b.snapshot(host, target),
+        }
+    }
+    fn history(&self, host: &Host, target: &SessionTarget, lines: usize) -> Result<String> {
+        match self {
+            Backend::Tmux(b) => b.history(host, target, lines),
+            Backend::Session(b) => b.history(host, target, lines),
+        }
+    }
+    fn final_screen(&self, host: &Host, target: &SessionTarget) -> Result<String> {
+        match self {
+            Backend::Tmux(b) => b.final_screen(host, target),
+            Backend::Session(b) => b.final_screen(host, target),
+        }
+    }
+    fn title(&self, host: &Host, target: &SessionTarget) -> Result<String> {
+        match self {
+            Backend::Tmux(b) => b.title(host, target),
+            Backend::Session(b) => b.title(host, target),
+        }
+    }
+    fn get_metadata(
+        &self,
+        host: &Host,
+        target: &SessionTarget,
+        key: &str,
+        deadline: Option<Duration>,
+    ) -> Result<Option<String>> {
+        match self {
+            Backend::Tmux(b) => b.get_metadata(host, target, key, deadline),
+            Backend::Session(b) => b.get_metadata(host, target, key, deadline),
+        }
+    }
+    fn set_metadata(
+        &self,
+        host: &Host,
+        target: &SessionTarget,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        match self {
+            Backend::Tmux(b) => b.set_metadata(host, target, key, value),
+            Backend::Session(b) => b.set_metadata(host, target, key, value),
+        }
+    }
+    fn get_env(&self, host: &Host, target: &SessionTarget, var: &str) -> Result<Option<String>> {
+        match self {
+            Backend::Tmux(b) => b.get_env(host, target, var),
+            Backend::Session(b) => b.get_env(host, target, var),
+        }
+    }
+    fn enumerate_slots(
+        &self,
+        host: &Host,
+        target: &SessionTarget,
+        deadline: Option<Duration>,
+    ) -> std::io::Result<Option<Vec<SlotInfo>>> {
+        match self {
+            Backend::Tmux(b) => b.enumerate_slots(host, target, deadline),
+            Backend::Session(b) => b.enumerate_slots(host, target, deadline),
+        }
+    }
+    fn respawn(&self, target: &SessionTarget, cmd: &str) -> RespawnOutcome {
+        match self {
+            Backend::Tmux(b) => b.respawn(target, cmd),
+            Backend::Session(b) => b.respawn(target, cmd),
+        }
+    }
+    fn resize(&self, host: &Host, target: &SessionTarget, cols: u16, rows: u16) -> Result<()> {
+        match self {
+            Backend::Tmux(b) => b.resize(host, target, cols, rows),
+            Backend::Session(b) => b.resize(host, target, cols, rows),
+        }
+    }
+    fn injection_lock(&self, target: &SessionTarget) -> InjectionGuard {
+        // Keyed identically in both variants (both go through `injection_guard`
+        // on `label()`), so the lock is stable regardless of the active backend.
+        injection_guard(&target.label())
+    }
 }
 
 /// [`SessionBackend`] over tmux, via [`shelbi_tmux`] and [`shelbi_ssh`]. Unit
@@ -625,10 +865,19 @@ impl SessionBackend for TmuxBackend {
     }
 
     fn injection_lock(&self, target: &SessionTarget) -> InjectionGuard {
-        let mutex = target_injection_mutex(&target.label());
-        InjectionGuard {
-            _guard: mutex.lock().unwrap_or_else(|p| p.into_inner()),
-        }
+        injection_guard(&target.label())
+    }
+}
+
+/// Acquire the process-global injection lock keyed on `label`, blocking until
+/// it is free and returning a guard that releases it on drop. Shared by every
+/// backend ([`TmuxBackend`] and the session-process backend both key on
+/// [`SessionTarget::label`]), so a paste into one target is serialized no matter
+/// which backend is active or how many times [`backend`] was called.
+pub(crate) fn injection_guard(label: &str) -> InjectionGuard {
+    let mutex = target_injection_mutex(label);
+    InjectionGuard {
+        _guard: mutex.lock().unwrap_or_else(|p| p.into_inner()),
     }
 }
 

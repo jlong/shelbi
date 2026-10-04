@@ -4719,6 +4719,60 @@ pub(crate) fn local_pane_tmux_argv(a: LocalPaneTmuxArgs<'_>) -> Vec<String> {
     argv
 }
 
+impl LocalPaneTmuxArgs<'_> {
+    /// Map this local-dispatch spec to a session-process [`SpawnSpec`] for the
+    /// session backend. The same per-dispatch variables tmux injects via `-e`
+    /// (`TASK_ID` / `PROJECT` / `SHELBI_HUB_SOCK`, and `SHELBI_AGENT` / `PORT` /
+    /// the review pgid file when set) are placed as an env prefix before an
+    /// `exec` of the identical `--as-pane` wrapper command, the POSIX idiom the
+    /// remote path (`remote_cd_launch`) already uses — so the wrapper inherits
+    /// them in a login shell (for the user's PATH) regardless of when the
+    /// caller's state save lands. The session is named with the plan's readable
+    /// convention `<project>/ws/<workspace>`, keyed off `project`/`window` so it
+    /// matches what every later `SessionTarget`-derived lookup resolves to.
+    pub(crate) fn to_session_spawn_spec(&self) -> shelbi_session::SpawnSpec {
+        let mut env_prefix = format!(
+            "TASK_ID={} PROJECT={} SHELBI_HUB_SOCK={}",
+            shelbi_agent::shell_escape(self.task_id),
+            shelbi_agent::shell_escape(self.project),
+            shelbi_agent::shell_escape(self.hub_sock),
+        );
+        if let Some(agent) = self.agent {
+            env_prefix.push_str(&format!(" SHELBI_AGENT={}", shelbi_agent::shell_escape(agent)));
+        }
+        if let Some(port) = self.port {
+            env_prefix.push_str(&format!(" PORT={port}"));
+        }
+        if let Some(pgid_file) = self.review_pgid_file {
+            env_prefix.push_str(&format!(
+                " {}={}",
+                shelbi_state::REVIEW_SERVE_PGID_FILE_ENV,
+                shelbi_agent::shell_escape(pgid_file),
+            ));
+        }
+        // `$SHELL -lc` (login shell) so the wrapper picks up the user's PATH,
+        // matching the tmux pane's `sh -c` inheriting the server env; the
+        // env-prefix-before-`exec` scopes the per-dispatch vars to the wrapper.
+        let line = format!("{env_prefix} exec {}", self.pane_cmd);
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let (cols, rows) = crate::session_process_backend::SessionProcessBackend::default_size();
+        shelbi_session::SpawnSpec {
+            name: format!("{}/ws/{}", self.project, self.window),
+            // The `--as-pane` wrapper cd's into the worktree itself, so the
+            // session's starting cwd only needs to be a real directory; the
+            // user's home matches where a tmux server typically starts.
+            cwd: std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/")),
+            cols,
+            rows,
+            task: Some(self.task_id.to_string()),
+            raw_output_log: false,
+            child_argv: vec![shell, "-lc".to_string(), line],
+        }
+    }
+}
+
 /// We park the assignment immediately before `exec` so it scopes to the
 /// agent process (the surrounding `$SHELL -lc` strips its own
 /// environment otherwise — env-prefix-before-exec is the POSIX idiom

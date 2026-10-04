@@ -33,6 +33,7 @@ pub mod poller;
 pub mod ready;
 pub mod review_ui;
 pub mod session_backend;
+pub mod session_process_backend;
 pub mod submit;
 pub mod supervision;
 pub mod system_plugin;
@@ -688,6 +689,24 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
         project_name,
         shelbi_state::ORCHESTRATOR_AGENT,
     );
+
+    // With the hidden `session_backend` dev flag on, the orchestrator runs as a
+    // detached session process (owning its own PTY, no tmux pane) through the
+    // backend seam — no `$TMUX_PANE`, no duplicated pane stdin. Everything above
+    // (project-open, the commit guard refresh, agent-context deploy) is
+    // backend-agnostic and has already run; the tmux dashboard layout below is
+    // skipped, because standing up a session-backend view layout is Phase 4 TUI
+    // work (`rt-tui-shell`). tmux stays the default runtime.
+    if shelbi_state::session_backend_enabled() {
+        return ensure_orchestrator_session(
+            &host,
+            project_name,
+            session,
+            &runner_spec,
+            &workdir,
+            hub.work_dir.as_path(),
+        );
+    }
 
     // Drop the sidebar-clamp script. The bootstrapped hooks invoke it
     // via `sh <path>` — keeping the body in a file dodges all of the
@@ -1832,6 +1851,136 @@ fn orchestrator_pane_cmd(
     )
 }
 
+/// Build the [`SpawnSpec`](shelbi_session::SpawnSpec) that runs the orchestrator
+/// as a **session process** — the session-backend analogue of
+/// [`orchestrator_pane_cmd`], used only when the hidden `session_backend` dev
+/// flag is on (see [`session_backend::backend`]).
+///
+/// Unlike the tmux pane wrapper, this runs the launch command as the PTY's
+/// **foreground child** with no shell backgrounding, which is what retires the
+/// two tmux artifacts the Codex orchestrator depended on
+/// (`docs/removing-tmux/phase0/agents.md`, item 4):
+///
+/// - **No `exec 3<&0` stdin dup.** The pane wrapper dups fd 0 only because it
+///   backgrounds the orchestrator as a shell job (job control off, so POSIX
+///   would otherwise hand a background job `/dev/null` for stdin). A session
+///   process owns the PTY and `exec`s the launch directly, so the PTY slave *is*
+///   the orchestrator's only stdin — the dup (and the `reader source not set`
+///   crossterm hazard it works around) has nothing left to fix and is gone. The
+///   Codex bridge's inherited remote TUI therefore draws straight to the session
+///   PTY, and a delivered steer reaches the process exactly once.
+/// - **No `$TMUX_PANE`.** The crash-record tail (`__orch-record-exit … $TMUX_PANE`)
+///   and the zen heartbeat / signal traps are tmux-pane lifecycle machinery; in
+///   the session model they become daemon/session supervision responsibilities
+///   (Phase 3 `rt-daemon-poller`), so they are not reproduced here. The
+///   orchestrator's identity comes from the session target (`<project>/orch`),
+///   never a tmux pane id.
+///
+/// The per-launch environment the pane wrapper `export`s is placed as an env
+/// prefix before the `exec`, scoped to the launch — the POSIX idiom
+/// [`workspace::LocalPaneTmuxArgs::to_session_spawn_spec`] uses for a worker
+/// dispatch. `SHELBI_MANAGED_CONTEXT=1` is load-bearing: it marks the
+/// orchestrator as a Shelbi-managed context so the hub commit guard governs it
+/// exactly as it does the tmux pane.
+pub fn orchestrator_session_spec(
+    project_name: &str,
+    session: &str,
+    workdir: &std::path::Path,
+    launch: &str,
+) -> shelbi_session::SpawnSpec {
+    use crate::session_backend::SessionTarget;
+
+    let proj = shelbi_agent::shell_escape(project_name);
+    let sess = shelbi_agent::shell_escape(session);
+    let wd = shelbi_agent::shell_escape(&workdir.to_string_lossy());
+    // `cd <workdir>` for parity with the tmux pane (and to survive a login
+    // profile that cd's), then the per-launch env scoped before an `exec` of the
+    // launch as the PTY's foreground child. No backgrounding → no stdin dup, and
+    // no `$TMUX_PANE`.
+    let line = format!(
+        "cd {wd} && SHELBI_PROJECT={proj} SHELBI_TMUX_SESSION={sess} SHELBI_MANAGED_CONTEXT=1 exec {launch}",
+    );
+    // A login shell so the orchestrator inherits the user's PATH, matching the
+    // tmux pane's `sh -c` picking up the tmux server env.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let (cols, rows) = session_process_backend::SessionProcessBackend::default_size();
+    shelbi_session::SpawnSpec {
+        // Keyed identically to what every `SessionTarget::session(session)`
+        // lookup (probe / kill / send) resolves to, so spawn and lookup agree.
+        name: session_process_backend::session_name(&SessionTarget::session(session.to_string())),
+        cwd: workdir.to_path_buf(),
+        cols,
+        rows,
+        task: None,
+        raw_output_log: false,
+        child_argv: vec![shell, "-lc".to_string(), line],
+    }
+}
+
+/// Bring the orchestrator up as a **session process** (the hidden
+/// `session_backend` dev flag is on) instead of a tmux dashboard pane. This is
+/// the session-backend branch of [`ensure_dashboard`].
+///
+/// It spawns the orchestrator through the [`SessionBackend`](session_backend::SessionBackend)
+/// seam with the dup-free, `$TMUX_PANE`-free shape [`orchestrator_session_spec`]
+/// builds, and returns. The surrounding *visual* dashboard — the sidebar pane,
+/// the hidden task/review/activity views, and the `swap-pane` layout — is tmux
+/// topology with no session analogue; standing those up for the session backend
+/// is the Phase 4 TUI shell's job (`rt-tui-shell`). So this path brings up the
+/// orchestrator process itself (the AC4 scope) and leaves the view layout to a
+/// later phase. tmux stays the default runtime; this runs only behind the flag.
+fn ensure_orchestrator_session(
+    host: &Host,
+    project_name: &str,
+    session: &str,
+    runner_spec: &shelbi_core::AgentRunnerSpec,
+    workdir: &std::path::Path,
+    hub_work_dir: &std::path::Path,
+) -> Result<BootstrapStatus> {
+    use crate::session_backend::{backend, SessionBackend, SessionTarget};
+
+    let b = backend();
+    let target = SessionTarget::session(session.to_string());
+
+    // Idempotent: a live orchestrator session is the session-backend equivalent
+    // of the tmux "dashboard already has 2+ panes" early return.
+    if b.probe(host, &target, None).is_alive() {
+        return Ok(BootstrapStatus::AlreadyRunning);
+    }
+
+    // Claim the one-shot first-project greeting exactly as the tmux path does, so
+    // the orchestrator's first turn gets the onboarding prompt. Re-armed below if
+    // the spawn fails, so a failed launch never silently consumes it.
+    let first_launch_repo =
+        shelbi_state::claim_contextual_greeting(project_name)?.then_some(hub_work_dir);
+
+    let shelbi_bin = current_exe_string()?;
+    let launch = orchestrator_launch_command(
+        &shelbi_bin,
+        runner_spec,
+        project_name,
+        workdir,
+        first_launch_repo,
+    );
+    let spec = orchestrator_session_spec(project_name, session, workdir, &launch);
+
+    if let Err(error) = b.spawn_orchestrator_session(spec) {
+        // Mirror the tmux split-failure path: restore the greeting the claim
+        // consumed so a later launch still makes the promised first opening.
+        if first_launch_repo.is_some() {
+            if let Err(rearm) = shelbi_state::arm_contextual_greeting(project_name) {
+                return Err(Error::Other(format!(
+                    "orchestrator session spawn failed ({error}); could not restore the \
+                     pending first-project greeting: {rearm}"
+                )));
+            }
+        }
+        return Err(error);
+    }
+
+    Ok(BootstrapStatus::Started)
+}
+
 // Tasks is a real ratatui app (`shelbi __tasks <p>`). Wrap it in a `while
 // true` loop so an accidental crash or Ctrl-C respawns the TUI instead of
 // leaving the stash pane empty — palette swap-pane assumes the pane id stays
@@ -2685,6 +2834,71 @@ mod pane_cmd_tests {
         assert!(
             rec_exit_idx < exit_idx,
             "crash capture must run before __zen-orch-exit clears the marker"
+        );
+    }
+
+    #[test]
+    fn orchestrator_session_spec_execs_the_launch_dup_free_without_tmux_pane() {
+        // The session-backend orchestrator (AC4): the launch runs as the PTY's
+        // foreground child with no stdin dup and no `$TMUX_PANE`, so the Codex
+        // three-process shape no longer needs either tmux artifact.
+        let spec = orchestrator_session_spec(
+            "myapp",
+            "shelbi-myapp",
+            std::path::Path::new("/Users/me/.shelbi/projects/myapp"),
+            "claude --flag",
+        );
+        // Named so every `SessionTarget::session("shelbi-myapp")` lookup — probe,
+        // kill, send — resolves to the session the spawn created.
+        assert_eq!(spec.name, "myapp/orch");
+        assert_eq!(spec.task, None);
+        assert_eq!(spec.cwd, std::path::Path::new("/Users/me/.shelbi/projects/myapp"));
+
+        // `$SHELL -lc <body>` — a login shell for the user's PATH.
+        assert_eq!(spec.child_argv.len(), 3, "argv: {:?}", spec.child_argv);
+        assert_eq!(spec.child_argv[1], "-lc");
+        let body = &spec.child_argv[2];
+
+        // The launch is `exec`'d as the foreground child — no backgrounding.
+        assert!(body.contains("exec claude --flag"), "body: {body}");
+        // The two tmux artifacts AC4 forbids are both absent:
+        assert!(
+            !body.contains("3<&0") && !body.contains("<&3"),
+            "the session path must not dup pane stdin (the PTY is the only stdin): {body}"
+        );
+        assert!(
+            !body.contains("TMUX_PANE"),
+            "the session path must never read $TMUX_PANE: {body}"
+        );
+        // And none of the tmux-pane lifecycle machinery (moved to Phase 3
+        // supervision): no heartbeat loop, no crash-record tail, no signal traps.
+        assert!(!body.contains("__zen-heartbeat"), "no heartbeat loop: {body}");
+        assert!(!body.contains("__orch-record-exit"), "no crash-record tail: {body}");
+        assert!(!body.contains("trap "), "no signal traps: {body}");
+        // But it still marks the Shelbi-managed context for the hub commit guard,
+        // and carries the project / session env the tmux pane exported.
+        assert!(body.contains("SHELBI_MANAGED_CONTEXT=1"), "body: {body}");
+        assert!(body.contains("SHELBI_PROJECT=myapp"), "body: {body}");
+        assert!(
+            body.starts_with("cd /Users/me/.shelbi/projects/myapp && "),
+            "body: {body}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_session_spec_shell_escapes_workdir_with_spaces() {
+        // Same space-safety the tmux pane wrapper has: a workdir with spaces must
+        // be single-quoted so `$SHELL -lc` doesn't split the `cd` arg.
+        let spec = orchestrator_session_spec(
+            "myapp",
+            "shelbi-myapp",
+            std::path::Path::new("/Users/jane doe/.shelbi/projects/myapp"),
+            "claude",
+        );
+        let body = &spec.child_argv[2];
+        assert!(
+            body.contains("cd '/Users/jane doe/.shelbi/projects/myapp'"),
+            "body: {body}"
         );
     }
 
@@ -4773,10 +4987,10 @@ mod supervise_restart_orchestrator_tests {
             unreachable!()
         }
         fn injection_lock(&self, target: &SessionTarget) -> InjectionGuard {
-            // The injection lock is a pure process-global mutex with no tmux
-            // dependency, so the real backend's is reused rather than minting a
+            // The injection lock is a pure process-global mutex with no backend
+            // dependency, so the shared registry is reused rather than minting a
             // second guard type. Unused by the restart path regardless.
-            session_backend::backend().injection_lock(target)
+            session_backend::injection_guard(&target.label())
         }
     }
 
