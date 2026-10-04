@@ -165,8 +165,8 @@ impl Connection {
         rx.recv().map_err(|_| ClientError::ReaderGone)
     }
 
-    /// Subscribe to the output stream. The session replies with a replay
-    /// (currently a [`SessionEvent::Resync`] snapshot) first, then live output,
+    /// Subscribe to the output stream. The session replies with a full-state
+    /// replay (a [`SessionEvent::Resync`] byte stream) first, then live output,
     /// all over the event channel. `since_seq` is reserved for exact reconnect;
     /// pass `None` for a full replay.
     pub fn attach(&self, since_seq: Option<u64>) -> Result<(), ClientError> {

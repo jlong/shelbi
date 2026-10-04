@@ -31,17 +31,17 @@
 //!   (frozen core plus every additive capability — `info`, `paste`, `set-meta`,
 //!   `detach`, the pushed title/bell/resized events, in-band sequenced resize,
 //!   backpressure `resync`, and keepalive).
+//! - [`replay`] — attach replay: serialize the emulator's *full* state (both
+//!   buffers, scrollback, saved cursors, scroll region, tabs, charsets, modes,
+//!   the kitty keyboard-protocol stack) into a byte stream a fresh client
+//!   emulator replays to end up identical. Wired into `attach` and the
+//!   backpressure `resync`.
+//! - [`output_split`] — rest-boundary framing of the live output stream, so a
+//!   frame edge (and the replay/live split a client resumes at) never lands mid
+//!   escape sequence or mid UTF-8.
 //! - [`daemon_watchdog`] — a background thread that restarts a crashed hub
 //!   daemon while this session's project is open (the service units are retired,
 //!   so sessions are the watchers).
-//!
-//! ## What this crate does *not* do
-//!
-//! Attach **replay** — reconstructing *full* emulator state (both buffers, saved
-//! cursors, modes, history) for a new client — is `rt-replay`. Until it lands,
-//! `attach` and the backpressure drop both recover a client with a full-screen
-//! text snapshot (the [`Resync`](shelbi_proto::Resync) stand-in), which is
-//! correct for a repaint but not a byte-exact state restore.
 
 pub mod daemon_watchdog;
 pub mod emulator;
@@ -49,6 +49,8 @@ pub mod history;
 pub mod layout;
 pub mod lock;
 pub mod meta;
+pub mod output_split;
+pub mod replay;
 pub mod responder;
 pub mod session;
 pub mod spawn;

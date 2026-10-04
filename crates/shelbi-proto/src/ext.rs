@@ -164,18 +164,26 @@ pub struct EventResized {
     pub rows: u16,
 }
 
-/// Backpressure recovery. When a client falls too far behind, the session drops
-/// its queued output and sends this: the full visible screen as text plus the
-/// sequence number live output resumes from. The client resets its emulator to
-/// `screen` and continues from `seq`. This is the pre-`rt-replay` stand-in for a
-/// full state replay — a clearly marked hook that `rt-replay` will upgrade to a
-/// complete emulator-state reconstruction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Attach replay / backpressure recovery. Sent on `attach` (the initial
+/// replay) and when a client falls too far behind (its queued output is dropped
+/// and it is refreshed). Carries a **regenerated escape-sequence byte stream**
+/// that reconstructs the session's full emulator state — both screen buffers,
+/// scrollback, saved cursors, scroll region, tab stops, charsets, every mode
+/// including the kitty keyboard-protocol stack — plus the sequence number live
+/// output resumes from. The client feeds `replay` into a fresh emulator and
+/// continues from `seq`; the stream is self-contained (it begins with a full
+/// reset), so a lagging client need not clear its emulator first.
+///
+/// Encoded as `[seq: u64 BE][replay bytes]` — **not** JSON — like
+/// [`Output`](crate::Output), so a large replay (scrollback can be many KB)
+/// does not pay JSON's byte-array blow-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resync {
     /// The sequence number the next live [`Output`](crate::Output) will carry.
     pub seq: u64,
-    /// The visible screen as text (`capture-pane -p -J` shape).
-    pub screen: String,
+    /// The regenerated escape-sequence byte stream reconstructing full emulator
+    /// state. Fed into a fresh emulator, it ends up identical to the session's.
+    pub replay: Vec<u8>,
 }
 
 /// A decoded additive-capability frame.
@@ -235,7 +243,13 @@ impl ExtFrame {
             ExtFrame::Resized(m) => serde_json::to_vec(m)?,
             ExtFrame::EventTitle(m) => serde_json::to_vec(m)?,
             ExtFrame::EventResized(m) => serde_json::to_vec(m)?,
-            ExtFrame::Resync(m) => serde_json::to_vec(m)?,
+            // Binary, not JSON: `[seq: u64 BE][replay bytes]` (see [`Resync`]).
+            ExtFrame::Resync(m) => {
+                let mut buf = Vec::with_capacity(8 + m.replay.len());
+                buf.extend_from_slice(&m.seq.to_be_bytes());
+                buf.extend_from_slice(&m.replay);
+                buf
+            }
             // Payload-less frames carry an empty JSON object so the body is never
             // zero-length (a zero body is rejected by the decoder).
             ExtFrame::Detach | ExtFrame::EventBell | ExtFrame::Ping | ExtFrame::Pong => {
@@ -292,7 +306,16 @@ impl ExtFrame {
             ExtType::EventTitle => ExtFrame::EventTitle(serde_json::from_slice(payload)?),
             ExtType::EventBell => ExtFrame::EventBell,
             ExtType::EventResized => ExtFrame::EventResized(serde_json::from_slice(payload)?),
-            ExtType::Resync => ExtFrame::Resync(serde_json::from_slice(payload)?),
+            ExtType::Resync => {
+                if payload.len() < 8 {
+                    return Err(ProtoError::MalformedPayload { kind: "resync" });
+                }
+                let seq = u64::from_be_bytes(payload[..8].try_into().unwrap());
+                ExtFrame::Resync(Resync {
+                    seq,
+                    replay: payload[8..].to_vec(),
+                })
+            }
             ExtType::Ping => ExtFrame::Ping,
             ExtType::Pong => ExtFrame::Pong,
         };
@@ -394,7 +417,12 @@ mod tests {
         roundtrip(ExtFrame::EventResized(EventResized { cols: 80, rows: 24 }));
         roundtrip(ExtFrame::Resync(Resync {
             seq: 7,
-            screen: "line".into(),
+            replay: b"\x1bc\x1b[0mhi".to_vec(),
+        }));
+        // An empty replay still round-trips (the seq prefix is always present).
+        roundtrip(ExtFrame::Resync(Resync {
+            seq: 0,
+            replay: Vec::new(),
         }));
         roundtrip(ExtFrame::Ping);
         roundtrip(ExtFrame::Pong);
@@ -439,7 +467,7 @@ mod tests {
     fn incomplete_is_reported_until_the_whole_frame_is_present() {
         let bytes = ExtFrame::Resync(Resync {
             seq: 1,
-            screen: "s".into(),
+            replay: b"state".to_vec(),
         })
         .encode()
         .unwrap();

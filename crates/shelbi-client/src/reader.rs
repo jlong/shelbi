@@ -56,13 +56,17 @@ pub enum SessionEvent {
         /// New height in rows.
         rows: u16,
     },
-    /// Backpressure recovery: the client fell behind and was dropped to a fresh
-    /// snapshot. Reset the emulator to `screen` and resume live output from `seq`.
+    /// Attach replay / backpressure recovery: feed `replay` into a fresh
+    /// emulator to reconstruct the session's full state, then resume live output
+    /// from `seq`. Sent on attach and when the client was dropped for falling
+    /// behind. The stream is self-contained (it begins with a full reset), so a
+    /// lagging client need not clear its emulator first.
     Resync {
         /// The sequence the next [`SessionEvent::Output`] will carry.
         seq: u64,
-        /// The visible screen as text.
-        screen: String,
+        /// The regenerated escape-sequence byte stream reconstructing full
+        /// emulator state.
+        replay: Vec<u8>,
     },
     /// Pushed event: the program set a new window title (empty = reset).
     Title(String),
@@ -168,7 +172,7 @@ fn route(
             if events
                 .send(SessionEvent::Resync {
                     seq: r.seq,
-                    screen: r.screen,
+                    replay: r.replay,
                 })
                 .is_err()
             {
