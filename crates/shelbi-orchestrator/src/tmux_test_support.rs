@@ -11,6 +11,17 @@
 //! our env — lands on a server socket no other process (or crate's test binary)
 //! can see.
 //!
+//! The `TMUX_TMPDIR` pin is NOT sufficient on its own. When the test process is
+//! itself running inside a tmux pane — exactly the case for a Shelbi worker
+//! running `cargo test` in its managed pane — tmux resolves its server socket
+//! from the inherited `$TMUX` and IGNORES `TMUX_TMPDIR` entirely. Every
+//! "isolated" spawn would then route straight back to the ambient server (the
+//! user's real Shelbi server), where `apply_palette_binding` rewrites the
+//! server-global `C-p` root binding to point at this test binary — the exact
+//! leak this harness exists to prevent. So [`use_private_tmux_server`] also
+//! clears `$TMUX`/`$TMUX_PANE`, forcing tmux back onto the private socket
+//! regardless of whether the suite runs inside a pane or on bare CI.
+//!
 //! Because that pin is process-global (a `TMUX_TMPDIR` `set_var`, inherited by
 //! every later `tmux` spawn in the process), it MUST hold for the whole binary:
 //! a test left on the default server while others pin the private one is still
@@ -37,7 +48,7 @@ use std::time::Duration;
 /// and every real-tmux test wants the same private server. Call it before the
 /// FIRST tmux interaction of a test (some assert Dead on a not-yet-created
 /// session, so even the opening probe must hit the private server, not the
-/// default one). Callers hold [`crate::test_lock`] so the one-time `set_var`
+/// default one). Callers hold [`crate::test_lock`] so the one-time env mutation
 /// can't race a concurrent env reader elsewhere in the suite.
 pub(crate) fn use_private_tmux_server() {
     use std::sync::Once;
@@ -46,6 +57,12 @@ pub(crate) fn use_private_tmux_server() {
         let dir = std::env::temp_dir().join(format!("shelbi-tmux-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("TMUX_TMPDIR", &dir);
+        // Drop any inherited pane context. tmux honors `TMUX_TMPDIR` only when
+        // `$TMUX` is unset; inside a pane it would otherwise resolve the socket
+        // from `$TMUX` and drive the ambient (user's real) server instead. See
+        // the module doc for why this is the load-bearing half of the pin.
+        std::env::remove_var("TMUX");
+        std::env::remove_var("TMUX_PANE");
     });
 }
 
