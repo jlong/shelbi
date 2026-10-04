@@ -11250,11 +11250,24 @@ printf '%s\n' installed-from-reviewed-lock > packages/app/node_modules/reviewed-
         let _home = ProbeHomeGuard::install();
         let (base, _origin, wt) = setup_origin_and_worktree();
         let install_started = base.path().join("npm-install-started");
+        let install_started_partial = base.path().join("npm-install-started.partial");
         let release_install = base.path().join("npm-install-release");
+        // The installer hands its workspace root to the mutator thread by
+        // writing `$PWD` to `install_started`. Write it to a sibling temp file
+        // first and rename it into place: `rename(2)` is atomic on one
+        // filesystem, so `install_started` only ever exists with its full
+        // contents. A bare `> install_started` truncates (creating an empty
+        // file) before `printf` runs, and the mutator — which fires the moment
+        // the path exists — could sample that empty window, read a blank root,
+        // and write its mutated lock to a relative path in its own CWD instead
+        // of into the probe worktree. The probe's reviewed lock would then be
+        // untouched, the post-install checkout verification would pass, and the
+        // probe would return `Ok` when the test demands it fail closed.
         let npm_script = format!(
             r#"#!/bin/sh
 if [ "$1" = --version ]; then printf '%s\n' 10.0.0; exit 0; fi
-printf '%s\n' "$PWD" > {install_started}
+printf '%s\n' "$PWD" > {install_started_partial}
+mv {install_started_partial} {install_started}
 i=0
 while [ ! -f {release_install} ] && [ "$i" -lt 500 ]; do
   sleep 0.01
@@ -11264,6 +11277,8 @@ test -f {release_install} || exit 71
 mkdir -p node_modules
 "#,
             install_started = shelbi_agent::shell_escape(&install_started.to_string_lossy()),
+            install_started_partial =
+                shelbi_agent::shell_escape(&install_started_partial.to_string_lossy()),
             release_install = shelbi_agent::shell_escape(&release_install.to_string_lossy()),
         );
         let _tools = LoginToolGuard::install("npm", &npm_script);
@@ -11315,8 +11330,18 @@ mkdir -p node_modules
             for _ in 0..500 {
                 if started_for_thread.exists() {
                     let package_root = std::fs::read_to_string(&started_for_thread).unwrap();
+                    let package_root = package_root.trim();
+                    // The atomic rename in the installer guarantees a complete
+                    // absolute root here; assert it rather than silently writing
+                    // the mutated lock to a relative path in our own CWD, which
+                    // would leave the probe's reviewed lock untouched and mask
+                    // the fail-closed behaviour this test exists to prove.
+                    assert!(
+                        std::path::Path::new(package_root).is_absolute(),
+                        "installer handed a non-absolute workspace root: {package_root:?}"
+                    );
                     std::fs::write(
-                        std::path::Path::new(package_root.trim()).join("package-lock.json"),
+                        std::path::Path::new(package_root).join("package-lock.json"),
                         "concurrently-mutated-lock\n",
                     )
                     .unwrap();
