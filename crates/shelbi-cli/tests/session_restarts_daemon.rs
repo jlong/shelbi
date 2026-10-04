@@ -91,6 +91,10 @@ impl Home {
             .env("SHELBI_HOME", &self.path)
             .env_remove("SHELBI_ROOT")
             .env_remove("SHELBI_HUB_SOCK")
+            // Belt-and-braces hermeticity: the watchdog-spawned daemon inherits
+            // this env, so it never touches the real user's supervisor unit (the
+            // default-root gate already skips it, since SHELBI_HOME is set).
+            .env("SHELBI_NO_RETIRE_UNITS", "1")
             // Resolve the daemon from the test binary, not this session image.
             .env("SHELBI_BIN", BIN)
             // Drive the watchdog loop fast so a restart lands in the test window.
@@ -299,6 +303,7 @@ fn several_sessions_converge_on_exactly_one_daemon() {
         .env("SHELBI_HOME", &home.path)
         .env_remove("SHELBI_ROOT")
         .env_remove("SHELBI_HUB_SOCK")
+        .env("SHELBI_NO_RETIRE_UNITS", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
