@@ -17,7 +17,9 @@
 //! shelbi-app's [`ClientState`]. This crate adds no model logic.
 
 mod caps;
+mod changes;
 mod overlays;
+mod refresh;
 mod session;
 mod sidebar;
 mod terminal_view;
@@ -27,7 +29,7 @@ mod pty_input_tests;
 
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::cursor::Show;
@@ -51,14 +53,17 @@ use ratatui::Terminal;
 use shelbi_app::command::CommandRegistry;
 use shelbi_app::exec::{Effect, Mutation};
 use shelbi_app::nav::{ClientState, Focus, View};
-use shelbi_app::refresh::{spawn_refresher, Snapshot};
 use shelbi_app::view::SidebarModel;
 use shelbi_app::CommandKind;
 use shelbi_state::keymap::{load_keymaps, GlobalAction, KeyChord, Keymaps};
 use shelbi_term::Size;
 
+use crate::activity::ActivityApp;
+use crate::kanban::{ExecutorMovePersister, KanbanApp};
+use crate::machines::MachinesApp;
 use caps::Caps;
 use overlays::{ActiveOverlay, OverlayEvent};
+use refresh::ShellSnapshot;
 use session::{LiveConnector, MainState, SessionManager, SessionRef};
 use sidebar::{RowTarget, SidebarView};
 
@@ -91,9 +96,13 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
     let mut state = ShellState::new(project, connector, caps);
 
     let proj = project.to_string();
-    let refresher = spawn_refresher(move |generation| read_snapshot(&proj, generation));
+    let refresher = refresh::spawn(move |generation| read_snapshot(&proj, generation));
     refresher.request();
     let mut last_refresh = Instant::now();
+
+    // Daemon change notifications drive refreshes (the native views don't poll);
+    // the periodic request below is the fallback for a hubless project.
+    let (_changes, change_rx) = changes::spawn(project);
 
     // Start on the orchestrator chat, focused.
     state.show(RowTarget::Session(SessionRef::Orchestrator));
@@ -120,13 +129,28 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             }
         }
 
-        // Background sources (all non-blocking).
-        if last_refresh.elapsed() >= REFRESH_INTERVAL {
+        // Background sources (all non-blocking). A daemon change notification
+        // triggers an immediate refresh; the periodic request is the fallback.
+        let mut changed = false;
+        while change_rx.try_recv().is_ok() {
+            changed = true;
+        }
+        if changed || last_refresh.elapsed() >= REFRESH_INTERVAL {
             refresher.request();
             last_refresh = Instant::now();
         }
         if let Some(snap) = refresher.latest() {
             state.apply_snapshot(snap);
+        }
+        // Advance the board's background card-move persistence (settle a landed
+        // hop, start the next queued one, or roll back on failure) so an optimistic
+        // move resolves within a tick without ever blocking the loop — the same
+        // call the standalone `__tasks` loop makes each tick. Keep redrawing while
+        // a move is in flight so the settle / rollback shows.
+        let had_moves = state.kanban.has_pending_moves();
+        state.kanban.poll_pending_moves();
+        if had_moves {
+            state.dirty = true;
         }
         let mut ring = false;
         if state.sessions.pump_output(&mut ring) {
@@ -157,6 +181,7 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
 }
 
 /// What the main area is currently showing.
+#[derive(Clone)]
 enum MainView {
     Session,
     Native(View),
@@ -168,6 +193,16 @@ struct ShellState {
     sessions: SessionManager,
     caps: Caps,
     sidebar_model: Option<SidebarModel>,
+    /// The embedded native views. They share their rendering (`render_full`) and
+    /// interaction with the standalone tmux-runtime processes; the shell drives
+    /// them from off-thread snapshots rather than their own refresh loop.
+    kanban: KanbanApp,
+    activity: ActivityApp,
+    machines: MachinesApp,
+    /// The user's keymaps (with this project's overrides), loaded once and
+    /// shared by the embedded native-view key handlers, the palette's bindings,
+    /// and resolving the palette-open chord.
+    keymaps: Keymaps,
     main_view: MainView,
     /// Rects from the last draw, for mouse hit-testing.
     sidebar_rect: Rect,
@@ -182,9 +217,6 @@ struct ShellState {
     /// The open in-process overlay (removing-tmux Phase 4d), if any. Only one is
     /// open at a time; while open it captures input and draws over the main area.
     overlay: Option<ActiveOverlay>,
-    /// The user's keymaps (with this project's overrides), for the palette's
-    /// bindings and resolving the palette-open chord.
-    keymaps: Keymaps,
     /// The configured palette-open chord (`GlobalAction::OpenPalette`). The
     /// palette also always opens on Ctrl+Space (the plan's reserved key), so the
     /// opener is the union of this chord and Ctrl+Space.
@@ -212,18 +244,29 @@ impl ShellState {
             text,
             until: Instant::now() + Duration::from_secs(NOTICE_SECS),
         });
-        // Load the keymaps once (the palette's bindings and the opener chord come
-        // from here); a load failure degrades to the embedded defaults.
+        // Load the keymaps once: the palette's bindings and opener chord come
+        // from here, and the embedded native-view handlers share them. A load
+        // failure degrades to the embedded defaults; the sidebar surfaces the
+        // diagnostic count.
         let (keymaps, _diags) = load_keymaps(Some(project));
         let palette_chord = keymaps
             .global
             .first_chord_for(GlobalAction::OpenPalette)
             .copied();
+        let mut kanban = KanbanApp::new(project);
+        kanban.keymaps = keymaps.clone();
+        // Board moves go through the shelbi-app executor (daemon-backed when
+        // `dev.daemon_mutations` is on); the standalone process keeps its direct path.
+        kanban.move_persister = Some(Arc::new(ExecutorMovePersister));
         Self {
             client: ClientState::new(project),
             sessions: SessionManager::new(project, connector),
             caps,
             sidebar_model: None,
+            kanban,
+            activity: ActivityApp::new(project),
+            machines: MachinesApp::new(project),
+            keymaps,
             main_view: MainView::Session,
             sidebar_rect: Rect::default(),
             main_rect: Rect::default(),
@@ -231,7 +274,6 @@ impl ShellState {
             search_input: None,
             notice,
             overlay: None,
-            keymaps,
             palette_chord,
             status: None,
             job: None,
@@ -255,7 +297,7 @@ impl ShellState {
         }
     }
 
-    fn apply_snapshot(&mut self, snap: Snapshot) {
+    fn apply_snapshot(&mut self, snap: ShellSnapshot) {
         if let Some(sidebar) = snap.sidebar {
             // Keep the selection in range as rows come and go.
             let view = SidebarView::build(&sidebar);
@@ -270,6 +312,21 @@ impl ShellState {
                     ov.refresh_palette(entries);
                 }
             }
+            self.dirty = true;
+        }
+        // Fold the off-thread reads into the embedded native views (cheap, never
+        // blocks). The apps keep their own interaction state (selection, scroll,
+        // dropdowns, in-flight optimistic moves); this only swaps the data.
+        if let Some(board) = snap.board {
+            self.kanban.apply_board_data(board);
+            self.dirty = true;
+        }
+        if let Some(activity) = snap.activity {
+            self.activity.apply_activity_data(activity);
+            self.dirty = true;
+        }
+        if let Some(machines) = snap.machines {
+            self.machines.apply_data(machines);
             self.dirty = true;
         }
     }
@@ -298,19 +355,31 @@ impl ShellState {
     }
 
     /// Open a sidebar target: a session shows in the main area and takes focus;
-    /// a native/review placeholder just swaps the main area.
+    /// a native view just swaps the main area (focus stays on the sidebar until
+    /// the user steps in with Ctrl+Space). The chosen view is recorded in the
+    /// client state so it becomes this project's remembered view — what a later
+    /// project switch restores.
     fn show(&mut self, target: RowTarget) {
         match target {
             RowTarget::Session(r) => {
                 self.main_view = MainView::Session;
                 self.reported_main = None; // force a resize report for the new session
+                // Record the view (orchestrator chat or a workspace session).
+                let view = match &r {
+                    SessionRef::Orchestrator => View::Session("orch".into()),
+                    SessionRef::Workspace(w) => View::Session(w.clone()),
+                };
+                self.client.set_view(view);
                 self.sessions.show(r);
                 self.client.focus_main();
             }
             RowTarget::Native(v) => {
+                self.client.set_view(v.clone());
                 self.main_view = MainView::Native(v);
             }
             RowTarget::Review(id) => {
+                // Review has no `View` variant (it is a transient interface, not a
+                // remembered main view), so it is not recorded.
                 self.main_view = MainView::Review(id);
             }
         }
@@ -624,6 +693,29 @@ impl ShellState {
     }
 
     fn handle_main_key(&mut self, k: KeyEvent) {
+        // A native view handles its own keys (board nav / moves / popover /
+        // dropdowns, activity scroll / filters, machines nav / open). The session
+        // path below is only for a terminal view. (The palette-open chord is
+        // handled upstream in `handle_key`, before we get here.)
+        match &self.main_view {
+            MainView::Native(View::Issues) => {
+                self.handle_issues_key(k);
+                self.dirty = true;
+                return;
+            }
+            MainView::Native(View::Activity) => {
+                self.handle_activity_key(k);
+                self.dirty = true;
+                return;
+            }
+            MainView::Native(View::Machines) => {
+                self.handle_machines_key(k);
+                self.dirty = true;
+                return;
+            }
+            _ => {}
+        }
+
         // A scrollback search prompt captures typing.
         if let Some(mut buf) = self.search_input.take() {
             match k.code {
@@ -704,6 +796,49 @@ impl ShellState {
         true
     }
 
+    // --- native view key routing -------------------------------------------
+
+    /// Route a key to the embedded issues board (same handler the standalone
+    /// `__tasks` process uses, so columns/keys/card actions are identical). The
+    /// board's own quit/palette chords are neutralized: the shell owns quit, and
+    /// Ctrl+Space is the way back to the sidebar.
+    fn handle_issues_key(&mut self, k: KeyEvent) {
+        use crate::handlers::kanban::Outcome;
+        match crate::handlers::kanban::handle_kanban_key(&mut self.kanban, k, &self.keymaps) {
+            // In one process there's no board process to quit, and the palette is
+            // a later phase; both are no-ops here.
+            Outcome::Quit | Outcome::OpenPalette | Outcome::Continue => {}
+        }
+    }
+
+    /// Route a key to the embedded activity feed. Quit is neutralized (the shell
+    /// owns quit); the feed's scroll/filter/zen chords work as in the standalone.
+    fn handle_activity_key(&mut self, k: KeyEvent) {
+        crate::handlers::activity::handle_activity_key(&mut self.activity, k, &self.keymaps);
+        self.activity.should_quit = false;
+    }
+
+    /// Route a key to the embedded machines view. Unlike the standalone process
+    /// (which focuses the workspace in a tmux pane), Enter here opens the
+    /// workspace's session in the terminal view.
+    fn handle_machines_key(&mut self, k: KeyEvent) {
+        // Global quit/palette chords are swallowed (the shell owns them).
+        let chord = crate::keymap::chord_from_event(k);
+        if chord.and_then(|c| self.keymaps.global.dispatch(c)).is_some() {
+            return;
+        }
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') => self.machines.nav_up(),
+            KeyCode::Down | KeyCode::Char('j') => self.machines.nav_down(),
+            KeyCode::Enter => {
+                if let Some(ws) = self.machines.selected_workspace().map(str::to_string) {
+                    self.show(RowTarget::Session(SessionRef::Workspace(ws)));
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
         if contains(self.sidebar_rect, m.column, m.row) {
             self.handle_sidebar_mouse(m);
@@ -759,6 +894,34 @@ impl ShellState {
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.client.focus_main();
         }
+
+        // Native views handle their own mouse. The board's hit maps and the
+        // feed's pill hits are recorded in `render_full` against `main_rect`
+        // (absolute terminal coordinates), so the standalone handlers' absolute
+        // coordinate math applies unchanged.
+        match &self.main_view {
+            MainView::Native(View::Issues) => {
+                crate::handlers::kanban::handle_kanban_mouse(&mut self.kanban, m);
+                self.dirty = true;
+                return;
+            }
+            MainView::Native(View::Activity) => {
+                crate::handlers::activity::handle_activity_mouse(&mut self.activity, m);
+                self.dirty = true;
+                return;
+            }
+            MainView::Native(View::Machines) => {
+                match m.kind {
+                    MouseEventKind::ScrollUp => self.machines.nav_up(),
+                    MouseEventKind::ScrollDown => self.machines.nav_down(),
+                    _ => {}
+                }
+                self.dirty = true;
+                return;
+            }
+            _ => {}
+        }
+
         let origin_col = self.main_rect.x;
         let origin_row = self.main_rect.y;
         let (pane_col, pane_row) = (
@@ -853,13 +1016,32 @@ fn draw(
     // back right after the draw.
     let mut overlay = state.overlay.take();
 
-    // Borrow what the closure needs.
+    // Borrow what the closure needs. `sidebar_view` is owned and `main_view` is
+    // cloned (cheap) so the closure can disjointly borrow the embedded views
+    // mutably — a native view's `render_full` takes `&mut app` and `&mut Frame`.
     let sidebar_view = state.sidebar_view();
-    let main_view = &state.main_view;
+    let main_view = state.main_view.clone();
+    let kanban = &mut state.kanban;
+    let activity = &mut state.activity;
+    let machines = &mut state.machines;
+    let sessions = &state.sessions;
 
     let mut cursor: Option<(u16, u16)> = None;
     let begin = execute!(io::stdout(), BeginSynchronizedUpdate);
     let res = term.draw(|frame| {
+        // A native view renders through the `Frame` (its own `render_full`), so it
+        // must run before we take the shared buffer below.
+        match &main_view {
+            MainView::Native(View::Issues) => crate::kanban::render_full(frame, kanban, main_rect),
+            MainView::Native(View::Activity) => {
+                crate::activity::render_full(frame, activity, main_rect)
+            }
+            MainView::Native(View::Machines) => {
+                crate::machines::render_full(frame, machines, main_rect)
+            }
+            _ => {}
+        }
+
         let buf = frame.buffer_mut();
 
         // Sidebar.
@@ -867,9 +1049,9 @@ fn draw(
             view.render(buf, sidebar_rect, selection, !focus_main);
         }
 
-        // Main area.
-        match main_view {
-            MainView::Session => match state.sessions.state() {
+        // Main area (session / review; native views were drawn above).
+        match &main_view {
+            MainView::Session => match sessions.state() {
                 MainState::Empty => render_placeholder(buf, main_rect, "No session"),
                 MainState::Connecting(r) => {
                     render_placeholder(buf, main_rect, &format!("Connecting to {}…", r.display()))
@@ -886,9 +1068,7 @@ fn draw(
                     }
                 }
             },
-            MainView::Native(v) => {
-                render_placeholder(buf, main_rect, &native_placeholder(v))
-            }
+            MainView::Native(_) => {} // drawn above
             MainView::Review(id) => render_placeholder(
                 buf,
                 main_rect,
@@ -896,7 +1076,7 @@ fn draw(
             ),
         }
 
-        // Scrollback search prompt (bottom of the main area).
+        // Scrollback search prompt (bottom of the main area; session view only).
         if let Some(q) = &searching {
             render_search_prompt(buf, main_rect, q);
         } else if let Some(s) = &status {
@@ -971,16 +1151,6 @@ fn layout(area: Rect, sidebar_width: u16) -> (Rect, Rect) {
     (sidebar, main)
 }
 
-fn native_placeholder(v: &View) -> String {
-    let name = match v {
-        View::Issues => "Issues",
-        View::Activity => "Activity",
-        View::Machines => "Machines",
-        View::Session(_) => "Session",
-    };
-    format!("{name} view — native views land in rt-tui-native-views")
-}
-
 fn render_placeholder(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1033,15 +1203,19 @@ fn render_notice(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
 
 // --- the background model reader -------------------------------------------
 
-/// Read a fresh snapshot of the view models for `project`. Runs on the
-/// refresher thread; reads state only (the daemon poller keeps the board
-/// index current in session-backend mode).
-fn read_snapshot(project: &str, generation: u64) -> Snapshot {
-    Snapshot {
-        generation,
-        taken_at: Some(SystemTime::now()),
+/// Read a fresh snapshot of every view's data for `project`. Runs on the
+/// refresher thread (never the UI thread): the sidebar model plus the opaque
+/// data bundles the embedded native views fold in. The board read goes through
+/// the daemon-owned index (no per-pane `gh` sweep); the activity read is served
+/// from the store's TTL cache; machines reads the poller's persisted state. A
+/// slow read here never blocks the event loop — the loop only polls
+/// [`ShellRefresher::latest`].
+fn read_snapshot(project: &str, _generation: u64) -> ShellSnapshot {
+    ShellSnapshot {
         sidebar: read_sidebar_model(project),
-        ..Default::default()
+        board: Some(KanbanApp::read_board_data(project)),
+        activity: Some(ActivityApp::read_activity_data(project)),
+        machines: Some(MachinesApp::read_data(project)),
     }
 }
 
@@ -1176,8 +1350,7 @@ mod tests {
             nested: None,
         };
         let mut st = ShellState::new("proj", Arc::new(NoopConnector), caps);
-        st.apply_snapshot(Snapshot {
-            generation: 1,
+        st.apply_snapshot(ShellSnapshot {
             sidebar: Some(SidebarModel {
                 project_label: "proj".into(),
                 nav: vec![
@@ -1203,7 +1376,9 @@ mod tests {
                 zen_on: false,
                 unread_errors: 0,
             }),
-            ..Default::default()
+            board: None,
+            activity: None,
+            machines: None,
         });
         st
     }
@@ -1279,6 +1454,144 @@ mod tests {
         st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(st.main_view, MainView::Native(View::Activity)));
         assert_eq!(st.client.focus(), Focus::Sidebar);
+    }
+
+    /// A sidebar with every native-view nav entry (Chat/Issues/Activity/Machines),
+    /// one workspace, and no reviews.
+    fn state_with_machines_nav() -> ShellState {
+        let caps = Caps { kitty: true, truecolor: true, nested: None };
+        let mut st = ShellState::new("proj", Arc::new(NoopConnector), caps);
+        st.apply_snapshot(ShellSnapshot {
+            sidebar: Some(SidebarModel {
+                project_label: "proj".into(),
+                nav: vec![
+                    NavItem { label: "Chat".into(), view: View::Session("orch".into()) },
+                    NavItem { label: "Issues".into(), view: View::Issues },
+                    NavItem { label: "Activity".into(), view: View::Activity },
+                    NavItem { label: "Machines".into(), view: View::Machines },
+                ],
+                workspaces: vec![WorkspaceRow { name: "alpha".into(), current_task: None, agent: None }],
+                reviews: vec![],
+                zen_on: false,
+                unread_errors: 0,
+            }),
+            board: None,
+            activity: None,
+            machines: None,
+        });
+        st
+    }
+
+    #[test]
+    fn issues_activity_and_machines_open_in_the_main_area_from_the_sidebar() {
+        let mut st = state_with_machines_nav();
+        st.client.focus_sidebar();
+        // Rows: 0 Chat, 1 Issues, 2 Activity, 3 Machines, 4 alpha.
+        st.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // Issues
+        st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(st.main_view, MainView::Native(View::Issues)));
+        assert_eq!(st.client.view(), &View::Issues, "the view is recorded for the project");
+
+        st.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // Activity
+        st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(st.main_view, MainView::Native(View::Activity)));
+
+        st.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // Machines
+        st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(st.main_view, MainView::Native(View::Machines)));
+        assert_eq!(st.client.view(), &View::Machines);
+    }
+
+    #[test]
+    fn the_embedded_board_routes_moves_through_the_executor() {
+        // The shell installs the executor-routing move persister so board moves go
+        // through the shelbi-app executor (daemon-backed when the setting is on);
+        // the standalone process keeps its default direct path (move_persister None).
+        let st = state_with_machines_nav();
+        assert!(
+            st.kanban.move_persister.is_some(),
+            "the shell's board moves route through the executor"
+        );
+        assert!(
+            KanbanApp::new("proj").move_persister.is_none(),
+            "the standalone board keeps its direct library path"
+        );
+    }
+
+    #[test]
+    fn the_last_view_is_restored_when_switching_back_to_a_project() {
+        let mut st = state_with_machines_nav();
+        // Open Activity on this project; it is recorded as the project's view.
+        st.show(RowTarget::Native(View::Activity));
+        assert_eq!(st.client.view(), &View::Activity);
+        // Switch away to another project (lands on that project's default view)…
+        st.client.switch_project("other");
+        assert_eq!(st.client.view(), &View::default_for_project());
+        // …and back: the Activity view is restored.
+        st.client.switch_project("proj");
+        assert_eq!(st.client.view(), &View::Activity);
+    }
+
+    #[test]
+    fn machines_enter_opens_the_selected_workspace_session() {
+        use crate::machines::{MachineEntry, MachinesData, WorkspaceRow as MachineWsRow};
+        use shelbi_core::MachineKind;
+
+        let mut st = state_with_machines_nav();
+        // Feed the machines view one machine with one workspace.
+        st.machines.apply_data(MachinesData {
+            display_name: Some("proj".into()),
+            machines: vec![MachineEntry {
+                name: "local".into(),
+                kind: MachineKind::Local,
+                host: None,
+                is_local: true,
+                tags: vec![],
+                remote: None,
+                workspaces: vec![MachineWsRow { name: "alpha".into(), state: None, current_task: None }],
+            }],
+        });
+        st.main_view = MainView::Native(View::Machines);
+        st.client.focus_main();
+        // Enter on the selected workspace opens its session in the terminal view.
+        st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(st.main_view, MainView::Session));
+        assert_eq!(
+            st.sessions.current_target(),
+            Some(&SessionRef::Workspace("alpha".into()))
+        );
+    }
+
+    #[test]
+    fn a_key_in_the_issues_view_routes_to_the_board_not_the_session() {
+        // With the board focused in the main area, a board affordance (`f` opens
+        // the workspace filter dropdown) must reach the embedded KanbanApp rather
+        // than being sent to a session. `f` is routed directly by the kanban
+        // handler (not a keymap binding), so this is independent of `keys.yaml`;
+        // the lock+temp-home keep construction deterministic anyway.
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-shell-issues-route-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let caps = Caps { kitty: true, truecolor: true, nested: None };
+        let mut st = ShellState::new("proj", Arc::new(NoopConnector), caps);
+        st.main_view = MainView::Native(View::Issues);
+        st.client.focus_main();
+        assert!(!st.kanban.workspace_dropdown_is_open());
+        st.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert!(
+            st.kanban.workspace_dropdown_is_open(),
+            "the key reached the board handler"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

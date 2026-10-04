@@ -342,6 +342,11 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__activity")]
     Activity { project: String },
+    /// (internal) Run the machines ratatui view inside the hidden stash
+    /// pane. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__machines")]
+    Machines { project: String },
     /// (internal) Run the review-panel ratatui view inside the review
     /// interface's third pane. Not for direct use.
     #[command(hide = true)]
@@ -596,6 +601,7 @@ fn main() -> Result<()> {
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
         Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),
         Some(Cmd::Activity { project }) => shelbi_tui::run_activity(&project).context("activity"),
+        Some(Cmd::Machines { project }) => shelbi_tui::run_machines(&project).context("machines"),
         Some(Cmd::ReviewPanel { project, task }) => {
             shelbi_tui::run_review_panel(&project, &task).context("review-panel")
         }
@@ -819,6 +825,7 @@ fn init_tracing(cmd: Option<&Cmd>) {
         Some(Cmd::Sidebar { .. })
             | Some(Cmd::Tasks { .. })
             | Some(Cmd::Activity { .. })
+            | Some(Cmd::Machines { .. })
             | Some(Cmd::ReviewPanel { .. })
             | Some(Cmd::CodexOrchestrator { .. })
     );

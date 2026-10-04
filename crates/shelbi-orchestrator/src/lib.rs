@@ -2002,19 +2002,15 @@ fn activity_cmd(shelbi_bin: &str, project_name: &str) -> String {
     )
 }
 
-// Live workspace/machine table — `shelbi workspace list` probes each workspace's
-// tmux pane and prints the assigned task (if any), so remote workspaces
-// show up alongside local ones with the same shape. Refresh every 5s;
-// the SSH probe per remote workspace keeps this cheap-but-not-free, hence
-// the slower cadence than the kanban view.
+// Machines is a real ratatui app (`shelbi __machines <p>`), replacing the old
+// `while true; shelbi workspace list; sleep 5` text loop. It renders the same
+// view (`shelbi_tui::machines`) the single-process TUI shell shows in-process,
+// reading the hub poller's persisted workspace state (no per-tick SSH probe on
+// the render path). Wrapped in the same `while true` respawn loop as
+// tasks/activity so a crash respawns rather than leaving the stash pane empty.
 fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
-    // The label must be shell-escaped like every other value: a raw
-    // project name interpolated into the single-quoted `echo` broke the
-    // render loop on a name containing `'` and let `x'; rm -rf ~; echo '`
-    // execute. Pass the escaped name as a separate `echo` argument so it's
-    // printed literally, never re-parsed by the shell.
     format!(
-        "while true; do printf '\\033c'; echo 'workspaces ·' {proj}; echo; {bin} --project {proj} workspace list 2>&1; sleep 5; done",
+        "while true; do {bin} __machines {proj}; sleep 1; done",
         bin = shelbi_agent::shell_escape(shelbi_bin),
         proj = shelbi_agent::shell_escape(project_name),
     )
@@ -2055,7 +2051,7 @@ pub fn workspace_pane_cmd(
 ///
 /// - `shelbi-<project>:dashboard.{left}` → `shelbi __sidebar <project>`
 /// - stash `tasks` pane → tasks-view loop
-/// - stash `machines` pane → `shelbi workspace list` loop
+/// - stash `machines` pane → machines-view loop (`shelbi __machines`)
 /// - stash `activity` pane → activity-view loop
 /// - orchestrator pane (`dashboard.{right}`) → its launch wrapper
 ///
@@ -2728,21 +2724,22 @@ mod pane_cmd_tests {
     }
 
     #[test]
-    fn machines_cmd_calls_workspace_list_on_a_loop() {
+    fn machines_cmd_runs_the_machines_view_on_a_respawn_loop() {
         let out = machines_cmd("/usr/local/bin/shelbi", "myapp");
-        // sanity check: clears the screen each tick, runs `workspace list`,
-        // and threads --project through so the inner subcommand picks the
-        // right project even though it's invoked through `sh -c`.
-        assert!(out.contains("printf '\\033c'"));
-        assert!(out.contains("/usr/local/bin/shelbi --project myapp workspace list"));
-        assert!(out.contains("sleep 5"));
+        // The machines pane is now a real ratatui view (`__machines`), respawned
+        // on a `while true` loop like tasks/activity so a crash never leaves the
+        // stash pane empty. The old `workspace list` text loop is gone.
+        assert!(out.contains("while true; do"));
+        assert!(out.contains("/usr/local/bin/shelbi __machines myapp"));
+        assert!(out.contains("sleep 1"));
+        assert!(!out.contains("workspace list"), "the text loop was replaced");
     }
 
     #[test]
     fn machines_cmd_neutralizes_a_quote_injection_in_the_project_name() {
-        // A hostile/typo'd project name must not break out of the label or
-        // inject a command. shell_escape wraps the single quote as
-        // `'\''`, so the payload is printed literally, never executed.
+        // A hostile/typo'd project name must not inject a command: shell_escape
+        // wraps the single quote as `'\''`, so the payload is passed as a literal
+        // argument, never executed.
         let out = machines_cmd("/usr/local/bin/shelbi", "x'; rm -rf ~; echo '");
         // The payload survives only inside the escaped single-quoted form —
         // there is no unquoted `; rm -rf` that a shell would execute.

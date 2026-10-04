@@ -115,6 +115,10 @@ impl SidebarModel {
                     label: "Activity".into(),
                     view: View::Activity,
                 },
+                NavItem {
+                    label: "Machines".into(),
+                    view: View::Machines,
+                },
             ],
             workspaces,
             reviews,
@@ -471,8 +475,9 @@ mod tests {
         assert_eq!(model.project_label, "Alpha");
         assert!(model.zen_on);
         assert_eq!(model.unread_errors, 4);
-        assert_eq!(model.nav.len(), 3);
+        assert_eq!(model.nav.len(), 4);
         assert_eq!(model.nav[1].view, View::Issues);
+        assert_eq!(model.nav[3].view, View::Machines);
 
         // One review task.
         assert_eq!(model.reviews.len(), 1);

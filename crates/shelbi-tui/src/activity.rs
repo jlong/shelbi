@@ -285,6 +285,78 @@ struct TaskCacheEntry {
 /// that a remote title / branch / assignment edit shows up promptly.
 const REMOTE_META_TTL: Duration = Duration::from_secs(15);
 
+/// Everything one activity refresh reads. Produced by
+/// [`ActivityApp::read_activity_data`] (off the UI thread in the shell) and
+/// folded in by [`ActivityApp::apply_activity_data`].
+pub(crate) struct ActivityData {
+    events: Vec<Event>,
+    task_cache: HashMap<String, TaskCacheEntry>,
+    /// A read error message for the status line, if the read failed.
+    status: Option<String>,
+}
+
+/// Resolve task metadata for every id referenced by `events`, building a fresh
+/// cache (resolved entries + negatively-cached misses). The free-function form of
+/// [`ActivityApp::resolve_task_meta`] used by the off-thread
+/// [`ActivityApp::read_activity_data`] path: it takes no `&self`, so it is safe on
+/// a background worker. Since it builds the cache from scratch it fetches every
+/// referenced id (the store's own TTL cache keeps that cheap).
+fn resolve_task_meta_for(project_name: &str, events: &[Event]) -> HashMap<String, TaskCacheEntry> {
+    use std::collections::HashSet;
+    let mut cache: HashMap<String, TaskCacheEntry> = HashMap::new();
+    let mut wanted: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for ev in events {
+        if let Some(id) = event_task_id(ev) {
+            if seen.insert(id) {
+                wanted.push(id.to_string());
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return cache;
+    }
+    let store = match shelbi_state::issue_store_for(project_name) {
+        Ok(s) => s,
+        Err(_) => return cache,
+    };
+    let refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
+    let fetched = store.fetch_many(&refs).unwrap_or_default();
+    let now = Instant::now();
+    let mut resolved: HashSet<String> = HashSet::new();
+    for tf in fetched {
+        let id = tf.task.id.clone();
+        let mtime = task_file_mtime(project_name, &id);
+        resolved.insert(id.clone());
+        cache.insert(
+            id,
+            TaskCacheEntry {
+                meta: Some(TaskMeta {
+                    title: tf.task.title,
+                    branch: tf.task.branch,
+                    assigned_to: tf.task.assigned_to,
+                }),
+                mtime,
+                fetched: now,
+            },
+        );
+    }
+    // Negative-cache the misses so an unresolvable id isn't re-searched.
+    for id in wanted {
+        if !resolved.contains(&id) {
+            cache.insert(
+                id,
+                TaskCacheEntry {
+                    meta: None,
+                    mtime: None,
+                    fetched: now,
+                },
+            );
+        }
+    }
+    cache
+}
+
 /// Active filter pills above the feed. Both flags off means "All" — the
 /// pill row's `All` chip lights up and every event is rendered. Toggling
 /// `zen` or `workspaces` switches to a multi-select union: any event that
@@ -598,6 +670,71 @@ impl ActivityApp {
         if self.last_refresh.elapsed() >= Duration::from_millis(500) {
             self.refresh();
         }
+    }
+
+    /// Read the activity feed off the UI thread — the IO half of a refresh for
+    /// the single-process TUI shell, which cannot afford a blocking disk / `gh`
+    /// read on its event loop. Unlike [`refresh`](Self::refresh) (the standalone
+    /// process's incremental, tail-reading path) this does a full re-read of
+    /// `events.log` and resolves task metadata for every referenced id into a
+    /// fresh cache, so it is self-contained — it takes only the project name and
+    /// is safe to run on a background worker. The result is folded in by
+    /// [`apply_activity_data`](Self::apply_activity_data).
+    ///
+    /// A full re-read is cheap (the log is small) and `fetch_many` is served from
+    /// the store's own TTL cache, so repeated reads do not spam the tracker.
+    pub(crate) fn read_activity_data(project_name: &str) -> ActivityData {
+        let path = match events_log_path() {
+            Ok(p) => p,
+            Err(e) => {
+                return ActivityData {
+                    events: Vec::new(),
+                    task_cache: HashMap::new(),
+                    status: Some(format!("events.log path failed: {e}")),
+                }
+            }
+        };
+        // Missing log file → empty feed, no error (matches `refresh`).
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return ActivityData {
+                    events: Vec::new(),
+                    task_cache: HashMap::new(),
+                    status: Some(format!("read events.log: {e}")),
+                }
+            }
+        };
+        let events: Vec<Event> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(parse_event_line)
+            .collect();
+        let task_cache = resolve_task_meta_for(project_name, &events);
+        ActivityData {
+            events,
+            task_cache,
+            status: None,
+        }
+    }
+
+    /// Fold a freshly-read [`ActivityData`] in — the in-memory half of a refresh.
+    /// Replaces the event list and task-meta cache; scroll / auto-scroll / filter
+    /// state live on the app and are untouched, so the feed stays where the user
+    /// left it. The incremental `log_offset` / `log_mtime` are reset so a later
+    /// call to [`refresh`](Self::refresh) (if any) re-reads cleanly.
+    pub(crate) fn apply_activity_data(&mut self, data: ActivityData) {
+        if let Some(msg) = data.status {
+            self.fail_status(msg);
+        }
+        self.events = data.events;
+        self.task_cache = data.task_cache;
+        // A full re-read superseded the incremental offset; forget it so a mixed
+        // caller (shell apply then a standalone-style refresh) doesn't skip lines.
+        self.log_offset = 0;
+        self.log_mtime = None;
+        self.last_refresh = Instant::now();
     }
 
     pub fn scroll_up(&mut self) {
