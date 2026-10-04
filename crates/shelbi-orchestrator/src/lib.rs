@@ -816,6 +816,23 @@ fn apply_palette_binding(
     project_name: &str,
     shelbi_bin: &str,
 ) -> Result<String> {
+    // Defense in depth against a server-global leak. The root-table binding we
+    // install is shared by every session on the tmux server, so binding it to
+    // anything but the real `shelbi` executable poisons the user's palette for
+    // all sessions. The leak we actually hit: a tmux-backed test whose
+    // `current_exe()` is the test harness (e.g. a path under
+    // `target/debug/deps/shelbi_orchestrator-<hash>`) reaching this path and
+    // pointing `C-p` at that throwaway binary. Test isolation (a private tmux
+    // server) is the primary guard; this refuses to install the binding at all
+    // when `shelbi_bin` isn't the `shelbi` binary, so even an un-isolated or
+    // mis-pointed caller can never rewrite the chord to a non-`shelbi` target.
+    if !is_shelbi_executable(shelbi_bin) {
+        eprintln!(
+            "warning: refusing to bind the palette chord to a non-shelbi executable `{shelbi_bin}`"
+        );
+        return Ok(String::new());
+    }
+
     let (keymaps, _diags) = load_keymaps(Some(project_name));
     let chord = keymaps
         .global
@@ -1385,6 +1402,21 @@ fn current_exe_string() -> Result<String> {
         .map_err(Error::Io)?
         .to_string_lossy()
         .into_owned())
+}
+
+/// Whether `bin` names the real `shelbi` executable rather than something like
+/// a test harness. The production binary is always installed as `shelbi`
+/// (`crates/shelbi-cli/Cargo.toml` `[[bin]] name = "shelbi"`), whether it lives
+/// at `/usr/local/bin/shelbi`, `target/{debug,release}/shelbi`, or a user path;
+/// a cargo test harness is instead named `<crate>-<hash>` (e.g.
+/// `shelbi_orchestrator-43961ecc2d8269ca`) and lives under `target/*/deps/`. We
+/// gate the server-global palette binding on an exact file-name match so only
+/// the real binary can ever be wired to the chord.
+fn is_shelbi_executable(bin: &str) -> bool {
+    std::path::Path::new(bin)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "shelbi" || name == "shelbi.exe")
 }
 
 // The sidebar is a real ratatui app (`shelbi __sidebar <p>`) and, until this
@@ -4436,6 +4468,114 @@ mod reload_target_tmux_tests {
             window_id_of(&sidebar),
             dashboard_win,
             "sidebar never left the dashboard window"
+        );
+    }
+
+    /// The server-global palette binding must only ever name the real `shelbi`
+    /// binary — never a cargo test harness. The predicate is pure, so pin its
+    /// exact file-name contract here without touching tmux.
+    #[test]
+    fn palette_guard_accepts_only_the_real_shelbi_binary() {
+        for ok in [
+            "shelbi",
+            "shelbi.exe",
+            "/usr/local/bin/shelbi",
+            "/Users/j/Workspaces/shelbi/target/debug/shelbi",
+            "/Users/j/Workspaces/shelbi/target/release/shelbi",
+        ] {
+            assert!(is_shelbi_executable(ok), "should accept `{ok}`");
+        }
+        for bad in [
+            "",
+            // The exact leak from the field: an orchestrator test harness.
+            "/Users/jlong/Workspaces/shelbi/.shelbi/wt/hotel/target/debug/deps/shelbi_orchestrator-43961ecc2d8269ca",
+            "/w/target/debug/deps/shelbi-43961ecc2d8269ca",
+            "/w/target/debug/deps/shelbi_cli-deadbeef",
+            "/some/other/tool",
+        ] {
+            assert!(!is_shelbi_executable(bad), "should reject `{bad}`");
+        }
+    }
+
+    /// End-to-end guard on an isolated server: `apply_palette_binding` installs
+    /// the root `C-p` binding when handed the real `shelbi` binary, but refuses
+    /// (binds nothing) when handed a test-harness path. Defense in depth behind
+    /// the private-server isolation so a stray caller still can't poison the
+    /// server-global chord with a throwaway binary.
+    #[test]
+    fn apply_palette_binding_skips_non_shelbi_executables() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::install(temp.path());
+
+        crate::tmux_test_support::use_private_tmux_server();
+        let project_name = format!("palette-guard-{}", std::process::id());
+        let hub_work_dir = temp.path().join("repo");
+        std::fs::create_dir_all(&hub_work_dir).unwrap();
+        shelbi_state::save_project(&non_codex_project(&project_name, &hub_work_dir)).unwrap();
+
+        // A long-lived holder keeps the private server alive for the whole test,
+        // and the guard restores whatever root C-p binding was there before.
+        let holder = format!("shelbi-palette-guard-holder-{}", std::process::id());
+        kill_session(&holder);
+        let _sessions = SessionGuard::new(&[&holder]);
+        let _tmux_globals = TmuxGlobalsGuard::capture();
+        start_session(&holder, "w");
+
+        let root_cp_binding = || -> Option<String> {
+            let out = std::process::Command::new("tmux")
+                .args(["list-keys", "-T", "root"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "tmux list-keys -T root failed");
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find(|line| {
+                    line.split_whitespace()
+                        .collect::<Vec<_>>()
+                        .windows(3)
+                        .any(|w| w == ["-T", "root", "C-p"])
+                })
+                .map(str::to_string)
+        };
+
+        // Start from a known-clean chord so the assertions below read only this
+        // test's effect, not a sibling test's leftover binding.
+        let _ = std::process::Command::new("tmux")
+            .args(["unbind-key", "-n", "C-p"])
+            .status();
+        assert!(root_cp_binding().is_none(), "precondition: C-p is unbound");
+
+        // A test-harness path is refused: empty key back, nothing bound.
+        let harness = format!(
+            "{}/target/debug/deps/shelbi_orchestrator-43961ecc2d8269ca",
+            hub_work_dir.display()
+        );
+        assert_eq!(
+            apply_palette_binding(&Host::Local, &project_name, &harness).unwrap(),
+            String::new(),
+            "a test-harness bin must be refused"
+        );
+        assert!(
+            root_cp_binding().is_none(),
+            "guard must install no binding for a non-shelbi executable"
+        );
+
+        // The real binary binds the chord to its own `popup` command.
+        let real_bin = format!("{}/shelbi", hub_work_dir.display());
+        assert_eq!(
+            apply_palette_binding(&Host::Local, &project_name, &real_bin).unwrap(),
+            "C-p",
+            "the real shelbi binary must bind the chord"
+        );
+        let binding = root_cp_binding().expect("C-p bound to the real binary");
+        assert!(
+            binding.contains(&format!("{real_bin} popup")),
+            "chord must run the real binary's popup: {binding}"
         );
     }
 }
