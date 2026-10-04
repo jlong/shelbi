@@ -85,10 +85,96 @@ struct ReviewOpenParams {
     has_review_url: bool,
 }
 
+/// How a review-open resolve landed off the UI thread (`rt-tui-review-load-queued`):
+/// the task is already on a slot (open the interface) or still queued (pick a
+/// free slot to load it onto).
+enum ResolvedReview {
+    /// Already serving — build the native interface with these inputs.
+    Serving(ReviewOpenParams),
+    /// Queued — offer the free review slots. `total_slots` lets the shell tell
+    /// "every slot is busy" (some exist, none free) from "no review workspace"
+    /// (none exist). `title` is the card title the picker shows.
+    Queued {
+        title: String,
+        free_slots: Vec<crate::overlay::review_confirm::Slot>,
+        total_slots: usize,
+    },
+}
+
+/// The daemon-facing review operations the shell runs off its UI thread, behind
+/// a trait so the queued-load flow is testable with a stubbed daemon
+/// (`rt-tui-review-load-queued`).
+trait ReviewBackend: Send + Sync {
+    /// Resolve how to open `task`: serving on a slot, or queued with the free
+    /// slots to pick from. Blocking board/config reads.
+    fn resolve(&self, project: &str, task: &str) -> Result<ResolvedReview, String>;
+    /// Load a queued `task` onto the free review `workspace` through the daemon
+    /// (checkout + boot + health-check + agent). Blocking.
+    fn load(&self, project: &str, task: &str, workspace: &str) -> Result<(), String>;
+}
+
+/// The production [`ReviewBackend`]: resolve through the orchestrator's
+/// board-derived state and load through the daemon control socket.
+struct DaemonReviewBackend;
+
+impl ReviewBackend for DaemonReviewBackend {
+    fn resolve(&self, project: &str, task: &str) -> Result<ResolvedReview, String> {
+        use shelbi_orchestrator::review_session::ReviewOpenTarget;
+        match shelbi_orchestrator::review_session::review_open_target(project, task)
+            .map_err(|e| e.to_string())?
+        {
+            ReviewOpenTarget::Serving(info) => Ok(ResolvedReview::Serving(ReviewOpenParams {
+                task_id: task.to_string(),
+                slot: info.slot,
+                worktree: info.worktree,
+                editor_name: info.editor_name,
+                has_review_url: info.has_review_url,
+            })),
+            ReviewOpenTarget::Queued { title } => {
+                // List the free review slots (the only loadable ones here — a
+                // busy slot is left for its occupant, not evicted), plus the
+                // total so the shell can report "every slot is busy".
+                let all = shelbi_orchestrator::load::review_slots(project)
+                    .map_err(|e| e.to_string())?;
+                let total_slots = all.len();
+                let free_slots = all
+                    .into_iter()
+                    .filter(|s| s.occupant.is_none())
+                    .map(|s| crate::overlay::review_confirm::Slot {
+                        name: s.name,
+                        occupant: None,
+                    })
+                    .collect();
+                Ok(ResolvedReview::Queued {
+                    title,
+                    free_slots,
+                    total_slots,
+                })
+            }
+        }
+    }
+
+    fn load(&self, project: &str, task: &str, workspace: &str) -> Result<(), String> {
+        shelbi_app::review_session(
+            project,
+            task,
+            shelbi_app::ReviewSessionOp::Load {
+                workspace: workspace.to_string(),
+            },
+            &mut |_, _| {},
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
 /// A message from a review background job (all run off the UI thread).
 enum ReviewJobMsg {
-    /// A review-open resolution finished (build the interface, or show the error).
-    Opened(Result<ReviewOpenParams, String>),
+    /// A review-open resolve finished: build the interface, open the slot
+    /// picker, or show the error (`rt-tui-review-load-queued`).
+    Resolved(Result<ResolvedReview, String>),
+    /// A queued-review load onto a slot finished (`rt-tui-review-load-queued`).
+    /// On success the daemon's `ReviewOpened` event opens the interface.
+    LoadDone(Result<(), String>),
     /// A daemon `Ensure` for a content role finished; bind the view on success.
     ContentReady(shelbi_app::ReviewRole, Result<(), String>),
     /// The gated merge (approve) finished.
@@ -438,6 +524,19 @@ struct ShellState {
     /// In-flight review background work (open resolution, content ensure,
     /// approve, reject). Drained by [`ShellState::poll_review`].
     review_rx: Option<Receiver<ReviewJobMsg>>,
+    /// The daemon-facing review operations (resolve / load), behind a seam so the
+    /// queued-load flow is testable with a stubbed daemon (`rt-tui-review-load-queued`).
+    review_backend: Arc<dyn ReviewBackend>,
+    /// The task a review-open resolve is in flight for, so a resolve that lands
+    /// after the user navigated away (or started opening a different review) is
+    /// dropped (`rt-tui-review-load-queued`).
+    review_opening: Option<String>,
+    /// The task this client loaded onto a slot and is now waiting to see serve:
+    /// the matching daemon `ReviewOpened` opens the interface, while a
+    /// background `ReviewOpened` (another client's load, a poller resume) for
+    /// any other task never steals this client's view
+    /// (`rt-tui-review-load-queued`).
+    review_open_pending: Option<String>,
     /// Pushed layout events from the daemon poller over the hub socket
     /// (`rt-daemon-layout-split`), plus this process's own change bus as the
     /// setting-off fallback. Drained by [`ShellState::poll_layout_events`].
@@ -547,6 +646,9 @@ impl ShellState {
             lifecycle,
             review: None,
             review_rx: None,
+            review_backend: Arc::new(DaemonReviewBackend),
+            review_opening: None,
+            review_open_pending: None,
             layout_rx: None,
             layout_bus: None,
             last_review_reconcile: Instant::now(),
@@ -684,7 +786,7 @@ impl ShellState {
             RowTarget::Review(id) => {
                 // Review has no `View` variant (it is a transient interface, not a
                 // remembered main view), so it is not recorded.
-                self.open_review(id);
+                self.begin_review(id);
             }
         }
         self.dirty = true;
@@ -868,12 +970,10 @@ impl ShellState {
             OverlayEvent::ReviewConfirmed { task_id, slot } => {
                 self.overlay = None;
                 self.client.focus_main();
-                // The confirm dialog returns the chosen slot as a value; wiring
-                // it to the load-for-review transition is the review interface
-                // (rt-tui-review, Phase 4e).
-                self.status = Some(format!(
-                    "Load {task_id} onto {slot} — review loading lands in the review interface"
-                ));
+                // Load the queued task onto the chosen free slot through the
+                // daemon, off the UI thread; the daemon's `ReviewOpened` event
+                // opens the interface once the slot is serving.
+                self.start_review_load(task_id, slot);
             }
             OverlayEvent::ReviewCancelled => {
                 self.overlay = None;
@@ -1001,7 +1101,7 @@ impl ShellState {
             Effect::FocusWorkspace { workspace, .. } => {
                 self.show(RowTarget::Session(SessionRef::Workspace(workspace)))
             }
-            Effect::LoadReview { task_id, .. } => self.open_review(task_id),
+            Effect::LoadReview { task_id, .. } => self.begin_review(task_id),
             Effect::FocusSession { session } => {
                 self.status = Some(format!(
                     "focus session {session} — legacy spawned agents aren't shown here yet"
@@ -1110,35 +1210,159 @@ impl ShellState {
         true
     }
 
-    // --- review interface (rt-tui-review) ----------------------------------
+    // --- review interface (rt-tui-review / rt-tui-review-load-queued) -------
 
-    /// Begin opening the review interface for `task_id`: resolve its slot,
-    /// worktree, editor, and review-URL off the UI thread, then build the
-    /// interface when that lands (see [`ShellState::poll_review`]). The main
-    /// area switches to the Review view immediately so the user sees progress.
-    fn open_review(&mut self, task_id: String) {
+    /// Begin opening the review for `task_id`. First resolves off the UI thread
+    /// whether the task is already serving on a slot or still queued
+    /// (`rt-tui-review-load-queued`); [`ShellState::on_review_resolved`] then
+    /// either builds the interface or raises the slot picker. The main view is
+    /// left alone until that lands, so a queued task raises the picker rather
+    /// than flashing an empty review.
+    fn begin_review(&mut self, task_id: String) {
         // Already showing this review — no-op.
         if self.review.as_ref().map(|r| r.task_id()) == Some(task_id.as_str())
             && matches!(self.main_view, MainView::Review(_))
         {
             return;
         }
-        self.main_view = MainView::Review(task_id.clone());
-        self.client.focus_main();
+        let Some(project) = self.client.project().map(str::to_string) else {
+            return;
+        };
+        self.review_opening = Some(task_id.clone());
+        self.status = Some(format!("opening review {task_id}…"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.review_rx = Some(rx);
+        let backend = self.review_backend.clone();
+        std::thread::Builder::new()
+            .name("shelbi-review-open".into())
+            .spawn(move || {
+                let _ = tx.send(ReviewJobMsg::Resolved(backend.resolve(&project, &task_id)));
+            })
+            .ok();
+    }
+
+    /// Act on a finished review-open resolve: build the interface (serving),
+    /// raise the slot picker (queued with free slots), report that every slot is
+    /// busy (queued with none free), or surface the error. A resolve for a task
+    /// the user is no longer opening is dropped (`rt-tui-review-load-queued`).
+    fn on_review_resolved(&mut self, result: Result<ResolvedReview, String>) {
+        let Some(task) = self.review_opening.take() else {
+            return; // navigated away / superseded — the resolve is stale
+        };
+        match result {
+            Ok(ResolvedReview::Serving(p)) => self.build_review_interface(p),
+            Ok(ResolvedReview::Queued {
+                title,
+                free_slots,
+                total_slots,
+            }) => self.open_review_picker(task, title, free_slots, total_slots),
+            Err(e) => {
+                self.review_open_pending = None;
+                self.status = Some(format!("review failed: {e}"));
+            }
+        }
+    }
+
+    /// Build the native review interface from resolved params and switch the main
+    /// area to it (`rt-tui-review`).
+    fn build_review_interface(&mut self, p: ReviewOpenParams) {
         let project = self
             .client
             .project()
             .map(str::to_string)
             .unwrap_or_default();
+        self.main_view = MainView::Review(p.task_id.clone());
+        self.client.focus_main();
+        self.review = Some(ReviewInterface::new(
+            &project,
+            self.connector.clone(),
+            p.task_id,
+            p.slot,
+            p.worktree,
+            p.editor_name,
+            p.has_review_url,
+        ));
+        self.reported_main = None; // re-report size for the content view
+        self.status = None;
+        self.review_open_pending = None;
+        self.dirty = true;
+    }
+
+    /// Raise the "Load for review" picker for a queued `task` over its `free`
+    /// slots, or — when none are free — the appropriate no-slots report (every
+    /// slot busy, or no review workspace configured at all). Loads nothing until
+    /// the user confirms a slot (`rt-tui-review-load-queued`).
+    fn open_review_picker(
+        &mut self,
+        task: String,
+        title: String,
+        free: Vec<crate::overlay::review_confirm::Slot>,
+        total_slots: usize,
+    ) {
+        self.status = None;
+        self.overlay = Some(if free.is_empty() {
+            if total_slots == 0 {
+                // No `review`-tagged workspace exists — the overlay's default
+                // "no review workspace is configured" report.
+                ActiveOverlay::review_confirm(task, title, Vec::new())
+            } else {
+                ActiveOverlay::review_busy_report(
+                    task,
+                    title,
+                    "Every review slot is busy — free one to load this task.",
+                )
+            }
+        } else {
+            ActiveOverlay::review_confirm(task, title, free)
+        });
+        self.client.focus_main();
+        self.dirty = true;
+    }
+
+    /// Load a queued `task_id` onto the free review `workspace` the picker chose,
+    /// off the UI thread (`rt-tui-review-load-queued`). Records the task as
+    /// pending so the daemon's matching `ReviewOpened` opens the interface.
+    fn start_review_load(&mut self, task_id: String, workspace: String) {
+        let Some(project) = self.client.project().map(str::to_string) else {
+            return;
+        };
+        self.review_open_pending = Some(task_id.clone());
+        self.status = Some(format!("loading {task_id} onto {workspace}…"));
         let (tx, rx) = std::sync::mpsc::channel();
         self.review_rx = Some(rx);
-        self.status = Some(format!("opening review {task_id}…"));
+        let backend = self.review_backend.clone();
+        let task = task_id.clone();
         std::thread::Builder::new()
-            .name("shelbi-review-open".into())
+            .name("shelbi-review-load".into())
             .spawn(move || {
-                let _ = tx.send(ReviewJobMsg::Opened(resolve_review_open(&project, &task_id)));
+                let res = backend.load(&project, &task, &workspace);
+                let _ = tx.send(ReviewJobMsg::LoadDone(res));
             })
             .ok();
+    }
+
+    /// Act on a finished queued-review load. On success the slot is serving and
+    /// the daemon's `ReviewOpened` event opens the interface; on failure clear
+    /// the pending wait and surface the error (`rt-tui-review-load-queued`).
+    fn on_review_load_done(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.status = Some("review loaded; opening…".to_string()),
+            Err(e) => {
+                self.review_open_pending = None;
+                self.status = Some(format!("review load failed: {e}"));
+            }
+        }
+    }
+
+    /// Open the review interface for a slot the daemon just reported serving.
+    /// Only the client that loaded `task` opens it; a background `ReviewOpened`
+    /// (another client's load, a poller resume) never steals this client's view,
+    /// matching the tmux sidebar's no-focus resume (`rt-tui-review-load-queued`).
+    fn on_review_opened(&mut self, task: String) {
+        if self.review_open_pending.as_deref() == Some(task.as_str()) {
+            self.review_open_pending = None;
+            self.begin_review(task);
+        }
     }
 
     /// Drain a finished review background job without blocking. Returns `true`
@@ -1157,32 +1381,8 @@ impl ShellState {
         };
         self.review_rx = None;
         match msg {
-            ReviewJobMsg::Opened(Ok(p)) => {
-                // Only build if we're still meant to be on this review.
-                if matches!(&self.main_view, MainView::Review(id) if *id == p.task_id) {
-                    let project = self
-                        .client
-                        .project()
-                        .map(str::to_string)
-                        .unwrap_or_default();
-                    self.review = Some(ReviewInterface::new(
-                        &project,
-                        self.connector.clone(),
-                        p.task_id,
-                        p.slot,
-                        p.worktree,
-                        p.editor_name,
-                        p.has_review_url,
-                    ));
-                    self.reported_main = None; // re-report size for the content view
-                    self.status = None;
-                }
-            }
-            ReviewJobMsg::Opened(Err(e)) => {
-                self.status = Some(format!("review failed: {e}"));
-                // Drop back to the orchestrator chat.
-                self.show(RowTarget::Session(SessionRef::Orchestrator));
-            }
+            ReviewJobMsg::Resolved(result) => self.on_review_resolved(result),
+            ReviewJobMsg::LoadDone(result) => self.on_review_load_done(result),
             ReviewJobMsg::ContentReady(role, Ok(())) => {
                 if let Some(r) = self.review.as_mut() {
                     r.show_role(role);
@@ -1481,11 +1681,15 @@ impl ShellState {
                     self.show(RowTarget::Session(SessionRef::Orchestrator));
                 }
             }
-            // Opened/AgentRecovered: the sessions are the daemon's half; the
-            // interface opens on user selection and the content view reconnects
-            // on its own. A refresh keeps the sidebar current. OrchestratorRestarted
-            // likewise needs nothing here (the main session reconnects).
-            ReviewOpened { .. } | ReviewAgentRecovered { .. } | OrchestratorRestarted => {}
+            // A slot this client loaded for review (`rt-tui-review-load-queued`)
+            // is now serving: open the native interface. Only the initiating
+            // client reacts (see `on_review_opened`), so a sibling's load or a
+            // poller resume never steals this client's view.
+            ReviewOpened { task, .. } => self.on_review_opened(task),
+            // AgentRecovered: the content view reconnects on its own; a refresh
+            // keeps the sidebar current. OrchestratorRestarted likewise needs
+            // nothing here (the main session reconnects).
+            ReviewAgentRecovered { .. } | OrchestratorRestarted => {}
         }
     }
 
@@ -1817,21 +2021,6 @@ fn toggle_zen_blocking(project: &str) -> Result<String, String> {
         "enabled"
     };
     Ok(format!("Zen Mode {word}"))
-}
-
-/// Resolve the inputs for a review panel off the UI thread (board + project
-/// config reads). The orchestrator owns the resolution so it matches the
-/// daemon's session-spawn path (`rt-tui-review`).
-fn resolve_review_open(project: &str, task_id: &str) -> Result<ReviewOpenParams, String> {
-    let info = shelbi_orchestrator::review_session::review_open_info(project, task_id)
-        .map_err(|e| e.to_string())?;
-    Ok(ReviewOpenParams {
-        task_id: task_id.to_string(),
-        slot: info.slot,
-        worktree: info.worktree,
-        editor_name: info.editor_name,
-        has_review_url: info.has_review_url,
-    })
 }
 
 /// Run an approve/reject review mutation through the daemon control socket
@@ -2569,6 +2758,201 @@ mod tests {
         assert!(review_view_is_stale("t-gone", &open));
         // Nothing open at all → any shown review is stale.
         assert!(review_view_is_stale("t-a", &[]));
+    }
+
+    // --- queued review load (rt-tui-review-load-queued) --------------------
+
+    use crate::overlay::review_confirm::Slot;
+
+    /// A stubbed daemon for the queued-load flow: staged resolve results and a
+    /// recorded, canned `load`, so the shell's routing is exercised without a
+    /// real daemon.
+    #[derive(Default)]
+    struct StubReviewBackend {
+        /// The next resolve to return (consumed), so a test can stage a Queued
+        /// result and then a Serving one.
+        resolve: Mutex<Option<Result<ResolvedReview, String>>>,
+        load_result: Mutex<Option<Result<(), String>>>,
+        load_calls: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl StubReviewBackend {
+        fn stage_resolve(&self, r: Result<ResolvedReview, String>) {
+            *self.resolve.lock().unwrap() = Some(r);
+        }
+        fn stage_load(&self, r: Result<(), String>) {
+            *self.load_result.lock().unwrap() = Some(r);
+        }
+    }
+
+    impl ReviewBackend for StubReviewBackend {
+        fn resolve(&self, _project: &str, _task: &str) -> Result<ResolvedReview, String> {
+            self.resolve
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err("no resolve staged".into()))
+        }
+        fn load(&self, project: &str, task: &str, workspace: &str) -> Result<(), String> {
+            self.load_calls
+                .lock()
+                .unwrap()
+                .push((project.into(), task.into(), workspace.into()));
+            self.load_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Ok(()))
+        }
+    }
+
+    fn slot(name: &str) -> Slot {
+        Slot {
+            name: name.into(),
+            occupant: None,
+        }
+    }
+
+    /// Pump the off-thread review job to completion (the stub is instant, so the
+    /// bounded wait never spins long).
+    fn pump_review(st: &mut ShellState) {
+        for _ in 0..1000 {
+            if st.poll_review() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("review job never completed");
+    }
+
+    #[test]
+    fn enter_on_a_queued_review_opens_the_slot_picker_over_the_free_slots() {
+        // AC1: a queued review (not on a slot) resolves to the free review slots
+        // and raises the "Load for review" picker over them — not the interface.
+        let stub = Arc::new(StubReviewBackend::default());
+        stub.stage_resolve(Ok(ResolvedReview::Queued {
+            title: "Fix login".into(),
+            free_slots: vec![slot("review-1"), slot("review-2")],
+            total_slots: 2,
+        }));
+        let mut st = test_state();
+        st.review_backend = stub.clone();
+        st.begin_review("T-1".into());
+        pump_review(&mut st);
+        match &st.overlay {
+            Some(ActiveOverlay::ReviewConfirm { task_id, dialog }) => {
+                assert_eq!(task_id, "T-1");
+                assert!(dialog.has_slots(), "the picker lists the free slots");
+                assert!(dialog.is_picker(), "two free slots → a picker");
+            }
+            other => panic!("expected the slot picker, got {:?}", other.is_some()),
+        }
+        // The main area has NOT switched to a review (nothing is loaded yet).
+        assert!(!matches!(st.main_view, MainView::Review(_)));
+        assert!(st.review.is_none());
+    }
+
+    #[test]
+    fn every_review_slot_busy_reports_and_loads_nothing() {
+        // AC3: slots exist but none are free → the overlay reports it (a no-slots
+        // informational dialog) and no load is started.
+        let stub = Arc::new(StubReviewBackend::default());
+        stub.stage_resolve(Ok(ResolvedReview::Queued {
+            title: "Fix login".into(),
+            free_slots: Vec::new(),
+            total_slots: 2,
+        }));
+        let mut st = test_state();
+        st.review_backend = stub.clone();
+        st.begin_review("T-2".into());
+        pump_review(&mut st);
+        match &st.overlay {
+            Some(ActiveOverlay::ReviewConfirm { dialog, .. }) => {
+                assert!(!dialog.has_slots(), "every slot busy → a no-slots report");
+            }
+            other => panic!("expected the busy report, got {:?}", other.is_some()),
+        }
+        // Nothing was loaded, and dismissing the report loads nothing either.
+        assert!(st.review_open_pending.is_none());
+        st.apply_overlay_event(OverlayEvent::ReviewCancelled);
+        assert!(st.overlay.is_none());
+        assert!(
+            stub.load_calls.lock().unwrap().is_empty(),
+            "an all-busy report must never load"
+        );
+    }
+
+    #[test]
+    fn confirming_loads_through_the_daemon_then_review_opened_opens_the_interface() {
+        // AC2: confirming a free slot loads the task through the (stubbed) daemon
+        // off the UI thread, and the daemon's ReviewOpened event opens the native
+        // interface once the slot is serving.
+        let stub = Arc::new(StubReviewBackend::default());
+        stub.stage_resolve(Ok(ResolvedReview::Queued {
+            title: "Fix login".into(),
+            free_slots: vec![slot("review-1")],
+            total_slots: 1,
+        }));
+        stub.stage_load(Ok(()));
+        let mut st = test_state();
+        st.review_backend = stub.clone();
+
+        // Open the picker, then confirm its single slot.
+        st.begin_review("T-1".into());
+        pump_review(&mut st);
+        assert!(matches!(st.overlay, Some(ActiveOverlay::ReviewConfirm { .. })));
+        st.apply_overlay_event(OverlayEvent::ReviewConfirmed {
+            task_id: "T-1".into(),
+            slot: "review-1".into(),
+        });
+        // The confirm closes the overlay, records the task as pending its serve,
+        // and dispatches the load off-thread.
+        assert!(st.overlay.is_none());
+        assert_eq!(st.review_open_pending.as_deref(), Some("T-1"));
+        pump_review(&mut st); // the load job lands
+        assert_eq!(
+            &*stub.load_calls.lock().unwrap(),
+            &[("proj".into(), "T-1".into(), "review-1".into())],
+            "the load routes to the daemon for the chosen slot"
+        );
+        // The load succeeded; still waiting for the serve event (no interface yet).
+        assert_eq!(st.review_open_pending.as_deref(), Some("T-1"));
+        assert!(st.review.is_none());
+
+        // The daemon reports the slot serving: the interface opens for this task.
+        stub.stage_resolve(Ok(ResolvedReview::Serving(ReviewOpenParams {
+            task_id: "T-1".into(),
+            slot: "review-1".into(),
+            worktree: "/wt".into(),
+            editor_name: "Vim".into(),
+            has_review_url: false,
+        })));
+        st.apply_layout_event(shelbi_state::LayoutEvent::ReviewOpened {
+            workspace: "review-1".into(),
+            task: "T-1".into(),
+        });
+        pump_review(&mut st); // the re-resolve (now serving) lands
+        assert!(matches!(st.main_view, MainView::Review(id) if id == "T-1"));
+        assert_eq!(st.review.as_ref().map(|r| r.task_id()), Some("T-1"));
+        assert!(st.review_open_pending.is_none());
+    }
+
+    #[test]
+    fn a_background_review_opened_for_another_task_never_steals_the_view() {
+        // A ReviewOpened this client did not initiate (another client's load, a
+        // poller resume) must not open an interface here — matching the tmux
+        // sidebar's no-focus resume.
+        let stub = Arc::new(StubReviewBackend::default());
+        let mut st = test_state();
+        st.review_backend = stub.clone();
+        // Not pending anything.
+        st.apply_layout_event(shelbi_state::LayoutEvent::ReviewOpened {
+            workspace: "review-1".into(),
+            task: "someone-elses".into(),
+        });
+        assert!(st.review.is_none());
+        assert!(!matches!(st.main_view, MainView::Review(_)));
+        assert!(st.review_rx.is_none(), "no resolve was kicked off");
     }
 
     #[test]
