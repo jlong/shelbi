@@ -1871,17 +1871,25 @@ dependencies = [
 name = "shelbi-tui"
 version = "0.9.0"
 dependencies = [
+ "alacritty_terminal",
  "anyhow",
  "chrono",
  "crossterm 0.28.1",
+ "libc",
  "ratatui",
  "shelbi-agent",
+ "shelbi-app",
+ "shelbi-client",
  "shelbi-core",
  "shelbi-orchestrator",
  "shelbi-palette",
+ "shelbi-proto",
+ "shelbi-session",
  "shelbi-ssh",
  "shelbi-state",
+ "shelbi-term",
  "shelbi-tmux",
+ "tempfile",
  "tracing",
  "unicode-width 0.1.14",
 ]

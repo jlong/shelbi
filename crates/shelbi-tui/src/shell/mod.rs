@@ -1,0 +1,955 @@
+//! The single-process TUI shell (removing-tmux Phase 4b).
+//!
+//! With the `session_backend` dev flag on, `shelbi` runs this instead of
+//! `exec tmux attach`: one ratatui program that owns the whole screen, a
+//! sidebar on the left and a main area on the right. The main area shows a
+//! session through a [`terminal_view::TerminalPane`] (the orchestrator chat and
+//! each workspace agent), or a placeholder for the native views that land in
+//! `rt-tui-native-views`.
+//!
+//! Everything runs in **one event loop**: local input, session output, model
+//! snapshots, and timers. Anything that can block — here, connecting and
+//! attaching to a session — runs off the UI thread (see [`session`]) and
+//! reports back, because in one process a blocked call freezes every view.
+//!
+//! The sidebar is a renderer over shelbi-app's `SidebarModel` (built by a
+//! background refresher); navigation state (selection, focus, sidebar width) is
+//! shelbi-app's [`ClientState`]. This crate adds no model logic.
+
+mod caps;
+mod session;
+mod sidebar;
+mod terminal_view;
+
+#[cfg(all(test, unix))]
+mod pty_input_tests;
+
+use std::io::{self, Write};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+use anyhow::{Context, Result};
+use crossterm::cursor::Show;
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::Terminal;
+
+use shelbi_app::nav::{ClientState, Focus, View};
+use shelbi_app::refresh::{spawn_refresher, Snapshot};
+use shelbi_app::view::SidebarModel;
+use shelbi_term::Size;
+
+use caps::Caps;
+use session::{LiveConnector, MainState, SessionManager, SessionRef};
+use sidebar::{RowTarget, SidebarView};
+
+/// The frame budget: redraws are capped at roughly 60 per second.
+const FRAME: Duration = Duration::from_millis(16);
+/// How often the background refresher is asked for fresh model data.
+const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+/// How long the one-time keyboard-protocol notice stays up.
+const NOTICE_SECS: u64 = 6;
+
+/// Run the single-process shell for `project` until the user quits.
+pub fn run(project: &str) -> Result<()> {
+    run_with(project, Arc::new(LiveConnector))
+}
+
+/// Run the shell against an injected connector (for tests that avoid a real
+/// session). The terminal setup still happens, so this needs a TTY; the pure
+/// routing is covered by unit tests instead.
+fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()> {
+    // Detect capabilities before entering raw mode, while the terminal can
+    // answer the kitty-protocol query.
+    let caps = Caps::detect();
+
+    let _guard = RawGuard::enter().context("entering raw mode")?;
+    let mut term =
+        Terminal::new(CrosstermBackend::new(io::stdout())).context("initializing the terminal")?;
+
+    let mut state = ShellState::new(project, connector, caps);
+
+    let proj = project.to_string();
+    let refresher = spawn_refresher(move |generation| read_snapshot(&proj, generation));
+    refresher.request();
+    let mut last_refresh = Instant::now();
+
+    // Start on the orchestrator chat, focused.
+    state.show(RowTarget::Session(SessionRef::Orchestrator));
+
+    let mut last_draw = Instant::now()
+        .checked_sub(FRAME)
+        .unwrap_or_else(Instant::now);
+
+    loop {
+        if state.should_quit {
+            break;
+        }
+
+        // Pace the loop on local input; this bounds the redraw rate too.
+        if event::poll(FRAME).unwrap_or(false) {
+            while event::poll(Duration::ZERO).unwrap_or(false) {
+                match event::read() {
+                    Ok(ev) => state.handle_event(ev),
+                    Err(_) => break,
+                }
+                if state.should_quit {
+                    break;
+                }
+            }
+        }
+
+        // Background sources (all non-blocking).
+        if last_refresh.elapsed() >= REFRESH_INTERVAL {
+            refresher.request();
+            last_refresh = Instant::now();
+        }
+        if let Some(snap) = refresher.latest() {
+            state.apply_snapshot(snap);
+        }
+        let mut ring = false;
+        if state.sessions.pump_output(&mut ring) {
+            state.dirty = true;
+        }
+        if state.sessions.poll() {
+            state.dirty = true;
+        }
+        if ring {
+            let mut out = io::stdout();
+            let _ = out.write_all(b"\x07");
+            let _ = out.flush();
+        }
+
+        // Redraw, capped and wrapped in synchronized output.
+        let now = Instant::now();
+        if state.dirty && now.duration_since(last_draw) >= FRAME {
+            draw(&mut term, &mut state)?;
+            last_draw = now;
+            state.dirty = false;
+        }
+    }
+
+    Ok(())
+}
+
+/// What the main area is currently showing.
+enum MainView {
+    Session,
+    Native(View),
+    Review(String),
+}
+
+struct ShellState {
+    client: ClientState,
+    sessions: SessionManager,
+    caps: Caps,
+    sidebar_model: Option<SidebarModel>,
+    main_view: MainView,
+    /// Rects from the last draw, for mouse hit-testing.
+    sidebar_rect: Rect,
+    main_rect: Rect,
+    /// The main-area size last reported to the live session.
+    reported_main: Option<Size>,
+    /// When `Some`, the user is typing a scrollback search query.
+    search_input: Option<String>,
+    /// The one-time keyboard-protocol notice: shown from startup until its
+    /// deadline, then cleared and never re-armed (see [`ShellState::notice_text`]).
+    notice: Option<Notice>,
+    should_quit: bool,
+    dirty: bool,
+}
+
+/// The startup keyboard-protocol notice and the instant it auto-hides at.
+struct Notice {
+    text: &'static str,
+    until: Instant,
+}
+
+impl ShellState {
+    fn new(project: &str, connector: Arc<dyn session::Connector>, caps: Caps) -> Self {
+        let notice = caps.keyboard_notice().map(|text| Notice {
+            text,
+            until: Instant::now() + Duration::from_secs(NOTICE_SECS),
+        });
+        Self {
+            client: ClientState::new(project),
+            sessions: SessionManager::new(project, connector),
+            caps,
+            sidebar_model: None,
+            main_view: MainView::Session,
+            sidebar_rect: Rect::default(),
+            main_rect: Rect::default(),
+            reported_main: None,
+            search_input: None,
+            notice,
+            should_quit: false,
+            dirty: true,
+        }
+    }
+
+    /// The keyboard-protocol notice text to paint at `now`, or `None`. The
+    /// notice shows from startup until its deadline; once the deadline passes it
+    /// is cleared and this returns `None` forever after, so the banner is
+    /// emitted exactly once per run and never re-armed.
+    fn notice_text(&mut self, now: Instant) -> Option<&'static str> {
+        match &self.notice {
+            Some(n) if now < n.until => Some(n.text),
+            Some(_) => {
+                self.notice = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn apply_snapshot(&mut self, snap: Snapshot) {
+        if let Some(sidebar) = snap.sidebar {
+            // Keep the selection in range as rows come and go.
+            let view = SidebarView::build(&sidebar);
+            self.client.clamp_selection(view.selectable_count());
+            self.sidebar_model = Some(sidebar);
+            self.dirty = true;
+        }
+    }
+
+    fn sidebar_view(&self) -> Option<SidebarView> {
+        self.sidebar_model.as_ref().map(SidebarView::build)
+    }
+
+    fn selection(&self) -> usize {
+        self.client.sidebar_selection()
+    }
+
+    fn sidebar_width(&self) -> u16 {
+        self.client.sidebar_width()
+    }
+
+    /// Open a sidebar target: a session shows in the main area and takes focus;
+    /// a native/review placeholder just swaps the main area.
+    fn show(&mut self, target: RowTarget) {
+        match target {
+            RowTarget::Session(r) => {
+                self.main_view = MainView::Session;
+                self.reported_main = None; // force a resize report for the new session
+                self.sessions.show(r);
+                self.client.focus_main();
+            }
+            RowTarget::Native(v) => {
+                self.main_view = MainView::Native(v);
+            }
+            RowTarget::Review(id) => {
+                self.main_view = MainView::Review(id);
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn activate_selection(&mut self) {
+        if let Some(view) = self.sidebar_view() {
+            if let Some(target) = view.target_at(self.selection()) {
+                self.show(target);
+            }
+        }
+    }
+
+    // --- event handling ----------------------------------------------------
+
+    fn handle_event(&mut self, ev: Event) {
+        match ev {
+            Event::Key(k) => self.handle_key(k),
+            Event::Mouse(m) => self.handle_mouse(m),
+            Event::Paste(s) => {
+                if self.focus_is_main() {
+                    self.sessions.send_paste(&s);
+                    self.dirty = true;
+                }
+            }
+            Event::FocusGained => self.forward_focus(true),
+            Event::FocusLost => self.forward_focus(false),
+            Event::Resize(_, _) => self.dirty = true,
+        }
+    }
+
+    fn focus_is_main(&self) -> bool {
+        self.client.focus() == Focus::Main
+    }
+
+    fn handle_key(&mut self, k: KeyEvent) {
+        if !terminal_view::is_actionable(&k) {
+            return;
+        }
+        if self.focus_is_main() {
+            self.handle_main_key(k);
+        } else {
+            self.handle_sidebar_key(k);
+        }
+    }
+
+    fn handle_sidebar_key(&mut self, k: KeyEvent) {
+        let count = self
+            .sidebar_view()
+            .map(|v| v.selectable_count())
+            .unwrap_or(0);
+        match k.code {
+            KeyCode::Up => self.client.select_up(),
+            KeyCode::Down | KeyCode::Tab => self.client.select_down(count),
+            KeyCode::BackTab => self.client.select_up(),
+            KeyCode::Enter => self.activate_selection(),
+            // Ctrl+Space toggles back to the main area.
+            _ if terminal_view::is_focus_key(&k) => self.client.focus_main(),
+            KeyCode::Char('q') => self.should_quit = true,
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    fn handle_main_key(&mut self, k: KeyEvent) {
+        // Ctrl+Space always returns focus to the sidebar (until overlays land).
+        if terminal_view::is_focus_key(&k) {
+            self.client.focus_sidebar();
+            self.dirty = true;
+            return;
+        }
+
+        // A scrollback search prompt captures typing.
+        if let Some(mut buf) = self.search_input.take() {
+            match k.code {
+                KeyCode::Esc => {
+                    if let Some(p) = self.sessions.live_pane_mut() {
+                        p.clear_search();
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(p) = self.sessions.live_pane_mut() {
+                        p.search(&buf);
+                    }
+                }
+                KeyCode::Backspace => {
+                    buf.pop();
+                    self.search_input = Some(buf);
+                }
+                KeyCode::Char(c) => {
+                    buf.push(c);
+                    self.search_input = Some(buf);
+                }
+                _ => self.search_input = Some(buf),
+            }
+            self.dirty = true;
+            return;
+        }
+
+        // In scrollback, Shelbi owns navigation/search keys.
+        let in_scrollback = self
+            .sessions
+            .live_pane_mut()
+            .map(|p| p.in_scrollback())
+            .unwrap_or(false);
+        if in_scrollback && self.handle_scrollback_key(&k) {
+            self.dirty = true;
+            return;
+        }
+
+        // Shift+PageUp enters scrollback even from the live bottom.
+        if k.code == KeyCode::PageUp && k.modifiers.contains(KeyModifiers::SHIFT) {
+            if let Some(p) = self.sessions.live_pane_mut() {
+                p.scroll_up(p_page());
+                self.dirty = true;
+                return;
+            }
+        }
+
+        // Otherwise the key goes to the agent.
+        if let Some(p) = self.sessions.live_pane_mut() {
+            if let Some(bytes) = p.encode_key(&k) {
+                self.sessions.send_input(&bytes);
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Returns `true` if the key was consumed as a scrollback/search command.
+    fn handle_scrollback_key(&mut self, k: &KeyEvent) -> bool {
+        let Some(p) = self.sessions.live_pane_mut() else {
+            return false;
+        };
+        match k.code {
+            KeyCode::Up => p.scroll_up(1),
+            KeyCode::Down => p.scroll_down(1),
+            KeyCode::PageUp => p.scroll_up(p_page()),
+            KeyCode::PageDown => p.scroll_down(p_page()),
+            KeyCode::Char('/') => {
+                self.search_input = Some(String::new());
+            }
+            KeyCode::Char('n') => p.search_next(),
+            KeyCode::Char('N') => p.search_prev(),
+            KeyCode::Esc => {
+                p.clear_search();
+                p.scroll_to_bottom();
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        if contains(self.sidebar_rect, m.column, m.row) {
+            self.handle_sidebar_mouse(m);
+            return;
+        }
+        if contains(self.main_rect, m.column, m.row) {
+            self.handle_main_mouse(m);
+        }
+    }
+
+    fn handle_sidebar_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        // Wheel over the sidebar moves the selection.
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                self.client.focus_sidebar();
+                self.client.select_up();
+                self.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                let count = self
+                    .sidebar_view()
+                    .map(|v| v.selectable_count())
+                    .unwrap_or(0);
+                self.client.focus_sidebar();
+                self.client.select_down(count);
+                self.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A click in the sidebar focuses and selects (plan).
+                self.client.focus_sidebar();
+                if let Some(view) = self.sidebar_view() {
+                    if let Some(sel) = view.hit(self.sidebar_rect, m.column, m.row) {
+                        self.client.clamp_selection(view.selectable_count());
+                        // Move selection to the clicked row.
+                        while self.client.sidebar_selection() < sel {
+                            self.client.select_down(view.selectable_count());
+                        }
+                        while self.client.sidebar_selection() > sel {
+                            self.client.select_up();
+                        }
+                    }
+                }
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_main_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        // A click in the main area focuses it.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.client.focus_main();
+        }
+        let origin_col = self.main_rect.x;
+        let origin_row = self.main_rect.y;
+        let (pane_col, pane_row) = (
+            m.column.saturating_sub(origin_col),
+            m.row.saturating_sub(origin_row),
+        );
+        // The viewer the click lands in is the main area; a session sized by
+        // another (more-recently-active) client is letterboxed or clipped into
+        // it, so the pane translates coordinates against this size.
+        let viewer = Size::new(self.main_rect.width, self.main_rect.height);
+        if let Some(p) = self.sessions.live_pane_mut() {
+            match p.on_mouse(&m, pane_col, pane_row, viewer) {
+                terminal_view::MouseOutcome::Forward(bytes) => self.sessions.send_input(&bytes),
+                terminal_view::MouseOutcome::Copy(text) => copy_to_clipboard(&text),
+                terminal_view::MouseOutcome::Handled => {}
+                terminal_view::MouseOutcome::Ignored => {}
+            }
+            self.dirty = true;
+        }
+    }
+
+    fn forward_focus(&mut self, focused: bool) {
+        if let Some(p) = self.sessions.live_pane_mut() {
+            if let Some(bytes) = p.encode_focus(focused) {
+                self.sessions.send_input(&bytes);
+            }
+        }
+    }
+}
+
+/// A fixed page step for scrollback (rows are re-derived at render; a small
+/// constant keeps paging predictable without plumbing the live height here).
+fn p_page() -> usize {
+    20
+}
+
+fn contains(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.left() && x < area.right() && y >= area.top() && y < area.bottom()
+}
+
+// --- rendering -------------------------------------------------------------
+
+fn draw(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &mut ShellState,
+) -> Result<()> {
+    // Compute layout up front so we can report the main-area size to the live
+    // session before painting.
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: term.size()?.width,
+        height: term.size()?.height,
+    };
+    let (sidebar_rect, main_rect) = layout(area, state.sidebar_width());
+    state.sidebar_rect = sidebar_rect;
+    state.main_rect = main_rect;
+
+    // Report our viewport so the session reflows to fill the main area when we
+    // are the most-recently-active client.
+    let main_size = Size::new(main_rect.width, main_rect.height);
+    if state.reported_main != Some(main_size) {
+        state.sessions.resize(main_size.cols, main_size.rows);
+        state.reported_main = Some(main_size);
+    }
+
+    let truecolor = state.caps.truecolor;
+    let focus_main = state.focus_is_main();
+    let selection = state.selection();
+    // The one-time keyboard-protocol notice: shown until its deadline, then
+    // cleared for good (so it is emitted exactly once per run).
+    let notice = state.notice_text(Instant::now());
+    let searching = state.search_input.clone();
+
+    // Borrow what the closure needs.
+    let sidebar_view = state.sidebar_view();
+    let main_view = &state.main_view;
+
+    let mut cursor: Option<(u16, u16)> = None;
+    let begin = execute!(io::stdout(), BeginSynchronizedUpdate);
+    let res = term.draw(|frame| {
+        let buf = frame.buffer_mut();
+
+        // Sidebar.
+        if let Some(view) = &sidebar_view {
+            view.render(buf, sidebar_rect, selection, !focus_main);
+        }
+
+        // Main area.
+        match main_view {
+            MainView::Session => match state.sessions.state() {
+                MainState::Empty => render_placeholder(buf, main_rect, "No session"),
+                MainState::Connecting(r) => {
+                    render_placeholder(buf, main_rect, &format!("Connecting to {}…", r.display()))
+                }
+                MainState::Failed(r, err) => render_placeholder(
+                    buf,
+                    main_rect,
+                    &format!("Couldn't attach to {}: {err}", r.display()),
+                ),
+                MainState::Live(pane) => {
+                    let cur = pane.render(buf, main_rect, truecolor);
+                    if focus_main {
+                        cursor = cur;
+                    }
+                }
+            },
+            MainView::Native(v) => {
+                render_placeholder(buf, main_rect, &native_placeholder(v))
+            }
+            MainView::Review(id) => render_placeholder(
+                buf,
+                main_rect,
+                &format!("Review of {id} — the review interface lands in rt-tui-review"),
+            ),
+        }
+
+        // Scrollback search prompt (bottom of the main area).
+        if let Some(q) = &searching {
+            render_search_prompt(buf, main_rect, q);
+        }
+
+        // One-time keyboard-protocol notice.
+        if let Some(text) = notice {
+            render_notice(buf, area, text);
+        }
+
+        if let Some((x, y)) = cursor {
+            frame.set_cursor_position(Position::new(x, y));
+        }
+    });
+    if begin.is_ok() {
+        let _ = execute!(io::stdout(), EndSynchronizedUpdate);
+    }
+    res.context("drawing the shell")?;
+    Ok(())
+}
+
+/// Split `area` into (sidebar, main). The sidebar is clamped to leave room for
+/// the main area.
+fn layout(area: Rect, sidebar_width: u16) -> (Rect, Rect) {
+    let max = area.width.saturating_sub(1).max(1);
+    let w = sidebar_width.clamp(1, max);
+    let sidebar = Rect::new(area.x, area.y, w, area.height);
+    let main = Rect::new(area.x + w, area.y, area.width.saturating_sub(w), area.height);
+    (sidebar, main)
+}
+
+fn native_placeholder(v: &View) -> String {
+    let name = match v {
+        View::Issues => "Issues",
+        View::Activity => "Activity",
+        View::Machines => "Machines",
+        View::Session(_) => "Session",
+    };
+    format!("{name} view — native views land in rt-tui-native-views")
+}
+
+fn render_placeholder(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let p = Paragraph::new(vec![Line::from(Span::styled(
+        text,
+        Style::default().fg(Color::DarkGray),
+    ))])
+    .wrap(Wrap { trim: true });
+    p.render(centered(area), buf);
+}
+
+/// A small vertically-centered band for placeholder text.
+fn centered(area: Rect) -> Rect {
+    let y = area.y + area.height / 2;
+    Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1)
+}
+
+fn render_search_prompt(buf: &mut ratatui::buffer::Buffer, area: Rect, query: &str) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let y = area.bottom() - 1;
+    let label = format!(" search: {query}▏");
+    let style = Style::default().add_modifier(Modifier::REVERSED);
+    for (x, ch) in (area.left()..area.right()).zip(label.chars().chain(std::iter::repeat(' '))) {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_char(ch);
+            cell.set_style(style);
+        }
+    }
+}
+
+fn render_notice(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let y = area.top();
+    let style = Style::default()
+        .bg(Color::Rgb(90, 70, 30))
+        .fg(Color::White);
+    let label = format!(" {text} ");
+    for (x, ch) in (area.left()..area.right()).zip(label.chars()) {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_char(ch);
+            cell.set_style(style);
+        }
+    }
+}
+
+// --- the background model reader -------------------------------------------
+
+/// Read a fresh snapshot of the view models for `project`. Runs on the
+/// refresher thread; reads state only (the daemon poller keeps the board
+/// index current in session-backend mode).
+fn read_snapshot(project: &str, generation: u64) -> Snapshot {
+    Snapshot {
+        generation,
+        taken_at: Some(SystemTime::now()),
+        sidebar: read_sidebar_model(project),
+        ..Default::default()
+    }
+}
+
+fn read_sidebar_model(project: &str) -> Option<SidebarModel> {
+    let report = shelbi_state::read_board_report(project).ok()?;
+    let board = if report.state.is_cold() {
+        Vec::new()
+    } else {
+        report.state.into_issues()
+    };
+    let names = workspace_pool(project);
+    let zen_on = shelbi_state::read_state(project)
+        .map(|s| !matches!(s.zen_mode, shelbi_state::ZenModeState::Off))
+        .unwrap_or(false);
+    let unread = shelbi_state::unread_error_count(project).unwrap_or(0);
+    Some(SidebarModel::from_board(project, &board, &names, zen_on, unread))
+}
+
+/// The project's declared dev-workspace pool (review-tagged slots surface only
+/// through the review sections, mirroring the tmux sidebar).
+fn workspace_pool(project: &str) -> Vec<String> {
+    let Ok(p) = shelbi_state::load_project(project) else {
+        return Vec::new();
+    };
+    p.workspaces
+        .iter()
+        .filter(|w| !p.effective_tags(w).contains("review"))
+        .map(|w| w.name.clone())
+        .collect()
+}
+
+// --- clipboard -------------------------------------------------------------
+
+/// Copy `text` to the clipboard. OSC 52 is the portable path (it works over SSH
+/// and through an outer tmux/Screen when configured); locally we also pipe to
+/// the native clipboard as a best-effort fallback.
+fn copy_to_clipboard(text: &str) {
+    let mut out = io::stdout();
+    let _ = out.write_all(&terminal_view::osc52(text));
+    let _ = out.flush();
+    native_clipboard(text);
+}
+
+#[cfg(target_os = "macos")]
+fn native_clipboard(text: &str) {
+    use std::process::{Command, Stdio};
+    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_clipboard(_text: &str) {
+    // On Linux the OSC 52 path is the primary; a native fallback (wl-copy /
+    // xclip) is deferred — it needs display-server detection that is out of
+    // scope for Phase 4b.
+}
+
+// --- terminal lifecycle ----------------------------------------------------
+
+/// Best-effort terminal restore, safe from the panic hook, the RAII guard, and
+/// an explicit call.
+fn restore_terminal() {
+    let mut out = io::stdout();
+    let _ = execute!(
+        out,
+        PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
+        DisableFocusChange,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show,
+    );
+    let _ = disable_raw_mode();
+    let _ = out.flush();
+}
+
+/// RAII terminal setup: raw mode, alternate screen, mouse/focus/paste capture,
+/// and a best-effort kitty keyboard push so Shift+Enter reaches the agent where
+/// the terminal supports it. Restores everything on drop and on panic.
+struct RawGuard;
+
+impl RawGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut out = io::stdout();
+        execute!(
+            out,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableFocusChange,
+            EnableBracketedPaste,
+        )?;
+        let _ = execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            prev(info);
+        }));
+        Ok(RawGuard)
+    }
+}
+
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shelbi_app::view::{NavItem, WorkspaceRow};
+
+    struct NoopConnector;
+    impl session::Connector for NoopConnector {
+        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<session::Connected, String> {
+            Err("no session in tests".into())
+        }
+    }
+
+    fn test_state() -> ShellState {
+        let caps = Caps {
+            kitty: true,
+            truecolor: true,
+            nested: None,
+        };
+        let mut st = ShellState::new("proj", Arc::new(NoopConnector), caps);
+        st.apply_snapshot(Snapshot {
+            generation: 1,
+            sidebar: Some(SidebarModel {
+                project_label: "proj".into(),
+                nav: vec![
+                    NavItem {
+                        label: "Chat".into(),
+                        view: View::Session("orch".into()),
+                    },
+                    NavItem {
+                        label: "Issues".into(),
+                        view: View::Issues,
+                    },
+                    NavItem {
+                        label: "Activity".into(),
+                        view: View::Activity,
+                    },
+                ],
+                workspaces: vec![WorkspaceRow {
+                    name: "alpha".into(),
+                    current_task: None,
+                    agent: None,
+                }],
+                reviews: vec![],
+                zen_on: false,
+                unread_errors: 0,
+            }),
+            ..Default::default()
+        });
+        st
+    }
+
+    #[test]
+    fn ctrl_space_toggles_focus_between_main_and_sidebar() {
+        let mut st = test_state();
+        st.client.focus_main();
+        assert!(st.focus_is_main());
+        // Ctrl+Space from the main area moves focus to the sidebar.
+        st.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        assert_eq!(st.client.focus(), Focus::Sidebar);
+        // And back again.
+        st.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        assert!(st.focus_is_main());
+    }
+
+    #[test]
+    fn sidebar_arrows_tab_and_enter_navigate_and_activate() {
+        let mut st = test_state();
+        st.client.focus_sidebar();
+        assert_eq!(st.selection(), 0, "starts on Chat");
+        st.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(st.selection(), 1, "Down → Issues");
+        st.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(st.selection(), 2, "Tab → Activity");
+        // Enter on a native view swaps the main area and keeps sidebar focus.
+        st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(st.main_view, MainView::Native(View::Activity)));
+        assert_eq!(st.client.focus(), Focus::Sidebar);
+    }
+
+    #[test]
+    fn activating_a_workspace_shows_its_session_and_focuses_main() {
+        let mut st = test_state();
+        st.client.focus_sidebar();
+        // Rows: 0 Chat, 1 Issues, 2 Activity, 3 alpha (workspace).
+        for _ in 0..3 {
+            st.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(st.selection(), 3);
+        st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(st.main_view, MainView::Session));
+        assert!(st.focus_is_main(), "opening a session focuses the main area");
+        assert_eq!(
+            st.sessions.current_target(),
+            Some(&SessionRef::Workspace("alpha".into()))
+        );
+    }
+
+    #[test]
+    fn layout_splits_sidebar_and_main() {
+        let area = Rect::new(0, 0, 100, 40);
+        let (sb, main) = layout(area, 28);
+        assert_eq!(sb, Rect::new(0, 0, 28, 40));
+        assert_eq!(main, Rect::new(28, 0, 72, 40));
+    }
+
+    #[test]
+    fn layout_clamps_a_too_wide_sidebar() {
+        let area = Rect::new(0, 0, 10, 5);
+        let (sb, main) = layout(area, 28);
+        assert_eq!(sb.width, 9, "sidebar leaves at least one column for main");
+        assert_eq!(main.width, 1);
+    }
+
+    #[test]
+    fn keyboard_notice_is_emitted_exactly_once() {
+        // Inside tmux with no kitty-protocol round-trip (the shape AC9 names).
+        let caps = Caps {
+            kitty: false,
+            truecolor: true,
+            nested: Some(caps::Nesting::Tmux),
+        };
+        let mut st = ShellState::new("proj", Arc::new(NoopConnector), caps);
+        // Armed at startup; within the window it paints the tmux-tailored notice.
+        let now = Instant::now();
+        let text = st.notice_text(now).expect("notice is armed without the kitty protocol");
+        assert!(text.contains("extended-keys"), "the tmux fix is named: {text}");
+        assert!(st.notice_text(now).is_some(), "still showing within the window");
+        // Past the deadline it clears...
+        let later = now + Duration::from_secs(NOTICE_SECS + 1);
+        assert!(st.notice_text(later).is_none(), "the notice hides after its deadline");
+        // ...and never re-arms, even if queried again with an earlier instant:
+        // the banner is emitted exactly once per run.
+        assert!(st.notice_text(now).is_none(), "the notice is never shown a second time");
+    }
+
+    #[test]
+    fn no_keyboard_notice_when_the_protocol_round_trips() {
+        let caps = Caps {
+            kitty: true,
+            truecolor: true,
+            nested: Some(caps::Nesting::Tmux),
+        };
+        let mut st = ShellState::new("proj", Arc::new(NoopConnector), caps);
+        assert!(st.notice_text(Instant::now()).is_none(), "kitty present → no notice");
+    }
+
+    #[test]
+    fn is_actionable_ignores_releases() {
+        use crossterm::event::{KeyEventKind, KeyEventState};
+        let press = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(terminal_view::is_actionable(&press));
+        let release = KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        };
+        assert!(!terminal_view::is_actionable(&release));
+    }
+}

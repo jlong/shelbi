@@ -28,6 +28,7 @@ mod keymap;
 mod layout_sub;
 mod markdown;
 mod review_panel;
+mod shell;
 mod sidebar;
 pub mod theme;
 mod zen_probe;
@@ -168,6 +169,16 @@ pub fn run_main(project_name: &str) -> Result<()> {
 
     shelbi_orchestrator::ensure_dashboard(project_name)
         .with_context(|| format!("setting up dashboard for `{project_name}`"))?;
+
+    // Remove-tmux Phase 4b: with the session backend on, `ensure_dashboard`
+    // above has already brought up the orchestrator *session* (not a tmux
+    // dashboard), so instead of `exec tmux attach` we run the single-process
+    // ratatui shell that owns the whole screen and shows sessions through
+    // shelbi-term / shelbi-client. With the flag off, nothing changes: we fall
+    // through to the tmux attach path exactly as before.
+    if shelbi_state::session_backend_enabled() {
+        return shell::run(project_name);
+    }
 
     let session = format!("shelbi-{project_name}");
     let inside_tmux = std::env::var("TMUX").is_ok();
