@@ -2520,21 +2520,9 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
             })?;
         }
         Host::Ssh { .. } => {
-            backend()
-                .spawn(a.host, &SessionTarget::from_tmux_addr(a.addr), None)
-                .map_err(|e| {
-                    Error::Other(format!(
-                        "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
-                        a.workspace.name,
-                        runner_label(&a.runner.command),
-                        a.runner.command,
-                    ))
-                })?;
-            // Remote panes run the agent directly — the lifecycle wrapper isn't
-            // deployed on the workspace host — so we build the launch command
-            // here and send it into the pane. This goes through the SAME
-            // `workspace_launch_command` constructor the local wrapper
-            // (`shelbi open --as-pane`) uses, so the two host paths can't drift.
+            // Both remote paths build the launch line the same way (so the local
+            // wrapper and the remote send can't drift): one `cd … && … exec
+            // <runner>` string through `workspace_launch_command`.
             let launch = workspace_launch_command_with_startup_prompt(
                 a.runner,
                 a.permission_mode,
@@ -2542,16 +2530,62 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
                 startup_prompt_rel,
             );
             let cd_launch = remote_cd_launch(a.host, a.worktree, &launch, a.port);
-            backend()
-                .send_line(a.host, &SessionTarget::from_tmux_addr(a.addr), &cd_launch)
-                .map_err(|e| {
-                Error::Other(format!(
-                    "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
-                    a.workspace.name,
-                    runner_label(&a.runner.command),
-                    a.runner.command,
-                ))
-            })?;
+
+            if shelbi_state::session_backend_enabled() {
+                // Session backend (Phase 5, rt-remote-spawn): the remote
+                // workspace *is* a detached `shelbi __session` started over SSH,
+                // not a tmux pane we send a line into. Resolve + gate the remote
+                // binary first (a missing/incompatible one fails the dispatch
+                // naming `shelbi machine setup`), then launch the session running
+                // the same `cd_launch` line under the remote login shell.
+                let bin = crate::remote_session::resolve_remote_bin(&a.workspace.machine)
+                    .map_err(|e| {
+                        Error::Other(format!(
+                            "remote dispatch for workspace `{}`: {e}",
+                            a.workspace.name
+                        ))
+                    })?;
+                let target = SessionTarget::from_tmux_addr(a.addr);
+                let spec = crate::remote_session::remote_launch_spec(
+                    crate::session_process_backend::session_name(&target),
+                    a.worktree.to_path_buf(),
+                    Some(a.task_id.to_string()),
+                    cd_launch,
+                );
+                crate::remote_session::spawn_remote_session(a.host, &bin, &spec).map_err(|e| {
+                    Error::Other(format!(
+                        "remote session startup failure for workspace `{}` using {} runner `{}`: {e}",
+                        a.workspace.name,
+                        runner_label(&a.runner.command),
+                        a.runner.command,
+                    ))
+                })?;
+            } else {
+                // tmux backend (default): create the remote session/pane, then
+                // send the launch line into it. Remote panes run the agent
+                // directly — the lifecycle wrapper isn't deployed on the
+                // workspace host.
+                backend()
+                    .spawn(a.host, &SessionTarget::from_tmux_addr(a.addr), None)
+                    .map_err(|e| {
+                        Error::Other(format!(
+                            "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
+                            a.workspace.name,
+                            runner_label(&a.runner.command),
+                            a.runner.command,
+                        ))
+                    })?;
+                backend()
+                    .send_line(a.host, &SessionTarget::from_tmux_addr(a.addr), &cd_launch)
+                    .map_err(|e| {
+                        Error::Other(format!(
+                            "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
+                            a.workspace.name,
+                            runner_label(&a.runner.command),
+                            a.runner.command,
+                        ))
+                    })?;
+            }
         }
     }
 
