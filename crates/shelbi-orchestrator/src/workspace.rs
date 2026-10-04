@@ -1984,12 +1984,28 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     let worktree = workspace_worktree(&machine, spec.workspace);
     let addr = workspace_tmux_addr(spec.project, spec.workspace)?;
 
+    // Register this launch with the cancellation registry, scoped to its
+    // (project, workspace). If a prior launch on this workspace timed out and
+    // bumped the generation (`rt-daemon-cancellation`), that abandoned launch's
+    // guard is already tripped: it checks this before every irreversible step
+    // below and stands down rather than starting an agent on a now-stale task.
+    // A launch started *after* the bump (the redispatch) gets a fresh guard and
+    // runs normally.
+    let cancel = crate::cancel::register(&spec.project.name, Some(&spec.workspace.name), crate::cancel::JobKind::Launch);
+
     // 0. Serialize the whole dispatch against any concurrent start for the
     //    same workspace. Without this, two `task start`s racing one
     //    workspace interleave sync-worktree / checkout / pane-recreate and
     //    leave the pane running one branch while the worktree sits on
     //    another. The guard is held until this function returns.
     let _dispatch_lock = shelbi_state::lock_workspace(&spec.project.name, &spec.workspace.name)?;
+
+    // Early bail: if we were cancelled while waiting for the dispatch lock (a
+    // timeout + redispatch raced us, or the project was quit), release the lock
+    // at once without touching the worktree or the pane.
+    if cancel.is_cancelled() {
+        return Err(cancelled_launch(spec.task_id, &spec.workspace.name));
+    }
 
     // 0a. If the project asks for auto-mode, claude must be v2.1.83+. Older
     //     versions silently fall back to `default` and the user gets a Bash
@@ -2098,6 +2114,17 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     if let Some(section) = &review_section {
         prompt.push_str(section);
     }
+
+    // The irreversible step. Everything above is reversible setup (worktree
+    // sync, pane validation); `deploy_and_spawn` creates the agent pane and
+    // starts the runner. If our generation was superseded while that setup ran
+    // — the launch timed out and the task was redispatched, or the project was
+    // quit — stop here rather than spawn an agent on a task that no longer
+    // wants this launch. This is the check that makes an abandoned launch that
+    // wakes late do nothing (`rt-daemon-cancellation`, acceptance criterion 1).
+    if cancel.is_cancelled() {
+        return Err(cancelled_launch(spec.task_id, &spec.workspace.name));
+    }
     deploy_and_spawn(SpawnArgs {
         project: spec.project,
         workspace: spec.workspace,
@@ -2115,6 +2142,18 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     })?;
 
     Ok(addr)
+}
+
+/// The error a launch returns when it stands down because its generation was
+/// superseded (a timeout + redispatch) or its project was quit. Mapped by
+/// [`shelbi_core::Error::is_cancelled`] so callers treat it as a clean no-op,
+/// never a failure to roll back or surface.
+fn cancelled_launch(task_id: &str, workspace: &str) -> Error {
+    Error::Cancelled(format!(
+        "launch of `{task_id}` on `{workspace}` was cancelled before spawning \
+         (generation superseded by a timeout + redispatch, or the project was quit); \
+         no agent was started"
+    ))
 }
 
 /// Relaunch a workspace on the task it is ALREADY working, without discarding
@@ -2162,9 +2201,18 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     let worktree = workspace_worktree(&machine, spec.workspace);
     let addr = workspace_tmux_addr(spec.project, spec.workspace)?;
 
+    // Same cancellation registration as the dev-start path: a resume that was
+    // superseded (timeout + redispatch) or whose project was quit stands down
+    // before touching the pane (`rt-daemon-cancellation`).
+    let cancel = crate::cancel::register(&spec.project.name, Some(&spec.workspace.name), crate::cancel::JobKind::Launch);
+
     // Serialize against any concurrent start/resume for the same workspace —
     // same rationale as the dev path. Held until this function returns.
     let _dispatch_lock = shelbi_state::lock_workspace(&spec.project.name, &spec.workspace.name)?;
+
+    if cancel.is_cancelled() {
+        return Err(cancelled_launch(spec.task_id, &spec.workspace.name));
+    }
 
     require_auto_mode_supported(&host, &runner, permission_mode.as_deref())?;
 
@@ -2226,6 +2274,11 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         resume,
         &handoff,
     );
+    // Irreversible step — stand down if our generation was superseded or the
+    // project quit while the resume synced its worktree.
+    if cancel.is_cancelled() {
+        return Err(cancelled_launch(spec.task_id, &spec.workspace.name));
+    }
     deploy_and_spawn(SpawnArgs {
         project: spec.project,
         workspace: spec.workspace,

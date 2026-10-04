@@ -101,6 +101,27 @@ use shelbi_state::{
 /// this cadence imposes is on SSH hosts.
 const FORWARD_RECHECK_INTERVAL: Duration = Duration::from_secs(120);
 
+/// Default wall-clock bound a poll thread's cancellation scope puts on a single
+/// SSH read (snapshot / title / get_env). Deliberately generous — well above a
+/// healthy capture's latency — so bounding the previously-unbounded poll reads
+/// never flaps a slow-but-alive host to `unreachable`; its real job is to stop
+/// a *wedged* host pinning the thread forever. Cancellation (a project quit)
+/// kills an in-flight read within a poll tick regardless of this bound, via the
+/// scope's cancel flag, so this only governs the no-quit wedge case.
+const DEFAULT_POLL_SUBPROC_DEADLINE_MS: u64 = 60_000;
+
+/// The poll thread's per-SSH-call deadline, env-overridable via
+/// `SHELBI_POLL_SUBPROC_DEADLINE_MS` (clamped to a sane range) so a test can
+/// drive it fast and a chronically slow link can be given a longer leash.
+fn poll_subprocess_deadline() -> Duration {
+    let ms = std::env::var("SHELBI_POLL_SUBPROC_DEADLINE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_POLL_SUBPROC_DEADLINE_MS)
+        .clamp(50, 600_000);
+    Duration::from_millis(ms)
+}
+
 /// Spawned poller handle. Dropping it asks the thread to exit and joins it.
 pub struct WorkspacePoller {
     shutdown: Arc<AtomicBool>,
@@ -249,8 +270,16 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     // are not retroactively reconciled — the accepted watermark tradeoff.
     let mut issue_reconcile = IssueReconcileSchedule::default();
 
+    // The project-wide supervisor job (`rt-daemon-cancellation`): its
+    // mutating passes below (orchestrator supervision, CI/GitHub/issue
+    // reconciles, stranded-slot resumes) all run on this thread and shell out,
+    // so a project quit must be able to cancel them and kill an in-flight call.
+    // Scoped to the project (no workspace), tripped by `quit_project`.
+    let job = crate::cancel::register(&project_name, None, crate::cancel::JobKind::Poll);
+    let _scope = crate::cancel::enter_scope(poll_subprocess_deadline(), job.cancel_flag());
+
     loop {
-        if shutdown.load(Ordering::SeqCst) {
+        if shutdown.load(Ordering::SeqCst) || job.is_cancelled() {
             break;
         }
         let project = match shelbi_state::load_project(&project_name) {
@@ -488,8 +517,19 @@ fn run_workspace_poll_loop(
     // grace window for a slot that was already mid-reap — harmless.
     let mut orphan_since: Option<Instant> = None;
 
+    // Bring this poll thread under the cancellation model
+    // (`rt-daemon-cancellation`). The job guard, scoped to this (project,
+    // workspace), is tripped when the project is quit; the scope installed from
+    // its cancel flag bounds every SSH read this thread makes and kills an
+    // in-flight one on cancellation — so a quit drains this thread promptly even
+    // if it is wedged on a dead host, instead of leaking it for the daemon's
+    // lifetime. The guard drops when this function returns, which is what the
+    // quit barrier waits for.
+    let job = crate::cancel::register(&project_name, Some(&workspace_name), crate::cancel::JobKind::Poll);
+    let _scope = crate::cancel::enter_scope(poll_subprocess_deadline(), job.cancel_flag());
+
     loop {
-        if shutdown.load(Ordering::SeqCst) {
+        if shutdown.load(Ordering::SeqCst) || job.is_cancelled() {
             break;
         }
         let project = match shelbi_state::load_project(&project_name) {

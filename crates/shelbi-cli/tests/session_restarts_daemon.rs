@@ -104,6 +104,41 @@ impl Home {
         self.sessions.push(child);
     }
 
+    /// Is the per-project poller lock (`<project_dir>/poller.lock`) currently
+    /// held? The daemon's per-project poller takes an exclusive `flock` on it
+    /// for its whole lifetime (`shelbi_state::acquire_poller_lock`), so a held
+    /// lock is proof that the daemon is supervising this project — the signal
+    /// we use to show supervision resumes after a restart. We probe it the same
+    /// way the real acquirer does: a non-blocking `LOCK_EX` whose refusal
+    /// (`EWOULDBLOCK`) means a live holder.
+    fn poller_lock_held(&self, project: &str) -> bool {
+        use std::os::unix::io::AsRawFd;
+        let path = self
+            .path
+            .join(PROJECTS)
+            .join(project)
+            .join("poller.lock");
+        let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+        else {
+            return false;
+        };
+        // SAFETY: `flock` on a valid fd we own; no memory is dereferenced.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            // We took it → nobody was holding it. Release at once so our probe
+            // never becomes the thing that keeps the daemon's poller out.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            false
+        } else {
+            true
+        }
+    }
+
     /// The daemon's recorded pid, if a pid file exists.
     fn daemon_pid(&self) -> Option<i32> {
         let text = std::fs::read_to_string(self.path.join("shelbi.pid")).ok()?;
@@ -197,6 +232,49 @@ fn a_session_restarts_the_daemon_when_its_project_is_open() {
     assert!(
         wait_until(Duration::from_secs(25), || socket_answers(&home.sock())),
         "the session watchdog must restart the crashed daemon within a few intervals"
+    );
+}
+
+#[test]
+fn supervision_resumes_on_its_own_after_the_daemon_is_restarted() {
+    // Acceptance criterion 3 (`rt-daemon-cancellation`): the daemon is killed
+    // with no client attached, a session process restarts it, and supervision
+    // resumes on its own. We prove "supervision resumes" via the per-project
+    // poller lock — the daemon's poller holds it for its whole life — so a lock
+    // that is held again after the restart means the poller came back up for the
+    // still-open project, with a fresh generation (nothing the quit barrier or a
+    // stale generation left behind blocks the resume).
+    let mut home = Home::new("resume");
+    home.open_project("p");
+    home.start_session("srd-resume", "p");
+
+    // First daemon comes up and starts supervising p.
+    assert!(
+        wait_until(Duration::from_secs(25), || socket_answers(&home.sock())),
+        "the session watchdog must start a daemon for an open project"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || home.poller_lock_held("p")),
+        "the daemon must start supervising the open project (poller lock held)"
+    );
+
+    // Crash it hard with no client attached. The lock dies with the holder.
+    let pid = home.daemon_pid().expect("a running daemon has a pid file");
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert!(
+        wait_until(Duration::from_secs(5), || !socket_answers(&home.sock())),
+        "the daemon must be gone after a SIGKILL"
+    );
+
+    // The watchdog restarts it, and supervision must resume on its own: the
+    // poller lock is taken again without any client ever attaching.
+    assert!(
+        wait_until(Duration::from_secs(25), || socket_answers(&home.sock())),
+        "the session watchdog must restart the crashed daemon"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || home.poller_lock_held("p")),
+        "supervision must resume on its own after the restart (poller lock held again)"
     );
 }
 
