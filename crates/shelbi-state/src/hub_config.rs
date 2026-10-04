@@ -38,6 +38,15 @@ pub struct DevConfig {
     /// byte-identical to today. See [`daemon_mutations_enabled`].
     #[serde(default)]
     pub daemon_mutations: bool,
+
+    /// Perform session operations (spawn/kill/probe/send/snapshot/title/…)
+    /// against detached `shelbi __session` processes instead of tmux. Off by
+    /// default: tmux stays the runtime, byte-identical to today. The
+    /// orchestrator's backend seam (`session_backend::backend()`) reads this
+    /// through [`session_backend_enabled`]. Dev-only, for exercising the
+    /// session-process backend before cutover.
+    #[serde(default)]
+    pub session_backend: bool,
 }
 
 impl DevConfig {
@@ -73,6 +82,25 @@ pub fn daemon_mutations_enabled() -> bool {
     }
     load_hub_config()
         .map(|c| c.dev.daemon_mutations)
+        .unwrap_or(false)
+}
+
+/// Whether session operations should run against `shelbi __session` processes
+/// instead of tmux.
+///
+/// `$SHELBI_SESSION_BACKEND` wins when set (`1`/`true` on, `0`/`false` off) so
+/// tests and quick local toggling need not touch the config file; otherwise the
+/// hidden [`DevConfig::session_backend`] flag in `~/.shelbi/shelbi.yaml` decides,
+/// defaulting to off. A config read error is treated as off — the session
+/// backend is the opt-in, so the safe fallback is tmux.
+pub fn session_backend_enabled() -> bool {
+    match std::env::var("SHELBI_SESSION_BACKEND").ok().as_deref() {
+        Some("1") | Some("true") => return true,
+        Some("0") | Some("false") => return false,
+        _ => {}
+    }
+    load_hub_config()
+        .map(|c| c.dev.session_backend)
         .unwrap_or(false)
 }
 
@@ -282,6 +310,37 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         let cfg = load_hub_config().unwrap();
         assert!(cfg.projects.is_empty());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn session_backend_defaults_off_and_is_env_overridable() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::remove_var("SHELBI_SESSION_BACKEND");
+
+        // No config, no env → the safe default is tmux (off).
+        assert!(!session_backend_enabled());
+
+        // The config flag turns it on, and the dev block is persisted only when
+        // it differs from the default.
+        let mut cfg = HubConfig::default();
+        cfg.dev.session_backend = true;
+        save_hub_config(&cfg).unwrap();
+        assert!(session_backend_enabled());
+        let yaml = std::fs::read_to_string(hub_config_path().unwrap()).unwrap();
+        assert!(yaml.contains("session_backend"), "dev block persisted: {yaml}");
+
+        // The env var wins over the config either way.
+        std::env::set_var("SHELBI_SESSION_BACKEND", "0");
+        assert!(!session_backend_enabled());
+        std::env::set_var("SHELBI_SESSION_BACKEND", "1");
+        let empty = HubConfig::default();
+        save_hub_config(&empty).unwrap();
+        assert!(session_backend_enabled());
+
+        std::env::remove_var("SHELBI_SESSION_BACKEND");
         std::env::remove_var("SHELBI_HOME");
     }
 }

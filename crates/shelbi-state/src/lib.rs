@@ -117,7 +117,8 @@ pub use agent_workspaces::{
 };
 pub use hub_config::{
     daemon_mutations_enabled, hub_config_path, list_projects, load_hub_config, save_hub_config,
-    touch_project_launched, DevConfig, HubConfig, ProjectMeta, ProjectSummary,
+    session_backend_enabled, touch_project_launched, DevConfig, HubConfig, ProjectMeta,
+    ProjectSummary,
 };
 pub use daemon_lifecycle::{
     daemon_lock_held, ensure_daemon_running, hub_lock_path, stop_daemon,
