@@ -109,6 +109,23 @@ pub enum HookUninstall {
     SkippedForeignHook,
 }
 
+/// The one-time disclosure printed (to stderr) when a scaffold/install path
+/// actually *writes* the hub branch guard, so the user learns it exists, what
+/// it does, and how to remove it — the exact transparency the silent-install
+/// trust incident demanded. Shared by `shelbi init` (the `project_create`
+/// engine) and `shelbi guard install` so both disclose identically. The
+/// returned string has no trailing newline (the caller's `eprintln!` adds one).
+pub fn hub_branch_guard_disclosure(work_dir: &Path) -> String {
+    format!(
+        "shelbi: installed a git pre-commit hook at {}/.git/hooks/pre-commit.\n\
+         shelbi:   It blocks commits to a protected branch ONLY inside Shelbi-managed\n\
+         shelbi:   agent panes (marked with SHELBI_MANAGED_CONTEXT); your own commits from\n\
+         shelbi:   a normal shell are never affected. Remove it anytime with\n\
+         shelbi:   `shelbi guard uninstall`.",
+        work_dir.display(),
+    )
+}
+
 /// Render the `pre-commit` script. The guard is context-scoped: a no-op
 /// unless the committing process carries [`MANAGED_CONTEXT_ENV`], after
 /// which it rejects commits while HEAD is attached to any of `protected`

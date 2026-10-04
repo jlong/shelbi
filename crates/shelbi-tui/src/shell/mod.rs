@@ -57,6 +57,8 @@ use shelbi_app::exec::{Effect, Mutation};
 use shelbi_app::nav::{ClientState, Focus, View};
 use shelbi_app::view::SidebarModel;
 use shelbi_app::CommandKind;
+use shelbi_core::{ConfigMode, IssueTrackerConfig};
+use shelbi_orchestrator::project_create::{self, ResolvedProjectRoot};
 use shelbi_state::keymap::{load_keymaps, GlobalAction, KeyChord, Keymaps};
 use shelbi_term::Size;
 
@@ -70,6 +72,7 @@ use review::{ReviewAction, ReviewInterface};
 use session::{LiveConnector, MainState, SessionManager, SessionRef};
 use sidebar::{RowTarget, SidebarView};
 
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 /// Resolved inputs the shell needs to build a [`ReviewInterface`], read off the
@@ -92,6 +95,13 @@ enum ReviewJobMsg {
     MergeDone(Result<(), String>),
     /// A reject-with-reason finished.
     RejectDone(Result<(), String>),
+}
+
+/// The result of the off-thread add-project job: the created project's slug (to
+/// switch to on the UI thread), or a user-facing failure message.
+enum CreateOutcome {
+    Created(String),
+    Failed(String),
 }
 
 /// The frame budget: redraws are capped at roughly 60 per second.
@@ -235,6 +245,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             state.dirty = true;
         }
         if state.poll_job() {
+            state.dirty = true;
+        }
+        if state.poll_create_job() {
             state.dirty = true;
         }
         if ring {
@@ -478,6 +491,11 @@ struct ShellState {
     /// finishes. Blocking commands (e.g. the Zen toggle) run here so they never
     /// freeze the one event loop.
     job: Option<Receiver<String>>,
+    /// A pending off-UI-thread add-project scaffold. Separate from [`Self::job`]
+    /// because on success the shell must switch to the new project on the UI
+    /// thread, so the result is typed ([`CreateOutcome`]) rather than a bare
+    /// status string.
+    create_job: Option<Receiver<CreateOutcome>>,
     should_quit: bool,
     dirty: bool,
 }
@@ -550,6 +568,7 @@ impl ShellState {
             palette_chord,
             status: None,
             job: None,
+            create_job: None,
             should_quit: false,
             dirty: true,
         }
@@ -874,7 +893,87 @@ impl ShellState {
                 self.client.focus_main();
                 self.apply_zen_intro(project, confirmed, dont_show_again);
             }
+            OverlayEvent::AddProjectCancel => {
+                self.overlay = None;
+                self.client.focus_main();
+            }
+            OverlayEvent::AddProjectSubmit { name, root, mode } => {
+                self.submit_add_project(name, root, mode)
+            }
         }
+    }
+
+    /// Validate the submitted add-project form. On success, close the form and
+    /// scaffold + switch off the UI thread; on failure, keep the form open with
+    /// the inline error so the user can fix the input. Validation itself is
+    /// cheap (a slug check, a collision lookup, a path stat) so it runs here.
+    fn submit_add_project(&mut self, name: String, root: String, mode: ConfigMode) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match project_create::validate_add_project(&name, &root, &cwd) {
+            Ok(resolved) => {
+                self.overlay = None;
+                self.client.focus_main();
+                self.create_project(resolved, mode);
+            }
+            Err(msg) => {
+                if let Some(ActiveOverlay::AddProject { form }) = self.overlay.as_mut() {
+                    form.set_error(msg);
+                }
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Scaffold the validated project off the UI thread (file IO can block),
+    /// pinning the `file_system` board the form has no control over. On success
+    /// [`Self::poll_create_job`] switches to it on the UI thread.
+    fn create_project(&mut self, resolved: ResolvedProjectRoot, mode: ConfigMode) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let slug = resolved.name.clone();
+        if std::thread::Builder::new()
+            .name("shelbi-add-project".into())
+            .spawn(move || {
+                let outcome = match project_create::scaffold_project(
+                    &resolved,
+                    mode,
+                    &IssueTrackerConfig::default(),
+                    &mut project_create::NullReporter,
+                ) {
+                    Ok(()) => CreateOutcome::Created(slug),
+                    Err(e) => CreateOutcome::Failed(format!("Add project failed: {e}")),
+                };
+                let _ = tx.send(outcome);
+            })
+            .is_ok()
+        {
+            self.status = Some("Creating project…".to_string());
+            self.create_job = Some(rx);
+        }
+    }
+
+    /// Poll the pending add-project scaffold without blocking. On success,
+    /// switch to the freshly created project; on failure, surface the error.
+    /// Returns `true` when the job finished (so the caller redraws).
+    fn poll_create_job(&mut self) -> bool {
+        let outcome = match &self.create_job {
+            Some(rx) => match rx.try_recv() {
+                Ok(o) => o,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => {
+                    CreateOutcome::Failed("add project stopped unexpectedly".to_string())
+                }
+            },
+            None => return false,
+        };
+        self.create_job = None;
+        match outcome {
+            CreateOutcome::Created(slug) => {
+                self.switch_project(&slug);
+                self.status = Some(format!("Created project {slug} — switched to it"));
+            }
+            CreateOutcome::Failed(msg) => self.status = Some(msg),
+        }
+        true
     }
 
     /// Resolve a palette entry to its command effect and dispatch it.
@@ -918,13 +1017,12 @@ impl ShellState {
             }
             Effect::SwitchProject { project } => self.switch_project(&project),
             Effect::AddProject => {
-                // Switching between already-open projects is this subtask's
-                // scope; creating a new one needs an in-process add-project
-                // form plus a shared creation path (the CLI's `add_project`
-                // lives in shelbi-cli, which shelbi-tui can't depend on), so it
-                // ports in its own overlay/creation subtask, not Phase 4f.
-                self.status =
-                    Some("Add project opens the add-project form (ported in its own subtask)".into())
+                // Open the in-process add-project form over the main area. On
+                // submit the shell validates + scaffolds through the shared
+                // `project_create` engine (the same path `shelbi init` uses),
+                // off the UI thread, then switches to the new project.
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                self.overlay = Some(ActiveOverlay::add_project(&cwd));
             }
             Effect::QuitProject { .. } => self.quit(QuitAction::QuitProject),
             Effect::QuitShelbi => self.quit(QuitAction::QuitShelbi),

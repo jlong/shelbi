@@ -1761,8 +1761,10 @@ dependencies = [
 name = "shelbi-orchestrator"
 version = "0.9.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "chrono-tz",
+ "dirs",
  "globset",
  "libc",
  "regex",

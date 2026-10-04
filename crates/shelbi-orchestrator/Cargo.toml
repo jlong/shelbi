@@ -23,6 +23,12 @@ shelbi-session = { workspace = true }
 serde = { workspace = true }
 regex = { workspace = true }
 serde_json = { workspace = true }
+# `project_create` renders the starter project YAML through serde, expands `~`
+# in a repo path, and reports scaffold failures as context-tagged `anyhow`
+# errors to match the CLI's existing init surface.
+anyhow = { workspace = true }
+serde_yaml = { workspace = true }
+dirs = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 signal-hook = "0.3"

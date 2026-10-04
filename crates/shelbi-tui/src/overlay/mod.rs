@@ -19,6 +19,7 @@
 //!   these same types, so the tmux runtime is byte-identical until cutover.
 
 // Submodules are added as each overlay is ported (removing-tmux Phase 4d).
+pub mod add_project;
 pub mod error_log;
 pub mod palette;
 pub mod review_confirm;
