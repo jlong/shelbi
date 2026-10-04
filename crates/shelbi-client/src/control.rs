@@ -17,8 +17,8 @@ use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use shelbi_proto::control::{
-    self, ChangeNote, ClientMsg, MutationRequest, ServerMsg, Stream as OutStream,
-    CONTROL_PROTOCOL_VERSION,
+    self, ChangeNote, ClientMsg, MutationRequest, ReviewSessionRequest, ServerMsg,
+    Stream as OutStream, CONTROL_PROTOCOL_VERSION,
 };
 
 use crate::error::ClientError;
@@ -161,6 +161,39 @@ impl ControlClient {
                 // The daemon closed as it stopped: the action took effect.
                 Ok(None) | Err(ClientError::UnexpectedEof) => return Ok(()),
                 Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Ask the daemon to start or stop a review slot's editor/diff/server
+    /// sessions (`rt-tui-review`). Blocks until the daemon reports
+    /// [`ServerMsg::Done`] (`Ok`) or [`ServerMsg::Failed`]
+    /// ([`ClientError::Mutation`]), draining any streamed lines through
+    /// `on_line`. The daemon owns the sessions' lifetime, so a `Close` that
+    /// returns `Ok` guarantees the editor/diff/server are gone and the port is
+    /// free.
+    pub fn review_session(
+        &mut self,
+        req: &ReviewSessionRequest,
+        on_line: &mut dyn FnMut(OutStream, &str),
+    ) -> Result<(), ClientError> {
+        self.write
+            .write_all(&control::encode(&ClientMsg::ReviewSession(req.clone()))?)?;
+        self.write.flush()?;
+
+        loop {
+            let msg: ServerMsg = self.read.read_frame()?.ok_or(ClientError::UnexpectedEof)?;
+            match msg {
+                ServerMsg::Line {
+                    request_id,
+                    stream,
+                    text,
+                } if request_id == req.request_id => on_line(stream, &text),
+                ServerMsg::Done { request_id } if request_id == req.request_id => return Ok(()),
+                ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
+                    return Err(ClientError::Mutation(error))
+                }
+                _ => {}
             }
         }
     }

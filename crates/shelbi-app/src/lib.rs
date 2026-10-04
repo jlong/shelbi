@@ -37,7 +37,8 @@ pub mod view;
 
 pub use command::{Command, CommandKind, CommandModel, CommandRegistry};
 pub use exec::{EditTarget, Effect, ExecError, ExecOutcome, Executor, Mutation};
-pub use exec_daemon::execute_mutation;
+pub use exec_daemon::{execute_mutation, review_session};
+pub use shelbi_proto::control::{ReviewRole, ReviewSessionOp};
 pub use nav::{ClientState, Focus, GlobalFlags, Overlay, View};
 pub use refresh::{spawn_refresher, RefreshHandle, Snapshot};
 pub use view::{

@@ -31,8 +31,8 @@ use std::time::Duration;
 
 use shelbi_orchestrator::mutate::{self, MutateError, OutputSink};
 use shelbi_proto::control::{
-    self, ChangeNote, ClientMsg, MutationError, MutationKind, MutationRequest, ServerMsg, Stream,
-    CONTROL_PROTOCOL_VERSION,
+    self, ChangeNote, ClientMsg, MutationError, MutationKind, MutationRequest, ReviewRole,
+    ReviewSessionOp, ReviewSessionRequest, ServerMsg, Stream, CONTROL_PROTOCOL_VERSION,
 };
 use shelbi_state::CLIENT_VERSION;
 
@@ -359,6 +359,13 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 });
                 let _ = tx.send(ServerMsg::Done { request_id });
             }
+            ClientMsg::ReviewSession(req) => {
+                // Detached like a mutation: the daemon owns the review sessions'
+                // lifetime, so a client that detaches right after asking doesn't
+                // abandon a half-spawned (or half-torn-down) interface.
+                let tx = tx.clone();
+                thread::spawn(move || run_review_session_job(req, tx));
+            }
         }
     }
 
@@ -448,6 +455,40 @@ fn run_job(origin: u64, req: MutationRequest, state: ControlState, tx: Sender<Se
             let _ = tx.send(ServerMsg::Failed {
                 request_id,
                 error: e.into(),
+            });
+        }
+    }
+}
+
+/// Carry out one review-session request (`rt-tui-review`): start/stop the
+/// editor/diff/server sessions of a review slot through
+/// [`shelbi_orchestrator::review_session`], then report the result keyed by
+/// `request_id`. These are not issue mutations (no board change, no
+/// expected-state gate), so they skip the per-issue lock and the recheck; the
+/// orchestrator calls are themselves idempotent and best-effort.
+fn run_review_session_job(req: ReviewSessionRequest, tx: Sender<ServerMsg>) {
+    use shelbi_orchestrator::review_session::{self, ReviewContentRole};
+    let request_id = req.request_id;
+    let result = match req.op {
+        ReviewSessionOp::Ensure { role } => {
+            let role = match role {
+                ReviewRole::Editor => ReviewContentRole::Editor,
+                ReviewRole::Diff => ReviewContentRole::Diff,
+            };
+            review_session::ensure_content_session(&req.project, &req.task, role)
+        }
+        ReviewSessionOp::Close => review_session::close_review(&req.project, &req.task),
+    };
+    match result {
+        Ok(()) => {
+            let _ = tx.send(ServerMsg::Done { request_id });
+        }
+        Err(e) => {
+            let _ = tx.send(ServerMsg::Failed {
+                request_id,
+                error: MutationError::Backend {
+                    message: e.to_string(),
+                },
             });
         }
     }

@@ -27,6 +27,13 @@ pub enum SessionRef {
     Orchestrator,
     /// A dev workspace's session.
     Workspace(String),
+    /// A review slot's content session: the editor or diff tool the review
+    /// interface shows in a terminal view (`rt-tui-review`). `slot` is the
+    /// review workspace, `role` is `editor` / `diff`. The daemon owns their
+    /// lifetime (see [`shelbi_orchestrator::review_session`]); the shell only
+    /// attaches. The review slot's agent (chat) session is a
+    /// [`SessionRef::Workspace`] of the slot name.
+    Review { slot: String, role: String },
 }
 
 impl SessionRef {
@@ -35,6 +42,7 @@ impl SessionRef {
         match self {
             SessionRef::Orchestrator => "orchestrator".to_string(),
             SessionRef::Workspace(w) => w.clone(),
+            SessionRef::Review { slot, role } => format!("{slot} {role}"),
         }
     }
 }
@@ -44,6 +52,7 @@ pub fn discovery_name(project: &str, r: &SessionRef) -> String {
     match r {
         SessionRef::Orchestrator => format!("{project}/orch"),
         SessionRef::Workspace(w) => format!("{project}/ws/{w}"),
+        SessionRef::Review { slot, role } => format!("{project}/review/{slot}/{role}"),
     }
 }
 

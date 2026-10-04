@@ -13,7 +13,8 @@
 //! are not part of the issue control protocol and are left to the host.
 
 use shelbi_proto::control::{
-    AddSpec, EditSpec, ExpectedState, MutationKind, MutationRequest, Stream,
+    AddSpec, EditSpec, ExpectedState, MutationKind, MutationRequest, ReviewSessionOp,
+    ReviewSessionRequest, Stream,
 };
 
 use crate::exec::{ExecError, ExecOutcome, Mutation};
@@ -29,6 +30,30 @@ pub fn execute_mutation(
 ) -> ExecOutcome {
     let (project, id, kind) = map_to_kind(mutation)?;
     route(&project, &id, kind, on_line)
+}
+
+/// Ask the daemon to start or stop a review slot's editor/diff/server sessions
+/// (`rt-tui-review`). The single-process TUI calls this off its UI thread when
+/// a review view is switched to (`Ensure`) and when a review is closed
+/// (`Close`); the daemon owns the sessions so they outlive a client detach and
+/// the teardown frees the slot's port. Streamed lines go to `on_line`.
+pub fn review_session(
+    project: &str,
+    task: &str,
+    op: ReviewSessionOp,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> ExecOutcome {
+    shelbi_state::ensure_daemon_running().map_err(|e| ExecError::Backend(e.to_string()))?;
+    let sock = shelbi_state::control_socket_path().map_err(|e| ExecError::Backend(e.to_string()))?;
+    let mut client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)
+        .map_err(|e| ExecError::Backend(e.to_string()))?;
+    let req = ReviewSessionRequest {
+        request_id: 1,
+        project: project.to_string(),
+        task: task.to_string(),
+        op,
+    };
+    client.review_session(&req, on_line).map_err(map_client_err)
 }
 
 /// Map an app [`Mutation`] to `(project, issue id, wire kind)`. The two

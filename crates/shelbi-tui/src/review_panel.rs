@@ -938,7 +938,7 @@ pub fn open_url_command(os: OsKind, url: &str) -> (String, Vec<String>) {
 
 /// Run a fire-and-forget opener command, mapping a launch failure to a short
 /// message the caller can surface on the status line (never a crash).
-fn spawn_opener(program: &str, args: &[String]) -> std::result::Result<(), String> {
+pub(crate) fn spawn_opener(program: &str, args: &[String]) -> std::result::Result<(), String> {
     std::process::Command::new(program)
         .args(args)
         .stdout(std::process::Stdio::null())
@@ -1307,7 +1307,7 @@ where
 
 /// Resolve the concrete review URL to open for `task_id` (with `$PORT` /
 /// `$SLOT` substituted), or `None` when none is configured.
-fn review_url(project_name: &str, task_id: &str) -> Option<String> {
+pub(crate) fn review_url(project_name: &str, task_id: &str) -> Option<String> {
     let project = shelbi_state::load_project(project_name).ok()?;
     let store = shelbi_state::issue_store_for_project(&project).ok()?;
     let tf = store.get(task_id).ok().flatten()?;

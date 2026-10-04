@@ -20,6 +20,7 @@ mod caps;
 mod changes;
 mod overlays;
 mod refresh;
+mod review;
 mod session;
 mod sidebar;
 mod terminal_view;
@@ -65,10 +66,33 @@ use crate::machines::MachinesApp;
 use caps::Caps;
 use overlays::{ActiveOverlay, OverlayEvent};
 use refresh::ShellSnapshot;
+use review::{ReviewAction, ReviewInterface};
 use session::{LiveConnector, MainState, SessionManager, SessionRef};
 use sidebar::{RowTarget, SidebarView};
 
 use std::sync::mpsc::{Receiver, TryRecvError};
+
+/// Resolved inputs the shell needs to build a [`ReviewInterface`], read off the
+/// UI thread (board + project config lookups).
+struct ReviewOpenParams {
+    task_id: String,
+    slot: String,
+    worktree: String,
+    editor_name: String,
+    has_review_url: bool,
+}
+
+/// A message from a review background job (all run off the UI thread).
+enum ReviewJobMsg {
+    /// A review-open resolution finished (build the interface, or show the error).
+    Opened(Result<ReviewOpenParams, String>),
+    /// A daemon `Ensure` for a content role finished; bind the view on success.
+    ContentReady(shelbi_app::ReviewRole, Result<(), String>),
+    /// The gated merge (approve) finished.
+    MergeDone(Result<(), String>),
+    /// A reject-with-reason finished.
+    RejectDone(Result<(), String>),
+}
 
 /// The frame budget: redraws are capped at roughly 60 per second.
 const FRAME: Duration = Duration::from_millis(16);
@@ -95,6 +119,15 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         Terminal::new(CrosstermBackend::new(io::stdout())).context("initializing the terminal")?;
 
     let mut state = ShellState::new(project, connector, caps);
+
+    // React to the daemon poller's layout events (review opened/closed/agent
+    // recovered), with this process's own change bus as the setting-off
+    // fallback — the same two sources the tmux sidebar drains
+    // (`rt-daemon-layout-split`), now driving the native review interface.
+    state.layout_bus = Some(shelbi_state::subscribe_changes());
+    // Held for the loop's lifetime; dropping it stops the subscriber thread.
+    let (_layout_sub, layout_rx) = crate::layout_sub::spawn(project);
+    state.layout_rx = Some(layout_rx);
 
     let proj = project.to_string();
     let refresher = refresh::spawn(move |generation| read_snapshot(&proj, generation));
@@ -170,11 +203,35 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         if had_moves {
             state.dirty = true;
         }
+        // Layout events (review opened/closed/agent recovered) from the daemon.
+        if state.poll_layout_events() {
+            state.dirty = true;
+        }
         let mut ring = false;
         if state.sessions.pump_output(&mut ring) {
             state.dirty = true;
         }
         if state.sessions.poll() {
+            state.dirty = true;
+        }
+        // The review interface's content terminal view runs its own connection.
+        if let Some(r) = state.review.as_mut() {
+            if r.pump_output(&mut ring) {
+                state.dirty = true;
+            }
+            if r.poll() {
+                state.dirty = true;
+            }
+            // Advance the merge spinner each tick while a gated merge runs.
+            if r.is_merging() {
+                r.tick_spinner();
+                state.dirty = true;
+            }
+        }
+        if state.poll_review() {
+            state.dirty = true;
+        }
+        if state.poll_review_reconcile() {
             state.dirty = true;
         }
         if state.poll_job() {
@@ -357,10 +414,29 @@ struct ShellState {
     client: ClientState,
     sessions: SessionManager,
     /// The connector, kept so a project switch can rebuild the session manager
-    /// for the new project.
+    /// for the new project, and so a review interface can build its own content
+    /// [`SessionManager`] (the main one is single-slot).
     connector: Arc<dyn session::Connector>,
     /// The project/shelbi quit operations (daemon control socket in production).
     lifecycle: Arc<dyn ShellLifecycle>,
+    /// The open review interface (panel + content terminal view), when
+    /// `main_view` is [`MainView::Review`]. `rt-tui-review`.
+    review: Option<ReviewInterface>,
+    /// In-flight review background work (open resolution, content ensure,
+    /// approve, reject). Drained by [`ShellState::poll_review`].
+    review_rx: Option<Receiver<ReviewJobMsg>>,
+    /// Pushed layout events from the daemon poller over the hub socket
+    /// (`rt-daemon-layout-split`), plus this process's own change bus as the
+    /// setting-off fallback. Drained by [`ShellState::poll_layout_events`].
+    layout_rx: Option<Receiver<shelbi_state::LayoutEvent>>,
+    layout_bus: Option<shelbi_state::ChangeSubscription>,
+    /// Throttle for the open-review close-reconcile (the board read runs off the
+    /// UI thread, at most ~1 Hz, and only while a review is open).
+    last_review_reconcile: Instant,
+    /// In-flight close-reconcile read: delivers `(task, still_open)` so a review
+    /// whose task has left the review column is dropped. Off-thread so a slow
+    /// (remote) board read never blocks the UI.
+    reconcile_rx: Option<Receiver<(String, bool)>>,
     caps: Caps,
     sidebar_model: Option<SidebarModel>,
     /// The embedded native views. They share their rendering (`render_full`) and
@@ -451,6 +527,12 @@ impl ShellState {
             sessions: SessionManager::new(project, connector.clone()),
             connector,
             lifecycle,
+            review: None,
+            review_rx: None,
+            layout_rx: None,
+            layout_bus: None,
+            last_review_reconcile: Instant::now(),
+            reconcile_rx: None,
             caps,
             sidebar_model: None,
             kanban,
@@ -565,6 +647,12 @@ impl ShellState {
                 let view = match &r {
                     SessionRef::Orchestrator => View::Session("orch".into()),
                     SessionRef::Workspace(w) => View::Session(w.clone()),
+                    // Review content sessions live inside the review interface's
+                    // own manager, never the main one; this arm only keeps the
+                    // match exhaustive.
+                    SessionRef::Review { slot, role } => {
+                        View::Session(format!("review/{slot}/{role}"))
+                    }
                 };
                 self.client.set_view(view);
                 self.sessions.show(r);
@@ -577,7 +665,7 @@ impl ShellState {
             RowTarget::Review(id) => {
                 // Review has no `View` variant (it is a transient interface, not a
                 // remembered main view), so it is not recorded.
-                self.main_view = MainView::Review(id);
+                self.open_review(id);
             }
         }
         self.dirty = true;
@@ -775,10 +863,7 @@ impl ShellState {
             OverlayEvent::Rejected { task_id, reason } => {
                 self.overlay = None;
                 self.client.focus_main();
-                let _ = &reason;
-                self.status = Some(format!(
-                    "Reject {task_id} — submitting the reason lands in the review interface"
-                ));
+                self.submit_reject(task_id, reason);
             }
             OverlayEvent::ZenResult {
                 project,
@@ -817,7 +902,7 @@ impl ShellState {
             Effect::FocusWorkspace { workspace, .. } => {
                 self.show(RowTarget::Session(SessionRef::Workspace(workspace)))
             }
-            Effect::LoadReview { task_id, .. } => self.show(RowTarget::Review(task_id)),
+            Effect::LoadReview { task_id, .. } => self.open_review(task_id),
             Effect::FocusSession { session } => {
                 self.status = Some(format!(
                     "focus session {session} — legacy spawned agents aren't shown here yet"
@@ -927,6 +1012,391 @@ impl ShellState {
         true
     }
 
+    // --- review interface (rt-tui-review) ----------------------------------
+
+    /// Begin opening the review interface for `task_id`: resolve its slot,
+    /// worktree, editor, and review-URL off the UI thread, then build the
+    /// interface when that lands (see [`ShellState::poll_review`]). The main
+    /// area switches to the Review view immediately so the user sees progress.
+    fn open_review(&mut self, task_id: String) {
+        // Already showing this review — no-op.
+        if self.review.as_ref().map(|r| r.task_id()) == Some(task_id.as_str())
+            && matches!(self.main_view, MainView::Review(_))
+        {
+            return;
+        }
+        self.main_view = MainView::Review(task_id.clone());
+        self.client.focus_main();
+        let project = self
+            .client
+            .project()
+            .map(str::to_string)
+            .unwrap_or_default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.review_rx = Some(rx);
+        self.status = Some(format!("opening review {task_id}…"));
+        std::thread::Builder::new()
+            .name("shelbi-review-open".into())
+            .spawn(move || {
+                let _ = tx.send(ReviewJobMsg::Opened(resolve_review_open(&project, &task_id)));
+            })
+            .ok();
+    }
+
+    /// Drain a finished review background job without blocking. Returns `true`
+    /// when something changed.
+    fn poll_review(&mut self) -> bool {
+        let msg = match &self.review_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(m) => m,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => {
+                    self.review_rx = None;
+                    return false;
+                }
+            },
+            None => return false,
+        };
+        self.review_rx = None;
+        match msg {
+            ReviewJobMsg::Opened(Ok(p)) => {
+                // Only build if we're still meant to be on this review.
+                if matches!(&self.main_view, MainView::Review(id) if *id == p.task_id) {
+                    let project = self
+                        .client
+                        .project()
+                        .map(str::to_string)
+                        .unwrap_or_default();
+                    self.review = Some(ReviewInterface::new(
+                        &project,
+                        self.connector.clone(),
+                        p.task_id,
+                        p.slot,
+                        p.worktree,
+                        p.editor_name,
+                        p.has_review_url,
+                    ));
+                    self.reported_main = None; // re-report size for the content view
+                    self.status = None;
+                }
+            }
+            ReviewJobMsg::Opened(Err(e)) => {
+                self.status = Some(format!("review failed: {e}"));
+                // Drop back to the orchestrator chat.
+                self.show(RowTarget::Session(SessionRef::Orchestrator));
+            }
+            ReviewJobMsg::ContentReady(role, Ok(())) => {
+                if let Some(r) = self.review.as_mut() {
+                    r.show_role(role);
+                    self.reported_main = None;
+                }
+            }
+            ReviewJobMsg::ContentReady(_, Err(e)) => {
+                if let Some(r) = self.review.as_mut() {
+                    r.set_status(format!("open view failed: {e}"));
+                    r.show_chat();
+                }
+            }
+            ReviewJobMsg::MergeDone(Ok(())) => self.finish_review_close("approved"),
+            ReviewJobMsg::MergeDone(Err(e)) => {
+                if let Some(r) = self.review.as_mut() {
+                    r.set_merging(false);
+                    r.set_status(format!("approve failed: {e}"));
+                }
+            }
+            ReviewJobMsg::RejectDone(Ok(())) => self.finish_review_close("rejected"),
+            ReviewJobMsg::RejectDone(Err(e)) => {
+                if let Some(r) = self.review.as_mut() {
+                    r.set_merging(false);
+                    r.set_status(format!("reject failed: {e}"));
+                }
+            }
+        }
+        true
+    }
+
+    /// Carry out one [`ReviewAction`] from the embedded panel. Blocking parts
+    /// run off the UI thread and report back through [`ReviewJobMsg`].
+    fn apply_review_action(&mut self, action: ReviewAction) {
+        let (Some(project), Some(review)) = (
+            self.client.project().map(str::to_string),
+            self.review.as_ref(),
+        ) else {
+            return;
+        };
+        let task = review.task_id().to_string();
+        match action {
+            ReviewAction::None => {}
+            ReviewAction::ShowContent(None) => {
+                if let Some(r) = self.review.as_mut() {
+                    r.show_chat();
+                    self.reported_main = None;
+                }
+            }
+            ReviewAction::ShowContent(Some(role)) => {
+                // Ask the daemon to ensure the editor/diff session, then bind it.
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.review_rx = Some(rx);
+                std::thread::Builder::new()
+                    .name("shelbi-review-ensure".into())
+                    .spawn(move || {
+                        let op = shelbi_app::ReviewSessionOp::Ensure { role };
+                        let res = shelbi_app::review_session(&project, &task, op, &mut |_, _| {})
+                            .map_err(|e| e.to_string());
+                        let _ = tx.send(ReviewJobMsg::ContentReady(role, res));
+                    })
+                    .ok();
+            }
+            ReviewAction::Approve => {
+                if let Some(r) = self.review.as_mut() {
+                    r.set_merging(true);
+                }
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.review_rx = Some(rx);
+                std::thread::Builder::new()
+                    .name("shelbi-review-approve".into())
+                    .spawn(move || {
+                        let m = shelbi_app::Mutation::ApproveReview {
+                            project: project.clone(),
+                            id: task.clone(),
+                        };
+                        let res = run_review_mutation(&m);
+                        let _ = tx.send(ReviewJobMsg::MergeDone(res));
+                    })
+                    .ok();
+            }
+            ReviewAction::Reject => {
+                self.overlay = Some(ActiveOverlay::reject_reason(task));
+            }
+            ReviewAction::OpenBrowser | ReviewAction::RevealFolder => {
+                // Openers run inline (spawn+detach); failures land on the status.
+                if let Some(r) = self.review.as_mut() {
+                    r.set_status("opening…");
+                }
+                self.spawn_review_opener(action);
+            }
+            ReviewAction::Back => {
+                // Leave the interface loaded (daemon sessions stay); just return
+                // to the orchestrator chat.
+                self.review = None;
+                self.show(RowTarget::Session(SessionRef::Orchestrator));
+            }
+            ReviewAction::Close => self.close_review(&project, &task),
+        }
+    }
+
+    /// Open the browser / reveal the folder for the current review, off-thread.
+    fn spawn_review_opener(&mut self, action: ReviewAction) {
+        let (Some(project), Some(review)) = (
+            self.client.project().map(str::to_string),
+            self.review.as_ref(),
+        ) else {
+            return;
+        };
+        let task = review.task_id().to_string();
+        self.spawn_job(move || match action {
+            ReviewAction::OpenBrowser => match review::open_browser(&project, &task) {
+                Ok(()) => "opened browser".to_string(),
+                Err(e) => format!("open browser failed: {e}"),
+            },
+            ReviewAction::RevealFolder => match review::reveal_folder(&project, &task) {
+                Ok(()) => "revealed folder".to_string(),
+                Err(e) => format!("reveal failed: {e}"),
+            },
+            _ => String::new(),
+        });
+    }
+
+    /// Close the review: ask the daemon to end the editor/diff/server sessions
+    /// (freeing the port), drop the interface, and return to the orchestrator.
+    fn close_review(&mut self, project: &str, task: &str) {
+        let project = project.to_string();
+        let task = task.to_string();
+        self.spawn_job(move || {
+            let op = shelbi_app::ReviewSessionOp::Close;
+            match shelbi_app::review_session(&project, &task, op, &mut |_, _| {}) {
+                Ok(()) => "review closed".to_string(),
+                Err(e) => format!("review close failed: {e}"),
+            }
+        });
+        self.review = None;
+        self.show(RowTarget::Session(SessionRef::Orchestrator));
+    }
+
+    /// Finish an approve/reject: the task has left review, so tear the interface
+    /// down (the daemon frees the sessions and port) and return to the chat.
+    fn finish_review_close(&mut self, how: &str) {
+        let project = self
+            .client
+            .project()
+            .map(str::to_string)
+            .unwrap_or_default();
+        if let Some(r) = self.review.as_ref() {
+            let task = r.task_id().to_string();
+            let p = project.clone();
+            self.spawn_job(move || {
+                let op = shelbi_app::ReviewSessionOp::Close;
+                let _ = shelbi_app::review_session(&p, &task, op, &mut |_, _| {});
+                String::new()
+            });
+        }
+        self.review = None;
+        self.status = Some(format!("review {how}"));
+        self.show(RowTarget::Session(SessionRef::Orchestrator));
+    }
+
+    /// Submit a reject-with-reason (from the reject overlay) off the UI thread.
+    /// Like approve, the review is held inert while it runs.
+    fn submit_reject(&mut self, task_id: String, reason: String) {
+        let Some(project) = self.client.project().map(str::to_string) else {
+            return;
+        };
+        if let Some(r) = self.review.as_mut() {
+            r.set_merging(true);
+        } else {
+            self.status = Some(format!("rejecting {task_id}…"));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.review_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("shelbi-review-reject".into())
+            .spawn(move || {
+                let m = shelbi_app::Mutation::RejectReview {
+                    project,
+                    id: task_id,
+                    reason,
+                };
+                let res = run_review_mutation(&m);
+                let _ = tx.send(ReviewJobMsg::RejectDone(res));
+            })
+            .ok();
+    }
+
+    // --- layout events (rt-daemon-layout-split, driven natively) -----------
+
+    /// Drain pushed layout events and the in-process change bus, applying each.
+    /// Also reconciles the open review against durable state so a `ReviewClosed`
+    /// missed while detached (or any stale review view) is dropped — the
+    /// close-reconcile the tmux path never needed (`rt-tui-review`).
+    fn poll_layout_events(&mut self) -> bool {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = self.layout_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => events.push(ev),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.layout_rx = None;
+        }
+        let project = self.client.project().map(str::to_string);
+        if let (Some(bus), Some(project)) = (self.layout_bus.as_ref(), project.as_ref()) {
+            while let Some(change) = bus.try_recv() {
+                if change.project() == *project {
+                    if let Some(ev) = change.layout() {
+                        events.push(ev.clone());
+                    }
+                }
+            }
+        }
+        let had = !events.is_empty();
+        for ev in events {
+            self.apply_layout_event(ev);
+        }
+        // Kick off a close-reconcile so a review whose task has left the review
+        // column is dropped even if its ReviewClosed event was missed while this
+        // client was detached. Throttled (after any real layout event, else at
+        // most ~1 Hz) and run off the UI thread, so a slow (remote) board read
+        // never blocks the loop. Only while a review is actually open.
+        if (had || self.last_review_reconcile.elapsed() >= Duration::from_secs(1))
+            && self.reconcile_rx.is_none()
+        {
+            self.spawn_review_reconcile();
+        }
+        had
+    }
+
+    /// Start an off-thread board read that reports whether the open review's
+    /// task is still in the review column (the close-reconcile source).
+    fn spawn_review_reconcile(&mut self) {
+        let MainView::Review(task) = &self.main_view else {
+            return;
+        };
+        let task = task.clone();
+        let Some(project) = self.client.project().map(str::to_string) else {
+            return;
+        };
+        self.last_review_reconcile = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        if std::thread::Builder::new()
+            .name("shelbi-review-reconcile".into())
+            .spawn(move || {
+                let still = review_task_still_open(&project, &task);
+                let _ = tx.send((task, still));
+            })
+            .is_ok()
+        {
+            self.reconcile_rx = Some(rx);
+        }
+    }
+
+    /// Apply a finished close-reconcile read. Returns `true` if it dropped a
+    /// stale review view.
+    fn poll_review_reconcile(&mut self) -> bool {
+        let (task, still_open) = match &self.reconcile_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(v) => v,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => {
+                    self.reconcile_rx = None;
+                    return false;
+                }
+            },
+            None => return false,
+        };
+        self.reconcile_rx = None;
+        if !still_open && self.showing_review(&task) {
+            self.review = None;
+            self.status = Some(format!("review {task} closed"));
+            self.show(RowTarget::Session(SessionRef::Orchestrator));
+            return true;
+        }
+        false
+    }
+
+    fn apply_layout_event(&mut self, ev: shelbi_state::LayoutEvent) {
+        use shelbi_state::LayoutEvent::*;
+        match ev {
+            ReviewClosed { task, .. } => {
+                // If we're showing that review, drop it and return to chat. The
+                // daemon already freed the slot; no client teardown needed.
+                if self.showing_review(&task) {
+                    self.review = None;
+                    self.status = Some(format!("review {task} closed"));
+                    self.show(RowTarget::Session(SessionRef::Orchestrator));
+                }
+            }
+            // Opened/AgentRecovered: the sessions are the daemon's half; the
+            // interface opens on user selection and the content view reconnects
+            // on its own. A refresh keeps the sidebar current. OrchestratorRestarted
+            // likewise needs nothing here (the main session reconnects).
+            ReviewOpened { .. } | ReviewAgentRecovered { .. } | OrchestratorRestarted => {}
+        }
+    }
+
+    /// Whether the main area is currently showing the review for `task`.
+    fn showing_review(&self, task: &str) -> bool {
+        matches!(&self.main_view, MainView::Review(id) if id == task)
+            && self.review.as_ref().map(|r| r.task_id()) == Some(task)
+    }
+
     fn handle_sidebar_key(&mut self, k: KeyEvent) {
         let count = self
             .sidebar_view()
@@ -947,6 +1417,16 @@ impl ShellState {
     }
 
     fn handle_main_key(&mut self, k: KeyEvent) {
+        // The review interface owns the main area when it is open: keys drive
+        // the panel or forward to its content view (rt-tui-review).
+        if matches!(self.main_view, MainView::Review(_)) {
+            if let Some(r) = self.review.as_mut() {
+                let action = r.handle_key(k);
+                self.apply_review_action(action);
+                self.dirty = true;
+            }
+            return;
+        }
         // A native view handles its own keys (board nav / moves / popover /
         // dropdowns, activity scroll / filters, machines nav / open). The session
         // path below is only for a terminal view. (The palette-open chord is
@@ -1148,6 +1628,16 @@ impl ShellState {
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.client.focus_main();
         }
+        // The review interface owns main-area mouse when it is open.
+        if matches!(self.main_view, MainView::Review(_)) {
+            let area = self.main_rect;
+            if let Some(r) = self.review.as_mut() {
+                let action = r.handle_mouse(m, area);
+                self.apply_review_action(action);
+                self.dirty = true;
+            }
+            return;
+        }
 
         // Native views handle their own mouse. The board's hit maps and the
         // feed's pill hits are recorded in `render_full` against `main_rect`
@@ -1231,6 +1721,54 @@ fn toggle_zen_blocking(project: &str) -> Result<String, String> {
     Ok(format!("Zen Mode {word}"))
 }
 
+/// Resolve the inputs for a review panel off the UI thread (board + project
+/// config reads). The orchestrator owns the resolution so it matches the
+/// daemon's session-spawn path (`rt-tui-review`).
+fn resolve_review_open(project: &str, task_id: &str) -> Result<ReviewOpenParams, String> {
+    let info = shelbi_orchestrator::review_session::review_open_info(project, task_id)
+        .map_err(|e| e.to_string())?;
+    Ok(ReviewOpenParams {
+        task_id: task_id.to_string(),
+        slot: info.slot,
+        worktree: info.worktree,
+        editor_name: info.editor_name,
+        has_review_url: info.has_review_url,
+    })
+}
+
+/// Run an approve/reject review mutation through the daemon control socket
+/// (`shelbi_app::execute_mutation`), stringifying the outcome for the worker.
+fn run_review_mutation(m: &shelbi_app::Mutation) -> Result<(), String> {
+    shelbi_app::execute_mutation(m, &mut |_s, _t| {}).map_err(|e| e.to_string())
+}
+
+/// Whether `task` is still a review-column task on a review slot — the
+/// board-derived state a late-attaching (or reconnecting) client lays out from
+/// (`review_ui::review_layout_state`). Used to reconcile a stale open review
+/// view after a missed `ReviewClosed` (`rt-tui-review`).
+fn review_task_still_open(project: &str, task: &str) -> bool {
+    match shelbi_orchestrator::review_ui::review_layout_state(project) {
+        Ok(slots) => !review_view_is_stale(task, &slots),
+        // A transient read error must not yank a live review out from under the
+        // user; keep it until a definitive "not in review" read.
+        Err(_) => true,
+    }
+}
+
+/// Whether an open review view for `shown` should be dropped because its task
+/// is no longer among the review-column slots `open` — the close half of
+/// late-attach reconciliation. `rt-daemon-layout-split`'s
+/// [`review_layout_state`](shelbi_orchestrator::review_ui::review_layout_state)
+/// reconciled only opens; a `ReviewClosed` missed while this client was
+/// detached (or a review that advanced out-of-band) must still drop its view
+/// on reconnect (`rt-tui-review`).
+fn review_view_is_stale(
+    shown: &str,
+    open: &[shelbi_orchestrator::review_ui::ReviewSlotLayout],
+) -> bool {
+    !open.iter().any(|s| s.task == shown)
+}
+
 // --- rendering -------------------------------------------------------------
 
 fn draw(
@@ -1254,6 +1792,10 @@ fn draw(
     let main_size = Size::new(main_rect.width, main_rect.height);
     if state.reported_main != Some(main_size) {
         state.sessions.resize(main_size.cols, main_size.rows);
+        // The review content view occupies only the content sub-rect.
+        if let Some(r) = state.review.as_ref() {
+            r.resize(main_rect);
+        }
         state.reported_main = Some(main_size);
     }
 
@@ -1269,12 +1811,16 @@ fn draw(
     // borrow while it holds shared borrows of the rest of `state`; it is put
     // back right after the draw.
     let mut overlay = state.overlay.take();
+    // Taken out like the overlay so the draw closure can render it with a
+    // mutable borrow of the frame; put back after the draw (rt-tui-review).
+    let mut review = state.review.take();
 
     // Borrow what the closure needs. `sidebar_view` is owned and `main_view` is
     // cloned (cheap) so the closure can disjointly borrow the embedded views
     // mutably — a native view's `render_full` takes `&mut app` and `&mut Frame`.
     let sidebar_view = state.sidebar_view();
     let main_view = state.main_view.clone();
+    let is_review = matches!(main_view, MainView::Review(_));
     let kanban = &mut state.kanban;
     let activity = &mut state.activity;
     let machines = &mut state.machines;
@@ -1283,8 +1829,8 @@ fn draw(
     let mut cursor: Option<(u16, u16)> = None;
     let begin = execute!(io::stdout(), BeginSynchronizedUpdate);
     let res = term.draw(|frame| {
-        // A native view renders through the `Frame` (its own `render_full`), so it
-        // must run before we take the shared buffer below.
+        // Native views render through the `Frame` (their own `render_full`), so
+        // they must run before the shared buffer is taken below.
         match &main_view {
             MainView::Native(View::Issues) => crate::kanban::render_full(frame, kanban, main_rect),
             MainView::Native(View::Activity) => {
@@ -1296,58 +1842,74 @@ fn draw(
             _ => {}
         }
 
-        let buf = frame.buffer_mut();
+        // All buffer-level painting happens next, in its own scope, so the `buf`
+        // borrow ends before the review interface / overlay re-borrow the frame.
+        {
+            let buf = frame.buffer_mut();
 
-        // Sidebar.
-        if let Some(view) = &sidebar_view {
-            view.render(buf, sidebar_rect, selection, !focus_main);
-        }
+            // Sidebar.
+            if let Some(view) = &sidebar_view {
+                view.render(buf, sidebar_rect, selection, !focus_main);
+            }
 
-        // Main area (session / review; native views were drawn above).
-        match &main_view {
-            MainView::Session => match sessions.state() {
-                MainState::Empty => render_placeholder(buf, main_rect, "No session"),
-                MainState::Connecting(r) => {
-                    render_placeholder(buf, main_rect, &format!("Connecting to {}…", r.display()))
-                }
-                MainState::Failed(r, err) => render_placeholder(
-                    buf,
-                    main_rect,
-                    &format!("Couldn't attach to {}: {err}", r.display()),
-                ),
-                MainState::Live(pane) => {
-                    let cur = pane.render(buf, main_rect, truecolor);
-                    if focus_main {
-                        cursor = cur;
+            // Main area (session / review-fallback; native views drawn above).
+            match &main_view {
+                MainView::Session => match sessions.state() {
+                    MainState::Empty => render_placeholder(buf, main_rect, "No session"),
+                    MainState::Connecting(r) => {
+                        render_placeholder(buf, main_rect, &format!("Connecting to {}…", r.display()))
+                    }
+                    MainState::Failed(r, err) => render_placeholder(
+                        buf,
+                        main_rect,
+                        &format!("Couldn't attach to {}: {err}", r.display()),
+                    ),
+                    MainState::Live(pane) => {
+                        let cur = pane.render(buf, main_rect, truecolor);
+                        if focus_main {
+                            cursor = cur;
+                        }
+                    }
+                },
+                MainView::Native(_) => {} // drawn above
+                MainView::Review(id) => {
+                    // The interface itself renders at the frame level below; this
+                    // is only the "still opening" fallback before it is built.
+                    if review.is_none() {
+                        render_placeholder(buf, main_rect, &format!("opening review {id}…"));
                     }
                 }
-            },
-            MainView::Native(_) => {} // drawn above
-            MainView::Review(id) => render_placeholder(
-                buf,
-                main_rect,
-                &format!("Review of {id} — the review interface lands in rt-tui-review"),
-            ),
+            }
+
+            // The review panel carries its own status line, so the shell's
+            // bottom-row status/search band is only for the other main views.
+            if !is_review {
+                if let Some(q) = &searching {
+                    render_search_prompt(buf, main_rect, q);
+                } else if let Some(s) = &status {
+                    render_status(buf, main_rect, s);
+                }
+            }
+
+            // One-time keyboard-protocol notice.
+            if let Some(text) = notice {
+                render_notice(buf, area, text);
+            }
         }
 
-        // Scrollback search prompt (bottom of the main area; session view only).
-        if let Some(q) = &searching {
-            render_search_prompt(buf, main_rect, q);
-        } else if let Some(s) = &status {
-            // A one-line status note on the main area's bottom row (effect
-            // results, deferred-feature notes, background-job outcomes).
-            render_status(buf, main_rect, s);
-        }
-
-        // One-time keyboard-protocol notice.
-        if let Some(text) = notice {
-            render_notice(buf, area, text);
+        // The review interface (panel + content terminal view) renders with a
+        // mutable frame borrow.
+        if let Some(r) = review.as_mut() {
+            let cur = r.render(frame, main_rect, truecolor, focus_main);
+            if overlay.is_none() {
+                cursor = cur;
+            }
         }
 
         // Dim the main area under an open overlay so the modal reads as on top
         // (the overlay's own `Clear` un-dims the cells it occupies).
         if overlay.is_some() {
-            dim_area(buf, main_rect);
+            dim_area(frame.buffer_mut(), main_rect);
         }
 
         // An open overlay draws over the dimmed main area and owns the cursor.
@@ -1358,6 +1920,7 @@ fn draw(
         }
     });
     state.overlay = overlay;
+    state.review = review;
     if begin.is_ok() {
         let _ = execute!(io::stdout(), EndSynchronizedUpdate);
     }
@@ -1416,7 +1979,9 @@ fn row_target_to_view(target: &RowTarget) -> Option<View> {
         RowTarget::Session(SessionRef::Orchestrator) => Some(View::Session(ORCH_VIEW.to_string())),
         RowTarget::Session(SessionRef::Workspace(w)) => Some(View::Session(w.clone())),
         RowTarget::Native(v) => Some(v.clone()),
-        RowTarget::Review(_) => None,
+        // A review content session (editor/diff) is transient and laid out from
+        // current state, never restored from a saved view. `rt-tui-review`.
+        RowTarget::Session(SessionRef::Review { .. }) | RowTarget::Review(_) => None,
     }
 }
 
@@ -1890,6 +2455,22 @@ mod tests {
             st.sessions.current_target(),
             Some(&SessionRef::Workspace("alpha".into()))
         );
+    }
+
+    #[test]
+    fn close_reconcile_drops_a_review_whose_task_left_the_column() {
+        use shelbi_orchestrator::review_ui::ReviewSlotLayout;
+        let open = vec![ReviewSlotLayout {
+            workspace: "review-1".into(),
+            task: "t-a".into(),
+        }];
+        // A review whose task is still on a review slot stays.
+        assert!(!review_view_is_stale("t-a", &open));
+        // A review whose task has left the review column is dropped — the
+        // close-reconcile the open-only layout events missed (rt-tui-review).
+        assert!(review_view_is_stale("t-gone", &open));
+        // Nothing open at all → any shown review is stale.
+        assert!(review_view_is_stale("t-a", &[]));
     }
 
     #[test]
