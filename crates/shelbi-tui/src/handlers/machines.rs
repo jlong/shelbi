@@ -123,6 +123,7 @@ mod tests {
                 is_local: true,
                 tags: vec![],
                 remote: None,
+                reachability: shelbi_orchestrator::machine::Reachability::Reachable,
                 workspaces: vec![
                     WorkspaceRow {
                         name: "a".into(),

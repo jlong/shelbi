@@ -26,6 +26,7 @@ mod handlers;
 mod kanban;
 mod keymap;
 mod machines;
+mod reachability;
 mod layout_sub;
 mod markdown;
 pub mod overlay;
@@ -389,6 +390,9 @@ pub fn run_machines(project_name: &str) -> Result<()> {
 
     let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = MachinesApp::new(project_name);
+    // Live reachability probing in the background (off the render path); the
+    // prober winds down when `app` drops at the end of this function.
+    app.enable_reachability();
     app.refresh();
 
     let result = handlers::machines::machines_loop(&mut term, &mut app, &keymaps);

@@ -441,6 +441,11 @@ impl ShellState {
         // Board moves go through the shelbi-app executor (daemon-backed when
         // `dev.daemon_mutations` is on); the standalone process keeps its direct path.
         kanban.move_persister = Some(Arc::new(ExecutorMovePersister));
+        // The embedded machines view probes remote reachability in the
+        // background (off the UI thread and the refresh worker); the prober
+        // winds down when the shell state drops.
+        let mut machines = MachinesApp::new(project);
+        machines.enable_reachability();
         Self {
             client: ClientState::new(project),
             sessions: SessionManager::new(project, connector.clone()),
@@ -450,7 +455,7 @@ impl ShellState {
             sidebar_model: None,
             kanban,
             activity: ActivityApp::new(project),
-            machines: MachinesApp::new(project),
+            machines,
             keymaps,
             main_view: MainView::Session,
             sidebar_rect: Rect::default(),
@@ -1822,6 +1827,7 @@ mod tests {
                 is_local: true,
                 tags: vec![],
                 remote: None,
+                reachability: shelbi_orchestrator::machine::Reachability::Reachable,
                 workspaces: vec![MachineWsRow { name: "alpha".into(), state: None, current_task: None }],
             }],
         });
