@@ -19,13 +19,16 @@
 //! the name without a side channel. Native plan-shaped targets land when the
 //! callers are rewritten at cutover.
 //!
-//! **Scope (Phase 2, behind the dev flag).**
+//! **Remote workspaces (Phase 5, `rt-remote-spawn`).** A `Host::Ssh` target is
+//! a session process on another machine, started over SSH and reached through
+//! one relay per machine ([`crate::remote_session`]). Every remote operation
+//! below delegates there: spawn runs `shelbi session new` on the remote, and
+//! probe / send / snapshot / title / kill / resize / enumerate ride the relay. A
+//! machine that cannot be reached reports [`Liveness::Unreachable`] (never
+//! `Dead`), so an SSH blip never makes a live remote agent look absent.
 //!
-//! - **Local only.** Remote (`Host::Ssh`) session spawn is Phase 5
-//!   (`rt-remote-spawn`): remote operations here report
-//!   [`Liveness::Unreachable`] / an error rather than silently succeeding, so a
-//!   `Host::Ssh` workspace is never mistaken for dead. A developer exercising
-//!   the flag uses a local project.
+//! **Scope (Phase 2+, behind the dev flag).**
+//!
 //! - **Metadata / session env are not persisted.** tmux user options
 //!   (`@shelbi-user-shell`) and the session environment (`SHELBI_PANE_orch`,
 //!   the review `SHELBI_REVIEW_*` keys) have no session-process analogue yet;
@@ -35,6 +38,7 @@
 //!   degrades to "rebuild from scratch" rather than misbehaving. Persisting
 //!   these moves with the daemon/TUI in Phases 3–4.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use shelbi_client::{DiscoveredSession, SnapshotSource};
@@ -42,6 +46,7 @@ use shelbi_core::{Error, Host, Result};
 use shelbi_proto::capability;
 use shelbi_session::SpawnSpec;
 
+use crate::remote_session;
 use crate::session_backend::{
     injection_guard, InjectionGuard, Liveness, RespawnOutcome, SessionBackend, SessionTarget,
     SlotInfo, TargetParts,
@@ -134,29 +139,41 @@ impl SessionProcessBackend {
         Ok(conn)
     }
 
-    /// Reject a remote host up front: the session backend is local-only until
-    /// Phase 5 (`rt-remote-spawn`). Returns the error a `Result`-returning op
-    /// should surface.
-    fn remote_unsupported(op: &str) -> Error {
-        Error::Other(format!(
-            "session backend cannot {op} on a remote host yet (remote spawn is Phase 5 rt-remote-spawn)"
-        ))
-    }
 }
 
 impl SessionBackend for SessionProcessBackend {
-    fn spawn(&self, _host: &Host, _target: &SessionTarget, _command: Option<&str>) -> Result<()> {
+    fn spawn(&self, host: &Host, target: &SessionTarget, command: Option<&str>) -> Result<()> {
         // `spawn` is the trait's *remote* workspace path (the local dispatch
-        // uses the inherent `Backend::spawn_local_pane`). Remote session spawn
-        // is Phase 5 (`rt-remote-spawn`), so this is unsupported either way.
-        Err(Self::remote_unsupported("spawn a session"))
+        // uses the inherent `Backend::spawn_local_pane`). A remote session runs
+        // the given launch command under a login shell; the dispatch path
+        // (`deploy_and_spawn`) builds the full `cd … && … exec <runner>` line and
+        // passes it here, having already resolved+gated the remote binary.
+        if !host.is_ssh() {
+            return Err(Error::Other(
+                "local workspace spawn uses spawn_local_pane, not the neutral spawn".into(),
+            ));
+        }
+        let cmd = command.ok_or_else(|| {
+            Error::Other("remote session spawn needs a launch command".into())
+        })?;
+        let worktree = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let spec = remote_session::remote_launch_spec(
+            session_name(target),
+            worktree,
+            None,
+            cmd.to_string(),
+        );
+        let bin = remote_session::relay_bin_for_host(host);
+        remote_session::spawn_remote_session(host, &bin, &spec)
     }
 
     fn kill(&self, host: &Host, target: &SessionTarget) -> Result<()> {
-        if host.is_ssh() {
-            return Err(Self::remote_unsupported("kill a session"));
-        }
         let name = session_name(target);
+        if host.is_ssh() {
+            return remote_session::kill(host, &name);
+        }
         // Best-effort: an already-dead session is fine. Signal the child's
         // process group over the socket; the session writes its exit record and
         // exits once the child is gone.
@@ -169,15 +186,15 @@ impl SessionBackend for SessionProcessBackend {
     }
 
     fn probe(&self, host: &Host, target: &SessionTarget, _deadline: Option<Duration>) -> Liveness {
+        let name = session_name(target);
         if host.is_ssh() {
-            return Liveness::Unreachable {
-                reason: "session backend is local-only (remote is Phase 5 rt-remote-spawn)".into(),
-            };
+            // Over the relay: Alive/Dead when the machine answers, Unreachable
+            // when it cannot be reached (never collapsed to Dead).
+            return remote_session::probe(host, &name);
         }
         // A local scan is a filesystem read: it always produces a definitive
         // answer, so the deadline is irrelevant and the probe is never
         // Unreachable. A name that no live session carries is Dead.
-        let name = session_name(target);
         match self.find_any(&name) {
             Some(s) if s.alive => Liveness::Alive,
             _ => Liveness::Dead,
@@ -185,10 +202,10 @@ impl SessionBackend for SessionProcessBackend {
     }
 
     fn send_text(&self, host: &Host, target: &SessionTarget, text: &str) -> Result<()> {
-        if host.is_ssh() {
-            return Err(Self::remote_unsupported("send text"));
-        }
         let name = session_name(target);
+        if host.is_ssh() {
+            return remote_session::send_text(host, &name, text);
+        }
         let session = self
             .find_live(&name)
             .ok_or_else(|| Error::Other(format!("no live session `{name}` to send to")))?;
@@ -201,10 +218,10 @@ impl SessionBackend for SessionProcessBackend {
     }
 
     fn send_enter(&self, host: &Host, target: &SessionTarget) -> Result<()> {
-        if host.is_ssh() {
-            return Err(Self::remote_unsupported("send enter"));
-        }
         let name = session_name(target);
+        if host.is_ssh() {
+            return remote_session::send_enter(host, &name);
+        }
         let session = self
             .find_live(&name)
             .ok_or_else(|| Error::Other(format!("no live session `{name}` to send Enter to")))?;
@@ -225,10 +242,10 @@ impl SessionBackend for SessionProcessBackend {
     }
 
     fn history(&self, host: &Host, target: &SessionTarget, lines: usize) -> Result<String> {
-        if host.is_ssh() {
-            return Err(Self::remote_unsupported("snapshot"));
-        }
         let name = session_name(target);
+        if host.is_ssh() {
+            return remote_session::snapshot(host, &name, lines);
+        }
         let session = self
             .find_any(&name)
             .ok_or_else(|| Error::Other(format!("no session `{name}` to snapshot")))?;
@@ -246,10 +263,14 @@ impl SessionBackend for SessionProcessBackend {
     }
 
     fn final_screen(&self, host: &Host, target: &SessionTarget) -> Result<String> {
-        if host.is_ssh() {
-            return Err(Self::remote_unsupported("read a final screen"));
-        }
         let name = session_name(target);
+        if host.is_ssh() {
+            // A relay bridges live sockets only — a dead remote session's
+            // `final.txt` is not reachable this way. Return the live screen when
+            // it is still up; otherwise this surfaces an error the crash-record
+            // caller already tolerates.
+            return remote_session::snapshot(host, &name, 0);
+        }
         let session = self
             .find_any(&name)
             .ok_or_else(|| Error::Other(format!("no session `{name}` for a final screen")))?;
@@ -263,10 +284,10 @@ impl SessionBackend for SessionProcessBackend {
     }
 
     fn title(&self, host: &Host, target: &SessionTarget) -> Result<String> {
-        if host.is_ssh() {
-            return Err(Self::remote_unsupported("read a title"));
-        }
         let name = session_name(target);
+        if host.is_ssh() {
+            return remote_session::title(host, &name);
+        }
         // A dead session carries no live title (it is read from the title
         // event, which only a running emulator emits); report empty, which
         // `parse_pane_title_marker` reads as "no marker".
@@ -321,16 +342,17 @@ impl SessionBackend for SessionProcessBackend {
         target: &SessionTarget,
         _deadline: Option<Duration>,
     ) -> std::io::Result<Option<Vec<SlotInfo>>> {
+        let project = project_of(target.session_name()).to_string();
         if host.is_ssh() {
-            // Couldn't ask on a remote host — distinct from "no sessions".
-            return Ok(None);
+            // Over the relay: Some(slots) when the machine answered, None when it
+            // could not be asked (distinct from "no sessions").
+            return Ok(remote_session::enumerate(host, &project));
         }
         // tmux lists the windows inside the shared project session; here each
         // workspace is its own `<project>/ws/<workspace>` session. Enumerate the
         // live ones under this project, keyed so teardown can act on them:
         // `name` is the workspace (what `slot_ids_named` filters on) and `id` is
         // the full logical name `kill_window` kills.
-        let project = project_of(target.session_name()).to_string();
         let prefix = format!("{project}/ws/");
         let slots = self
             .discover()
@@ -362,10 +384,10 @@ impl SessionBackend for SessionProcessBackend {
     }
 
     fn resize(&self, host: &Host, target: &SessionTarget, cols: u16, rows: u16) -> Result<()> {
-        if host.is_ssh() {
-            return Err(Self::remote_unsupported("resize"));
-        }
         let name = session_name(target);
+        if host.is_ssh() {
+            return remote_session::resize(host, &name, cols, rows);
+        }
         let Some(session) = self.find_live(&name) else {
             return Ok(());
         };
@@ -405,7 +427,7 @@ impl SessionProcessBackend {
     /// Best-effort: an already-gone session is fine.
     pub(crate) fn kill_by_name(&self, host: &Host, name: &str) -> Result<()> {
         if host.is_ssh() {
-            return Err(Self::remote_unsupported("kill a session"));
+            return remote_session::kill(host, name);
         }
         if let Some(session) = self.find_live(name) {
             let conn = self.connect(&session)?;
@@ -420,7 +442,7 @@ impl SessionProcessBackend {
     /// handle still gets a definitive membership answer.
     pub(crate) fn live_session_names(&self, host: &Host) -> Result<Vec<String>> {
         if host.is_ssh() {
-            return Err(Self::remote_unsupported("list live sessions"));
+            return remote_session::live_session_names(host);
         }
         Ok(self
             .discover()
@@ -461,12 +483,38 @@ mod tests {
         assert_eq!(session_name(&t), "pane/%7");
     }
 
+    /// An SSH seam that can never reach its machine: every relay open and launch
+    /// fails. Stands in for an unreachable remote so the three-state behavior is
+    /// deterministic (and no real `ssh` is spawned in a unit test).
+    struct UnreachableSeam;
+    impl remote_session::RemoteSsh for UnreachableSeam {
+        fn launch(&self, _host: &Host, _bin: &str, _spec: &SpawnSpec) -> Result<()> {
+            Err(Error::Other("unreachable (test)".into()))
+        }
+        fn open_relay(
+            &self,
+            _host: &Host,
+            _bin: &str,
+        ) -> Result<remote_session::RelayHandle> {
+            Err(Error::Other("unreachable (test)".into()))
+        }
+    }
+
     #[test]
-    fn remote_operations_are_rejected_not_silently_successful() {
+    fn remote_operations_against_an_unreachable_machine() {
+        let _g = crate::test_lock::acquire();
+        remote_session::set_test_seam(Some(std::sync::Arc::new(UnreachableSeam)));
+
         let b = SessionProcessBackend;
         let host = Host::Ssh { host: "box".into() };
         let t = SessionTarget::slot("shelbi-demo", "alice");
+
+        // `spawn` with no command can't build a launch line at all.
         assert!(b.spawn(&host, &t, None).is_err());
+        // With a command, the launch is attempted through the seam and fails.
+        assert!(b.spawn(&host, &t, Some("exec claude")).is_err());
+        // A relay we can't open surfaces as an error on ops, and crucially as
+        // Unreachable (never Dead) on probe, so supervision won't redispatch.
         assert!(b.kill(&host, &t).is_err());
         assert!(b.send_text(&host, &t, "x").is_err());
         assert!(matches!(
@@ -476,6 +524,8 @@ mod tests {
         // Enumerate reports "couldn't ask" (None), never an empty list that
         // would read as "no sessions".
         assert_eq!(b.enumerate_slots(&host, &t, None).unwrap(), None);
+
+        remote_session::set_test_seam(None);
     }
 
     #[test]
