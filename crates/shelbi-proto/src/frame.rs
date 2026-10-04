@@ -225,6 +225,41 @@ impl Frame {
     }
 }
 
+/// Total wire length (prefix + body) of the frame at the front of `buf`, read
+/// from the length prefix **alone** — without decoding the type byte or the
+/// payload.
+///
+/// A relay forwards whole session frames between a remote session and the hub
+/// over a multiplexed channel; it must peel them one at a time so a drop or a
+/// re-wrap never splits a frame, yet it must not choke on a frame type it
+/// cannot itself decode (an additive-capability frame emitted by a session
+/// built after the relay). Frame boundaries are defined by the length prefix,
+/// so this gives the relay exactly that — the byte length of the next whole
+/// frame — and nothing it would have to understand. Returns
+/// [`ProtoError::Incomplete`] until the whole frame is buffered, and rejects a
+/// zero body or an over-cap length the same way [`Frame::decode`] does.
+pub fn frame_boundary(buf: &[u8]) -> Result<usize, ProtoError> {
+    if buf.len() < LEN_PREFIX {
+        return Err(ProtoError::Incomplete {
+            needed: Some(LEN_PREFIX - buf.len()),
+        });
+    }
+    let body_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if body_len == 0 {
+        return Err(ProtoError::MalformedPayload { kind: "frame" });
+    }
+    if body_len > MAX_FRAME_LEN {
+        return Err(ProtoError::FrameTooLarge(body_len));
+    }
+    let total = LEN_PREFIX + body_len;
+    if buf.len() < total {
+        return Err(ProtoError::Incomplete {
+            needed: Some(total - buf.len()),
+        });
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +429,36 @@ mod tests {
         assert!(matches!(
             Frame::decode(&buf),
             Err(ProtoError::MalformedPayload { kind: "output" })
+        ));
+    }
+
+    #[test]
+    fn frame_boundary_measures_whole_frames_without_decoding() {
+        // A well-formed core frame: boundary equals its full encoded length.
+        let a = Frame::Resize(Resize { cols: 80, rows: 24 }).encode().unwrap();
+        assert_eq!(frame_boundary(&a).unwrap(), a.len());
+
+        // An additive-capability byte the core cannot decode is still measurable
+        // from the length prefix alone — this is the relay's forwarding path.
+        let payload = b"arbitrary";
+        let body_len = 1 + payload.len();
+        let mut unknown = (body_len as u32).to_be_bytes().to_vec();
+        unknown.push(FrameType::CAPABILITY_BASE + 9); // not a known ext byte either
+        unknown.extend_from_slice(payload);
+        assert_eq!(frame_boundary(&unknown).unwrap(), unknown.len());
+        // ...even though a full decode rejects it.
+        assert!(Frame::decode(&unknown).is_err());
+
+        // Incomplete until the whole frame is present.
+        assert!(matches!(
+            frame_boundary(&a[..a.len() - 1]),
+            Err(ProtoError::Incomplete { .. })
+        ));
+        assert!(matches!(frame_boundary(&[0, 0]), Err(ProtoError::Incomplete { .. })));
+        // Zero body and over-cap are rejected, matching decode.
+        assert!(matches!(
+            frame_boundary(&[0, 0, 0, 0]),
+            Err(ProtoError::MalformedPayload { kind: "frame" })
         ));
     }
 

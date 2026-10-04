@@ -480,6 +480,12 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__session")]
     Session(commands::session::Args),
+    /// (internal) Bridge one stdio channel to every session on this machine
+    /// (remove-tmux remote backend). Started by the hub over `ssh <host> shelbi
+    /// relay`; it reads/writes the relay protocol on stdin/stdout and holds no
+    /// session state. Not for direct use.
+    #[command(hide = true)]
+    Relay(commands::relay::Args),
 }
 
 fn main() -> Result<()> {
@@ -624,6 +630,7 @@ fn main() -> Result<()> {
         Some(Cmd::ReviewServe { cmd }) => commands::review_serve::run(cmd),
         Some(Cmd::ErrorLog { project }) => commands::error_log::run(project),
         Some(Cmd::Session(args)) => commands::session::run(args),
+        Some(Cmd::Relay(args)) => commands::relay::run(args),
         Some(Cmd::ZenOrchStart { project }) => commands::zen_lifecycle::orch_start(&project),
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),
         Some(Cmd::EnsureDaemon) => {
@@ -1215,6 +1222,23 @@ mod cli_tests {
         assert!(
             !help.contains("__codex-orchestrator"),
             "internal bridge command leaked into help: {help}"
+        );
+    }
+
+    #[test]
+    fn relay_command_is_hidden_but_parseable() {
+        let cli = Cli::parse_from(["shelbi", "relay"]);
+        assert!(
+            matches!(cli.cmd, Some(Cmd::Relay(_))),
+            "`shelbi relay` should parse as the relay command"
+        );
+
+        let help = Cli::try_parse_from(["shelbi", "--help"])
+            .expect_err("--help exits through clap")
+            .to_string();
+        assert!(
+            !help.contains("relay"),
+            "the machine-facing relay command leaked into help: {help}"
         );
     }
 

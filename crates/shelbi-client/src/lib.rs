@@ -51,13 +51,17 @@ pub mod control;
 pub mod discovery;
 pub mod error;
 pub mod reader;
+pub mod relay;
 pub mod snapshot;
 pub mod spawn;
+pub mod transport;
 
 pub use connect::{Connection, SessionEvents};
 pub use control::{ControlClient, Subscription};
 pub use discovery::{list, reap_dead, DiscoveredSession};
 pub use error::ClientError;
 pub use reader::SessionEvent;
+pub use relay::{serve_relay, RelayChannel, RelayStream};
 pub use snapshot::{snapshot, Snapshot, SnapshotSource};
 pub use spawn::{spawn, spawn_with_exe, SpawnSpec, SpawnedSession};
+pub use transport::{LocalTransport, Transport};
