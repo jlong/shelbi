@@ -198,10 +198,70 @@ pub struct KanbanApp {
     /// in-progress branch cut, a merge edge's gated merge and cleanup) on the
     /// background persistence thread. The live runner outside tests.
     transition_runner: SharedTransitionRunner,
+    /// Optional override for how a card move is persisted. `None` (the
+    /// standalone `__tasks` process) uses the direct in-process library path via
+    /// [`transition_runner`](Self::transition_runner). The single-process TUI
+    /// shell injects one that routes through the shelbi-app executor so moves are
+    /// daemon-backed when `dev.daemon_mutations` is on, keeping the executor the
+    /// single entry point for board moves.
+    pub(crate) move_persister: Option<Arc<dyn MovePersister>>,
 }
 
 /// A [`TransitionRunner`] the background persistence threads can share.
 type SharedTransitionRunner = Arc<dyn TransitionRunner + Send + Sync>;
+
+/// How a card move is persisted off the UI thread. The default
+/// ([`LibraryPersister`]) runs the shared in-process move function; a host (the
+/// single-process shell) can inject one that routes through the daemon.
+pub(crate) trait MovePersister: Send + Sync {
+    /// Persist a move of `id` to `target`, returning the settled move or a
+    /// ready-to-display error. Called on the background persistence thread.
+    fn persist(&self, project: &str, id: &str, target: &Column) -> PersistResult;
+}
+
+/// The default persister: the shared in-process library move
+/// ([`persist_move_step`]), parameterized by the app's [`TransitionRunner`].
+pub(crate) struct LibraryPersister {
+    runner: SharedTransitionRunner,
+}
+
+impl MovePersister for LibraryPersister {
+    fn persist(&self, project: &str, id: &str, target: &Column) -> PersistResult {
+        persist_move_step(project, id, target, self.runner.as_ref())
+    }
+}
+
+/// The persister the single-process TUI shell injects: the shelbi-app executor is
+/// the single entry point for a board move. With `dev.daemon_mutations` off it runs
+/// the shared in-process move function directly (identical to [`LibraryPersister`]
+/// with the live git runner); with it on it routes the move through the daemon's
+/// control socket (`shelbi_app::execute_mutation`), where the daemon runs the same
+/// gated merge and workflow actions. Either way the board's optimistic move and
+/// rollback (owned by [`KanbanApp`]) are unchanged.
+pub(crate) struct ExecutorMovePersister;
+
+impl MovePersister for ExecutorMovePersister {
+    fn persist(&self, project: &str, id: &str, target: &Column) -> PersistResult {
+        if shelbi_state::daemon_mutations_enabled() {
+            let mutation = shelbi_app::Mutation::MoveIssue {
+                project: project.to_string(),
+                id: id.to_string(),
+                to_status: target.as_str().to_string(),
+            };
+            // The daemon streams output lines (e.g. the gated merge's progress);
+            // the board shows its own optimistic move, so we only need the final
+            // outcome. A failure maps to a ready-to-display error.
+            let mut sink = |_stream, _line: &str| {};
+            shelbi_app::execute_mutation(&mutation, &mut sink)
+                .map(|()| PersistedMove::default())
+                .map_err(|e| format!("move failed: {e}"))
+        } else {
+            // Setting off: the shared in-process move function, exactly as the
+            // standalone board and `shelbi issue move` run it.
+            persist_move_step(project, id, target, &GitTransitionRunner)
+        }
+    }
+}
 
 /// What a card move's background persistence reports back on success.
 #[derive(Debug, Default)]
@@ -436,6 +496,60 @@ pub struct TaskPopover {
     pub scroll: u16,
 }
 
+/// Everything one board refresh reads off disk / the daemon index. Produced by
+/// [`KanbanApp::read_board_data`] — pure IO, safe to run on a background worker —
+/// and folded into the app by [`KanbanApp::apply_board_data`] on the UI thread.
+///
+/// Splitting the read from the fold is what lets the single-process TUI shell
+/// keep the board fresh without ever blocking its event loop on a disk or `gh`
+/// read: the shell does the read on its refresh worker and applies the result in
+/// a cheap in-memory fold. [`KanbanApp::refresh`] still does both back to back,
+/// so the standalone `__tasks` process is byte-for-byte unchanged.
+pub(crate) struct BoardData {
+    /// `None` when the project YAML couldn't be read (degrade to empty lists).
+    project: Option<BoardProject>,
+    /// The project state snapshot (`read_state(...).ok()`), for the workspace and
+    /// kanban-column-override view state.
+    state_snapshot: Option<shelbi_state::State>,
+    /// Loaded workflows, or the load error message for the status line.
+    workflows: Result<Vec<Workflow>, String>,
+    /// `statuses.yaml`, or the load error message for the status line.
+    project_statuses: Result<ProjectStatuses, String>,
+    /// The board read outcome.
+    board: BoardOutcome,
+}
+
+/// The project-level fields a refresh reads.
+struct BoardProject {
+    default_workflow_name: String,
+    display_name: Option<String>,
+    workspaces: Vec<String>,
+}
+
+/// The outcome of reading the board (and its on-demand closed history).
+enum BoardOutcome {
+    /// `issue_store_for` or `read_board_report` failed — carries the message the
+    /// UI thread passes to `fail_refresh`.
+    Failed(String),
+    /// A cold board: no index published yet. The chrome paints with a loading
+    /// overlay until the daemon fills the index.
+    Cold { banner: Option<String> },
+    /// A warm/stale board read. `base_tasks` is the open board; `closed` is the
+    /// on-demand terminal-history page (`None` when that read failed), merged with
+    /// any already-paged history on the UI thread.
+    Warm {
+        banner: Option<String>,
+        base_tasks: Vec<IssueFile>,
+        closed: Option<ClosedPageRead>,
+    },
+}
+
+/// The on-demand terminal `done`/`canceled` page a refresh read.
+struct ClosedPageRead {
+    issues: Vec<IssueFile>,
+    next_cursor: Option<String>,
+}
+
 impl KanbanApp {
     pub fn new(project_name: impl Into<String>) -> Self {
         // Seed `all_columns` with the canonical six-status default so a
@@ -482,6 +596,7 @@ impl KanbanApp {
             refresh_errors: crate::error_report::TransientErrorLog::new("github"),
             pending_moves: HashMap::new(),
             transition_runner: Arc::new(GitTransitionRunner),
+            move_persister: None,
         }
     }
 
@@ -804,157 +919,202 @@ impl KanbanApp {
     }
 
     pub fn refresh(&mut self) {
-        // Project YAML may be missing on a fresh project — surface an
-        // empty workspace list rather than failing the refresh; the
-        // dropdown will degrade to just "All" / "Unassigned" until the
-        // project file appears.
-        match shelbi_state::load_project(&self.project_name) {
-            Ok(p) => {
-                self.default_workflow_name = p.default_workflow_name().to_string();
-                self.display_name = p.display_name.clone().or_else(|| p.label.clone());
-                self.workspaces = p.workspaces.into_iter().map(|w| w.name).collect();
+        let data = Self::read_board_data(&self.project_name);
+        self.apply_board_data(data);
+    }
+
+    /// Read everything one board refresh needs — off the UI thread when the caller
+    /// is the single-process shell. Pure IO: it reads the project, the project
+    /// state snapshot, the workflows, `statuses.yaml`, and the board (plus the
+    /// on-demand terminal history page). The fold happens in
+    /// [`apply_board_data`](Self::apply_board_data).
+    ///
+    /// The **open** columns come from the daemon-owned `board-index.json`
+    /// (`Plans/github-issue-caching-and-rate-limits.md` §5) via `read_board_report`
+    /// — never a per-pane backend sweep, so a `__tasks` pane issues no `gh api`
+    /// list of its own. On a cold process with no index published yet the read
+    /// returns `Cold` without blocking.
+    pub(crate) fn read_board_data(project_name: &str) -> BoardData {
+        // Project YAML may be missing on a fresh project — surface empty lists
+        // rather than failing; the dropdown degrades to "All"/"Unassigned".
+        let project = shelbi_state::load_project(project_name)
+            .ok()
+            .map(|p| BoardProject {
+                default_workflow_name: p.default_workflow_name().to_string(),
+                display_name: p.display_name.clone().or_else(|| p.label.clone()),
+                workspaces: p.workspaces.into_iter().map(|w| w.name).collect(),
+            });
+
+        // Workspace filter / column overrides are persisted view state; a missing
+        // or unreadable state.json falls back to defaults silently.
+        let state_snapshot = shelbi_state::read_state(project_name).ok();
+
+        // Workflows are still loaded — per-task overlays and move semantics need
+        // them — but no longer drive the column layout. A broken file degrades to
+        // the canonical default so the board still paints.
+        let workflows = shelbi_state::list_workflows(project_name)
+            .map_err(|e| format!("workflow load failed: {e}"));
+
+        // `statuses.yaml` is the source of truth for the column layout. A broken /
+        // missing file degrades to the canonical six.
+        let project_statuses = shelbi_state::load_project_statuses(project_name)
+            .map_err(|e| format!("statuses.yaml load failed: {e}"));
+
+        // The board read. `issue_store_for` is resolved for the on-demand terminal
+        // `done`/`canceled` lanes (their own lazy closed-cache path, see
+        // `gh-cache-p2-done-column-on-demand`), not for the open board.
+        let board = match shelbi_state::issue_store_for(project_name) {
+            Err(e) => BoardOutcome::Failed(format!("refresh failed: {e}")),
+            Ok(store) => {
+                // `read_board_report` serves this process's snapshot cache when no
+                // index exists and no daemon answers, so a bare `__tasks` pane on a
+                // hubless machine paints its last-known board rather than empty.
+                match shelbi_state::read_board_report(project_name) {
+                    Err(e) => BoardOutcome::Failed(format!("refresh failed: {e}")),
+                    Ok(report) => {
+                        let banner = report.freshness.banner();
+                        match report.state {
+                            shelbi_state::BoardState::Cold => BoardOutcome::Cold { banner },
+                            state => {
+                                let base_tasks = state.into_issues();
+                                let closed = store.closed_page(None).ok().map(|page| ClosedPageRead {
+                                    issues: page.issues,
+                                    next_cursor: page.next_cursor,
+                                });
+                                BoardOutcome::Warm {
+                                    banner,
+                                    base_tasks,
+                                    closed,
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            Err(_) => {
+        };
+
+        BoardData {
+            project,
+            state_snapshot,
+            workflows,
+            project_statuses,
+            board,
+        }
+    }
+
+    /// Fold a freshly-read [`BoardData`] into the app — the in-memory half of a
+    /// refresh. Cheap and never blocks, so the shell can call it on its UI thread
+    /// after reading the data on a worker. Reproduces exactly what the old inline
+    /// `refresh` did (status/error lines, the cold loading overlay, the terminal
+    /// history merge, selection clamp, and the optimistic-move reconcile).
+    pub(crate) fn apply_board_data(&mut self, data: BoardData) {
+        match data.project {
+            Some(p) => {
+                self.default_workflow_name = p.default_workflow_name;
+                self.display_name = p.display_name;
+                self.workspaces = p.workspaces;
+            }
+            None => {
                 self.default_workflow_name = DEFAULT_WORKFLOW_NAME.to_string();
                 self.display_name = None;
                 self.workspaces = Vec::new();
             }
         }
-        // Workspace filter is persisted view state — a missing /
-        // unreadable state.json falls back to "All" silently. Reload
-        // every tick so a CLI or palette edit shows up without a
-        // respawn. The workflow filter is intentionally NOT loaded
-        // here: it's per-session by design (resets on `shelbi reload`),
-        // matching how the column-scroll position is per-session.
-        let state_snapshot = shelbi_state::read_state(&self.project_name).ok();
-        self.workspace_filter = state_snapshot
+
+        // Reload every tick so a CLI or palette edit shows up without a respawn.
+        // The workflow filter is intentionally NOT loaded here: it's per-session
+        // by design (resets on `shelbi reload`).
+        self.workspace_filter = data
+            .state_snapshot
             .as_ref()
             .and_then(|s| s.workspace_filter.clone())
             .map(|s| WorkspaceFilter::from_disk(&s));
-        self.column_overrides = state_snapshot
+        self.column_overrides = data
+            .state_snapshot
             .as_ref()
             .map(|s| s.kanban_column_overrides.clone())
             .unwrap_or_default();
-        // Workflows are still loaded — per-task overlays and the move
-        // semantics need them — but they no longer drive the column
-        // layout. A broken `workflows/<name>.yaml` surfaces as a
-        // status_line warning and we fall back to the canonical default
-        // so the board still paints.
-        self.workflows = match shelbi_state::list_workflows(&self.project_name) {
+
+        self.workflows = match data.workflows {
             Ok(wfs) => wfs,
-            Err(e) => {
-                self.fail_status(format!("workflow load failed: {e}"));
+            Err(msg) => {
+                self.fail_status(msg);
                 vec![default_workflow()]
             }
         };
-        // `statuses.yaml` is the source of truth for the column layout.
-        // A broken / missing file surfaces as a status_line warning and
-        // degrades to the canonical six so the board still paints.
-        self.project_statuses = match shelbi_state::load_project_statuses(&self.project_name) {
+        self.project_statuses = match data.project_statuses {
             Ok(ps) => ps,
-            Err(e) => {
-                self.fail_status(format!("statuses.yaml load failed: {e}"));
+            Err(msg) => {
+                self.fail_status(msg);
                 default_project_statuses()
             }
         };
         self.all_columns = self.compute_all_columns();
-        // The **open** columns come from the daemon-owned `board-index.json`
-        // (`Plans/github-issue-caching-and-rate-limits.md` §5) via the shared
-        // `read_board` helper — never a per-pane backend sweep, so this
-        // `shelbi __tasks` pane issues no `gh api` list of its own. On a cold
-        // process with no index published yet `read_board` returns `Cold`
-        // without blocking, so the board paints its chrome plus a loading
-        // overlay; a warm/stale (or `file_system`) board renders normally.
-        //
-        // The `store` is still resolved for the terminal `done`/`canceled`
-        // lanes below, which stay on their own on-demand lazy path (see
-        // `gh-cache-p2-done-column-on-demand`) rather than the daemon index.
-        let store = match shelbi_state::issue_store_for(&self.project_name) {
-            Ok(store) => store,
-            Err(e) => {
-                self.fail_refresh(format!("refresh failed: {e}"));
-                return;
+
+        match data.board {
+            BoardOutcome::Failed(msg) => {
+                self.board_banner = None;
+                self.fail_refresh(msg);
             }
-        };
-        // Read the board with its freshness envelope so the title bar can show a
-        // staleness banner (Phase 3 §6). `read_board_report` also serves this
-        // process's snapshot cache when no index exists and no daemon answers, so
-        // a bare `__tasks` pane on a hubless machine paints its last-known board
-        // rather than an empty one.
-        match shelbi_state::read_board_report(&self.project_name) {
-            Ok(report) => {
-                self.board_banner = report.freshness.banner();
+            BoardOutcome::Cold { banner } => {
+                self.board_banner = banner;
                 // A board read that returned (cold, warm or stale) is a healthy
                 // refresh: log a single "recovered" line if it had been parked.
                 self.clear_refresh_error();
-                match report.state {
-                    shelbi_state::BoardState::Cold => {
-                        // No data yet; leave `tasks` as-is (empty on first paint)
-                        // and flag loading. The daemon's next tick fills the index
-                        // and the next refresh renders the real board.
-                        self.board_loading = true;
-                        self.last_refresh = Instant::now();
-                    }
-                    state => self.render_board_state(store.as_ref(), state),
-                }
+                // No data yet; leave `tasks` as-is (empty on first paint) and flag
+                // loading. The daemon's next tick fills the index.
+                self.board_loading = true;
+                self.last_refresh = Instant::now();
             }
-            Err(e) => {
-                self.board_banner = None;
-                self.fail_refresh(format!("refresh failed: {e}"));
+            BoardOutcome::Warm {
+                banner,
+                base_tasks,
+                closed,
+            } => {
+                self.board_banner = banner;
+                self.clear_refresh_error();
+                self.apply_warm_board(base_tasks, closed);
             }
         }
+
         // Re-apply any in-flight optimistic moves onto the just-read board so a
-        // poll that landed before a background write finished never bounces a
-        // card back to its old column (and drop entries the board now agrees
-        // with). Runs last, after `self.tasks` is rebuilt.
+        // poll that landed before a background write finished never bounces a card
+        // back to its old column (and drop entries the board now agrees with).
         self.reconcile_pending_moves();
     }
 
     /// Fold a warm/stale board read into `self.tasks`, merging the on-demand
-    /// terminal `done`/`canceled` lanes. Split out of [`refresh`](Self::refresh)
-    /// so the freshness-aware read path stays legible.
-    fn render_board_state(&mut self, store: &dyn shelbi_state::IssueStore, state: shelbi_state::BoardState) {
-        {
-                self.board_loading = false;
-                // The index is the **open** board — it deliberately omits the
-                // terminal history so a render never pays a `state=all` sweep.
-                // The Kanban renders every column, though, so merge the terminal
-                // `done`/`canceled` lanes from `list_in_status`, served from the
-                // separate long-TTL closed cache (`state=closed`, refreshed
-                // rarely in the background). Dedupe by id so the local
-                // `file_system` backend — whose open board already returns the
-                // full board, including any custom terminal status — is
-                // unaffected.
-                let mut tasks = state.into_issues();
-                let mut seen: HashSet<String> =
-                    tasks.iter().map(|tf| tf.task.id.clone()).collect();
-                // The terminal `done`/`canceled` history is loaded on demand as
-                // one page of 50 (§4) — the first page from the long-TTL closed
-                // cache, never a `state=closed` sweep. The Kanban renders both
-                // terminal lanes from it and offers a "load more" row when the
-                // page reports more history (`closed_next_cursor`). Any pages the
-                // user already paged in (`closed_more`) are merged back so a poll
-                // never drops them. `file_system` boards return the whole board
-                // from `state` already, so the dedupe keeps them unaffected.
-                match store.closed_page(None) {
-                    Ok(page) => {
-                        self.closed_next_cursor = page.next_cursor;
-                        for tf in page.issues.into_iter().chain(self.closed_more.iter().cloned()) {
-                            if seen.insert(tf.task.id.clone()) {
-                                tasks.push(tf);
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // A failed closed read leaves the terminal lanes empty
-                        // this paint; the open board still renders.
-                        self.closed_next_cursor = None;
+    /// terminal `done`/`canceled` lanes with any history the user already paged in.
+    fn apply_warm_board(&mut self, base_tasks: Vec<IssueFile>, closed: Option<ClosedPageRead>) {
+        self.board_loading = false;
+        // The index is the **open** board — it deliberately omits the terminal
+        // history so a render never pays a `state=all` sweep. The Kanban renders
+        // every column, though, so merge the terminal `done`/`canceled` lanes
+        // (`gh-cache-p2-done-column-on-demand`). Dedupe by id so the local
+        // `file_system` backend — whose open board already returns the full board
+        // — is unaffected.
+        let mut tasks = base_tasks;
+        let mut seen: HashSet<String> = tasks.iter().map(|tf| tf.task.id.clone()).collect();
+        match closed {
+            Some(page) => {
+                self.closed_next_cursor = page.next_cursor;
+                // Any pages the user already paged in (`closed_more`) are merged
+                // back so a poll never drops them.
+                for tf in page.issues.into_iter().chain(self.closed_more.iter().cloned()) {
+                    if seen.insert(tf.task.id.clone()) {
+                        tasks.push(tf);
                     }
                 }
-                self.tasks = tasks;
-                self.last_refresh = Instant::now();
-                self.clamp_selection();
+            }
+            None => {
+                // A failed closed read leaves the terminal lanes empty this paint;
+                // the open board still renders.
+                self.closed_next_cursor = None;
+            }
         }
+        self.tasks = tasks;
+        self.last_refresh = Instant::now();
+        self.clamp_selection();
     }
 
     /// Whether a "load more" of the terminal history is available — the on-demand
@@ -1656,7 +1816,7 @@ impl KanbanApp {
                     &self.project_name,
                     id,
                     target.clone(),
-                    self.transition_runner.clone(),
+                    self.move_persister(),
                 );
                 self.pending_moves.insert(
                     id.to_string(),
@@ -1705,15 +1865,22 @@ impl KanbanApp {
             pm.queue.pop_front()
         };
         if let Some(target) = target {
-            let rx = spawn_persist_move(
-                &self.project_name,
-                id,
-                target.clone(),
-                self.transition_runner.clone(),
-            );
+            let rx = spawn_persist_move(&self.project_name, id, target.clone(), self.move_persister());
             if let Some(pm) = self.pending_moves.get_mut(id) {
                 pm.rx = Some((target, rx));
             }
+        }
+    }
+
+    /// The persister a card move uses: the injected override (the shell's
+    /// executor-routing one) if set, otherwise the default direct library path
+    /// over this app's [`transition_runner`](Self::transition_runner).
+    fn move_persister(&self) -> Arc<dyn MovePersister> {
+        match &self.move_persister {
+            Some(p) => p.clone(),
+            None => Arc::new(LibraryPersister {
+                runner: self.transition_runner.clone(),
+            }),
         }
     }
 
@@ -1834,6 +2001,14 @@ impl KanbanApp {
                 tf.task.column = Column::from_status_id(&pm.shown_status_id);
             }
         }
+    }
+
+    /// Whether any optimistic card move is still being tracked — in flight,
+    /// queued, or settled-awaiting-confirmation. The single-process shell keeps
+    /// redrawing while this is true so a move's settle / rollback is shown without
+    /// polling a per-view loop.
+    pub(crate) fn has_pending_moves(&self) -> bool {
+        !self.pending_moves.is_empty()
     }
 
     /// True while any optimistic move is still persisting (a write is in flight
@@ -3141,13 +3316,13 @@ fn spawn_persist_move(
     project_name: &str,
     id: &str,
     target: Column,
-    runner: SharedTransitionRunner,
+    persister: Arc<dyn MovePersister>,
 ) -> Receiver<PersistResult> {
     let (tx, rx) = std::sync::mpsc::channel();
     let project = project_name.to_string();
     let id = id.to_string();
     std::thread::spawn(move || {
-        let _ = tx.send(persist_move_step(&project, &id, &target, runner.as_ref()));
+        let _ = tx.send(persister.persist(&project, &id, &target));
     });
     rx
 }

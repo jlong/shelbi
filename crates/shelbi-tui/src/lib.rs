@@ -25,6 +25,7 @@ mod error_report;
 mod handlers;
 mod kanban;
 mod keymap;
+mod machines;
 mod layout_sub;
 mod markdown;
 pub mod overlay;
@@ -138,6 +139,7 @@ pub(crate) mod test_support {
 pub use activity::ActivityApp;
 pub use app::{App, Row, View, WorkspaceBadge, WorkspaceOverview};
 pub use kanban::KanbanApp;
+pub use machines::MachinesApp;
 pub use sidebar::decoration_to_color;
 // The poller moved out of this crate into `shelbi-orchestrator` (Phase 3,
 // `rt-daemon-poller`) so it can run either here (the sidebar) or in
@@ -371,6 +373,25 @@ pub fn run_activity(project_name: &str) -> Result<()> {
     app.refresh();
 
     let result = handlers::activity::activity_loop(&mut term, &mut app);
+
+    restore_terminal(&mut term).context("restoring terminal")?;
+    result
+}
+
+/// Run the machines view in the current pane. Hosted in the hidden stash
+/// session and swapped in by the sidebar — same lifecycle as `run_tasks` /
+/// `run_activity`. Replaces the old `while true; shelbi workspace list; sleep 5`
+/// shell loop with a real ratatui view that shares its rendering
+/// ([`machines::render_full`]) with the single-process TUI shell's native view.
+pub fn run_machines(project_name: &str) -> Result<()> {
+    let (keymaps, diags) = shelbi_state::keymap::load_keymaps(Some(project_name));
+    log_keymap_diagnostics(&diags);
+
+    let mut term = setup_terminal().context("setting up terminal")?;
+    let mut app = MachinesApp::new(project_name);
+    app.refresh();
+
+    let result = handlers::machines::machines_loop(&mut term, &mut app, &keymaps);
 
     restore_terminal(&mut term).context("restoring terminal")?;
     result
