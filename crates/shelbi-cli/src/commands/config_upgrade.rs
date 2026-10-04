@@ -422,6 +422,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
     } else if id.ends_with(".agent.orchestrator.instructions") {
         sniff_orchestrator_instructions(entry, &text, out);
         sniff_orchestrator_active_dispatch(entry, &text, out);
+        sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_merge_reason_format(entry, &text, out);
         sniff_zen_assignee_scope(entry, &text, out);
@@ -1245,6 +1246,66 @@ fn sniff_orchestrator_active_dispatch(
     }
 }
 
+/// Marker phrase the healed heartbeat `idle_workspaces` definition carries once
+/// it notes the review-slot exclusion. Present only in the post-fix shipped
+/// orchestrator template; absent from every prior copy, which defined the count
+/// as "how many workspaces have no active-category issue" with no exclusion.
+/// Kept in sync with the template by the drift guard in this module's tests.
+const IDLE_WORKSPACES_REVIEW_EXCLUSION_MARKER: &str = "excluded from this count";
+
+/// Anchor substring the heartbeat `idle_workspaces` definition carries in both
+/// the pre- and post-fix copies — the definition's opening clause. Used to put
+/// a prompt *in scope* for the sniff only when it actually defines the count.
+const IDLE_WORKSPACES_DEFINITION_ANCHOR: &str = "idle_workspaces` is how";
+
+/// Sniff an orchestrator `instructions.md` whose heartbeat `idle_workspaces`
+/// definition predates the review-slot exclusion.
+///
+/// `idle_workspaces` counts only dev-dispatch workspaces: `review`-tagged slots
+/// are excluded from the pool because they never take dev dispatch, so an idle
+/// review slot is not spare capacity and a review slot serving a handoff task is
+/// not a busy *dev* slot. The shipped template's definition now says so; a
+/// forked copy from before the fix still defines the count as "how many
+/// workspaces have no active-category issue", which disagrees with what the
+/// heartbeat now emits and can mislead the orchestrator about spare capacity
+/// when it gates a Zen scan on `idle_workspaces > 0`.
+///
+/// A default change (the count's definition) only reaches NEW projects via the
+/// shipped template; existing projects carry forked copies, so this sniffer
+/// hands the orchestrator a boot finding to refresh them (per the AGENTS.md
+/// "Changing shipped defaults" guardrail). An **absence** sniff keyed on the
+/// definition's stable anchor: in scope only when the definition is present,
+/// idempotent once the healed marker appears. Routed to
+/// [`Classification::NeedsJudgment`] because the correct rewrite of free-form,
+/// user-customizable prose is a judgment call, not a mechanical patch.
+fn sniff_heartbeat_idle_workspaces_review_exclusion(
+    entry: &InventoryEntry,
+    text: &str,
+    out: &mut Vec<UpgradeFinding>,
+) {
+    if !text.contains(IDLE_WORKSPACES_DEFINITION_ANCHOR) {
+        return;
+    }
+    if text.contains(IDLE_WORKSPACES_REVIEW_EXCLUSION_MARKER) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        "ORCH_HEARTBEAT_IDLE_REVIEW_EXCLUSION_MISSING",
+        "the heartbeat's `idle_workspaces` definition doesn't note that `review`-tagged slots are \
+         excluded from the count, so the orchestrator may read an idle review slot as spare dev \
+         capacity (or its serving as a busy dev slot) and misjudge whether a Zen scan can place \
+         eligible backlog work",
+        "In the heartbeat event description, update the `idle_workspaces` definition to say it \
+         counts how many *dev* workspaces have no active-category issue, with `review`-tagged \
+         slots excluded (they never take dev dispatch, so an idle review slot is not spare dev \
+         capacity), keeping it equal to the dev-slot view of `shelbi workspace list`. Mirror the \
+         shipped default template.",
+        locate_line_containing(text, IDLE_WORKSPACES_DEFINITION_ANCHOR),
+    ));
+}
+
 /// Detect the pre-rename `shelbi task <verb>` board command in an agent's prose
 /// (orchestrator `instructions.md` or `zenmode.md`). The board command was
 /// renamed `shelbi task` -> `shelbi issue` (design D5); `shelbi task` still works
@@ -2048,6 +2109,12 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
         "ZEN_PR_CREATE_PUBLISHED_HEAD_MISSING" => {
             "The PR-flow finalize prose is free-form and user-customizable, so the \
              `--match-published-head-commit` guidance can't be merged in mechanically without \
+             risking loss of local edits — the orchestrator repairs its own copy with judgment, \
+             preserving customizations."
+        }
+        "ORCH_HEARTBEAT_IDLE_REVIEW_EXCLUSION_MISSING" => {
+            "The heartbeat-event prose is free-form and user-customizable, so the review-slot \
+             exclusion in the `idle_workspaces` definition can't be merged in mechanically without \
              risking loss of local edits — the orchestrator repairs its own copy with judgment, \
              preserving customizations."
         }
@@ -3087,6 +3154,73 @@ mod tests {
             .is_some(),
             "shipped default template no longer has a `{REACTION_RULES_SECTION_HEADING}` \
              section — the sniffer's absence check is now dead",
+        );
+    }
+
+    // ---- heartbeat idle_workspaces review exclusion ---------------------
+
+    #[test]
+    fn idle_workspaces_definition_without_review_exclusion_is_needs_judgment() {
+        // A pre-fix heartbeat definition: defines the count as "how many
+        // workspaces have no active-category issue" with no review-slot
+        // exclusion, so it predates the dev-pool fix.
+        let text = "# Orchestrator\n\n- `heartbeat` — `idle_workspaces` is how many workspaces \
+                    have no active-category issue. See the reaction rule.\n";
+        let mut out = Vec::new();
+        sniff_heartbeat_idle_workspaces_review_exclusion(&orch_entry(), text, &mut out);
+        let f = find(&out, "ORCH_HEARTBEAT_IDLE_REVIEW_EXCLUSION_MISSING").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+    }
+
+    #[test]
+    fn idle_workspaces_definition_with_review_exclusion_is_clean() {
+        let text = "- `heartbeat` — `idle_workspaces` is how many dev workspaces have no \
+                    active-category issue; `review`-tagged slots are excluded from this count.\n";
+        let mut out = Vec::new();
+        sniff_heartbeat_idle_workspaces_review_exclusion(&orch_entry(), text, &mut out);
+        assert!(
+            find(&out, "ORCH_HEARTBEAT_IDLE_REVIEW_EXCLUSION_MISSING").is_none(),
+            "a definition that excludes review slots should not be flagged: {:?}",
+            codes(&out),
+        );
+    }
+
+    #[test]
+    fn idle_workspaces_definition_absent_is_not_flagged() {
+        // A heavily-customized prompt that never defines the count: the absence
+        // sniff keys on the definition anchor, so it stays silent here.
+        let text = "# Custom orchestrator\n\n## My own scheduling notes\n\nno heartbeat prose\n";
+        let mut out = Vec::new();
+        sniff_heartbeat_idle_workspaces_review_exclusion(&orch_entry(), text, &mut out);
+        assert!(find(&out, "ORCH_HEARTBEAT_IDLE_REVIEW_EXCLUSION_MISSING").is_none());
+    }
+
+    /// Drift guard: the shipped default orchestrator template must carry the
+    /// review-slot exclusion in its `idle_workspaces` definition, so a
+    /// freshly-materialized project never trips this sniffer. If this fails, the
+    /// template's heartbeat prose lost (or never had) the exclusion note.
+    #[test]
+    fn shipped_default_template_does_not_trip_the_idle_workspaces_sniffer() {
+        let mut out = Vec::new();
+        sniff_heartbeat_idle_workspaces_review_exclusion(
+            &orch_entry(),
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+            &mut out,
+        );
+        assert!(
+            find(&out, "ORCH_HEARTBEAT_IDLE_REVIEW_EXCLUSION_MISSING").is_none(),
+            "shipped default template trips the idle_workspaces sniffer: {:?}",
+            codes(&out),
+        );
+        // Guard the sniffer's precondition: if the definition anchor is ever
+        // reworded in the template the sniff silently stops firing, so assert
+        // the anchor it keys on is present in the shipped default.
+        assert!(
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS
+                .contains(IDLE_WORKSPACES_DEFINITION_ANCHOR),
+            "shipped default template no longer carries the `idle_workspaces` definition anchor \
+             — the sniffer's absence check is now dead",
         );
     }
 
