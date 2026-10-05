@@ -42,8 +42,17 @@ A tag push runs these jobs in `release.yml`:
 4. **`homebrew-pr`** and **`apt-publish`** — run in the
    **`release-downstream`** environment, each gated on a repository variable (see
    [Downstream publication](#downstream-publication)).
-5. **`apt-verify-install`** — installs Shelbi from the live APT repository and
-   asserts the binary and the three system-plugin files are present.
+5. **`apt-verify-install`** — waits for the hosted APT repository to settle,
+   then installs Shelbi from it and asserts the binary and the three
+   system-plugin files are present. Because `apt.shelbi.dev` is served by Vercel,
+   the edge can briefly serve a new `InRelease` alongside a stale `Packages.gz`
+   (or the reverse) while a deploy propagates, which apt reports as `File has
+   unexpected size (...). Mirror sync in progress?`. The job first runs
+   `scripts/release/wait-for-apt-consistency.sh`, which polls (up to ~5 minutes)
+   until the signed `InRelease` and the index files it references agree before
+   running `apt-get update`. A mismatch that clears within the window no longer
+   fails the release; one that persists past the deadline still fails the job
+   and logs the observed vs. expected sizes.
 6. **`downstream-publication`** — always runs after the above and records the
    downstream result in the job log.
 
@@ -238,6 +247,14 @@ docker run --rm debian:bookworm bash -euxo pipefail -c '
   apt-get install -y shelbi
   shelbi --version
 '
+```
+
+If `apt-get update` complains that a file has an unexpected size ("Mirror sync
+in progress?"), the Vercel deploy serving `apt.shelbi.dev` is still propagating.
+Wait for it to settle before retrying, the same way CI does:
+
+```bash
+scripts/release/wait-for-apt-consistency.sh --base-url https://apt.shelbi.dev
 ```
 
 The installed version must match `VERSION`.
