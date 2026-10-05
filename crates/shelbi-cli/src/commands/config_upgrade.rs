@@ -868,6 +868,9 @@ fn sniff_project_registration(
         sniff_zen_checks_msrv(entry, text, zen, out);
         sniff_zen_cargo_test_no_fail_fast(entry, text, zen, out);
     }
+    // Reads both the top-level `disk:` and `zen:` keys, so it runs here with the
+    // whole registration value rather than inside the zen fan-out above.
+    sniff_disk_config_missing(entry, text, &value, out);
 }
 
 /// Sniff a project's `workspace_permissions_mode`. Absent configuration is now
@@ -1207,6 +1210,57 @@ fn sniff_zen_checks_msrv(entry: &InventoryEntry, text: &str, zen: &Value, out: &
          declared MSRV (Cargo.toml `rust-version`), mirroring CI's `msrv` job, and skips cleanly \
          when the toolchain can't be provisioned.",
         locate_key(text, "checks"),
+    ));
+}
+
+/// Flag a Rust-track Zen project that predates the `disk:` config section
+/// (added to cap the hub's shared cargo `target/` and warn on low disk). The
+/// knobs default to 20 GiB whether or not the block is present, so this is not
+/// a behavioral gap — it is a discoverability nudge, surfaced only for the
+/// projects whose hub `target/` actually fills: those whose `zen.checks.local`
+/// runs cargo (the same Rust signal [`sniff_zen_checks_msrv`] uses).
+///
+/// NeedsJudgment, not AutoHeal: materializing the block means re-serializing the
+/// registration YAML (dropping user comments) or a surgical insert whose
+/// placement is a judgment call, so the orchestrator adds it to its own copy
+/// with judgment rather than risking a lossy rewrite. A project that already
+/// has a `disk:` block never fires.
+fn sniff_disk_config_missing(
+    entry: &InventoryEntry,
+    text: &str,
+    value: &Value,
+    out: &mut Vec<UpgradeFinding>,
+) {
+    // Already configured → nothing to suggest.
+    if get(value, "disk").is_some() {
+        return;
+    }
+    // Only a Rust-track Zen project (cargo in `zen.checks.local`) builds into
+    // the hub's shared cargo target, so only it needs the cap / low-disk knobs.
+    let is_rust_zen = get(value, "zen")
+        .and_then(|z| get(z, "checks"))
+        .and_then(|c| get(c, "local"))
+        .and_then(Value::as_sequence)
+        .map(|local| {
+            local
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|c| c.split_whitespace().next() == Some("cargo"))
+        })
+        .unwrap_or(false);
+    if !is_rust_zen {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        "DISK_CONFIG_MISSING",
+        "no `disk:` block — Rust build output accumulates in the hub's shared cargo `target/` \
+         and can fill the data volume over a week of Zen builds",
+        "Add a `disk:` block to cap the hub's shared cargo `target/` and set the low-disk warning \
+         threshold: `disk: { target_cap_gib: 20, low_free_gib: 20 }` (both default to 20 GiB even \
+         when the block is absent, so this only makes the knobs explicit and tunable).",
+        locate_key(text, "zen"),
     ));
 }
 
@@ -2483,6 +2537,12 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              re-serialize the file and drop its comments — so the orchestrator adds the \
              `shelbi msrv-check` entry to its own copy instead of a lossy auto-heal."
         }
+        "DISK_CONFIG_MISSING" => {
+            "The defaults already protect the hub (20 GiB cap and threshold apply without the \
+             block), so this is a discoverability nudge, not a fix — and inserting the block \
+             means a lossy re-serialize or a placement judgment, so the orchestrator adds it to \
+             its own copy rather than an auto-heal."
+        }
         "REVIEW_INSTRUCTIONS_NO_HUMAN_AUTHORIZED_REBASE" => {
             "These are prose instructions a project may have forked and customized, so the \
              human-authorized-rebase exception can't be merged in mechanically without risking \
@@ -3614,6 +3674,45 @@ mod tests {
         assert!(
             find(&fs, "ZEN_CHECKS_MSRV_MISSING").is_none(),
             "a non-Rust checks list was flagged: {:?}",
+            codes(&fs)
+        );
+    }
+
+    // ---- disk: config discoverability (Rust-zen projects) ---------------
+
+    #[test]
+    fn rust_zen_project_without_disk_block_is_needs_judgment() {
+        let fs = project_findings(
+            "name: demo\nzen:\n  checks:\n    local:\n      - cargo build --workspace\n",
+        );
+        let f = find(&fs, "DISK_CONFIG_MISSING").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+    }
+
+    #[test]
+    fn rust_zen_project_with_disk_block_is_clean() {
+        let fs = project_findings(
+            "name: demo\ndisk:\n  target_cap_gib: 30\nzen:\n  checks:\n    local:\n      \
+             - cargo build --workspace\n",
+        );
+        assert!(
+            find(&fs, "DISK_CONFIG_MISSING").is_none(),
+            "a project that already declares `disk:` was flagged: {:?}",
+            codes(&fs)
+        );
+    }
+
+    #[test]
+    fn non_rust_zen_project_is_not_flagged_for_disk() {
+        // A non-Rust track doesn't build into the hub's cargo target, so the
+        // cap/low-disk nudge doesn't apply.
+        let fs = project_findings(
+            "name: demo\nzen:\n  checks:\n    local:\n      - npm run build\n",
+        );
+        assert!(
+            find(&fs, "DISK_CONFIG_MISSING").is_none(),
+            "a non-Rust project was flagged for a missing disk block: {:?}",
             codes(&fs)
         );
     }

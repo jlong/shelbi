@@ -5044,6 +5044,7 @@ transitions:
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),
+            disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
         };
         shelbi_state::save_project(&project).unwrap();
@@ -6827,6 +6828,7 @@ transitions:
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),
+            disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
         };
         shelbi_state::save_project(&project).unwrap();

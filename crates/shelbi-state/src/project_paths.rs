@@ -399,6 +399,7 @@ mod tests {
             issue_tracker: Default::default(),
             runners: Default::default(),
             agents: Default::default(),
+            disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
         }
     }
