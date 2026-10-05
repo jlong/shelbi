@@ -271,6 +271,27 @@ pub fn workspace_ready_deferred_marker(machine: &Machine, workspace: &WorkspaceS
         .join("shelbi-ready-deferred")
 }
 
+/// The ready-handoff **refusal** sidecar for a workspace:
+/// `<worktree>/.claude/shelbi-ready-refused`.
+///
+/// When the poller's pre-push worktree check (see
+/// [`verify_worktree_ready_for_handoff`]) refuses a ready marker — the worker
+/// left uncommitted work, or the branch has no commits ahead of base — the card
+/// stays in its active status with the ready marker *in place* so the handoff
+/// auto-proceeds the moment the worker commits. Left unguarded, that would re-log
+/// the refusal and re-nudge the worker on every tick. This sidecar records the
+/// current refusal token (e.g. `uncommitted-changes` / `no-commits-ahead`) so the
+/// refusal is logged and the worker messaged **once per distinct reason** rather
+/// than every poll; the handoff proceeding (a passing check) clears it, arming the
+/// next refusal to surface afresh. Lives under `.claude/` for the same gitignore
+/// reason as the ready marker itself, and reuses the [`read_deferred_marker`] /
+/// [`write_deferred_marker`] / [`clear_deferred_marker`] trio (all path-generic).
+pub fn workspace_ready_refused_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
+    workspace_worktree(machine, workspace)
+        .join(".claude")
+        .join("shelbi-ready-refused")
+}
+
 /// Read the deferral sidecar, returning the recorded error-class token (trimmed)
 /// or `None` when it's absent or empty. Host-aware, matching the ready marker: a
 /// local workspace reads straight off disk; a remote one routes `cat` through
@@ -1435,6 +1456,211 @@ pub fn push_workspace_branch_to_origin(host: &Host, worktree: &Path, branch: &st
             reason: format!("push_spawn_failed:{e}"),
         },
     }
+}
+
+/// Verdict of the pre-handoff worktree verification (see
+/// [`verify_worktree_ready_for_handoff`]). [`Ready`](Self::Ready) permits the
+/// handoff; the other two block it with a reason the poller records on
+/// `events.log` and relays into the worker's pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffReadiness {
+    /// The worktree is clean (no user-authored changes) and the branch carries
+    /// real commits to hand off — or the work already landed on base and there
+    /// is legitimately nothing to push. The handoff may proceed.
+    Ready,
+    /// The worktree has `files` uncommitted *user-authored* changes (shelbi's
+    /// own `.claude/` / `.shelbi/` footprint already excluded). Handing off now
+    /// would push a tip that doesn't contain that work and then reset the
+    /// worktree on the next dispatch — losing it. Block.
+    UncommittedChanges { files: usize },
+    /// The branch has zero commits ahead of its base and is *not* already merged
+    /// (its tip equals base — an empty branch). Handing off would open a no-op
+    /// PR / empty push; on a PR workflow it loops on the `open_pr` failure.
+    /// Block.
+    NoCommitsAhead,
+}
+
+impl HandoffReadiness {
+    /// True only for [`Ready`](Self::Ready) — the handoff may proceed.
+    pub fn is_ready(&self) -> bool {
+        matches!(self, HandoffReadiness::Ready)
+    }
+
+    /// Short, stable `reason=` token for the refusal event / worker message,
+    /// or `None` for [`Ready`](Self::Ready).
+    pub fn refusal_reason(&self) -> Option<&'static str> {
+        match self {
+            HandoffReadiness::Ready => None,
+            HandoffReadiness::UncommittedChanges { .. } => Some("uncommitted-changes"),
+            HandoffReadiness::NoCommitsAhead => Some("no-commits-ahead"),
+        }
+    }
+}
+
+/// Count the commits in a `git rev-list --count <range>` on `host`, or `None`
+/// when the range can't be resolved (a missing `base_ref`/branch, or a
+/// transport failure) — callers treat an inconclusive count as "don't block".
+fn rev_list_count(host: &Host, wt: &str, range: &str) -> Option<usize> {
+    let out = run_git_bounded(host, ["git", "-C", wt, "rev-list", "--count", range]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Verify a workspace's worktree is safe to hand off *before* the poller pushes
+/// its branch and runs the handoff edge's `open_pr` / `merge` actions.
+///
+/// The ready marker is a one-way "I'm done" signal the poller never validates:
+/// a worker that writes it with uncommitted work, or on a branch equal to its
+/// base, used to get an empty push, a no-op PR, and a review card with an empty
+/// diff — and its uncommitted work then stranded in a worktree the next
+/// dispatch resets. (On a PR workflow the empty-branch case loops on the
+/// `open_pr` failure every tick.) This gate catches both before any of that
+/// runs:
+///
+/// 1. **Uncommitted user work** — `git status --porcelain -z` filtered through
+///    [`user_dirty_porcelain_lines`], so shelbi's own `.claude/` deploy files
+///    (the ready marker included) and `.shelbi/` runtime scratch never count.
+///    Any surviving record → [`HandoffReadiness::UncommittedChanges`].
+/// 2. **No commits ahead of base** — `git rev-list --count <base_ref>..<branch>`.
+///    Zero means the branch has nothing unique over base. An empty branch (tip
+///    *equal to* base — the no-op-PR bug) is refused
+///    ([`HandoffReadiness::NoCommitsAhead`]); but work that already landed on
+///    base (base has moved strictly *ahead* of the branch tip) legitimately has
+///    nothing to push, so it is allowed through rather than wrongly blocked.
+///
+/// `base_ref` should be the ref the branch merges into, freshened from origin
+/// first (see [`fetch_origin_base_ref`]), so the ancestry/count reflects what
+/// the work will actually merge into rather than a stale local ref. An
+/// inconclusive git read (status read failed, range unresolvable) degrades to
+/// [`Ready`](HandoffReadiness::Ready): this gate only ever *adds* a refusal on a
+/// condition it can positively confirm; it never wedges a handoff on a transport
+/// hiccup (the downstream push gate still guards the remote tip).
+pub fn verify_worktree_ready_for_handoff(
+    host: &Host,
+    worktree: &Path,
+    branch: &str,
+    base_ref: &str,
+) -> HandoffReadiness {
+    let wt = worktree.to_string_lossy().into_owned();
+
+    // 1. Uncommitted user work. A failed/again-unreadable status read is NOT
+    //    treated as dirty — we only refuse on a condition we can positively see.
+    if let Ok(out) = run_git_bounded(host, ["git", "-C", &wt, "status", "--porcelain", "-z"]) {
+        if out.status.success() {
+            let dirty = String::from_utf8_lossy(&out.stdout);
+            let files = user_dirty_porcelain_lines(&dirty).len();
+            if files > 0 {
+                return HandoffReadiness::UncommittedChanges { files };
+            }
+        }
+    }
+
+    // 2. Commits ahead of base. `<base_ref>..refs/heads/<branch>` counts commits
+    //    reachable from the branch tip but not from base.
+    let branch_ref = format!("refs/heads/{branch}");
+    let ahead = match rev_list_count(host, &wt, &format!("{base_ref}..{branch_ref}")) {
+        Some(n) => n,
+        // Range unresolvable (base_ref or branch missing locally, transport
+        // blip): inconclusive, so don't block — the push gate still runs.
+        None => return HandoffReadiness::Ready,
+    };
+    if ahead > 0 {
+        return HandoffReadiness::Ready;
+    }
+
+    // Zero ahead. Distinguish an empty branch (tip == base: refuse) from work
+    // already integrated into base (base strictly ahead of the branch tip:
+    // nothing to push, but a legitimate end state — allow). The latter shows
+    // the branch *behind* base with no unique commits of its own.
+    let behind = rev_list_count(host, &wt, &format!("{branch_ref}..{base_ref}")).unwrap_or(0);
+    if behind > 0 {
+        HandoffReadiness::Ready
+    } else {
+        HandoffReadiness::NoCommitsAhead
+    }
+}
+
+/// Push a one-line `directive` message onto the assigned worker's durable
+/// message log (`<worktree>/.shelbi/messages/<task-id>.log`) — the same
+/// restart-safe, file-based channel `shelbi message` writes and the worker's
+/// SessionStart `tail` injects into its context. Used by the poller to tell a
+/// worker *why* its ready handoff was refused (uncommitted changes / empty
+/// branch) so the fix is actionable in the pane, not only on `events.log`.
+///
+/// Mirrors `shelbi message`'s on-disk record exactly (single-line JSON:
+/// `msg_id`, `ts`, `kind`, `body`) so the worker's existing drain parses it
+/// identically, and audits the push on the shared events stream via
+/// [`shelbi_state::append_message_event`]. It intentionally skips the daemon
+/// ack-timer notify — this is a best-effort nudge, not a tracked request.
+///
+/// Best-effort and non-blocking by contract: the refusal is already on
+/// `events.log`, so a failed append (missing worktree, SSH blip) only costs the
+/// in-pane nudge. Returns the generated `msg_id` on success, `None` on failure.
+pub fn push_worker_directive(
+    host: &Host,
+    worktree: &Path,
+    task_id: &str,
+    body: &str,
+) -> Option<String> {
+    let msg_id = format!(
+        "m-{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        std::process::id()
+    );
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    // serde_json escapes any newline/quote in `body`, so the whole record is a
+    // single line — the precondition for POSIX O_APPEND line atomicity.
+    let mut line = serde_json::to_string(&serde_json::json!({
+        "msg_id": msg_id,
+        "ts": ts,
+        "kind": "directive",
+        "body": body,
+    }))
+    .ok()?;
+    line.push('\n');
+
+    let messages_dir = worktree.join(".shelbi").join("messages");
+    let log_path = messages_dir.join(format!("{task_id}.log"));
+    append_message_log_line(host, &messages_dir, &log_path, &line).ok()?;
+
+    // Audit on the shared events stream (best-effort). Unlike `shelbi message`,
+    // we don't arm the daemon ack timer — the orchestrator already sees the
+    // `handoff ... status=refused` line; this is just an in-pane nudge.
+    let _ = shelbi_state::append_message_event(&msg_id, task_id);
+    Some(msg_id)
+}
+
+/// Append one already-newline-terminated message-log `line` to `log_path` on
+/// `host`, creating `dir` first. Local: `O_APPEND` single write. Remote:
+/// `mkdir -p && cat >>` over SSH with the body fed on stdin. Both rely on POSIX
+/// `O_APPEND` atomicity for lines ≤ PIPE_BUF (mirrors `shelbi message`'s
+/// appender). Kept private — the public entry point is [`push_worker_directive`].
+fn append_message_log_line(
+    host: &Host,
+    dir: &Path,
+    log_path: &Path,
+    line: &str,
+) -> std::io::Result<()> {
+    if host.is_local() {
+        use std::io::Write;
+        std::fs::create_dir_all(dir)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
+        return f.write_all(line.as_bytes());
+    }
+    let esc = shelbi_core::shell_escape;
+    let script = format!(
+        "mkdir -p {} && cat >> {}",
+        esc(&dir.to_string_lossy()),
+        esc(&log_path.to_string_lossy()),
+    );
+    shelbi_ssh::run_with_stdin(host, ["sh", "-c", &script], line.as_bytes())
+        .map(|_| ())
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Argv for the local slot-liveness probe: list the project session's
@@ -13004,5 +13230,97 @@ More detail that should not be included.
         // No criteria section and no prose — location alone still ships.
         assert_eq!(review_ready_notes("## Heading only\n\n---\n"), "");
         assert_eq!(review_ready_notes(""), "");
+    }
+}
+
+#[cfg(test)]
+mod handoff_readiness_git_tests {
+    //! Real-git tests for [`verify_worktree_ready_for_handoff`] — the pre-push
+    //! gate that refuses to turn a ready marker into a handoff on an uncommitted
+    //! or empty branch. Each provisions a working repo and exercises one verdict.
+    //! Skipped silently when `git` isn't on PATH.
+    use super::rebase_git_tests::{commit_file, git_available, init_repo, run_git_in};
+    use super::*;
+
+    #[test]
+    fn ready_when_branch_has_commits_ahead_and_clean_tree() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("ready-ahead");
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "hi\n", "feature work");
+
+        assert_eq!(
+            verify_worktree_ready_for_handoff(&Host::Local, &repo, "feature", "main"),
+            HandoffReadiness::Ready,
+        );
+    }
+
+    #[test]
+    fn uncommitted_user_changes_block_but_shelbi_footprint_does_not() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("ready-dirty");
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "hi\n", "feature work");
+
+        // shelbi's own footprint alone must NOT count as uncommitted work.
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(repo.join(".claude").join("shelbi-ready"), "feature\n").unwrap();
+        std::fs::create_dir_all(repo.join(".shelbi").join("messages")).unwrap();
+        std::fs::write(repo.join(".shelbi").join("pr-body.md"), "pr\n").unwrap();
+        assert_eq!(
+            verify_worktree_ready_for_handoff(&Host::Local, &repo, "feature", "main"),
+            HandoffReadiness::Ready,
+            "shelbi's .claude/.shelbi footprint must not count as dirty",
+        );
+
+        // Two genuine user changes: one untracked, one modified-tracked.
+        std::fs::write(repo.join("feature.txt"), "changed\n").unwrap();
+        std::fs::write(repo.join("scratch.txt"), "new\n").unwrap();
+        assert_eq!(
+            verify_worktree_ready_for_handoff(&Host::Local, &repo, "feature", "main"),
+            HandoffReadiness::UncommittedChanges { files: 2 },
+        );
+    }
+
+    #[test]
+    fn empty_branch_equal_to_base_is_refused() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("ready-empty");
+        // Branch cut from main with no new commits: tip == main.
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        assert_eq!(
+            verify_worktree_ready_for_handoff(&Host::Local, &repo, "feature", "main"),
+            HandoffReadiness::NoCommitsAhead,
+        );
+    }
+
+    #[test]
+    fn already_merged_branch_behind_base_is_allowed_not_refused() {
+        // A branch whose work already landed on base (base advanced strictly
+        // ahead of the branch tip, which has no unique commits) legitimately has
+        // nothing to push — it must be allowed through, NOT refused as empty.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("ready-merged");
+        // `feature` sits at main's initial commit; main then advances.
+        run_git_in(&repo, &["branch", "feature"]);
+        commit_file(&repo, "more.txt", "more\n", "advance main");
+
+        // ahead(main..feature)=0, behind(feature..main)=1 → already merged.
+        assert_eq!(
+            verify_worktree_ready_for_handoff(&Host::Local, &repo, "feature", "main"),
+            HandoffReadiness::Ready,
+        );
     }
 }

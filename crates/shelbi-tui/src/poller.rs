@@ -2727,6 +2727,27 @@ fn maybe_apply_ready_handoff(
             };
             let to_column = Column::from_status_id(&to_status);
 
+            // Verify the worktree is actually safe to hand off BEFORE touching
+            // git (rebase / push / the edge's `open_pr` / `merge`). A ready
+            // marker is a one-way "I'm done" signal the poller never validated:
+            // a worker that wrote it with uncommitted work, or on a branch equal
+            // to its base, used to get an empty push, a no-op PR, and a review
+            // card with an empty diff — its uncommitted work then stranded in a
+            // worktree the next dispatch resets. On a PR workflow the empty
+            // branch loops on the `open_pr` failure every tick. Refuse first:
+            // leave the card in its active status with the marker in place (so
+            // the handoff auto-proceeds once the worker commits), record the
+            // reason on `events.log`, and nudge the worker in its pane — deduped
+            // to once per distinct reason via the refusal sidecar. Only runs for
+            // a workflow whose forward edge actually touches git; a pure
+            // status-move workflow has nothing to push and is never blocked.
+            if !verify_handoff_or_refuse(
+                project, workspace, machine, host, &workflow, &tf.task, &from_status, &to_status,
+                &task_id,
+            ) {
+                return;
+            }
+
             // Auto-rebase the workspace's branch onto its base branch (the
             // branch the work merges into — see
             // `rebase_workspace_branch_before_handoff`) before the column
@@ -3372,6 +3393,171 @@ fn maybe_apply_transition(
 
     if let Err(e) = shelbi_orchestrator::workspace::clear_transition_marker(host, &marker) {
         tracing::warn!(workspace = %workspace.name, error = %e, "clear_transition_marker failed");
+    }
+}
+
+/// Gate the ready handoff on the worktree actually being safe to hand off,
+/// *before* any git runs (rebase / push / the edge's `open_pr` / `merge`).
+///
+/// Returns `true` when the handoff may proceed, `false` when it was refused (the
+/// caller returns without advancing, leaving the card in its active status and
+/// the ready marker in place so the handoff auto-retries once the worker
+/// commits). A refusal:
+///
+/// - records `handoff ... status=refused reason=<reason>[ files=<n>]` on
+///   `events.log` (orchestrator-visible), and
+/// - pushes a `directive` message onto the worker's durable message log so the
+///   worker sees *why* in its pane and what to do (commit / add a commit),
+///
+/// both **deduped to once per distinct reason** via the refusal sidecar
+/// ([`workspace_ready_refused_marker`]) so an idle worktree doesn't re-log and
+/// re-nudge every tick. A passing check clears that sidecar, so a later refusal
+/// surfaces afresh.
+///
+/// The check only runs for a workflow whose forward edge (`from_status ->
+/// to_status`) actually touches git (`push_branch` / `open_pr` / `merge`): a
+/// pure status-move workflow has nothing to push, so it is never blocked
+/// (mirrors the task's "nothing to push" carve-out). Resolution failures
+/// (unloadable branch, unresolvable base) and inconclusive git reads degrade to
+/// "proceed" — this gate only ever adds a refusal on a positively-confirmed
+/// condition, never wedges a handoff on a transport hiccup (the downstream push
+/// gate still guards the remote tip).
+#[allow(clippy::too_many_arguments)]
+fn verify_handoff_or_refuse(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    machine: &shelbi_core::Machine,
+    host: &shelbi_core::Host,
+    workflow: &Workflow,
+    task: &shelbi_core::Issue,
+    from_status: &str,
+    to_status: &str,
+    task_id: &str,
+) -> bool {
+    use shelbi_core::TransitionAction;
+    use shelbi_orchestrator::workspace::HandoffReadiness;
+
+    let refused_marker =
+        shelbi_orchestrator::workspace::workspace_ready_refused_marker(machine, workspace);
+
+    // Nothing to push → nothing to verify. A workflow with no `transitions:`
+    // block is the legacy implicit flow, whose handoff pushes and opens a PR
+    // regardless (the shipped default) — always git-bearing. When transitions
+    // ARE declared, only a forward edge that pushes / opens a PR / merges
+    // carries git work whose absence (empty branch) or staleness (uncommitted)
+    // matters; a pure status-move edge legitimately has nothing to push and is
+    // exempt (the task's "nothing to push" carve-out).
+    let touches_git = workflow.transitions.is_none()
+        || workflow
+            .actions_for_transition(from_status, to_status)
+            .iter()
+            .any(|a| {
+                matches!(
+                    a,
+                    TransitionAction::PushBranch
+                        | TransitionAction::OpenPr
+                        | TransitionAction::Merge
+                )
+            });
+    if !touches_git {
+        let _ = shelbi_orchestrator::workspace::clear_deferred_marker(host, &refused_marker);
+        return true;
+    }
+
+    // Resolve branch + base exactly as the rebase/push steps do, so the check
+    // compares against the same ref the work will merge into. An unresolvable
+    // branch means there's nothing we could verify — proceed (don't wedge).
+    let branch = match shelbi_orchestrator::branch::branch_name_for_task(
+        project,
+        Some(workflow),
+        task,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(workspace = %workspace.name, task = %task_id, error = %e, "skip handoff verify: branch resolution failed");
+            return true;
+        }
+    };
+    let base_branch = workflow
+        .resolve_git(&task.string_params())
+        .ok()
+        .flatten()
+        .and_then(|g| g.base_branch)
+        .unwrap_or_else(|| project.default_branch.clone());
+
+    let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
+    let base_ref =
+        shelbi_orchestrator::workspace::fetch_origin_base_ref(host, &worktree, &base_branch);
+    let readiness = shelbi_orchestrator::workspace::verify_worktree_ready_for_handoff(
+        host, &worktree, &branch, &base_ref,
+    );
+
+    let Some(reason) = readiness.refusal_reason() else {
+        // Ready: clear any prior refusal so a future one logs/nudges afresh.
+        let _ = shelbi_orchestrator::workspace::clear_deferred_marker(host, &refused_marker);
+        return true;
+    };
+
+    // Refused. Dedupe the log line + worker nudge so an idle worktree doesn't
+    // spam every tick; re-surface when the reason changes. Key the sidecar on
+    // `<task>:<reason>` so a worktree reused by a *different* task never
+    // false-suppresses that task's first refusal.
+    let token = format!("{task_id}:{reason}");
+    let already_logged = matches!(
+        shelbi_orchestrator::workspace::read_deferred_marker(host, &refused_marker),
+        Ok(Some(prev)) if prev == token
+    );
+    if !already_logged {
+        let files = match readiness {
+            HandoffReadiness::UncommittedChanges { files } => Some(files),
+            _ => None,
+        };
+        if let Err(e) =
+            shelbi_state::append_handoff_refused_event(task_id, &workspace.name, &branch, reason, files)
+        {
+            tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_handoff_refused_event failed");
+        }
+        let body = handoff_refusal_message(&readiness, &branch, &base_branch);
+        shelbi_orchestrator::workspace::push_worker_directive(host, &worktree, task_id, &body);
+        if let Err(e) =
+            shelbi_orchestrator::workspace::write_deferred_marker(host, &refused_marker, &token)
+        {
+            tracing::debug!(workspace = %workspace.name, task = %task_id, error = %e, "write refusal sidecar failed");
+        }
+    }
+    tracing::warn!(
+        workspace = %workspace.name,
+        task = %task_id,
+        branch = %branch,
+        reason = %reason,
+        "ready handoff refused: worktree not safe to hand off; leaving card in-progress with marker in place",
+    );
+    false
+}
+
+/// The in-pane message a worker gets when its ready handoff is refused — names
+/// the reason and the concrete fix so it is actionable without reading
+/// `events.log`.
+fn handoff_refusal_message(
+    readiness: &shelbi_orchestrator::workspace::HandoffReadiness,
+    branch: &str,
+    base_branch: &str,
+) -> String {
+    use shelbi_orchestrator::workspace::HandoffReadiness;
+    match readiness {
+        HandoffReadiness::UncommittedChanges { files } => format!(
+            "Handoff refused: your worktree has {files} uncommitted change(s). \
+             Commit your work on `{branch}` (the ready marker is still in place, \
+             so the handoff proceeds automatically once you commit), then it will \
+             advance to review on the next poll."
+        ),
+        HandoffReadiness::NoCommitsAhead => format!(
+            "Handoff refused: branch `{branch}` has no commits ahead of `{base_branch}` \
+             — handing off now would open an empty, no-op PR. Commit your work on \
+             `{branch}` first; the ready marker is still in place, so the handoff \
+             proceeds automatically once there's a commit to hand off."
+        ),
+        HandoffReadiness::Ready => String::new(),
     }
 }
 
@@ -8746,6 +8932,205 @@ transitions:
         assert!(
             !log.lines().any(|l| l.contains(" task=fix-login ")
                 && l.contains(" in_progress -> review ")),
+            "no review transition must be logged; log: {log:?}",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ready_marker_refused_when_worktree_has_uncommitted_changes() {
+        // A worker that writes the ready marker with uncommitted work must NOT
+        // be handed off: the card stays in-progress, the marker is retained (so
+        // the handoff auto-proceeds once it commits), a `status=refused
+        // reason=uncommitted-changes files=N` event is logged, and the worker is
+        // nudged in its pane. Shelbi's own `.claude/`/`.shelbi/` footprint must
+        // NOT count toward the dirty tally. The refusal is deduped — a second
+        // tick on the unchanged worktree neither re-logs nor re-nudges (no
+        // open_pr / refusal loop).
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-dirty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        assert!(git_in(&work_dir, &["init", "-q", "-b", "main"]).status.success());
+        std::fs::write(work_dir.join("README.md"), "# repo\n").unwrap();
+        assert!(git_in(&work_dir, &["add", "README.md"]).status.success());
+        assert!(git_in(&work_dir, &["commit", "-q", "-m", "init"]).status.success());
+
+        // Worktree on the task branch with one real commit ahead of main (so the
+        // only possible refusal is the dirty tree, not no-commits-ahead).
+        let project = local_project(&work_dir);
+        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        assert!(git_in(
+            &work_dir,
+            &["worktree", "add", "-q", "-b", "shelbi/fix-login", wt.to_str().unwrap(), "main"],
+        )
+        .status
+        .success());
+        std::fs::write(wt.join("work.txt"), "v0\n").unwrap();
+        assert!(git_in(&wt, &["add", "work.txt"]).status.success());
+        assert!(git_in(&wt, &["commit", "-q", "-m", "task work"]).status.success());
+
+        // One uncommitted USER change, plus shelbi's own footprint that must be
+        // ignored: the ready marker (written below) under `.claude/`, and a
+        // `.shelbi/` scratch file.
+        std::fs::write(wt.join("work.txt"), "v1 dirty\n").unwrap();
+        std::fs::create_dir_all(wt.join(".shelbi")).unwrap();
+        std::fs::write(wt.join(".shelbi").join("pr-body.md"), "pr\n").unwrap();
+
+        let mut task = in_progress_task("fix-login", "alpha");
+        task.branch = Some("shelbi/fix-login".into());
+        shelbi_state::save_task("demo", &task, "body").unwrap();
+        let marker = write_marker(&project, "fix-login\n");
+
+        let run = || {
+            maybe_apply_ready_handoff(
+                &project,
+                &project.workspaces[0],
+                &project.machines[0],
+                &Host::Local,
+                &TmuxAddr { session: "s".into(), window: "w".into() },
+            );
+        };
+        run();
+
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login").unwrap().task.column,
+            Column::in_progress(),
+            "a dirty worktree must leave the task in-progress, not hand it off",
+        );
+        assert!(marker.exists(), "the ready marker must be retained so the handoff auto-retries");
+
+        let refused: Vec<String> = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains(" task=fix-login ") && l.contains(" status=refused "))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(refused.len(), 1, "exactly one refusal line expected; got: {refused:?}");
+        assert!(
+            refused[0].contains(" reason=uncommitted-changes ") && refused[0].contains(" files=1"),
+            "refusal must name the reason and count only the one USER file (shelbi's own \
+             `.claude/`/`.shelbi/` files excluded); line: {}",
+            refused[0],
+        );
+
+        // The worker was nudged in its pane via the durable message log.
+        let msg_log = wt.join(".shelbi").join("messages").join("fix-login.log");
+        let msg_body = std::fs::read_to_string(&msg_log).unwrap_or_default();
+        assert!(
+            msg_body.contains("\"kind\":\"directive\"") && msg_body.contains("Handoff refused"),
+            "worker must get a directive message explaining the refusal; log: {msg_body:?}",
+        );
+
+        // Dedupe: a second unchanged tick neither re-logs nor re-nudges.
+        run();
+        let refused_after: usize = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains(" task=fix-login ") && l.contains(" status=refused "))
+            .count();
+        assert_eq!(refused_after, 1, "a repeat refusal on the unchanged worktree must be deduped");
+        assert_eq!(
+            std::fs::read_to_string(&msg_log).unwrap_or_default().matches("Handoff refused").count(),
+            1,
+            "the worker must not be re-nudged every tick",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ready_marker_refused_when_branch_has_no_commits_ahead() {
+        // A ready marker on a branch with zero commits ahead of its base (an
+        // empty branch whose tip equals base) must be refused before the push /
+        // open_pr — not turned into a no-op PR. Task stays in-progress, marker
+        // retained, `reason=no-commits-ahead` logged.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-noahead-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        assert!(git_in(&work_dir, &["init", "-q", "-b", "main"]).status.success());
+        std::fs::write(work_dir.join("README.md"), "# repo\n").unwrap();
+        assert!(git_in(&work_dir, &["add", "README.md"]).status.success());
+        assert!(git_in(&work_dir, &["commit", "-q", "-m", "init"]).status.success());
+
+        // Worktree on a branch cut from main with NO new commits: tip == main.
+        let project = local_project(&work_dir);
+        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        assert!(git_in(
+            &work_dir,
+            &["worktree", "add", "-q", "-b", "shelbi/fix-login", wt.to_str().unwrap(), "main"],
+        )
+        .status
+        .success());
+
+        let mut task = in_progress_task("fix-login", "alpha");
+        task.branch = Some("shelbi/fix-login".into());
+        shelbi_state::save_task("demo", &task, "body").unwrap();
+        let marker = write_marker(&project, "fix-login\n");
+
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr { session: "s".into(), window: "w".into() },
+        );
+
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login").unwrap().task.column,
+            Column::in_progress(),
+            "an empty branch must leave the task in-progress, not open a no-op PR",
+        );
+        assert!(marker.exists(), "the ready marker must be retained");
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.lines().any(|l| l.contains(" task=fix-login ")
+                && l.contains(" status=refused ")
+                && l.contains(" reason=no-commits-ahead")),
+            "a no-commits-ahead refusal must be logged; log: {log:?}",
+        );
+        assert!(
+            !log.lines().any(|l| l.contains(" task=fix-login ") && l.contains(" in_progress -> review ")),
             "no review transition must be logged; log: {log:?}",
         );
 
