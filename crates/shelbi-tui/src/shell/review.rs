@@ -298,6 +298,14 @@ impl ReviewInterface {
                 content_rect,
                 &format!("Couldn't attach to {}: {err}", r.display()),
             ),
+            // The review agent's chat session should always be live; if it isn't
+            // up yet, treat it like "no session here" rather than the dev-slot
+            // idle placeholder (which doesn't fit a review content pane).
+            MainState::Idle(info) => super::render_placeholder(
+                buf,
+                content_rect,
+                &format!("No live session for {}", info.name),
+            ),
             MainState::Live(pane) => {
                 let cur = pane.render(buf, content_rect, truecolor);
                 if focus_main && self.focus == ReviewFocus::Content {
@@ -365,15 +373,15 @@ fn contains(area: Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shell::session::Connected;
+    use crate::shell::session::{ConnectFailure, Connected};
     use crossterm::event::KeyModifiers;
 
     /// A connector that never resolves — the content view stays Connecting, so
     /// these pure-routing tests touch no real session.
     struct NeverConnector;
     impl Connector for NeverConnector {
-        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, String> {
-            Err("test: no session".into())
+        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
+            Err(ConnectFailure::Message("test: no session".into()))
         }
     }
 

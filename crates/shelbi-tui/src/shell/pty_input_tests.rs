@@ -41,14 +41,20 @@ struct DirectConnector {
 }
 
 impl Connector for DirectConnector {
-    fn connect(&self, _project: &str, _target: &SessionRef) -> Result<Connected, String> {
-        let (conn, events) =
-            Connection::open(&self.sock, None, capability::ALL).map_err(|e| e.to_string())?;
+    fn connect(
+        &self,
+        _project: &str,
+        _target: &SessionRef,
+    ) -> Result<Connected, super::session::ConnectFailure> {
+        use super::session::ConnectFailure;
+        let (conn, events) = Connection::open(&self.sock, None, capability::ALL)
+            .map_err(|e| ConnectFailure::Message(e.to_string()))?;
         let size = match conn.info() {
             Ok(info) => Size::new(info.cols.max(1), info.rows.max(1)),
             Err(_) => Size::new(80, 24),
         };
-        conn.attach(None).map_err(|e| e.to_string())?;
+        conn.attach(None)
+            .map_err(|e| ConnectFailure::Message(e.to_string()))?;
         Ok(Connected { conn, events, size })
     }
 }

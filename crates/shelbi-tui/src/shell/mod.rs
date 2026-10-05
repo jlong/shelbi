@@ -306,8 +306,12 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         // Background sources (all non-blocking). A daemon change notification
         // triggers an immediate refresh; the periodic request is the fallback.
         let mut changed = false;
-        while change_rx.try_recv().is_ok() {
+        let mut woke_workspaces: Vec<String> = Vec::new();
+        while let Ok(wake) = change_rx.try_recv() {
             changed = true;
+            if let changes::ChangeWake::Workspace(ws) = wake {
+                woke_workspaces.push(ws);
+            }
         }
         if changed || last_refresh.elapsed() >= REFRESH_INTERVAL {
             refresher.request();
@@ -315,6 +319,14 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         }
         if let Some(snap) = refresher.latest() {
             state.apply_snapshot(snap);
+        }
+        // A change arrived for the workspace the main area is showing: if its
+        // attach was idle or failed (no session yet), retry so a session that
+        // just started shows up without the user re-selecting the row
+        // (`rt-tui-idle-workspace-open`). Scoped to the shown workspace so
+        // unrelated board churn never flickers the placeholder.
+        if state.retry_shown_workspace(&woke_workspaces) {
+            state.dirty = true;
         }
         // Advance the board's background card-move persistence (settle a landed
         // hop, start the next queued one, or roll back on failure) so an optimistic
@@ -873,6 +885,12 @@ impl ShellState {
         }
         match target {
             RowTarget::Session(r) => {
+                // Leaving an open review for a session: drop the review interface
+                // so it stops rendering over the main area (it draws at the frame
+                // level regardless of `main_view`). Dropping detaches the content
+                // views; the daemon keeps the review's sessions, so reopening the
+                // review-column task reattaches (`rt-tui-idle-workspace-open`).
+                self.review = None;
                 self.main_view = MainView::Session;
                 self.reported_main = None; // force a resize report for the new session
                 // Record the view (orchestrator chat or a workspace session).
@@ -891,6 +909,9 @@ impl ShellState {
                 self.client.focus_main();
             }
             RowTarget::Native(v) => {
+                // As above: a native view also replaces the main area, so drop
+                // any open review interface drawn over it.
+                self.review = None;
                 self.client.set_view(v.clone());
                 self.main_view = MainView::Native(v);
             }
@@ -985,6 +1006,25 @@ impl ShellState {
             if let Some(target) = view.target_at(self.selection()) {
                 self.show(target);
             }
+        }
+    }
+
+    /// Retry the main-area attach when one of `changed_workspaces` is the
+    /// workspace currently shown and its session was idle/failed — so a session
+    /// that just started attaches without the user re-selecting the row
+    /// (`rt-tui-idle-workspace-open`). Returns whether a retry was kicked.
+    fn retry_shown_workspace(&mut self, changed_workspaces: &[String]) -> bool {
+        if !matches!(self.main_view, MainView::Session) {
+            return false;
+        }
+        let shown = match self.sessions.current_target() {
+            Some(SessionRef::Workspace(name)) => name.clone(),
+            _ => return false,
+        };
+        if changed_workspaces.contains(&shown) {
+            self.sessions.retry_if_stale()
+        } else {
+            false
         }
     }
 
@@ -2353,6 +2393,7 @@ fn draw(
                     MainState::Connecting(r) => {
                         render_placeholder(buf, main_rect, &format!("Connecting to {}…", r.display()))
                     }
+                    MainState::Idle(info) => render_idle_workspace(buf, main_rect, info),
                     MainState::Failed(r, err) => render_placeholder(
                         buf,
                         main_rect,
@@ -2489,6 +2530,68 @@ fn view_to_row_target(view: &View) -> RowTarget {
         View::Session(name) if name == ORCH_VIEW => RowTarget::Session(SessionRef::Orchestrator),
         View::Session(name) => RowTarget::Session(SessionRef::Workspace(name.clone())),
     }
+}
+
+/// The lines of the idle-workspace placeholder: the workspace identity, then a
+/// blank, then the "idle" state and how to start work on it. Pure (no IO, no
+/// rendering) so the content is unit-testable (`rt-tui-idle-workspace-open`).
+fn idle_placeholder_lines(info: &session::IdleInfo) -> Vec<String> {
+    // Identity: "<name>" then "<machine> · <branch>" (each part dropped when
+    // unknown, e.g. a remote workspace whose branch we don't resolve).
+    let mut identity: Vec<String> = Vec::new();
+    if !info.machine.is_empty() {
+        identity.push(info.machine.clone());
+    }
+    if let Some(branch) = &info.branch {
+        identity.push(branch.clone());
+    }
+    let mut lines = vec![info.name.clone()];
+    if !identity.is_empty() {
+        lines.push(identity.join(" · "));
+    }
+    lines.push(String::new());
+    lines.push("Idle — no running session.".to_string());
+    lines.push(
+        "Dispatch a ready task here from the Issues board, or the command palette (Ctrl+Space), \
+         to start work."
+            .to_string(),
+    );
+    lines
+}
+
+/// Render the idle-workspace placeholder: the workspace's identity and how to
+/// start work on it, so opening an idle slot shows something the sidebar
+/// selection agrees with instead of a bare attach error
+/// (`rt-tui-idle-workspace-open`).
+fn render_idle_workspace(buf: &mut ratatui::buffer::Buffer, area: Rect, info: &session::IdleInfo) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let lines = idle_placeholder_lines(info);
+    // Vertically centre the block; the name reads brighter than the dim body.
+    let n = lines.len() as u16;
+    let top = area.y + area.height.saturating_sub(n) / 2;
+    let body: Vec<Line> = lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let style = if i == 0 {
+                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Line::from(Span::styled(text, style))
+        })
+        .collect();
+    let block = Rect::new(
+        area.x + 1,
+        top,
+        area.width.saturating_sub(2),
+        n.min(area.height),
+    );
+    Paragraph::new(body)
+        .wrap(Wrap { trim: true })
+        .render(block, buf);
 }
 
 fn render_placeholder(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
@@ -2650,18 +2753,51 @@ mod tests {
 
     struct NoopConnector;
     impl session::Connector for NoopConnector {
-        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<session::Connected, String> {
-            Err("no session in tests".into())
+        fn connect(
+            &self,
+            _p: &str,
+            _t: &SessionRef,
+        ) -> Result<session::Connected, session::ConnectFailure> {
+            Err(session::ConnectFailure::Message("no session in tests".into()))
+        }
+    }
+
+    /// A connector that reports every workspace target as idle, with the given
+    /// identity — for the idle-workspace-open tests (`rt-tui-idle-workspace-open`).
+    struct IdleWorkspaceConnector {
+        machine: String,
+        branch: Option<String>,
+    }
+    impl session::Connector for IdleWorkspaceConnector {
+        fn connect(
+            &self,
+            _p: &str,
+            target: &SessionRef,
+        ) -> Result<session::Connected, session::ConnectFailure> {
+            match target {
+                SessionRef::Workspace(name) => {
+                    Err(session::ConnectFailure::Idle(session::IdleInfo {
+                        name: name.clone(),
+                        machine: self.machine.clone(),
+                        branch: self.branch.clone(),
+                    }))
+                }
+                _ => Err(session::ConnectFailure::Message("no session in tests".into())),
+            }
         }
     }
 
     fn test_state() -> ShellState {
+        test_state_with_connector(Arc::new(NoopConnector))
+    }
+
+    fn test_state_with_connector(connector: Arc<dyn session::Connector>) -> ShellState {
         let caps = Caps {
             kitty: true,
             truecolor: true,
             nested: None,
         };
-        let mut st = ShellState::new("proj", Arc::new(NoopConnector), caps);
+        let mut st = ShellState::new("proj", connector, caps);
         st.apply_snapshot(ShellSnapshot {
             sidebar: Some(SidebarModel {
                 project_label: "proj".into(),
@@ -2911,6 +3047,178 @@ mod tests {
         );
         // A session click takes main focus, exactly as Enter does.
         assert_eq!(st.client.focus(), Focus::Main);
+    }
+
+    /// Poll the main-area session manager until its in-flight connect settles,
+    /// so a test can assert the resolved [`MainState`].
+    fn settle_sessions(st: &mut ShellState) {
+        for _ in 0..400 {
+            if st.sessions.poll() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the session connect never settled");
+    }
+
+    #[test]
+    fn opening_an_idle_workspace_shows_its_placeholder() {
+        // AC: opening (Enter/click) an idle workspace with no session shows the
+        // idle-workspace placeholder in the main area, and the main view agrees
+        // with the sidebar selection (`rt-tui-idle-workspace-open`).
+        let mut st = test_state_with_connector(Arc::new(IdleWorkspaceConnector {
+            machine: "hub".into(),
+            branch: Some("main".into()),
+        }));
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        st.client.focus_sidebar();
+        // The single flat workspace `alpha` sits on y=11 (see the click test).
+        st.handle_mouse(left_click(2, 11));
+        assert!(matches!(st.main_view, MainView::Session));
+        assert_eq!(
+            st.sessions.current_target(),
+            Some(&SessionRef::Workspace("alpha".into())),
+        );
+        settle_sessions(&mut st);
+        match st.sessions.state() {
+            MainState::Idle(info) => {
+                assert_eq!(info.name, "alpha");
+                assert_eq!(info.machine, "hub");
+                assert_eq!(info.branch.as_deref(), Some("main"));
+            }
+            _ => panic!("an idle workspace lands in MainState::Idle"),
+        }
+    }
+
+    #[test]
+    fn idle_placeholder_lines_carry_identity_and_a_start_hint() {
+        // Full identity: name, then "machine · branch", a blank, the idle line,
+        // and the start hint.
+        let lines = idle_placeholder_lines(&session::IdleInfo {
+            name: "vector".into(),
+            machine: "hub".into(),
+            branch: Some("jlong/widget".into()),
+        });
+        assert_eq!(lines[0], "vector");
+        assert_eq!(lines[1], "hub · jlong/widget");
+        assert!(lines.iter().any(|l| l.contains("Idle")));
+        assert!(lines.iter().any(|l| l.contains("Issues board")));
+
+        // A remote workspace (no resolved branch) drops the branch part.
+        let remote = idle_placeholder_lines(&session::IdleInfo {
+            name: "vector".into(),
+            machine: "gpu-box".into(),
+            branch: None,
+        });
+        assert_eq!(remote[1], "gpu-box");
+
+        // A workspace whose config couldn't load still shows its name.
+        let bare = idle_placeholder_lines(&session::IdleInfo {
+            name: "vector".into(),
+            machine: String::new(),
+            branch: None,
+        });
+        assert_eq!(bare[0], "vector");
+        assert!(bare.iter().any(|l| l.contains("Idle")));
+    }
+
+    #[test]
+    fn a_change_for_the_shown_idle_workspace_retries_the_attach() {
+        // AC: after a session for the shown workspace starts, the main area
+        // attaches without re-selecting. A workspace change naming the shown
+        // (idle) workspace kicks a retry; an unrelated one does not
+        // (`rt-tui-idle-workspace-open`).
+        let mut st = test_state_with_connector(Arc::new(IdleWorkspaceConnector {
+            machine: "hub".into(),
+            branch: None,
+        }));
+        st.show(RowTarget::Session(SessionRef::Workspace("alpha".into())));
+        settle_sessions(&mut st);
+        assert!(matches!(st.sessions.state(), MainState::Idle(_)));
+
+        // A change for a different workspace is ignored.
+        assert!(!st.retry_shown_workspace(&["beta".into()]));
+        assert!(matches!(st.sessions.state(), MainState::Idle(_)));
+
+        // A change naming the shown workspace retries: it goes back to
+        // connecting (the worker re-runs) with no re-selection.
+        assert!(st.retry_shown_workspace(&["alpha".into()]));
+        assert!(matches!(st.sessions.state(), MainState::Connecting(_)));
+    }
+
+    #[test]
+    fn render_idle_workspace_paints_the_identity_into_the_area() {
+        // The placeholder actually paints the workspace identity into the main
+        // area's buffer (not just the pure line builder).
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_idle_workspace(
+            &mut buf,
+            area,
+            &session::IdleInfo {
+                name: "vector".into(),
+                machine: "hub".into(),
+                branch: Some("main".into()),
+            },
+        );
+        let painted: String = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect();
+        assert!(painted.contains("vector"), "name painted: {painted:?}");
+        assert!(painted.contains("hub"), "machine painted");
+        assert!(painted.contains("Idle"), "idle line painted");
+    }
+
+    #[test]
+    fn opening_a_workspace_with_a_dead_session_shows_its_last_output() {
+        // AC: opening a workspace whose session exited shows its last output
+        // line — the orchestrator view's existing behavior, routed through the
+        // Failed placeholder (`rt-tui-idle-workspace-open`).
+        struct DeadConnector;
+        impl session::Connector for DeadConnector {
+            fn connect(
+                &self,
+                _p: &str,
+                _t: &SessionRef,
+            ) -> Result<session::Connected, session::ConnectFailure> {
+                Err(session::ConnectFailure::Message(
+                    "no live session `proj/ws/alpha` — last output: zsh: command not found: claude"
+                        .into(),
+                ))
+            }
+        }
+        let mut st = test_state_with_connector(Arc::new(DeadConnector));
+        st.show(RowTarget::Session(SessionRef::Workspace("alpha".into())));
+        settle_sessions(&mut st);
+        match st.sessions.state() {
+            MainState::Failed(_, err) => {
+                assert!(err.contains("last output: zsh: command not found: claude"));
+            }
+            _ => panic!("a dead session lands in MainState::Failed with its last line"),
+        }
+    }
+
+    #[test]
+    fn opening_a_session_drops_an_open_review() {
+        // The review interface draws over the main area regardless of
+        // `main_view`, so navigating to a workspace/session must drop it — else
+        // the idle placeholder (or any session) is hidden behind the review,
+        // which is the bug that motivated this task (`rt-tui-idle-workspace-open`).
+        let mut st = test_state();
+        st.main_view = MainView::Review("t-1".into());
+        st.review = Some(ReviewInterface::new(
+            "proj",
+            Arc::new(NoopConnector),
+            "t-1",
+            "rev-1",
+            "/tmp/wt",
+            "vim",
+            false,
+        ));
+        st.show(RowTarget::Session(SessionRef::Orchestrator));
+        assert!(matches!(st.main_view, MainView::Session));
+        assert!(st.review.is_none(), "navigating away drops the review interface");
     }
 
     #[test]

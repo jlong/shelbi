@@ -110,6 +110,63 @@ pub fn workspace_worktree(machine: &Machine, workspace: &WorkspaceSpec) -> PathB
         .join(&workspace.name)
 }
 
+/// Identity shown in the shell's idle-workspace placeholder (the main area a
+/// client lands on when it opens a declared workspace that has no live
+/// session). Assembled from the project config plus — for a local machine — a
+/// quick read of the worktree's current branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleWorkspaceIdentity {
+    /// The machine the workspace is declared on.
+    pub machine: String,
+    /// Whether that machine is a remote (SSH) host.
+    pub is_remote: bool,
+    /// The worktree's current git branch. Resolved only for a local machine —
+    /// an instant `git` read — and left `None` for a remote workspace (whose
+    /// branch would need an SSH round-trip we don't want an idle-open to block
+    /// on) or when the worktree can't be read (missing, detached HEAD, not a
+    /// repo yet).
+    pub branch: Option<String>,
+}
+
+/// Resolve the [`IdleWorkspaceIdentity`] for `workspace` in `project`, or
+/// `None` when the project config can't load or names no such workspace /
+/// machine. Does blocking IO (config load + a local `git` read), so callers
+/// run it off the UI thread.
+pub fn resolve_idle_workspace(project: &str, workspace: &str) -> Option<IdleWorkspaceIdentity> {
+    let p = shelbi_state::load_project(project).ok()?;
+    let spec = p.workspace(workspace)?;
+    let machine = p.machine(&spec.machine)?;
+    let host = machine.host();
+    let is_remote = !host.is_local();
+    let branch = if is_remote {
+        None
+    } else {
+        worktree_current_branch(&host, &workspace_worktree(machine, spec))
+    };
+    Some(IdleWorkspaceIdentity {
+        machine: spec.machine.clone(),
+        is_remote,
+        branch,
+    })
+}
+
+/// The worktree's current branch via `git rev-parse --abbrev-ref HEAD`, or
+/// `None` when the worktree is missing, isn't a git repo, or is on a detached
+/// HEAD (no branch to name). Best-effort: any failure reads as "unknown".
+fn worktree_current_branch(host: &Host, worktree: &Path) -> Option<String> {
+    let dir = worktree.to_string_lossy();
+    let out = crate::git::run_in_dir(host, &dir, &["git", "rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() || s == "HEAD" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// The ready-handoff file marker for a workspace:
 /// `<worktree>/.claude/shelbi-ready`.
 ///
@@ -6389,6 +6446,51 @@ mod tests {
     use super::*;
     use shelbi_core::{AgentRunnerSpec, MachineKind, OrchestratorSpec, ResolvedReviewRecipe};
     use std::collections::BTreeMap;
+
+    fn run_git_here(repo: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    #[test]
+    fn worktree_current_branch_reads_head_and_tolerates_a_missing_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git_here(&repo, &["init", "-q", "-b", "main"]);
+        run_git_here(&repo, &["config", "user.email", "t@example.com"]);
+        run_git_here(&repo, &["config", "user.name", "T"]);
+        std::fs::write(repo.join("f"), "x\n").unwrap();
+        run_git_here(&repo, &["add", "f"]);
+        run_git_here(&repo, &["commit", "-q", "-m", "init"]);
+
+        assert_eq!(
+            worktree_current_branch(&Host::Local, &repo).as_deref(),
+            Some("main"),
+        );
+
+        // A missing directory is "unknown", not an error.
+        assert_eq!(
+            worktree_current_branch(&Host::Local, &tmp.path().join("nope")),
+            None,
+        );
+
+        // A detached HEAD has no branch to name.
+        let head = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run_git_here(&repo, &["checkout", "-q", &head]);
+        assert_eq!(worktree_current_branch(&Host::Local, &repo), None);
+    }
 
     #[test]
     fn review_recipe_section_renders_resolved_commands_under_the_anchor() {

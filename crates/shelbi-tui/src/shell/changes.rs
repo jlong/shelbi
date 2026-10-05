@@ -25,6 +25,16 @@ use std::time::Duration;
 
 use shelbi_state::ChangeNotification;
 
+/// A refresh-worthy change, forwarded to the shell. A workspace change carries
+/// its name so the shell can retry just that workspace's idle/failed main-area
+/// attach when its session starts (`rt-tui-idle-workspace-open`); a board change
+/// only requests a data refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeWake {
+    Board,
+    Workspace(String),
+}
+
 /// How long a connect attempt / idle read waits before re-checking the stop flag,
 /// and the pause between reconnect attempts.
 const POLL_SLICE: Duration = Duration::from_millis(500);
@@ -49,7 +59,7 @@ impl Drop for ChangeSubscription {
 /// receiver the shell drains each tick. Every board/workspace change for this
 /// project yields one `()` wake; other projects and layout-only changes are
 /// filtered out thread-side.
-pub fn spawn(project: &str) -> (ChangeSubscription, Receiver<()>) {
+pub fn spawn(project: &str) -> (ChangeSubscription, Receiver<ChangeWake>) {
     let (tx, rx) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
@@ -61,7 +71,7 @@ pub fn spawn(project: &str) -> (ChangeSubscription, Receiver<()>) {
     (ChangeSubscription { stop, handle: Some(handle) }, rx)
 }
 
-fn subscriber_loop(project: &str, tx: &Sender<()>, stop: &AtomicBool) {
+fn subscriber_loop(project: &str, tx: &Sender<ChangeWake>, stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
         match connect_and_stream(project, tx, stop) {
             StreamEnd::ReceiverGone => return,
@@ -75,7 +85,7 @@ enum StreamEnd {
     ReceiverGone,
 }
 
-fn connect_and_stream(project: &str, tx: &Sender<()>, stop: &AtomicBool) -> StreamEnd {
+fn connect_and_stream(project: &str, tx: &Sender<ChangeWake>, stop: &AtomicBool) -> StreamEnd {
     let Ok(path) = shelbi_state::hub_socket_path() else {
         return StreamEnd::Disconnected;
     };
@@ -111,34 +121,36 @@ fn connect_and_stream(project: &str, tx: &Sender<()>, stop: &AtomicBool) -> Stre
 
 /// Split complete lines out of `buf`; send a wake for each board/workspace change
 /// for this project. `Err(())` means the receiver was dropped.
-fn drain_lines(buf: &mut Vec<u8>, project: &str, tx: &Sender<()>) -> std::result::Result<(), ()> {
+fn drain_lines(
+    buf: &mut Vec<u8>,
+    project: &str,
+    tx: &Sender<ChangeWake>,
+) -> std::result::Result<(), ()> {
     while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
         let line: Vec<u8> = buf.drain(..=nl).collect();
         let line = &line[..line.len() - 1];
-        if wakes_refresh(line, project) {
-            tx.send(()).map_err(|_| ())?;
+        if let Some(wake) = wake_for(line, project) {
+            tx.send(wake).map_err(|_| ())?;
         }
     }
     Ok(())
 }
 
-/// Whether `line` is a board/workspace change for `project` (the changes that
-/// should trigger a data refresh). Layout events, other projects, and malformed
-/// lines do not.
-fn wakes_refresh(line: &[u8], project: &str) -> bool {
-    let Some(change) = std::str::from_utf8(line)
+/// The [`ChangeWake`] `line` warrants for `project`, or `None` when it isn't a
+/// board/workspace change for this project (layout events, other projects, and
+/// malformed lines don't wake a refresh).
+fn wake_for(line: &[u8], project: &str) -> Option<ChangeWake> {
+    let change = std::str::from_utf8(line)
         .ok()
-        .and_then(ChangeNotification::from_line)
-    else {
-        return false;
-    };
+        .and_then(ChangeNotification::from_line)?;
     if change.project() != project {
-        return false;
+        return None;
     }
-    matches!(
-        change,
-        ChangeNotification::Board { .. } | ChangeNotification::Workspace { .. }
-    )
+    match change {
+        ChangeNotification::Board { .. } => Some(ChangeWake::Board),
+        ChangeNotification::Workspace { workspace, .. } => Some(ChangeWake::Workspace(workspace)),
+        _ => None,
+    }
 }
 
 fn sleep_slice(stop: &AtomicBool) {
@@ -183,19 +195,24 @@ mod tests {
     #[test]
     fn board_and_workspace_changes_for_the_project_wake_refresh() {
         let board = br#"{"change":"board","project":"demo"}"#;
-        assert!(wakes_refresh(board, "demo"));
+        assert_eq!(wake_for(board, "demo"), Some(ChangeWake::Board));
+        // A workspace change carries its name so the shell can retry just that
+        // workspace's idle attach.
         let ws = br#"{"change":"workspace","project":"demo","workspace":"alpha"}"#;
-        assert!(wakes_refresh(ws, "demo"));
+        assert_eq!(
+            wake_for(ws, "demo"),
+            Some(ChangeWake::Workspace("alpha".into()))
+        );
     }
 
     #[test]
     fn other_projects_layout_events_and_junk_do_not_wake() {
         let other = br#"{"change":"board","project":"other"}"#;
-        assert!(!wakes_refresh(other, "demo"));
+        assert_eq!(wake_for(other, "demo"), None);
         let layout =
             br#"{"change":"layout","project":"demo","event":{"layout":"orchestrator-restarted"}}"#;
-        assert!(!wakes_refresh(layout, "demo"));
-        assert!(!wakes_refresh(b"not json", "demo"));
+        assert_eq!(wake_for(layout, "demo"), None);
+        assert_eq!(wake_for(b"not json", "demo"), None);
     }
 
     #[test]

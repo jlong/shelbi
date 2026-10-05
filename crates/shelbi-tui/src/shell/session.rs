@@ -63,10 +63,36 @@ pub struct Connected {
     pub size: Size,
 }
 
+/// Identity for the idle-workspace placeholder: a declared workspace the client
+/// opened that has no live session (and no exited one to show a last line for).
+/// The main area shows this instead of a bare "couldn't attach" error so the
+/// sidebar selection and the main view agree (`rt-tui-idle-workspace-open`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleInfo {
+    /// The workspace name.
+    pub name: String,
+    /// The machine the workspace is declared on.
+    pub machine: String,
+    /// The worktree's current branch, when known (local workspaces only).
+    pub branch: Option<String>,
+}
+
+/// Why a connect didn't yield a live session.
+pub enum ConnectFailure {
+    /// A declared workspace with no session at all — the main area shows the
+    /// idle-workspace placeholder rather than an error.
+    Idle(IdleInfo),
+    /// Any other no-session / attach failure. The message is shown as-is and,
+    /// for a session that *exited*, already carries its last output line (so a
+    /// dead workspace or orchestrator surfaces why it's gone — the behavior the
+    /// orchestrator view already had).
+    Message(String),
+}
+
 /// The blocking work of connecting to a session, injectable so the event loop
 /// can be tested against a connector that blocks without a real session.
 pub trait Connector: Send + Sync {
-    fn connect(&self, project: &str, target: &SessionRef) -> Result<Connected, String>;
+    fn connect(&self, project: &str, target: &SessionRef) -> Result<Connected, ConnectFailure>;
 }
 
 /// The production connector: discover the session on disk, open it, and attach
@@ -74,10 +100,11 @@ pub trait Connector: Send + Sync {
 pub struct LiveConnector;
 
 impl Connector for LiveConnector {
-    fn connect(&self, project: &str, target: &SessionRef) -> Result<Connected, String> {
-        let root = shelbi_state::sessions_dir().map_err(|e| e.to_string())?;
+    fn connect(&self, project: &str, target: &SessionRef) -> Result<Connected, ConnectFailure> {
+        let root = shelbi_state::sessions_dir().map_err(|e| ConnectFailure::Message(e.to_string()))?;
         let want = discovery_name(project, target);
-        let sessions = shelbi_client::list(&root).map_err(|e| e.to_string())?;
+        let sessions =
+            shelbi_client::list(&root).map_err(|e| ConnectFailure::Message(e.to_string()))?;
         let sess = match sessions.iter().find(|s| s.meta.name == want && s.alive) {
             Some(s) => s.clone(),
             None => {
@@ -90,21 +117,50 @@ impl Connector for LiveConnector {
                     .iter()
                     .find(|s| s.meta.name == want && !s.alive)
                     .and_then(|s| last_final_line(&s.dir));
-                return Err(no_live_session_error(&want, last_line.as_deref()));
+                // A declared workspace with no exited session is *idle*, not
+                // failed: show its identity + how to start, not a terse error
+                // (`rt-tui-idle-workspace-open`). A session that exited (or any
+                // non-workspace target) keeps the explanatory message.
+                if let (SessionRef::Workspace(name), None) = (target, &last_line) {
+                    return Err(ConnectFailure::Idle(idle_info(project, name)));
+                }
+                return Err(ConnectFailure::Message(no_live_session_error(
+                    &want,
+                    last_line.as_deref(),
+                )));
             }
         };
-        let (conn, events) =
-            Connection::open(&sess.sock, None, capability::ALL).map_err(|e| e.to_string())?;
+        let (conn, events) = Connection::open(&sess.sock, None, capability::ALL)
+            .map_err(|e| ConnectFailure::Message(e.to_string()))?;
         let size = match conn.info() {
             Ok(info) => Size::new(info.cols.max(1), info.rows.max(1)),
             Err(_) => Size::new(80, 24),
         };
-        conn.attach(None).map_err(|e| e.to_string())?;
+        conn.attach(None)
+            .map_err(|e| ConnectFailure::Message(e.to_string()))?;
         Ok(Connected {
             conn,
             events,
             size,
         })
+    }
+}
+
+/// Assemble an idle workspace's [`IdleInfo`] from the project config and (for a
+/// local machine) its worktree branch. Falls back to just the name when the
+/// config can't be read, so the placeholder always has something to show.
+fn idle_info(project: &str, name: &str) -> IdleInfo {
+    match shelbi_orchestrator::workspace::resolve_idle_workspace(project, name) {
+        Some(id) => IdleInfo {
+            name: name.to_string(),
+            machine: id.machine,
+            branch: id.branch,
+        },
+        None => IdleInfo {
+            name: name.to_string(),
+            machine: String::new(),
+            branch: None,
+        },
     }
 }
 
@@ -146,10 +202,16 @@ enum Slot {
     Empty,
     Connecting {
         target: SessionRef,
-        rx: Receiver<Result<Connected, String>>,
+        rx: Receiver<Result<Connected, ConnectFailure>>,
         _join: JoinHandle<()>,
     },
     Live(Box<LiveSlot>),
+    /// A declared workspace with no live session — the main area shows the
+    /// idle-workspace placeholder (`rt-tui-idle-workspace-open`).
+    Idle {
+        target: SessionRef,
+        info: IdleInfo,
+    },
     Failed {
         target: SessionRef,
         error: String,
@@ -168,6 +230,8 @@ pub enum MainState<'a> {
     Empty,
     Connecting(&'a SessionRef),
     Live(&'a TerminalPane),
+    /// An idle workspace: render its placeholder (`rt-tui-idle-workspace-open`).
+    Idle(&'a IdleInfo),
     Failed(&'a SessionRef, &'a str),
 }
 
@@ -217,9 +281,9 @@ impl SessionManager {
             Slot::Connecting { rx, .. } => match rx.try_recv() {
                 Ok(r) => r,
                 Err(TryRecvError::Empty) => return false,
-                Err(TryRecvError::Disconnected) => {
-                    Err("connect worker stopped unexpectedly".to_string())
-                }
+                Err(TryRecvError::Disconnected) => Err(ConnectFailure::Message(
+                    "connect worker stopped unexpectedly".to_string(),
+                )),
             },
             _ => return false,
         };
@@ -238,9 +302,25 @@ impl SessionManager {
                 events: c.events,
                 pane: TerminalPane::new(c.size),
             })),
-            Err(error) => Slot::Failed { target, error },
+            Err(ConnectFailure::Idle(info)) => Slot::Idle { target, info },
+            Err(ConnectFailure::Message(error)) => Slot::Failed { target, error },
         };
         true
+    }
+
+    /// Retry the current binding when it settled on a non-live outcome (idle or
+    /// failed). Used when a board/workspace change arrives while the main area
+    /// shows an idle/failed workspace, so a session that just started attaches
+    /// without the user re-selecting the row (`rt-tui-idle-workspace-open`).
+    /// A no-op while connecting, live, or empty — returns whether it kicked a
+    /// reconnect.
+    pub fn retry_if_stale(&mut self) -> bool {
+        if matches!(self.slot, Slot::Idle { .. } | Slot::Failed { .. }) {
+            self.reconnect();
+            true
+        } else {
+            false
+        }
     }
 
     /// Drain any pending output from the live session into its pane. Returns
@@ -264,7 +344,9 @@ impl SessionManager {
     pub fn current_target(&self) -> Option<&SessionRef> {
         match &self.slot {
             Slot::Empty => None,
-            Slot::Connecting { target, .. } | Slot::Failed { target, .. } => Some(target),
+            Slot::Connecting { target, .. }
+            | Slot::Idle { target, .. }
+            | Slot::Failed { target, .. } => Some(target),
             Slot::Live(live) => Some(&live.target),
         }
     }
@@ -288,6 +370,7 @@ impl SessionManager {
             Slot::Empty => MainState::Empty,
             Slot::Connecting { target, .. } => MainState::Connecting(target),
             Slot::Live(live) => MainState::Live(&live.pane),
+            Slot::Idle { info, .. } => MainState::Idle(info),
             Slot::Failed { target, error } => MainState::Failed(target, error),
         }
     }
@@ -327,7 +410,7 @@ struct ConnectJob {
     connector: std::sync::Arc<dyn Connector>,
     project: String,
     target: SessionRef,
-    tx: mpsc::Sender<Result<Connected, String>>,
+    tx: mpsc::Sender<Result<Connected, ConnectFailure>>,
 }
 
 impl ConnectJob {
@@ -414,14 +497,81 @@ mod tests {
     }
 
     impl Connector for BlockingConnector {
-        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, String> {
+        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
             // Block until the test drops its sender.
             let rx = self.release.lock().unwrap().take();
             if let Some(rx) = rx {
                 let _ = rx.recv();
             }
-            Err("released".into())
+            Err(ConnectFailure::Message("released".into()))
         }
+    }
+
+    /// A connector that always reports the target as an idle workspace.
+    struct IdleConnector(IdleInfo);
+
+    impl Connector for IdleConnector {
+        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
+            Err(ConnectFailure::Idle(self.0.clone()))
+        }
+    }
+
+    /// Drive `mgr.poll()` until it reports the connect settled (or the budget
+    /// runs out), so a test can assert the resolved [`MainState`].
+    fn poll_until_settled(mgr: &mut SessionManager) {
+        for _ in 0..400 {
+            if mgr.poll() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the connect never settled");
+    }
+
+    #[test]
+    fn an_idle_workspace_lands_in_the_idle_state() {
+        let info = IdleInfo {
+            name: "vector".into(),
+            machine: "hub".into(),
+            branch: Some("main".into()),
+        };
+        let mut mgr = SessionManager::new("demo", std::sync::Arc::new(IdleConnector(info)));
+        mgr.show(SessionRef::Workspace("vector".into()));
+        poll_until_settled(&mut mgr);
+        match mgr.state() {
+            MainState::Idle(got) => {
+                assert_eq!(got.name, "vector");
+                assert_eq!(got.machine, "hub");
+                assert_eq!(got.branch.as_deref(), Some("main"));
+            }
+            _ => panic!("an idle workspace resolves to MainState::Idle"),
+        }
+        // The target is still bound, so a retry knows what to reconnect to.
+        assert_eq!(
+            mgr.current_target(),
+            Some(&SessionRef::Workspace("vector".into()))
+        );
+    }
+
+    #[test]
+    fn retry_if_stale_reconnects_an_idle_slot_but_not_a_connecting_one() {
+        let info = IdleInfo {
+            name: "vector".into(),
+            machine: "hub".into(),
+            branch: None,
+        };
+        let mut mgr = SessionManager::new("demo", std::sync::Arc::new(IdleConnector(info)));
+        mgr.show(SessionRef::Workspace("vector".into()));
+        poll_until_settled(&mut mgr);
+        assert!(matches!(mgr.state(), MainState::Idle(_)));
+
+        // A change notification retries the idle slot: it goes back to
+        // connecting (the worker re-runs) without the caller re-selecting.
+        assert!(mgr.retry_if_stale(), "an idle slot retries");
+        assert!(matches!(mgr.state(), MainState::Connecting(_)));
+
+        // While connecting, a further retry is a no-op (nothing stacks).
+        assert!(!mgr.retry_if_stale(), "a connecting slot does not retry");
     }
 
     #[test]
