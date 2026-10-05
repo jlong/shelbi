@@ -17,8 +17,8 @@ or shrink the pool (`add` / `rm`), and intervene (stop a pane to release a stuck
 issue). A slot no longer selects a runner: runner/model resolution is owned by
 the [agent](/docs/configuration/agents) that runs there.
 
-A [workspace](/docs/concepts/workspaces) is capacity: a machine, a tmux pane,
-and a worktree; the [agent](/docs/concepts/agents) inside it is chosen per issue
+A [workspace](/docs/concepts/workspaces) is capacity: a machine, a Shelbi
+session, and a worktree; the [agent](/docs/concepts/agents) inside it is chosen per issue
 by the workflow, which is why `list` reports both. The sidebar shows the same
 pool, grouped by machine, with a badge marking each state (`⏵` working, `·`
 idle):
@@ -87,8 +87,8 @@ echo         devbox   -              conventional   idle
 This is the first command the orchestrator runs at session start to snapshot
 the pool, and the same snapshot you want when answering "who's free, and what
 are they running?" An `AGENT` of `-` with `idle` state is a free slot. `STATE`
-is live-probed, not board-derived — `list` runs a real tmux/SSH probe of each
-pane. It renders `idle`, `in_progress: <task-id>`, `review: <task-id>`,
+is live-probed, not board-derived: `list` probes each workspace's session
+(over SSH for remotes). It renders `idle`, `in_progress: <task-id>`, `review: <task-id>`,
 `occupied (user shell)`, `orphaned session`, or `unreachable (<reason>)`. For
 the poller's finer-grained read of an in-flight issue (`working`,
 `awaiting_input`, `blocked`), use [`status`](#status).
@@ -99,13 +99,13 @@ the poller's finer-grained read of an in-flight issue (`working`,
 shelbi workspace stop [OPTIONS] <NAME>
 ```
 
-Stop the workspace's tmux pane. By default the in-flight issue is released
+Stop the workspace's session. By default the in-flight issue is released
 back to its `ready` status (`todo` in the default workflow) and its
 `assigned_to` field is cleared. The board never shows an orphaned
-`in_progress` card pointing at a dead pane. Pass `--keep-task` when you're
+`in_progress` card pointing at a dead session. Pass `--keep-task` when you're
 about to restart on the same issue and don't want the card to move.
 
-For a remote workspace, `stop` also kills the remote tmux session so no
+For a remote workspace, `stop` also kills the remote session so no
 detached agent process lingers on the other machine.
 
 | Flag | Type | Default | Description |
@@ -120,7 +120,7 @@ shelbi workspace status [NAME]
 ```
 
 Print observed workspace state from the hub-side poller. Reads
-`~/.shelbi/workspaces/<name>/status.yaml` files; no tmux probing. Cheaper
+`~/.shelbi/workspaces/<name>/status.yaml` files; no live session probing. Cheaper
 than `list` and safe to call repeatedly. With a `NAME`, prints a single row
 plus the raw status.yaml contents.
 
@@ -165,7 +165,7 @@ shelbi workspace stop charlie --keep-task
 shelbi issue start docs-write-cli-reference-pages
 ```
 
-Inspect a single workspace's raw status without spawning a tmux probe:
+Inspect a single workspace's raw status without a live session probe:
 
 ```bash
 shelbi workspace status alpha

@@ -1,7 +1,7 @@
 ---
 title: shelbi reload
 order: 27
-summary: Respawn the Shelbi-owned tmux panes in place so a freshly installed binary takes effect.
+summary: Respawn the Shelbi-owned surfaces in place so a freshly installed binary takes effect.
 ---
 
 ```text
@@ -9,10 +9,10 @@ shelbi reload [OPTIONS] [TARGET] [NAME]
 ```
 
 `shelbi reload` is the "I just rebuilt the binary, pick up the new code"
-command. It respawns the Shelbi-owned panes in place (the sidebar, the hidden
-tasks / review / machines panes, and the orchestrator pane) so a new binary
+command. It respawns the Shelbi-owned surfaces in place (the sidebar, the
+tasks / activity / machines views, and the orchestrator session) so a new binary
 takes effect and edits to the orchestrator's instructions or the shared
-preamble land without tearing down your tmux session.
+preamble land without tearing down the dashboard.
 
 The orchestrator's context survives the respawn. Before the old pane is
 replaced, it's asked to write `agents/orchestrator/handoff.md` covering its

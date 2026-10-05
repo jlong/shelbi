@@ -7,12 +7,14 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
+      - 'scripts/ci/**'
       - '.github/workflows/app-ci.yml'
   pull_request:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
+      - 'scripts/ci/**'
       - '.github/workflows/app-ci.yml'
 
 jobs:
@@ -83,3 +85,31 @@ jobs:
           done
           echo "::error::cargo test --workspace did not pass after 2 attempts"
           exit 1
+
+  # Nesting smoke: the single-process TUI is an ordinary full-screen program, so
+  # it must launch, render, and tear down cleanly inside tmux and inside GNU
+  # Screen (the `$TMUX` branching that used to special-case this is gone). The
+  # script hard-asserts the binary paints a non-empty frame within ~2s and exits
+  # 0 on the quit key, and reaps everything under bounded waits so the job can
+  # never hang; see scripts/ci/tui-smoke.sh.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install tmux and screen
+        run: sudo apt-get update && sudo apt-get install -y tmux screen
+
+      - name: Build shelbi
+        run: cargo build -p shelbi
+
+      - name: Smoke the TUI inside tmux
+        run: SHELBI_BIN="$PWD/target/debug/shelbi" scripts/ci/tui-smoke.sh tmux
+
+      - name: Smoke the TUI inside GNU Screen
+        run: SHELBI_BIN="$PWD/target/debug/shelbi" scripts/ci/tui-smoke.sh screen

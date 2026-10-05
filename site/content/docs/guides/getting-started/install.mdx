@@ -4,7 +4,7 @@ order: 11
 summary: Install Shelbi with Homebrew on macOS, APT on Ubuntu, or from source for development.
 ---
 
-<CopyPromptBanner prompt="Install and start Shelbi on my machine. On macOS, run `brew install jlong/shelbi/shelbi && shelbi`. On Ubuntu amd64, add the Shelbi APT keyring from https://apt.shelbi.dev/shelbi-archive-keyring.gpg, add the `https://apt.shelbi.dev stable main` source list with signed-by=/etc/apt/keyrings/shelbi-archive-keyring.gpg, then run `sudo apt update && sudo apt install shelbi`, followed by `shelbi`. Make sure tmux 3.2+ and one authenticated agent CLI, claude or codex, are available." />
+<CopyPromptBanner prompt="Install and start Shelbi on my machine. On macOS, run `brew install jlong/shelbi/shelbi && shelbi`. On Ubuntu amd64, add the Shelbi APT keyring from https://apt.shelbi.dev/shelbi-archive-keyring.gpg, add the `https://apt.shelbi.dev stable main` source list with signed-by=/etc/apt/keyrings/shelbi-archive-keyring.gpg, then run `sudo apt update && sudo apt install shelbi`, followed by `shelbi`. Make sure one authenticated agent CLI, claude or codex, is available." />
 
 On macOS, install Shelbi and start its first-run setup in one command:
 
@@ -63,12 +63,8 @@ If you're hacking on Shelbi or testing unreleased changes, use the
 
 ## Prerequisites
 
-You need three things before you start:
+You need two things before you start:
 
-- **`tmux` 3.2 or later.** Shelbi runs every workspace inside a tmux pane
-  and drives it with `send-keys` / `capture-pane`; older releases miss
-  features the TUI relies on. Homebrew and APT install this dependency for
-  the hub, but remote workspace machines need it too.
 - **An agent CLI.** At least one of `claude`
   ([Claude Code](https://docs.claude.com/en/docs/claude-code)) or `codex`,
   installed and authenticated. Declare more than one later, and the
@@ -78,34 +74,14 @@ You need three things before you start:
   `openssh-client`; on macOS, install them with Xcode Command Line Tools or
   your usual package manager if they are not already present.
 
-Install `tmux` with your package manager:
+Shelbi runs each agent in its own Shelbi session, so there is no terminal
+multiplexer to install. It also runs fine inside tmux or Screen if you prefer
+to launch it from one.
 
-<CodeTabs group="os">
-  <CodeTab label="macOS">
-
-  ```bash
-  brew install tmux
-  ```
-
-  </CodeTab>
-  <CodeTab label="Debian/Ubuntu">
-
-  ```bash
-  sudo apt install tmux
-  ```
-
-  </CodeTab>
-  <CodeTab label="Fedora">
-
-  ```bash
-  sudo dnf install tmux
-  ```
-
-  </CodeTab>
-</CodeTabs>
-
-Remote workspaces need the same `tmux` and agent CLI on the machine they
-run on, plus an `ssh` host you can reach without a password prompt.
+Remote workspaces need a compatible `shelbi` binary and the agent CLI on the
+machine they run on, plus an `ssh` host you can reach without a password prompt.
+[`shelbi machine setup`](/docs/cli/machine) finds or installs that binary for
+you.
 
 ## Verify or start later
 
@@ -245,10 +221,6 @@ codesign commands yourself against your install path.
 **`cargo: command not found`.** Install Rust via
 [rustup](https://rustup.rs) and restart your shell so `~/.cargo/bin` is on
 your `PATH`. Cargo is only required for source builds.
-
-**`tmux: command not found`** (or `tmux 1.x` warnings). Install or
-upgrade tmux to 3.2+. The TUI assumes modern pane title and popup
-support; older versions render incorrectly.
 
 ## Next
 

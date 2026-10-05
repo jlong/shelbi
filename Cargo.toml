@@ -16,15 +16,12 @@ members = [
     "crates/shelbi-session",
 ]
 default-members = ["crates/shelbi-cli"]
-# Throwaway prototypes for the "removing tmux" work. Excluded so they never
-# affect `cargo build --workspace`, `test`, or `clippy`; deleted at cutover.
-#
 # `vendor/*` holds vendored third-party forks (e.g. `alacritty_terminal`, the
 # client-side terminal emulator chosen in the `rt-spike-emulator-replay`
 # spike). They are path dependencies of workspace crates but NOT workspace
 # members, so `cargo clippy --workspace -- -D warnings` never lints upstream
 # code and `cargo test --workspace` never runs their suites.
-exclude = ["spikes", "vendor"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.9.0"

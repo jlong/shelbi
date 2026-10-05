@@ -20,7 +20,7 @@ them, in parallel, across your own machines.
 | The agent | None of its own — drives your CLI (Claude Code, Codex, aider) | Ships the CodeAct agent, which writes and runs Python + bash to act |
 | Where work runs | Many workers in parallel across laptop + remote machines over SSH | One agent per conversation inside a sandboxed runtime |
 | Isolation unit | A git worktree on its own branch, per task | A Docker / Apptainer / remote container, per conversation |
-| Runtime deps | `ssh`, `tmux`, `git`, your agent CLI — no daemons, no servers | Docker (often Docker-in-Docker), agent/automation servers, optional Kubernetes |
+| Runtime deps | The `shelbi` binary, `git`, `ssh`, your agent CLI; no Docker, no containers | Docker (often Docker-in-Docker), agent/automation servers, optional Kubernetes |
 | State | Plain markdown + YAML files on disk | An event-sourced action/observation stream inside the platform |
 | Interface | Two-pane terminal TUI | Web GUI (Agent Canvas), CLI, headless, IDE plugins, SDK |
 | Models | Whatever your agent CLI already uses | Model-agnostic via LiteLLM (Claude, OpenAI, Gemini, local, …) |
@@ -42,12 +42,13 @@ them, in parallel, across your own machines.
   workstation become a worker pool; the orchestrator picks the highest-priority
   unblocked task and dispatches it the moment a worker frees up.
 
-- **No daemons, no servers, no Docker-in-Docker.** OpenHands centers on a
+- **No containers, no VMs, no Docker-in-Docker.** OpenHands centers on a
   container runtime — Docker (frequently Docker-in-Docker), agent and automation
   servers, optional Kubernetes at the enterprise tier — and its docs note the
-  setup "takes real effort." Shelbi needs only `ssh`, `tmux`, `git`, and your
-  agent CLI on each machine. Adding a remote worker is a few lines in a YAML file
-  and a `shelbi reload`.
+  setup "takes real effort." Shelbi runs a small local daemon on the hub and the
+  `shelbi` binary on each worker; past that it needs only `ssh`, `git`, and your
+  agent CLI, with no containers to build. Adding a remote worker is `shelbi
+  machine setup`, a few lines in a YAML file, and a `shelbi reload`.
 
 - **State is plain text you can grep, diff, and edit.** OpenHands keeps
   conversation state as an event-sourced stream inside the platform. Shelbi keeps
@@ -95,8 +96,8 @@ them, in parallel, across your own machines.
 
 You live in the terminal, already run an agent CLI you trust, and want to run
 many of them at once across the machines you already own — each task isolated on
-its own branch, all state in plain files you can read, with no servers to stand
-up and no per-seat bill.
+its own branch, all state in plain files you can read, with nothing to host and
+no per-seat bill.
 
 ## Choose OpenHands if…
 

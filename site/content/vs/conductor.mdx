@@ -15,7 +15,7 @@ summary: A native macOS desktop app that wraps git worktrees and the major codin
 
 | Dimension          | Shelbi                                 | Conductor                                |
 | ------------------ | -------------------------------------- | ---------------------------------------- |
-| Form factor        | Terminal Kanban TUI + tmux panes       | Native macOS desktop app                 |
+| Form factor        | Terminal Kanban TUI + attachable sessions | Native macOS desktop app              |
 | Platforms          | macOS, Linux, remote over SSH          | macOS only (Windows on waitlist)         |
 | Concurrency model  | Fixed pool of named, persistent workspaces | Ephemeral workspace spawned per task |
 | Where work runs    | Hub + any SSH-reachable machine        | Single Mac, locally                      |
@@ -55,7 +55,7 @@ same Kanban board. (See
 ### An orchestration loop you can read and edit
 
 Conductor's dispatcher is a closed-source feature inside a closed-source
-app. Shelbi's orchestrator is *just a Claude session* in a tmux pane,
+app. Shelbi's orchestrator is *just a Claude agent* in a Shelbi session,
 loaded from a plain-text agent prompt you edit per project at
 `~/.shelbi/projects/<name>/agents/orchestrator/instructions.md` (with
 project-wide context in `agents/_shared/preamble.md`). Want it to
@@ -73,7 +73,7 @@ per-workspace review-ready marker the hub poller watches. The workspace
 never runs a `shelbi` command —
 `printf '%s\n' <task-id> > .claude/shelbi-review-ready` is the entire
 on-workspace protocol. That is how a remote workspace can ship with
-nothing installed but `tmux`, `git`, and an agent CLI. (See
+nothing installed but `git`, an agent CLI, and the `shelbi` binary itself. (See
 [The events log](/docs/concepts/events-log) and
 [Workspaces — how a task completes](/docs/concepts/workspaces#how-a-task-completes).)
 
@@ -98,7 +98,7 @@ If you live in a Mac GUI, Conductor's app is genuinely good — keyboard
 shortcuts (⌘N, ⌘⇧D, ⌘⇧P), an in-app side-by-side and unified diff
 viewer, inline comments that pin to lines and feed back to the agent as
 context, sound and color preferences. Shelbi is a terminal Kanban plus
-tmux panes; if you don't want to live in a terminal, Conductor's
+attachable sessions; if you don't want to live in a terminal, Conductor's
 surface is more inviting.
 
 ### Multi-agent provider support in one place
@@ -135,7 +135,7 @@ five live previews open at once, that's a real ergonomic win.
   than a polished GUI.
 - "Don't merge until a human signs off" is non-negotiable, and you want
   a Kanban column for that review step.
-- You're already comfortable in tmux and the terminal.
+- You're already comfortable working in the terminal.
 
 ## Choose Conductor if…
 
