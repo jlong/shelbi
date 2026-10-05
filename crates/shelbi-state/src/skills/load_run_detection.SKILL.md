@@ -66,7 +66,6 @@ verbatim):
 
 ```sh
 <SERVE> >/tmp/review-serve.log 2>&1 &
-#   (or a dedicated tmux window: tmux new-window -d -n serve '<SERVE>')
 ```
 
 The recipe's serve/run command already has its port substituted — there is

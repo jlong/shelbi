@@ -82,15 +82,12 @@ and every child it forks (`next-server`, `esbuild`, a `concurrently` parent, …
 it so it outlives your turn.
 
 There is **no `shelbi workspace serve` command** — you launch the process
-directly. Two reliable ways, writing `<SERVE>` for the recipe's serve line
-**verbatim** (keep any `shelbi __review-serve --` prefix intact):
+directly, writing `<SERVE>` for the recipe's serve line **verbatim** (keep
+any `shelbi __review-serve --` prefix intact):
 
 ```sh
-# a) Background it, output to a log you can tail on failure:
+# Background it, output to a log you can tail on failure:
 cd site && <SERVE> >/tmp/review-serve.log 2>&1 &
-
-# b) Or a dedicated, inspectable tmux window in your session:
-tmux new-window -d -n serve 'cd site && <SERVE>'
 ```
 
 - If the recipe names a working directory, `cd` into it first (as shown). The

@@ -415,6 +415,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         && (id.ends_with(".instructions") || id.contains(".skill."))
     {
         sniff_review_instructions(entry, &text, out);
+        sniff_tmux_commands(entry, &text, out);
     } else if matches!(entry.format, SurfaceFormat::Markdown)
         && id.ends_with(".agent.developer.instructions")
     {
@@ -425,6 +426,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_merge_reason_format(entry, &text, out);
         sniff_zen_assignee_scope(entry, &text, out);
+        sniff_tmux_commands(entry, &text, out);
     } else if id.ends_with(".zenmode") {
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_pr_create_published_head(entry, &text, out);
@@ -624,6 +626,133 @@ fn sniff_developer_instructions(entry: &InventoryEntry, text: &str, out: &mut Ve
          local primary ref — mirror the shipped default template.",
         Location { line: 1, column: 1 },
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Legacy tmux commands in agent instructions / the load-run skill (Markdown)
+
+/// Code the remove-tmux cutover drops from the agent instruction templates onto
+/// a project's own forked copy: a passage that tells an agent to run a `tmux`
+/// command. The product no longer runs tmux — agents drive the session backend
+/// (`shelbi session snapshot` / `shelbi session send`) — so these passages are
+/// stale guidance pointing at a command that is gone.
+pub(crate) const TMUX_INSTRUCTION_AUTOHEAL_CODE: &str = "INSTRUCTIONS_TMUX_COMMAND";
+/// Same deprecation, but the surrounding passage has been edited so no exact
+/// known legacy form matches — the rewrite can't be applied mechanically without
+/// risking the local edits, so it routes to the orchestrator for judgment.
+const TMUX_INSTRUCTION_NEEDS_JUDGMENT_CODE: &str = "INSTRUCTIONS_TMUX_COMMAND_EDITED";
+
+/// Exact legacy tmux passages shipped in past agent-instruction defaults, each
+/// paired with its session-command replacement. The remove-tmux cutover rewrote
+/// the shipped templates (orchestrator / review instructions, the load-run skill)
+/// to drive `shelbi session …` instead of tmux; a project's own forked copy still
+/// carries the old passage, so both [`sniff_tmux_commands`] and the healer in
+/// [`super::config_upgrade_apply`] drive off this one table.
+///
+/// Each entry is an exact substring → its replacement. An UNEDITED copy contains
+/// the legacy substring verbatim, so swapping it is deterministic and non-lossy
+/// — an auto-heal. A copy whose surrounding prose the user edited no longer
+/// matches any entry verbatim but still carries a bare `tmux` token; that is
+/// reported needs-judgment with the replacement as the proposed fix, never
+/// rewritten silently.
+///
+/// Kept in sync with the shipped default templates by the drift guard in this
+/// module's tests: every `replacement` appears in the shipped template and no
+/// shipped template carries a `legacy` substring or a bare `tmux` token.
+pub(crate) const TMUX_INSTRUCTION_REWRITES: &[(&str, &str)] = &[
+    // orchestrator: the `send status=stuck` reaction — never fall back to the raw
+    // PTY send. `tmux send-keys` becomes the session backend's `shelbi session send`.
+    (
+        "never fall back to raw\n  `tmux send-keys`.",
+        "never fall back to raw\n  `shelbi session send`.",
+    ),
+    // orchestrator: the heartbeat missed-marker sweep samples the session, not a
+    // tmux pane. `tmux capture-pane` becomes `shelbi session snapshot`.
+    (
+        "Workspace pane is at the Claude prompt — no spinner, no\n        \"Running…\", not actively editing. Sample the tmux pane\n        with `tmux capture-pane -p -t <workspace-target>` (same",
+        "Workspace session is at the Claude prompt — no spinner, no\n        \"Running…\", not actively editing. Sample the session\n        with `shelbi session snapshot <workspace>` (same",
+    ),
+    // review instructions: drop the tmux-window serve alternative (option b),
+    // leaving the background `&` form — the session backend has no window to open.
+    (
+        "directly. Two reliable ways, writing `<SERVE>` for the recipe's serve line\n**verbatim** (keep any `shelbi __review-serve --` prefix intact):\n\n```sh\n# a) Background it, output to a log you can tail on failure:\ncd site && <SERVE> >/tmp/review-serve.log 2>&1 &\n\n# b) Or a dedicated, inspectable tmux window in your session:\ntmux new-window -d -n serve 'cd site && <SERVE>'\n```",
+        "directly, writing `<SERVE>` for the recipe's serve line **verbatim** (keep\nany `shelbi __review-serve --` prefix intact):\n\n```sh\n# Background it, output to a log you can tail on failure:\ncd site && <SERVE> >/tmp/review-serve.log 2>&1 &\n```",
+    ),
+    // load-run skill: drop the tmux-window parenthetical from the serve snippet.
+    (
+        "<SERVE> >/tmp/review-serve.log 2>&1 &\n#   (or a dedicated tmux window: tmux new-window -d -n serve '<SERVE>')\n",
+        "<SERVE> >/tmp/review-serve.log 2>&1 &\n",
+    ),
+];
+
+/// Apply every applicable entry of [`TMUX_INSTRUCTION_REWRITES`] whose legacy
+/// substring is present in `text`, returning the rewritten text. Shared by the
+/// sniffer (to compute the residual that reveals an edited passage) and by the
+/// healer's write-back so the two can never diverge.
+pub(crate) fn apply_tmux_instruction_rewrites(text: &str) -> String {
+    let mut out = text.to_string();
+    for (legacy, replacement) in TMUX_INSTRUCTION_REWRITES {
+        if out.contains(legacy) {
+            out = out.replace(legacy, replacement);
+        }
+    }
+    out
+}
+
+/// Detect legacy `tmux`-command passages in an agent's instructions or the
+/// load-run skill (the remove-tmux cutover rewrote the shipped templates to use
+/// the session backend; a project's forked copy still carries the old wording).
+///
+/// Two outcomes, mirroring the project directive (auto-heal what can self-heal;
+/// hand the rest to judgment):
+///
+/// * An **exact** known legacy passage ([`TMUX_INSTRUCTION_REWRITES`]) is a
+///   deterministic, non-lossy swap → [`Classification::AutoHeal`] (one finding
+///   per file; the healer applies every matched entry at once).
+/// * A `tmux` token that survives applying every exact rewrite marks a passage
+///   the user edited — rewriting it mechanically risks clobbering local edits —
+///   → [`Classification::NeedsJudgment`], carrying the shipped replacements as
+///   the proposed fix, never auto-applied.
+///
+/// Idempotent: after an auto-heal the file carries the replacements and no
+/// `tmux` token, so a second pass finds nothing.
+fn sniff_tmux_commands(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    let has_exact = TMUX_INSTRUCTION_REWRITES
+        .iter()
+        .any(|(legacy, _)| text.contains(legacy));
+    if has_exact {
+        out.push(finding(
+            entry,
+            Classification::AutoHeal,
+            TMUX_INSTRUCTION_AUTOHEAL_CODE,
+            "agent instructions tell an agent to run a `tmux` command — tmux is gone from the \
+             product; agents drive the session backend instead",
+            "Rewrite the legacy tmux passage to the session backend: `tmux capture-pane` -> \
+             `shelbi session snapshot <workspace>`, `tmux send-keys` -> `shelbi session send`, \
+             and drop the `tmux new-window` serve alternative (background the command directly). \
+             Mirror the shipped default template.",
+            locate_line_containing(text, "tmux"),
+        ));
+    }
+
+    // Any `tmux` token that survives applying every exact rewrite is in a passage
+    // the user edited away from the shipped wording — flag it for the orchestrator
+    // to repair its own copy rather than risk clobbering the local edits.
+    let residual = apply_tmux_instruction_rewrites(text);
+    if residual.contains("tmux") {
+        out.push(finding(
+            entry,
+            Classification::NeedsJudgment,
+            TMUX_INSTRUCTION_NEEDS_JUDGMENT_CODE,
+            "agent instructions carry an edited `tmux`-command passage that doesn't match any \
+             shipped wording — tmux is gone from the product, so the command no longer exists",
+            "Rewrite the tmux passage to the session backend, preserving your customizations: \
+             `tmux capture-pane` -> `shelbi session snapshot <workspace>`, `tmux send-keys` -> \
+             `shelbi session send`, and drop any `tmux new-window` serve alternative (background \
+             the command directly). Mirror the shipped default template.",
+            locate_line_containing(text, "tmux"),
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2064,6 +2193,11 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              the workspace's next dispatch, preserving your keys, so this is reported \
              rather than auto-applied."
         }
+        "INSTRUCTIONS_TMUX_COMMAND_EDITED" => {
+            "The tmux passage has been edited away from any shipped wording, so the \
+             session-backend rewrite can't be applied mechanically without risking your edits \
+             — the orchestrator refreshes its own copy with judgment, preserving customizations."
+        }
         "ZEN_MERGE_REASON_FORMAT_STALE" => {
             "The merge-finalize prose is free-form and user-customizable, so switching the \
              zen-merge reason to the canonical `orchestrator:zen-merge pr=<n>` form can't be \
@@ -2675,6 +2809,99 @@ mod tests {
             "shipped review defaults tripped the sniffer: {:?}",
             codes(&out)
         );
+    }
+
+    // ---- legacy tmux commands in agent instructions ---------------------
+
+    /// Drift guard for [`TMUX_INSTRUCTION_REWRITES`]: no shipped agent
+    /// instruction / skill template may carry a `tmux` token or any legacy
+    /// substring, and every replacement must actually appear in one of them — so
+    /// the table can never diverge from what Shelbi ships. (Also the fresh-project
+    /// acceptance criterion: a project scaffolded from these defaults has no tmux
+    /// mentions in its agents' instructions.)
+    #[test]
+    fn shipped_agent_defaults_carry_no_tmux_and_match_the_rewrite_table() {
+        let shipped = [
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+            shelbi_state::DEFAULT_REVIEW_INSTRUCTIONS,
+            shelbi_state::DEFAULT_DEVELOPER_INSTRUCTIONS,
+            shelbi_state::DEFAULT_QA_INSTRUCTIONS,
+            shelbi_state::DEFAULT_SECURITY_INSTRUCTIONS,
+            shelbi_state::DEFAULT_ADVERSARIAL_INSTRUCTIONS,
+            shelbi_state::DEFAULT_REVIEW_LOAD_RUN_SKILL,
+        ];
+        for t in shipped {
+            assert!(!t.contains("tmux"), "a shipped agent default still mentions tmux");
+        }
+        let all: String = shipped.join("\n");
+        for (legacy, replacement) in TMUX_INSTRUCTION_REWRITES {
+            assert!(
+                !all.contains(legacy),
+                "a shipped default still carries a legacy tmux passage: {legacy:?}",
+            );
+            assert!(
+                all.contains(replacement),
+                "no shipped default carries the replacement for a rewrite entry: {replacement:?}",
+            );
+        }
+    }
+
+    fn orch_instr_entry() -> InventoryEntry {
+        entry(
+            "project.demo.agent.orchestrator.instructions",
+            "project:demo",
+            SurfaceFormat::Markdown,
+        )
+    }
+
+    #[test]
+    fn exact_legacy_tmux_passage_is_a_single_auto_heal() {
+        // A forked copy still carrying the exact shipped-then-legacy passages:
+        // every one is a deterministic swap, so the file gets one AutoHeal finding
+        // and no needs-judgment (nothing is edited).
+        let text = format!(
+            "# Orchestrator\n\n{}\n\nmore prose\n\n{}\n",
+            TMUX_INSTRUCTION_REWRITES[0].0, TMUX_INSTRUCTION_REWRITES[1].0,
+        );
+        let mut out = Vec::new();
+        sniff_tmux_commands(&orch_instr_entry(), &text, &mut out);
+        assert_eq!(codes(&out), vec![TMUX_INSTRUCTION_AUTOHEAL_CODE]);
+        assert_eq!(out[0].classification, Classification::AutoHeal);
+    }
+
+    #[test]
+    fn edited_tmux_passage_is_needs_judgment_not_auto_heal() {
+        // The capture-pane passage, but with the target placeholder renamed — so
+        // no exact entry matches, yet a bare `tmux` token survives. That is a
+        // user-edited passage: reported needs-judgment, never auto-rewritten.
+        let text = "# Orchestrator\n\nSample it with `tmux capture-pane -p -t <my-slot>`.\n";
+        let mut out = Vec::new();
+        sniff_tmux_commands(&orch_instr_entry(), text, &mut out);
+        assert_eq!(codes(&out), vec![TMUX_INSTRUCTION_NEEDS_JUDGMENT_CODE]);
+        assert_eq!(out[0].classification, Classification::NeedsJudgment);
+        assert!(!out[0].rationale.is_empty(), "needs-judgment finding needs a rationale");
+    }
+
+    #[test]
+    fn tmux_free_instructions_trip_nothing() {
+        let mut out = Vec::new();
+        sniff_tmux_commands(
+            &orch_instr_entry(),
+            "# Orchestrator\n\nUse `shelbi session snapshot <workspace>` to sample a session.\n",
+            &mut out,
+        );
+        assert!(out.is_empty(), "clean prose tripped the sniffer: {:?}", codes(&out));
+    }
+
+    #[test]
+    fn apply_tmux_instruction_rewrites_is_idempotent() {
+        let text = format!(
+            "# Orchestrator\n\n{}\n\n{}\n",
+            TMUX_INSTRUCTION_REWRITES[0].0, TMUX_INSTRUCTION_REWRITES[1].0,
+        );
+        let once = apply_tmux_instruction_rewrites(&text);
+        assert!(!once.contains("tmux"), "rewrite left a tmux token: {once}");
+        assert_eq!(once, apply_tmux_instruction_rewrites(&once), "not idempotent");
     }
 
     // ---- review agent instructions (commit-and-push tweak, Rule 2) ------

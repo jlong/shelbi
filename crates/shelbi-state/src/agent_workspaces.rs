@@ -2087,6 +2087,30 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
         );
     }
 
+    /// Fresh-project guard (remove-tmux cutover): tmux is gone from the product,
+    /// so no shipped agent instruction / skill template may tell an agent to run
+    /// a tmux command. A project scaffolded from these defaults inherits exactly
+    /// this content, so this is the "fresh project has no tmux mentions" check.
+    #[test]
+    fn shipped_agent_templates_mention_no_tmux() {
+        let templates = [
+            ("orchestrator", DEFAULT_ORCHESTRATOR_INSTRUCTIONS),
+            ("developer", DEFAULT_DEVELOPER_INSTRUCTIONS),
+            ("review", DEFAULT_REVIEW_INSTRUCTIONS),
+            ("qa", DEFAULT_QA_INSTRUCTIONS),
+            ("security", DEFAULT_SECURITY_INSTRUCTIONS),
+            ("adversarial", DEFAULT_ADVERSARIAL_INSTRUCTIONS),
+            ("load-run skill", DEFAULT_REVIEW_LOAD_RUN_SKILL),
+        ];
+        for (name, text) in templates {
+            assert!(
+                !text.contains("tmux"),
+                "the shipped `{name}` template still mentions tmux — agents drive \
+                 the session backend (`shelbi session …`) now"
+            );
+        }
+    }
+
     /// Sanity-check the developer prompt has the spec-required hooks
     /// (ready marker handoff, agents/_shared/preamble.md reference,
     /// the Phase 5 socket-emit paragraph) so a regression doesn't

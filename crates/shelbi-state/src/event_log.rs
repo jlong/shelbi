@@ -2366,9 +2366,12 @@ pub struct ReviewReadyEvent<'a> {
     pub title: &'a str,
     /// The review workspace's name.
     pub workspace: &'a str,
-    /// The tmux pane target of the review slot (`session:window`), so the
-    /// orchestrator jumps straight to it rather than grepping `tmux list-panes`.
-    pub pane: &'a str,
+    /// The review slot's agent session name (`<project>/ws/<slot>`), so the
+    /// orchestrator jumps straight to it (`shelbi session snapshot <slot>` /
+    /// `shelbi attach <slot>`) rather than rediscovering the slot. The
+    /// session-backend name of the review workspace's agent, which the review
+    /// interface's editor/diff helpers sit beside as `<project>/review/<slot>/<role>`.
+    pub session: &'a str,
     /// The checked-out review worktree path, so the reviewer opens the exact
     /// tree rather than reverse-engineering it from `git worktree list`.
     pub worktree: &'a str,
@@ -2385,7 +2388,7 @@ pub struct ReviewReadyEvent<'a> {
 /// Append the `review-ready` signal to `~/.shelbi/events.log`:
 ///
 /// ```text
-/// <rfc3339> review-ready project=<p> task=<id> workspace=<ws> state=serving pane=<target> worktree=<path>[ port=<port>][ url=<url>] title=<title…> notes=<notes…>
+/// <rfc3339> review-ready project=<p> task=<id> workspace=<ws> state=serving session=<name> worktree=<path>[ port=<port>][ url=<url>] title=<title…> notes=<notes…>
 /// ```
 ///
 /// Emitted by the hub poller on the *edge* into the review slot's `serving`
@@ -2401,7 +2404,7 @@ pub struct ReviewReadyEvent<'a> {
 /// rather than an ordinary task/workspace transition, even though it carries
 /// `task=` / `workspace=` metadata. Identifier fields (`project`, `task`,
 /// `workspace`) are pinned to the strict [`sanitize_field`] allowlist; the
-/// location and free-text fields (`pane`, `worktree`, `url`, `title`, `notes`)
+/// location and free-text fields (`session`, `worktree`, `url`, `title`, `notes`)
 /// fold whitespace to underscores via [`sanitize_reason`] so their `:` / `/`
 /// separators survive while the line stays a single parseable record. `title`
 /// and `notes` are length-bounded so one over-long task can't blow up the line.
@@ -2410,13 +2413,13 @@ pub fn append_review_ready_event(ev: &ReviewReadyEvent) -> Result<()> {
     let project = sanitize_field(ev.project);
     let task_id = sanitize_field(ev.task_id);
     let workspace = sanitize_field(ev.workspace);
-    let pane = sanitize_reason(ev.pane);
+    let session = sanitize_reason(ev.session);
     let worktree = sanitize_reason(ev.worktree);
     let title = sanitize_reason(&truncate_with_ellipsis(ev.title, REVIEW_READY_TITLE_BUDGET));
     let notes = sanitize_reason(&truncate_with_ellipsis(ev.notes, REVIEW_READY_NOTES_BUDGET));
     let mut line = format!(
         "{ts} review-ready project={project} task={task_id} workspace={workspace} \
-         state=serving pane={pane} worktree={worktree}"
+         state=serving session={session} worktree={worktree}"
     );
     if let Some(port) = ev.port {
         line.push_str(&format!(" port={port}"));
@@ -3387,7 +3390,7 @@ mod tests {
             task_id: "fix-login",
             title: "Fix the login redirect loop",
             workspace: "review",
-            pane: "shelbi-demo:review",
+            session: "demo/ws/review",
             worktree: "/repo/.shelbi/wt/review",
             port: Some(4310),
             url: Some("http://localhost:4310"),
@@ -3404,7 +3407,7 @@ mod tests {
         assert!(line.contains(" task=fix-login "));
         assert!(line.contains(" workspace=review "));
         assert!(line.contains(" state=serving "));
-        assert!(line.contains(" pane=shelbi-demo:review "));
+        assert!(line.contains(" session=demo/ws/review "));
         assert!(line.contains(" worktree=/repo/.shelbi/wt/review "));
         assert!(line.contains(" port=4310 "));
         assert!(line.contains(" url=http://localhost:4310 "));
@@ -3437,7 +3440,7 @@ mod tests {
             task_id: "diff-only",
             title: "",
             workspace: "review",
-            pane: "shelbi-demo:review",
+            session: "demo/ws/review",
             worktree: "/repo/.shelbi/wt/review",
             port: None,
             url: None,

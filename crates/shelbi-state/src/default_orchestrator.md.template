@@ -481,7 +481,7 @@ One bullet per event prefix. React to every matching line.
   failed delivery in your next user-facing reply and inspect the pane before
   deciding what to do next. Do not blindly repeat the send because an
   unconfirmed delivery may still have landed, and never fall back to raw
-  `tmux send-keys`. If the instruction must be durable, identify the issue
+  `shelbi session send`. If the instruction must be durable, identify the issue
   assigned to the workspace and use
   `shelbi message <task-id> directive "<text>"` (or the `context` kind); that
   channel records and acknowledges
@@ -583,9 +583,9 @@ One bullet per event prefix. React to every matching line.
      1. Branch is ahead of `main` (any number of commits).
      2. Working tree is clean (no staged or unstaged changes —
         `git status --porcelain` in the worktree is empty).
-     3. Workspace pane is at the Claude prompt — no spinner, no
-        "Running…", not actively editing. Sample the tmux pane
-        with `tmux capture-pane -p -t <workspace-target>` (same
+     3. Workspace session is at the Claude prompt — no spinner, no
+        "Running…", not actively editing. Sample the session
+        with `shelbi session snapshot <workspace>` (same
         trick the readiness probe uses) and check that the tail
         looks like the idle prompt, not in-progress output.
      4. The issue has been in the `active` category for at least one
