@@ -132,6 +132,15 @@ pub struct Project {
     /// to `off` to disable. See [`HeartbeatConfig`].
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
+    /// Hub disk-management knobs: the size cap on the hub checkout's shared
+    /// Rust `target/` (above which a Zen probe clears it before building) and
+    /// the free-space threshold below which the heartbeat and `shelbi status`
+    /// warn. Both default to 20 GiB; absent on existing projects, which pick
+    /// up the binary defaults with no YAML change. Elided from the wire form
+    /// when it is the default so existing project YAMLs don't grow a key on
+    /// round-trip. See [`DiskConfig`].
+    #[serde(default, skip_serializing_if = "DiskConfig::is_default")]
+    pub disk: DiskConfig,
     /// Project-level git config: where workspace branches are based and how
     /// `shelbi merge` (and Zen Mode's auto-merge path) integrates them
     /// back. `base_branch` falls back to [`Project::default_branch`] when
@@ -241,6 +250,7 @@ pub const SHARED_PROJECT_FIELDS: &[&str] = &[
     "workspace_settings_template",
     "zen",
     "heartbeat",
+    "disk",
     "git",
     "review",
     "issue_tracker",
@@ -2626,6 +2636,71 @@ fn default_ci_timeout() -> Duration {
     Duration::from_secs(15 * 60)
 }
 
+/// One gibibyte, in bytes. Shelbi's disk accounting is done in bytes so the
+/// `du`/`statvfs` numbers compare directly; the YAML knobs are in GiB because
+/// that is the unit a human reasons about when sizing a `target/`.
+pub const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Default cap on the hub checkout's shared Rust `target/`, in GiB. A fresh
+/// debug build of a medium Rust workspace is roughly 9 GiB; 20 GiB leaves
+/// headroom for incremental growth while still bounding the unbounded
+/// accumulation that fills the hub disk over a week of Zen runs.
+pub const DEFAULT_DISK_TARGET_CAP_GIB: u64 = 20;
+
+/// Default free-space threshold, in GiB, below which the heartbeat line and
+/// `shelbi status` warn. A full data volume looks like a wedged hub (probes
+/// hang, heartbeats stop), so the warning fires with enough headroom to act
+/// before the volume actually fills.
+pub const DEFAULT_DISK_LOW_FREE_GIB: u64 = 20;
+
+/// Hub disk-management knobs, stored under the `disk:` key in the project YAML.
+///
+/// Both knobs are optional and fold to a shipped default (20 GiB) via the
+/// accessor methods, so an existing project with no `disk:` block picks up the
+/// defaults with no YAML change. A `0` is treated as "unset" and also folds to
+/// the default rather than disabling the guard — a zero cap or zero threshold
+/// would be the failure mode these exist to prevent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiskConfig {
+    /// Size cap on the hub checkout's shared Rust `target/`, in GiB. Before a
+    /// Zen probe builds, a `target/` larger than this is cleared first (unless
+    /// another probe is building into it). `None`/`0` ⇒
+    /// [`DEFAULT_DISK_TARGET_CAP_GIB`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_cap_gib: Option<u64>,
+    /// Free-space threshold on the volume holding the project's `work_dir`, in
+    /// GiB. When free space drops below this, the heartbeat line carries
+    /// `disk_low=true` and `shelbi status` shows a warning. `None`/`0` ⇒
+    /// [`DEFAULT_DISK_LOW_FREE_GIB`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_free_gib: Option<u64>,
+}
+
+impl DiskConfig {
+    /// True when nothing is set, so the block can be elided from the wire form.
+    pub fn is_default(&self) -> bool {
+        *self == DiskConfig::default()
+    }
+
+    /// The configured `target/` size cap in bytes, folding an unset or zero
+    /// knob to the shipped default.
+    pub fn target_cap_bytes(&self) -> u64 {
+        self.target_cap_gib
+            .filter(|&g| g > 0)
+            .unwrap_or(DEFAULT_DISK_TARGET_CAP_GIB)
+            * GIB
+    }
+
+    /// The configured low-disk free-space threshold in bytes, folding an unset
+    /// or zero knob to the shipped default.
+    pub fn low_free_bytes(&self) -> u64 {
+        self.low_free_gib
+            .filter(|&g| g > 0)
+            .unwrap_or(DEFAULT_DISK_LOW_FREE_GIB)
+            * GIB
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ZenChecks {
     /// Shell commands run locally before the workspace hands off to CI.
@@ -3971,6 +4046,7 @@ workspace_settings_template: /etc/shelbi/p.json
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),
+            disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
         };
         assert!(project.validate_workspaces().is_ok());
@@ -4071,6 +4147,7 @@ workspaces:
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),
+            disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -4376,6 +4453,7 @@ workspaces:
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),
+            disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -4421,6 +4499,77 @@ agent_runners:
 "#;
         let p: Project = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(p.zen, ZenConfig::default());
+    }
+
+    #[test]
+    fn disk_config_defaults_fold_to_20_gib() {
+        let d = DiskConfig::default();
+        assert!(d.is_default());
+        assert_eq!(d.target_cap_bytes(), 20 * GIB);
+        assert_eq!(d.low_free_bytes(), 20 * GIB);
+    }
+
+    #[test]
+    fn disk_config_zero_folds_to_default() {
+        // A zero knob is treated as "unset" rather than disabling the guard.
+        let d = DiskConfig {
+            target_cap_gib: Some(0),
+            low_free_gib: Some(0),
+        };
+        assert_eq!(d.target_cap_bytes(), 20 * GIB);
+        assert_eq!(d.low_free_bytes(), 20 * GIB);
+    }
+
+    #[test]
+    fn project_yaml_omits_disk_and_uses_defaults() {
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert!(p.disk.is_default());
+        assert_eq!(p.disk.target_cap_bytes(), 20 * GIB);
+        assert_eq!(p.disk.low_free_bytes(), 20 * GIB);
+    }
+
+    #[test]
+    fn project_yaml_parses_disk_block() {
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+disk:
+  target_cap_gib: 40
+  low_free_gib: 10
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.disk.target_cap_gib, Some(40));
+        assert_eq!(p.disk.low_free_gib, Some(10));
+        assert_eq!(p.disk.target_cap_bytes(), 40 * GIB);
+        assert_eq!(p.disk.low_free_bytes(), 10 * GIB);
+    }
+
+    #[test]
+    fn default_disk_config_is_elided_from_wire_form() {
+        let p: Project = serde_yaml::from_str(
+            "name: p\nrepo: r\nmachines:\n  - { name: hub, kind: local, work_dir: /tmp }\n\
+             orchestrator: { runner: claude }\nagent_runners:\n  claude: { command: claude, flags: [] }\n",
+        )
+        .unwrap();
+        let round = serde_yaml::to_string(&p).unwrap();
+        assert!(
+            !round.contains("disk:"),
+            "a default disk block must not grow the wire form: {round}"
+        );
     }
 
     #[test]
@@ -5746,6 +5895,7 @@ git:
             }],
             runners: Default::default(),
             agents: Default::default(),
+            disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
         }
     }

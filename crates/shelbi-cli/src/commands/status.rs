@@ -159,10 +159,49 @@ fn print_summary(project: &str) -> Result<()> {
     if let Some(line) = github_summary_line(project) {
         println!("github: {line}");
     }
+    if let Some(line) = disk_warning_line(project) {
+        println!("disk: {line}");
+    }
     for task in review_tasks_missing_pr(project) {
         println!("review: {task} — no PR");
     }
     Ok(())
+}
+
+/// A visible low-disk warning line for `shelbi status`, or `None` when free
+/// space on the hub volume is healthy (the status stays quiet above the
+/// threshold) or can't be probed.
+///
+/// Best-effort and side-effect free, like [`review_tasks_missing_pr`]: any
+/// failure (project unreadable, no local machine, `statvfs` unavailable) drops
+/// the check rather than the whole `status` output. The hub machine's
+/// `work_dir` is the volume that fills with build output, so it is the one
+/// probed.
+fn disk_warning_line(project: &str) -> Option<String> {
+    let p = shelbi_state::load_project(project).ok()?;
+    let work_dir = p
+        .machines
+        .iter()
+        .find(|m| matches!(m.kind, MachineKind::Local))
+        .map(|m| m.work_dir.clone())?;
+    let free = shelbi_state::disk::free_space_bytes(&work_dir)?;
+    disk_warning_from(&work_dir, p.disk.low_free_bytes(), free)
+}
+
+/// Pure decision + rendering for the low-disk `status` line: `Some(line)` when
+/// `free` is below `threshold`, `None` otherwise. Split out so the
+/// threshold/formatting is unit-testable without a project on disk or a live
+/// `statvfs`.
+fn disk_warning_from(work_dir: &std::path::Path, threshold: u64, free: u64) -> Option<String> {
+    if free >= threshold {
+        return None;
+    }
+    Some(format!(
+        "LOW — {} GiB free on {} (warns below {} GiB)",
+        shelbi_state::format_gib(free),
+        work_dir.display(),
+        shelbi_state::format_gib(threshold),
+    ))
 }
 
 /// Ids of review-column (handoff-category) tasks whose PR-opening workflow
@@ -262,6 +301,13 @@ fn print_full(project: &str) -> Result<()> {
     println!("## Daemon");
     println!();
     println!("daemon: {}", super::hub_version::status_line());
+
+    if let Some(line) = disk_warning_line(project) {
+        println!();
+        println!("## Disk");
+        println!();
+        println!("{line}");
+    }
 
     if let Some(section) = github_section(project) {
         println!();
@@ -765,8 +811,20 @@ fn event_line_timestamp(line: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use crate::commands::test_support::ENV_LOCK as TEST_LOCK;
-    use shelbi_core::{default_project_statuses, ProjectStatuses};
+    use shelbi_core::{default_project_statuses, ProjectStatuses, GIB};
     use std::path::PathBuf;
+
+    #[test]
+    fn disk_warning_fires_below_threshold_and_is_quiet_above() {
+        let dir = std::path::Path::new("/work/dir");
+        // Below threshold → a visible LOW line naming the free space + threshold.
+        let line = disk_warning_from(dir, 20 * GIB, 7 * GIB + GIB / 10).expect("should warn");
+        assert!(line.starts_with("LOW — 7.1 GiB free on /work/dir"), "{line}");
+        assert!(line.contains("warns below 20.0 GiB"), "{line}");
+        // At or above threshold → quiet.
+        assert_eq!(disk_warning_from(dir, 20 * GIB, 20 * GIB), None);
+        assert_eq!(disk_warning_from(dir, 20 * GIB, 40 * GIB), None);
+    }
 
     fn fresh_home() -> PathBuf {
         let p = std::env::temp_dir().join(format!(

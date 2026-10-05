@@ -2040,11 +2040,19 @@ pub fn append_zen_dryrun_event(task_id: &str, action: &str, detail: &str) -> Res
 /// appended per the [`ZenHeartbeatCue`] variant (the poller drives the two
 /// re-injection cadences). When Zen is Off the caller passes `None` and the
 /// line is byte-identical to the pre-Zen-pairing shape.
+///
+/// `disk_low_free_bytes` is `Some(free)` only when free space on the volume
+/// holding the project's `work_dir` has dropped below the configured
+/// threshold; it adds `disk_free_gib=<n> disk_low=true` to the structured
+/// tokens. When disk is healthy or unknown the caller passes `None` and no
+/// disk token is emitted — a heartbeat stays quiet above the threshold, so its
+/// line shape is byte-identical to the pre-disk-warning form.
 pub fn append_heartbeat_event(
     project: &str,
     zen_eligible: usize,
     idle_workspaces: usize,
     zen: Option<ZenHeartbeatCue>,
+    disk_low_free_bytes: Option<u64>,
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
     let project = sanitize_field(project);
@@ -2055,6 +2063,16 @@ pub fn append_heartbeat_event(
     let mut line = format!(
         "{ts} project={project} heartbeat{zen_marker} zen_eligible={zen_eligible} idle_workspaces={idle_workspaces}"
     );
+    // Low-disk warning: structured tokens, so the orchestrator's reaction rules
+    // (and the activity feed) can key on `disk_low=true`. Appended before the
+    // trailing ` — ` zen free text below. Omitted entirely when disk is healthy
+    // or unprobeable, keeping the quiet-above-threshold line shape unchanged.
+    if let Some(free) = disk_low_free_bytes {
+        line.push_str(&format!(
+            " disk_free_gib={} disk_low=true",
+            format_gib(free)
+        ));
+    }
     // The reminder is trailing free text (introduced by ` — `) so it stays
     // human-readable for the orchestrator rather than underscore-folded; the
     // structured `key=value` tokens above are unaffected. `Plain` adds
@@ -2076,6 +2094,14 @@ pub fn append_heartbeat_event(
         Some(ZenHeartbeatCue::Plain) | None => {}
     }
     append_event_line(&line)
+}
+
+/// Render a byte count as a one-decimal GiB string (e.g. `7.1`) for the
+/// `disk_free_gib=` heartbeat token and `shelbi status`. One decimal is enough
+/// precision to see a volume approaching full without a noisy long fraction.
+pub fn format_gib(bytes: u64) -> String {
+    let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    format!("{gib:.1}")
 }
 
 /// Append `<rfc3339> project=<name> board rate-limited until=<rfc3339>` to
@@ -3561,7 +3587,7 @@ mod tests {
         };
         std::env::set_var(ORCH_EVENT_CALLBACK_SOCK_ENV, &sock);
 
-        append_heartbeat_event("demo", 3, 4, None).unwrap();
+        append_heartbeat_event("demo", 3, 4, None, None).unwrap();
 
         let (stream, _) = listener.accept().unwrap();
         let mut line = String::new();
@@ -5507,8 +5533,8 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_heartbeat_event("myapp", 5, 4, None).unwrap();
-        append_heartbeat_event("myapp", 0, 0, None).unwrap();
+        append_heartbeat_event("myapp", 5, 4, None, None).unwrap();
+        append_heartbeat_event("myapp", 0, 0, None, None).unwrap();
 
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
@@ -5535,6 +5561,47 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_low_disk_appends_warning_tokens_and_stays_quiet_above() {
+        // Below the threshold the line gains `disk_free_gib=<n> disk_low=true`
+        // after the counts; a healthy/unknown disk (None) leaves the line shape
+        // byte-identical to the no-disk form.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // 7.1 GiB free, below threshold → warn.
+        let low = (7.1_f64 * 1024.0 * 1024.0 * 1024.0) as u64;
+        append_heartbeat_event("myapp", 1, 2, None, Some(low)).unwrap();
+        // Healthy → quiet.
+        append_heartbeat_event("myapp", 1, 2, None, None).unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].ends_with(
+                " project=myapp heartbeat zen_eligible=1 idle_workspaces=2 disk_free_gib=7.1 disk_low=true"
+            ),
+            "low-disk line: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].ends_with(" project=myapp heartbeat zen_eligible=1 idle_workspaces=2"),
+            "healthy line must carry no disk token: {}",
+            lines[1]
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn format_gib_renders_one_decimal() {
+        assert_eq!(format_gib(0), "0.0");
+        assert_eq!(format_gib(1024 * 1024 * 1024), "1.0");
+        assert_eq!(format_gib(20 * 1024 * 1024 * 1024), "20.0");
+    }
+
+    #[test]
     fn heartbeat_zen_cues_write_expected_shapes() {
         // Zen-on heartbeats carry a `zen=on` marker right after `heartbeat`.
         // Plain adds nothing more; Summary appends the one-line reminder;
@@ -5543,16 +5610,17 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_heartbeat_event("myapp", 2, 1, Some(ZenHeartbeatCue::Plain)).unwrap();
+        append_heartbeat_event("myapp", 2, 1, Some(ZenHeartbeatCue::Plain), None).unwrap();
         append_heartbeat_event(
             "myapp",
             2,
             1,
             Some(ZenHeartbeatCue::Summary("Zen: do the thing.".into())),
+            None,
         )
         .unwrap();
-        append_heartbeat_event("myapp", 2, 1, Some(ZenHeartbeatCue::Reread)).unwrap();
-        append_heartbeat_event("myapp", 2, 1, None).unwrap();
+        append_heartbeat_event("myapp", 2, 1, Some(ZenHeartbeatCue::Reread), None).unwrap();
+        append_heartbeat_event("myapp", 2, 1, None, None).unwrap();
 
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();

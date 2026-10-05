@@ -63,3 +63,12 @@ shelbi-palette = { path = "crates/shelbi-palette" }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Dependencies don't need debug info — we never step into them — and their
+# debug symbols are the bulk of a debug `target/`, which is what fills the hub
+# disk over a week of Zen builds. This `"*"` override drops debug info for
+# non-workspace packages only, shrinking the baseline build substantially;
+# our own workspace crates keep the default `[profile.dev]` debug info for
+# stepping and backtraces.
+[profile.dev.package."*"]
+debug = false
