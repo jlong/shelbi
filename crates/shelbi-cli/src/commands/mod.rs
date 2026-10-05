@@ -14,6 +14,7 @@ pub mod issue;
 pub mod issue_store;
 pub mod machine;
 pub mod message;
+pub mod msrv_check;
 pub mod mutate_client;
 pub mod open;
 pub mod orchestrate;

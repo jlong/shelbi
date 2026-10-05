@@ -55,8 +55,8 @@ use crate::git::{
     commit_subject, compose_pr_body, gh_pr_merge, locate_hub_workdir, locate_workspace_worktree,
     login_shell_prefix, lookup_merged_pr, lookup_open_pr_in_repository, lookup_origin_repository,
     lookup_origin_repository_selector, lookup_origin_repository_with_push_target,
-    lookup_pr_identity, parse_pr_number_from_url, run_in_dir,
-    run_login_shell_script_with_deadline, MergedPr, RepositoryIdentity,
+    lookup_pr_identity, parse_pr_number_from_url, pr_title, run_in_dir,
+    run_login_shell_script_with_deadline, squash_merge_subject, MergedPr, RepositoryIdentity,
 };
 use crate::workspace::{rebase_workspace_branch_onto_default, workspace_worktree, RebaseOutcome};
 
@@ -1998,13 +1998,20 @@ fn merge_via_pull_request(
 ) -> Result<PrMergeOutcome> {
     // Shares the exact `gh pr merge` primitive with the per-workflow `merge`
     // action and `shelbi merge`; here we pin the repo and the reviewed head so
-    // GitHub can only act on the commit Zen verified.
+    // GitHub can only act on the commit Zen verified. We also pin the squash
+    // title to the PR title so a feature-plus-fixup branch isn't retitled
+    // after the last commit (see `git::squash_merge_subject`).
+    let subject = squash_merge_subject(
+        &pr_title(host, wt, pr, Some(&repository.selector))?,
+        pr,
+    );
     let merge = gh_pr_merge(
         host,
         wt,
         pr,
         MergeStrategy::Squash,
         Some(&repository.selector),
+        Some(&subject),
         Some(&expected.integration_sha),
     )?;
     if !merge.status.success() {
@@ -3457,6 +3464,9 @@ case "$1 $2" in
         ;;
       *mergeCommit*)
         cat {merge_commit}
+        ;;
+      *"--json title"*)
+        printf 'reviewed feature title\n'
         ;;
       *headRefName*)
         printf '%s\n' {task_branch}
@@ -8187,21 +8197,22 @@ fn run_one_check_with_shared_cargo_target(
     let output = run_check_script(host, &script);
     let elapsed = started.elapsed();
 
-    let (exit_code, combined) = match output {
+    let (exit_code, stdout, stderr) = match output {
         Ok(o) => {
             let code = o.status.code().unwrap_or(-1);
-            let mut buf = String::new();
-            buf.push_str(&String::from_utf8_lossy(&o.stdout));
-            if !o.stderr.is_empty() {
-                if !buf.is_empty() && !buf.ends_with('\n') {
-                    buf.push('\n');
-                }
-                buf.push_str(&String::from_utf8_lossy(&o.stderr));
-            }
-            (code, buf)
+            (
+                code,
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
         }
+        // The timeout / launch-failure notes are shelbi diagnostics, not tool
+        // output; route them through the stderr slot so they tail like any
+        // single-stream failure (there is no real stdout report to preserve
+        // alongside them in these cases).
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => (
             LOCAL_CHECK_TIMED_OUT_EXIT,
+            String::new(),
             format!(
                 "(shelbi: check exceeded the {}s local-check timeout and was terminated. \
                  This bound keeps a wedged check from stalling `shelbi zen probe` on a \
@@ -8210,10 +8221,14 @@ fn run_one_check_with_shared_cargo_target(
                 local_check_timeout().as_secs()
             ),
         ),
-        Err(e) => (-1, format!("(shelbi: failed to launch command: {e})\n")),
+        Err(e) => (
+            -1,
+            String::new(),
+            format!("(shelbi: failed to launch command: {e})\n"),
+        ),
     };
 
-    let tail = tail_lines(&combined, OUTPUT_TAIL_LINES);
+    let tail = build_output_tail(&stdout, &stderr, OUTPUT_TAIL_LINES);
     let tail = augment_command_not_found(host, cmd, exit_code, tail);
 
     LocalCheck {
@@ -8344,6 +8359,31 @@ fn ms_truncating(d: Duration) -> u64 {
     // by ~10 orders of magnitude; this is just defensive against
     // pathological `Duration` values from tests.
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Build a check's `output_tail` from its captured streams, keeping the tail of
+/// each independently when both carried output.
+///
+/// A check's actionable detail doesn't always live on the same stream. `cargo
+/// build` and `cargo clippy` write their errors to stderr, but `cargo test`
+/// prints the failing test's name, its `---- <test> stdout ----` block, the
+/// `failures:` summary, and each binary's `test result: FAILED` line to
+/// *stdout* — stderr carries only the `Running <binary>` lines and the trailing
+/// `error: test failed`. A single concatenated tail (stdout then stderr, last
+/// `n` lines) therefore buries the whole stdout failure report behind that
+/// trailing stderr noise, so the log ends up unable to say which test failed or
+/// why — the visibility bug this guards against. When both streams carried
+/// output we keep the tail of *each*, labeled, so neither is lost; when only one
+/// did we keep just that one, header-free (the common single-stream case).
+fn build_output_tail(stdout: &str, stderr: &str, n: usize) -> String {
+    let out = tail_lines(stdout, n);
+    let err = tail_lines(stderr, n);
+    match (out.is_empty(), err.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => out,
+        (true, false) => err,
+        (false, false) => format!("---- stdout ----\n{out}\n---- stderr ----\n{err}"),
+    }
 }
 
 /// Return the last `n` non-empty trailing lines of `s`, joined with `\n`.
@@ -9548,6 +9588,58 @@ mod probe_tests {
         assert_eq!(line_count, OUTPUT_TAIL_LINES);
         // Last line is line-199.
         assert!(res.output_tail.ends_with("line-199"));
+    }
+
+    #[test]
+    fn stdout_failure_detail_survives_a_stderr_flood() {
+        // The cargo-test visibility bug in miniature: the actionable failure
+        // report is on stdout (one distinctive line here; in `cargo test` it's
+        // the `---- <test> stdout ----` panic block and `failures:` summary),
+        // while stderr carries far more than `OUTPUT_TAIL_LINES` of trailing
+        // noise (cargo's per-binary `Running ...` + `error: test failed`). The
+        // old single-tail-of-concatenated-output dropped the stdout line
+        // entirely; the per-stream tail must keep it.
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path();
+        let flood = OUTPUT_TAIL_LINES * 2;
+        let res = run_one_check(
+            &Host::Local,
+            wt,
+            &format!(
+                "echo DISTINCTIVE_STDOUT_FAILURE; \
+                 i=0; while [ $i -lt {flood} ]; do echo noise-$i 1>&2; i=$((i+1)); done; \
+                 exit 1"
+            ),
+        );
+        assert_eq!(res.exit_code, 1);
+        assert!(
+            res.output_tail.contains("DISTINCTIVE_STDOUT_FAILURE"),
+            "stdout failure detail must survive a stderr flood; got: {}",
+            res.output_tail
+        );
+        // Both streams are labeled when both carried output, and the trailing
+        // stderr is still there too (the last noise line).
+        assert!(res.output_tail.contains("---- stdout ----"), "{}", res.output_tail);
+        assert!(res.output_tail.contains("---- stderr ----"), "{}", res.output_tail);
+        assert!(
+            res.output_tail.contains(&format!("noise-{}", flood - 1)),
+            "last stderr line must survive too; got: {}",
+            res.output_tail
+        );
+    }
+
+    #[test]
+    fn build_output_tail_keeps_single_stream_header_free() {
+        // Single-stream output (the build/clippy case) stays header-free and
+        // identical to a plain tail, so nothing downstream that reads a lone
+        // stream's tail changes shape.
+        assert_eq!(build_output_tail("a\nb\nc", "", 2), "b\nc");
+        assert_eq!(build_output_tail("", "x\ny\nz", 2), "y\nz");
+        assert_eq!(build_output_tail("", "", 5), "");
+        assert_eq!(
+            build_output_tail("out1\nout2", "err1\nerr2", 5),
+            "---- stdout ----\nout1\nout2\n---- stderr ----\nerr1\nerr2"
+        );
     }
 
     // --- rebase-onto-default before probing -------------------------------
@@ -11250,11 +11342,24 @@ printf '%s\n' installed-from-reviewed-lock > packages/app/node_modules/reviewed-
         let _home = ProbeHomeGuard::install();
         let (base, _origin, wt) = setup_origin_and_worktree();
         let install_started = base.path().join("npm-install-started");
+        let install_started_partial = base.path().join("npm-install-started.partial");
         let release_install = base.path().join("npm-install-release");
+        // The installer hands its workspace root to the mutator thread by
+        // writing `$PWD` to `install_started`. Write it to a sibling temp file
+        // first and rename it into place: `rename(2)` is atomic on one
+        // filesystem, so `install_started` only ever exists with its full
+        // contents. A bare `> install_started` truncates (creating an empty
+        // file) before `printf` runs, and the mutator — which fires the moment
+        // the path exists — could sample that empty window, read a blank root,
+        // and write its mutated lock to a relative path in its own CWD instead
+        // of into the probe worktree. The probe's reviewed lock would then be
+        // untouched, the post-install checkout verification would pass, and the
+        // probe would return `Ok` when the test demands it fail closed.
         let npm_script = format!(
             r#"#!/bin/sh
 if [ "$1" = --version ]; then printf '%s\n' 10.0.0; exit 0; fi
-printf '%s\n' "$PWD" > {install_started}
+printf '%s\n' "$PWD" > {install_started_partial}
+mv {install_started_partial} {install_started}
 i=0
 while [ ! -f {release_install} ] && [ "$i" -lt 500 ]; do
   sleep 0.01
@@ -11264,6 +11369,8 @@ test -f {release_install} || exit 71
 mkdir -p node_modules
 "#,
             install_started = shelbi_agent::shell_escape(&install_started.to_string_lossy()),
+            install_started_partial =
+                shelbi_agent::shell_escape(&install_started_partial.to_string_lossy()),
             release_install = shelbi_agent::shell_escape(&release_install.to_string_lossy()),
         );
         let _tools = LoginToolGuard::install("npm", &npm_script);
@@ -11315,8 +11422,18 @@ mkdir -p node_modules
             for _ in 0..500 {
                 if started_for_thread.exists() {
                     let package_root = std::fs::read_to_string(&started_for_thread).unwrap();
+                    let package_root = package_root.trim();
+                    // The atomic rename in the installer guarantees a complete
+                    // absolute root here; assert it rather than silently writing
+                    // the mutated lock to a relative path in our own CWD, which
+                    // would leave the probe's reviewed lock untouched and mask
+                    // the fail-closed behaviour this test exists to prove.
+                    assert!(
+                        std::path::Path::new(package_root).is_absolute(),
+                        "installer handed a non-absolute workspace root: {package_root:?}"
+                    );
                     std::fs::write(
-                        std::path::Path::new(package_root.trim()).join("package-lock.json"),
+                        std::path::Path::new(package_root).join("package-lock.json"),
                         "concurrently-mutated-lock\n",
                     )
                     .unwrap();

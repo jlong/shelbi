@@ -433,6 +433,109 @@ pub(crate) fn workspace_occupied_by(
         }))
 }
 
+/// The issue — other than `exclude_id` — that `workspace_name` is actively
+/// assigned to right now, decided from **local, authoritative** state rather
+/// than the daemon's published index.
+///
+/// This is the release guard behind the supplant decision: a dispatch tears down
+/// the card's prior assignee only when that workspace is still on THIS card (or
+/// idle). If it has since been re-dispatched to another issue this returns that
+/// issue, so the release is skipped rather than killing a live worker mid-task on
+/// an unrelated card.
+///
+/// Why not the published index: on a remote (GitHub) backend `read_board` serves
+/// the daemon's `board-index.json`, which lags local routing — an assignment
+/// write never bumps a GitHub `updatedAt`, and a parked or dead daemon stops
+/// republishing entirely. In the 2026-10-04 incident the prior assignee had been
+/// re-dispatched to another card *after* the last refresh and the daemon then
+/// died: the index still showed that card in `todo` (and the old guard only
+/// counted `in_progress`/`review`), so the workspace read as idle and its live
+/// worker was killed. Assignment for a remote backend lives only in the local
+/// overlay (`assignments/<id>`), which every dispatch writes synchronously and
+/// `read_board`'s overlay re-resolve folds in. That overlay is the authoritative
+/// routing record here: any non-terminal issue other than `exclude_id` routed to
+/// the workspace counts as busy, whatever column a stale index shows it in.
+///
+/// Returns:
+/// - `Ok(Some(issue))` — the workspace is busy on another non-terminal issue;
+///   the caller skips the release and logs it.
+/// - `Ok(None)` — the workspace is definitively free (on THIS card or idle);
+///   the caller releases its pane.
+/// - `Err(_)` — can't confirm (the overlay read failed, or local state names
+///   another issue but the board isn't `Warm` enough to rule out that it has
+///   since gone terminal). The caller errs toward NOT releasing.
+pub(crate) fn workspace_busy_with_other(
+    project: &str,
+    workspace_name: &str,
+    exclude_id: &str,
+) -> Result<Option<Issue>, MutateError> {
+    let cfg = shelbi_state::load_project(project)
+        .map_err(MutateError::backend)?
+        .issue_tracker;
+    if !cfg.backend.is_remote() {
+        // Local (`file_system`) board: assignment lives in the card frontmatter
+        // and the directory read is always authoritative (`BoardState::Warm`).
+        // The open board is open-only, so every row is non-terminal — any card
+        // assigned to this workspace other than the one being dispatched counts,
+        // whatever column it is parked in.
+        return Ok(shelbi_state::read_board(project)
+            .map_err(MutateError::backend)?
+            .into_issues()
+            .into_iter()
+            .map(|tf| tf.task)
+            .find(|task| {
+                task.assigned_to.as_deref() == Some(workspace_name) && task.id != exclude_id
+            }));
+    }
+
+    // Remote backend: the local assignment overlay is the authoritative routing
+    // record. Every dispatch writes it synchronously, so it never lags the way
+    // the daemon's published index can.
+    let mut others: Vec<String> = shelbi_state::task_assignments(project)
+        .map_err(MutateError::backend)?
+        .into_iter()
+        .filter(|(id, ws)| ws == workspace_name && id != exclude_id)
+        .map(|(id, _)| id)
+        .collect();
+    if others.is_empty() {
+        // Authoritative: nothing else is routed to this workspace, so it is on
+        // THIS card or idle — safe to release.
+        return Ok(None);
+    }
+
+    // At least one other issue is routed here. Confirm it is still non-terminal
+    // before counting it busy: a terminal card's marker can linger, and a stale
+    // marker alone must not block a legitimate release. The open board drops
+    // terminal cards, so presence there is the confirmation — and it holds even
+    // for a `Stale` index, which is exactly the incident shape (the routed card
+    // still listed, in whatever column).
+    let state = shelbi_state::read_board(project).map_err(MutateError::backend)?;
+    if let Some(task) = state
+        .issues()
+        .iter()
+        .find(|tf| others.contains(&tf.task.id))
+        .map(|tf| tf.task.clone())
+    {
+        return Ok(Some(task));
+    }
+
+    // None of the routed issues are in the open board. A `Warm` board is the
+    // current open-only set, so their absence proves they have gone terminal and
+    // the workspace is free. A board that isn't warm (stale, cold, unreachable)
+    // can't prove that, so we can't confirm — err toward NOT releasing.
+    match state {
+        shelbi_state::BoardState::Warm(_) => Ok(None),
+        _ => {
+            others.sort();
+            Err(MutateError::Backend(format!(
+                "the prior assignee `{workspace_name}` is routed to `{}` in the local overlay but \
+                 the board index isn't warm enough to confirm whether it is still active",
+                others.join("`, `"),
+            )))
+        }
+    }
+}
+
 /// Refuse to dispatch/assign onto a workspace already running a *different*
 /// in-flight issue. Shared by assign and start.
 pub(crate) fn ensure_workspace_dispatchable(
