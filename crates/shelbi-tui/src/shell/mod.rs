@@ -2049,7 +2049,10 @@ impl ShellState {
                 self.dirty = true;
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // A click in the sidebar focuses and selects (plan).
+                // A click on a selectable row focuses the sidebar, selects that
+                // row, and opens it — the same one-click behavior as pressing
+                // Enter on it. A click on a section header or blank space only
+                // focuses the sidebar (hit returns `None`), opening nothing.
                 self.client.focus_sidebar();
                 if let Some(view) = self.sidebar_view() {
                     if let Some(sel) = view.hit(self.sidebar_rect, m.column, m.row) {
@@ -2060,6 +2063,12 @@ impl ShellState {
                         }
                         while self.client.sidebar_selection() > sel {
                             self.client.select_up();
+                        }
+                        // Open it, exactly as Enter would: native views swap the
+                        // main area (focus stays on the sidebar), a session or a
+                        // review-column task attaches/opens and takes main focus.
+                        if let Some(target) = view.target_at(sel) {
+                            self.show(target);
                         }
                     }
                 }
@@ -2776,6 +2785,115 @@ mod tests {
         st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(st.main_view, MainView::Native(View::Machines)));
         assert_eq!(st.client.view(), &View::Machines);
+    }
+
+    /// A synthetic left-click at `(col, row)` in absolute terminal coordinates.
+    fn left_click(col: u16, row: u16) -> crossterm::event::MouseEvent {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A synthetic wheel event (`up` scrolls up, else down) over `(col, row)`.
+    fn wheel(up: bool, col: u16, row: u16) -> crossterm::event::MouseEvent {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        MouseEvent {
+            kind: if up {
+                MouseEventKind::ScrollUp
+            } else {
+                MouseEventKind::ScrollDown
+            },
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_a_native_view_row_selects_and_opens_it() {
+        // rt-tui-sidebar-click-activates: a single click opens the row, the same
+        // as Enter — no second keystroke needed.
+        let mut st = test_state();
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        st.client.focus_main();
+        // Row layout from top: 0 title, 1 Chat, 2 Issues, 3 Activity,
+        // 4 "— Workspaces —" header, 5 alpha. Click Issues (row 2).
+        st.handle_mouse(left_click(2, 2));
+        assert_eq!(st.selection(), 1, "selection moved to Issues");
+        assert!(
+            matches!(st.main_view, MainView::Native(View::Issues)),
+            "the click opened the Issues view"
+        );
+        // A native view keeps sidebar focus, exactly as Enter does.
+        assert_eq!(st.client.focus(), Focus::Sidebar);
+
+        // Clicking Activity (row 3) switches the main area again.
+        st.handle_mouse(left_click(2, 3));
+        assert_eq!(st.selection(), 2, "selection moved to Activity");
+        assert!(matches!(st.main_view, MainView::Native(View::Activity)));
+    }
+
+    #[test]
+    fn clicking_a_workspace_row_attaches_its_session() {
+        let mut st = test_state();
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        st.client.focus_sidebar();
+        // alpha is on row 5 (selectable index 3).
+        st.handle_mouse(left_click(2, 5));
+        assert_eq!(st.selection(), 3, "selection moved to alpha");
+        assert!(
+            matches!(st.main_view, MainView::Session),
+            "the click opened a session in the main area"
+        );
+        assert_eq!(
+            st.sessions.current_target(),
+            Some(&SessionRef::Workspace("alpha".into())),
+            "the clicked workspace's session is attached"
+        );
+        // A session click takes main focus, exactly as Enter does.
+        assert_eq!(st.client.focus(), Focus::Main);
+    }
+
+    #[test]
+    fn clicking_a_section_header_or_blank_row_opens_nothing() {
+        let mut st = test_state();
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        // Open Activity first so we can prove a header/blank click doesn't change it.
+        st.show(RowTarget::Native(View::Activity));
+        let before = st.selection();
+        // Row 4 is the "— Workspaces —" section header.
+        st.handle_mouse(left_click(2, 4));
+        assert_eq!(st.selection(), before, "a header click doesn't move the selection");
+        assert!(
+            matches!(st.main_view, MainView::Native(View::Activity)),
+            "a header click opens nothing"
+        );
+        // Row 10 is blank space below the last row.
+        st.handle_mouse(left_click(2, 10));
+        assert_eq!(st.selection(), before, "a blank click doesn't move the selection");
+        assert!(matches!(st.main_view, MainView::Native(View::Activity)));
+    }
+
+    #[test]
+    fn wheel_scrolling_moves_the_selection_without_opening() {
+        let mut st = test_state();
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        // Start on a session view so an accidental open would be visible.
+        st.show(RowTarget::Session(SessionRef::Orchestrator));
+        assert_eq!(st.selection(), 0);
+        st.handle_mouse(wheel(false, 2, 2)); // scroll down
+        assert_eq!(st.selection(), 1, "wheel down moved the selection");
+        assert!(
+            matches!(st.main_view, MainView::Session),
+            "wheel scrolling opens nothing"
+        );
+        st.handle_mouse(wheel(true, 2, 2)); // scroll up
+        assert_eq!(st.selection(), 0, "wheel up moved the selection back");
+        assert!(matches!(st.main_view, MainView::Session));
     }
 
     #[test]
