@@ -254,6 +254,7 @@ impl DetectedSetupPlan {
             issue_tracker: self.issue_tracker.clone(),
             runners: Default::default(),
             agents: Default::default(),
+            disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
         };
         project

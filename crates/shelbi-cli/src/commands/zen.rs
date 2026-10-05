@@ -46,6 +46,30 @@ use shelbi_state::{
 
 use crate::commands::require_project;
 
+/// Install a one-shot SIGINT/SIGTERM handler that clears any probe worktree
+/// this `shelbi zen probe` process still owns, then exits on the conventional
+/// `128 + signum` code. Without it, interrupting a probe mid-run leaks the
+/// detached `.shelbi-probe-*` worktree until a later probe's startup sweep.
+///
+/// Runs its cleanup on a normal `signal_hook` iterator thread — not inside an
+/// async-signal handler — so it may safely take locks and spawn the `git`
+/// removal subprocess. A failure to register the handler is non-fatal: the
+/// startup sweep remains the backstop.
+fn install_probe_signal_cleanup() {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
+    let Ok(mut signals) = Signals::new([SIGINT, SIGTERM]) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        if let Some(sig) = signals.forever().next() {
+            zen::cleanup_registered_probe_worktrees();
+            std::process::exit(128 + sig);
+        }
+    });
+}
+
 /// Default cadence for the dry-run preview loop. Slow enough that a
 /// busy project doesn't see one probe stomping the next; fast enough
 /// that a state change (workspace handing off, user promoting a task)
@@ -292,6 +316,12 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
         ZenCmd::Pause => set(&project_name, ZenModeState::Paused),
         ZenCmd::Status => status(&project_name),
         ZenCmd::Probe { task_id } => {
+            // A SIGINT/SIGTERM mid-probe would otherwise leave the detached
+            // probe worktree behind. Install a handler that clears any
+            // registered probe worktree before exiting on the conventional
+            // signal code. SIGKILL/crash can't be caught — the next probe's
+            // startup sweep is the backstop for those.
+            install_probe_signal_cleanup();
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
             let tf = shelbi_state::issue_store_for(&project_name)
                 .map_err(|e| anyhow!(e))?

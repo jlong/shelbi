@@ -21,6 +21,7 @@ use shelbi_core::{
 
 mod agent_workspaces;
 pub mod board_index;
+pub mod disk;
 pub mod done_history;
 pub mod error_log;
 mod event_log;
@@ -161,7 +162,7 @@ pub use event_log::{
     append_worktree_detach_event, append_zen_dryrun_event, append_zen_mode_event, delivery_id,
     claim_event_follower, emit_event_body, event_cursor_path, event_follower_owner,
     event_follower_path, event_log_current_base, event_log_head, events_log_path,
-    latest_task_transition_targets,
+    format_gib, latest_task_transition_targets,
     message_delivery_status, read_event_log_from, read_event_log_from_deadline,
     read_or_initialize_event_cursor, read_or_initialize_event_cursor_deadline, recent_dispatch_active,
     release_event_follower, task_event_body, write_event_cursor,
@@ -862,6 +863,62 @@ pub(crate) fn acquire_file_lock_deadline(
     Ok(Some(FileLockGuard { _file: file }))
 }
 
+/// Acquire a *shared* (reader) advisory lock on `lock_path`, blocking until it
+/// is held. Any number of shared holders coexist, but a shared lock excludes
+/// an exclusive one — so a reader that holds this blocks a would-be exclusive
+/// writer. Used by Zen probe builds, which may run concurrently into one shared
+/// cargo target while excluding the exclusive cap-cleanup that would clear it.
+pub(crate) fn acquire_file_lock_shared(lock_path: &Path) -> Result<FileLockGuard> {
+    let file = open_lock_file(lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+            if rc == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(shelbi_core::Error::Io(err));
+            }
+        }
+    }
+    Ok(FileLockGuard { _file: file })
+}
+
+/// Try to take an *exclusive* advisory lock on `lock_path` without blocking.
+///
+/// Returns `Ok(Some(guard))` when no other descriptor — shared or exclusive —
+/// holds the lock, and `Ok(None)` when one does (so the caller can skip rather
+/// than wait). This is the writer side of the reader/writer pair with
+/// [`acquire_file_lock_shared`]: the Zen cap-cleanup takes it to prove no probe
+/// is building into the shared target before it clears the target.
+pub(crate) fn try_acquire_file_lock_exclusive(
+    lock_path: &Path,
+) -> Result<Option<FileLockGuard>> {
+    let file = open_lock_file(lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            match err.kind() {
+                // Held by another descriptor — report "in use" to the caller.
+                std::io::ErrorKind::WouldBlock => return Ok(None),
+                // A signal interrupted the non-blocking syscall; just retry it.
+                std::io::ErrorKind::Interrupted => continue,
+                _ => return Err(shelbi_core::Error::Io(err)),
+            }
+        }
+    }
+    Ok(Some(FileLockGuard { _file: file }))
+}
+
 /// Public RAII handle for the per-workspace dispatch lock. Wraps a
 /// [`FileLockGuard`] so callers outside this crate can serialize the
 /// sync-worktree + spawn sequence without gaining access to the internal
@@ -1001,6 +1058,55 @@ pub fn lock_ssh_master(host: &str) -> Result<SshMasterLock> {
         .collect();
     let path = shelbi_home()?.join("ssh").join(format!("master-{token}.lock"));
     Ok(SshMasterLock(acquire_file_lock(&path)?))
+}
+
+/// Public RAII handle for a Zen shared-cargo-target lock. Released when
+/// dropped. Carries no behavior beyond holding the `flock`.
+#[must_use = "the zen-target lock is released as soon as the guard is dropped"]
+pub struct ZenTargetLock(#[allow(dead_code)] FileLockGuard);
+
+/// Local lock-file path coordinating access to a shared Zen cargo target.
+///
+/// `key` identifies the logical target (the orchestrator passes a
+/// host-plus-path string). The lock lives under `$SHELBI_HOME/locks/`, *not*
+/// inside the target it guards — the cap-cleanup clears the target wholesale,
+/// which would otherwise delete the lock inode out from under a holder. Every
+/// Zen probe process runs on the hub, so a local `flock` serializes them even
+/// when the target itself is on a remote machine.
+fn zen_target_lock_path(key: &str) -> Result<PathBuf> {
+    // Hash the key to a flat, bounded filename: a target path can be long and
+    // carry separators, and two distinct keys hashing alike merely serialize
+    // with each other, which is harmless for an advisory lock.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for b in key.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Ok(shelbi_home()?
+        .join("locks")
+        .join(format!("zen-target-{hash:016x}.lock")))
+}
+
+/// Take a *shared* lock on a Zen shared-cargo-target, blocking until held.
+///
+/// Held by a probe for the duration of its build so that any number of probes
+/// can build into the one shared target concurrently while excluding the
+/// exclusive cap-cleanup ([`try_lock_zen_target_cleanup`]) that would clear it
+/// mid-build.
+pub fn lock_zen_target_build(key: &str) -> Result<ZenTargetLock> {
+    let path = zen_target_lock_path(key)?;
+    Ok(ZenTargetLock(acquire_file_lock_shared(&path)?))
+}
+
+/// Try to take the *exclusive* cap-cleanup lock on a Zen shared-cargo-target
+/// without blocking.
+///
+/// Returns `Ok(Some(guard))` only when no probe build holds the shared lock, so
+/// the caller may safely clear the target; `Ok(None)` when a build holds it, so
+/// the caller skips the cleanup this time.
+pub fn try_lock_zen_target_cleanup(key: &str) -> Result<Option<ZenTargetLock>> {
+    let path = zen_target_lock_path(key)?;
+    Ok(try_acquire_file_lock_exclusive(&path)?.map(ZenTargetLock))
 }
 
 /// Sibling lock-file path for `path` (`state.json` → `state.json.lock`).
@@ -3802,6 +3908,7 @@ mod tests {
             issue_tracker: Default::default(),
             runners: Default::default(),
             agents: Default::default(),
+            disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
         }
     }

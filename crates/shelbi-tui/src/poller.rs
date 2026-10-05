@@ -1186,7 +1186,14 @@ fn maybe_emit_heartbeat(
     // in its plain shape. Computed here — the cadence counters live in the
     // schedule — so the summary/reread decision is one place, not inline.
     let zen_cue = zen_heartbeat_cue(project, schedule, now);
-    if let Err(e) = append_heartbeat_event(&project.name, zen_eligible, idle_workspaces, zen_cue) {
+    // Low-disk warning: probe the volume holding the hub's `work_dir` and pass
+    // the free bytes only when they fall below the configured threshold, so the
+    // heartbeat stays quiet above it. A non-local-only fleet or an unprobeable
+    // volume yields `None` (quiet).
+    let disk_low = low_disk_free_bytes(project);
+    if let Err(e) =
+        append_heartbeat_event(&project.name, zen_eligible, idle_workspaces, zen_cue, disk_low)
+    {
         tracing::warn!(
             project = %project.name,
             error = %e,
@@ -1208,6 +1215,24 @@ fn maybe_emit_heartbeat(
     };
     schedule.interval = Some(next_interval);
     schedule.next_attempt = Some(now + next_interval);
+}
+
+/// Free bytes on the volume holding the hub's `work_dir`, but only when they
+/// are below the project's configured low-disk threshold — otherwise `None`,
+/// so the heartbeat and status stay quiet above the threshold.
+///
+/// The hub machine is the one whose disk fills with build output, so the probe
+/// targets the local machine's `work_dir`. When the fleet has no local machine,
+/// or the volume can't be probed (`statvfs` unavailable/failed), the result is
+/// `None` and no warning is emitted.
+pub(crate) fn low_disk_free_bytes(project: &shelbi_core::Project) -> Option<u64> {
+    let work_dir = project
+        .machines
+        .iter()
+        .find(|m| matches!(m.kind, shelbi_core::MachineKind::Local))
+        .map(|m| m.work_dir.as_path())?;
+    let free = shelbi_state::disk::free_space_bytes(work_dir)?;
+    (free < project.disk.low_free_bytes()).then_some(free)
 }
 
 /// Decide the Zen reminder to attach to this heartbeat and advance the Zen
@@ -6956,8 +6981,42 @@ Auto mode works better when it knows your environment. Takes about a minute.
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),
+            disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn low_disk_free_bytes_warns_under_threshold_and_is_quiet_above() {
+        // Probe a real volume (the temp dir). With the threshold set absurdly
+        // high the volume is "below" it and the free count is reported; with a
+        // 0-GiB knob (folds to the 20 GiB default on a host with >20 GiB free,
+        // but be robust: use an explicit 1-byte-equivalent via a huge-then-tiny
+        // pair) the result flips to quiet. We bracket the real free value.
+        let dir = std::env::temp_dir();
+        let real_free =
+            shelbi_state::disk::free_space_bytes(&dir).expect("temp dir has a probeable volume");
+
+        let mut warn = local_project(&dir);
+        // Threshold above real free → warn, reporting the real free bytes.
+        warn.disk.low_free_gib = Some(real_free / (1024 * 1024 * 1024) + 1_000_000);
+        assert_eq!(low_disk_free_bytes(&warn), Some(real_free));
+
+        let mut quiet = local_project(&dir);
+        // Threshold of 1 GiB on a host with far more free → quiet.
+        quiet.disk.low_free_gib = Some(1);
+        // Only assert quiet when the host genuinely has >1 GiB free (CI/dev do).
+        if real_free > 1024 * 1024 * 1024 {
+            assert_eq!(low_disk_free_bytes(&quiet), None);
+        }
+    }
+
+    #[test]
+    fn low_disk_free_bytes_is_none_without_a_local_machine() {
+        let dir = std::env::temp_dir();
+        let mut p = local_project(&dir);
+        p.machines.clear();
+        assert_eq!(low_disk_free_bytes(&p), None);
     }
 
     // --- freshness-guard tests: no destructive action on a stale/failed board ---
