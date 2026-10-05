@@ -389,7 +389,7 @@ pub fn build_command_model(project: &str, sidebar: &SidebarModel) -> CommandMode
 
     CommandModel {
         project: Some(project.to_string()),
-        zen_on: sidebar.zen_on,
+        zen_on: !matches!(sidebar.zen_mode, shelbi_state::ZenModeState::Off),
         zen_shortcut: None,
         views,
         workspaces,
@@ -487,7 +487,7 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
     use shelbi_app::nav::View;
-    use shelbi_app::view::{NavItem, ReviewRow, WorkspaceRow};
+    use shelbi_app::view::{NavItem, ReviewRow, ReviewState, WorkspaceBadge, WorkspaceRow};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -601,14 +601,28 @@ mod tests {
             ],
             workspaces: vec![WorkspaceRow {
                 name: "alpha-1".into(),
+                machine: "hub".into(),
+                is_remote: false,
                 current_task: Some("T-1".into()),
                 agent: Some("developer".into()),
+                badge: WorkspaceBadge::Working,
             }],
             reviews: vec![ReviewRow {
                 task_id: "T-9".into(),
                 title: "Review me".into(),
+                branch: "user/T-9".into(),
+                location: None,
+                workspace: None,
+                state: ReviewState::Pending,
             }],
-            zen_on: true,
+            config_error: None,
+            board_loading: false,
+            collapsed_machines: Default::default(),
+            board_banner: None,
+            daemon_version_line: None,
+            daemon_version_mismatch: false,
+            status_line: String::new(),
+            zen_mode: shelbi_state::ZenModeState::On,
             unread_errors: 0,
         };
         let m = build_command_model("alpha", &sidebar);

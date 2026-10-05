@@ -12,10 +12,11 @@
 //! kanban, and activity views by filtering one freshly-read board, and it
 //! keeps the mapping unit-testable without a `$SHELBI_HOME` or a `gh`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use shelbi_core::{Column, Machine, MachineKind, StatusCategory, WorkspaceSpec};
-use shelbi_state::{ErrorLogEntry, IssueFile};
+use shelbi_palette::{Decoration, DecorationColor};
+use shelbi_state::{ErrorLogEntry, IssueFile, ZenModeState};
 
 use crate::nav::View;
 
@@ -24,14 +25,47 @@ use crate::nav::View;
 // ---------------------------------------------------------------------------
 
 /// The left navigation list.
+///
+/// Everything a renderer needs to draw the sidebar at parity with the former
+/// tmux-runtime sidebar: the fixed nav, the machine-grouped workspace pool
+/// (each row carrying its state badge), the review sections (split by
+/// lifecycle state), and the footer chrome (zen state, version segment, status
+/// line, unread-errors count). The board-derived parts are pure functions over
+/// an already-read board slice; the disk-derived parts (badges, review
+/// serving-markers, version probe) are filled by the host that owns IO.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarModel {
     pub project_label: String,
     pub nav: Vec<NavItem>,
     pub workspaces: Vec<WorkspaceRow>,
-    /// Tasks sitting in the review column.
+    /// Tasks sitting in the review column. The renderer partitions these into
+    /// the "Ready for Review" (`Serving` / `Loading`) and "Queued for Review"
+    /// (`Pending`) sections by each row's [`ReviewRow::state`].
     pub reviews: Vec<ReviewRow>,
-    pub zen_on: bool,
+    /// The project config load error (present-but-broken config), surfaced
+    /// inline under the Workspaces header instead of silently dropping the
+    /// section. `None` for a healthy or genuinely-absent config.
+    pub config_error: Option<String>,
+    /// True on a cold process whose board hasn't loaded yet — drives the dim
+    /// "Loading…" placeholder so the chrome paints instantly.
+    pub board_loading: bool,
+    /// Machines the user has collapsed in the Workspaces tree (their workspace
+    /// rows are hidden, the group header shows a count suffix).
+    pub collapsed_machines: BTreeSet<String>,
+    /// Footer freshness banner (shares the version row): `None` for a local or
+    /// not-yet-probed board.
+    pub board_banner: Option<String>,
+    /// Preformatted daemon/CLI version footer segment. `None` until probed.
+    pub daemon_version_line: Option<String>,
+    /// True when the probed daemon version differs from the running binary —
+    /// the renderer paints the version segment red instead of dim.
+    pub daemon_version_mismatch: bool,
+    /// Launch-time sidebar status line (the first-run hint or a startup-warning
+    /// count). Empty when there is nothing to surface.
+    pub status_line: String,
+    /// Latest Zen Mode state — drives the footer's green band (On) vs the
+    /// hotkey hint (Off / Paused).
+    pub zen_mode: ZenModeState,
     pub unread_errors: usize,
 }
 
@@ -46,10 +80,17 @@ pub struct NavItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRow {
     pub name: String,
+    /// The machine this workspace lives on — used to group rows under a
+    /// `▾ <machine>` header when the project declares more than one.
+    pub machine: String,
+    /// Whether `machine` is a remote (SSH) host.
+    pub is_remote: bool,
     /// The task id this workspace is currently working, if any.
     pub current_task: Option<String>,
     /// The agent name (from the task's `agent:` frontmatter), if known.
     pub agent: Option<String>,
+    /// Per-workspace state glyph shown in the badge column.
+    pub badge: WorkspaceBadge,
 }
 
 /// A review-column task row.
@@ -57,6 +98,100 @@ pub struct WorkspaceRow {
 pub struct ReviewRow {
     pub task_id: String,
     pub title: String,
+    /// Branch name shown dim on the entry's second line.
+    pub branch: String,
+    /// `machine:port` URL badge — `Some` only for a `Serving` task.
+    pub location: Option<String>,
+    /// The `review`-tagged workspace this task is loaded onto, when assigned.
+    pub workspace: Option<String>,
+    /// Which lifecycle state drives the row's section and glyph.
+    pub state: ReviewState,
+}
+
+/// Per-workspace state glyph shown in the sidebar's badge column. The plain
+/// data twin of the former tmux-runtime `WorkspaceBadge`; the glyph + colour
+/// are the single source both the sidebar renderer and the palette consume so
+/// the two surfaces can't drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceBadge {
+    /// ⏵ — the agent is actively running a turn.
+    Working,
+    /// ? — finished a turn and sitting at the prompt.
+    AwaitingInput,
+    /// ⚠ — a permission dialog is up.
+    AwaitingPermission,
+    /// ⏸ — the runner stalled on a usage/session limit.
+    Paused,
+    /// · — no in-flight task assigned.
+    Idle,
+}
+
+impl WorkspaceBadge {
+    /// Single-char glyph — paired with one trailing space in the renderer.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            WorkspaceBadge::Working => "⏵",
+            WorkspaceBadge::AwaitingInput => "?",
+            WorkspaceBadge::AwaitingPermission => "⚠",
+            WorkspaceBadge::Paused => "⏸",
+            WorkspaceBadge::Idle => "·",
+        }
+    }
+
+    /// Colour the glyph paints in.
+    pub fn decoration_color(self) -> DecorationColor {
+        match self {
+            WorkspaceBadge::Working => DecorationColor::Green,
+            WorkspaceBadge::AwaitingInput => DecorationColor::Yellow,
+            WorkspaceBadge::AwaitingPermission => DecorationColor::Red,
+            WorkspaceBadge::Paused => DecorationColor::Yellow,
+            WorkspaceBadge::Idle => DecorationColor::DarkGray,
+        }
+    }
+
+    pub fn decoration(self) -> Decoration {
+        Decoration {
+            glyph: self.glyph().to_string(),
+            color: self.decoration_color(),
+        }
+    }
+}
+
+/// Which of the three review lifecycle states a [`ReviewRow`] is in. `Serving`
+/// and `Loading` both read "Ready for Review" (the slot is already assigned —
+/// serving shows a ✓, loading a ▶ with no ✓ yet); `Pending` reads "Queued for
+/// Review" (no slot yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewState {
+    /// The review slot's dev server is confirmed up. Ready for Review, ✓, with
+    /// the `machine:port` location.
+    Serving,
+    /// Assigned to a review slot but the server isn't confirmed serving yet.
+    /// Ready for Review, ▶, no ✓ and no location yet.
+    Loading,
+    /// In Review but not yet assigned to any review slot. Queued for Review, ·.
+    Pending,
+}
+
+impl ReviewState {
+    /// Glyph + colour for the entry's badge — the single source shared with the
+    /// palette so the ✓ is gated on serving, never on section membership.
+    pub fn decoration(self) -> Decoration {
+        match self {
+            ReviewState::Serving => Decoration {
+                glyph: "✓".into(),
+                color: DecorationColor::Cyan,
+            },
+            ReviewState::Loading => Decoration {
+                glyph: "▶".into(),
+                color: DecorationColor::Yellow,
+            },
+            ReviewState::Pending => Decoration {
+                glyph: "·".into(),
+                color: DecorationColor::DarkGray,
+            },
+        }
+    }
 }
 
 impl SidebarModel {
@@ -82,6 +217,18 @@ impl SidebarModel {
             .map(|f| ReviewRow {
                 task_id: f.task.id.clone(),
                 title: f.task.title.clone(),
+                // Structural builder: no project/orchestrator context, so the
+                // branch falls back to the task's recorded branch (or the
+                // `user/<id>` default) and every row reads Queued/Pending with
+                // no serving location. A host with IO overrides these.
+                branch: f
+                    .task
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| format!("user/{}", f.task.id)),
+                location: None,
+                workspace: None,
+                state: ReviewState::Pending,
             })
             .collect();
 
@@ -92,10 +239,21 @@ impl SidebarModel {
                     f.task.assigned_to.as_deref() == Some(name.as_str())
                         && f.task.column.category() == StatusCategory::Active
                 });
+                let current_task = task.map(|f| f.task.id.clone());
+                // Without a `status.yaml` read the badge is a structural guess:
+                // a workspace with an active task reads Working, otherwise Idle.
+                let badge = if current_task.is_some() {
+                    WorkspaceBadge::Working
+                } else {
+                    WorkspaceBadge::Idle
+                };
                 WorkspaceRow {
                     name: name.clone(),
-                    current_task: task.map(|f| f.task.id.clone()),
+                    machine: String::new(),
+                    is_remote: false,
+                    current_task,
                     agent: task.and_then(|f| f.task.param_str("agent").map(str::to_string)),
+                    badge,
                 }
             })
             .collect();
@@ -122,7 +280,18 @@ impl SidebarModel {
             ],
             workspaces,
             reviews,
-            zen_on,
+            config_error: None,
+            board_loading: false,
+            collapsed_machines: BTreeSet::new(),
+            board_banner: None,
+            daemon_version_line: None,
+            daemon_version_mismatch: false,
+            status_line: String::new(),
+            zen_mode: if zen_on {
+                ZenModeState::On
+            } else {
+                ZenModeState::Off
+            },
             unread_errors,
         }
     }
@@ -473,7 +642,7 @@ mod tests {
             4,
         );
         assert_eq!(model.project_label, "Alpha");
-        assert!(model.zen_on);
+        assert_eq!(model.zen_mode, ZenModeState::On);
         assert_eq!(model.unread_errors, 4);
         assert_eq!(model.nav.len(), 4);
         assert_eq!(model.nav[1].view, View::Issues);

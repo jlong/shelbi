@@ -23,6 +23,7 @@ mod refresh;
 mod review;
 mod session;
 mod sidebar;
+mod sidebar_model;
 mod terminal_view;
 
 #[cfg(all(test, unix))]
@@ -59,7 +60,8 @@ use shelbi_app::view::SidebarModel;
 use shelbi_app::CommandKind;
 use shelbi_core::{ConfigMode, IssueTrackerConfig};
 use shelbi_orchestrator::project_create::{self, ResolvedProjectRoot};
-use shelbi_state::keymap::{load_keymaps, GlobalAction, KeyChord, Keymaps};
+use shelbi_state::keymap::{load_keymaps, DisplayStyle, GlobalAction, KeyChord, Keymaps};
+use shelbi_state::ZenToggleChord;
 use shelbi_term::Size;
 
 use crate::activity::ActivityApp;
@@ -632,6 +634,16 @@ struct ShellState {
     /// shared by the embedded native-view key handlers, the palette's bindings,
     /// and resolving the palette-open chord.
     keymaps: Keymaps,
+    /// Platform convention for rendering chord hints in the sidebar footer —
+    /// detected once at construction so per-frame rendering never re-probes.
+    display_style: DisplayStyle,
+    /// Chord that toggles Zen Mode, resolved from the keymaps once at startup.
+    /// Drives the sidebar footer's off-state hotkey hint.
+    zen_toggle_chord: ZenToggleChord,
+    /// Launch-time sidebar status line (first-run hint / startup-warning count),
+    /// claimed once at construction and stamped onto each refreshed sidebar
+    /// model. Empty when there is nothing to surface.
+    startup_status: String,
     main_view: MainView,
     /// Rects from the last draw, for mouse hit-testing.
     sidebar_rect: Rect,
@@ -702,11 +714,18 @@ impl ShellState {
         // from here, and the embedded native-view handlers share them. A load
         // failure degrades to the embedded defaults; the sidebar surfaces the
         // diagnostic count.
-        let (keymaps, _diags) = load_keymaps(Some(project));
+        let (keymaps, diags) = load_keymaps(Some(project));
         let palette_chord = keymaps
             .global
             .first_chord_for(GlobalAction::OpenPalette)
             .copied();
+        let display_style = DisplayStyle::detect();
+        // Resolve the Zen toggle chord for the footer hint, falling back to the
+        // Alt+Z default for bindings the preset enum can't represent.
+        let zen_toggle_chord = keymaps.zen_toggle_chord(ZenToggleChord::default());
+        // Claim the one-time first-run hint, else surface any keymap-diagnostic
+        // count. Mirrors the former sidebar's launch status line.
+        let startup_status = sidebar::sidebar_startup_status_line(diags.len());
         let mut kanban = KanbanApp::new(project);
         kanban.keymaps = keymaps.clone();
         // Board moves go through the shelbi-app executor (daemon-backed when
@@ -739,6 +758,9 @@ impl ShellState {
             activity: ActivityApp::new(project),
             machines,
             keymaps,
+            display_style,
+            zen_toggle_chord,
+            startup_status,
             main_view: MainView::Session,
             sidebar_rect: Rect::default(),
             main_rect: Rect::default(),
@@ -772,7 +794,10 @@ impl ShellState {
     }
 
     fn apply_snapshot(&mut self, snap: ShellSnapshot) {
-        if let Some(sidebar) = snap.sidebar {
+        if let Some(mut sidebar) = snap.sidebar {
+            // The launch status line is startup state (claimed once), not a
+            // per-refresh board read — stamp it onto the freshly-built model.
+            sidebar.status_line = self.startup_status.clone();
             // Keep the selection in range as rows come and go.
             let view = SidebarView::build(&sidebar);
             self.client.clamp_selection(view.selectable_count());
@@ -818,6 +843,12 @@ impl ShellState {
 
     fn sidebar_view(&self) -> Option<SidebarView> {
         self.sidebar_model.as_ref().map(SidebarView::build)
+    }
+
+    /// The per-frame sidebar footer inputs (keybind hint + Zen glyph), owned so
+    /// the draw closure holds no borrow of the rest of the shell state.
+    fn sidebar_chrome(&self) -> sidebar::SidebarChrome {
+        sidebar::SidebarChrome::from_keymaps(&self.keymaps, self.display_style, self.zen_toggle_chord)
     }
 
     fn selection(&self) -> usize {
@@ -868,6 +899,24 @@ impl ShellState {
                 // remembered main view), so it is not recorded.
                 self.begin_review(id);
             }
+            RowTarget::Machine(name) => {
+                // A machine group header toggles its collapse state (persisted to
+                // `state.json`). Mirror the new state into the cached model so the
+                // next render reflects it without waiting for a refresh tick; a
+                // disk failure leaves the row reading what's on disk.
+                match shelbi_state::toggle_sidebar_machine_collapsed(&name) {
+                    Ok(now_collapsed) => {
+                        if let Some(m) = self.sidebar_model.as_mut() {
+                            if now_collapsed {
+                                m.collapsed_machines.insert(name);
+                            } else {
+                                m.collapsed_machines.remove(&name);
+                            }
+                        }
+                    }
+                    Err(e) => self.status = Some(format!("collapse failed: {e}")),
+                }
+            }
         }
         self.dirty = true;
     }
@@ -903,6 +952,9 @@ impl ShellState {
             }
             RowTarget::Native(v) => self.main_view = MainView::Native(v),
             RowTarget::Review(id) => self.main_view = MainView::Review(id),
+            // `view_to_row_target` never yields a machine-toggle target (it has
+            // no `View`), so this arm is only for exhaustiveness.
+            RowTarget::Machine(_) => {}
         }
     }
 
@@ -2260,6 +2312,7 @@ fn draw(
     // cloned (cheap) so the closure can disjointly borrow the embedded views
     // mutably — a native view's `render_full` takes `&mut app` and `&mut Frame`.
     let sidebar_view = state.sidebar_view();
+    let sidebar_chrome = state.sidebar_chrome();
     let main_view = state.main_view.clone();
     let is_review = matches!(main_view, MainView::Review(_));
     let kanban = &mut state.kanban;
@@ -2290,7 +2343,7 @@ fn draw(
 
             // Sidebar.
             if let Some(view) = &sidebar_view {
-                view.render(buf, sidebar_rect, selection, !focus_main);
+                view.render(buf, sidebar_rect, selection, !focus_main, &sidebar_chrome);
             }
 
             // Main area (session / review-fallback; native views drawn above).
@@ -2423,6 +2476,8 @@ fn row_target_to_view(target: &RowTarget) -> Option<View> {
         // A review content session (editor/diff) is transient and laid out from
         // current state, never restored from a saved view. `rt-tui-review`.
         RowTarget::Session(SessionRef::Review { .. }) | RowTarget::Review(_) => None,
+        // A machine group header toggles collapse; it is not a view.
+        RowTarget::Machine(_) => None,
     }
 }
 
@@ -2497,39 +2552,11 @@ fn render_notice(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
 /// [`ShellRefresher::latest`].
 fn read_snapshot(project: &str, _generation: u64) -> ShellSnapshot {
     ShellSnapshot {
-        sidebar: read_sidebar_model(project),
+        sidebar: sidebar_model::read_sidebar_model(project),
         board: Some(KanbanApp::read_board_data(project)),
         activity: Some(ActivityApp::read_activity_data(project)),
         machines: Some(MachinesApp::read_data(project)),
     }
-}
-
-fn read_sidebar_model(project: &str) -> Option<SidebarModel> {
-    let report = shelbi_state::read_board_report(project).ok()?;
-    let board = if report.state.is_cold() {
-        Vec::new()
-    } else {
-        report.state.into_issues()
-    };
-    let names = workspace_pool(project);
-    let zen_on = shelbi_state::read_state(project)
-        .map(|s| !matches!(s.zen_mode, shelbi_state::ZenModeState::Off))
-        .unwrap_or(false);
-    let unread = shelbi_state::unread_error_count(project).unwrap_or(0);
-    Some(SidebarModel::from_board(project, &board, &names, zen_on, unread))
-}
-
-/// The project's declared dev-workspace pool (review-tagged slots surface only
-/// through the review sections, mirroring the tmux sidebar).
-fn workspace_pool(project: &str) -> Vec<String> {
-    let Ok(p) = shelbi_state::load_project(project) else {
-        return Vec::new();
-    };
-    p.workspaces
-        .iter()
-        .filter(|w| !p.effective_tags(w).contains("review"))
-        .map(|w| w.name.clone())
-        .collect()
 }
 
 // --- clipboard -------------------------------------------------------------
@@ -2654,11 +2681,21 @@ mod tests {
                 ],
                 workspaces: vec![WorkspaceRow {
                     name: "alpha".into(),
+                    machine: "hub".into(),
+                    is_remote: false,
                     current_task: None,
                     agent: None,
+                    badge: shelbi_app::view::WorkspaceBadge::Idle,
                 }],
                 reviews: vec![],
-                zen_on: false,
+                config_error: None,
+                board_loading: false,
+                collapsed_machines: Default::default(),
+                board_banner: None,
+                daemon_version_line: None,
+                daemon_version_mismatch: false,
+                status_line: String::new(),
+                zen_mode: shelbi_state::ZenModeState::Off,
                 unread_errors: 0,
             }),
             board: None,
@@ -2755,9 +2792,23 @@ mod tests {
                     NavItem { label: "Activity".into(), view: View::Activity },
                     NavItem { label: "Machines".into(), view: View::Machines },
                 ],
-                workspaces: vec![WorkspaceRow { name: "alpha".into(), current_task: None, agent: None }],
+                workspaces: vec![WorkspaceRow {
+                    name: "alpha".into(),
+                    machine: "hub".into(),
+                    is_remote: false,
+                    current_task: None,
+                    agent: None,
+                    badge: shelbi_app::view::WorkspaceBadge::Idle,
+                }],
                 reviews: vec![],
-                zen_on: false,
+                config_error: None,
+                board_loading: false,
+                collapsed_machines: Default::default(),
+                board_banner: None,
+                daemon_version_line: None,
+                daemon_version_mismatch: false,
+                status_line: String::new(),
+                zen_mode: shelbi_state::ZenModeState::Off,
                 unread_errors: 0,
             }),
             board: None,
@@ -2820,9 +2871,11 @@ mod tests {
         let mut st = test_state();
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_main();
-        // Row layout from top: 0 title, 1 Chat, 2 Issues, 3 Activity,
-        // 4 "— Workspaces —" header, 5 alpha. Click Issues (row 2).
-        st.handle_mouse(left_click(2, 2));
+        // Visual-parity sidebar geometry: rows 0-1 are the title + blank, then
+        // the nav block interleaves items with separator lines — Chat on y=3,
+        // Issues on y=5, Activity on y=7 (even rows between are inert
+        // separators). Click Issues.
+        st.handle_mouse(left_click(2, 5));
         assert_eq!(st.selection(), 1, "selection moved to Issues");
         assert!(
             matches!(st.main_view, MainView::Native(View::Issues)),
@@ -2831,8 +2884,8 @@ mod tests {
         // A native view keeps sidebar focus, exactly as Enter does.
         assert_eq!(st.client.focus(), Focus::Sidebar);
 
-        // Clicking Activity (row 3) switches the main area again.
-        st.handle_mouse(left_click(2, 3));
+        // Clicking Activity (y=7) switches the main area again.
+        st.handle_mouse(left_click(2, 7));
         assert_eq!(st.selection(), 2, "selection moved to Activity");
         assert!(matches!(st.main_view, MainView::Native(View::Activity)));
     }
@@ -2842,8 +2895,10 @@ mod tests {
         let mut st = test_state();
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_sidebar();
-        // alpha is on row 5 (selectable index 3).
-        st.handle_mouse(left_click(2, 5));
+        // After the nav block (ends y=8) comes a blank (y=9), the
+        // "— Workspaces —" header (y=10), then the single flat workspace alpha
+        // on y=11 (selectable ordinal 3).
+        st.handle_mouse(left_click(2, 11));
         assert_eq!(st.selection(), 3, "selection moved to alpha");
         assert!(
             matches!(st.main_view, MainView::Session),
@@ -2865,15 +2920,15 @@ mod tests {
         // Open Activity first so we can prove a header/blank click doesn't change it.
         st.show(RowTarget::Native(View::Activity));
         let before = st.selection();
-        // Row 4 is the "— Workspaces —" section header.
-        st.handle_mouse(left_click(2, 4));
+        // y=10 is the "— Workspaces —" section header.
+        st.handle_mouse(left_click(2, 10));
         assert_eq!(st.selection(), before, "a header click doesn't move the selection");
         assert!(
             matches!(st.main_view, MainView::Native(View::Activity)),
             "a header click opens nothing"
         );
-        // Row 10 is blank space below the last row.
-        st.handle_mouse(left_click(2, 10));
+        // y=13 is blank space below the last row (alpha, y=11).
+        st.handle_mouse(left_click(2, 13));
         assert_eq!(st.selection(), before, "a blank click doesn't move the selection");
         assert!(matches!(st.main_view, MainView::Native(View::Activity)));
     }
