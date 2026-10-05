@@ -1446,7 +1446,7 @@ mod tests {
         // Output assertions live behind a refactor (split compute from
         // render); the smoke test catches accidental regressions in the
         // wiring.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -1575,7 +1575,7 @@ workspaces:
         // composed reason (mirrors what `start()` writes) so the test
         // doesn't need to stand up a real tmux pane to spawn the
         // workspace.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -1607,7 +1607,7 @@ workspaces:
         // start` resolves the active status's agent and lands on
         // `developer`. The resolver doesn't care about Zen mode for an
         // `owner: agent` status, so this passes regardless of state.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_default_agents_for_test("p");
@@ -1641,7 +1641,7 @@ statuses:
         // bundled `developer` agent — that way the spawn path still
         // mounts agent context, instead of silently dispatching with
         // nothing.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_default_agents_for_test("p");
@@ -1751,7 +1751,7 @@ statuses:
         // already sitting in the agent-owned `adversarial-review` gate resolves
         // to that gate's agent, not the developer of `in-progress`. Asserted
         // through the dispatch resolver, not a spawned pane.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_default_agents_for_test("p");
@@ -1781,7 +1781,7 @@ statuses:
         // A resume needs to know which workspace holds the in-flight work.
         // With no `assigned_to` and no `--workspace`, it must fail cleanly
         // (before touching any pane) rather than guessing.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
@@ -1798,7 +1798,7 @@ statuses:
     fn resume_rejects_unknown_workspace() {
         // An explicit `--workspace` that isn't declared in the project must
         // be rejected with the known-workspaces list, same as `start`/`assign`.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         // provision_hub_repo_for_project declares no workspaces, so any name
@@ -2025,7 +2025,7 @@ workspaces:
 
     #[test]
     fn show_renders_a_github_only_issue_with_no_local_file() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         write_github_project_yaml(&home, "gh");
@@ -2078,7 +2078,7 @@ workspaces:
     /// drops closed cards) instead, so the stranded snapshot entry is inert.
     #[test]
     fn workspace_occupied_by_ignores_a_done_card_stranded_in_the_stale_snapshot() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         write_github_project_yaml(&home, "gh");
@@ -2110,7 +2110,7 @@ workspaces:
     /// column. The card excluded by id is never its own occupant.
     #[test]
     fn workspace_occupied_by_reports_a_live_in_progress_card_with_its_real_column() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         write_github_project_yaml(&home, "gh");
@@ -2165,7 +2165,7 @@ workspaces:
     /// it — proving the path is workflow-agnostic and move-fresh.
     #[test]
     fn prio_reorders_from_the_live_index_not_the_stale_snapshot() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         write_github_project_yaml(&home, "gh");

@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn list_succeeds_on_fresh_project_with_no_agents() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         // No agents/ directory at all.
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn list_includes_defaults_with_no_status_marker_when_no_workflows_reference_them() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_defaults("p");
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn customized_marker_reports_no_for_unmodified_default() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_defaults("p");
@@ -445,7 +445,7 @@ mod tests {
     /// `yes` — the byte-compare false positive this task fixes.
     #[test]
     fn customized_marker_reports_no_for_stale_untouched_default() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_defaults("p");
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn customized_marker_reports_yes_when_instructions_diverge() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_defaults("p");
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn customized_marker_dash_for_user_added_agent() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         new("p", "sidekick").unwrap();
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn list_status_join_dedupes_across_workflows() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_defaults("p");
@@ -546,7 +546,7 @@ statuses:
 
     #[test]
     fn show_errors_on_missing_agent() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let err = show("p", "ghost").unwrap_err().to_string();
@@ -558,7 +558,7 @@ statuses:
 
     #[test]
     fn show_prints_instructions_and_skills_section_with_descriptions() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         new("p", "qa").unwrap();
@@ -591,7 +591,7 @@ statuses:
 
     #[test]
     fn new_scaffolds_directory_instructions_and_skills_dir() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         new("p", "qa").unwrap();
@@ -610,7 +610,7 @@ statuses:
 
     #[test]
     fn new_errors_when_agent_already_exists() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         new("p", "qa").unwrap();
@@ -622,7 +622,7 @@ statuses:
 
     #[test]
     fn new_rejects_invalid_name_before_touching_disk() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let err = new("p", "escape/me").unwrap_err().to_string();
@@ -636,7 +636,7 @@ statuses:
 
     #[test]
     fn edit_errors_when_agent_missing_with_hint_at_new() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let err = edit("p", "ghost").unwrap_err().to_string();
@@ -651,7 +651,7 @@ statuses:
         // Point EDITOR at /usr/bin/true so the spawn step is a successful
         // no-op — we can't realistically launch a real $EDITOR from a unit
         // test.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         // VISUAL takes precedence over EDITOR in the shared resolver, so

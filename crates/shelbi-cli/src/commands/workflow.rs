@@ -239,7 +239,7 @@ statuses:
 
     #[test]
     fn new_creates_file_with_starter_yaml_that_round_trips() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -259,7 +259,7 @@ statuses:
 
     #[test]
     fn new_refuses_to_clobber_existing_file() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -272,7 +272,7 @@ statuses:
 
     #[test]
     fn new_rejects_invalid_name_before_touching_disk() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -287,7 +287,7 @@ statuses:
 
     #[test]
     fn edit_cmd_errors_when_non_default_workflow_missing() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -303,7 +303,7 @@ statuses:
         // We can't realistically launch $EDITOR from a unit test. Drive
         // the materialize-then-open path by pointing EDITOR at /usr/bin/true
         // so the spawn step is a successful no-op.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         std::env::set_var("EDITOR", "/usr/bin/true");
@@ -332,7 +332,7 @@ statuses:
     fn list_succeeds_when_directory_is_absent() {
         // Smoke test: the fallback path doesn't crash and we don't blow up
         // on the on-disk marker probe (the file simply doesn't exist).
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         list("p").unwrap();
@@ -341,7 +341,7 @@ statuses:
 
     #[test]
     fn list_sees_files_written_via_new() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         // `shelbi workflow new` only writes the workflow file; the
@@ -360,7 +360,7 @@ statuses:
 
     #[test]
     fn show_prints_file_when_present() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let dir = shelbi_state::workflows_dir("p").unwrap();
@@ -377,7 +377,7 @@ statuses:
         // statuses are declared in a different order than `statuses.yaml`.
         // The renderer must re-sort by the canonical position so the
         // table reads top-to-bottom in column order.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let dir = shelbi_state::workflows_dir("p").unwrap();
@@ -403,7 +403,7 @@ statuses:
 
     #[test]
     fn show_falls_back_to_built_in_default_when_missing() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         // The default name has a built-in fallback even before any file
@@ -417,7 +417,7 @@ statuses:
 
     #[test]
     fn show_errors_on_unknown_workflow() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let err = show("p", "ghost").unwrap_err();

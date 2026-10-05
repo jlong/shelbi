@@ -233,7 +233,16 @@ pub(super) fn bind(path: &std::path::Path) -> anyhow::Result<UnixListener> {
     // A stale socket from a crashed daemon blocks bind; the hub's single-instance
     // lock guarantees we are the only daemon, so removing it is safe.
     let _ = std::fs::remove_file(path);
-    let prev_umask = unsafe { libc::umask(0o177) };
+    // Tighten the umask around bind() so the socket inode is created 0600 from
+    // the start, closing the window between bind() and the chmod below where a
+    // local peer could connect. Mask only the group/other bits (`0o077`), never
+    // owner-execute: `umask` is process-global, and a value that cleared
+    // owner-x (e.g. `0o177`) would strip the search bit from any *directory* a
+    // concurrent thread creates in this same window, leaving it unusable
+    // (EACCES). Harmless for a lone daemon process, but in the test binary many
+    // threads create board/home dirs in parallel — see the rt-cli test env-lock
+    // race. `0o077` yields the identical 0600 socket while leaving 0700 dirs.
+    let prev_umask = unsafe { libc::umask(0o077) };
     let bind_result = UnixListener::bind(path);
     unsafe { libc::umask(prev_umask) };
     let listener =

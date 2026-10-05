@@ -1078,7 +1078,7 @@ issue_tracker:\n\
 
     #[test]
     fn list_succeeds_against_default_statuses() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         // No statuses.yaml on disk — loader falls back to the built-in
@@ -1092,7 +1092,7 @@ issue_tracker:\n\
         // Sanity-check that the printed order matches the on-disk
         // declared order — the column-ordering contract everything
         // downstream relies on.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let custom = ProjectStatuses {
@@ -1121,7 +1121,7 @@ issue_tracker:\n\
 
     #[test]
     fn category_counts_bucket_default_columns() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -1218,7 +1218,7 @@ issue_tracker:\n\
 
     #[test]
     fn consume_handoff_writes_then_deletes() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
@@ -1238,7 +1238,7 @@ issue_tracker:\n\
 
     #[test]
     fn consume_handoff_is_noop_when_absent() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let _work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
@@ -1254,7 +1254,7 @@ issue_tracker:\n\
         // The `--full` flag is meant to be safe to re-run: a HANDOFF.md
         // that exists on disk must stay put after `--full` returns.
         // Consumption only happens under `--handoff`.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
@@ -1280,7 +1280,7 @@ issue_tracker:\n\
         // `--full --handoff` on a project with no HANDOFF.md should print
         // both sections in one call and NOT error just because the note
         // isn't there — that's the orchestrator's every-bootstrap shape.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let _work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
@@ -1291,7 +1291,7 @@ issue_tracker:\n\
 
     #[test]
     fn zen_snapshot_flags_recent_crash_recovery_event() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let _work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
@@ -1313,7 +1313,7 @@ issue_tracker:\n\
 
     #[test]
     fn stale_crash_recovery_event_is_not_flagged() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -1346,7 +1346,7 @@ issue_tracker:\n\
 
     #[test]
     fn crash_scan_reads_only_the_tail_not_the_whole_log() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
