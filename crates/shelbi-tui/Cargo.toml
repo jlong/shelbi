@@ -30,6 +30,10 @@ unicode-width = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+# The post-first-frame kitty-protocol probe polls stdin with a short timeout
+# (`shell::caps`), so a headless terminal that never answers the query can't
+# stall the first draw (`rt-tui-headless-startup-block`).
+libc = { workspace = true }
 
 [dev-dependencies]
 # The sidebar's degraded-render test seeds an on-disk board snapshot for a
@@ -39,7 +43,7 @@ tracing = { workspace = true }
 shelbi-state = { workspace = true, features = ["test-support"] }
 # The shell's real-PTY key-echo test (AC4) spawns a genuine `shelbi_session::run`
 # on a thread and reads the echoed bytes back through a client, so it needs the
-# session server, a temp `SHELBI_HOME`, and `libc` for the kill signal.
+# session server and a temp `SHELBI_HOME` (`libc`, for the kill signal, is a
+# regular dependency above).
 shelbi-session = { workspace = true }
 tempfile = "3"
-libc = { workspace = true }

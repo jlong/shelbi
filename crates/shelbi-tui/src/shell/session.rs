@@ -235,6 +235,20 @@ impl SessionManager {
         }
     }
 
+    /// Re-attach to the current target with a fresh connect, even if it is
+    /// already the connecting/failed/live target (which [`show`](Self::show)
+    /// would no-op). Used after a background bootstrap brings the orchestrator
+    /// session up, so an attach that failed because the session didn't exist yet
+    /// retries (`rt-tui-headless-startup-block`). A no-op when nothing is bound.
+    pub fn reconnect(&mut self) {
+        if let Some(target) = self.current_target().cloned() {
+            // Clear the slot first so `show` doesn't recognise the target as
+            // already-current and skip the reconnect.
+            self.slot = Slot::Empty;
+            self.show(target);
+        }
+    }
+
     pub fn state(&self) -> MainState<'_> {
         match &self.slot {
             Slot::Empty => MainState::Empty,

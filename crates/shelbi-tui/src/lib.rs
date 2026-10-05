@@ -5,7 +5,7 @@
 //!   shows worker sessions through shelbi-term / shelbi-client. This is what
 //!   `shelbi` (no subcommand) invokes.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 mod activity;
 mod app;
@@ -150,29 +150,24 @@ pub fn run_main(project_name: &str) -> Result<()> {
     // missing/unwritable ~/.shelbi/shelbi.yaml should not block launching.
     let _ = shelbi_state::touch_project_launched(project_name);
 
-    // Opening a project starts the on-demand hub daemon if it isn't already
-    // running (`docs/removing-tmux/phase3-daemon.md`). Best-effort: a daemon
-    // that won't start shouldn't block attaching, and the mutation/version gate
-    // reports a genuinely broken daemon on first use.
-    if let Err(e) = shelbi_state::ensure_daemon_running() {
-        eprintln!("shelbi: warning: could not start the hub daemon: {e}");
-    }
-
-    shelbi_orchestrator::ensure_dashboard(project_name)
-        .with_context(|| format!("setting up dashboard for `{project_name}`"))?;
-
     // Cutover migration pass (`rt-cutover-migration`): now that the open gate
     // proved the local tmux session gone, record each workspace's migration
     // state so dispatch knows which worktrees are proven idle. Local workspaces
     // migrate; a remote stays pending until the hub reaches its machine and
     // confirms (killing a surviving `shelbi-w-<ws>` only with the user's
     // agreement). Best-effort — a pending workspace doesn't block opening;
-    // dispatch to it is what's refused.
+    // dispatch to it is what's refused. Runs here, before the shell takes over
+    // the screen, because its consent prompt needs a plain-terminal `[y/N]`; it
+    // probes tmux/SSH directly and needs neither the daemon nor the dashboard.
     run_open_migration_pass(project_name);
 
-    // `ensure_dashboard` above has brought up the orchestrator *session*, so we
-    // run the single-process ratatui shell that owns the whole screen and shows
-    // sessions through shelbi-term / shelbi-client.
+    // Starting the on-demand hub daemon and bootstrapping the orchestrator
+    // dashboard session used to run synchronously here — the daemon socket wait
+    // and the cold orchestrator launch were the bulk of the "shelbi draws
+    // nothing for seconds" headless startup block. Both now run off the shell's
+    // UI thread (`shell::run` -> `ShellState::spawn_startup`) so the first frame
+    // draws immediately; the orchestrator session attaches when the bootstrap
+    // completes (`rt-tui-headless-startup-block`).
     shell::run(project_name)
 }
 
