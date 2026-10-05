@@ -289,7 +289,7 @@ fn lookup_open_pr_impl(
 }
 
 /// Merge an open pull request through GitHub's own PR merge —
-/// `gh pr merge <pr> [--repo <sel>] --<strategy> [--match-head-commit <sha>]`
+/// `gh pr merge <pr> [--repo <sel>] --<strategy> [--subject <s>] [--match-head-commit <sha>]`
 /// — in `wt` on `host`.
 ///
 /// This is the **single** place both the per-workflow `merge` action (via
@@ -299,27 +299,37 @@ fn lookup_open_pr_impl(
 /// `delete_branch` action's job, sequenced *after* `merge` in the shipped
 /// workflows. Callers read the resulting merge SHA back themselves (they
 /// differ on how) and map a non-zero exit to their own error type.
+///
+/// `subject` pins the squash commit's title explicitly (via gh's `--subject`).
+/// Callers pass the PR title here so a bounce-and-rework cycle — a feature
+/// commit followed by a later fix-up commit — can't let GitHub's default title
+/// the squash commit after whichever commit happened to land *last*. Left
+/// `None`, gh falls back to its own default (which is exactly the behavior this
+/// guards against on a multi-commit branch).
 pub(crate) fn gh_pr_merge(
     host: &Host,
     wt: &str,
     pr: u64,
     strategy: MergeStrategy,
     repo: Option<&str>,
+    subject: Option<&str>,
     match_head_commit: Option<&str>,
 ) -> Result<Output> {
-    let argv = gh_pr_merge_argv(pr, strategy, repo, match_head_commit);
+    let argv = gh_pr_merge_argv(pr, strategy, repo, subject, match_head_commit);
     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
     run_in_dir(host, wt, &argv_ref)
 }
 
 /// Build the `gh pr merge` argv. Split out from [`gh_pr_merge`] so the exact
 /// invocation both merge paths share is lockable by a unit test without
-/// spawning `gh`. `--repo` (when set) precedes the strategy flag and
-/// `--match-head-commit` (when set) follows it, matching gh's own ordering.
+/// spawning `gh`. `--repo` (when set) precedes the strategy flag;
+/// `--subject` (when set) and then `--match-head-commit` (when set) follow it,
+/// matching gh's own ordering.
 fn gh_pr_merge_argv(
     pr: u64,
     strategy: MergeStrategy,
     repo: Option<&str>,
+    subject: Option<&str>,
     match_head_commit: Option<&str>,
 ) -> Vec<String> {
     let mut argv = vec![
@@ -333,11 +343,46 @@ fn gh_pr_merge_argv(
         argv.push(repo.to_string());
     }
     argv.push(strategy.gh_flag().to_string());
+    if let Some(subject) = subject {
+        argv.push("--subject".to_string());
+        argv.push(subject.to_string());
+    }
     if let Some(sha) = match_head_commit {
         argv.push("--match-head-commit".to_string());
         argv.push(sha.to_string());
     }
     argv
+}
+
+/// The explicit squash-merge commit title Shelbi hands gh's `--subject`: the
+/// PR `title` with GitHub's conventional ` (#<pr>)` suffix appended, so the
+/// pinned title is byte-identical to the one GitHub's own default produces for
+/// a *single-commit* PR. Pinning it means a multi-commit branch (feature +
+/// later fix-up) gets the same title rather than the last commit's subject.
+pub(crate) fn squash_merge_subject(title: &str, pr: u64) -> String {
+    format!("{} (#{pr})", title.trim())
+}
+
+/// Fetch a PR's title via `gh pr view <pr> [--repo <sel>] --json title`, used
+/// to pin the squash-merge commit title (see [`squash_merge_subject`]). `repo`
+/// mirrors [`gh_pr_merge`]: `Some` on Zen's repo-pinned path, `None` for the
+/// per-workflow `merge` action that runs inside the repo.
+pub(crate) fn pr_title(host: &Host, wt: &str, pr: u64, repo: Option<&str>) -> Result<String> {
+    let pr_str = pr.to_string();
+    let mut args = vec!["gh", "pr", "view", pr_str.as_str()];
+    if let Some(repo) = repo {
+        args.extend(["--repo", repo]);
+    }
+    args.extend(["--json", "title", "--jq", ".title"]);
+    let out = run_in_dir(host, wt, &args)?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("gh pr view {pr_str} --json title"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// The immutable and routing-sensitive identity of an open pull request.
@@ -1035,21 +1080,53 @@ mod tests {
         // The per-workflow `merge` action / `shelbi merge`: no repo pin, no
         // head match — just `gh pr merge <pr> --<strategy>`.
         assert_eq!(
-            gh_pr_merge_argv(42, MergeStrategy::Squash, None, None),
+            gh_pr_merge_argv(42, MergeStrategy::Squash, None, None, None),
             vec!["gh", "pr", "merge", "42", "--squash"]
         );
         assert_eq!(
-            gh_pr_merge_argv(7, MergeStrategy::Merge, None, None),
+            gh_pr_merge_argv(7, MergeStrategy::Merge, None, None, None),
             vec!["gh", "pr", "merge", "7", "--merge"]
         );
     }
 
     #[test]
-    fn gh_pr_merge_argv_zen_shape_pins_repo_and_head() {
-        // Zen's required-PR path: `--repo` precedes the strategy flag,
-        // `--match-head-commit` follows it — the exact ordering gh expects.
+    fn gh_pr_merge_argv_pins_squash_subject_after_strategy() {
+        // The per-workflow `merge` action pins the squash title so a
+        // feature-plus-fixup branch isn't retitled after the last commit.
+        // `--subject` lands right after the strategy flag.
         assert_eq!(
-            gh_pr_merge_argv(42, MergeStrategy::Squash, Some("jlong/shelbi"), Some("abc123")),
+            gh_pr_merge_argv(
+                42,
+                MergeStrategy::Squash,
+                None,
+                Some("feat: do the thing (#42)"),
+                None,
+            ),
+            vec![
+                "gh",
+                "pr",
+                "merge",
+                "42",
+                "--squash",
+                "--subject",
+                "feat: do the thing (#42)",
+            ]
+        );
+    }
+
+    #[test]
+    fn gh_pr_merge_argv_zen_shape_pins_repo_subject_and_head() {
+        // Zen's required-PR path: `--repo` precedes the strategy flag;
+        // `--subject` then `--match-head-commit` follow it — the exact
+        // ordering gh expects.
+        assert_eq!(
+            gh_pr_merge_argv(
+                42,
+                MergeStrategy::Squash,
+                Some("jlong/shelbi"),
+                Some("feat: do the thing (#42)"),
+                Some("abc123"),
+            ),
             vec![
                 "gh",
                 "pr",
@@ -1058,9 +1135,26 @@ mod tests {
                 "--repo",
                 "jlong/shelbi",
                 "--squash",
+                "--subject",
+                "feat: do the thing (#42)",
                 "--match-head-commit",
                 "abc123",
             ]
+        );
+    }
+
+    #[test]
+    fn squash_merge_subject_appends_pr_suffix() {
+        // Byte-identical to GitHub's own default single-commit title, so
+        // pinning it never changes a single-commit branch's merge title.
+        assert_eq!(
+            squash_merge_subject("feat: do the thing", 42),
+            "feat: do the thing (#42)"
+        );
+        // Trailing whitespace in the PR title is trimmed before the suffix.
+        assert_eq!(
+            squash_merge_subject("feat: do the thing  ", 7),
+            "feat: do the thing (#7)"
         );
     }
 

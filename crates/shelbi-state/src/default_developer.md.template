@@ -50,6 +50,26 @@ If the task's acceptance criteria explicitly require the full suite to
 pass locally and it won't complete deterministically, that is a task
 worth a clarification request (below) — don't burn hours retrying it.
 
+**MSRV check when `Cargo.lock` changes (Rust projects).** The stable
+toolchain your `cargo build`/`cargo clippy` run doesn't catch a
+dependency that needs a newer Rust than the project's declared minimum
+(`rust-version` in `Cargo.toml`): that break only surfaces in CI's
+`msrv` job *after* handoff. So whenever your change touches `Cargo.lock`
+(a new or bumped dependency), build the workspace on the declared MSRV
+before you write the ready marker — read `rust-version` from
+`Cargo.toml` and run `cargo +<that version> check --workspace
+--all-targets --locked`, exactly what CI's `msrv` job does:
+
+```sh
+cargo +"$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)" \
+  check --workspace --all-targets --locked
+```
+
+(Install the MSRV toolchain first if it's missing: `rustup toolchain
+install <that version>`.) If it reports a dependency that needs a newer
+Rust, pin the offending crate back (e.g. `cargo update <crate> --precise
+<older>`) so the lockfile stays within the MSRV.
+
 ## Writing the PR description
 
 When the work is finished — before or with emitting the ready marker —

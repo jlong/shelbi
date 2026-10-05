@@ -282,6 +282,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::zen::ZenCmd,
     },
+    /// Build the workspace on the declared minimum Rust version (the
+    /// `rust-version` in Cargo.toml), mirroring CI's `msrv` job
+    /// (`cargo +<rust-version> check --workspace --all-targets --locked`). Meant
+    /// as a `zen.checks.local` entry on Rust tracks so an MSRV break (a lockfile
+    /// bump pulling in a dependency that needs newer Rust) is caught before
+    /// handoff instead of only in CI. Reads the toolchain from the nearest
+    /// Cargo.toml, installs it once if missing, and skips cleanly (exit 0) when
+    /// the toolchain can't be provisioned rather than hard-failing.
+    #[command(name = "msrv-check")]
+    MsrvCheck,
     /// Manage the hub checkout's context-scoped default-branch commit guard
     /// (the Shelbi-managed `pre-commit` hook). `install`/`uninstall`/`status`.
     /// The hook only blocks commits from inside a Shelbi-managed agent pane —
@@ -440,6 +450,7 @@ fn main() -> Result<()> {
         Some(Cmd::Events { cmd }) => commands::events::run(cmd),
         Some(Cmd::Daemon { cmd }) => commands::daemon::run(cmd),
         Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),
+        Some(Cmd::MsrvCheck) => commands::msrv_check::run(),
         Some(Cmd::Guard { cmd }) => commands::guard::run(cli.project, cmd),
         Some(Cmd::Action { cmd }) => commands::action::run(cli.project, cmd),
         Some(Cmd::Attach {

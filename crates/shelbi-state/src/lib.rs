@@ -164,7 +164,7 @@ pub use event_log::{
     append_board_rate_limited_event,
     append_board_unreachable_event,
     append_ci_event, append_clarification_event, append_dispatch_event, append_external_event,
-    append_handoff_action_failed_event,
+    append_handoff_action_failed_event, append_handoff_refused_event,
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
     append_limit_resume_event, append_marker_deferred_event, append_marker_skipped_event,
     append_github_merge_reconcile_event, append_merge_event, append_message_ack_event,
@@ -3047,19 +3047,26 @@ pub fn list_ready(project: &str) -> Result<Vec<IssueFile>> {
         .collect())
 }
 
-/// Count workspaces that can absorb a fresh dispatch: those with no task
-/// **holding** them. A workspace is held when a task on the open board names it
-/// in `assigned_to` and that task's *workflow-resolved* status category is
-/// [`StatusCategory::Active`] or [`StatusCategory::Handoff`]
-/// ([`occupied_workspaces_on_board`]) — the same predicate dispatch
-/// (`occupied_workspaces`) and `shelbi workspace list` use, so the heartbeat's
-/// `idle_workspaces=` agrees with both. Surfaced in the heartbeat payload so
-/// the orchestrator can tell, at emit time, whether there's spare capacity to
-/// absorb eligible backlog work.
+/// Count the **dev-dispatch** workspaces that can absorb a fresh dispatch:
+/// declared workspaces that are not `review`-tagged and hold no
+/// `active`-category task. A workspace holds a task when a card on the open
+/// board names it in `assigned_to`; it counts as occupied only when that card's
+/// *workflow-resolved* status category is [`StatusCategory::Active`]
+/// ([`occupied_workspaces_on_board`]). `review`-tagged slots are excluded from
+/// the pool entirely — they never take dev dispatch, so an idle review slot is
+/// not spare capacity and a review slot serving a handoff task is not a busy
+/// *dev* slot. This keeps the heartbeat's `idle_workspaces=` equal to the
+/// dev-slot view of `shelbi workspace list`. Surfaced in the heartbeat payload
+/// so the orchestrator can tell, at emit time, whether there's spare dev
+/// capacity to absorb eligible backlog work.
 pub fn idle_workspace_count(project: &Project) -> Result<usize> {
     let board = read_board(&project.name)?.into_issues();
     let busy = occupied_workspaces_on_board(&project.name, project, &board);
-    Ok(idle_workspace_count_from(&project.workspaces, &busy))
+    Ok(idle_dev_workspace_count_from(
+        &project.workspaces,
+        |w| project.effective_tags(w).contains("review"),
+        &busy,
+    ))
 }
 
 /// Like [`idle_workspace_count`], but read from the daemon-published board
@@ -3085,30 +3092,32 @@ pub fn idle_workspace_count_warm(project: &Project) -> Result<Option<usize>> {
         BoardState::Stale(_) | BoardState::Cold => return Ok(None),
     };
     let busy = occupied_workspaces_on_board(&project.name, project, &board);
-    Ok(Some(idle_workspace_count_from(&project.workspaces, &busy)))
+    Ok(Some(idle_dev_workspace_count_from(
+        &project.workspaces,
+        |w| project.effective_tags(w).contains("review"),
+        &busy,
+    )))
 }
 
-/// Names of the workspaces on `board` that are **occupied** — the set the
-/// heartbeat subtracts from the pool. A workspace is occupied when a task names
-/// it in `assigned_to` and, by that task's *workflow-resolved* status category:
+/// Names of the workspaces on `board` **holding an `active`-category task** —
+/// the set the heartbeat subtracts from the dev pool. A workspace is counted
+/// when a card names it in `assigned_to` and that card's *workflow-resolved*
+/// status category is [`StatusCategory::Active`]: the stock `in-progress`, or
+/// any agent-owned active gate (e.g. `review-app`).
 ///
-/// - the status is [`StatusCategory::Active`] — an in-progress dev task or any
-///   agent-owned active gate, on *any* workspace; or
-/// - the status is [`StatusCategory::Handoff`] (a review task) **and** the
-///   named slot is `review`-tagged — a review slot actually serving the task.
-///
-/// The handoff case is tag-gated to match `shelbi workspace list`, which marks a
-/// review-column task as occupying only a `review`-tagged slot (`review: <id>`).
-/// A handoff task still pointing at the finishing developer slot — before the
-/// review slot picks it up — does *not* occupy that dev slot: its pane was torn
-/// down at the ready handoff, and `workspace list` probes it as free. Counting
-/// it busy would understate capacity, the mirror of the bug this fixes.
+/// A `handoff`-category card (a review task) does **not** occupy the slot it
+/// names, even when `assigned_to` still points at the finishing *developer*
+/// slot before the review slot adopts it: that pane was torn down at the ready
+/// handoff and `shelbi workspace list` probes it as free, so counting it busy
+/// would understate capacity. A review slot *serving* the handoff task isn't
+/// special-cased here either — it's `review`-tagged, and the dev pool filter
+/// ([`idle_dev_workspace_count_from`]) excludes every review slot regardless, so
+/// its occupancy never bears on the count.
 ///
 /// Resolving the category through each task's workflow — rather than a fixed
-/// `column == Column::in_progress()` equality — is the fix for the count
-/// reporting the full pool while work is in flight: any active-category status
-/// that isn't spelled `in-progress` was invisible to the id check and left its
-/// holder counted idle.
+/// `column == Column::in_progress()` equality — is what keeps an active-category
+/// status that isn't spelled `in-progress` from being invisible to the check
+/// and leaving its holder miscounted idle.
 ///
 /// The category lookup is cached by resolved workflow name so a large board
 /// doesn't re-read the same `workflows/*.yaml` once per card. A workflow that
@@ -3136,37 +3145,34 @@ pub fn occupied_workspaces_on_board(
         let Some(category) = workflow.status(tf.task.column.as_str()).map(|s| s.category) else {
             continue;
         };
-        let occupies = match category {
-            shelbi_core::StatusCategory::Active => true,
-            shelbi_core::StatusCategory::Handoff => project
-                .workspace(ws)
-                .is_some_and(|spec| project.effective_tags(spec).contains("review")),
-            _ => false,
-        };
-        if occupies {
+        if category == shelbi_core::StatusCategory::Active {
             busy.insert(ws.to_string());
         }
     }
     busy
 }
 
-/// Pure core of [`idle_workspace_count`]: the pool arithmetic once occupancy is
-/// known. Counts declared workspaces whose name is not in `busy` (the occupied
-/// set from [`occupied_workspaces_on_board`]). Split out so unit tests can drive
-/// it with in-memory fixtures without touching disk or `SHELBI_HOME`.
+/// Pure core of [`idle_workspace_count`]: the dev-pool arithmetic once
+/// occupancy is known. Counts declared workspaces that are **not** review slots
+/// (`is_review` reports a workspace's `review` tag — via the project's effective
+/// tags at the call sites) and whose name is not in `busy` (the active-task set
+/// from [`occupied_workspaces_on_board`]). Split out so unit tests can drive it
+/// with in-memory fixtures without touching disk or `SHELBI_HOME`.
 ///
-/// A `review`-tagged slot is *not* filtered out of the pool here: the pool is
-/// every declared workspace, so an idle review slot counts as idle and a review
-/// slot serving a handoff task counts as busy (it lands in `busy`). This keeps
-/// the number equal to `N - K` (total workspaces minus occupied ones) and in
-/// step with `shelbi workspace list`, which renders that same slot as `idle` or
-/// `review: <id>` respectively.
-pub fn idle_workspace_count_from(
+/// `review`-tagged slots are filtered out of the pool here, not merely out of
+/// `busy`: a review slot never takes dev dispatch, so an idle one is not spare
+/// capacity (it must not inflate the count) and a serving one is not a busy dev
+/// slot (it must not be charged against the dev pool). The result is the
+/// dev-slot `N - K` the heartbeat reports and `shelbi workspace list` agrees
+/// with, and it stays consistent whether the review slot is idle or serving.
+pub fn idle_dev_workspace_count_from(
     workspaces: &[shelbi_core::WorkspaceSpec],
+    is_review: impl Fn(&shelbi_core::WorkspaceSpec) -> bool,
     busy: &HashSet<String>,
 ) -> usize {
     workspaces
         .iter()
+        .filter(|w| !is_review(w))
         .filter(|w| !busy.contains(w.name.as_str()))
         .count()
 }
@@ -4564,7 +4570,7 @@ mod tests {
 
     #[test]
     fn idle_workspace_count_excludes_only_occupied_workspaces() {
-        // Four workspaces, two of which hold an active-category task. The
+        // Four dev workspaces, two of which hold an active-category task. The
         // other two are idle. An occupied name with no matching workspace
         // (a stale assignment to `ghost`) doesn't suppress any real workspace.
         let workspaces = [
@@ -4574,13 +4580,46 @@ mod tests {
             workspace("delta"),
         ];
         let busy = busy_set(&["alpha", "charlie", "ghost"]);
-        assert_eq!(idle_workspace_count_from(&workspaces, &busy), 2);
+        assert_eq!(
+            idle_dev_workspace_count_from(&workspaces, |_| false, &busy),
+            2
+        );
     }
 
     #[test]
     fn idle_workspace_count_all_idle_when_nothing_occupied() {
         let workspaces = [workspace("alpha"), workspace("bravo")];
-        assert_eq!(idle_workspace_count_from(&workspaces, &HashSet::new()), 2);
+        assert_eq!(
+            idle_dev_workspace_count_from(&workspaces, |_| false, &HashSet::new()),
+            2
+        );
+    }
+
+    #[test]
+    fn idle_workspace_count_excludes_review_slots_from_the_pool() {
+        // A `review`-tagged slot never takes dev dispatch, so it is filtered out
+        // of the pool whether it is idle or serving — it neither inflates the
+        // count when idle nor is charged against the dev pool when busy. Pool is
+        // the two dev slots; `alpha` active → one idle dev slot (`bravo`). The
+        // review slot is absent from `busy` (idle) yet still not counted.
+        let workspaces = [
+            workspace("alpha"),
+            workspace("bravo"),
+            workspace("review"),
+        ];
+        let is_review = |w: &shelbi_core::WorkspaceSpec| w.name == "review";
+        assert_eq!(
+            idle_dev_workspace_count_from(&workspaces, is_review, &busy_set(&["alpha"])),
+            1,
+            "idle review slot is excluded, not counted idle"
+        );
+        // Now the review slot is serving (in `busy`): still excluded, and the
+        // count is unchanged — no double-charge against the dev pool.
+        assert_eq!(
+            idle_dev_workspace_count_from(&workspaces, is_review, &busy_set(&["alpha", "review"])),
+            1,
+            "serving review slot is excluded, not charged against the dev pool"
+        );
     }
 
     #[test]
@@ -7666,13 +7705,13 @@ statuses:
 
     #[test]
     fn idle_workspace_count_warm_tracks_a_pool_from_busy_to_idle() {
-        // Regression for the heartbeat counting a busy pool as fully idle. Drive
-        // a four-slot pool (three dev slots + one `review`-tagged slot) through
-        // busy -> idle and assert the emitted count at each step. The count is
-        // `N - K`: total workspaces minus those holding an active- or
-        // handoff-category task, resolved through the workflow — so an
-        // in-progress (active) dev task and a review (handoff) slot both count
-        // as busy, and the review slot returns to the idle pool once free.
+        // Regression for the heartbeat counting a busy pool as fully idle, and
+        // for the review slot muddying the count. Drive a four-slot pool (three
+        // dev slots + one `review`-tagged slot) through busy -> idle. The count
+        // is the *dev-slot* `N - K`: the three dev slots minus those holding an
+        // active-category task. The `review`-tagged slot is excluded from the
+        // pool throughout — serving or idle — so the count tops out at 3, never
+        // 4, and never dips for the review slot's own occupancy.
         let _g = LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -7696,7 +7735,8 @@ statuses:
         };
 
         // Step 1: `alpha` holds an in-progress (active) task and the `review`
-        // slot is serving a review (handoff) task. Two of four busy → 2 idle.
+        // slot is serving a review (handoff) task. Of the three dev slots only
+        // `alpha` is busy → 2 idle; the review slot doesn't count.
         publish(vec![
             in_progress_card("a", Some("alpha")),
             card_in("r", Column::review(), Some("review"), None),
@@ -7704,25 +7744,26 @@ statuses:
         assert_eq!(
             idle_workspace_count_warm(&project).unwrap(),
             Some(2),
-            "alpha (active) + review (handoff) busy → bravo, charlie idle"
+            "alpha (active) busy → bravo, charlie idle; review slot excluded"
         );
 
         // Step 2: `a` reaches done and drops off the open board; the review
-        // slot is still serving. One of four busy → 3 idle.
+        // slot is still serving. No dev slot is busy → all 3 dev slots idle.
         publish(vec![card_in("r", Column::review(), Some("review"), None)]);
         assert_eq!(
             idle_workspace_count_warm(&project).unwrap(),
             Some(3),
-            "only the review slot remains busy"
+            "no dev slot busy → three dev slots idle; serving review slot still excluded"
         );
 
         // Step 3: the review task is accepted and leaves the open board. The
-        // review slot rejoins the idle pool → all 4 idle.
+        // review slot is now idle, but it stays out of the pool — the count
+        // holds at 3 dev slots, it does not climb to 4.
         publish(vec![]);
         assert_eq!(
             idle_workspace_count_warm(&project).unwrap(),
-            Some(4),
-            "fully idle pool counts every slot, review slot included"
+            Some(3),
+            "fully idle pool counts the three dev slots only, review slot excluded"
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -7731,10 +7772,12 @@ statuses:
 
     #[test]
     fn idle_workspace_count_warm_ignores_a_handoff_task_still_on_a_dev_slot() {
-        // A review (handoff) task whose `assigned_to` still names the finishing
-        // *developer* slot (before the review slot picks it up) must not count
-        // that dev slot as busy: its pane is torn down and `workspace list`
-        // probes it free. Only a `review`-tagged slot serving the task occupies.
+        // The reported bug: a dev slot whose finished task moved to the
+        // `handoff` category (review) kept counting busy because the card still
+        // named it in `assigned_to`. A handoff card does not occupy the slot it
+        // names — the dev pane is torn down at handoff and `workspace list`
+        // probes it free. So the dev slot counts idle; the `review`-tagged slot
+        // is excluded from the dev pool entirely.
         let _g = LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -7745,8 +7788,9 @@ statuses:
             &[("alpha", &[]), ("bravo", &[]), ("review", &["review"])],
         );
         let project = load_project(name).unwrap();
-        // `alpha` (a dev slot) still holds the review-column card. No slot is
-        // occupied by it → all three idle.
+        // `alpha` (a dev slot) still holds the review-column card. The handoff
+        // card doesn't occupy it, and the review slot isn't in the dev pool →
+        // both dev slots (`alpha`, `bravo`) idle.
         let mut idx = BoardIndex::fresh(vec![card_in(
             "r",
             Column::review(),
@@ -7757,8 +7801,51 @@ statuses:
         write_board_index(name, &idx).unwrap();
         assert_eq!(
             idle_workspace_count_warm(&project).unwrap(),
+            Some(2),
+            "handoff card on a dev slot leaves both dev slots idle; review slot excluded"
+        );
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn idle_workspace_count_warm_matches_the_reported_multi_handoff_scenario() {
+        // The exact scenario in the bug report: five dev slots, two holding an
+        // in-progress (active) task (alpha, hotel) and three whose task handed
+        // off to review while still named in `assigned_to` (bravo, charlie,
+        // golf), plus an idle `review`-tagged slot. The heartbeat must report 3
+        // idle dev slots — the three handed-off slots — matching what
+        // `shelbi workspace list` shows, not undercount them as busy.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let name = "ghguard-idle-reported";
+        write_gh_project_ws_tagged(
+            &home,
+            name,
+            &[
+                ("alpha", &[]),
+                ("bravo", &[]),
+                ("charlie", &[]),
+                ("golf", &[]),
+                ("hotel", &[]),
+                ("review", &["review"]),
+            ],
+        );
+        let project = load_project(name).unwrap();
+        let mut idx = BoardIndex::fresh(vec![
+            in_progress_card("a", Some("alpha")),
+            in_progress_card("h", Some("hotel")),
+            card_in("b", Column::review(), Some("bravo"), None),
+            card_in("c", Column::review(), Some("charlie"), None),
+            card_in("g", Column::review(), Some("golf"), None),
+        ]);
+        idx.repo = Some(github_board_repo("owner/repo"));
+        write_board_index(name, &idx).unwrap();
+        assert_eq!(
+            idle_workspace_count_warm(&project).unwrap(),
             Some(3),
-            "a handoff task on a non-review slot leaves the whole pool idle"
+            "bravo, charlie, golf handed off → idle; alpha, hotel active; review excluded"
         );
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

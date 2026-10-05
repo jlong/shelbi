@@ -152,8 +152,11 @@ Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
   in-review CI whose terminal `ci` event was missed. The two counts are
   accurate at emit time: `zen_eligible` is how many `backlog`-category
   issues `shelbi zen scan` would return right now, `idle_workspaces` is how
-  many workspaces have no active-category issue. See the heartbeat reaction
-  rule for how they force a skipped scan back into the loop under Zen.
+  many **dev** workspaces have no active-category issue — `review`-tagged slots
+  are excluded from this count, since they never take dev dispatch (an idle
+  review slot is not spare dev capacity), so it stays equal to the dev-slot view
+  of `shelbi workspace list`. See the heartbeat reaction rule for how they force
+  a skipped scan back into the loop under Zen.
 
 You consume it via `shelbi orchestrator events next --follow` — a durable
 claim/ack feed over the same stream, and the **only** consuming reader you run

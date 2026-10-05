@@ -307,26 +307,50 @@ pub(crate) fn start(
         }
     }
 
-    // Release a supplanted prior workspace's pane when a *different* one takes
-    // over. Best-effort.
+    // Release the workspace this card was previously assigned to — but ONLY when
+    // that workspace is still working on THIS card (or has gone idle). The
+    // reassignment above already moved the card onto `workspace_name`; the prior
+    // assignee's pane would otherwise be left running against a card it no longer
+    // owns, so a gate-to-gate move (`in-progress -> adversarial-review`) still
+    // needs it torn down. What it must NOT do is tear down a prior assignee that
+    // has since been re-dispatched to a *different* issue — that pane holds a
+    // live worker mid-task on an unrelated card, and releasing on the card's
+    // stale `assigned_to` alone would kill it. Fires only once the new pane is
+    // confirmed up (this block runs after a successful launch), so a failed
+    // dispatch that rolls the card back never strands the prior worker.
+    // Best-effort throughout: a dead/absent pane or a board-read hiccup must not
+    // undo the authoritative reassignment already persisted.
     if let Some(prev_ws_name) =
         supplanted_workspace(original.assigned_to.as_deref(), &workspace_name)
     {
-        if let Some(prev_ws) = project_yaml.workspace(prev_ws_name) {
-            if let Err(e) = teardown_workspace_pane(&project_yaml, prev_ws) {
-                sink.warn(&format!(
-                    "warning: releasing the supplanted workspace pane on `{prev_ws_name}` \
-                     failed ({e}) — check it and kill a stale worker by hand if one is left"
-                ));
-            } else if let Err(e) = shelbi_state::append_dispatch_event(
-                project,
-                id,
-                prev_ws_name,
-                "released",
-                "supplanted by a new workspace taking over the card's active status",
-            ) {
-                sink.warn(&format!("warning: append_dispatch_event failed: {e}"));
+        match super::workspace_busy_with_other(project, prev_ws_name, id) {
+            // Still on this card (or idle) — safe to reclaim its pane.
+            Ok(None) => release_supplanted_pane(project, &project_yaml, prev_ws_name, id, sink),
+            // Re-dispatched elsewhere — leave its live worker alone, and record a
+            // `skipped` line naming the issue it is busy with so the non-release
+            // is visible in `events.log` rather than silent.
+            Ok(Some(busy)) => {
+                if let Err(e) = shelbi_state::append_dispatch_event(
+                    project,
+                    id,
+                    prev_ws_name,
+                    "skipped",
+                    &format!(
+                        "prior assignee is now active on `{}`; its pane was left running",
+                        busy.id
+                    ),
+                ) {
+                    sink.warn(&format!("warning: append_dispatch_event failed: {e}"));
+                }
             }
+            // Board read failed — err toward NOT releasing. A possibly orphaned
+            // pane on this card is recoverable; killing an unrelated live worker
+            // on a false negative is not.
+            Err(e) => sink.warn(&format!(
+                "warning: couldn't check whether the prior assignee `{prev_ws_name}` is still \
+                 on `{id}` ({e}) — leaving its pane alone; kill a stale worker by hand if one \
+                 is left"
+            )),
         }
     }
 
@@ -415,6 +439,75 @@ fn teardown_workspace_pane(
     let host = machine.host();
     let addr = crate::workspace::workspace_target(project_yaml, workspace)?;
     crate::workspace::kill_workspace_pane(&host, &addr, &workspace.name)
+}
+
+/// Is `workspace`'s session slot live right now? Resolves the machine/target the
+/// same way [`teardown_workspace_pane`] does and probes it. Errors on a
+/// mis-declared workspace — the target won't resolve — which the caller treats
+/// as "can't confirm" rather than guessing.
+fn workspace_pane_liveness(
+    project_yaml: &shelbi_core::Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+) -> Result<bool, shelbi_core::Error> {
+    let machine = project_yaml.machine(&workspace.machine).ok_or_else(|| {
+        shelbi_core::Error::Other(format!(
+            "machine `{}` for workspace `{}` is not declared",
+            workspace.machine, workspace.name
+        ))
+    })?;
+    let host = machine.host();
+    let addr = crate::workspace::workspace_target(project_yaml, workspace)?;
+    crate::workspace::workspace_slot_alive(&host, &addr)
+}
+
+/// Tear down the pane of the card's prior assignee `prev_ws_name` and record a
+/// `released` dispatch event — but only when a live pane is actually taken down.
+/// The caller has already established (via [`super::workspace_busy_with_other`])
+/// that `prev_ws_name` is still on THIS card (or idle), so the teardown can't
+/// kill a worker that has moved to another issue.
+///
+/// An idle slot (no live pane) is a no-op that records nothing: the `released`
+/// line is reserved for a real teardown so it never implies a worker was killed
+/// when none was running. A workspace that won't resolve is left alone (teardown
+/// would hit the same error) and records nothing.
+fn release_supplanted_pane(
+    project: &str,
+    project_yaml: &shelbi_core::Project,
+    prev_ws_name: &str,
+    id: &str,
+    sink: &mut dyn OutputSink,
+) {
+    let Some(prev_ws) = project_yaml.workspace(prev_ws_name) else {
+        return;
+    };
+    match workspace_pane_liveness(project_yaml, prev_ws) {
+        // Idle slot: nothing to reclaim, nothing to record.
+        Ok(false) => {}
+        // A live pane on this card — reclaim it and log the release.
+        Ok(true) => {
+            if let Err(e) = teardown_workspace_pane(project_yaml, prev_ws) {
+                sink.warn(&format!(
+                    "warning: releasing the supplanted workspace pane on `{prev_ws_name}` \
+                     failed ({e}) — check it and kill a stale worker by hand if one is left"
+                ));
+            } else if let Err(e) = shelbi_state::append_dispatch_event(
+                project,
+                id,
+                prev_ws_name,
+                "released",
+                "supplanted by a new workspace taking over the card's active status",
+            ) {
+                sink.warn(&format!("warning: append_dispatch_event failed: {e}"));
+            }
+        }
+        // Can't confirm liveness (the target won't resolve) — teardown would hit
+        // the same error, so leave it and record nothing rather than over-claim
+        // a release that didn't happen.
+        Err(e) => sink.warn(&format!(
+            "warning: couldn't probe the supplanted pane on `{prev_ws_name}` ({e}) — left \
+             alone; kill a stale worker by hand if one is left"
+        )),
+    }
 }
 
 /// Terminal outcome of [`await_launch`].
