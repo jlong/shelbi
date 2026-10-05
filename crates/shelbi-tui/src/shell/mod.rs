@@ -196,6 +196,9 @@ const FRAME: Duration = Duration::from_millis(16);
 const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 /// How long the one-time keyboard-protocol notice stays up.
 const NOTICE_SECS: u64 = 6;
+/// The status line shown while the off-thread startup (daemon + dashboard
+/// bootstrap) runs, cleared when it succeeds (`rt-tui-headless-startup-block`).
+const STARTUP_STATUS: &str = "starting orchestrator…";
 
 /// Run the single-process shell for `project` until the user quits.
 pub fn run(project: &str) -> Result<()> {
@@ -206,15 +209,27 @@ pub fn run(project: &str) -> Result<()> {
 /// session). The terminal setup still happens, so this needs a TTY; the pure
 /// routing is covered by unit tests instead.
 fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()> {
-    // Detect capabilities before entering raw mode, while the terminal can
-    // answer the kitty-protocol query.
-    let caps = Caps::detect();
+    // Capabilities split in two so the first frame never waits on a terminal
+    // query (`rt-tui-headless-startup-block`): the env-derived signals
+    // (truecolor, nesting) are instant and used to build the shell now; the
+    // kitty round-trip is probed *after* the first draw, below.
+    let caps = Caps::detect_fast();
 
     let _guard = RawGuard::enter().context("entering raw mode")?;
     let mut term =
         Terminal::new(CrosstermBackend::new(io::stdout())).context("initializing the terminal")?;
 
-    let mut state = ShellState::new(project, connector, caps);
+    // Build with the keyboard-protocol notice suppressed (a placeholder
+    // `kitty: true`): the post-first-frame probe below establishes the real
+    // value and arms the notice through `set_caps`, so a kitty-capable terminal
+    // never flashes the banner on frame one. `kitty` drives only that notice, so
+    // the placeholder doesn't affect the first frame's rendering.
+    let mut state = ShellState::new(project, connector, Caps { kitty: true, ..caps });
+    // Start the daemon + dashboard off the UI thread, and show a status note
+    // while it runs. The first frame draws immediately (below), before any of
+    // this completes.
+    state.status = Some(STARTUP_STATUS.to_string());
+    state.spawn_startup();
 
     // React to the daemon poller's layout events (review opened/closed/agent
     // recovered), with this process's own change bus as the setting-off
@@ -248,9 +263,19 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         None => state.show(RowTarget::Session(SessionRef::Orchestrator)),
     }
 
-    let mut last_draw = Instant::now()
-        .checked_sub(FRAME)
-        .unwrap_or_else(Instant::now);
+    // Draw the first frame now — the sidebar shell with placeholders and the
+    // "starting orchestrator…" note — *before* probing the terminal or waiting
+    // on the daemon, so a headless PTY sees a frame within milliseconds instead
+    // of a multi-second blank (`rt-tui-headless-startup-block`).
+    draw(&mut term, &mut state)?;
+    let mut last_draw = Instant::now();
+
+    // Now probe the kitty keyboard protocol with a short timeout (the terminal
+    // is in raw mode and nothing else is draining stdin yet). A headless PTY
+    // that never answers falls back to `kitty: false` within the budget rather
+    // than blocking; the result arms the one-time keyboard notice.
+    let kitty = caps::probe_keyboard_enhancement(caps::KITTY_PROBE_TIMEOUT);
+    state.set_caps(Caps { kitty, ..caps });
 
     loop {
         if state.should_quit {
@@ -334,6 +359,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             state.dirty = true;
         }
         if state.poll_create_job() {
+            state.dirty = true;
+        }
+        if state.poll_startup() {
             state.dirty = true;
         }
         if ring {
@@ -509,6 +537,41 @@ fn connect_control() -> Option<shelbi_client::ControlClient> {
     shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION).ok()
 }
 
+/// The blocking startup work the shell runs off its UI thread so the first frame
+/// draws without waiting on it (`rt-tui-headless-startup-block`): starting the
+/// on-demand hub daemon and bringing up the orchestrator dashboard session.
+/// Behind a trait so the shell's "first frame before a slow daemon" guarantee is
+/// testable with a stubbed (slow) bootstrap.
+trait Bootstrap: Send + Sync {
+    /// Start the daemon (if not already running) and bring up `project`'s
+    /// orchestrator dashboard. Blocking; returns a user-facing message on
+    /// failure.
+    fn bootstrap(&self, project: &str) -> Result<(), String>;
+}
+
+/// The production [`Bootstrap`]: start the hub daemon, then bootstrap the
+/// orchestrator session. These used to run synchronously in `run_main` before
+/// the shell started — the `ensure_daemon_running` socket wait (up to 10 s on a
+/// cold/slow daemon) and the cold `ensure_dashboard` agent launch were the bulk
+/// of the headless startup block, drawn nothing until they finished.
+struct DaemonBootstrap;
+
+impl Bootstrap for DaemonBootstrap {
+    fn bootstrap(&self, project: &str) -> Result<(), String> {
+        // A daemon that won't start shouldn't wedge the UI: surface it as a
+        // status note, not a hard failure (read-only session viewing still
+        // works, and the mutation/version gate reports a genuinely broken daemon
+        // on first use). The dashboard bootstrap is the one that must succeed for
+        // the orchestrator session to attach, so its error propagates.
+        if let Err(e) = shelbi_state::ensure_daemon_running() {
+            tracing::warn!(error = %e, "could not start the hub daemon");
+        }
+        shelbi_orchestrator::ensure_dashboard(project)
+            .map(|_status| ())
+            .map_err(|e| format!("couldn't bring up the orchestrator: {e}"))
+    }
+}
+
 struct ShellState {
     client: ClientState,
     sessions: SessionManager,
@@ -518,6 +581,14 @@ struct ShellState {
     connector: Arc<dyn session::Connector>,
     /// The project/shelbi quit operations (daemon control socket in production).
     lifecycle: Arc<dyn ShellLifecycle>,
+    /// The off-thread startup work (daemon start + dashboard bootstrap), behind a
+    /// seam so a slow bootstrap can be stubbed in tests
+    /// (`rt-tui-headless-startup-block`).
+    bootstrap: Arc<dyn Bootstrap>,
+    /// The in-flight startup job, drained by [`ShellState::poll_startup`]. `Some`
+    /// from [`ShellState::spawn_startup`] until the daemon + dashboard bootstrap
+    /// finishes; the first frame draws while it is still pending.
+    startup_rx: Option<Receiver<Result<(), String>>>,
     /// The open review interface (panel + content terminal view), when
     /// `main_view` is [`MainView::Review`]. `rt-tui-review`.
     review: Option<ReviewInterface>,
@@ -607,7 +678,13 @@ struct Notice {
 
 impl ShellState {
     fn new(project: &str, connector: Arc<dyn session::Connector>, caps: Caps) -> Self {
-        Self::new_with(project, connector, caps, Arc::new(DaemonLifecycle))
+        Self::new_with(
+            project,
+            connector,
+            caps,
+            Arc::new(DaemonLifecycle),
+            Arc::new(DaemonBootstrap),
+        )
     }
 
     fn new_with(
@@ -615,6 +692,7 @@ impl ShellState {
         connector: Arc<dyn session::Connector>,
         caps: Caps,
         lifecycle: Arc<dyn ShellLifecycle>,
+        bootstrap: Arc<dyn Bootstrap>,
     ) -> Self {
         let notice = caps.keyboard_notice().map(|text| Notice {
             text,
@@ -644,6 +722,8 @@ impl ShellState {
             sessions: SessionManager::new(project, connector.clone()),
             connector,
             lifecycle,
+            bootstrap,
+            startup_rx: None,
             review: None,
             review_rx: None,
             review_backend: Arc::new(DaemonReviewBackend),
@@ -1072,6 +1152,71 @@ impl ShellState {
                 self.status = Some(format!("Created project {slug} — switched to it"));
             }
             CreateOutcome::Failed(msg) => self.status = Some(msg),
+        }
+        true
+    }
+
+    /// Fold the real terminal capabilities in once the post-first-frame kitty
+    /// probe has run, arming the one-time keyboard-protocol notice if warranted.
+    /// Construction starts from [`Caps::detect_fast`] (no notice), so this is
+    /// where the notice is first armed (`rt-tui-headless-startup-block`).
+    fn set_caps(&mut self, caps: Caps) {
+        self.caps = caps;
+        self.notice = caps.keyboard_notice().map(|text| Notice {
+            text,
+            until: Instant::now() + Duration::from_secs(NOTICE_SECS),
+        });
+        self.dirty = true;
+    }
+
+    /// Spawn the off-thread startup job (daemon start + dashboard bootstrap). The
+    /// event loop draws its first frame and stays interactive while this runs;
+    /// [`ShellState::poll_startup`] folds the result in (`rt-tui-headless-startup-block`).
+    fn spawn_startup(&mut self) {
+        let Some(project) = self.client.project().map(str::to_string) else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bootstrap = self.bootstrap.clone();
+        if std::thread::Builder::new()
+            .name("shelbi-shell-startup".into())
+            .spawn(move || {
+                let _ = tx.send(bootstrap.bootstrap(&project));
+            })
+            .is_ok()
+        {
+            self.startup_rx = Some(rx);
+        }
+    }
+
+    /// Poll the off-thread startup job without blocking. On success, re-attach
+    /// the orchestrator/workspace session now that the dashboard is up (an attach
+    /// that failed before bootstrap retries); on failure, surface the message.
+    /// Returns `true` when the job finished (so the caller redraws).
+    fn poll_startup(&mut self) -> bool {
+        let result = match &self.startup_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(r) => r,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => {
+                    Err("startup stopped unexpectedly".to_string())
+                }
+            },
+            None => return false,
+        };
+        self.startup_rx = None;
+        match result {
+            Ok(()) => {
+                // The orchestrator session exists now; re-attach if the main area
+                // is showing a session (a native view doesn't need it).
+                if matches!(self.main_view, MainView::Session) {
+                    self.sessions.reconnect();
+                }
+                if self.status.as_deref() == Some(STARTUP_STATUS) {
+                    self.status = None;
+                }
+            }
+            Err(msg) => self.status = Some(msg),
         }
         true
     }
@@ -3042,7 +3187,89 @@ mod tests {
             truecolor: true,
             nested: None,
         };
-        ShellState::new_with("proj", Arc::new(NoopConnector), caps, lifecycle)
+        ShellState::new_with(
+            "proj",
+            Arc::new(NoopConnector),
+            caps,
+            lifecycle,
+            Arc::new(DaemonBootstrap),
+        )
+    }
+
+    /// A bootstrap that blocks until the test releases its gate, standing in for
+    /// a slow daemon/dashboard start (`rt-tui-headless-startup-block`).
+    struct BlockingBootstrap {
+        started: Arc<std::sync::atomic::AtomicBool>,
+        gate: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl Bootstrap for BlockingBootstrap {
+        fn bootstrap(&self, _project: &str) -> Result<(), String> {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // Block here until the test opens the gate — a slow bootstrap.
+            let _ = self.gate.lock().unwrap().recv();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_slow_bootstrap_never_blocks_the_ui_thread() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // The headless-startup bug was the shell drawing nothing until the
+        // daemon/dashboard bootstrap finished. Prove the inverse: with the
+        // bootstrap wedged, the shell's event-loop calls stay non-blocking and
+        // input is still handled (so the first frame — drawn by the loop before
+        // this ever completes — is never gated on it).
+        let caps = Caps {
+            kitty: true,
+            truecolor: true,
+            nested: None,
+        };
+        let (open_gate, gate) = std::sync::mpsc::channel();
+        let started = Arc::new(AtomicBool::new(false));
+        let boot = Arc::new(BlockingBootstrap {
+            started: started.clone(),
+            gate: Mutex::new(gate),
+        });
+        let mut st = ShellState::new_with(
+            "proj",
+            Arc::new(NoopConnector),
+            caps,
+            Arc::new(RecordingLifecycle::default()),
+            boot,
+        );
+
+        st.spawn_startup();
+        // The bootstrap thread is running (and now wedged on the gate).
+        let ran = wait_until(Duration::from_secs(2), || started.load(Ordering::SeqCst));
+        assert!(ran, "the bootstrap runs off the UI thread");
+
+        // Polling it does not block, and reports not-yet-done while wedged.
+        assert!(!st.poll_startup(), "a pending bootstrap leaves poll_startup non-blocking");
+
+        // The shell is fully interactive meanwhile: Ctrl+Space opens the palette.
+        st.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        assert!(
+            matches!(st.overlay, Some(ActiveOverlay::Palette(_))),
+            "input is handled while the bootstrap is still running"
+        );
+
+        // Release the gate; the job completes and poll_startup folds it in.
+        open_gate.send(()).unwrap();
+        let done = wait_until(Duration::from_secs(2), || st.poll_startup());
+        assert!(done, "poll_startup reports completion once the bootstrap returns");
+    }
+
+    /// Spin until `f` is true or `timeout` elapses (bounded; never a hard hang).
+    fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        f()
     }
 
     #[test]

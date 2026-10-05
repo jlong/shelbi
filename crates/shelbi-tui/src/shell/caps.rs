@@ -12,6 +12,16 @@
 //!   nesting spike confirmed `extended-keys` is the right thing to recommend).
 //! - **Truecolor** falls back to 256 colors; the renderer quantizes RGB cells
 //!   when this is false.
+//!
+//! Detection must never block the first frame (`rt-tui-headless-startup-block`).
+//! crossterm's own `supports_keyboard_enhancement` waits up to **2 s** for the
+//! terminal to answer the `CSI ? u` query, which a headless PTY (CI smoke jobs,
+//! `tmux`/`screen` capture harnesses) never does — so the shell drew nothing for
+//! seconds. We instead split detection: the env-derived signals (truecolor,
+//! nesting) are read instantly at construction ([`Caps::detect_fast`]), and the
+//! kitty round-trip is probed *after* the first frame with a short timeout
+//! ([`probe_keyboard_enhancement`]), falling back to the safe `kitty: false`
+//! default when no reply arrives.
 
 /// An outer multiplexer the shell is running inside, detected from the
 /// environment. We don't branch behavior on it (the shell is just a full-screen
@@ -48,18 +58,25 @@ pub const KEYBOARD_NOTICE_SCREEN: &str = "⚠ Modified keys like Shift+Enter may
 pub const KEYBOARD_NOTICE_GENERIC: &str = "⚠ Modified keys like Shift+Enter may not reach the \
     agent here (this terminal doesn't support the kitty keyboard protocol)";
 
+/// How long [`probe_keyboard_enhancement`] waits for the terminal to answer the
+/// `CSI ? u` query before falling back to `kitty: false`. Short enough that a
+/// non-answering (headless) terminal never visibly stalls the shell, generous
+/// enough that a real terminal's near-instant reply always lands first.
+pub const KITTY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150);
+
 impl Caps {
-    /// Probe the live terminal. `supports_keyboard_enhancement` issues a
-    /// `CSI ? u` query and waits briefly for the reply; inside tmux/Screen the
-    /// query is swallowed and this reports `false`, which is exactly the signal
-    /// we want. Truecolor is read from `COLORTERM` (the only cheap signal; when
-    /// it over-reports inside a multiplexer the renderer still quantizes
-    /// correctly because the outer terminal does, so the worst case is a
-    /// true-color escape the multiplexer itself downsamples). Nesting is read
-    /// from `$TMUX` / `$STY`.
-    pub fn detect() -> Self {
+    /// The instant, non-blocking signals, read from the environment: truecolor
+    /// from `COLORTERM`, nesting from `$TMUX` / `$STY`. The kitty round-trip is
+    /// *not* probed here (it can block up to 2 s on a terminal that never
+    /// answers — see the module docs); it defaults to the safe `false` and is
+    /// filled in later by [`probe_keyboard_enhancement`] after the first frame.
+    ///
+    /// Truecolor over-reporting inside a multiplexer is harmless: the renderer
+    /// still quantizes correctly because the outer terminal does, so the worst
+    /// case is a true-color escape the multiplexer itself downsamples.
+    pub fn detect_fast() -> Self {
         Caps {
-            kitty: crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false),
+            kitty: false,
             truecolor: truecolor_from_env(std::env::var("COLORTERM").ok().as_deref()),
             nested: detect_nesting(
                 std::env::var("TMUX").ok().as_deref(),
@@ -86,6 +103,126 @@ impl Caps {
 /// Pure `COLORTERM` → truecolor decision, split out for testing.
 pub(crate) fn truecolor_from_env(colorterm: Option<&str>) -> bool {
     matches!(colorterm, Some("truecolor") | Some("24bit"))
+}
+
+/// Probe whether the terminal speaks the kitty keyboard protocol, waiting at
+/// most `timeout` for a reply. Writes the standard detection query — the
+/// progressive-flags query `CSI ? u` followed by the primary-device-attributes
+/// query `CSI c` — to the controlling terminal, then reads the reply from
+/// stdin. A terminal that supports the protocol answers the flags query (a
+/// `CSI ? … u` reply) *before* the device-attributes reply (`CSI ? … c`); one
+/// that doesn't answers only the device attributes. A terminal that answers
+/// neither within `timeout` (a headless PTY, or an outer tmux/Screen that
+/// swallows the query) yields the safe `false`.
+///
+/// **Precondition:** the terminal is already in raw mode and nothing else is
+/// draining stdin — the shell calls this once, after the first frame and before
+/// the event loop begins reading input, so the reply isn't line-buffered and
+/// isn't stolen by a concurrent reader.
+#[cfg(unix)]
+pub(crate) fn probe_keyboard_enhancement(timeout: std::time::Duration) -> bool {
+    use std::io::Write;
+
+    // ESC [ ? u   progressive keyboard enhancement flags (kitty protocol)
+    // ESC [ c     primary device attributes
+    const QUERY: &[u8] = b"\x1b[?u\x1b[c";
+
+    // Write the query to the controlling terminal; fall back to stdout if
+    // `/dev/tty` can't be opened (e.g. no controlling terminal).
+    let wrote_tty = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .ok()
+        .and_then(|mut f| f.write_all(QUERY).and_then(|()| f.flush()).ok())
+        .is_some();
+    if !wrote_tty {
+        let mut out = std::io::stdout();
+        if out.write_all(QUERY).and_then(|()| out.flush()).is_err() {
+            return false;
+        }
+    }
+
+    read_kitty_reply(libc::STDIN_FILENO, timeout)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn probe_keyboard_enhancement(_timeout: std::time::Duration) -> bool {
+    false
+}
+
+/// Read bytes from `fd` until the terminal's reply classifies (see
+/// [`classify_kitty_reply`]) or `timeout` elapses. Returns the classification,
+/// or `false` on timeout / read error.
+#[cfg(unix)]
+fn read_kitty_reply(fd: std::os::unix::io::RawFd, timeout: std::time::Duration) -> bool {
+    use std::time::Instant;
+
+    let deadline = Instant::now() + timeout;
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    let mut chunk = [0u8; 64];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a valid single-entry poll set; `ms` is non-negative.
+        let r = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if r < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if r == 0 {
+            return false; // timed out with no reply
+        }
+        if pfd.revents & libc::POLLIN == 0 {
+            return false; // POLLERR / POLLHUP / POLLNVAL — no reply coming
+        }
+        // SAFETY: `fd` is readable (POLLIN); `chunk` is a valid writable buffer.
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast::<libc::c_void>(), chunk.len()) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if n == 0 {
+            return false; // EOF
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+        if let Some(verdict) = classify_kitty_reply(&buf) {
+            return verdict;
+        }
+    }
+}
+
+/// Classify the terminal's reply to the `CSI ? u` + `CSI c` detection query.
+///
+/// A terminal that speaks the kitty keyboard protocol answers the flags query
+/// first, with a `CSI ? … u` sequence; its device-attributes reply (`CSI ? … c`)
+/// follows. A terminal that doesn't answers only the device attributes. Since
+/// the parameter bytes of both replies are only digits and `;`, the final byte
+/// `u` or `c` is unambiguous: whichever appears first decides.
+///
+/// Returns `Some(true)` once a `u` is seen before any `c` (kitty supported),
+/// `Some(false)` once a `c` is seen first (device attributes only), or `None`
+/// when neither terminator has arrived yet (read more).
+pub(crate) fn classify_kitty_reply(buf: &[u8]) -> Option<bool> {
+    let u = buf.iter().position(|&b| b == b'u');
+    let c = buf.iter().position(|&b| b == b'c');
+    match (u, c) {
+        (Some(ui), Some(ci)) => Some(ui < ci),
+        (Some(_), None) => Some(true),
+        (None, Some(_)) => Some(false),
+        (None, None) => None,
+    }
 }
 
 /// Pure `$TMUX` / `$STY` → nesting decision, split out for testing. tmux wins
@@ -130,6 +267,56 @@ mod tests {
         // Empty values count as unset.
         assert_eq!(detect_nesting(Some(""), Some("")), None);
         assert_eq!(detect_nesting(None, None), None);
+    }
+
+    #[test]
+    fn classify_kitty_reply_reads_the_first_terminator() {
+        // Flags reply (`u`) before device attributes (`c`) → kitty supported.
+        assert_eq!(classify_kitty_reply(b"\x1b[?1u\x1b[?62;c"), Some(true));
+        // Device-attributes reply only → not supported.
+        assert_eq!(classify_kitty_reply(b"\x1b[?62;1;6c"), Some(false));
+        // Neither terminator yet → inconclusive, keep reading.
+        assert_eq!(classify_kitty_reply(b"\x1b[?62;1;6"), None);
+        assert_eq!(classify_kitty_reply(b""), None);
+        // A lone flags reply with no trailing device attributes still decides.
+        assert_eq!(classify_kitty_reply(b"\x1b[?0u"), Some(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kitty_probe_times_out_fast_when_the_terminal_never_answers() {
+        use std::os::unix::io::AsRawFd;
+        use std::time::{Duration, Instant};
+
+        // A pipe whose write end is held open but never written: the read end is
+        // a valid fd that stays readable-never, standing in for a headless PTY
+        // that swallows the query. The probe must give up at the timeout, not
+        // hang (the bug was crossterm's hard-coded 2 s wait).
+        let (reader, _writer) = std::io::pipe().expect("pipe");
+        let timeout = Duration::from_millis(80);
+        let start = Instant::now();
+        let supported = super::read_kitty_reply(reader.as_raw_fd(), timeout);
+        let elapsed = start.elapsed();
+        assert!(!supported, "a terminal that never answers is treated as no-kitty");
+        assert!(
+            elapsed < timeout + Duration::from_millis(400),
+            "the probe must return near its {timeout:?} budget, not block (took {elapsed:?})"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kitty_probe_reads_a_pending_flags_reply() {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        use std::time::Duration;
+
+        // A kitty flags reply already waiting on the read end: the probe reads it
+        // and reports support without waiting out the timeout.
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"\x1b[?1u\x1b[?62;c").expect("seed reply");
+        drop(writer); // EOF after the reply so a mis-parse can't block
+        assert!(super::read_kitty_reply(reader.as_raw_fd(), Duration::from_secs(1)));
     }
 
     #[test]
