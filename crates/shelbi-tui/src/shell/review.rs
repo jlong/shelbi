@@ -98,7 +98,7 @@ impl ReviewInterface {
     ) -> Self {
         let task_id = task_id.into();
         let slot = slot.into();
-        let panel = ReviewPanel::new(&task_id, worktree, editor_name, has_review_url);
+        let panel = ReviewPanel::new(worktree, editor_name, has_review_url);
         let mut content = SessionManager::new(project, connector);
         // Chat is the default view: bind to the review agent's workspace session.
         content.show(SessionRef::Workspace(slot.clone()));

@@ -26,112 +26,12 @@ pub struct ProjectMeta {
     pub last_launched: Option<DateTime<Utc>>,
 }
 
-/// Hidden developer settings for the "removing tmux" migration.
-///
-/// Not surfaced in the wizard or any user-facing config edit. Through Phase 6
-/// cutover (`rt-cutover-migration`) both flags **default on**: the session
-/// backend and daemon-executed mutations are the runtime. The settings are kept
-/// so the flip can be verified both ways — an explicit `false` restores the
-/// tmux path for a bisect or regression check — until `rt-cutover-delete`
-/// removes them entirely.
-///
-/// Serde subtlety: a derived `Default` for `bool` is `false`, but these default
-/// *on*. Both the field-level `#[serde(default = "…")]` (a `dev:` block that
-/// omits one field) and the struct-level [`DevConfig::default`] (no `dev:` block
-/// at all) must agree on `true`, so a hand-written `Default` sets both. The
-/// field is only serialized when turned *off* ([`is_true`]), so an untouched
-/// config file stays clean.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DevConfig {
-    /// Route issue mutations (`move`/`start`/`assign`/`edit`/`add` and review
-    /// approve/reject) through the daemon's control socket. On by default (the
-    /// cutover runtime). See [`daemon_mutations_enabled`].
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub daemon_mutations: bool,
-
-    /// Perform session operations (spawn/kill/probe/send/snapshot/title/…)
-    /// against detached `shelbi __session` processes instead of tmux. On by
-    /// default (the cutover runtime). The orchestrator's backend seam
-    /// (`session_backend::backend()`) reads this through
-    /// [`session_backend_enabled`], and the single-process TUI is selected by
-    /// the same flag. An explicit `false` restores tmux for verification.
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub session_backend: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn is_true(b: &bool) -> bool {
-    *b
-}
-
-impl Default for DevConfig {
-    fn default() -> Self {
-        Self {
-            daemon_mutations: true,
-            session_backend: true,
-        }
-    }
-}
-
-impl DevConfig {
-    fn is_default(&self) -> bool {
-        self == &DevConfig::default()
-    }
-}
-
 /// The single hub-wide config at `~/.shelbi/shelbi.yaml`. Optional —
 /// absence is treated as default-empty.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HubConfig {
     #[serde(default)]
     pub projects: BTreeMap<String, ProjectMeta>,
-    /// Hidden dev settings (see [`DevConfig`]). Omitted from the file entirely
-    /// when at defaults so an untouched config stays clean.
-    #[serde(default, skip_serializing_if = "DevConfig::is_default")]
-    pub dev: DevConfig,
-}
-
-/// Whether issue mutations should be routed through the daemon control socket.
-///
-/// `$SHELBI_DAEMON_MUTATIONS` wins when set (`1`/`true` on, `0`/`false` off) so
-/// tests and quick local toggling need not touch the config file; otherwise the
-/// hidden [`DevConfig::daemon_mutations`] flag in `~/.shelbi/shelbi.yaml`
-/// decides, defaulting **on** (the Phase 6 cutover runtime). A config read
-/// error is treated as on — the daemon path is now the runtime, so the safe
-/// fallback matches the default rather than silently reverting to tmux-era
-/// in-process mutations.
-pub fn daemon_mutations_enabled() -> bool {
-    match std::env::var("SHELBI_DAEMON_MUTATIONS").ok().as_deref() {
-        Some("1") | Some("true") => return true,
-        Some("0") | Some("false") => return false,
-        _ => {}
-    }
-    load_hub_config()
-        .map(|c| c.dev.daemon_mutations)
-        .unwrap_or(true)
-}
-
-/// Whether session operations should run against `shelbi __session` processes
-/// instead of tmux.
-///
-/// `$SHELBI_SESSION_BACKEND` wins when set (`1`/`true` on, `0`/`false` off) so
-/// tests and quick local toggling need not touch the config file; otherwise the
-/// hidden [`DevConfig::session_backend`] flag in `~/.shelbi/shelbi.yaml` decides,
-/// defaulting **on** (the Phase 6 cutover runtime). A config read error is
-/// treated as on — the session backend is now the runtime, so the safe fallback
-/// matches the default rather than silently reverting to tmux.
-pub fn session_backend_enabled() -> bool {
-    match std::env::var("SHELBI_SESSION_BACKEND").ok().as_deref() {
-        Some("1") | Some("true") => return true,
-        Some("0") | Some("false") => return false,
-        _ => {}
-    }
-    load_hub_config()
-        .map(|c| c.dev.session_backend)
-        .unwrap_or(true)
 }
 
 pub fn hub_config_path() -> Result<PathBuf> {
@@ -343,58 +243,7 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
-    #[test]
-    fn session_backend_defaults_on_and_is_env_overridable() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        std::env::remove_var("SHELBI_SESSION_BACKEND");
 
-        // No config, no env → the Phase 6 cutover default is the session
-        // backend (on). A default HubConfig stays at the default dev block, so
-        // nothing is persisted.
-        assert!(session_backend_enabled());
-        let default_cfg = HubConfig::default();
-        save_hub_config(&default_cfg).unwrap();
-        let yaml = std::fs::read_to_string(hub_config_path().unwrap()).unwrap();
-        assert!(
-            !yaml.contains("session_backend"),
-            "an on (default) dev block must not persist: {yaml}"
-        );
 
-        // Turning it *off* is the deviation that persists.
-        let mut cfg = HubConfig::default();
-        cfg.dev.session_backend = false;
-        save_hub_config(&cfg).unwrap();
-        assert!(!session_backend_enabled());
-        let yaml = std::fs::read_to_string(hub_config_path().unwrap()).unwrap();
-        assert!(
-            yaml.contains("session_backend"),
-            "an off (non-default) dev block persisted: {yaml}"
-        );
 
-        // The env var wins over the config either way.
-        std::env::set_var("SHELBI_SESSION_BACKEND", "1");
-        assert!(session_backend_enabled());
-        std::env::set_var("SHELBI_SESSION_BACKEND", "0");
-        assert!(!session_backend_enabled());
-
-        std::env::remove_var("SHELBI_SESSION_BACKEND");
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn daemon_mutations_defaults_on() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        std::env::remove_var("SHELBI_DAEMON_MUTATIONS");
-
-        assert!(daemon_mutations_enabled());
-        std::env::set_var("SHELBI_DAEMON_MUTATIONS", "0");
-        assert!(!daemon_mutations_enabled());
-
-        std::env::remove_var("SHELBI_DAEMON_MUTATIONS");
-        std::env::remove_var("SHELBI_HOME");
-    }
 }

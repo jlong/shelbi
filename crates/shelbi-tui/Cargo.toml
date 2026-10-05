@@ -14,13 +14,11 @@ shelbi-state = { workspace = true }
 shelbi-orchestrator = { workspace = true }
 shelbi-agent = { workspace = true }
 shelbi-palette = { workspace = true }
-shelbi-tmux = { workspace = true }
 shelbi-ssh = { workspace = true }
-# The single-process TUI shell (Phase 4b of removing-tmux, behind the
-# `session_backend` dev flag) renders over shelbi-app's view models and shows
+# The single-process TUI shell renders over shelbi-app's view models and shows
 # sessions through shelbi-term / shelbi-client. alacritty_terminal types are
 # read directly when painting the emulator grid into a ratatui buffer, exactly
-# as `shelbi session attach` does.
+# as `shelbi attach` does.
 shelbi-app = { workspace = true }
 shelbi-term = { workspace = true }
 shelbi-client = { workspace = true }

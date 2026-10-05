@@ -1,39 +1,12 @@
-use std::time::Duration;
 
-use anyhow::Result;
 use crossterm::event::{
-    self, Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    KeyEvent, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::{backend::Backend, Terminal};
 use shelbi_state::keymap::{ActivityAction, GlobalAction, Keymaps};
 
-use crate::activity::{self, ActivityApp};
+use crate::activity::ActivityApp;
 
-pub fn activity_loop<B: Backend>(term: &mut Terminal<B>, app: &mut ActivityApp) -> Result<()> {
-    // Snapshot the keymaps once up-front: the loader does file IO + chord
-    // parsing, and we'd otherwise re-borrow `app.keymaps()` on every tick
-    // (and run into a double-borrow against the `&mut app` the handler
-    // wants). A `Keymaps` is plain HashMaps; cloning it is cheap relative
-    // to a single key dispatch.
-    let keymaps = app.keymaps().clone();
-    while !app.should_quit {
-        app.maybe_refresh();
-        term.draw(|f| activity::render_full(f, app, f.area()))?;
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                Event::Key(k) => {
-                    if k.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    handle_activity_key(app, k, &keymaps);
-                }
-                Event::Mouse(m) => handle_activity_mouse(app, m),
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
+
 
 /// Dispatch one key press against the configured keymaps. Global chords
 /// (Ctrl+C / the Zen-toggle chord / Ctrl+P) win over activity chords so
@@ -89,6 +62,7 @@ pub fn handle_activity_mouse(app: &mut ActivityApp, mouse: MouseEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use crossterm::event::{KeyCode, KeyModifiers};
     use shelbi_state::keymap::load_keymaps;
 

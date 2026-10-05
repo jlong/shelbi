@@ -275,7 +275,7 @@ fn rm(project: &str, name: &str, force: bool) -> Result<()> {
 
     // Kill any live pane, then tear down the worktree. Both are best-effort /
     // idempotent so a partially-provisioned workspace still removes cleanly.
-    let addr = orch_workspace::workspace_tmux_addr(&p, &workspace).map_err(|e| anyhow!(e))?;
+    let addr = orch_workspace::workspace_target(&p, &workspace).map_err(|e| anyhow!(e))?;
     if let Err(e) = orch_workspace::kill_workspace_pane(&machine.host(), &addr, name) {
         eprintln!("warning: killing pane for `{name}`: {e}");
     }
@@ -345,12 +345,11 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
         println!("{line}");
     }
 
-    // Cutover (`rt-cutover-migration`): call out workspaces still pending the
-    // tmux→session-backend migration, so the user can see why dispatch to them
-    // is paused. Only surfaced on the session backend and when something is
-    // actually pending, so the table is unchanged on the tmux runtime and for a
+    // Cutover: call out workspaces still pending the tmux→session migration, so
+    // the user can see why dispatch to them is paused. Only surfaced when
+    // something is actually pending, so the table is unchanged for a
     // fully-migrated install.
-    if shelbi_state::session_backend_enabled() {
+    {
         if let Ok(states) = shelbi_state::all_workspace_migration_states(project) {
             let pending: Vec<&str> = p
                 .workspaces
@@ -499,7 +498,7 @@ fn occupied_idle_workspaces(
         })?;
         let host = machine.host();
         let addr =
-            orch_workspace::workspace_tmux_addr(project, workspace).map_err(|e| anyhow!(e))?;
+            orch_workspace::workspace_target(project, workspace).map_err(|e| anyhow!(e))?;
         match orch_workspace::probe_workspace_slot(&host, &addr, deadline) {
             orch_workspace::SlotProbe::Dead => {}
             orch_workspace::SlotProbe::Alive { user_shell } => {
@@ -647,7 +646,7 @@ fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
         )
     })?;
     let host = machine.host();
-    let addr = orch_workspace::workspace_tmux_addr(&p, workspace).map_err(|e| anyhow!(e))?;
+    let addr = orch_workspace::workspace_target(&p, workspace).map_err(|e| anyhow!(e))?;
 
     // Release/park the task BEFORE killing the pane. The stranded-slot resume
     // only acts on a *dead* review pane whose task is still assigned on disk;

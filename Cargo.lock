@@ -1702,7 +1702,6 @@ dependencies = [
  "shelbi-ssh",
  "shelbi-state",
  "shelbi-term",
- "shelbi-tmux",
  "shelbi-tui",
  "signal-hook 0.3.18",
  "syn 2.0.118",
@@ -1778,7 +1777,6 @@ dependencies = [
  "shelbi-session",
  "shelbi-ssh",
  "shelbi-state",
- "shelbi-tmux",
  "signal-hook 0.3.18",
  "tempfile",
  "thiserror 1.0.69",
@@ -1860,16 +1858,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shelbi-tmux"
-version = "0.9.0"
-dependencies = [
- "shelbi-core",
- "shelbi-ssh",
- "tempfile",
- "tracing",
-]
-
-[[package]]
 name = "shelbi-tui"
 version = "0.9.0"
 dependencies = [
@@ -1890,7 +1878,6 @@ dependencies = [
  "shelbi-ssh",
  "shelbi-state",
  "shelbi-term",
- "shelbi-tmux",
  "tempfile",
  "tracing",
  "unicode-width 0.1.14",

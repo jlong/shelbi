@@ -31,7 +31,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use shelbi_client::{serve_relay, RelayChannel};
-use shelbi_core::{Error, Host, Result, TmuxAddr};
+use shelbi_core::{Error, Host, Result};
 use shelbi_orchestrator::remote_session::{self, RelayHandle, RemoteSsh};
 use shelbi_orchestrator::session_backend::{backend, Liveness, SessionBackend, SessionTarget};
 use shelbi_session::SpawnSpec;
@@ -100,7 +100,6 @@ fn remote_dispatch_to_handoff_reconnect_and_unreachable() {
     let marker = home.path().join("review-ready.marker");
 
     std::env::set_var("SHELBI_HOME", home.path());
-    std::env::set_var("SHELBI_SESSION_BACKEND", "1");
     remote_session::set_test_seam(Some(Arc::new(LocalRelaySeam)));
 
     // The remote workspace, addressed as the orchestrator addresses one: a
@@ -109,11 +108,7 @@ fn remote_dispatch_to_handoff_reconnect_and_unreachable() {
     let host = Host::Ssh {
         host: "box".into(),
     };
-    let addr = TmuxAddr {
-        session: "shelbi-demo".into(),
-        window: "alice".into(),
-    };
-    let target = SessionTarget::from_tmux_addr(&addr);
+    let target = SessionTarget::slot("shelbi-demo", "alice");
 
     struct Guard<'a> {
         host: &'a Host,
@@ -123,7 +118,6 @@ fn remote_dispatch_to_handoff_reconnect_and_unreachable() {
         fn drop(&mut self) {
             let _ = backend().kill(self.host, self.target);
             remote_session::set_test_seam(None);
-            std::env::remove_var("SHELBI_SESSION_BACKEND");
             std::env::remove_var("SHELBI_HOME");
         }
     }

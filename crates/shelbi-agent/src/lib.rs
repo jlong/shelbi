@@ -1,7 +1,8 @@
 //! Pluggable agent CLI runners.
 //!
 //! v1 model: every runner is a CLI command + flags. shelbi launches it in
-//! interactive mode inside a tmux pane and drives it with send-keys.
+//! interactive mode inside a session process and drives it over the session
+//! socket.
 //!
 //! In the future this trait can grow methods for richer integration
 //! (`session_id`, `--resume`, streaming JSON), but the v1 surface stays
@@ -16,8 +17,8 @@ use shelbi_core::{AgentRunnerSpec, CapabilityLadder, ReasoningEffort, RunnerKind
 /// `shelbi-ssh` reaches the same function without depending on this crate.
 pub use shelbi_core::shell_escape;
 
-/// Construct the shell command to launch the agent CLI inside a tmux pane.
-/// Returns a single string suitable for `tmux new-window -- <command>`.
+/// Construct the shell command to launch the agent CLI. Returns a single
+/// string suitable for a session process's child command.
 pub fn launch_command(spec: &AgentRunnerSpec) -> String {
     let mut parts = vec![shell_escape(&spec.command)];
     for f in &spec.flags {
@@ -325,7 +326,7 @@ pub fn with_permission_mode(spec: &AgentRunnerSpec, mode: Option<&str>) -> Agent
 /// `claude` and `resume` is set. `claude --continue` reloads the most recent
 /// conversation in the pane's working directory, so a resumed workspace picks
 /// up mid-thought with its full prior context — the session transcript lives
-/// under the user's `~/.claude/` and survives a killed tmux pane or a
+/// under the user's `~/.claude/` and survives a killed agent session or a
 /// recreated worktree (the cwd path is stable). This is the strongest resume
 /// semantics shelbi can offer, so `shelbi task resume` prefers it for claude
 /// and falls back to plain prompt re-injection for every other runner (which

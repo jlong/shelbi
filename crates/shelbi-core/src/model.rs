@@ -1907,7 +1907,6 @@ pub struct Agent {
     pub status: Status,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
-    pub tmux: TmuxAddr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1930,51 +1929,6 @@ impl Status {
             Status::Done => "✓",
             Status::Error => "✗",
             Status::Archived => "·",
-        }
-    }
-}
-
-/// A tmux address. Most callers use `session:window`; dashboard view code may
-/// target a stable tmux pane id (`%N`) because that pane can be swapped between
-/// windows while retaining its identity.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TmuxAddr {
-    pub session: String,
-    pub window: String,
-}
-
-impl TmuxAddr {
-    pub fn pane_id(pane_id: impl Into<String>) -> Self {
-        Self {
-            session: String::new(),
-            window: pane_id.into(),
-        }
-    }
-
-    /// Whether this address is a stable tmux pane id (`%N`) rather than a
-    /// named `session:window` address.
-    ///
-    /// Keep both checks: an empty `session` is how [`Self::pane_id`] records
-    /// the address kind, while the `%` sigil prevents a malformed or legacy
-    /// name-only address from silently losing tmux's exact-match protection.
-    pub fn is_pane_id(&self) -> bool {
-        self.session.is_empty() && self.window.starts_with('%')
-    }
-
-    /// Stable label used in tmux delivery diagnostics.
-    pub fn target_kind(&self) -> &'static str {
-        if self.is_pane_id() {
-            "pane_id"
-        } else {
-            "session_window"
-        }
-    }
-
-    pub fn target(&self) -> String {
-        if self.session.is_empty() {
-            self.window.clone()
-        } else {
-            format!("{}:{}", self.session, self.window)
         }
     }
 }
@@ -3100,25 +3054,7 @@ mod tests {
     use super::*;
     use crate::WorkflowZenConfig;
 
-    #[test]
-    fn tmux_addr_can_target_a_stable_pane_id() {
-        let pane = TmuxAddr::pane_id("%42");
-        assert_eq!(pane.target(), "%42");
-        assert!(pane.is_pane_id());
-        assert_eq!(pane.target_kind(), "pane_id");
 
-        let named = TmuxAddr {
-            session: "shelbi-demo".into(),
-            window: "dashboard".into(),
-        };
-        assert_eq!(named.target(), "shelbi-demo:dashboard");
-        assert!(!named.is_pane_id());
-        assert_eq!(named.target_kind(), "session_window");
-
-        let malformed = TmuxAddr::pane_id("dashboard");
-        assert!(!malformed.is_pane_id());
-        assert_eq!(malformed.target_kind(), "session_window");
-    }
 
     #[test]
     fn agent_id_validation() {
@@ -3192,14 +3128,7 @@ mod tests {
         assert_eq!(unique.len(), glyphs.len());
     }
 
-    #[test]
-    fn tmux_target_format() {
-        let addr = TmuxAddr {
-            session: "shelbi-daily".to_string(),
-            window: "w-fix-login".to_string(),
-        };
-        assert_eq!(addr.target(), "shelbi-daily:w-fix-login");
-    }
+
 
     #[test]
     fn column_serde_roundtrip() {

@@ -85,16 +85,6 @@ pub enum SessionCmd {
         #[arg(long)]
         history: Option<u32>,
     },
-    /// Attach a rendered, full-screen client to one session. Detach with the
-    /// configured key (default Ctrl+]); the terminal is restored on exit.
-    Attach {
-        /// Session selector: short-id, session name, or workspace.
-        session: String,
-        /// Key that detaches without stopping the session (e.g. `ctrl-]`,
-        /// `ctrl-q`, `alt-d`).
-        #[arg(long = "detach-key", default_value = "ctrl-]")]
-        detach_key: String,
-    },
 }
 
 /// Dispatch a `shelbi session` subcommand.
@@ -119,11 +109,19 @@ pub fn run(project: Option<String>, cmd: SessionCmd) -> Result<()> {
         SessionCmd::Snapshot { session, history } => {
             snapshot(project.as_deref(), &session, history)
         }
-        SessionCmd::Attach {
-            session,
-            detach_key,
-        } => attach(project.as_deref(), &session, &detach_key),
     }
+}
+
+/// `shelbi attach <workspace>` — attach a rendered, full-screen client to a
+/// workspace's session. Detach with `detach_key` (default Ctrl+]); the terminal
+/// is restored on exit. The workspace name resolves to its session the same way
+/// any session selector does.
+pub fn attach_workspace(
+    project: Option<String>,
+    workspace: String,
+    detach_key: String,
+) -> Result<()> {
+    attach(project.as_deref(), &workspace, &detach_key)
 }
 
 /// Enumerate the sessions on disk.

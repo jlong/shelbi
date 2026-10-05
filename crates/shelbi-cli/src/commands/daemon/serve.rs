@@ -291,9 +291,8 @@ pub(super) fn run_foreground() -> Result<()> {
     // The single board reader per hub: one refresh loop per open project,
     // publishing `board-index.json` on each project's configured cadence.
     super::board::spawn_refresh_manager(daemon.board.clone(), stop.clone());
-    // The per-project workspace-poller manager: one poller per open project when
-    // the hidden `SHELBI_DAEMON_POLLER` dev setting is on; a no-op otherwise (the
-    // sidebar owns the poller by default). Phase 3, `rt-daemon-poller`.
+    // The per-project workspace-poller manager: one poller per open project.
+    // Phase 3, `rt-daemon-poller`.
     super::poller::spawn_poller_manager(stop.clone());
     // Exit when no project is open (the on-demand lifecycle: nothing to serve,
     // and the next open restarts us). A short minimum-lifetime debounce keeps a
