@@ -258,8 +258,12 @@ pub(super) fn run_foreground() -> Result<()> {
     // bind() and the chmod below where the socket carries the umask
     // default (typically world/group-connectable) and a local peer could
     // connect. Restore the previous umask immediately so nothing else the
-    // daemon creates inherits the restrictive value.
-    let prev_umask = unsafe { libc::umask(0o177) };
+    // daemon creates inherits the restrictive value. Mask only group/other
+    // (`0o077`), never owner-execute: `umask` is process-global, and clearing
+    // owner-x (e.g. `0o177`) strips the search bit from any directory created
+    // concurrently in this window, leaving it unusable (EACCES). `0o077` still
+    // yields a 0600 socket. See the matching note in `control::bind`.
+    let prev_umask = unsafe { libc::umask(0o077) };
     let bind_result = UnixListener::bind(&sock);
     unsafe { libc::umask(prev_umask) };
     let listener =
