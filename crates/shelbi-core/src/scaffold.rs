@@ -221,6 +221,23 @@ zen:
     extend: [\".env\", \"infra/**\"]   # or `override: [...]`, or a bare list
 ",
     },
+    Section {
+        prose: &[
+            "Hub disk management. Build output (Rust `target/`) accumulates in the",
+            "hub checkout and fills the data volume over a week of Zen builds; a full",
+            "volume looks like a wedged hub. Both knobs default to 20 GiB, so leaving",
+            "this block out still protects the hub.",
+            "`target_cap_gib` caps the hub checkout's shared cargo `target/`: a Zen",
+            "probe clears it before building when it has grown past the cap (never",
+            "while another probe is building into it). `low_free_gib` is the free-space",
+            "threshold below which the heartbeat line and `shelbi status` warn.",
+        ],
+        yaml: "\
+disk:
+  target_cap_gib: 20         # clear the hub's shared cargo target/ above this. Default 20
+  low_free_gib: 20           # warn when free space on the work_dir volume drops below this. Default 20
+",
+    },
 ];
 
 /// Decorate the serde-rendered required project YAML (`active`) with a header

@@ -2999,6 +2999,7 @@ mod pr_create_tests {
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),
+            disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
             review: shelbi_core::ReviewConfig::default(),
@@ -3009,6 +3010,145 @@ mod pr_create_tests {
         let mut project = project(work_dir);
         project.machines[0].work_dir = hub_checkout.to_path_buf();
         project
+    }
+
+    // --- probe-worktree leak sweep + target cap + signal cleanup ---
+
+    /// A minimal local git repo whose `.shelbi/wt/hub` checkout is the probe
+    /// anchor; probe worktrees are siblings under `.shelbi/wt/`.
+    fn probe_anchor_repo() -> (tempfile::TempDir, PathBuf) {
+        let base = tempfile::tempdir().unwrap();
+        let wt = base.path().join(".shelbi").join("wt").join("hub");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        run_git(base.path(), &["init", "-q", "-b", "main", wt.to_str().unwrap()]);
+        run_git(&wt, &["config", "user.email", "t@example.com"]);
+        run_git(&wt, &["config", "user.name", "Test"]);
+        std::fs::write(wt.join("seed.txt"), "seed\n").unwrap();
+        run_git(&wt, &["add", "seed.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "seed"]);
+        (base, wt)
+    }
+
+    #[test]
+    fn sweep_removes_stale_probe_worktree_but_keeps_a_live_one() {
+        let (_base, anchor) = probe_anchor_repo();
+        let parent = anchor.parent().unwrap();
+        // A worktree whose owner pid is gone — the SIGKILLed/crashed probe leak.
+        let dead = parent.join(format!("{PROBE_WORKTREE_PREFIX}999999999-task-0"));
+        run_git(
+            &anchor,
+            &["worktree", "add", "--detach", dead.to_str().unwrap(), "HEAD"],
+        );
+        // A worktree owned by a live pid (this process) — a concurrent probe.
+        let live = parent.join(format!(
+            "{PROBE_WORKTREE_PREFIX}{}-task-0",
+            std::process::id()
+        ));
+        run_git(
+            &anchor,
+            &["worktree", "add", "--detach", live.to_str().unwrap(), "HEAD"],
+        );
+        // An unrelated sibling with the prefix but no numeric pid is left alone.
+        let not_a_probe = parent.join(format!("{PROBE_WORKTREE_PREFIX}notapid"));
+        std::fs::create_dir_all(&not_a_probe).unwrap();
+        assert!(dead.exists() && live.exists());
+
+        sweep_stale_probe_worktrees(&Host::Local, &anchor);
+
+        assert!(!dead.exists(), "a stale probe worktree should be swept");
+        assert!(live.exists(), "a live probe's worktree must never be swept");
+        assert!(
+            not_a_probe.exists(),
+            "a prefixed dir without a numeric owner pid is not a sweepable probe worktree"
+        );
+    }
+
+    #[test]
+    fn cap_clears_target_over_cap_keeps_under_and_skips_when_in_use() {
+        // `EnvGuard::install` mutates process-wide `SHELBI_HOME`, which the
+        // zen-target lock path resolves under. Serialize against the other
+        // env-mutating tests in this module so our lock key doesn't resolve
+        // under a sibling's home (masking `InUse`) and we don't corrupt theirs.
+        let _lock = crate::test_lock::acquire();
+        let base = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::install(base.path());
+        let target = base.path().join("target");
+
+        // Over the cap (cap = 0, dir holds a 1 MiB file) → removed.
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("big"), vec![0u8; 1024 * 1024]).unwrap();
+        assert_eq!(
+            cap_shared_cargo_target(&Host::Local, &target, 0).unwrap(),
+            CapOutcome::Removed
+        );
+        assert!(!target.exists(), "an over-cap target is cleared before the build");
+
+        // Under the cap → left strictly alone.
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("small"), b"x").unwrap();
+        assert_eq!(
+            cap_shared_cargo_target(&Host::Local, &target, 100 * shelbi_core::GIB).unwrap(),
+            CapOutcome::UnderCap
+        );
+        assert!(target.exists());
+
+        // A concurrent build holds the shared lock → cleanup skips, even over cap.
+        let key = shared_target_lock_key(&Host::Local, &target);
+        let _build = shelbi_state::lock_zen_target_build(&key).unwrap();
+        assert_eq!(
+            cap_shared_cargo_target(&Host::Local, &target, 0).unwrap(),
+            CapOutcome::InUse
+        );
+        assert!(target.exists(), "a target a build is using is never cleared");
+
+        // No target yet → nothing to do.
+        assert_eq!(
+            cap_shared_cargo_target(&Host::Local, &base.path().join("nope"), 0).unwrap(),
+            CapOutcome::Absent
+        );
+    }
+
+    #[test]
+    fn probe_worktree_is_registered_on_add_and_removed_on_signal_cleanup() {
+        let (_base, anchor) = probe_anchor_repo();
+        let head = git_stdout(&anchor, &["rev-parse", "HEAD"]).trim().to_string();
+        let probe = anchor.parent().unwrap().join(format!(
+            "{PROBE_WORKTREE_PREFIX}{}-sig-0",
+            std::process::id()
+        ));
+
+        add_probe_worktree(&Host::Local, &anchor, &probe, &head).unwrap();
+        assert!(probe.exists());
+        assert!(
+            probe_worktree_registered(&probe),
+            "add must register the worktree so a signal can clean it"
+        );
+
+        // The SIGINT/SIGTERM path removes registered worktrees and deregisters.
+        let handle = ActiveProbeWorktree {
+            host: Host::Local,
+            anchor: anchor.clone(),
+            path: probe.clone(),
+        };
+        remove_probe_worktrees(std::slice::from_ref(&handle));
+        assert!(!probe.exists(), "signal cleanup removes the probe worktree");
+        assert!(
+            !probe_worktree_registered(&probe),
+            "removal deregisters so later cleanup doesn't chase it"
+        );
+    }
+
+    #[test]
+    fn probe_worktree_owner_pid_parses_only_a_numeric_owner() {
+        assert_eq!(
+            probe_worktree_owner_pid(".shelbi-probe-4321-some-task-id-0"),
+            Some(4321)
+        );
+        assert_eq!(probe_worktree_owner_pid(".shelbi-probe-notapid-0"), None);
+        assert_eq!(probe_worktree_owner_pid("unrelated-dir"), None);
+        // This process's own pid always reads as alive.
+        assert!(probe_owner_is_alive(std::process::id() as i32));
+        assert!(!probe_owner_is_alive(999_999_999));
     }
 
     fn project_with_probe_check(work_dir: &Path) -> Project {
@@ -6138,6 +6278,40 @@ pub fn probe_in_workflow(
     )?
     .unwrap_or_else(|| initial_head.clone());
 
+    // Reap any `.shelbi-probe-*` worktree a SIGKILLed or crashed probe leaked
+    // (the graceful and signal paths clean their own). A live probe's worktree
+    // is left untouched, so this is safe to run while other probes are active.
+    sweep_stale_probe_worktrees(&host, &repository_anchor);
+
+    // Cap the hub checkout's shared cargo target before building into it, so a
+    // week of Zen builds can't fill the hub disk. Skipped when another probe is
+    // building into it (the exclusive cap lock yields to the shared build
+    // lock). Best-effort: a cap failure must not sink the probe, so it is
+    // logged, not propagated.
+    match cap_shared_cargo_target(&host, &shared_cargo_target, project.disk.target_cap_bytes()) {
+        Ok(CapOutcome::Removed) => tracing::info!(
+            target_dir = %shared_cargo_target.display(),
+            cap_gib = project.disk.target_cap_bytes() / shelbi_core::GIB,
+            "zen: cleared shared cargo target over cap before probe build",
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            target_dir = %shared_cargo_target.display(),
+            error = %e,
+            "zen: could not cap shared cargo target",
+        ),
+    }
+
+    // Hold a *shared* lock on the target for the lifetime of this probe. Any
+    // number of probes may build into the one shared target concurrently; the
+    // lock only excludes the exclusive cap-cleanup above (ours already ran, and
+    // a concurrent probe's will see this and skip) from clearing the target
+    // mid-build. A lock failure must not sink the probe, so it degrades to no
+    // lock held.
+    let _build_lock =
+        shelbi_state::lock_zen_target_build(&shared_target_lock_key(&host, &shared_cargo_target))
+            .ok();
+
     // Handoff detaches a finished task and immediately makes its workspace
     // reusable. The assigned path may therefore be checked out on a wholly
     // different task by the time Zen probes the old review. Use it only as a
@@ -6488,6 +6662,271 @@ fn normalize_probe_branch(branch: &str) -> Result<String> {
     Ok(branch.to_string())
 }
 
+/// Filename prefix every isolated probe worktree carries, so the sweep can
+/// recognize a leaked one and the registry/signal cleanup can match them. The
+/// `std::process::id()` that follows is the local pid of the owning
+/// `shelbi zen probe` process (see [`unique_probe_worktree_path`]).
+const PROBE_WORKTREE_PREFIX: &str = ".shelbi-probe-";
+
+/// An isolated probe worktree this process created and has not yet removed,
+/// tracked so an interrupting SIGINT/SIGTERM can still clear it (see
+/// [`cleanup_registered_probe_worktrees`]). The normal pass/fail/error paths
+/// remove the worktree directly and deregister it.
+#[derive(Clone)]
+struct ActiveProbeWorktree {
+    host: Host,
+    anchor: PathBuf,
+    path: PathBuf,
+}
+
+/// Probe worktrees this process currently owns. A `std::sync::Mutex` (not a
+/// signal-unsafe lock) is fine: the SIGINT/SIGTERM cleanup runs on a normal
+/// thread driven by `signal_hook`'s iterator, not inside an async-signal
+/// handler, so it may take the lock and spawn the `git` removal subprocess.
+static ACTIVE_PROBE_WORKTREES: std::sync::Mutex<Vec<ActiveProbeWorktree>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn register_probe_worktree(host: &Host, anchor: &std::path::Path, path: &std::path::Path) {
+    if let Ok(mut live) = ACTIVE_PROBE_WORKTREES.lock() {
+        live.push(ActiveProbeWorktree {
+            host: host.clone(),
+            anchor: anchor.to_path_buf(),
+            path: path.to_path_buf(),
+        });
+    }
+}
+
+fn deregister_probe_worktree(path: &std::path::Path) {
+    if let Ok(mut live) = ACTIVE_PROBE_WORKTREES.lock() {
+        live.retain(|w| w.path != path);
+    }
+}
+
+/// Whether `path` is currently in the signal-cleanup registry. Membership of a
+/// single owned path is unaffected by other tests registering their own
+/// distinct paths, so this stays deterministic in the shared test binary.
+#[cfg(test)]
+fn probe_worktree_registered(path: &std::path::Path) -> bool {
+    ACTIVE_PROBE_WORKTREES
+        .lock()
+        .map(|live| live.iter().any(|w| w.path == path))
+        .unwrap_or(false)
+}
+
+/// Remove every probe worktree this process still owns. Called from the
+/// `shelbi zen probe` signal handler so a SIGINT/SIGTERM mid-probe does not
+/// leak the detached worktree the way a bare `std::process::exit` would.
+///
+/// Best-effort: each removal failure is swallowed (the startup sweep of a later
+/// probe is the backstop for anything a signal couldn't clean). Draining the
+/// registry first means a concurrent normal-path removal can't double-remove.
+pub fn cleanup_registered_probe_worktrees() {
+    let drained: Vec<ActiveProbeWorktree> = match ACTIVE_PROBE_WORKTREES.lock() {
+        Ok(mut live) => std::mem::take(&mut *live),
+        Err(_) => return,
+    };
+    remove_probe_worktrees(&drained);
+}
+
+/// Remove a given set of probe worktrees, best-effort. Split from
+/// [`cleanup_registered_probe_worktrees`] so a test can exercise the removal on
+/// a worktree it owns without draining the process-global registry (which, in
+/// the shared test binary, other concurrent probe tests are also populating).
+/// In production one process runs one probe, so the drained set is exactly this
+/// process's own worktrees.
+fn remove_probe_worktrees(items: &[ActiveProbeWorktree]) {
+    for w in items {
+        let _ = remove_probe_worktree(&w.host, &w.anchor, &w.path);
+    }
+}
+
+/// Parse the owning pid out of a probe-worktree directory name
+/// (`.shelbi-probe-<pid>-<task>-<seq>`). Returns `None` for a name that does
+/// not carry a numeric pid in that slot, so an unrelated `.shelbi-probe-*`
+/// directory is never mistaken for a sweepable one.
+fn probe_worktree_owner_pid(dir_name: &str) -> Option<i32> {
+    let rest = dir_name.strip_prefix(PROBE_WORKTREE_PREFIX)?;
+    let pid_token = rest.split('-').next()?;
+    pid_token.parse::<i32>().ok()
+}
+
+/// Whether a local process with `pid` is still running. `kill(pid, 0)` sends no
+/// signal; it reports liveness. `0` (alive) and `EPERM` (alive, not ours to
+/// signal) both count as live; `ESRCH` means gone. The pid baked into a probe
+/// worktree name is always this host's `shelbi zen probe` process — it runs on
+/// the hub even when the worktree's anchor is a remote machine — so liveness is
+/// a local check regardless of where the worktree lives.
+#[cfg(unix)]
+fn probe_owner_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn probe_owner_is_alive(_pid: i32) -> bool {
+    // Without a liveness primitive, treat every owner as alive so the sweep
+    // never removes a worktree it can't prove is stale.
+    true
+}
+
+/// Remove `.shelbi-probe-*` worktrees under `repository_anchor` whose owning
+/// probe process is no longer running — the leak a SIGKILLed or crashed probe
+/// leaves behind (the graceful paths and the signal handler clean up their
+/// own). Called at the start of every probe so a leak is reaped by the next
+/// probe at the latest.
+///
+/// A worktree whose pid is still alive is left strictly alone, so a concurrent
+/// probe's worktree (and this process's own, once created) is never swept. Any
+/// single removal failure is logged-by-return and skipped rather than aborting
+/// the whole probe; a trailing `git worktree prune` clears stale admin entries.
+fn sweep_stale_probe_worktrees(host: &Host, repository_anchor: &std::path::Path) {
+    let Some(parent) = repository_anchor.parent() else {
+        return;
+    };
+    let parent = parent.to_string_lossy().into_owned();
+    // List the sibling directory entries on the worktree's host (works for a
+    // remote anchor too). A read failure just means nothing to sweep this time.
+    let listing = match probe_run_capture(
+        host,
+        [
+            "sh",
+            "-c",
+            // `-a` is required: probe worktrees are dot-prefixed, which plain
+            // `ls -1` hides. `.`/`..` are harmless — they don't match the
+            // probe prefix below.
+            &format!(
+                "ls -1a {} 2>/dev/null || true",
+                shell_escape_zen(&parent)
+            ),
+        ],
+    ) {
+        Ok(out) => out,
+        Err(_) => return,
+    };
+
+    let mut removed_any = false;
+    for name in listing.lines().map(str::trim).filter(|n| !n.is_empty()) {
+        if !name.starts_with(PROBE_WORKTREE_PREFIX) {
+            continue;
+        }
+        // Only sweep a name that carries a numeric owner pid that is gone.
+        match probe_worktree_owner_pid(name) {
+            Some(pid) if !probe_owner_is_alive(pid) => {}
+            _ => continue,
+        }
+        let path = std::path::Path::new(&parent).join(name);
+        if remove_probe_worktree(host, repository_anchor, &path).is_ok() {
+            removed_any = true;
+        }
+    }
+
+    if removed_any {
+        // Clear dangling admin entries for worktrees whose directory a crash
+        // removed but whose metadata git still holds.
+        let anchor = repository_anchor.to_string_lossy().into_owned();
+        let _ = probe_run(host, ["git", "-C", &anchor, "worktree", "prune"]);
+    }
+}
+
+/// POSIX single-quote escape for embedding a path inside an `sh -c` string.
+/// Local to zen's probe plumbing so the sweep's `ls` can name a path with
+/// spaces; mirrors `shelbi_core::shell_escape` without importing it here.
+fn shell_escape_zen(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Outcome of a [`cap_shared_cargo_target`] pass, so callers (and tests) can
+/// tell apart "cleared it", "left it (small enough)", "left it (a build holds
+/// it)", and "nothing there yet".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapOutcome {
+    /// The target was over the cap and no build held it, so it was removed.
+    Removed,
+    /// The target existed but was at or under the cap.
+    UnderCap,
+    /// A concurrent probe build holds the shared lock, so cleanup was skipped.
+    InUse,
+    /// No target directory exists yet.
+    Absent,
+}
+
+/// Lock key identifying one shared cargo target. Combines the host and the
+/// absolute target path so two machines (or two distinct targets) don't share a
+/// lock, while every local `shelbi zen probe` process targeting the same one
+/// does. The actual lock file is a local flock under `$SHELBI_HOME/locks/`
+/// (see `shelbi_state::lock_zen_target_build`), never inside the target it
+/// guards — the cap-cleanup clears the target wholesale.
+fn shared_target_lock_key(host: &Host, target: &std::path::Path) -> String {
+    let host_label = match host {
+        Host::Local => "local".to_string(),
+        Host::Ssh { host } => format!("ssh:{host}"),
+    };
+    format!("{host_label}|{}", target.to_string_lossy())
+}
+
+/// Measured size of `target` in bytes on `host`, via `du -sk`. `None` when the
+/// path is absent or the size can't be read.
+fn shared_target_size_bytes(host: &Host, target: &std::path::Path) -> Option<u64> {
+    let t = target.to_string_lossy().into_owned();
+    let out = probe_run_capture(host, ["du", "-sk", &t]).ok()?;
+    let kb: u64 = out.split_whitespace().next()?.parse().ok()?;
+    Some(kb.saturating_mul(1024))
+}
+
+/// Before a probe builds, clear the hub checkout's shared cargo `target/` if it
+/// has grown past `cap_bytes` — the unbounded accumulation that fills the hub
+/// disk over a week of Zen builds.
+///
+/// Safe under concurrency: a probe that is building holds a *shared* lock on
+/// this target ([`shelbi_state::lock_zen_target_build`]); this cleanup takes the
+/// *exclusive* lock without blocking and only clears the target when it gets it,
+/// so it never removes a `target/` a concurrent build is writing into. If a
+/// build holds the lock it returns [`CapOutcome::InUse`] and leaves the target
+/// for a later, idle probe to cap.
+fn cap_shared_cargo_target(
+    host: &Host,
+    target: &std::path::Path,
+    cap_bytes: u64,
+) -> Result<CapOutcome> {
+    let t = target.to_string_lossy().into_owned();
+    // Nothing to cap if the target doesn't exist yet.
+    let exists = probe_run(host, ["test", "-d", &t])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !exists {
+        return Ok(CapOutcome::Absent);
+    }
+
+    let key = shared_target_lock_key(host, target);
+    // Non-blocking: if any probe build holds the shared lock, skip this time.
+    let Some(_cleanup_lock) = shelbi_state::try_lock_zen_target_cleanup(&key)? else {
+        return Ok(CapOutcome::InUse);
+    };
+
+    match shared_target_size_bytes(host, target) {
+        Some(size) if size > cap_bytes => {
+            let out = probe_run(host, ["rm", "-rf", &t]).map_err(Error::Io)?;
+            if !out.status.success() {
+                return Err(Error::Command {
+                    cmd: format!("rm -rf {t}"),
+                    status: out.status.to_string(),
+                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                });
+            }
+            Ok(CapOutcome::Removed)
+        }
+        // Under the cap, or the size couldn't be read — leave it alone either
+        // way rather than risk clearing a target we can't measure.
+        _ => Ok(CapOutcome::UnderCap),
+    }
+}
+
 fn unique_probe_worktree_path(repository_anchor: &std::path::Path, task_id: &str) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6509,7 +6948,7 @@ fn unique_probe_worktree_path(repository_anchor: &std::path::Path, task_id: &str
         .parent()
         .unwrap_or(repository_anchor)
         .join(format!(
-            ".shelbi-probe-{}-{safe_id}-{seq}",
+            "{PROBE_WORKTREE_PREFIX}{}-{safe_id}-{seq}",
             std::process::id()
         ))
 }
@@ -6540,6 +6979,8 @@ fn add_probe_worktree(
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
     }
+    // Track the live worktree so a SIGINT/SIGTERM mid-probe still clears it.
+    register_probe_worktree(host, repository_anchor, probe_worktree);
     Ok(())
 }
 
@@ -6575,6 +7016,10 @@ fn remove_probe_worktree(
         ],
     )
     .map_err(Error::Io)?;
+    // Whether git succeeded or the worktree was already gone, this process no
+    // longer owns it — drop it from the signal-cleanup registry so a later
+    // `cleanup_registered_probe_worktrees` doesn't chase a stale entry.
+    deregister_probe_worktree(probe_worktree);
     if !out.status.success() {
         return Err(Error::Command {
             cmd: format!("git -C {anchor} worktree remove --force {probe}"),
@@ -9966,6 +10411,7 @@ mod probe_tests {
             runners: Default::default(),
             agents: Default::default(),
             issue_tracker: Default::default(),
+            disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
             review: shelbi_core::ReviewConfig::default(),
