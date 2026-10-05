@@ -13,3 +13,9 @@ serde = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+# `setsid(2)` in the login-shell capture's `pre_exec` (detaches the capture
+# shell from any controlling terminal so it never stops on SIGTTOU).
+libc = { workspace = true }
+# A warning when the login-shell env capture fails and we fall back to the
+# launcher's own environment.
+tracing = { workspace = true }

@@ -78,10 +78,21 @@ impl Connector for LiveConnector {
         let root = shelbi_state::sessions_dir().map_err(|e| e.to_string())?;
         let want = discovery_name(project, target);
         let sessions = shelbi_client::list(&root).map_err(|e| e.to_string())?;
-        let sess = sessions
-            .into_iter()
-            .find(|s| s.meta.name == want && s.alive)
-            .ok_or_else(|| format!("no live session `{want}`"))?;
+        let sess = match sessions.iter().find(|s| s.meta.name == want && s.alive) {
+            Some(s) => s.clone(),
+            None => {
+                // No live session. If a *dead* one with this name left a
+                // `final.txt`, surface its last output line so the TUI explains
+                // *why* the session isn't there — e.g. an orchestrator that
+                // exited at launch with `command not found: claude` — instead of
+                // only "no live session" (`rt-login-env-capture-empty-path`).
+                let last_line = sessions
+                    .iter()
+                    .find(|s| s.meta.name == want && !s.alive)
+                    .and_then(|s| last_final_line(&s.dir));
+                return Err(no_live_session_error(&want, last_line.as_deref()));
+            }
+        };
         let (conn, events) =
             Connection::open(&sess.sock, None, capability::ALL).map_err(|e| e.to_string())?;
         let size = match conn.info() {
@@ -95,6 +106,29 @@ impl Connector for LiveConnector {
             size,
         })
     }
+}
+
+/// Compose the error shown when no live session named `want` exists, appending a
+/// dead session's last output line when one is available. Split out (pure) so the
+/// message is unit-testable without a real sessions directory.
+fn no_live_session_error(want: &str, last_line: Option<&str>) -> String {
+    match last_line {
+        Some(line) if !line.is_empty() => {
+            format!("no live session `{want}` — last output: {line}")
+        }
+        _ => format!("no live session `{want}`"),
+    }
+}
+
+/// The last non-empty line of a dead session's `<dir>/final.txt`, trimmed, or
+/// `None` when the file is absent or blank. This is the exited session's final
+/// screen line (e.g. `zsh:1: command not found: claude`).
+fn last_final_line(dir: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("final.txt")).ok()?;
+    text.lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(str::to_string)
 }
 
 /// A connected, live session binding. Boxed inside [`Slot`] because it is much
@@ -312,6 +346,53 @@ mod tests {
 
     fn connecting(m: &SessionManager) -> bool {
         matches!(m.state(), MainState::Connecting(_))
+    }
+
+    #[test]
+    fn no_live_session_error_appends_the_exited_sessions_last_line() {
+        // An orchestrator that exited at launch has its final screen line
+        // surfaced, so the TUI shows the cause instead of only "no live session".
+        let msg = no_live_session_error(
+            "contextstore/orch",
+            Some("zsh:1: command not found: claude"),
+        );
+        assert_eq!(
+            msg,
+            "no live session `contextstore/orch` — last output: zsh:1: command not found: claude"
+        );
+    }
+
+    #[test]
+    fn no_live_session_error_without_a_last_line_is_the_bare_message() {
+        assert_eq!(
+            no_live_session_error("demo/orch", None),
+            "no live session `demo/orch`"
+        );
+        // An empty last line is treated as absent.
+        assert_eq!(
+            no_live_session_error("demo/orch", Some("")),
+            "no live session `demo/orch`"
+        );
+    }
+
+    #[test]
+    fn last_final_line_reads_the_last_nonblank_line_of_final_txt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("final.txt"),
+            "booting orchestrator\nzsh:1: command not found: claude\n\n   \n",
+        )
+        .unwrap();
+        assert_eq!(
+            last_final_line(dir.path()).as_deref(),
+            Some("zsh:1: command not found: claude")
+        );
+    }
+
+    #[test]
+    fn last_final_line_is_none_without_final_txt() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(last_final_line(dir.path()), None);
     }
 
     #[test]

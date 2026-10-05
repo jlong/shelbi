@@ -340,9 +340,9 @@ pub(super) fn run_foreground() -> Result<()> {
 /// Overlay the user's interactive login-shell environment onto this process's
 /// environment. Captured once (`$SHELL -l -i -c env`, cached in `shelbi-core`)
 /// and applied over the inherited environment so subprocesses (git, `gh`, ssh,
-/// workflow actions) see the user's real PATH and config. An empty capture (the
-/// login shell couldn't run) is a no-op, so a failure degrades to the inherited
-/// environment rather than clobbering it.
+/// workflow actions) see the user's real PATH and config. When the capture fails
+/// `shelbi-core` returns the launcher's own environment as a fallback, so the
+/// overlay is a no-op in that case rather than clobbering the inherited values.
 fn apply_login_shell_env() {
     for (key, value) in shelbi_core::login_shell_env() {
         std::env::set_var(key, value);
