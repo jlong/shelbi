@@ -9,7 +9,7 @@ summary: A desktop IDE for parallel coding agents — one window spawns Claude C
 
 | Dimension          | Shelbi                                       | Herd                                            |
 | ------------------ | -------------------------------------------- | ----------------------------------------------- |
-| Form factor        | Terminal Kanban + tmux panes                 | Desktop GUI (Windows, macOS, Linux `.deb`/`.rpm`) |
+| Form factor        | Terminal Kanban + attachable sessions        | Desktop GUI (Windows, macOS, Linux `.deb`/`.rpm`) |
 | Concurrency model  | Fixed pool of persistent workers             | Spawn-on-demand agents, capped by your laptop   |
 | Where work runs    | Your machines, your worktrees, SSH-routed    | One local machine, animal-named worktrees       |
 | Work intake        | Five-column Kanban with explicit triage      | Command-palette spawn; no board                 |
@@ -48,7 +48,7 @@ TODO becomes an issue, Herd no longer tracks it.
 
 ### An LLM orchestrator, not a chain trigger
 
-The orchestrator is a Claude agent in window 1 of the project's tmux
+The orchestrator is a Claude agent running in the project's Shelbi
 session. It tails `~/.shelbi/events.log`, matches lines like `task=fix-login
 todo -> in_progress` against its reaction rules, and dispatches the next
 ready task to whichever worker just freed up. Its instructions live in a
@@ -65,8 +65,8 @@ When a worker finishes a task, it writes its task id to
 `<worktree>/.claude/shelbi-review-ready`. The hub poller picks it up and
 moves the card to `review`. The handoff survives machine sleep, network
 blips, and SSH drops — the marker is the *entire* on-worker protocol,
-which is what lets a remote worker run with nothing installed but `tmux`,
-`git`, and the agent CLI.
+which is what lets a remote worker run with nothing installed but `git`,
+the agent CLI, and the `shelbi` binary itself.
 
 Herd's "done" is implicit when the agent's output ends in the same window
 the agent runs in. There is no separate review staging area; when the
@@ -127,7 +127,7 @@ write" problem, Herd has a direct answer.
   trigger you wire up per pair.
 - You want the orchestration surface scriptable from cron jobs, webhooks,
   or another agent — not locked inside a GUI.
-- You're comfortable in tmux and want workers that survive SSH drops.
+- You want workers that survive SSH drops and that you can attach to from any terminal.
 
 ## Choose Herd if…
 

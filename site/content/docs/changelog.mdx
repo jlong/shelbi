@@ -9,6 +9,23 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### October 4, 2026
+
+**Shelbi runs its own sessions; tmux is no longer required.** Each agent now
+runs in its own Shelbi session, a small process that owns one PTY and outlives
+the connection, instead of a tmux pane. Attach to any session from any terminal
+with [`shelbi attach <workspace>`](/docs/cli/attach), rendered full-screen, and
+detach with `Ctrl+]` without stopping the agent. The debug surface over sessions
+is [`shelbi session`](/docs/cli/session) (`ls`, `new`, `kill`, `send`,
+`snapshot`); remote machines are managed with
+[`shelbi machine`](/docs/cli/machine) (`setup`, `status`) and reached through a
+per-machine [`shelbi relay`](/docs/cli/relay). The deb and the Homebrew formula
+drop their tmux dependency: beyond the `shelbi` binary itself, a machine needs
+only `git` and your agent CLI, plus `ssh` to reach a remote one. The TUI is an
+ordinary full-screen program, so it still runs fine nested
+inside tmux or Screen if you prefer one. The retired tmux-era commands (`spawn`,
+`archive`, `tail`, `merge`, `popup`, and `daemon install`/`uninstall`) are gone.
+
 ### October 2, 2026
 
 **Zen only auto-promotes GitHub issues assigned to you.** On a GitHub-backed

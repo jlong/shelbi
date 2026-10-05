@@ -74,11 +74,9 @@ end
 # `.../releases/download/v#{version}/...` yields.
 formula = <<~RUBY
   class Shelbi < Formula
-    desc "Open-source agent orchestrator built on tmux"
+    desc "Open-source agent orchestrator for parallel coding agents"
     homepage "https://github.com/#{github_repo}"
     license "MIT"
-
-    depends_on "tmux"
 
     on_macos do
   #{urls.gsub(/^/, "    ")}

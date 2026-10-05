@@ -18,7 +18,7 @@ summary: A terminal-native agent multiplexer in Rust. "tmux for agents" with per
 
 | Dimension          | Shelbi                                       | Herdr                                            |
 | ------------------ | -------------------------------------------- | ------------------------------------------------ |
-| Form factor        | Terminal Kanban + tmux panes                 | Terminal multiplexer (pane grid), mouse-first    |
+| Form factor        | Terminal Kanban + attachable sessions        | Terminal multiplexer (pane grid), mouse-first    |
 | Work surface       | Five-column Kanban with triage and priority  | Live agent panes, no board                       |
 | Scheduler          | LLM orchestrator dispatching from events log | Human-driven multiplexer, the substrate not a scheduler |
 | Review flow        | `review` column, don't merge until signoff   | Live agent handoff, no board-level review gate   |
@@ -47,7 +47,7 @@ Herdr.
 
 ### An LLM orchestrator that dispatches
 
-The orchestrator is a Claude agent in window 1 of the project's tmux
+The orchestrator is a Claude agent running in the project's Shelbi
 session. It tails `~/.shelbi/events.log`, matches lines like `task=fix-login
 todo -> in_progress` against its reaction rules, and dispatches the next
 ready task to whichever worker just freed up. Its instructions live in a
@@ -119,13 +119,12 @@ each other, not only with a human operator. If agent-to-agent coordination
 is load-bearing in your workflow, Herdr treats it as a built-in primitive
 rather than something you assemble yourself.
 
-### Mouse-first polish lowers the tmux learning curve
+### Mouse-first polish lowers the terminal learning curve
 
 Herdr's pane management is mouse-first, a deliberate departure from the
 keyboard-first tmux and zellij model, with keyboard and mouse both
-first-class. For people who find tmux's muscle memory a barrier, that
-polish is a genuine on-ramp. Shelbi leans on tmux conventions and assumes
-you're comfortable there.
+first-class. For people who find a keyboard-driven terminal UI a barrier,
+that polish is a genuine on-ramp. Shelbi's TUI is keyboard-first.
 
 ### A simpler mental model when you just want the multiplexer
 

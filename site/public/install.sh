@@ -11,7 +11,6 @@
 # Prerequisites (same as scripts/install.sh):
 #   - git
 #   - cargo / rustup        (https://rustup.rs)
-#   - tmux                  (shelbi runs workers in tmux panes)
 #   - claude CLI            (the agent runtime shelbi drives)
 #
 # Notes:

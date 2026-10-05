@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Open-source agent orchestrator built on tmux"
+description = "Open-source agent orchestrator for parallel coding agents"
 
 [[bin]]
 name = "shelbi"

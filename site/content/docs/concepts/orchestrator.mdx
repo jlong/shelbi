@@ -4,15 +4,15 @@ order: 14
 summary: One agent in window 1 you talk to — it dispatches issues to workspaces, tails the events log, and reports back. You are the priority-setter; it is the scheduler.
 ---
 
-The orchestrator is the agent you talk to. It lives in window 1 of the
-project's tmux session (`shelbi-<project>:dashboard`), runs whatever
+The orchestrator is the agent you talk to. It runs as the project's
+orchestrator session, shown in the dashboard's main pane, runs whatever
 runner the project declares (typically `claude`), and treats the
 `shelbi` CLI as its tool surface, the same CLI you use yourself.
 
 It is a [**named agent**](/docs/concepts/agents) like any other
 (`agents/orchestrator/`), with an editable `instructions.md` for its system
-prompt. What makes it special is only *where* it runs: window 1, talking to
-you, rather than in a [workspace](/docs/concepts/workspaces) picking up
+prompt. What makes it special is only *where* it runs: in the dashboard, talking
+to you, rather than in a [workspace](/docs/concepts/workspaces) picking up
 issues. The `developer` agent (and any reviewer roles you author) run inside
 workspaces; the orchestrator runs the board.
 
