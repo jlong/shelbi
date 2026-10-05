@@ -261,6 +261,22 @@ enum Cmd {
         #[arg(value_name = "NAME")]
         name: Option<String>,
     },
+    /// Quit the current project: end its sessions (after the orchestrator
+    /// writes its handoff so the next open resumes with context) and mark it
+    /// closed. Other projects keep running. Worktrees and branches are left
+    /// intact, so the work resumes on the next launch.
+    ///
+    /// Pass `--all` to quit Shelbi entirely: close every project, end all
+    /// sessions, and stop the hub daemon (nothing restarts it).
+    ///
+    /// With no daemon running, nothing is open — this reports that and exits
+    /// cleanly.
+    Quit {
+        /// Quit Shelbi entirely (every project + the hub daemon) instead of
+        /// just the current project.
+        #[arg(long)]
+        all: bool,
+    },
     /// (internal) Own the Codex app-server, exact orchestrator thread, and
     /// remote TUI for one project. Not for direct use.
     #[command(hide = true)]
@@ -469,6 +485,7 @@ fn main() -> Result<()> {
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
         Some(Cmd::Orchestrator { cmd }) => commands::orchestrator::run(cli.project, cmd),
         Some(Cmd::Reload { target, name }) => commands::reload::run(cli.project, target, name),
+        Some(Cmd::Quit { all }) => commands::quit::run(cli.project, all),
         Some(Cmd::CodexOrchestrator {
             project,
             first_launch,
