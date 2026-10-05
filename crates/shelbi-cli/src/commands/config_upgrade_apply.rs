@@ -47,8 +47,9 @@ use shelbi_core::StatusCategory;
 
 use super::config_surfaces::{live_entries, InventoryEntry, SurfaceFormat};
 use super::config_upgrade::{
-    get, is_inert, legacy_status_id, scope_label, Classification, UpgradeFinding, UpgradeReport,
-    PR_TEMPLATE_MISSING, REMOVED_PROJECT_KEYS,
+    apply_tmux_instruction_rewrites, get, is_inert, legacy_status_id, scope_label, Classification,
+    UpgradeFinding, UpgradeReport, PR_TEMPLATE_MISSING, REMOVED_PROJECT_KEYS,
+    TMUX_INSTRUCTION_AUTOHEAL_CODE,
 };
 
 /// One auto-heal write-back that landed on disk this run. Returned to the
@@ -195,6 +196,13 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
     // `pr-template.md`). Independent of the content healers below.
     if codes.contains(PR_TEMPLATE_MISSING) {
         heal_missing_pr_template(entry, applied);
+    }
+
+    // Rewrite legacy tmux-command passages in an agent's instructions / the
+    // load-run skill to the session backend. A Markdown surface that doesn't
+    // match the YAML/JSON branches below, so handled independently.
+    if codes.contains(TMUX_INSTRUCTION_AUTOHEAL_CODE) {
+        heal_tmux_instructions(entry, applied);
     }
 
     let id = entry.logical_id.as_str();
@@ -839,6 +847,35 @@ fn heal_missing_pr_template(entry: &InventoryEntry, applied: &mut Vec<AppliedCha
     record(applied, entry, PR_TEMPLATE_MISSING, path, "materialize-shipped-default".into());
 }
 
+/// Rewrite every exact legacy tmux-command passage in an agent's instructions /
+/// the load-run skill to its session-backend form, using the shared
+/// [`apply_tmux_instruction_rewrites`] table (the same one the sniffer keys the
+/// `INSTRUCTIONS_TMUX_COMMAND` auto-heal on). Deterministic and non-lossy — only
+/// exact shipped passages match, so an edited passage (reported needs-judgment)
+/// is never touched here. A no-op write (nothing matched) is skipped so the file
+/// mtime and the events.log disclosure stay honest.
+fn heal_tmux_instructions(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
+    let path = &entry.canonical_path;
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let out = apply_tmux_instruction_rewrites(&text);
+    if out == text {
+        return;
+    }
+    if let Err(e) = write_atomic(path, &out) {
+        eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
+        return;
+    }
+    record(
+        applied,
+        entry,
+        TMUX_INSTRUCTION_AUTOHEAL_CODE,
+        path,
+        "tmux-command->shelbi-session".into(),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 
@@ -1220,6 +1257,114 @@ workspaces:
             "shipped default still trips the sniffer: {:?}",
             report2.findings.iter().map(|f| &f.code).collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn tmux_instructions_auto_heal_on_start_idempotently_and_discloses() {
+        // An existing project whose forked orchestrator `instructions.md` still
+        // carries the exact shipped-then-legacy tmux passages: the boot pass
+        // rewrites them to the session backend, discloses each, and a second pass
+        // is a no-op.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        std::fs::write(home.join("projects/demo.yaml"), "repo: /tmp/demo\n").unwrap();
+        let orch_dir = home.join("projects/demo/agents/orchestrator");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        let table = crate::commands::config_upgrade::TMUX_INSTRUCTION_REWRITES;
+        let legacy = format!(
+            "# Orchestrator\n\n{}\n\nmore prose\n\n{}\n",
+            table[0].0, table[1].0,
+        );
+        let path = orch_dir.join("instructions.md");
+        std::fs::write(&path, &legacy).unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == TMUX_INSTRUCTION_AUTOHEAL_CODE
+                    && f.classification == Classification::AutoHeal),
+            "expected an INSTRUCTIONS_TMUX_COMMAND auto-heal: {:?}",
+            report.findings.iter().map(|f| &f.code).collect::<Vec<_>>(),
+        );
+
+        let applied = apply_auto_heal(&["demo".to_string()], &report);
+        assert!(
+            applied.iter().any(|c| c.code == TMUX_INSTRUCTION_AUTOHEAL_CODE),
+            "nothing applied: {applied:?}",
+        );
+
+        // Disk is healed: no tmux left, session commands present.
+        let healed = std::fs::read_to_string(&path).unwrap();
+        assert!(!healed.contains("tmux"), "tmux survived the heal: {healed}");
+        assert!(healed.contains("shelbi session snapshot <workspace>"), "{healed}");
+        assert!(healed.contains("`shelbi session send`"), "{healed}");
+
+        // Disclosed on events.log.
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default();
+        assert!(log.contains("config-upgrade"), "no disclosure line: {log}");
+        assert!(log.contains(TMUX_INSTRUCTION_AUTOHEAL_CODE), "{log}");
+
+        // Idempotent: a second pass detects no auto-heal and writes nothing.
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report2
+                .findings
+                .iter()
+                .any(|f| f.code == TMUX_INSTRUCTION_AUTOHEAL_CODE),
+            "residual tmux auto-heal: {report2:?}",
+        );
+        let applied2 = apply_auto_heal(&["demo".to_string()], &report2);
+        assert!(applied2.is_empty(), "second pass wrote: {applied2:?}");
+    }
+
+    #[test]
+    fn edited_tmux_passage_is_needs_judgment_and_left_untouched() {
+        // A forked copy whose tmux passage the user edited away from the shipped
+        // wording: no exact entry matches, so it is reported needs-judgment (never
+        // auto-applied) and the file is left byte-for-byte untouched.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        std::fs::write(home.join("projects/demo.yaml"), "repo: /tmp/demo\n").unwrap();
+        let orch_dir = home.join("projects/demo/agents/orchestrator");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        let path = orch_dir.join("instructions.md");
+        let edited = "# Orchestrator\n\nSample it with `tmux capture-pane -p -t <my-slot>`.\n";
+        std::fs::write(&path, edited).unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.code == "INSTRUCTIONS_TMUX_COMMAND_EDITED")
+            .expect("edited tmux passage should surface a needs-judgment finding");
+        assert_eq!(finding.classification, Classification::NeedsJudgment);
+        assert!(!finding.rationale.is_empty(), "needs-judgment finding needs a rationale");
+        assert!(
+            !report.findings.iter().any(|f| f.code == TMUX_INSTRUCTION_AUTOHEAL_CODE),
+            "an edited passage must not also auto-heal",
+        );
+
+        // Apply never touches the edited passage (needs-judgment is never
+        // auto-applied), and the instructions file is left byte-for-byte intact —
+        // even though unrelated auto-heals (e.g. materializing a missing
+        // pr-template) may run on this bare project.
+        let applied = apply_auto_heal(&["demo".to_string()], &report);
+        assert!(
+            !applied.iter().any(|c| c.code == TMUX_INSTRUCTION_AUTOHEAL_CODE),
+            "an edited tmux passage was auto-applied: {applied:?}",
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited, "file was modified");
     }
 
     #[test]

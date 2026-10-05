@@ -5083,8 +5083,8 @@ fn record_review_serving(
 }
 
 /// Emit the `review-ready` signal for a review slot that just reached serving.
-/// Best-effort: every field shelbi already knows internally (pane target,
-/// worktree path, served port/url, task title/notes) is gathered here so the
+/// Best-effort: every field shelbi already knows internally (the slot's agent
+/// session name, worktree path, served port/url, task title/notes) is gathered here so the
 /// orchestrator doesn't reverse-engineer them. A failure to resolve the machine
 /// or load the task degrades gracefully — the location payload is still worth
 /// emitting, so we fall back to an empty title/notes rather than skipping the
@@ -5105,8 +5105,13 @@ fn emit_review_ready(
     };
     let worktree =
         crate::workspace::workspace_worktree(machine, workspace).to_string_lossy().into_owned();
-    let pane = match crate::workspace::workspace_target(project, workspace) {
-        Ok(addr) => addr.label(),
+    // The review slot's agent session name (`<project>/ws/<slot>`), derived from
+    // the backend-neutral target the same way the session backend keys it — so
+    // the orchestrator can `shelbi session snapshot` / `attach` the slot straight
+    // from the event rather than rediscovering it. (The old tmux `session:window`
+    // target is gone with the cutover.)
+    let session = match crate::workspace::workspace_target(project, workspace) {
+        Ok(addr) => crate::session_process_backend::session_name(&addr),
         Err(e) => {
             tracing::warn!(workspace = %workspace.name, error = %e, "review-ready: session target resolution failed");
             String::new()
@@ -5132,7 +5137,7 @@ fn emit_review_ready(
         task_id,
         title: &title,
         workspace: &workspace.name,
-        pane: &pane,
+        session: &session,
         worktree: &worktree,
         port,
         url,
@@ -5832,8 +5837,8 @@ Intro prose.
         assert!(line.contains(" task=t-serve "), "line: {line}");
         assert!(line.contains(" workspace=alpha "), "line: {line}");
         assert!(line.contains(" state=serving "), "line: {line}");
-        // Pane target + worktree path shelbi already knows internally.
-        assert!(line.contains(" pane=shelbi-demo:alpha "), "line: {line}");
+        // The slot's agent session name + worktree path shelbi already knows internally.
+        assert!(line.contains(" session=demo/ws/alpha "), "line: {line}");
         assert!(
             line.contains(" worktree=") && line.contains("/.shelbi/wt/alpha "),
             "line: {line}"
