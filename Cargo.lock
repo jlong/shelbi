@@ -1751,9 +1751,11 @@ name = "shelbi-core"
 version = "0.10.0"
 dependencies = [
  "chrono",
+ "libc",
  "serde",
  "serde_yaml",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

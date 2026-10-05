@@ -19,7 +19,13 @@ use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// Process-lifetime cache for [`login_shell_env`].
+/// Process-lifetime cache for a **successful** [`login_shell_env`] capture.
+///
+/// Only a capture that actually ran the login shell is stored. A failed or
+/// timed-out capture is deliberately *not* cached, so a later call retries it
+/// rather than being stuck with the fallback environment for the rest of the
+/// process's life (`rt-login-env-capture-empty-path`: a single early timeout
+/// used to poison every subsequent spawn from that process).
 static CACHE: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 
 /// Hard deadline for the login-shell capture. An interactive login shell on a
@@ -30,27 +36,71 @@ static CACHE: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 /// longer than this.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The user's interactive login-shell environment, captured once and cached.
+/// The user's interactive login-shell environment.
 ///
-/// Returns an empty map if the login shell can't be run or exits non-zero;
-/// callers overlay the result, so an empty map simply leaves their existing
-/// environment untouched rather than clobbering it.
-pub fn login_shell_env() -> &'static BTreeMap<String, String> {
-    CACHE.get_or_init(capture_login_shell_env)
+/// A **successful** capture is taken once and cached for the process lifetime.
+/// If the capture fails or times out, this returns the launcher's own
+/// environment as a fallback (see [`fallback_env`]) and does **not** cache it,
+/// so the next call retries the capture.
+///
+/// It never returns an empty map off a failure: callers like the session
+/// spawner `env_clear()` and then apply this map wholesale, so an empty result
+/// would hand the child *no* `PATH` and the agent (`claude`, `codex`, …) would
+/// fail to launch with `command not found`.
+pub fn login_shell_env() -> BTreeMap<String, String> {
+    resolve_login_env(&CACHE, || {
+        capture_env_bounded(&login_shell(), CAPTURE_TIMEOUT)
+    })
 }
 
-/// Run `$SHELL -l -i -c env` and parse its output. `$SHELL` falls back to
-/// `/bin/sh` when unset. stdin is `/dev/null` so an interactive shell can't
-/// block waiting for input, and stderr is discarded so prompt/rc noise never
-/// reaches the caller's output.
+/// The cache-or-fallback policy behind [`login_shell_env`], with the cache and
+/// the capture both injected so it is testable without a real shell or the
+/// process-global [`CACHE`].
 ///
-/// Returns an empty map on any failure *or* if the capture exceeds
-/// [`CAPTURE_TIMEOUT`]; callers overlay the result, so an empty map leaves their
-/// environment untouched rather than clobbering it, and the process is never
-/// left hanging on a wedged shell.
-fn capture_login_shell_env() -> BTreeMap<String, String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    capture_env_bounded(&shell, CAPTURE_TIMEOUT).unwrap_or_default()
+/// * A cached (previously successful) capture is returned straight away.
+/// * Otherwise `capture` runs. On success the result is cached and returned. On
+///   failure it is **not** cached — so the next call retries — and the
+///   launcher's own environment is returned as a non-empty fallback, with a
+///   warning naming the capture timeout.
+fn resolve_login_env<F>(cache: &OnceLock<BTreeMap<String, String>>, capture: F) -> BTreeMap<String, String>
+where
+    F: FnOnce() -> Option<BTreeMap<String, String>>,
+{
+    if let Some(cached) = cache.get() {
+        return cached.clone();
+    }
+    match capture() {
+        Some(env) => {
+            // Store the first successful capture. A concurrent racer may have set
+            // it already (then `set` is a no-op); either way the stored map wins.
+            let _ = cache.set(env);
+            cache.get().cloned().unwrap_or_else(fallback_env)
+        }
+        None => {
+            tracing::warn!(
+                "interactive login-shell env capture failed or timed out after {:?}; \
+                 falling back to the launcher's own environment",
+                CAPTURE_TIMEOUT
+            );
+            fallback_env()
+        }
+    }
+}
+
+/// `$SHELL`, or `/bin/sh` when it is unset.
+fn login_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+}
+
+/// The launcher's own environment, used as the fallback when the login-shell
+/// capture fails or times out.
+///
+/// The launcher (the TUI, the daemon, a CLI) was itself started from a shell, so
+/// its environment carries at least `PATH`/`HOME`/`USER`/`SHELL`/`LANG` — enough
+/// for the spawned agent to find its binary. This is strictly better than the
+/// empty map a failed capture used to yield, which left a child with no `PATH`.
+fn fallback_env() -> BTreeMap<String, String> {
+    std::env::vars().collect()
 }
 
 /// Run `shell -l -i -c env` with a hard deadline and parse its output.
@@ -61,13 +111,18 @@ fn capture_login_shell_env() -> BTreeMap<String, String> {
 /// pipe and outlives the shell, so `output()` could block forever even after the
 /// shell exits. Instead we:
 ///
-/// * put the shell in its own process group (so job-control noise and any
-///   children stay isolated from ours),
+/// * put the shell in its own **session** with no controlling terminal (so
+///   job-control noise and any children stay isolated from ours, *and* the
+///   interactive shell never stops on SIGTTOU/SIGTTIN — see
+///   [`bounded_capture_stdout`]),
 /// * read stdout on a detached thread that hands the bytes back over a channel,
 ///   and
 /// * wait on that channel with a deadline — on timeout we kill the shell and
 ///   give up with an empty map rather than block.
-fn capture_env_bounded(shell: &str, timeout: Duration) -> Option<BTreeMap<String, String>> {
+///
+/// Exposed (not private) so a controlling-tty regression test can drive it
+/// directly from a process that owns a pty.
+pub fn capture_env_bounded(shell: &str, timeout: Duration) -> Option<BTreeMap<String, String>> {
     let mut cmd = Command::new(shell);
     cmd.args(["-l", "-i", "-c", "env"]);
     bounded_capture_stdout(cmd, timeout).map(|out| parse_env_output(&out))
@@ -82,8 +137,9 @@ fn capture_env_bounded(shell: &str, timeout: Duration) -> Option<BTreeMap<String
 /// pipe and outlives the shell, so `output()` could block forever even after the
 /// shell exits. Instead we:
 ///
-/// * put the child in its own process group (so job-control noise and any
-///   children stay isolated from ours),
+/// * put the child in its own **session** with no controlling terminal (so
+///   job-control noise and any children stay isolated from ours, and the shell
+///   never stops fighting over a tty it should not see),
 /// * read stdout on a detached thread that hands the bytes back over a channel,
 ///   and
 /// * wait on that channel with a deadline — on timeout we kill the child and
@@ -94,15 +150,32 @@ fn capture_env_bounded(shell: &str, timeout: Duration) -> Option<BTreeMap<String
 fn bounded_capture_stdout(mut cmd: Command, timeout: Duration) -> Option<String> {
     use std::os::unix::process::CommandExt;
 
-    let mut child = cmd
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        // A fresh process group (pgid = child pid): the child can't touch our
-        // group, and anything it spawns is contained with it.
-        .process_group(0)
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    // `setsid`, not a plain `process_group(0)`: the capture shell must be
+    // detached from any **controlling terminal**, not merely isolated into its
+    // own group. When the launcher owns a controlling tty (the single-process
+    // TUI opening a project), a `process_group(0)` child is a *background* group
+    // on that tty, so the moment the interactive (`-i`) shell's rc touches
+    // terminal modes it takes SIGTTOU/SIGTTIN and stops — wedging the capture
+    // until the deadline and leaving every later spawn with an empty env
+    // (`rt-login-env-capture-empty-path`). `setsid` gives the shell a brand-new
+    // session with no controlling tty, so those signals never fire; it also
+    // subsumes the group isolation (the child becomes session *and* group
+    // leader, pgid == pid), matching the detached-spawn recipe elsewhere.
+    //
+    // SAFETY: `setsid(2)` is async-signal-safe and touches no shared state; it
+    // runs in the forked child before exec. A freshly forked child is never
+    // already a process-group leader, so the call does not fail in practice (and
+    // its result is ignored regardless).
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().ok()?;
 
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = mpsc::channel();
@@ -165,7 +238,7 @@ pub const SCRUBBED_TERMINAL_VARS: &[&str] = &["TMUX", "TMUX_PANE", "TERM_PROGRAM
 /// is nothing to install on a remote host. This is the shared helper the daemon
 /// and the session spawner both build the child environment from.
 pub fn session_child_env() -> BTreeMap<String, String> {
-    build_session_env(login_shell_env().clone())
+    build_session_env(login_shell_env())
 }
 
 /// The pure transform [`session_child_env`] applies to a captured environment:
@@ -343,6 +416,72 @@ mod tests {
         let mut cmd = Command::new("/bin/sh");
         cmd.args(["-c", "exit 3"]);
         assert_eq!(bounded_capture_stdout(cmd, Duration::from_secs(5)), None);
+    }
+
+    #[test]
+    fn fallback_env_carries_the_launchers_path() {
+        // The launcher always has a PATH; the fallback must forward it verbatim so
+        // a spawned child (which `env_clear()`s and applies this map) is never left
+        // with no PATH when the capture fails. Read the process PATH rather than
+        // mutating it — the env is process-global and other tests run in parallel.
+        let want = std::env::var("PATH").expect("the test process has a PATH");
+        let fb = fallback_env();
+        assert_eq!(fb.get("PATH"), Some(&want));
+        assert!(!fb.is_empty());
+    }
+
+    #[test]
+    fn a_forced_capture_failure_still_hands_a_child_a_nonempty_path() {
+        // Criterion: a forced capture failure must not clobber the child env. The
+        // session child env is `build_session_env(login_shell_env())`; on failure
+        // `login_shell_env` returns the fallback, so the child still gets the
+        // launcher's PATH rather than an empty one.
+        let want = std::env::var("PATH").expect("the test process has a PATH");
+        let cache = OnceLock::new();
+        let env = resolve_login_env(&cache, || None);
+        let child = build_session_env(env);
+        assert_eq!(
+            child.get("PATH"),
+            Some(&want),
+            "a failed capture must fall back to the launcher's PATH, not an empty map"
+        );
+    }
+
+    #[test]
+    fn a_failed_capture_is_not_cached_and_is_retried_until_it_succeeds() {
+        use std::cell::Cell;
+
+        let cache: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+        let calls = Cell::new(0usize);
+
+        // First call: the capture fails. Result is the (non-empty) fallback, and
+        // nothing is cached.
+        let first = resolve_login_env(&cache, || {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert!(!first.is_empty(), "fallback env is non-empty");
+        assert!(cache.get().is_none(), "a failed capture must not be cached");
+
+        // Second call: the capture now succeeds. It was *retried* (ran again),
+        // its result is returned, and it is cached.
+        let mut good = BTreeMap::new();
+        good.insert("PATH".to_string(), "/captured/bin".to_string());
+        let second = resolve_login_env(&cache, || {
+            calls.set(calls.get() + 1);
+            Some(good.clone())
+        });
+        assert_eq!(second.get("PATH").map(String::as_str), Some("/captured/bin"));
+        assert!(cache.get().is_some(), "a successful capture is cached");
+        assert_eq!(calls.get(), 2, "the capture is retried after a failure");
+
+        // Third call: served from the cache; the capture is not run again.
+        let third = resolve_login_env(&cache, || {
+            calls.set(calls.get() + 1);
+            panic!("must not re-capture once a capture has succeeded");
+        });
+        assert_eq!(third.get("PATH").map(String::as_str), Some("/captured/bin"));
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

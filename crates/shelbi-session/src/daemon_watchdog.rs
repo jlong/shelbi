@@ -182,7 +182,7 @@ fn start_daemon(exe: &Path) {
 /// interactive login-shell environment, plus Shelbi's state-root overrides so it
 /// resolves the same `~/.shelbi` this session is operating under.
 fn daemon_spawn_env() -> BTreeMap<String, String> {
-    let mut env = shelbi_core::login_shell_env().clone();
+    let mut env = shelbi_core::login_shell_env();
     for key in ["SHELBI_HOME", "SHELBI_ROOT"] {
         if let Ok(val) = std::env::var(key) {
             env.insert(key.to_string(), val);
