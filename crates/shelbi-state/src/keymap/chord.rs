@@ -161,34 +161,7 @@ impl KeyChord {
         KeyChord { code, mods }
     }
 
-    /// Render this chord in tmux's `bind-key` syntax (e.g. `C-p`, `M-z`,
-    /// `C-S-Space`, `F1`, `Up`, `BSpace`). Returns `None` for chords tmux
-    /// can't express as a global key — currently anything that carries
-    /// the `super` modifier, since tmux has no representation for it and
-    /// terminal multiplexers typically don't see the Super key at all.
-    ///
-    /// Modifier order mirrors tmux: `C-` (ctrl), `M-` (alt), `S-` (shift).
-    /// Letter keynames are emitted lowercase since tmux folds case there;
-    /// named keys use tmux's canonical TitleCase / abbreviated form
-    /// (`BSpace`, `PageUp`, `F12`).
-    pub fn to_tmux_key(&self) -> Option<String> {
-        if self.mods.contains(Mods::SUPER) {
-            return None;
-        }
-        let keyname = tmux_keyname(self.code)?;
-        let mut out = String::new();
-        if self.mods.contains(Mods::CONTROL) {
-            out.push_str("C-");
-        }
-        if self.mods.contains(Mods::ALT) {
-            out.push_str("M-");
-        }
-        if self.mods.contains(Mods::SHIFT) {
-            out.push_str("S-");
-        }
-        out.push_str(&keyname);
-        Some(out)
-    }
+
 
     /// Render this chord in the canonical, lossless string form. Round-
     /// trips through [`KeyChord::parse`]:
@@ -348,31 +321,7 @@ fn keyname(code: Key) -> String {
     }
 }
 
-/// Render a [`Key`] in tmux's `bind-key` syntax. Every [`Key`] variant maps
-/// to a tmux keyname, so this is total (the [`KeyChord::to_tmux_key`] `None`
-/// case is driven only by the `super` modifier, which tmux can't express).
-fn tmux_keyname(code: Key) -> Option<String> {
-    Some(match code {
-        Key::Char(' ') => "Space".to_string(),
-        Key::Char(c) => c.to_string(),
-        Key::Up => "Up".to_string(),
-        Key::Down => "Down".to_string(),
-        Key::Left => "Left".to_string(),
-        Key::Right => "Right".to_string(),
-        Key::Enter => "Enter".to_string(),
-        Key::Esc => "Escape".to_string(),
-        Key::Tab => "Tab".to_string(),
-        Key::BackTab => "BTab".to_string(),
-        Key::Backspace => "BSpace".to_string(),
-        Key::Delete => "DC".to_string(),
-        Key::Insert => "IC".to_string(),
-        Key::Home => "Home".to_string(),
-        Key::End => "End".to_string(),
-        Key::PageUp => "PageUp".to_string(),
-        Key::PageDown => "PageDown".to_string(),
-        Key::F(n) => format!("F{n}"),
-    })
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -572,69 +521,11 @@ mod tests {
         assert!(c.mods.contains(Mods::CONTROL));
     }
 
-    #[test]
-    fn to_tmux_key_renders_each_mapping_row() {
-        // Cases pulled directly from the task's mapping table.
-        let cases: &[(&str, &str)] = &[
-            ("ctrl-p", "C-p"),
-            ("alt-z", "M-z"),
-            ("ctrl-shift-space", "C-S-Space"),
-            ("f1", "F1"),
-            ("f12", "F12"),
-            ("enter", "Enter"),
-            ("space", "Space"),
-            ("esc", "Escape"),
-            ("up", "Up"),
-            ("backspace", "BSpace"),
-            ("tab", "Tab"),
-        ];
-        for (chord_str, expected) in cases {
-            let c = parse(chord_str);
-            assert_eq!(
-                c.to_tmux_key().as_deref(),
-                Some(*expected),
-                "to_tmux_key({chord_str}) → {expected}",
-            );
-        }
-    }
 
-    #[test]
-    fn to_tmux_key_returns_none_for_super_modifier() {
-        // The parser-friendly form: bind a chord with super-, ensure it
-        // refuses to translate. tmux has no way to express Super.
-        let c = parse("super-x");
-        assert_eq!(c.to_tmux_key(), None);
-        let c = parse("ctrl-super-p");
-        assert_eq!(c.to_tmux_key(), None);
-    }
 
-    #[test]
-    fn to_tmux_key_handles_remaining_named_keys() {
-        // Coverage for the keynames the mapping table doesn't enumerate,
-        // so a regression in tmux_keyname() can't slip through.
-        let extras = [
-            ("down", "Down"),
-            ("left", "Left"),
-            ("right", "Right"),
-            ("back-tab", "BTab"),
-            ("delete", "DC"),
-            ("insert", "IC"),
-            ("home", "Home"),
-            ("end", "End"),
-            ("page-up", "PageUp"),
-            ("page-down", "PageDown"),
-        ];
-        for (chord_str, expected) in extras {
-            let c = parse(chord_str);
-            assert_eq!(c.to_tmux_key().as_deref(), Some(expected));
-        }
-    }
 
-    #[test]
-    fn to_tmux_key_orders_modifiers_ctrl_alt_shift() {
-        // Even if the source string lists modifiers differently, tmux output
-        // canonicalizes to C-M-S- order.
-        let c = parse("shift-alt-ctrl-a");
-        assert_eq!(c.to_tmux_key().as_deref(), Some("C-M-S-a"));
-    }
+
+
+
+
 }

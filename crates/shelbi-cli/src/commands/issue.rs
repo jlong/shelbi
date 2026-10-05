@@ -1174,7 +1174,7 @@ fn resume(
         }
     }
 
-    println!("✓ {id} resumed on {workspace_name} ({})", addr.target());
+    println!("✓ {id} resumed on {workspace_name} ({})", addr.label());
     Ok(())
 }
 

@@ -24,25 +24,16 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
 
     match status {
         BootstrapStatus::Started => {
-            println!("✓ orchestrator started in {}", addr.target());
+            println!("✓ orchestrator started ({})", addr.label());
         }
         BootstrapStatus::AlreadyRunning => {
             // `args.status` is reserved for future status-only output; for
             // now both branches print the same line.
             let _ = args.status;
-            println!("orchestrator already running in {}", addr.target());
+            println!("orchestrator already running ({})", addr.label());
         }
     }
-    print_attach(&addr.session, &addr.window);
-    Ok(())
-}
-
-fn print_attach(session: &str, window: &str) {
     println!();
-    println!("attach with:");
-    if std::env::var("TMUX").is_ok() {
-        println!("  tmux select-window -t {session}:{window}");
-    } else {
-        println!("  tmux attach -t {session} \\; select-window -t {window}");
-    }
+    println!("open the project with `shelbi` to see the orchestrator.");
+    Ok(())
 }

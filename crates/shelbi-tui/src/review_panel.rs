@@ -27,19 +27,13 @@
 //! the filesystem, or the task board. [`run_review_panel`] is the real
 //! executor that maps each effect onto `shelbi_orchestrator` / `shelbi_state`.
 
-use std::time::Duration;
 
-use anyhow::{Context, Result};
-use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
-};
 use ratatui::{
-    backend::Backend,
     layout::{Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{List, ListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
+    Frame,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -113,12 +107,10 @@ pub enum PanelEffect {
     /// Accept: move the task out of review via the normal accept transition,
     /// tear down the interface, and quit the panel.
     Approve,
-    /// Open the reject-reason popover (a centered `tmux display-popup`). The
-    /// host loop launches the popup, and on submit performs the review-reject
-    /// with the typed reason, then tears down the interface and quits. The
-    /// reason itself is collected outside this process (a `display-popup`
-    /// child's output can't return here directly), so it isn't carried on the
-    /// effect — see [`reject_reason_popup`].
+    /// Open the reject-reason overlay. The host loop opens it, and on submit
+    /// performs the review-reject with the typed reason, then tears down the
+    /// interface and quits. The reason is collected by the overlay, not this
+    /// widget, so it isn't carried on the effect.
     RejectPrompt,
 }
 
@@ -126,7 +118,6 @@ pub enum PanelEffect {
 /// (worktree path, resolved editor name, whether a review URL exists) and
 /// then driven by key/mouse events.
 pub struct ReviewPanel {
-    pub task_id: String,
     /// Absolute path of the review worktree — shown truncated in the header,
     /// revealed on click.
     pub worktree: String,
@@ -140,10 +131,6 @@ pub struct ReviewPanel {
     /// Selected panel row.
     pub selected: usize,
     pub should_quit: bool,
-    /// Set when the reviewer Approved (accept). Distinguishes the accept exit
-    /// from a plain q / Esc / Reject dismissal so only acceptance closes the
-    /// review slot's window on the way out.
-    pub approved: bool,
     pub status_line: String,
     /// Set while the gated review→done merge runs on a background thread. The
     /// Approve row renders a busy spinner instead of the pressable button, and
@@ -162,20 +149,17 @@ pub struct ReviewPanel {
 
 impl ReviewPanel {
     pub fn new(
-        task_id: impl Into<String>,
         worktree: impl Into<String>,
         editor_name: impl Into<String>,
         has_review_url: bool,
     ) -> Self {
         let mut panel = Self {
-            task_id: task_id.into(),
             worktree: worktree.into(),
             editor_name: editor_name.into(),
             has_review_url,
             active_view: ActiveView::Chat,
             selected: 0,
             should_quit: false,
-            approved: false,
             status_line: String::new(),
             merging: false,
             spinner: 0,
@@ -299,23 +283,7 @@ impl ReviewPanel {
         }
     }
 
-    /// Fall the mid view back to Chat after its content pane (Vim / difftool)
-    /// died in place. Mirrors `activate_row(Switch(Chat))` — sets the active
-    /// view and returns [`PanelEffect::ShowChat`] — and moves the selection
-    /// highlight to the Chat entry, so a poll-tick auto-recovery drives the
-    /// exact same view-switch (and leaves the panel in the same visible state)
-    /// a click on the Chat entry would. Kept as its own method so the recovery
-    /// converges with the click path without duplicating the effect mapping.
-    pub fn recover_to_chat(&mut self) -> PanelEffect {
-        if let Some(idx) = self
-            .rows()
-            .iter()
-            .position(|r| matches!(r, PanelRow::Switch(SwitchItem::Chat)))
-        {
-            self.selected = idx;
-        }
-        self.activate_row(PanelRow::Switch(SwitchItem::Chat))
-    }
+
 
     /// Activate the selected row (Enter / Space).
     pub fn activate(&mut self) -> PanelEffect {
@@ -951,359 +919,19 @@ pub(crate) fn spawn_opener(program: &str, args: &[String]) -> std::result::Resul
 // ---------------------------------------------------------------------------
 // Executor
 
-/// Run the review panel in the current pane on `task_id`. Builds the panel
-/// state from the project/workflow config, then drives the crossterm event
-/// loop, mapping each [`PanelEffect`] onto the real orchestrator/state calls.
-pub fn run_review_panel(project_name: &str, task_id: &str) -> Result<()> {
-    let (worktree, has_review_url) = review_context(project_name, task_id);
-    let editor_name = shelbi_state::editor_display_name(&shelbi_state::resolve_editor());
 
-    let mut term = crate::setup_terminal_pub().context("setting up terminal")?;
-    let mut app = ReviewPanel::new(task_id, worktree, editor_name, has_review_url);
 
-    let result = review_panel_loop(&mut term, &mut app, project_name);
-    crate::restore_terminal_pub(&mut term).ok();
-    // Every exit path (q / Esc / Approve / Reject) tears the three-column
-    // interface back down: restore the agent pane to the review window's
-    // middle, drop the panel/editor panes, and return focus to the dashboard.
-    // Best-effort — the pane is going away regardless. This also parks focus on
-    // the dashboard, so the window-close below reaps a *non-active* window and
-    // never yanks the client onto some adjacent window.
-    let _ = shelbi_orchestrator::review_ui::close_review_interface(project_name);
-    // On accept (only), close the review slot's whole window now that the
-    // accept signal has been emitted — the slot returns to idle instead of
-    // lingering with just its agent pane. Ordering is load-bearing: the
-    // `approve_review_task` move event fired before we reach here, mirroring the
-    // dev-workspace teardown (promote, then close). q / Esc / Reject leave the
-    // window standing so the still-loaded review can be reopened.
-    if app.approved {
-        let _ = shelbi_orchestrator::review_ui::close_review_window(project_name, task_id);
-    }
-    result
-}
 
-/// Resolve the review worktree path and whether a review URL is configured
-/// for `task_id`. Missing config degrades gracefully — an empty worktree and
-/// no browser action rather than a failed launch.
-fn review_context(project_name: &str, task_id: &str) -> (String, bool) {
-    let Ok(project) = shelbi_state::load_project(project_name) else {
-        return (String::new(), false);
-    };
-    let Ok(store) = shelbi_state::issue_store_for_project(&project) else {
-        return (String::new(), false);
-    };
-    let Ok(Some(tf)) = store.get(task_id) else {
-        return (String::new(), false);
-    };
-    let worktree = tf
-        .task
-        .assigned_to
-        .as_deref()
-        .and_then(|ws| project.workspace(ws))
-        .and_then(|ws| {
-            let machine = project.machine(&ws.machine)?;
-            Some(shelbi_orchestrator::workspace::workspace_worktree(machine, ws))
-        })
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let has_review_url = shelbi_state::load_task_workflow(project_name, &project, &tf.task)
-        .ok()
-        .map(|wf| wf.review_url_for_status(tf.task.column.as_str()).is_some())
-        .unwrap_or(false);
-    (worktree, has_review_url)
-}
 
-fn review_panel_loop<B: Backend>(
-    term: &mut Terminal<B>,
-    app: &mut ReviewPanel,
-    project_name: &str,
-) -> Result<()> {
-    // Receiver for a gated review→done merge running on a background thread.
-    // Approve spawns the merge off-thread (it shells out to `gh` three times,
-    // up to ~6 minutes worst case) so the loop keeps drawing and handling input
-    // instead of freezing until every `gh` child returns. `Some` while a merge
-    // is in flight; the outcome (Ok, or the failure reason) is delivered here.
-    let mut merge_rx: Option<std::sync::mpsc::Receiver<std::result::Result<(), String>>> = None;
 
-    while !app.should_quit {
-        // Advance the busy spinner each tick while a merge runs, so the panel
-        // visibly keeps repainting rather than looking frozen.
-        if app.merging {
-            app.spinner = app.spinner.wrapping_add(1);
-        }
-        term.draw(|f| render_full(f, app, f.area()))?;
-        // Recover a dead middle content pane before waiting on input, on the
-        // same cadence as the event poll below. When the mid view's `exec`'d
-        // process exits (Vim `:q`, difftool quit) its pane dies in place; fall
-        // the view back to Chat via the same `ShowChat` effect a click on the
-        // Chat entry produces, so the window never sits showing a dead pane.
-        // `mid_content_pane_dead` is guarded to the active review window and is
-        // idempotent (false once Chat is back / while the pane is live), so a
-        // live pane is never rebuilt and the view is never double-switched.
-        if app.active_view != ActiveView::Chat
-            && shelbi_orchestrator::review_ui::mid_content_pane_dead(project_name, &app.task_id)
-        {
-            let effect = app.recover_to_chat();
-            perform_effect(app, project_name, effect);
-        }
-        // Apply a completed background merge. On success we accept + quit (the
-        // exit path closes the review window as before); on failure the busy
-        // spinner is replaced by the reason on the status line so the reviewer
-        // sees why it didn't land. `continue` so the next iteration redraws the
-        // outcome (and exits promptly on success) instead of waiting out the
-        // 200 ms poll below.
-        if let Some(rx) = merge_rx.as_ref() {
-            match rx.try_recv() {
-                Ok(Ok(())) => {
-                    merge_rx = None;
-                    app.merging = false;
-                    app.approved = true;
-                    app.should_quit = true;
-                    continue;
-                }
-                Ok(Err(e)) => {
-                    merge_rx = None;
-                    app.merging = false;
-                    let msg = format!("approve failed: {e}");
-                    crate::error_report::log_error(project_name, "review-panel", &msg);
-                    app.status_line = msg;
-                    continue;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // The worker dropped its sender without a result (a panic) —
-                    // clear the busy state and surface a generic failure rather
-                    // than spinning forever.
-                    merge_rx = None;
-                    app.merging = false;
-                    let msg = "approve failed: merge worker exited unexpectedly".to_string();
-                    crate::error_report::log_error(project_name, "review-panel", &msg);
-                    app.status_line = msg;
-                    continue;
-                }
-            }
-        }
-        if !event::poll(Duration::from_millis(200))? {
-            continue;
-        }
-        let effect = match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    app.request_quit();
-                    PanelEffect::None
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    app.nav_up();
-                    PanelEffect::None
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    app.nav_down();
-                    PanelEffect::None
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => app.activate(),
-                _ => PanelEffect::None,
-            },
-            Event::Mouse(m) => handle_mouse(app, m),
-            _ => PanelEffect::None,
-        };
-        // Approve runs off-thread; every other effect is handled inline. The
-        // pure model already declines a second Approve while `merging`, so the
-        // `merge_rx.is_none()` guard is belt-and-suspenders.
-        if matches!(effect, PanelEffect::Approve) {
-            if merge_rx.is_none() {
-                app.status_line.clear();
-                app.merging = true;
-                app.spinner = 0;
-                let (tx, rx) = std::sync::mpsc::channel();
-                let project = project_name.to_string();
-                let task = app.task_id.clone();
-                std::thread::spawn(move || {
-                    let result =
-                        shelbi_orchestrator::review_ui::approve_review_task(&project, &task)
-                            .map_err(|e| e.to_string());
-                    let _ = tx.send(result);
-                });
-                merge_rx = Some(rx);
-            }
-        } else {
-            perform_effect(app, project_name, effect);
-        }
-    }
-    Ok(())
-}
 
-fn handle_mouse(app: &mut ReviewPanel, mouse: MouseEvent) -> PanelEffect {
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => app.click(mouse.column, mouse.row),
-        _ => PanelEffect::None,
-    }
-}
 
-/// Map one [`PanelEffect`] onto the real world. Opener/tmux failures surface
-/// on the status line (spec: "failures surface as a status-line warning, not
-/// a crash").
-fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect) {
-    // Any real action supersedes a previously shown warning: clear it up front,
-    // and a failing action re-sets its own message in the match arms below. A
-    // no-op (a navigation keystroke maps to `None`) leaves the current warning
-    // in place, so an Approve refusal stays visible while the reviewer looks.
-    if !matches!(effect, PanelEffect::None) {
-        app.status_line.clear();
-    }
-    match effect {
-        PanelEffect::None => {}
-        // Back button: navigate focus to the dashboard without tearing the
-        // interface down (no `should_quit`), so the still-loaded review stays
-        // put and can be re-opened from the sidebar.
-        PanelEffect::FocusDashboard => {
-            if let Err(e) = shelbi_orchestrator::review_ui::focus_dashboard(project_name) {
-                let msg = format!("back to dashboard failed: {e}");
-                crate::error_report::log_error(project_name, "review-panel", &msg);
-                app.status_line = msg;
-            }
-        }
-        PanelEffect::ShowChat => {
-            if let Err(e) = shelbi_orchestrator::review_ui::show_review_view(
-                project_name,
-                &app.task_id,
-                shelbi_orchestrator::review_ui::ReviewMidView::Chat,
-            ) {
-                let msg = format!("show chat failed: {e}");
-                crate::error_report::log_error(project_name, "review-panel", &msg);
-                app.status_line = msg;
-            }
-        }
-        PanelEffect::ShowDiff => {
-            if let Err(e) = shelbi_orchestrator::review_ui::show_review_view(
-                project_name,
-                &app.task_id,
-                shelbi_orchestrator::review_ui::ReviewMidView::Diff,
-            ) {
-                let msg = format!("view diff failed: {e}");
-                crate::error_report::log_error(project_name, "review-panel", &msg);
-                app.status_line = msg;
-            }
-        }
-        PanelEffect::ShowVim => {
-            if let Err(e) = shelbi_orchestrator::review_ui::show_review_view(
-                project_name,
-                &app.task_id,
-                shelbi_orchestrator::review_ui::ReviewMidView::Editor,
-            ) {
-                let msg = format!("open editor failed: {e}");
-                crate::error_report::log_error(project_name, "review-panel", &msg);
-                app.status_line = msg;
-            }
-        }
-        PanelEffect::OpenBrowser => match review_url(project_name, &app.task_id) {
-            Some(url) => {
-                let (prog, args) = open_url_command(current_os(), &url);
-                if let Err(e) = spawn_opener(&prog, &args) {
-                    crate::error_report::log_error(project_name, "review-panel", &e);
-                    app.status_line = e;
-                }
-            }
-            None => app.status_line = "no review URL configured".into(),
-        },
-        PanelEffect::RevealFolder => {
-            if app.worktree.is_empty() {
-                app.status_line = "no review worktree to reveal".into();
-            } else {
-                let (prog, args) = reveal_command(current_os(), &app.worktree);
-                if let Err(e) = spawn_opener(&prog, &args) {
-                    crate::error_report::log_error(project_name, "review-panel", &e);
-                    app.status_line = e;
-                }
-            }
-        }
-        // Approve is handled off-thread in `review_panel_loop` (it must keep the
-        // panel repainting while the multi-second gated `gh` merge runs), so the
-        // effect never reaches this inline dispatcher — see the loop's Approve
-        // branch and `merge_rx`.
-        PanelEffect::Approve => {}
-        // Reject opens the reason popover (a centered tmux display-popup). A
-        // submitted reason drives the same review-reject transition the old
-        // inline prompt did; a cancel (or a failed popup launch) leaves the
-        // task untouched.
-        PanelEffect::RejectPrompt => {
-            if let Some(reason) = reject_reason_popup() {
-                match shelbi_orchestrator::review_ui::reject_review(
-                    project_name,
-                    &app.task_id,
-                    &reason,
-                ) {
-                    Ok(()) => app.should_quit = true,
-                    Err(e) => {
-                        let msg = format!("reject failed: {e}");
-                        crate::error_report::log_error(project_name, "review-panel", &msg);
-                        app.status_line = msg;
-                    }
-                }
-            }
-        }
-    }
-}
 
-/// Launch the reject-reason prompt as a centered `tmux display-popup` running
-/// `shelbi __review-reject-reason`, returning the typed reason on submit or
-/// `None` on cancel / launch failure.
-///
-/// The reason round-trips through a temp file: a `display-popup -E` child's
-/// stdout goes to the popup pane, not back to us, so the popup writes the
-/// reason to `--out PATH` on submit and exits 0; we read it back. The file is
-/// removed before launch (so a stale one can't masquerade as a submit) and
-/// after read. Mirrors the launch pattern of `App::review_load_dialog` in
-/// `app.rs` — `-B` suppresses tmux's own border so only the widget's frame
-/// shows. Any tmux/IO failure degrades to `None` (a no-op), never a crash.
-fn reject_reason_popup() -> Option<String> {
-    let bin = std::env::current_exe().ok()?;
-    let bin = bin.to_string_lossy();
-    // Per-process temp path — the review panel handles one reject at a time
-    // (the popup blocks its loop), so the pid alone keeps concurrent review
-    // panels from colliding on the round-trip file.
-    let out = std::env::temp_dir().join(format!("shelbi-reject-reason-{}.txt", std::process::id()));
-    let cmd = format!(
-        "{} __review-reject-reason --out {}",
-        shelbi_agent::shell_escape(&bin),
-        shelbi_agent::shell_escape(&out.to_string_lossy()),
-    );
-    let _ = std::fs::remove_file(&out);
-    // `-h 18` leaves room for the label, a several-line bordered text area, the
-    // button row, and the hint without clipping — the reason field is now a
-    // multi-line editor, so it wants the extra vertical space.
-    let ok = run_tmux([
-        "display-popup",
-        "-B",
-        "-E",
-        "-w",
-        "70",
-        "-h",
-        "18",
-        cmd.as_str(),
-    ]);
-    let reason = ok.then(|| std::fs::read_to_string(&out).ok()).flatten();
-    let _ = std::fs::remove_file(&out);
-    reason
-        .map(|r| r.trim().to_string())
-        .filter(|r| !r.is_empty())
-}
 
-/// Run `tmux ARGS`, returning whether it exited successfully. Mirrors
-/// `app::run_tmux`; kept local so the review panel's popup launch doesn't
-/// reach across modules.
-fn run_tmux<I, S>(args: I) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    std::process::Command::new("tmux")
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
+
+
+
+
 
 /// Resolve the concrete review URL to open for `task_id` (with `$PORT` /
 /// `$SLOT` substituted), or `None` when none is configured.
@@ -1330,7 +958,6 @@ mod tests {
 
     fn panel(has_url: bool) -> ReviewPanel {
         ReviewPanel::new(
-            "fix-login",
             "/Users/j/proj/.shelbi/wt/review",
             "Vim".to_string(),
             has_url,
@@ -1764,7 +1391,7 @@ mod tests {
 
     #[test]
     fn editor_label_tracks_resolved_editor_name() {
-        let mut app = ReviewPanel::new("t", "/wt", "Helix".to_string(), false);
+        let mut app = ReviewPanel::new("/wt", "Helix".to_string(), false);
         let out = render(&mut app, 30, 20);
         assert!(out.contains("Edit in Helix"), "label uses resolved editor: {out}");
     }
@@ -1793,38 +1420,6 @@ mod tests {
         // Back to Chat.
         select_switch(&mut app, SwitchItem::Chat);
         assert_eq!(app.activate(), PanelEffect::ShowChat);
-        assert_eq!(app.active_view, ActiveView::Chat);
-    }
-
-    /// The dead-mid-pane recovery (`recover_to_chat`) drives the exact same
-    /// effect + active-view state a click on the Chat entry produces: from a
-    /// Vim / Diff mid view it returns `ShowChat`, flips the active view back to
-    /// Chat, and moves the selection highlight onto the Chat switch so the panel
-    /// reads identically either way. This is the state-machine half of the
-    /// poll-tick recovery in `review_panel_loop`.
-    #[test]
-    fn recover_to_chat_mirrors_the_chat_switch_click() {
-        let mut app = panel(true);
-        // Simulate the user having switched the mid view to the editor.
-        select_switch(&mut app, SwitchItem::Vim);
-        assert_eq!(app.activate(), PanelEffect::ShowVim);
-        assert_eq!(app.active_view, ActiveView::Vim);
-
-        // The editor pane died (Vim `:q`): recovery falls the view back to Chat.
-        assert_eq!(app.recover_to_chat(), PanelEffect::ShowChat);
-        assert_eq!(app.active_view, ActiveView::Chat);
-        // Selection now sits on the Chat switch, matching the click path.
-        let chat_idx = app
-            .rows()
-            .iter()
-            .position(|r| matches!(r, PanelRow::Switch(SwitchItem::Chat)))
-            .unwrap();
-        assert_eq!(app.selected, chat_idx, "selection moves onto the Chat entry");
-
-        // Idempotent: recovering again while already on Chat is still a ShowChat
-        // no-op switch (the loop guards on `active_view != Chat` so it never even
-        // calls this again, but the method itself must stay stable).
-        assert_eq!(app.recover_to_chat(), PanelEffect::ShowChat);
         assert_eq!(app.active_view, ActiveView::Chat);
     }
 
@@ -1901,8 +1496,9 @@ mod tests {
 
     #[test]
     fn reject_row_activation_requests_the_reason_popover() {
-        // The reason is now collected in a tmux display-popup outside this
-        // process; activating Reject just asks the host loop to launch it.
+        // The reason is collected in a separate reject-reason overlay
+        // (`overlay::review_reject`); activating Reject just asks the host loop
+        // to open it.
         let mut app = panel(false);
         while !matches!(app.rows().get(app.selected), Some(PanelRow::Reject)) {
             app.nav_down();

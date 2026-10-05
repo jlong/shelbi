@@ -12,7 +12,7 @@
 //! auto-confirming the trust dialog along the way. Extracted here so the
 //! review flow reuses exactly the same detection the dispatch flow uses.
 
-use shelbi_core::{Host, Result, TmuxAddr};
+use shelbi_core::{Host, Result};
 
 use crate::session_backend::{backend, SessionBackend, SessionTarget};
 
@@ -78,10 +78,10 @@ pub const RESUME_COMPACTION_GRACE: std::time::Duration = std::time::Duration::fr
 /// dispatch never shows the dialog, so keying it in unconditionally is safe.
 pub fn wait_for_claude_ready(
     host: &Host,
-    addr: &TmuxAddr,
+    addr: &SessionTarget,
     timeout: std::time::Duration,
 ) -> Result<bool> {
-    let target = SessionTarget::from_tmux_addr(addr);
+    let target = addr.clone();
     let mut deadline = std::time::Instant::now() + timeout;
     let mut trust_dismissed = false;
     let mut resume_summary_answered = false;

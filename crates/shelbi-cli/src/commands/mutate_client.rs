@@ -12,27 +12,13 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use shelbi_orchestrator::mutate::{self, MutateError, OutputSink};
+use shelbi_orchestrator::mutate;
 use shelbi_proto::control::{MutationKind, MutationRequest, Stream};
 
-/// Run a mutation against issue `id` in `project`. Routes through the daemon
-/// when the hidden `dev.daemon_mutations` setting is on, else in-process.
+/// Run a mutation against issue `id` in `project`, routed through the daemon's
+/// control socket (the one runtime).
 pub fn run_mutation(project: &str, id: &str, kind: MutationKind) -> Result<()> {
-    if shelbi_state::daemon_mutations_enabled() {
-        run_via_daemon(project, id, kind)
-    } else {
-        run_in_process(project, id, kind)
-    }
-}
-
-/// The in-process path: call the library directly with a sink that prints and a
-/// recheck that always passes (no concurrent clients to guard against).
-fn run_in_process(project: &str, id: &str, kind: MutationKind) -> Result<()> {
-    let mut sink = StdoutSink;
-    let mut recheck = mutate::no_recheck();
-    mutate::apply(project, id, &kind, &mut sink, &mut recheck)
-        .map(|_| ())
-        .map_err(map_mutate_err)
+    run_via_daemon(project, id, kind)
 }
 
 /// The daemon path: ensure the daemon is up, connect to the control socket, and
@@ -86,32 +72,9 @@ fn connect_with_retry(sock: &std::path::Path) -> Result<shelbi_client::ControlCl
     }
 }
 
-/// Map a library error to the same `anyhow` error (and exit code) the CLI has
-/// always produced. [`MutateError::LaunchSpawn`] rebuilds the historical
-/// `launching workspace` context chain.
-fn map_mutate_err(e: MutateError) -> anyhow::Error {
-    match e {
-        MutateError::LaunchSpawn(inner) => anyhow!(inner).context("launching workspace"),
-        other => anyhow!("{other}"),
-    }
-}
-
 /// Map a control-client error to an `anyhow` error. A daemon-run mutation that
 /// failed carries its typed [`MutationError`](shelbi_proto::control::MutationError),
 /// whose `Display` is the operator-facing message.
 fn map_client_err(e: shelbi_client::ClientError) -> anyhow::Error {
     anyhow!("{e}")
-}
-
-/// An [`OutputSink`] that prints to the process's stdout/stderr — the
-/// in-process path, which is exactly what the CLI did before.
-struct StdoutSink;
-
-impl OutputSink for StdoutSink {
-    fn emit(&mut self, stream: Stream, text: &str) {
-        match stream {
-            Stream::Stdout => println!("{text}"),
-            Stream::Stderr => eprintln!("{text}"),
-        }
-    }
 }

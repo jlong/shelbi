@@ -8,12 +8,9 @@
 //! [`shelbi_state::list_open_projects`], starting a poller for a newly opened
 //! project and stopping the one for a project that has closed.
 //!
-//! It runs only while the hidden `SHELBI_DAEMON_POLLER` dev setting is on. With
-//! the setting off (the default), the sidebar owns the poller and this manager
-//! keeps none — so the two never run at once. The per-project poller lock
-//! ([`shelbi_state::acquire_poller_lock`], taken inside `WorkspacePoller::start`)
-//! is the hard backstop: even if a stale sidebar overlaps the switch, only the
-//! lock holder polls, and this manager retries an inert start on its next tick.
+//! The per-project poller lock ([`shelbi_state::acquire_poller_lock`], taken
+//! inside `WorkspacePoller::start`) is the hard backstop: only the lock holder
+//! polls, and this manager retries an inert start on its next tick.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,14 +66,6 @@ fn poller_manager_loop(stop: &AtomicBool) {
 /// Reconcile the running pollers against the open set for one tick. Split from
 /// the loop so a test can drive a single reconcile without threads or timing.
 fn reconcile(running: &mut HashMap<String, WorkspacePoller>) {
-    // The daemon owns the poller only while the dev setting is on. Off (the
-    // default): the sidebar polls, so the daemon keeps none and tears down any
-    // it was running if the setting was just flipped off.
-    if !shelbi_state::daemon_poller_enabled() {
-        running.clear();
-        return;
-    }
-
     let open = shelbi_state::list_open_projects().unwrap_or_default();
 
     // Stop pollers for projects that have closed. A close is a quit: cancel the
@@ -142,7 +131,6 @@ mod tests {
     struct DaemonPollerHome {
         _lock: std::sync::MutexGuard<'static, ()>,
         prev_home: Option<std::ffi::OsString>,
-        prev_setting: Option<std::ffi::OsString>,
         home: PathBuf,
     }
     impl DaemonPollerHome {
@@ -160,13 +148,10 @@ mod tests {
             ));
             std::fs::create_dir_all(home.join("projects")).unwrap();
             let prev_home = std::env::var_os("SHELBI_HOME");
-            let prev_setting = std::env::var_os(shelbi_state::DAEMON_POLLER_ENV);
             std::env::set_var("SHELBI_HOME", &home);
-            std::env::set_var(shelbi_state::DAEMON_POLLER_ENV, "1");
             Self {
                 _lock: lock,
                 prev_home,
-                prev_setting,
                 home,
             }
         }
@@ -194,10 +179,6 @@ mod tests {
             match self.prev_home.take() {
                 Some(v) => std::env::set_var("SHELBI_HOME", v),
                 None => std::env::remove_var("SHELBI_HOME"),
-            }
-            match self.prev_setting.take() {
-                Some(v) => std::env::set_var(shelbi_state::DAEMON_POLLER_ENV, v),
-                None => std::env::remove_var(shelbi_state::DAEMON_POLLER_ENV),
             }
             let _ = std::fs::remove_dir_all(&self.home);
         }
@@ -275,18 +256,6 @@ mod tests {
 
         std::env::remove_var("SHELBI_QUIT_BARRIER_MS");
         std::env::remove_var("SHELBI_POLL_SUBPROC_DEADLINE_MS");
-    }
-
-    #[test]
-    fn with_the_setting_off_the_manager_runs_no_pollers() {
-        let home = DaemonPollerHome::new("off");
-        home.open_project("alpha");
-        // Flip the setting off: the daemon must run none (the sidebar owns it).
-        std::env::set_var(shelbi_state::DAEMON_POLLER_ENV, "0");
-
-        let mut running: HashMap<String, WorkspacePoller> = HashMap::new();
-        reconcile(&mut running);
-        assert!(running.is_empty(), "setting off → daemon runs no pollers");
     }
 
     #[test]

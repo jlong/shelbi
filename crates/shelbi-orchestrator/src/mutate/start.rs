@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use shelbi_core::{default_workflow, Column, Issue, Owner, StatusCategory, Workflow, WorkflowStatus};
 
+use crate::session_backend::SessionTarget;
 use super::{
     ensure_workspace_dispatchable, guard_review_slot, issue_store, load_issue, MutateError,
     OutputSink, Recheck,
@@ -92,7 +93,7 @@ pub(crate) fn start(
 
     // Refuse to clobber a user shell. Best-effort probe.
     if let Some(ws_machine) = project_yaml.machine(&workspace.machine) {
-        if let Ok(ws_addr) = crate::workspace::workspace_tmux_addr(&project_yaml, workspace) {
+        if let Ok(ws_addr) = crate::workspace::workspace_target(&project_yaml, workspace) {
             let shell_open =
                 crate::workspace::workspace_user_shell_open(&ws_machine.host(), &ws_addr)
                     .unwrap_or(false);
@@ -247,7 +248,7 @@ pub(crate) fn start(
         }
         LaunchWait::IdleTimeout if launch_appears_complete(&project_yaml, workspace, id) => {
             launched_late = true;
-            crate::workspace::workspace_tmux_addr(&project_yaml, workspace)
+            crate::workspace::workspace_target(&project_yaml, workspace)
                 .map_err(MutateError::backend)?
         }
         LaunchWait::IdleTimeout => {
@@ -333,13 +334,13 @@ pub(crate) fn start(
         sink.out(&format!(
             "✓ {id} → in_progress on {workspace_name} ({}) — launch confirmed after the {}s \
              deadline; card left in_progress rather than rolled back",
-            addr.target(),
+            addr.label(),
             launch_deadline.as_secs(),
         ));
     } else {
         sink.out(&format!(
             "✓ {id} → in_progress on {workspace_name} ({})",
-            addr.target()
+            addr.label()
         ));
     }
     Ok(())
@@ -412,13 +413,13 @@ fn teardown_workspace_pane(
         ))
     })?;
     let host = machine.host();
-    let addr = crate::workspace::workspace_tmux_addr(project_yaml, workspace)?;
+    let addr = crate::workspace::workspace_target(project_yaml, workspace)?;
     crate::workspace::kill_workspace_pane(&host, &addr, &workspace.name)
 }
 
 /// Terminal outcome of [`await_launch`].
 enum LaunchWait {
-    Completed(shelbi_core::TmuxAddr),
+    Completed(SessionTarget),
     SpawnFailed(shelbi_core::Error),
     Panicked,
     IdleTimeout,
@@ -427,7 +428,7 @@ enum LaunchWait {
 /// Wait for the launch worker thread, measuring the timeout from the LAST
 /// observed launch-progress signal rather than one wall clock from the start.
 fn await_launch(
-    rx: &std::sync::mpsc::Receiver<shelbi_core::Result<shelbi_core::TmuxAddr>>,
+    rx: &std::sync::mpsc::Receiver<shelbi_core::Result<SessionTarget>>,
     idle_deadline: Duration,
     poll_interval: Duration,
     mut progress_token: impl FnMut() -> u64,
@@ -476,7 +477,7 @@ fn launch_appears_complete(
         return false;
     };
     let host = machine.host();
-    let Ok(addr) = crate::workspace::workspace_tmux_addr(project_yaml, workspace) else {
+    let Ok(addr) = crate::workspace::workspace_target(project_yaml, workspace) else {
         return false;
     };
     let alive = matches!(
@@ -637,7 +638,7 @@ mod tests {
     fn await_launch_reports_completion_spawn_failure_and_panic() {
         // Completion.
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(Ok(shelbi_core::TmuxAddr::pane_id("%1"))).unwrap();
+        tx.send(Ok(SessionTarget::pane("%1"))).unwrap();
         assert!(matches!(
             await_launch(&rx, Duration::from_secs(5), Duration::from_millis(10), || 0),
             LaunchWait::Completed(_)
@@ -652,7 +653,7 @@ mod tests {
         ));
 
         // Panic (sender dropped without sending).
-        let (tx, rx) = std::sync::mpsc::channel::<shelbi_core::Result<shelbi_core::TmuxAddr>>();
+        let (tx, rx) = std::sync::mpsc::channel::<shelbi_core::Result<SessionTarget>>();
         drop(tx);
         assert!(matches!(
             await_launch(&rx, Duration::from_secs(5), Duration::from_millis(10), || 0),
@@ -663,7 +664,7 @@ mod tests {
     #[test]
     fn await_launch_times_out_on_silence_but_a_moving_launch_extends_its_deadline() {
         // Silence past the deadline → IdleTimeout.
-        let (_tx, rx) = std::sync::mpsc::channel::<shelbi_core::Result<shelbi_core::TmuxAddr>>();
+        let (_tx, rx) = std::sync::mpsc::channel::<shelbi_core::Result<SessionTarget>>();
         assert!(matches!(
             await_launch(&rx, Duration::from_millis(30), Duration::from_millis(10), || 0),
             LaunchWait::IdleTimeout
@@ -672,7 +673,7 @@ mod tests {
         // A token that keeps increasing resets the idle clock, so the launch is
         // never declared stuck while it is still moving; once it stops moving it
         // times out. Bound the counter so the test still terminates.
-        let (_tx, rx) = std::sync::mpsc::channel::<shelbi_core::Result<shelbi_core::TmuxAddr>>();
+        let (_tx, rx) = std::sync::mpsc::channel::<shelbi_core::Result<SessionTarget>>();
         let mut n = 0u64;
         let out = await_launch(&rx, Duration::from_millis(30), Duration::from_millis(5), || {
             n += 1;

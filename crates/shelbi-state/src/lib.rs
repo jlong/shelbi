@@ -121,9 +121,8 @@ pub use agent_workspaces::{
     SHARED_AGENT_DIR, SHARED_PREAMBLE_FILE, STALE_HOOK_COMMAND_MARKER,
 };
 pub use hub_config::{
-    daemon_mutations_enabled, hub_config_path, list_projects, load_hub_config, save_hub_config,
-    session_backend_enabled, touch_project_launched, DevConfig, HubConfig, ProjectMeta,
-    ProjectSummary,
+    hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
+    HubConfig, ProjectMeta, ProjectSummary,
 };
 pub use daemon_lifecycle::{
     daemon_lock_held, ensure_daemon_running, hub_lock_path, stop_daemon,
@@ -132,9 +131,7 @@ pub use change_bus::{
     publish_change, publish_layout, subscribe_changes, ChangeNotification, ChangeSubscription,
     LayoutEvent,
 };
-pub use daemon_poller::{
-    acquire_poller_lock, daemon_poller_enabled, poller_lock_path, PollerLock, DAEMON_POLLER_ENV,
-};
+pub use daemon_poller::{acquire_poller_lock, poller_lock_path, PollerLock};
 pub use hub_version::{
     classify_daemon_version, daemon_version_status, ensure_daemon_matches_for_mutation,
     probe_daemon_hello, read_daemon_ack, DaemonHello, DaemonProbe, DaemonVersionStatus,
@@ -1597,9 +1594,8 @@ pub fn state_path(project: &str) -> Result<PathBuf> {
 // Global runtime state (~/.shelbi/state.json)
 
 /// Global cross-project runtime state at `~/.shelbi/state.json`. Tracks
-/// preferences that follow the user across every project: the most
-/// recent tmux palette binding (so the orchestrator can unbind it
-/// cleanly on rebind / project switch), the one-shot acknowledgement
+/// preferences that follow the user across every project: the one-shot
+/// acknowledgement
 /// of the Zen Mode intro popover (so the explanation doesn't re-fire in
 /// every project the user opens), the one-shot getting-started hint, and
 /// the sidebar's per-machine collapse state (a UI preference that follows
@@ -1610,11 +1606,6 @@ pub fn state_path(project: &str) -> Result<PathBuf> {
 /// `Eq` for it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GlobalState {
-    /// The exact tmux key string passed to `tmux bind-key -n …` on the
-    /// most recent install (e.g. `C-p`, `M-z`). `None` means no shelbi
-    /// session has installed a palette binding yet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tmux_palette_key: Option<String>,
     /// Set to `true` once the user has dismissed the Zen Mode intro
     /// popover with "Don't show this again" checked. The popover gates
     /// on this flag before rendering on every `off → on` toggle.
@@ -1648,7 +1639,6 @@ fn default_first_run_seen() -> bool {
 impl Default for GlobalState {
     fn default() -> Self {
         Self {
-            tmux_palette_key: None,
             zen_intro_seen: false,
             first_run_seen: true,
             sidebar: SidebarPrefs::default(),
@@ -1678,8 +1668,8 @@ impl SidebarPrefs {
 /// Flip the collapse state for `machine` in `~/.shelbi/state.json` and
 /// return whether the machine is now collapsed. Reads the current
 /// [`GlobalState`], mutates the set, and writes it back — the rest of
-/// the file is preserved (no overwriting `tmux_palette_key`,
-/// `zen_intro_seen`, or `first_run_seen`). Used by the sidebar's Space/Enter
+/// the file is preserved (no overwriting `zen_intro_seen` or
+/// `first_run_seen`). Used by the sidebar's Space/Enter
 /// handler when focus is on a `MachineGroup` row.
 pub fn toggle_sidebar_machine_collapsed(machine: &str) -> Result<bool> {
     update_global_state(|state| {
@@ -1930,7 +1920,6 @@ mod global_state_tests {
         std::env::set_var("SHELBI_HOME", &home);
         let s = read_global_state().unwrap();
         assert_eq!(s, GlobalState::default());
-        assert!(s.tmux_palette_key.is_none());
         assert!(
             s.first_run_seen,
             "an unarmed/missing state file must not onboard an existing project"
@@ -1970,7 +1959,12 @@ mod global_state_tests {
         .unwrap();
 
         let state = read_global_state().unwrap();
-        assert_eq!(state.tmux_palette_key.as_deref(), Some("M-z"));
+        // A removed field (`tmux_palette_key`) an older binary wrote is now an
+        // unknown key: it must survive in `extra`, not be dropped.
+        assert_eq!(
+            state.extra.get("tmux_palette_key"),
+            Some(&serde_json::json!("M-z"))
+        );
         assert_eq!(
             state.extra.get("telemetry_opt_in"),
             Some(&serde_json::json!(false))
@@ -1987,19 +1981,6 @@ mod global_state_tests {
         assert_eq!(disk["telemetry_opt_in"], serde_json::json!(false));
         assert_eq!(disk["future"], serde_json::json!([1, 2]));
 
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn round_trips_tmux_palette_key() {
-        let _g = LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        let mut s = read_global_state().unwrap();
-        s.tmux_palette_key = Some("M-z".into());
-        write_global_state(&s).unwrap();
-        let read_back = read_global_state().unwrap();
-        assert_eq!(read_back.tmux_palette_key.as_deref(), Some("M-z"));
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -2085,7 +2066,9 @@ mod global_state_tests {
         );
 
         let mut armed = read_global_state().unwrap();
-        armed.tmux_palette_key = Some("C-p".to_string());
+        armed
+            .extra
+            .insert("tmux_palette_key".to_string(), serde_json::json!("C-p"));
         armed
             .extra
             .insert("legacy_setting".to_string(), serde_json::json!(7));
@@ -2155,14 +2138,15 @@ mod global_state_tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         let mut s = read_global_state().unwrap();
-        s.tmux_palette_key = Some("M-z".into());
+        s.extra
+            .insert("tmux_palette_key".to_string(), serde_json::json!("M-z"));
         s.zen_intro_seen = true;
         s.first_run_seen = true;
         write_global_state(&s).unwrap();
 
         toggle_sidebar_machine_collapsed("hub").unwrap();
         let after = read_global_state().unwrap();
-        assert_eq!(after.tmux_palette_key.as_deref(), Some("M-z"));
+        assert_eq!(after.extra.get("tmux_palette_key"), Some(&serde_json::json!("M-z")));
         assert!(after.zen_intro_seen);
         assert!(after.first_run_seen);
         assert!(after.sidebar.collapsed_machines.contains("hub"));
@@ -2184,7 +2168,7 @@ mod global_state_tests {
         std::fs::write(home.join("state.json"), r#"{"tmux_palette_key":"C-p"}"#).unwrap();
         let s = read_global_state().unwrap();
         assert!(s.sidebar.collapsed_machines.is_empty());
-        assert_eq!(s.tmux_palette_key.as_deref(), Some("C-p"));
+        assert_eq!(s.extra.get("tmux_palette_key"), Some(&serde_json::json!("C-p")));
         std::env::remove_var("SHELBI_HOME");
     }
 }
@@ -2670,11 +2654,11 @@ pub fn parse_agent_file(text: &str) -> Result<AgentFile> {
 mod agent_tmux_addr_load_tests {
     use super::*;
 
-    /// Cutover (`rt-cutover-migration`): a persisted agent record written by the
-    /// tmux runtime carries a `tmux:` address. After the flip the new backend
-    /// ignores it, but such a record must still *load without error* — `Agent`
-    /// has no `deny_unknown_fields`, so the field is preserved and any key the
-    /// struct doesn't know is simply dropped rather than failing the parse.
+    /// Cutover: a persisted agent record written by the old tmux runtime carries
+    /// a `tmux:` address. After the cutover the `tmux` field is gone, but such a
+    /// record must still *load without error* — `Agent` has no
+    /// `deny_unknown_fields`, so an unknown `tmux:` key is simply dropped rather
+    /// than failing the parse.
     #[test]
     fn agent_record_with_tmux_address_loads() {
         let text = "\
@@ -2695,11 +2679,11 @@ legacy_backend_field: whatever
 ---
 body
 ";
-        let parsed = parse_agent_file(text).expect("tmux-addr agent record must load");
+        let parsed = parse_agent_file(text).expect("legacy tmux-addr agent record must load");
         assert_eq!(parsed.agent.id, "feat-x");
-        // The address is preserved on load (the tmux runtime still reads it; the
-        // session backend simply doesn't consult it).
-        assert_eq!(parsed.agent.tmux.session, "shelbi-w-feat-x");
+        // The `tmux:` key (and any other legacy field) is ignored on load, not a
+        // parse error.
+        assert_eq!(parsed.agent.machine, "hub");
         assert_eq!(parsed.body.trim(), "body");
     }
 }

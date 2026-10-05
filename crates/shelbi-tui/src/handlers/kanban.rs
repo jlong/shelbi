@@ -1,43 +1,12 @@
-use std::time::Duration;
 
-use anyhow::Result;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::{backend::Backend, Terminal};
 use shelbi_state::keymap::{GlobalAction, KanbanAction, Keymaps, PopoverAction};
 
-use crate::kanban::{self, KanbanApp};
+use crate::kanban::KanbanApp;
 
-pub fn tasks_loop<B: Backend>(
-    term: &mut Terminal<B>,
-    app: &mut KanbanApp,
-    km: &Keymaps,
-) -> Result<()> {
-    loop {
-        app.maybe_refresh();
-        // Apply any completed background card-move persistence (advance to the
-        // next queued hop, settle, or roll back on failure) before drawing, so
-        // outcomes show within a tick without the UI ever blocking on the write.
-        app.poll_pending_moves();
-        term.draw(|f| kanban::render_full(f, app, f.area()))?;
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                Event::Key(k) => {
-                    if k.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    match handle_kanban_key(app, k, km) {
-                        Outcome::Quit => return Ok(()),
-                        Outcome::Continue | Outcome::OpenPalette => {}
-                    }
-                }
-                Event::Mouse(m) => handle_kanban_mouse(app, m),
-                _ => {}
-            }
-        }
-    }
-}
+
 
 /// What the kanban handler signals back to its event loop. Mirrors the
 /// sidebar handler's [`crate::handlers::sidebar::Outcome`]: `Quit` ends

@@ -4,7 +4,6 @@ members = [
     "crates/shelbi-core",
     "crates/shelbi-state",
     "crates/shelbi-ssh",
-    "crates/shelbi-tmux",
     "crates/shelbi-agent",
     "crates/shelbi-orchestrator",
     "crates/shelbi-tui",
@@ -84,7 +83,6 @@ alacritty_terminal = { path = "vendor/alacritty_terminal" }
 shelbi-core = { path = "crates/shelbi-core" }
 shelbi-state = { path = "crates/shelbi-state" }
 shelbi-ssh = { path = "crates/shelbi-ssh" }
-shelbi-tmux = { path = "crates/shelbi-tmux" }
 shelbi-agent = { path = "crates/shelbi-agent" }
 shelbi-orchestrator = { path = "crates/shelbi-orchestrator" }
 shelbi-tui = { path = "crates/shelbi-tui" }

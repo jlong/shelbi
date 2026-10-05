@@ -30,7 +30,7 @@ pub use model::{
     Project, ProjectAgentConfig, ProjectRunnerConfig, ProjectShape,
     PromptInjectionKind, PromptInjectionSpec, ReviewConfig, RunnerKind, Session, SessionConfig, SessionProject, Status, Issue,
     IssueLaunchConfig, IssueZenConfig,
-    TmuxAddr, WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS,
+    WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS,
     DEFAULT_BUDGET_GRAPHQL_HIGH, DEFAULT_BUDGET_GRAPHQL_LOW, DEFAULT_BUDGET_GRAPHQL_MEDIUM,
     DEFAULT_BUDGET_REST_RESERVE, DEFAULT_BUDGET_SLOW_REFRESH_SECS,
     DEFAULT_ISSUE_REFRESH_SECS, DEFAULT_WORKFLOW_NAME, HEARTBEAT_DEFAULT, KNOWN_OPTIONAL_TASK_FIELDS,

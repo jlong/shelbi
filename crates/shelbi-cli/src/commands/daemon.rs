@@ -20,7 +20,7 @@
 //! - [`board`] — the hub-owned board-index refresh loop (one per open project)
 //!   and the `refresh-board` hub verb.
 //! - [`poller`] — the per-project workspace-poller manager (one poller per open
-//!   project), gated on the hidden `SHELBI_DAEMON_POLLER` dev setting.
+//!   project).
 //! - [`lifecycle`] — `restart` and `status` without a supervisor, plus the
 //!   `retire_supervisor_units` upgrade step [`serve`] calls on startup.
 

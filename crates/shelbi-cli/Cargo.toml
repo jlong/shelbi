@@ -16,7 +16,6 @@ path = "src/main.rs"
 shelbi-core = { workspace = true }
 shelbi-state = { workspace = true }
 shelbi-ssh = { workspace = true }
-shelbi-tmux = { workspace = true }
 shelbi-agent = { workspace = true }
 shelbi-orchestrator = { workspace = true }
 shelbi-tui = { workspace = true }

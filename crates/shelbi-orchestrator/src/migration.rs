@@ -1,9 +1,8 @@
 //! Phase 6 cutover: tmux → session-backend migration, tracked per workspace
 //! and enforced at dispatch (plan "Phase 6: Cutover", `rt-cutover-migration`).
 //!
-//! The cutover flips the runtime default to the session-process backend
-//! ([`shelbi_state::session_backend_enabled`]). Before the new backend may
-//! start an agent in a worktree, that worktree must be **proven idle** — a
+//! The cutover makes the session-process backend the only runtime. Before it
+//! may start an agent in a worktree, that worktree must be **proven idle** — a
 //! surviving tmux agent and a fresh session-process agent editing the same
 //! checkout is the hazard this module prevents. The durable per-workspace state
 //! lives in the project's `state.json`
@@ -26,11 +25,11 @@
 //!   workspace with a message that says why and how to resolve it. The rest of
 //!   the project keeps working.
 //!
-//! Every tmux query and kill runs against the **exact** session name
-//! ([`shelbi_tmux::session_target`]'s `=<name>` anchor), never a prefix, and
-//! goes through the [`MigrationProbe`] seam so tests exercise the whole pass
-//! against a stub rather than the real tmux server. This is cutover
-//! scaffolding; `rt-cutover-delete` removes it with the hidden backend setting.
+//! Every tmux query and kill runs against the **exact** session name (the
+//! `=<name>` anchor, never a prefix) and goes through the [`MigrationProbe`]
+//! seam so tests exercise the whole pass against a stub rather than the real
+//! tmux server. This is the one place Shelbi still shells out to tmux — a
+//! one-time check for a leftover session from the pre-cutover runtime.
 
 use std::time::Duration;
 
@@ -45,8 +44,8 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 /// The tmux operations the migration pass and open gate need, behind a seam so
 /// tests never touch the real tmux server (the hub runs inside its own live
 /// `shelbi-shelbi` session). The production implementation
-/// ([`RealMigrationProbe`]) shells out through `shelbi-tmux` / `shelbi-ssh`;
-/// tests install a stub.
+/// ([`RealMigrationProbe`]) shells out through `shelbi-ssh`; tests install a
+/// stub.
 pub trait MigrationProbe {
     /// Whether tmux is usable on the local hub at all. `false` means tmux is
     /// not installed, in which case no legacy local session can exist and every
@@ -65,10 +64,20 @@ pub trait MigrationProbe {
     fn kill_session(&self, host: &Host, name: &str);
 }
 
-/// Production [`MigrationProbe`]: exact-match tmux queries over `shelbi-tmux`
-/// (which routes local and SSH alike through `shelbi-ssh`) and an exact-match
-/// `kill-session`.
+/// Production [`MigrationProbe`]: exact-match tmux queries shelled out through
+/// `shelbi-ssh` (which routes local and SSH alike). This is the only remaining
+/// place Shelbi talks to tmux — a one-time check for a leftover session from the
+/// pre-cutover (tmux) runtime, kept so an upgrade migrates safely.
 pub struct RealMigrationProbe;
+
+impl RealMigrationProbe {
+    /// Exact-match tmux target (`=<name>`, never a prefix) so a query or kill can
+    /// only ever hit the session it was asked about — `=shelbi-w-bob` can't
+    /// match a live `shelbi-w-bob-2`.
+    fn exact(name: &str) -> String {
+        format!("={name}")
+    }
+}
 
 impl MigrationProbe for RealMigrationProbe {
     fn local_tmux_available(&self) -> bool {
@@ -80,17 +89,28 @@ impl MigrationProbe for RealMigrationProbe {
     }
 
     fn session_exists(&self, host: &Host, name: &str) -> Result<bool> {
-        // `shelbi_tmux::has_session*` targets `=<name>` (exact match, never a
-        // prefix) and returns Err on a transport failure rather than Ok(false).
-        // Bounded so an unreachable remote can't hang `shelbi open` on the SSH
-        // connect — a wedged probe times out and the workspace stays pending.
-        shelbi_tmux::has_session_with_deadline(host, name, PROBE_DEADLINE)
+        // `tmux has-session -t =<name>`: exit 0 exists, 1 absent, anything else
+        // is the transport failing — surfaced as Err (never a false Ok(false))
+        // so the caller leaves an unreachable remote pending. Bounded so an
+        // unreachable machine can't hang `shelbi open` on the SSH connect.
+        let target = Self::exact(name);
+        let out = shelbi_ssh::run_with_deadline(
+            host,
+            ["tmux", "has-session", "-t", target.as_str()],
+            PROBE_DEADLINE,
+        )
+        .map_err(Error::Io)?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(Error::Other(format!(
+                "could not determine whether tmux session `{name}` exists (transport failure)"
+            ))),
+        }
     }
 
     fn kill_session(&self, host: &Host, name: &str) {
-        // Exact-match target so we only ever kill the session we were asked
-        // about — `=shelbi-w-bob` can't prefix-match a live `shelbi-w-bob-2`.
-        let target = shelbi_tmux::session_target(name);
+        let target = Self::exact(name);
         let _ = shelbi_ssh::run(host, ["tmux", "kill-session", "-t", target.as_str()]);
     }
 }
@@ -117,22 +137,16 @@ fn local_session_names(project: &str) -> (String, String) {
 
 /// Whether a surviving legacy local session blocks opening `project`.
 ///
-/// On the tmux runtime (`session_backend` off) there is nothing to migrate and
-/// a live `shelbi-<p>` session is the *normal* open state, so this is always
-/// `Ok(())`. On the session backend, a surviving `shelbi-<p>` or `_shelbi-<p>`
-/// tmux session means an old sidebar/poller is still running; opening on the
-/// new runtime beside it would double-poll and could start a second agent in a
+/// A surviving `shelbi-<p>` or `_shelbi-<p>` tmux session (from the pre-cutover
+/// runtime) means an old sidebar/poller is still running; opening on the new
+/// runtime beside it would double-poll and could start a second agent in a
 /// worktree the old session still holds. Refuse with a message that says how to
-/// close it.
+/// close it. A no-op when tmux is not installed (nothing can be left over).
 pub fn ensure_project_openable(project: &str) -> Result<()> {
-    if !shelbi_state::session_backend_enabled() {
-        return Ok(());
-    }
     ensure_project_openable_with(project, &RealMigrationProbe)
 }
 
-/// [`ensure_project_openable`] with an injected probe (hermetic tests). The
-/// caller decides whether the session backend is active.
+/// [`ensure_project_openable`] with an injected probe (hermetic tests).
 pub fn ensure_project_openable_with(project: &str, probe: &dyn MigrationProbe) -> Result<()> {
     if !probe.local_tmux_available() {
         return Ok(());
@@ -147,10 +161,10 @@ pub fn ensure_project_openable_with(project: &str, probe: &dyn MigrationProbe) -
         let which = if main_live { &main } else { &stash };
         return Err(Error::Other(format!(
             "project `{project}` still has a running tmux session `{which}` from the \
-             previous (tmux) runtime. Close it first with `shelbi quit` (or the \
-             palette's Quit Project), then reopen `{project}`. Opening on the new \
-             runtime beside the old session would run two pollers at once and could \
-             start a second agent in a worktree the old session still holds."
+             previous (tmux) runtime. Close it first with `tmux kill-session -t ={which}`, \
+             then reopen `{project}`. Opening on the new runtime beside the old session \
+             would run two pollers at once and could start a second agent in a worktree \
+             the old session still holds."
         )));
     }
     Ok(())
@@ -313,27 +327,32 @@ fn persist_and_log(project: &str, m: &WorkspaceMigration) {
     let _ = shelbi_state::append_migration_event(project, &m.workspace, m.state.as_str(), m.detail);
 }
 
-/// Refuse to dispatch an agent onto `workspace` until it is migrated.
+/// Refuse to dispatch an agent onto `workspace` while it is explicitly
+/// [`MigrationState::Pending`] — its worktree may still be held by a tmux agent
+/// from the pre-cutover runtime. Every dispatch path funnels through the launch
+/// primitives that call this, so a pending workspace can never have an agent
+/// started in it.
 ///
-/// A no-op on the tmux runtime (nothing to migrate). On the session backend,
-/// returns `Err` with a user-facing message unless the workspace is
-/// [`MigrationState::Migrated`]. Every dispatch path funnels through the launch
-/// primitives that call this, so a pending workspace can never have a
-/// session-process agent started in it.
+/// A workspace with **no** recorded migration entry reads as dispatchable: the
+/// open-time migration pass records an explicit entry for every workspace
+/// declared before cutover, so a missing entry means a workspace added after
+/// cutover (`shelbi workspace add`) — created on the new runtime, with no
+/// pre-cutover tmux agent that could be holding its worktree. Blocking it would
+/// wedge dispatch forever.
 pub fn ensure_workspace_dispatchable(project: &str, workspace: &str) -> Result<()> {
-    if !shelbi_state::session_backend_enabled() {
-        return Ok(());
+    if matches!(
+        shelbi_state::workspace_migration_state(project, workspace)?,
+        Some(MigrationState::Pending)
+    ) {
+        return Err(Error::Other(format!(
+            "workspace `{workspace}` has not finished migrating off tmux, so a new agent \
+             can't start in it yet. Its worktree may still be held by a tmux session from \
+             the previous runtime. Reopen `{project}` to re-run migration; a remote \
+             workspace stays pending until its machine is reachable and its \
+             `shelbi-w-{workspace}` session is confirmed gone."
+        )));
     }
-    if shelbi_state::workspace_migrated(project, workspace)? {
-        return Ok(());
-    }
-    Err(Error::Other(format!(
-        "workspace `{workspace}` has not finished migrating off tmux, so a new agent \
-         can't start in it yet. Its worktree may still be held by a tmux session from \
-         the previous runtime. Reopen `{project}` to re-run migration; a remote \
-         workspace stays pending until its machine is reachable and its \
-         `shelbi-w-{workspace}` session is confirmed gone."
-    )))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -492,7 +511,6 @@ mod tests {
     struct HomeGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         prev_home: Option<std::ffi::OsString>,
-        prev_backend: Option<std::ffi::OsString>,
         home: PathBuf,
     }
     impl HomeGuard {
@@ -508,14 +526,10 @@ mod tests {
             ));
             std::fs::create_dir_all(home.join("projects").join(project)).unwrap();
             let prev_home = std::env::var_os("SHELBI_HOME");
-            // Captured so we restore (not clobber) whatever the suite's tmux
-            // harness pinned — leaving it exactly as we found it on drop.
-            let prev_backend = std::env::var_os("SHELBI_SESSION_BACKEND");
             std::env::set_var("SHELBI_HOME", &home);
             Self {
                 _lock: lock,
                 prev_home,
-                prev_backend,
                 home,
             }
         }
@@ -525,10 +539,6 @@ mod tests {
             match self.prev_home.take() {
                 Some(v) => std::env::set_var("SHELBI_HOME", v),
                 None => std::env::remove_var("SHELBI_HOME"),
-            }
-            match self.prev_backend.take() {
-                Some(v) => std::env::set_var("SHELBI_SESSION_BACKEND", v),
-                None => std::env::remove_var("SHELBI_SESSION_BACKEND"),
             }
             let _ = std::fs::remove_dir_all(&self.home);
         }
@@ -546,7 +556,10 @@ mod tests {
         let err = ensure_project_openable_with("demo", &probe).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("shelbi-demo"), "names the live session: {msg}");
-        assert!(msg.contains("shelbi quit"), "says how to close it: {msg}");
+        assert!(
+            msg.contains("tmux kill-session"),
+            "says how to close it: {msg}"
+        );
 
         // The hidden stash session alone also refuses.
         let probe = StubProbe::new(true, true);
@@ -647,7 +660,6 @@ mod tests {
     #[test]
     fn unreachable_remote_stays_pending_dispatch_refused_others_ok() {
         let _g = HomeGuard::new("demo");
-        std::env::set_var("SHELBI_SESSION_BACKEND", "1");
         let p = test_project("demo");
         let probe = StubProbe::new(true, true);
         probe.set("shelbi-w-bob", Answer::Unreachable);
@@ -677,7 +689,6 @@ mod tests {
         // live) is refused; once migration flips it to migrated, the same
         // dispatch gate lets the redispatch through.
         let _g = HomeGuard::new("demo");
-        std::env::set_var("SHELBI_SESSION_BACKEND", "1");
 
         shelbi_state::set_workspace_migration_state("demo", "bob", MigrationState::Pending)
             .unwrap();
@@ -689,11 +700,12 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_gate_is_a_noop_on_the_tmux_runtime() {
+    fn absent_migration_entry_reads_as_dispatchable() {
+        // A workspace with no recorded migration entry (e.g. added after cutover
+        // via `shelbi workspace add`) must be dispatchable — only an explicit
+        // `Pending` blocks. Blocking a never-recorded workspace would wedge its
+        // dispatch forever.
         let _g = HomeGuard::new("demo");
-        std::env::set_var("SHELBI_SESSION_BACKEND", "0");
-        // No migration state recorded at all, but the tmux runtime has nothing
-        // to migrate, so dispatch is never gated.
-        ensure_workspace_dispatchable("demo", "bob").unwrap();
+        ensure_workspace_dispatchable("demo", "never-recorded").unwrap();
     }
 }

@@ -2,7 +2,7 @@
 //! backend** (`rt-backend-sessions`), against a real `shelbi __session` process
 //! running a stub agent.
 //!
-//! This is the Phase 2 acceptance: with the hidden dev flag on, the orchestrator
+//! This is the Phase 2 acceptance: the orchestrator
 //! spawns a worker as a detached session, detects ready/busy through the
 //! backend's `snapshot` + `title`, delivers a message through the same seam
 //! `submit::deliver_text` uses, and observes the review-ready marker the agent
@@ -11,8 +11,7 @@
 //! The session is spawned with the real binary (`CARGO_BIN_EXE_shelbi` via
 //! `spawn_with_exe`) so a genuine `shelbi __session` owns the PTY and emulator;
 //! every subsequent operation (probe, snapshot, title, deliver, kill) goes
-//! through `session_backend::backend()`, which the `SHELBI_SESSION_BACKEND=1`
-//! flag points at the session-process backend. Production `spawn_local_pane`
+//! through `session_backend::backend()`, the one runtime. Production `spawn_local_pane`
 //! finds the binary via `current_exe` (covered by the `to_session_spawn_spec`
 //! unit test); a cargo test's `current_exe` is the harness, so the e2e uses the
 //! explicit-exe spawn to run the real session binary.
@@ -23,14 +22,14 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use shelbi_core::{Host, TmuxAddr};
+use shelbi_core::Host;
 use shelbi_orchestrator::ready;
 use shelbi_orchestrator::session_backend::{backend, Liveness, SessionBackend, SessionTarget};
 use shelbi_session::SpawnSpec;
 use shelbi_state::{parse_pane_title_marker, PaneMarker};
 
-/// These tests mutate process-global env (`SHELBI_HOME`, `SHELBI_SESSION_BACKEND`,
-/// `SHELL`), so they serialize against each other through this lock.
+/// These tests mutate process-global env (`SHELBI_HOME`, `SHELL`), so they
+/// serialize against each other through this lock.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Poll `f` until it returns `Some`, or the deadline passes.
@@ -55,20 +54,14 @@ fn local_dispatch_to_handoff_cycle_on_the_session_backend() {
     let cwd = tempfile::tempdir().unwrap();
     let marker = home.path().join("review-ready.marker");
 
-    // Point the whole process at this isolated home and turn the hidden dev flag
-    // on, so `backend()` resolves to the session-process backend and
-    // `sessions_dir()` lands under the temp home.
+    // Point the whole process at this isolated home so `sessions_dir()` lands
+    // under the temp home.
     std::env::set_var("SHELBI_HOME", home.path());
-    std::env::set_var("SHELBI_SESSION_BACKEND", "1");
 
     // The worker addressed the way the orchestrator addresses a local workspace:
     // a window named `alice` inside the project session `shelbi-demo`. The
     // session backend derives the logical name `demo/ws/alice` from this.
-    let addr = TmuxAddr {
-        session: "shelbi-demo".into(),
-        window: "alice".into(),
-    };
-    let target = SessionTarget::from_tmux_addr(&addr);
+    let target = SessionTarget::slot("shelbi-demo", "alice");
 
     // Before dispatch, nothing is bound to the slot.
     assert_eq!(backend().probe(&Host::Local, &target, None), Liveness::Dead);
@@ -110,7 +103,6 @@ fn local_dispatch_to_handoff_cycle_on_the_session_backend() {
     impl Drop for Guard<'_> {
         fn drop(&mut self) {
             let _ = backend().kill(&Host::Local, self.target);
-            std::env::remove_var("SHELBI_SESSION_BACKEND");
             std::env::remove_var("SHELBI_HOME");
         }
     }
@@ -147,7 +139,7 @@ fn local_dispatch_to_handoff_cycle_on_the_session_backend() {
     // injection lock + paste + Enter. `spawned.id` keeps the session reachable
     // for the cleanup guard even though we address by target.
     let _ = &spawned.id;
-    shelbi_orchestrator::submit::deliver_text(&Host::Local, &addr, "please review")
+    shelbi_orchestrator::submit::deliver_text(&Host::Local, &target, "please review")
         .expect("deliver the handoff message through the session backend");
 
     // The handoff: the agent wrote its review-ready marker, and its title now
@@ -193,7 +185,6 @@ fn orchestrator_runs_as_a_session_without_tmux_pane_and_delivers_input_once() {
     let delivered_file = home.path().join("delivered.txt");
 
     std::env::set_var("SHELBI_HOME", home.path());
-    std::env::set_var("SHELBI_SESSION_BACKEND", "1");
     // A deterministic login shell for `orchestrator_session_spec`'s `$SHELL -lc`.
     std::env::set_var("SHELL", "/bin/sh");
 
@@ -245,7 +236,6 @@ fn orchestrator_runs_as_a_session_without_tmux_pane_and_delivers_input_once() {
     impl Drop for Guard<'_> {
         fn drop(&mut self) {
             let _ = backend().kill(&Host::Local, self.target);
-            std::env::remove_var("SHELBI_SESSION_BACKEND");
             std::env::remove_var("SHELBI_HOME");
             std::env::remove_var("SHELL");
         }

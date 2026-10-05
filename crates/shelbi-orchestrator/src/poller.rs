@@ -1,7 +1,6 @@
-//! Background workspace-state poller. Runs either in the sidebar process or,
-//! when the hidden `SHELBI_DAEMON_POLLER` dev setting is on, in `shelbi daemon`
-//! (one [`WorkspacePoller`] per open project, started by the daemon's poller
-//! manager). It is the only place the hub talks to workspace panes for
+//! Background workspace-state poller. Runs in `shelbi daemon` (one
+//! [`WorkspacePoller`] per open project, started by the daemon's poller
+//! manager). It is the only place the hub talks to workspace sessions for
 //! observability. A per-project lock ([`shelbi_state::acquire_poller_lock`])
 //! guarantees exactly one poller runs for a project even if a stale sidebar
 //! overlaps a daemon that has taken over.
@@ -1506,7 +1505,7 @@ fn poll_one(
         return;
     };
     let host = machine.host();
-    let Ok(addr) = crate::workspace::workspace_tmux_addr(project, workspace) else {
+    let Ok(addr) = crate::workspace::workspace_target(project, workspace) else {
         return;
     };
 
@@ -1599,7 +1598,7 @@ fn poll_one(
     // can't see it. Best-effort: a capture failure leaves both untouched and
     // we fall through to the title path.
     let screen = backend()
-        .snapshot(&host, &SessionTarget::from_tmux_addr(&addr))
+        .snapshot(&host, &addr)
         .ok();
 
     // Usage-limit *pause* takes priority. Matched structurally against
@@ -1847,7 +1846,7 @@ fn poll_one(
         // busy/ready sample once the human answers.
         None if dialog.is_some() => WorkspaceState::Blocked,
         None => {
-            let title = match backend().title(&host, &SessionTarget::from_tmux_addr(&addr)) {
+            let title = match backend().title(&host, &addr) {
                 Ok(t) => t,
                 Err(_) => return,
             };
@@ -2500,7 +2499,7 @@ fn handle_limit_stall(
             let project_name = project.name.clone();
             let workspace_name = workspace.name.clone();
             let task_id = incident.task_id.clone();
-            let Ok(addr) = crate::workspace::workspace_tmux_addr(project, workspace)
+            let Ok(addr) = crate::workspace::workspace_target(project, workspace)
             else {
                 append("needs-human", &[("reason", "invalid-pane-address")]);
                 *state = LimitResumeState::NeedsHuman {
@@ -2721,7 +2720,7 @@ fn maybe_apply_ready_handoff(
     workspace: &shelbi_core::WorkspaceSpec,
     machine: &shelbi_core::Machine,
     host: &shelbi_core::Host,
-    addr: &shelbi_core::TmuxAddr,
+    addr: &SessionTarget,
 ) {
     let marker = crate::workspace::workspace_ready_marker(machine, workspace);
     let deferred_marker =
@@ -3336,7 +3335,7 @@ fn maybe_apply_transition(
     workspace: &shelbi_core::WorkspaceSpec,
     machine: &shelbi_core::Machine,
     host: &shelbi_core::Host,
-    addr: &shelbi_core::TmuxAddr,
+    addr: &SessionTarget,
 ) {
     let marker = crate::workspace::workspace_transition_marker(machine, workspace);
     let req = match crate::workspace::read_transition_marker(host, &marker) {
@@ -4045,50 +4044,7 @@ fn redispatch_workspace(
     Ok(())
 }
 
-/// Auto-restart supervision for the project's orchestrator pane, run once
-/// per supervisor tick. Unlike a workspace it has no idle state and no
-/// deliberate-shutdown marker: while its session is alive it should always be
-/// running, and a real quit tears down the whole session (killing this poller
-/// with it), so any orchestrator death this can observe is a crash. Relaunch
-/// is [`ensure_dashboard`], whose `__zen-orch-start` step keeps the Zen
-/// crash-recovery downgrade intact — a restarted orchestrator still comes up
-/// with Zen off.
-/// Whether review slot `workspace`'s agent is alive but **parked** outside a
-/// window — a View Diff / editor swap collapsed its window while the agent kept
-/// running in the stash ([`crate::review_ui::recover_parked_review_agent`]).
-///
-/// A read-only probe over the [`SessionBackend`] seam: the review interface's
-/// session env records which slot it is bound to ([`crate::review_ui::WS_KEY`])
-/// and the agent's chat pane id ([`crate::review_ui::CHAT_KEY`]); the slot is
-/// parked when the interface is bound to *this* window and that chat pane is
-/// still live. It makes no tmux layout call and no `review_ui` pane call
-/// (`rt-daemon-layout-split`), so the daemon poller can decide *not* to relaunch
-/// — the break-pane recovery itself is a client's reaction to the published
-/// `ReviewAgentRecovered` event. Conservative: any missing var or probe
-/// uncertainty reads as "not parked", so a genuinely dead slot still resumes.
-fn parked_review_agent_present(project: &Project, workspace: &str) -> bool {
-    let Some(hub) = project
-        .machines
-        .iter()
-        .find(|m| matches!(m.kind, shelbi_core::MachineKind::Local))
-    else {
-        return false;
-    };
-    let host = hub.host();
-    let session = SessionTarget::session(format!("shelbi-{}", project.name));
-    // The interface must be bound to THIS slot's window…
-    match backend().get_env(&host, &session, crate::review_ui::WS_KEY) {
-        Ok(Some(ws)) if ws == workspace => {}
-        _ => return false,
-    }
-    // …and its agent (chat) pane must still be alive somewhere on the server.
-    let Ok(Some(chat)) = backend().get_env(&host, &session, crate::review_ui::CHAT_KEY) else {
-        return false;
-    };
-    backend()
-        .probe(&host, &SessionTarget::pane(chat), None)
-        .is_alive()
-}
+
 
 fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState) {
     let alive = crate::orchestrator_pane_alive(&project.name).unwrap_or(true);
@@ -4289,7 +4245,7 @@ fn gate_task_is_served(project: &Project, task: &shelbi_core::Issue) -> bool {
         return false;
     };
     let host = machine.host();
-    let Ok(addr) = crate::workspace::workspace_tmux_addr(project, ws) else {
+    let Ok(addr) = crate::workspace::workspace_target(project, ws) else {
         return false;
     };
     crate::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true)
@@ -4413,7 +4369,7 @@ fn maybe_resume_stranded_review_slots(
         if !matches!(host, shelbi_core::Host::Local) {
             continue;
         }
-        let Ok(addr) = crate::workspace::workspace_tmux_addr(project, ws) else {
+        let Ok(addr) = crate::workspace::workspace_target(project, ws) else {
             continue;
         };
         let now = Instant::now();
@@ -4446,33 +4402,6 @@ fn maybe_resume_stranded_review_slots(
         // the dispatcher only just seeded has no parked View-Diff agent to
         // recover.
         if shelbi_state::recent_dispatch_active(&project.name, &ws.name, DISPATCH_CONFIRM_GRACE) {
-            entry.note_alive(now);
-            continue;
-        }
-
-        // Window gone, but the review agent may still be alive, parked in the
-        // stash by a View Diff / editor swap whose content pane (and the panel)
-        // since exited. Bring that agent back instead of relaunching: a relaunch
-        // reseeds a second agent into a bare window and strands the parked one
-        // as a zombie. The poller only *detects* the parked agent (a read-only
-        // probe over the `SessionBackend` seam — no tmux layout, no `review_ui`
-        // pane call, `rt-daemon-layout-split`); the break-pane recovery is a
-        // client's reaction to the published `ReviewAgentRecovered` event.
-        if parked_review_agent_present(project, &ws.name) {
-            shelbi_state::publish_layout(
-                &project.name,
-                shelbi_state::LayoutEvent::ReviewAgentRecovered {
-                    workspace: ws.name.clone(),
-                },
-            );
-            if let Err(e) = shelbi_state::append_workspace_pane_event(
-                &project.name,
-                &ws.name,
-                true,
-                "review-agent-recovered-from-stash",
-            ) {
-                tracing::warn!(workspace = %ws.name, error = %e, "append_workspace_pane_event failed");
-            }
             entry.note_alive(now);
             continue;
         }
@@ -4828,7 +4757,7 @@ fn maybe_resume_stranded_dev_slots(
         if !matches!(host, shelbi_core::Host::Local) {
             continue;
         }
-        let Ok(addr) = crate::workspace::workspace_tmux_addr(project, ws) else {
+        let Ok(addr) = crate::workspace::workspace_target(project, ws) else {
             continue;
         };
         let now = Instant::now();
@@ -5033,7 +4962,7 @@ fn handle_review_slot(
     workspace: &shelbi_core::WorkspaceSpec,
     machine: &shelbi_core::Machine,
     host: &shelbi_core::Host,
-    addr: &shelbi_core::TmuxAddr,
+    addr: &SessionTarget,
     last_known: &mut Option<WorkspaceState>,
 ) -> bool {
     let marker =
@@ -5176,10 +5105,10 @@ fn emit_review_ready(
     };
     let worktree =
         crate::workspace::workspace_worktree(machine, workspace).to_string_lossy().into_owned();
-    let pane = match crate::workspace::workspace_tmux_addr(project, workspace) {
-        Ok(addr) => addr.target(),
+    let pane = match crate::workspace::workspace_target(project, workspace) {
+        Ok(addr) => addr.label(),
         Err(e) => {
-            tracing::warn!(workspace = %workspace.name, error = %e, "review-ready: tmux addr resolution failed");
+            tracing::warn!(workspace = %workspace.name, error = %e, "review-ready: session target resolution failed");
             String::new()
         }
     };
@@ -5248,7 +5177,7 @@ fn maybe_reap_orphaned_review_slot(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     host: &shelbi_core::Host,
-    addr: &shelbi_core::TmuxAddr,
+    addr: &SessionTarget,
     marker: &std::path::Path,
 ) -> bool {
     // Clear any stale marker first so the Ready row drops even if the reap below
@@ -5371,7 +5300,7 @@ fn maybe_reconcile_orphaned_pane(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     host: &shelbi_core::Host,
-    addr: &shelbi_core::TmuxAddr,
+    addr: &SessionTarget,
     orphan_since: &mut Option<Instant>,
 ) -> bool {
     // Require a WARM board read: "no active task points here" may only reap when
@@ -5967,10 +5896,7 @@ Intro prose.
         std::fs::write(&marker, "gone-task http://localhost:4310\n").unwrap();
 
         let host = Host::Local;
-        let addr = TmuxAddr {
-            session: "shelbi-nonexistent-review-reap".into(),
-            window: "review-1".into(),
-        };
+        let addr = SessionTarget::slot("shelbi-nonexistent-review-reap", "review-1");
         let acted = maybe_reap_orphaned_review_slot(&project, &ws, &host, &addr, &marker);
         assert!(acted, "a lingering marker with no assigned task must be reaped");
         assert!(!marker.exists(), "the stale marker must be cleared");
@@ -6869,7 +6795,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
     }
 
     use shelbi_core::{
-        AgentRunnerSpec, Host, Machine, MachineKind, OrchestratorSpec, Issue, TmuxAddr,
+        AgentRunnerSpec, Host, Machine, MachineKind, OrchestratorSpec, Issue,
         WorkspaceSpec,
     };
     use std::collections::BTreeMap;
@@ -7454,86 +7380,36 @@ Auto mode works better when it knows your environment. Takes about a minute.
         }
     }
 
-    fn tmux_available() -> bool {
-        std::process::Command::new("tmux")
-            .arg("-V")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-    }
-
-    fn kill_tmux_session(session: &str) {
-        let _ = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", &format!("={session}")])
-            .output();
-    }
-
-    /// Start the fake-Claude pane and wait until tmux has registered it. Real
-    /// tmux tests share one server, whose socket can briefly race concurrent
-    /// session creation, so use the retry pattern from the orchestrator's
-    /// existing tmux integration tests rather than trusting one spawn.
-    fn start_limit_resume_tmux_session(
-        session: &str,
-        script: &std::path::Path,
-        receipt: &std::path::Path,
-    ) {
-        kill_tmux_session(session);
-        for _ in 0..50 {
-            let _ = std::process::Command::new("tmux")
-                .args(["new-session", "-d", "-s", session, "-n", "alpha"])
-                .arg("sh")
-                .arg(script)
-                .arg(receipt)
-                .status();
-            let live = std::process::Command::new("tmux")
-                .args(["has-session", "-t", &format!("={session}")])
-                .output()
-                .map(|out| out.status.success())
-                .unwrap_or(false);
-            if live {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        panic!("tmux session `{session}` never came up");
-    }
-
-    fn wait_for_limit_modal(host: &Host, addr: &TmuxAddr) -> String {
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(3);
-        while start.elapsed() < timeout {
-            let screen = shelbi_tmux::capture(host, addr).unwrap_or_default();
-            if crate::ready::detect_usage_limit(&screen).is_some() {
-                return screen;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        panic!(
-            "fake Claude never rendered its limit modal; last screen:\n{}",
-            shelbi_tmux::capture(host, addr).unwrap_or_default()
-        );
-    }
 
 
-    struct LimitResumeTmuxCleanup {
-        session: String,
+
+
+
+
+
+
+
+
+
+
+
+    /// RAII guard that restores `SHELBI_HOME` / `SHELBI_HUB_SOCK` and removes
+    /// the temp home on drop, so an env-mutating test cleans up even on panic.
+    struct LimitResumeCleanup {
         home: std::path::PathBuf,
         prior_home: Option<std::ffi::OsString>,
         prior_hub_sock: Option<std::ffi::OsString>,
     }
 
-    impl Drop for LimitResumeTmuxCleanup {
+    impl Drop for LimitResumeCleanup {
         fn drop(&mut self) {
-            kill_tmux_session(&self.session);
-            if let Some(home) = &self.prior_home {
-                std::env::set_var("SHELBI_HOME", home);
-            } else {
-                std::env::remove_var("SHELBI_HOME");
+            match &self.prior_home {
+                Some(home) => std::env::set_var("SHELBI_HOME", home),
+                None => std::env::remove_var("SHELBI_HOME"),
             }
-            if let Some(sock) = &self.prior_hub_sock {
-                std::env::set_var("SHELBI_HUB_SOCK", sock);
-            } else {
-                std::env::remove_var("SHELBI_HUB_SOCK");
+            match &self.prior_hub_sock {
+                Some(sock) => std::env::set_var("SHELBI_HUB_SOCK", sock),
+                None => std::env::remove_var("SHELBI_HUB_SOCK"),
             }
             let _ = std::fs::remove_dir_all(&self.home);
         }
@@ -7555,8 +7431,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         std::fs::create_dir_all(&home).unwrap();
         let prior_home = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", &home);
-        let _cleanup = LimitResumeTmuxCleanup {
-            session: format!("unused-{project_name}"),
+        let _cleanup = LimitResumeCleanup {
             home: home.clone(),
             prior_home,
             prior_hub_sock: std::env::var_os("SHELBI_HUB_SOCK"),
@@ -7631,291 +7506,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         assert!(!limit_resume_eligible_now(&project.name, "alpha", task_id));
     }
 
-    /// Full wire-path regression for a limited Claude worker: the poller
-    /// captures a real tmux pane, schedules the structurally current banner,
-    /// dismisses the modal, delivers + verifies the prompt, clears the pause
-    /// badge, and suppresses the same stale banner on the next heartbeat.
-    #[test]
-    fn limit_resume_tmux_round_trip_clears_pause_without_duplicate() {
-        if !tmux_available() {
-            eprintln!("skipping: tmux not on PATH");
-            return;
-        }
 
-        let _env = crate::test_lock::acquire();
-        let nonce = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let project_name = format!("limit-resume-e2e-{nonce}");
-        let session = format!("shelbi-{project_name}");
-        let home = std::env::temp_dir().join(&project_name);
-        std::fs::create_dir_all(&home).unwrap();
-        let prior_home = std::env::var_os("SHELBI_HOME");
-        std::env::set_var("SHELBI_HOME", &home);
-        let prior_hub_sock = std::env::var_os("SHELBI_HUB_SOCK");
-        let hub_sock = home.join("hub.sock");
-        let hub = std::os::unix::net::UnixListener::bind(&hub_sock).unwrap();
-        std::env::set_var("SHELBI_HUB_SOCK", &hub_sock);
-        let matching_daemon = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            for _ in 0..3 {
-                let (mut stream, _) = hub.accept().unwrap();
-                let mut request = Vec::new();
-                stream.read_to_end(&mut request).unwrap();
-                assert!(request.is_empty(), "version probe must send no frame");
-                stream
-                    .write_all(
-                        shelbi_state::DaemonHello::new(env!("CARGO_PKG_VERSION"))
-                            .to_line()
-                            .as_bytes(),
-                    )
-                    .unwrap();
-            }
-        });
-        let _cleanup = LimitResumeTmuxCleanup {
-            session: session.clone(),
-            home: home.clone(),
-            prior_home,
-            prior_hub_sock,
-        };
-
-        let work_dir = home.join("repo");
-        std::fs::create_dir_all(&work_dir).unwrap();
-        let mut project = local_project(&work_dir);
-        project.name.clone_from(&project_name);
-        shelbi_state::save_project(&project).unwrap();
-        let task_id = "resume-limited-worker";
-        shelbi_state::save_task(
-            &project.name,
-            &in_progress_task(task_id, "alpha"),
-            "keep working",
-        )
-        .unwrap();
-
-        // A tiny deterministic terminal app stands in for Claude. The first
-        // read is the modal-selection Enter. The second is the resume prompt;
-        // after consuming it the app deliberately clobbers its title and
-        // redraws stale modal pixels beside a genuine busy footer. That final
-        // screen pins the Resumed latch and direct badge-clear behavior.
-        let receipt = home.join("fake-claude.receipt");
-        let script = home.join("fake-claude.sh");
-        std::fs::write(
-            &script,
-            r#"receipt=$1
-show_current_modal() {
-  printf '%s\n' \
-    "⏱ You've hit your session limit · resets 7:20am (America/New_York)" \
-    "" \
-    " ❯ 1. Stop and wait for limit to reset" \
-    "   2. Upgrade your plan"
-}
-
-printf '\033]2;shelbi:working\007'
-printf '\033[2J\033[H'
-printf '%s\n' \
-  "Earlier conversation:" \
-  "⏱ You've hit your session limit · resets 1:05am (Europe/London)" \
-  " ❯ 1. Stop and wait for limit to reset" \
-  "   2. Upgrade your plan" \
-  ""
-show_current_modal
-
-IFS= read -r modal_choice
-printf 'dismissed=%s\n' "$modal_choice" > "$receipt"
-printf '\033[2J\033[H'
-printf '%s\n' \
-  "────────────────────────────────────────────────────────" \
-  "❯ " \
-  "────────────────────────────────────────────────────────" \
-  "  ⏵⏵ auto mode on (shift+tab to cycle)"
-
-IFS= read -r prompt
-printf 'prompt=%s\n' "$prompt" >> "$receipt"
-printf '\033]2;Claude Code\007'
-printf '\033[2J\033[H'
-show_current_modal
-printf '%s\n' "" "⏺ Working…" "  esc to interrupt"
-while :; do sleep 60; done
-"#,
-        )
-        .unwrap();
-        start_limit_resume_tmux_session(&session, &script, &receipt);
-
-        let host = Host::Local;
-        let addr = TmuxAddr {
-            session,
-            window: "alpha".into(),
-        };
-        let initial_screen = wait_for_limit_modal(&host, &addr);
-        assert!(initial_screen.contains("1:05am (Europe/London)"));
-        assert!(initial_screen.contains("7:20am (America/New_York)"));
-
-        let workspace = &project.workspaces[0];
-        let mut last_known = None;
-        let mut last_dialog = None;
-        let mut supervision = SupervisionState::default();
-        let mut limit_resume = LimitResumeState::default();
-        let mut orphan_since: Option<Instant> = None;
-
-        // Banner -> scheduled: persist the pause and surface the actual badge,
-        // but do not touch the modal before the stated due time.
-        poll_one(
-            &project,
-            workspace,
-            &mut last_known,
-            &mut last_dialog,
-            &mut 0,
-            &mut 0,
-            &mut false,
-            &mut supervision,
-            &mut limit_resume,
-            &mut orphan_since,
-        );
-        assert_eq!(last_known, Some(WorkspaceState::Paused));
-        let paused = load_workspace_status("alpha").unwrap().unwrap();
-        assert_eq!(paused.state, WorkspaceState::Paused);
-        assert_eq!(paused.current_task.as_deref(), Some(task_id));
-        assert!(!receipt.exists(), "the modal was touched before due");
-
-        let due = match &mut limit_resume {
-            LimitResumeState::Scheduled {
-                incident,
-                due,
-                attempts,
-            } => {
-                assert_eq!(incident.task_id, task_id);
-                assert_eq!(
-                    incident.banner,
-                    "⏱ You've hit your session limit · resets 7:20am (America/New_York)"
-                );
-                assert_eq!(
-                    incident.reset_hint.as_deref(),
-                    Some("7:20am (America/New_York)")
-                );
-                assert_eq!(*attempts, 0);
-                let scheduled = *due;
-                *due = Utc::now() - chrono::Duration::seconds(1);
-                scheduled
-            }
-            other => panic!("expected a scheduled resume, got {other:?}"),
-        };
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        assert_eq!(
-            log.lines()
-                .filter(|line| line.contains("supervision=limit-resume status=scheduled"))
-                .count(),
-            1,
-            "events.log: {log}"
-        );
-        assert!(
-            log.contains(&format!("scheduled_for={}", due.to_rfc3339())),
-            "events.log: {log}"
-        );
-        assert!(
-            !log.contains("reset=1:05am_(Europe/London)"),
-            "stale reset leaked into the scheduled incident: {log}"
-        );
-
-        // Due -> modal dismissal -> verified submission. The fake app only
-        // writes the prompt receipt after its terminal read consumed Enter.
-        poll_one(
-            &project,
-            workspace,
-            &mut last_known,
-            &mut last_dialog,
-            &mut 0,
-            &mut 0,
-            &mut false,
-            &mut supervision,
-            &mut limit_resume,
-            &mut orphan_since,
-        );
-        assert_eq!(
-            std::fs::read_to_string(&receipt).unwrap(),
-            format!("dismissed=\nprompt={LIMIT_RESUME_PROMPT}\n")
-        );
-        assert_eq!(last_known, Some(WorkspaceState::Working));
-        let working = load_workspace_status("alpha").unwrap().unwrap();
-        assert_eq!(working.state, WorkspaceState::Working);
-        assert_eq!(working.current_task.as_deref(), Some(task_id));
-        assert!(matches!(limit_resume, LimitResumeState::Resumed { .. }));
-
-        let stale_screen = shelbi_tmux::capture(&host, &addr).unwrap();
-        assert!(stale_screen.contains("7:20am (America/New_York)"));
-        assert!(stale_screen.contains("esc to interrupt"));
-        let title = shelbi_tmux::pane_title(&host, &addr).unwrap();
-        assert!(
-            parse_pane_title_marker(&title).is_none(),
-            "fake Claude must clobber the working marker, got `{title}`"
-        );
-
-        // Simulate a poller restart that inherited Paused on disk from a
-        // manual-resume race and lost its in-memory Resumed latch. The live
-        // busy footer must recover the badge even though the old modal and a
-        // clobbered title remain visible; it must not deliver a duplicate.
-        let restart_time = Utc::now();
-        save_workspace_status(&WorkspaceStatus {
-            workspace: "alpha".into(),
-            current_task: Some(task_id.into()),
-            state: WorkspaceState::Paused,
-            last_transition: restart_time,
-            last_seen: restart_time,
-        })
-        .unwrap();
-        last_known = None;
-        limit_resume = LimitResumeState::default();
-        poll_one(
-            &project,
-            workspace,
-            &mut last_known,
-            &mut last_dialog,
-            &mut 0,
-            &mut 0,
-            &mut false,
-            &mut supervision,
-            &mut limit_resume,
-            &mut orphan_since,
-        );
-        assert_eq!(last_known, Some(WorkspaceState::Working));
-        assert_eq!(
-            load_workspace_status("alpha").unwrap().unwrap().state,
-            WorkspaceState::Working
-        );
-        assert_eq!(
-            std::fs::read_to_string(&receipt).unwrap(),
-            format!("dismissed=\nprompt={LIMIT_RESUME_PROMPT}\n")
-        );
-
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        assert_eq!(
-            log.lines()
-                .filter(|line| line.contains("supervision=limit-resume status=scheduled"))
-                .count(),
-            1,
-            "events.log: {log}"
-        );
-        assert_eq!(
-            log.lines()
-                .filter(|line| line.contains("supervision=limit-resume status=sent"))
-                .count(),
-            1,
-            "events.log: {log}"
-        );
-        assert_eq!(
-            log.lines()
-                .filter(|line| line.contains(" -> paused reason=usage-limit"))
-                .count(),
-            1,
-            "events.log: {log}"
-        );
-        assert!(!log.contains("status=failed"), "events.log: {log}");
-        matching_daemon.join().unwrap();
-    }
 
     fn write_marker(project: &Project, body: &str) -> std::path::PathBuf {
         let marker = crate::workspace::workspace_ready_marker(
@@ -8054,10 +7645,7 @@ while :; do sleep 60; done
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
 
         assert_eq!(
@@ -8112,10 +7700,7 @@ while :; do sleep 60; done
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
         assert_eq!(
             shelbi_state::load_task("demo", "fix-login")
@@ -8218,10 +7803,7 @@ transitions:
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
 
         // The card lands in the gate, NOT the handoff status.
@@ -8274,10 +7856,7 @@ transitions:
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
 
         assert_eq!(
@@ -8329,10 +7908,7 @@ transitions:
                 &project.workspaces[0],
                 &project.machines[0],
                 &Host::Local,
-                &TmuxAddr {
-                    session: "s".into(),
-                    window: "w".into(),
-                },
+                &SessionTarget::slot("s", "w"),
             );
         };
 
@@ -8418,10 +7994,7 @@ transitions:
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
         assert!(
             !marker.exists(),
@@ -8476,10 +8049,7 @@ transitions:
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
 
         assert!(!marker.exists(), "a stale (moved-out) marker must be cleared");
@@ -8552,10 +8122,7 @@ transitions:
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
 
         assert_eq!(
@@ -8659,10 +8226,7 @@ transitions:
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
 
         // Handoff landed.
@@ -8837,10 +8401,7 @@ transitions:
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
 
         // The task must NOT have advanced, and the marker must be retained.
@@ -8924,10 +8485,7 @@ transitions:
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
 
         // Handoff still stands despite the detach failure.
@@ -9073,10 +8631,7 @@ transitions:
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
 
         match prev_home {
@@ -9285,10 +8840,7 @@ transitions:
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
         restore_home_shell(prev);
 
@@ -9440,10 +8992,7 @@ transitions:
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
         restore_home_shell(prev);
 
@@ -9520,10 +9069,7 @@ transitions:
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
 
         assert_eq!(
@@ -9565,10 +9111,7 @@ transitions:
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr {
-                session: "s".into(),
-                window: "w".into(),
-            },
+            &SessionTarget::slot("s", "w"),
         );
         assert_eq!(
             shelbi_state::load_task("demo", "fix-login")
@@ -10475,8 +10018,7 @@ transitions:
         let project_name = format!("orphan-debounce-{nonce}");
         let home = std::env::temp_dir().join(&project_name);
         std::fs::create_dir_all(&home).unwrap();
-        let _cleanup = LimitResumeTmuxCleanup {
-            session: format!("unused-{project_name}"),
+        let _cleanup = LimitResumeCleanup {
             home: home.clone(),
             prior_home: std::env::var_os("SHELBI_HOME"),
             prior_hub_sock: std::env::var_os("SHELBI_HUB_SOCK"),
@@ -10497,10 +10039,7 @@ transitions:
         shelbi_state::save_task(&project.name, &task, "no commits").unwrap();
 
         let host = Host::Local;
-        let addr = TmuxAddr {
-            session: format!("shelbi-{project_name}"),
-            window: "alpha".into(),
-        };
+        let addr = SessionTarget::slot(format!("shelbi-{project_name}"), "alpha");
 
         // First observation: orphaned-by-board, but the grace clock was unset,
         // so the reaper arms it and declines to act — the pane (a live,
@@ -10540,475 +10079,13 @@ transitions:
         );
     }
 
-    /// End-to-end reap: a real tmux slot for a dev workspace whose task was
-    /// hand-moved to `review` is closed by the reconciler, the slot returns to
-    /// idle, and a `pane_alive=false reason=orphaned-slot-reaped` line lands.
-    #[test]
-    fn reconcile_reaps_orphaned_dev_pane_and_logs_it() {
-        if !tmux_available() {
-            eprintln!("skipping: tmux not on PATH");
-            return;
-        }
-        let _g = crate::test_lock::acquire();
-        let nonce = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let project_name = format!("orphan-reap-{nonce}");
-        let session = format!("shelbi-{project_name}");
-        let home = std::env::temp_dir().join(&project_name);
-        std::fs::create_dir_all(&home).unwrap();
-        let _cleanup = LimitResumeTmuxCleanup {
-            session: session.clone(),
-            home: home.clone(),
-            prior_home: std::env::var_os("SHELBI_HOME"),
-            prior_hub_sock: std::env::var_os("SHELBI_HUB_SOCK"),
-        };
-        std::env::set_var("SHELBI_HOME", &home);
 
-        let work_dir = home.join("repo");
-        std::fs::create_dir_all(&work_dir).unwrap();
-        let mut project = local_project(&work_dir);
-        project.name.clone_from(&project_name);
-        shelbi_state::save_project(&project).unwrap();
 
-        // The task was hand-moved to review but is still assigned to the dev
-        // workspace (a manual `move_task` doesn't unassign). Its pane is a
-        // long-lived agent process that nothing tore down.
-        let mut task = in_progress_task("orphaned-task", "alpha");
-        task.column = Column::review();
-        shelbi_state::save_task(&project.name, &task, "no commits").unwrap();
 
-        let idle_script = home.join("idle.sh");
-        std::fs::write(&idle_script, "while :; do sleep 60; done\n").unwrap();
-        start_limit_resume_tmux_session(&session, &idle_script, &home.join("unused.receipt"));
 
-        let host = Host::Local;
-        let addr = TmuxAddr {
-            session: session.clone(),
-            window: "alpha".into(),
-        };
-        assert!(
-            crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
-            "the orphaned agent pane must be alive before the reap",
-        );
 
-        // The slot has read orphaned-by-board for longer than the grace window
-        // already (a genuine hand move-away, not a fresh dispatch racing a
-        // stale remote-board snapshot), so the reaper acts on this pass rather
-        // than re-arming the debounce. `checked_sub` guards the theoretical
-        // pre-monotonic-origin underflow.
-        let mut orphan_since = Some(
-            Instant::now()
-                .checked_sub(ORPHAN_REAP_GRACE + Duration::from_secs(1))
-                .unwrap_or_else(Instant::now),
-        );
-        let reaped =
-            maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan_since);
-        assert!(reaped, "a live dev pane with no active task must be reaped");
-        assert!(
-            orphan_since.is_none(),
-            "a completed reap must clear the grace clock so a re-dispatch starts fresh",
-        );
-        assert!(
-            !crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
-            "the pane must be gone after the reap",
-        );
 
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        assert!(
-            log.lines().any(|l| l.contains(&format!("project={project_name}"))
-                && l.contains("workspace=alpha")
-                && l.contains("pane_alive=false")
-                && l.contains("reason=orphaned-slot-reaped")),
-            "expected an orphan-reap pane event; log: {log:?}",
-        );
 
-        // Idempotent: with the pane gone, a second pass is a no-op even with
-        // the grace window already satisfied — the liveness probe sees a dead
-        // slot and declines to "reap" it again.
-        let mut elapsed_again = Some(
-            Instant::now()
-                .checked_sub(ORPHAN_REAP_GRACE + Duration::from_secs(1))
-                .unwrap_or_else(Instant::now),
-        );
-        assert!(
-            !maybe_reconcile_orphaned_pane(
-                &project,
-                &project.workspaces[0],
-                &host,
-                &addr,
-                &mut elapsed_again
-            ),
-            "a dead slot must not be re-reaped",
-        );
-    }
-
-    /// End-to-end: a real tmux slot whose agent process has exited but whose
-    /// pane stayed alive (the wrapper's `[agent exited — press enter to close]`
-    /// chrome + Claude's resume block on screen, stale `shelbi:working` title) is
-    /// detected by `poll_one` as `supervision=agent-exited`, recorded as Blocked,
-    /// and NOT re-emitted on the next poll (deduped per incident). This is the
-    /// SIGTERMed-agent-inside-a-healthy-pane blind spot.
-    #[test]
-    fn poll_one_detects_an_exited_agent_inside_a_live_pane() {
-        if !tmux_available() {
-            eprintln!("skipping: tmux not on PATH");
-            return;
-        }
-        let _g = crate::test_lock::acquire();
-        let nonce = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let project_name = format!("agent-exited-{nonce}");
-        let session = format!("shelbi-{project_name}");
-        let home = std::env::temp_dir().join(&project_name);
-        std::fs::create_dir_all(&home).unwrap();
-        let _cleanup = LimitResumeTmuxCleanup {
-            session: session.clone(),
-            home: home.clone(),
-            prior_home: std::env::var_os("SHELBI_HOME"),
-            prior_hub_sock: std::env::var_os("SHELBI_HUB_SOCK"),
-        };
-        std::env::set_var("SHELBI_HOME", &home);
-        // No live hub daemon in this test — event emission falls back to a direct
-        // append. Clear any inherited socket so we don't dial a dead one.
-        std::env::remove_var("SHELBI_HUB_SOCK");
-
-        let work_dir = home.join("repo");
-        std::fs::create_dir_all(&work_dir).unwrap();
-        let mut project = local_project(&work_dir);
-        project.name.clone_from(&project_name);
-        shelbi_state::save_project(&project).unwrap();
-        let task_id = "stranded-worker";
-        shelbi_state::save_task(
-            &project.name,
-            &in_progress_task(task_id, "alpha"),
-            "keep working",
-        )
-        .unwrap();
-
-        // The agent process has exited; the wrapper prints its close prompt and
-        // Claude's resume block, then the pane blocks (stays alive) with that
-        // screen and a stale `shelbi:working` title.
-        let script = home.join("exited.sh");
-        std::fs::write(
-            &script,
-            "printf '\\033]2;shelbi:working\\007'\n\
-             printf '\\033[2J\\033[H'\n\
-             printf '%s\\n' \\\n\
-               'Resume this session with:' \\\n\
-               'claude --resume 56d67514-c708-4810-b420-143a1b42d9d0' \\\n\
-               '[agent exited — press enter to close]'\n\
-             while :; do sleep 60; done\n",
-        )
-        .unwrap();
-        start_limit_resume_tmux_session(&session, &script, &home.join("unused.receipt"));
-
-        let host = Host::Local;
-        let addr = TmuxAddr {
-            session: session.clone(),
-            window: "alpha".into(),
-        };
-        // Wait until the exit chrome is actually on screen before polling.
-        let start = std::time::Instant::now();
-        while start.elapsed() < std::time::Duration::from_secs(3) {
-            let screen = shelbi_tmux::capture(&host, &addr).unwrap_or_default();
-            if crate::ready::detect_agent_exited(&screen) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(
-            crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
-            "the pane must be alive even though the agent exited",
-        );
-
-        let workspace = project.workspaces[0].clone();
-        let mut last_known = None;
-        let mut last_dialog = None;
-        let mut unknown_streak = 0;
-        let mut last_agent_exited = false;
-        let mut supervision = SupervisionState::default();
-        let mut limit_resume = LimitResumeState::default();
-        let mut orphan_since = None;
-        poll_one(
-            &project,
-            &workspace,
-            &mut last_known,
-            &mut last_dialog,
-            &mut unknown_streak,
-            &mut 0,
-            &mut last_agent_exited,
-            &mut supervision,
-            &mut limit_resume,
-            &mut orphan_since,
-        );
-
-        assert!(last_agent_exited, "the agent-exited latch must be armed");
-        assert_eq!(
-            last_known,
-            Some(WorkspaceState::Blocked),
-            "an exited agent must record Blocked, not the stale working title",
-        );
-        let status = load_workspace_status("alpha").unwrap().unwrap();
-        assert_eq!(status.state, WorkspaceState::Blocked);
-
-        let count_exit_lines = || {
-            let log =
-                std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
-            log.lines()
-                .filter(|l| {
-                    l.contains(&format!("project={project_name}"))
-                        && l.contains("workspace=alpha")
-                        && l.contains("supervision=agent-exited")
-                        && l.contains("reason=pane-alive")
-                })
-                .count()
-        };
-        assert_eq!(count_exit_lines(), 1, "exactly one agent-exited line on first poll");
-
-        // Second poll on the same still-exited screen must not re-emit.
-        poll_one(
-            &project,
-            &workspace,
-            &mut last_known,
-            &mut last_dialog,
-            &mut unknown_streak,
-            &mut 0,
-            &mut last_agent_exited,
-            &mut supervision,
-            &mut limit_resume,
-            &mut orphan_since,
-        );
-        assert_eq!(
-            count_exit_lines(),
-            1,
-            "a still-exited pane must be deduped (one line per incident)",
-        );
-    }
-
-    /// The launch-age grace: a live dev pane on a non-active (`todo`) card whose
-    /// launch epoch is recent is left alone even after the board-observation
-    /// grace has elapsed — this is the exact rollback/stale-snapshot race the
-    /// reaper used to lose (killing a live worker mid-task). Once the same pane's
-    /// launch ages past the deadline it is reaped as today. The card sits in
-    /// `todo` (not `review`) to mirror the CLI rollback that produced the bug.
-    #[test]
-    fn orphan_reaper_holds_a_launch_age_grace_over_a_freshly_launched_pane() {
-        if !tmux_available() {
-            eprintln!("skipping: tmux not on PATH");
-            return;
-        }
-        let _g = crate::test_lock::acquire();
-        let nonce = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let project_name = format!("orphan-launchage-{nonce}");
-        let session = format!("shelbi-{project_name}");
-        let home = std::env::temp_dir().join(&project_name);
-        std::fs::create_dir_all(&home).unwrap();
-        let _cleanup = LimitResumeTmuxCleanup {
-            session: session.clone(),
-            home: home.clone(),
-            prior_home: std::env::var_os("SHELBI_HOME"),
-            prior_hub_sock: std::env::var_os("SHELBI_HUB_SOCK"),
-        };
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let work_dir = home.join("repo");
-        std::fs::create_dir_all(&work_dir).unwrap();
-        let mut project = local_project(&work_dir);
-        project.name.clone_from(&project_name);
-        shelbi_state::save_project(&project).unwrap();
-
-        // A card rolled back to `todo` but still assigned to the dev workspace —
-        // the shape a CLI launch timeout leaves behind while the pane it spawned
-        // is still coming up. Orphaned-by-board, but the launch is fresh.
-        let mut task = in_progress_task("launchage-task", "alpha");
-        task.column = Column::todo();
-        shelbi_state::save_task(&project.name, &task, "no commits").unwrap();
-
-        let idle_script = home.join("idle.sh");
-        std::fs::write(&idle_script, "while :; do sleep 60; done\n").unwrap();
-        start_limit_resume_tmux_session(&session, &idle_script, &home.join("unused.receipt"));
-
-        let host = Host::Local;
-        let addr = TmuxAddr {
-            session: session.clone(),
-            window: "alpha".into(),
-        };
-        assert!(
-            crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
-            "the freshly-launched pane must be alive before the checks",
-        );
-
-        // The board-observation grace has already elapsed (a persisted orphan),
-        // so only the launch-age guard stands between the reaper and this pane.
-        let elapsed = || {
-            Some(
-                Instant::now()
-                    .checked_sub(ORPHAN_REAP_GRACE + Duration::from_secs(1))
-                    .unwrap_or_else(Instant::now),
-            )
-        };
-
-        // Stamp the launch as happening now: the pane is inside its launch-age
-        // grace, so it must NOT be reaped, and it stays alive.
-        crate::workspace::stamp_launch_epoch(&host, &addr).unwrap();
-        let mut orphan_since = elapsed();
-        assert!(
-            !maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan_since),
-            "a pane launched inside the launch-age grace must be left alone",
-        );
-        assert!(
-            crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
-            "the still-settling pane must survive the launch-age grace",
-        );
-
-        // Age the launch past the deadline: the same pane is now a genuine
-        // orphan and is reaped as today.
-        let past = chrono::Utc::now().timestamp()
-            - crate::workspace::launch_timeout().as_secs() as i64
-            - 5;
-        let set = std::process::Command::new("tmux")
-            .args(["set-option", "-w", "-t", &shelbi_tmux::command_target(&addr)])
-            .arg(crate::workspace::LAUNCH_EPOCH_OPTION)
-            .arg(past.to_string())
-            .status()
-            .unwrap();
-        assert!(set.success(), "re-stamping the launch epoch must succeed");
-
-        let mut orphan_since = elapsed();
-        assert!(
-            maybe_reconcile_orphaned_pane(&project, &project.workspaces[0], &host, &addr, &mut orphan_since),
-            "a pane whose launch aged past the deadline must be reaped",
-        );
-        assert!(
-            !crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
-            "the aged-out orphan pane must be gone after the reap",
-        );
-    }
-
-    /// End-to-end reap of a review slot whose task was accepted while the Review
-    /// agent was still on a `dialog:question` — so the poller never confirmed
-    /// serving and never wrote the `shelbi-review-loaded` marker. The pane is
-    /// still a live agent process; the marker-less reap must close it, drop the
-    /// slot's stale `status.yaml`, and log the pane event. This is the exact
-    /// orphaned-session-after-accept case from the bug report.
-    #[test]
-    fn reaps_markerless_review_pane_and_clears_status() {
-        if !tmux_available() {
-            eprintln!("skipping: tmux not on PATH");
-            return;
-        }
-        let _g = crate::test_lock::acquire();
-        let nonce = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let project_name = format!("review-reap-{nonce}");
-        let session = format!("shelbi-{project_name}");
-        let home = std::env::temp_dir().join(&project_name);
-        std::fs::create_dir_all(&home).unwrap();
-        let _cleanup = LimitResumeTmuxCleanup {
-            session: session.clone(),
-            home: home.clone(),
-            prior_home: std::env::var_os("SHELBI_HOME"),
-            prior_hub_sock: std::env::var_os("SHELBI_HUB_SOCK"),
-        };
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let work_dir = home.join("repo");
-        std::fs::create_dir_all(&work_dir).unwrap();
-        let mut project = local_project(&work_dir);
-        project.name.clone_from(&project_name);
-        project.workspaces[0].tags = vec!["review".into()];
-        project.workspaces[0].slot = Some(4319);
-        shelbi_state::save_project(&project).unwrap();
-        let ws = project.workspaces[0].clone();
-
-        // The Review agent pane is alive; NO review-loaded marker was ever
-        // written (it blocked on a dialog before serving). Its task has already
-        // left the review column (accepted → done), so nothing points at the
-        // slot — the None branch of `handle_review_slot` reaches this reap.
-        let idle_script = home.join("idle.sh");
-        std::fs::write(&idle_script, "while :; do sleep 60; done\n").unwrap();
-        start_limit_resume_tmux_session(&session, &idle_script, &home.join("unused.receipt"));
-
-        // A stale status.yaml frozen at the pre-accept state, as the poller left
-        // it while the slot sat blocked.
-        let now = Utc::now();
-        shelbi_state::save_workspace_status(&WorkspaceStatus {
-            workspace: ws.name.clone(),
-            current_task: None,
-            state: WorkspaceState::Working,
-            last_transition: now,
-            last_seen: now,
-        })
-        .unwrap();
-
-        let host = Host::Local;
-        let addr = TmuxAddr {
-            session: session.clone(),
-            window: "alpha".into(),
-        };
-        assert!(
-            crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
-            "the orphaned review agent pane must be alive before the reap",
-        );
-
-        let marker =
-            crate::workspace::workspace_review_loaded_marker(
-                project.machine(&ws.machine).unwrap(),
-                &ws,
-            );
-        assert!(!marker.exists(), "precondition: no review-loaded marker");
-
-        let acted = maybe_reap_orphaned_review_slot(&project, &ws, &host, &addr, &marker);
-        assert!(acted, "a live markerless review pane must be reaped");
-        assert!(
-            !crate::workspace::workspace_pane_alive(&host, &addr).unwrap(),
-            "the pane must be gone after the reap",
-        );
-        assert!(
-            shelbi_state::load_workspace_status(&ws.name).unwrap().is_none(),
-            "the stale status.yaml must be cleared so the slot reads idle",
-        );
-
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        assert!(
-            log.lines().any(|l| l.contains(&format!("project={project_name}"))
-                && l.contains(&format!("workspace={}", ws.name))
-                && l.contains("pane_alive=false")
-                && l.contains("reason=orphaned-review-slot-reaped")),
-            "expected an orphaned-review-slot-reaped pane event; log: {log:?}",
-        );
-
-        // Idempotent: with the pane gone, a second pass is a no-op.
-        assert!(
-            !maybe_reap_orphaned_review_slot(&project, &ws, &host, &addr, &marker),
-            "a dead review slot with no marker must not be re-reaped",
-        );
-    }
 
     /// Force `hb` due and run one consideration. Returns the interval that is
     /// now in effect after the call (the back-off level for the *next* gap).

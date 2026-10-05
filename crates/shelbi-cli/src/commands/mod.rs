@@ -1,54 +1,37 @@
 pub mod action;
 pub mod agent;
-pub mod archive;
-pub mod attach;
 pub mod config;
 pub mod doctor;
 mod config_surfaces;
 mod config_upgrade;
 mod config_upgrade_apply;
 pub mod daemon;
-pub mod diff;
-pub mod error_log;
 pub mod events;
 pub mod guard;
 pub mod hub_version;
 pub mod init;
 pub mod issue;
 pub mod issue_store;
-pub mod list;
 pub mod machine;
-pub mod merge;
 pub mod message;
 pub mod mutate_client;
 pub mod open;
 pub mod orchestrate;
 pub mod orchestrator;
-pub mod palette;
-pub mod popup;
 pub mod project;
-pub mod quit;
-pub mod quit_project;
-pub mod quit_shelbi;
 pub mod reload;
 pub mod reload_session;
-pub mod review_confirm;
 pub mod relay;
-pub mod review_reject;
 pub mod review_serve;
 pub mod send;
 pub mod session;
 pub mod session_attach;
 pub mod session_cli;
-pub mod spawn;
 pub mod status;
-pub mod tail;
-pub mod teardown;
 pub mod wizard;
 pub mod workflow;
 pub mod workspace;
 pub mod zen;
-pub mod zen_intro;
 pub mod zen_lifecycle;
 
 use std::path::Path;
@@ -136,50 +119,6 @@ pub fn launch_editor(path: &Path) -> Result<()> {
         return Err(anyhow!("editor `{program}` exited with {status}"));
     }
     Ok(())
-}
-
-/// Run a `tmux` subcommand for its side effect, returning whether it exited
-/// zero. Unlike a bare `.status()` call this captures stderr and, on failure
-/// (non-zero exit OR a spawn error), surfaces it on our own stderr so a broken
-/// tmux invocation is diagnosable instead of silently collapsing to `false`
-/// (Shelbi ContextStore docs/planning:reviews/adversarial-2026-07/cli-session-ux.md
-/// F12). Shared across the CLI's non-TUI tmux call sites
-/// (`open`, `palette`, `quit_project`, `quit_shelbi`) so the diagnostics and
-/// stderr handling live in one place (F14). Not for use inside a live ratatui
-/// screen — writing to stderr there would corrupt the alt-screen; those paths
-/// surface failures through their own status line instead.
-pub(crate) fn run_tmux<I, S>(args: I) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    let args: Vec<std::ffi::OsString> = args
-        .into_iter()
-        .map(|a| a.as_ref().to_os_string())
-        .collect();
-    let argv = || {
-        args.iter()
-            .map(|a| a.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    match std::process::Command::new("tmux").args(&args).output() {
-        Ok(out) if out.status.success() => true,
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stderr = stderr.trim();
-            if stderr.is_empty() {
-                eprintln!("warning: `tmux {}` exited {}", argv(), out.status);
-            } else {
-                eprintln!("warning: `tmux {}` failed: {stderr}", argv());
-            }
-            false
-        }
-        Err(e) => {
-            eprintln!("warning: failed to run `tmux {}`: {e}", argv());
-            false
-        }
-    }
 }
 
 /// Resolve the editor command as `(program, leading-args)`, honoring

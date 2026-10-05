@@ -23,8 +23,8 @@
 //! workspace-based projects.
 
 use anyhow::{anyhow, Result};
-use chrono::Utc;
-use shelbi_core::{AgentRunnerSpec, Host, Project, Status, TmuxAddr};
+use shelbi_core::{AgentRunnerSpec, Host, Project};
+use shelbi_orchestrator::session_backend::SessionTarget;
 use shelbi_orchestrator::submit::{PaneBaseline, SubmitProfile, SubmitStatus};
 use shelbi_orchestrator::workspace as orch_workspace;
 
@@ -44,43 +44,21 @@ pub fn run(project: Option<String>, id: String, message: String) -> Result<()> {
     let _pane_injection_lock =
         shelbi_state::lock_workspace(&project_name, &id).map_err(|e| anyhow!(e))?;
 
-    match target {
-        ResolvedTarget::Workspace { host, addr, runner } => {
-            // Pane must be live — the workspace can be declared but idle, in
-            // which case there's no runner to send to. Surface that as an
-            // actionable error rather than the opaque `os error 2` the
-            // legacy path produced.
-            let alive =
-                orch_workspace::workspace_pane_alive(&host, &addr).map_err(|e| anyhow!(e))?;
-            if !alive {
-                return Err(anyhow!(
-                    "workspace `{id}` has no live tmux pane at `{}` — open it with \
-                     `shelbi workspace open {id}` (or `shelbi task start <task-id>` to \
-                     dispatch a task onto it)",
-                    addr.target(),
-                ));
-            }
-            let delivery = send_verified(&project_name, &id, &runner, &host, &addr, &message)?;
-            println!("✓ {delivery} to {} ({})", id, addr.target());
-            Ok(())
-        }
-        ResolvedTarget::LegacyAgent { host, addr, runner } => {
-            let delivery = send_verified(&project_name, &id, &runner, &host, &addr, &message)?;
-            // Legacy path keeps the agent-file housekeeping the old
-            // implementation did — bumping `status: running` + `updated`
-            // and appending to the per-agent log so `shelbi tail` still
-            // shows the send.
-            let mut file = shelbi_state::load_agent(&project_name, &id).map_err(|e| anyhow!(e))?;
-            file.agent.status = Status::Running;
-            file.agent.updated = Utc::now();
-            shelbi_state::save_agent(&project_name, &file.agent, &file.body)
-                .map_err(|e| anyhow!(e))?;
-            shelbi_state::append_log(&project_name, &id, &format!("send: {message}"))
-                .map_err(|e| anyhow!(e))?;
-            println!("✓ {delivery} to {} ({})", id, addr.target());
-            Ok(())
-        }
+    let ResolvedTarget { host, addr, runner } = target;
+    // Session must be live — the workspace can be declared but idle, in which
+    // case there's no runner to send to. Surface that as an actionable error.
+    let alive = orch_workspace::workspace_pane_alive(&host, &addr).map_err(|e| anyhow!(e))?;
+    if !alive {
+        return Err(anyhow!(
+            "workspace `{id}` has no live session at `{}` — open it with \
+             `shelbi workspace open {id}` (or `shelbi task start <task-id>` to \
+             dispatch a task onto it)",
+            addr.label(),
+        ));
     }
+    let delivery = send_verified(&project_name, &id, &runner, &host, &addr, &message)?;
+    println!("✓ {delivery} to {} ({})", id, addr.label());
+    Ok(())
 }
 
 /// Human-facing success wording for a verified pane injection.
@@ -116,7 +94,7 @@ pub(super) fn send_verified(
     id: &str,
     runner: &AgentRunnerSpec,
     host: &Host,
-    addr: &TmuxAddr,
+    addr: &SessionTarget,
     message: &str,
 ) -> Result<SendDelivery> {
     let profile = SubmitProfile::for_runner(runner);
@@ -147,7 +125,7 @@ pub(super) fn send_verified(
     delivery.ok_or_else(|| {
         anyhow!(
             "message to `{id}` is stuck in {} after a retry Enter; the failure was recorded in events.log",
-            addr.target()
+            addr.label()
         )
     })
 }
@@ -179,24 +157,13 @@ fn classify_delivery(
     }
 }
 
-/// Where the message should land. We resolve once up front so the
-/// send + housekeeping arms each have a single code path.
+/// Where the message should land. The name must match a declared workspace;
+/// its session target is derived from the project YAML + machine spec.
 #[derive(Debug)]
-enum ResolvedTarget {
-    /// Name matched a declared workspace; address derived from the
-    /// project YAML + machine spec.
-    Workspace {
-        host: Host,
-        addr: TmuxAddr,
-        runner: AgentRunnerSpec,
-    },
-    /// Name only matched a legacy spawn-based agent file. Address read
-    /// from the agent's frontmatter.
-    LegacyAgent {
-        host: Host,
-        addr: TmuxAddr,
-        runner: AgentRunnerSpec,
-    },
+struct ResolvedTarget {
+    host: Host,
+    addr: SessionTarget,
+    runner: AgentRunnerSpec,
 }
 
 fn resolve_target(project: &Project, id: &str) -> Result<ResolvedTarget> {
@@ -208,7 +175,7 @@ fn resolve_target(project: &Project, id: &str) -> Result<ResolvedTarget> {
             )
         })?;
         let addr =
-            orch_workspace::workspace_tmux_addr(project, workspace).map_err(|e| anyhow!(e))?;
+            orch_workspace::workspace_target(project, workspace).map_err(|e| anyhow!(e))?;
         // A workspace no longer selects a runner; a plain `send` to a slot
         // (no dispatched agent to resolve) targets the project's baseline
         // runner for its submit/prompt-injection profile.
@@ -219,90 +186,34 @@ fn resolve_target(project: &Project, id: &str) -> Result<ResolvedTarget> {
                 project.orchestrator.runner
             )
         })?;
-        return Ok(ResolvedTarget::Workspace {
+        return Ok(ResolvedTarget {
             host: machine.host(),
             addr,
             runner: runner.clone(),
         });
     }
 
-    // Fall through to the legacy `shelbi spawn` registry. `load_agent`
-    // is what the old send did; we just swallow the not-found error and
-    // turn it into a unified `unknown id` message that lists both
-    // registries' members.
-    match shelbi_state::load_agent(&project.name, id) {
-        Ok(file) => {
-            let machine = project
-                .machine(&file.agent.machine)
-                .ok_or_else(|| anyhow!("machine `{}` no longer in project", file.agent.machine))?;
-            let runner = project.runner(&file.agent.runner).ok_or_else(|| {
-                anyhow!(
-                    "legacy agent `{id}` references runner `{}` which is no longer declared in agent_runners",
-                    file.agent.runner
-                )
-            })?;
-            Ok(ResolvedTarget::LegacyAgent {
-                host: machine.host(),
-                addr: file.agent.tmux.clone(),
-                runner: runner.clone(),
-            })
-        }
-        Err(_) => Err(anyhow!("{}", unknown_id_error(project, id))),
-    }
+    Err(anyhow!("{}", unknown_id_error(project, id)))
 }
 
-/// Build the "unknown id" error message that lists every workspace name
-/// and any legacy agent id we can find. The legacy lookup is best-effort
-/// — if the directory is missing or unreadable we just leave that line
-/// out rather than masking the real error.
+/// Build the "unknown workspace" error message that lists every declared
+/// workspace name.
 fn unknown_id_error(project: &Project, id: &str) -> String {
-    let mut lines = vec![format!(
-        "unknown workspace/agent `{id}` in project `{}`",
-        project.name
-    )];
+    let mut lines = vec![format!("unknown workspace `{id}` in project `{}`", project.name)];
     if project.workspaces.is_empty() {
         lines.push("(no workspaces declared in project YAML)".to_string());
     } else {
         let names: Vec<&str> = project.workspaces.iter().map(|w| w.name.as_str()).collect();
         lines.push(format!("workspaces: {}", names.join(", ")));
     }
-    if let Some(ids) = list_legacy_agent_ids(&project.name) {
-        if !ids.is_empty() {
-            lines.push(format!("legacy spawn agents: {}", ids.join(", ")));
-        }
-    }
     lines.join("\n  ")
-}
-
-/// Enumerate ids under `~/.shelbi/projects/<proj>/agents/*.md` (skipping
-/// the `.log.md` companions). Returns `None` on any I/O failure so the
-/// caller can quietly omit the line — this is only ever used to enrich
-/// an error message.
-fn list_legacy_agent_ids(project: &str) -> Option<Vec<String>> {
-    let dir = shelbi_state::agents_dir(project).ok()?;
-    if !dir.exists() {
-        return Some(Vec::new());
-    }
-    let mut ids = Vec::new();
-    for entry in std::fs::read_dir(&dir).ok()? {
-        let entry = entry.ok()?;
-        let name = entry.file_name();
-        let name = name.to_str()?;
-        if name.ends_with(".log.md") || !name.ends_with(".md") {
-            continue;
-        }
-        ids.push(name.trim_end_matches(".md").to_string());
-    }
-    ids.sort();
-    Some(ids)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::{EnvGuard, ENV_LOCK};
     use shelbi_core::{
-        Agent, AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind, OrchestratorSpec,
+        AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind, OrchestratorSpec,
         WorkspaceSpec, ZenConfig,
     };
     use std::collections::BTreeMap;
@@ -377,9 +288,8 @@ mod tests {
         }
     }
 
-    /// A local workspace resolves into a Workspace target with a
-    /// `shelbi-<project>:<name>` tmux address — the same one the dashboard
-    /// session uses for the workspace's window.
+    /// A local workspace resolves to its slot session
+    /// (`shelbi-<project>:<name>` label).
     #[test]
     fn local_workspace_resolves_to_dashboard_window() {
         let project = project_with_workspaces(
@@ -391,22 +301,14 @@ mod tests {
                 slot: None,
             }],
         );
-        match resolve_target(&project, "alpha").unwrap() {
-            ResolvedTarget::Workspace { host, addr, runner } => {
-                assert!(host.is_local());
-                assert_eq!(addr.session, "shelbi-demo");
-                assert_eq!(addr.window, "alpha");
-                assert_eq!(runner.command, "claude");
-            }
-            ResolvedTarget::LegacyAgent { .. } => {
-                panic!("expected workspace resolution, got legacy")
-            }
-        }
+        let t = resolve_target(&project, "alpha").unwrap();
+        assert!(t.host.is_local());
+        assert_eq!(t.addr.label(), "shelbi-demo:alpha");
+        assert_eq!(t.runner.command, "claude");
     }
 
-    /// A remote workspace resolves into a Workspace target with the
-    /// per-workspace `shelbi-w-<name>` session that lives on the remote
-    /// host's tmux server.
+    /// A remote workspace resolves to its per-workspace `shelbi-w-<name>`
+    /// session.
     #[test]
     fn remote_workspace_resolves_to_per_workspace_session() {
         let project = project_with_workspaces(
@@ -418,17 +320,10 @@ mod tests {
                 slot: None,
             }],
         );
-        match resolve_target(&project, "delta").unwrap() {
-            ResolvedTarget::Workspace { host, addr, runner } => {
-                assert!(matches!(host, Host::Ssh { ref host } if host == "devbox"));
-                assert_eq!(addr.session, "shelbi-w-delta");
-                assert_eq!(addr.window, "agent");
-                assert_eq!(runner.command, "claude");
-            }
-            ResolvedTarget::LegacyAgent { .. } => {
-                panic!("expected workspace resolution, got legacy")
-            }
-        }
+        let t = resolve_target(&project, "delta").unwrap();
+        assert!(matches!(t.host, Host::Ssh { ref host } if host == "devbox"));
+        assert_eq!(t.addr.label(), "shelbi-w-delta:agent");
+        assert_eq!(t.runner.command, "claude");
     }
 
     #[test]
@@ -447,62 +342,27 @@ mod tests {
             }],
         );
         project.orchestrator.runner = "codex".into();
-        match resolve_target(&project, "bravo").unwrap() {
-            ResolvedTarget::Workspace { runner, .. } => {
-                assert_eq!(runner.command, "/opt/homebrew/bin/codex");
-                let profile = SubmitProfile::for_runner(&runner);
-                assert!(profile.has_ui_verifier());
-                assert!(!profile.uses_claude_ui());
-            }
-            ResolvedTarget::LegacyAgent { .. } => {
-                panic!("expected workspace resolution, got legacy")
-            }
-        }
+        let t = resolve_target(&project, "bravo").unwrap();
+        assert_eq!(t.runner.command, "/opt/homebrew/bin/codex");
+        let profile = SubmitProfile::for_runner(&t.runner);
+        assert!(profile.has_ui_verifier());
+        assert!(!profile.uses_claude_ui());
     }
 
     #[test]
-    fn legacy_resolution_retains_runner_and_reports_removed_runner() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let env = EnvGuard::new(&["SHELBI_HOME"]);
-        env.set("SHELBI_HOME", tmp.path());
-
-        let mut project = project_with_workspaces("demo", Vec::new());
-        let now = Utc::now();
-        let agent = Agent {
-            id: "legacy-codex".into(),
-            project: project.name.clone(),
-            machine: "hub".into(),
-            runner: "codex".into(),
-            branch: "shelbi/legacy-codex".into(),
-            worktree: tmp.path().join("legacy-codex"),
-            status: Status::Running,
-            created: now,
-            updated: now,
-            tmux: TmuxAddr {
-                session: "shelbi-demo".into(),
-                window: "legacy-codex".into(),
-            },
-        };
-        shelbi_state::save_agent(&project.name, &agent, "# Task\n").unwrap();
-
-        match resolve_target(&project, "legacy-codex").unwrap() {
-            ResolvedTarget::LegacyAgent { runner, .. } => {
-                assert_eq!(runner.command, "/opt/homebrew/bin/codex");
-            }
-            ResolvedTarget::Workspace { .. } => {
-                panic!("expected legacy resolution, got workspace")
-            }
-        }
-
-        project.agent_runners.remove("codex");
-        let error = resolve_target(&project, "legacy-codex").unwrap_err();
-        assert!(
-            error.to_string().contains(
-                "legacy agent `legacy-codex` references runner `codex` which is no longer declared"
-            ),
-            "error: {error}"
+    fn unknown_workspace_errors_with_the_workspace_list() {
+        let project = project_with_workspaces(
+            "demo",
+            vec![WorkspaceSpec {
+                name: "alpha".into(),
+                machine: "hub".into(),
+                tags: Vec::new(),
+                slot: None,
+            }],
         );
+        let error = resolve_target(&project, "nope").unwrap_err();
+        assert!(error.to_string().contains("unknown workspace `nope`"), "error: {error}");
+        assert!(error.to_string().contains("alpha"), "error: {error}");
     }
 
     /// An unknown name on a project with no legacy agent files surfaces
@@ -528,7 +388,7 @@ mod tests {
         );
         let msg = unknown_id_error(&project, "charlie");
         assert!(
-            msg.contains("unknown workspace/agent `charlie`"),
+            msg.contains("unknown workspace `charlie`"),
             "msg: {msg}"
         );
         assert!(msg.contains("alpha"), "msg: {msg}");

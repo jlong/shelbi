@@ -242,24 +242,18 @@ pub(crate) struct ExecutorMovePersister;
 
 impl MovePersister for ExecutorMovePersister {
     fn persist(&self, project: &str, id: &str, target: &Column) -> PersistResult {
-        if shelbi_state::daemon_mutations_enabled() {
-            let mutation = shelbi_app::Mutation::MoveIssue {
-                project: project.to_string(),
-                id: id.to_string(),
-                to_status: target.as_str().to_string(),
-            };
-            // The daemon streams output lines (e.g. the gated merge's progress);
-            // the board shows its own optimistic move, so we only need the final
-            // outcome. A failure maps to a ready-to-display error.
-            let mut sink = |_stream, _line: &str| {};
-            shelbi_app::execute_mutation(&mutation, &mut sink)
-                .map(|()| PersistedMove::default())
-                .map_err(|e| format!("move failed: {e}"))
-        } else {
-            // Setting off: the shared in-process move function, exactly as the
-            // standalone board and `shelbi issue move` run it.
-            persist_move_step(project, id, target, &GitTransitionRunner)
-        }
+        let mutation = shelbi_app::Mutation::MoveIssue {
+            project: project.to_string(),
+            id: id.to_string(),
+            to_status: target.as_str().to_string(),
+        };
+        // The daemon streams output lines (e.g. the gated merge's progress);
+        // the board shows its own optimistic move, so we only need the final
+        // outcome. A failure maps to a ready-to-display error.
+        let mut sink = |_stream, _line: &str| {};
+        shelbi_app::execute_mutation(&mutation, &mut sink)
+            .map(|()| PersistedMove::default())
+            .map_err(|e| format!("move failed: {e}"))
     }
 }
 
