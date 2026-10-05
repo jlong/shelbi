@@ -20,6 +20,7 @@ pub mod open;
 pub mod orchestrate;
 pub mod orchestrator;
 pub mod project;
+pub mod quit;
 pub mod reload;
 pub mod reload_session;
 pub mod relay;
