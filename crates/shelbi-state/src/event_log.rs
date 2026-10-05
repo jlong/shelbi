@@ -2718,6 +2718,42 @@ pub fn append_handoff_action_failed_event(
     ))
 }
 
+/// Append a **ready-handoff refusal** line to `~/.shelbi/events.log`. Emitted by
+/// the poller's ready-marker handoff when the pre-push worktree check refuses to
+/// turn a ready marker into a handoff — the worker wrote the marker with
+/// uncommitted work (`reason=uncommitted-changes`, with `files=<n>` naming how
+/// many user-authored changes remain) or on a branch with no commits ahead of
+/// its base (`reason=no-commits-ahead`, an empty branch that would open a no-op
+/// PR / loop on `open_pr`). The card is left in its active status with the marker
+/// in place so the handoff auto-proceeds once the worker commits; this line is
+/// the visible trail (for the orchestrator and a human) explaining the refusal.
+///
+/// `<rfc3339> handoff task=<id> workspace=<name> branch=<branch> status=refused reason=<reason>[ files=<n>]`
+///
+/// `files` is included only for `uncommitted-changes`. Same task-scoped,
+/// `project=`-less shape as [`append_push_event`] / [`append_handoff_action_failed_event`];
+/// whitespace in every field folds to underscores so the record stays a single
+/// parseable line.
+pub fn append_handoff_refused_event(
+    task_id: &str,
+    workspace: &str,
+    branch: &str,
+    reason: &str,
+    files: Option<usize>,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let task_id = sanitize_field(task_id);
+    let workspace = sanitize_field(workspace);
+    let branch = sanitize_reason(branch);
+    let reason = sanitize_field(reason);
+    let files = files
+        .map(|n| format!(" files={n}"))
+        .unwrap_or_default();
+    append_event_line(&format!(
+        "{ts} handoff task={task_id} workspace={workspace} branch={branch} status=refused reason={reason}{files}"
+    ))
+}
+
 /// Append `<rfc3339> <body>` to `~/.shelbi/events.log`. Used by the hub
 /// daemon (`shelbi daemon`) for `event`-verb messages received over the
 /// Unix socket — the worker hands us a pre-formatted body line (e.g.
