@@ -273,10 +273,6 @@ impl SidebarModel {
                     label: "Activity".into(),
                     view: View::Activity,
                 },
-                NavItem {
-                    label: "Machines".into(),
-                    view: View::Machines,
-                },
             ],
             workspaces,
             reviews,
@@ -644,9 +640,15 @@ mod tests {
         assert_eq!(model.project_label, "Alpha");
         assert_eq!(model.zen_mode, ZenModeState::On);
         assert_eq!(model.unread_errors, 4);
-        assert_eq!(model.nav.len(), 4);
+        // Machines moved to the command palette; the nav is Chat / Issues /
+        // Activity only, matching main's sidebar.
+        assert_eq!(model.nav.len(), 3);
         assert_eq!(model.nav[1].view, View::Issues);
-        assert_eq!(model.nav[3].view, View::Machines);
+        assert_eq!(model.nav[2].view, View::Activity);
+        assert!(
+            !model.nav.iter().any(|n| n.view == View::Machines),
+            "Machines is no longer a sidebar nav entry"
+        );
 
         // One review task.
         assert_eq!(model.reviews.len(), 1);

@@ -22,6 +22,7 @@ use shelbi_app::command::{
     CommandModel, EditItem, ProjectItem, ReviewItem, ViewItem, WorkspaceItem,
 };
 use shelbi_app::exec::EditTarget;
+use shelbi_app::nav::View;
 use shelbi_app::view::SidebarModel;
 use shelbi_core::ConfigMode;
 use shelbi_palette::Entry;
@@ -345,7 +346,7 @@ fn confirm_event(task_id: &str, outcome: overlay::review_confirm::Outcome) -> Ov
 /// registry enumerates the palette's commands from this, so populating it is
 /// what makes every command reachable.
 pub fn build_command_model(project: &str, sidebar: &SidebarModel) -> CommandModel {
-    let views = sidebar
+    let mut views: Vec<ViewItem> = sidebar
         .nav
         .iter()
         .map(|n| ViewItem {
@@ -355,6 +356,18 @@ pub fn build_command_model(project: &str, sidebar: &SidebarModel) -> CommandMode
             decoration: None,
         })
         .collect();
+
+    // Machines is palette-only: it's no longer a sidebar nav row, so add its
+    // command here (guarded against duplication should a future nav reintroduce
+    // it). The id/title match the historical `view:machines` entry.
+    if !views.iter().any(|v| v.view == View::Machines) {
+        views.push(ViewItem {
+            id: format!("view:{}", View::Machines.as_view_id()),
+            title: "Machines".to_string(),
+            view: View::Machines,
+            decoration: None,
+        });
+    }
 
     let workspaces = sidebar
         .workspaces
@@ -631,7 +644,53 @@ mod tests {
         let view_ids: Vec<&str> = m.views.iter().map(|v| v.id.as_str()).collect();
         assert!(view_ids.contains(&"view:orch"));
         assert!(view_ids.contains(&"view:tasks"));
+        // Machines is palette-only now: it isn't in the sidebar nav, but
+        // `build_command_model` adds its command so Ctrl+P → Machines works.
+        assert!(
+            view_ids.contains(&"view:machines"),
+            "Machines reachable from the palette, got: {view_ids:?}"
+        );
+        let machines = m
+            .views
+            .iter()
+            .find(|v| v.id == "view:machines")
+            .expect("machines command present");
+        assert_eq!(machines.view, View::Machines);
+        assert_eq!(machines.title, "Machines");
         assert_eq!(m.workspaces[0].name, "alpha-1");
         assert_eq!(m.reviews[0].task_id, "T-9");
+    }
+
+    /// Guard against a double entry should a future sidebar nav reintroduce a
+    /// Machines row: the palette must still list exactly one Machines command.
+    #[test]
+    fn command_model_does_not_duplicate_machines_when_nav_has_it() {
+        let sidebar = SidebarModel {
+            project_label: "alpha".into(),
+            nav: vec![
+                NavItem {
+                    label: "Issues".into(),
+                    view: View::Issues,
+                },
+                NavItem {
+                    label: "Machines".into(),
+                    view: View::Machines,
+                },
+            ],
+            workspaces: Vec::new(),
+            reviews: Vec::new(),
+            config_error: None,
+            board_loading: false,
+            collapsed_machines: Default::default(),
+            board_banner: None,
+            daemon_version_line: None,
+            daemon_version_mismatch: false,
+            status_line: String::new(),
+            zen_mode: shelbi_state::ZenModeState::Off,
+            unread_errors: 0,
+        };
+        let m = build_command_model("alpha", &sidebar);
+        let machines = m.views.iter().filter(|v| v.id == "view:machines").count();
+        assert_eq!(machines, 1, "exactly one Machines command");
     }
 }
