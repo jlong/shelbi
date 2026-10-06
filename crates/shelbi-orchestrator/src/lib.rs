@@ -1113,10 +1113,17 @@ mod supervise_restart_orchestrator_tests {
     }
 
     /// Write a minimal local-hub project with a declared `claude` orchestrator
-    /// runner under a fresh `$SHELBI_HOME`, returning the home guard + lock.
-    fn seed_project(
-        name: &str,
-    ) -> (super::tests_support_restart::Fixture, std::sync::MutexGuard<'static, ()>) {
+    /// runner under a fresh `$SHELBI_HOME`, returning a single guard that owns
+    /// both the crate test lock and the home teardown.
+    ///
+    /// The lock lives *inside* the returned [`Fixture`] (rather than being a
+    /// second tuple element) so the env is always restored while the lock is
+    /// still held: `Fixture::drop` removes `SHELBI_HOME` in its body, which
+    /// runs before the lock field is dropped. Returning `(Fixture, guard)` and
+    /// binding `let (_fx, _lock)` would drop the guard *first* (reverse
+    /// declaration order), releasing the lock before `_fx` cleared the env —
+    /// a window in which a sibling test resolves the real `~/.shelbi`.
+    fn seed_project(name: &str) -> super::tests_support_restart::Fixture {
         let lock = crate::test_lock::acquire();
         let home = std::env::temp_dir().join(format!(
             "shelbi-orch-restart-{name}-{}-{}",
@@ -1140,12 +1147,16 @@ mod supervise_restart_orchestrator_tests {
         .unwrap();
         let prev = std::env::var_os("SHELBI_HOME");
         std::env::set_var("SHELBI_HOME", &home);
-        (super::tests_support_restart::Fixture { home, prev }, lock)
+        super::tests_support_restart::Fixture {
+            home,
+            prev,
+            _lock: lock,
+        }
     }
 
     #[test]
     fn restarts_the_orchestrator_session_in_place_via_the_backend() {
-        let (_fx, _lock) = seed_project("alpha");
+        let _fx = seed_project("alpha");
         let backend = StubBackend::new();
 
         let outcome = supervise_restart_orchestrator(&backend, "alpha").unwrap();
@@ -1165,7 +1176,7 @@ mod supervise_restart_orchestrator_tests {
 
     #[test]
     fn propagates_a_failed_respawn_from_the_backend() {
-        let (_fx, _lock) = seed_project("beta");
+        let _fx = seed_project("beta");
         // The real session backend returns `Failed` because a live session keeps
         // the binary it started with; the restart seam must surface that so the
         // poller falls back to republishing `OrchestratorRestarted` and letting a
@@ -1190,10 +1201,18 @@ mod tests_support_restart {
     pub(super) struct Fixture {
         pub(super) home: std::path::PathBuf,
         pub(super) prev: Option<std::ffi::OsString>,
+        /// The crate test lock, held for the fixture's whole lifetime. Keeping
+        /// it here (rather than as a separate binding at the call site) means
+        /// the restore in `drop` runs while the lock is still held: the `drop`
+        /// body executes before this field is dropped and the lock released.
+        pub(super) _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
+            // Restore the env first — the lock (`_lock`) only releases once
+            // this body returns and the struct's fields drop, so no sibling
+            // test can observe the cleared `SHELBI_HOME`.
             match self.prev.take() {
                 Some(v) => std::env::set_var("SHELBI_HOME", v),
                 None => std::env::remove_var("SHELBI_HOME"),
