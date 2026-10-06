@@ -66,6 +66,13 @@ impl TerminalPane {
         }
     }
 
+    /// The session's current grid size (what the PTY is locked to). Used by
+    /// tests to assert the pane reflowed to a requested viewport size.
+    #[cfg(test)]
+    pub(crate) fn session_size(&self) -> Size {
+        self.session_size
+    }
+
     /// True while the view is scrolled up into scrollback (or searching), i.e.
     /// Shelbi — not the agent — owns navigation keys.
     pub fn in_scrollback(&self) -> bool {

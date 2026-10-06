@@ -330,6 +330,15 @@ pub struct SessionManager {
     slot: Slot,
     /// How the connect worker retries a session whose socket isn't up yet.
     retry: RetryPolicy,
+    /// The last viewport size the shell asked us to report, remembered even
+    /// while we are connecting. A session attaches at its spawn-time default
+    /// size (e.g. the daemon's 120x40), so a resize request that went out while
+    /// this slot was still connecting reached no live connection and was
+    /// dropped — the shell reports the size once, when it changes, so it is
+    /// never re-sent. Re-applying this size the moment a session goes live
+    /// keeps the pane filling its area instead of letterboxing the default grid
+    /// (`rt-review-content-session-edit-in-vi-doesn-t-fill-the-content-area`).
+    last_size: Option<Size>,
 }
 
 /// What the main area should draw right now.
@@ -349,6 +358,7 @@ impl SessionManager {
             connector,
             slot: Slot::Empty,
             retry: RetryPolicy::default(),
+            last_size: None,
         }
     }
 
@@ -412,12 +422,26 @@ impl SessionManager {
             }
         };
         self.slot = match result {
-            Ok(c) => Slot::Live(Box::new(LiveSlot {
-                target,
-                conn: c.conn,
-                events: c.events,
-                pane: TerminalPane::new(c.size),
-            })),
+            Ok(c) => {
+                let live = LiveSlot {
+                    target,
+                    conn: c.conn,
+                    events: c.events,
+                    pane: TerminalPane::new(c.size),
+                };
+                // The session attached at its spawn-time default size. If the
+                // shell asked for a viewport size while we were still
+                // connecting, that request reached no live connection; re-apply
+                // it now so the just-attached session reflows to fill its area
+                // (the PTY resize echoes back a `Resized` event that updates the
+                // pane). Without this the content view letterboxes the default
+                // grid — e.g. "Edit in Vi" opening vim shorter than the content
+                // area (`rt-review-content-session-edit-in-vi-doesn-t-fill-the-content-area`).
+                if let Some(size) = self.last_size {
+                    let _ = live.conn.resize(size.cols.max(1), size.rows.max(1));
+                }
+                Slot::Live(Box::new(live))
+            }
             Err(ConnectFailure::Idle(info)) => Slot::Idle { target, info },
             // The worker only ever forwards a terminal outcome: it retries the
             // transient `Starting`/`Awaiting` signals itself and, on give-up,
@@ -522,10 +546,16 @@ impl SessionManager {
     }
 
     /// Report the main area's size to the live session so it reflows to fill
-    /// it when the shell is the most-recently-active client.
-    pub fn resize(&self, cols: u16, rows: u16) {
+    /// it when the shell is the most-recently-active client. The size is
+    /// remembered (even with no live session) and re-applied when a session
+    /// next goes live, so a resize issued while a slot was still connecting is
+    /// not lost
+    /// (`rt-review-content-session-edit-in-vi-doesn-t-fill-the-content-area`).
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        let size = Size::new(cols.max(1), rows.max(1));
+        self.last_size = Some(size);
         if let Slot::Live(live) = &self.slot {
-            let _ = live.conn.resize(cols.max(1), rows.max(1));
+            let _ = live.conn.resize(size.cols, size.rows);
         }
     }
 }
@@ -1155,6 +1185,94 @@ mod tests {
             true
         }));
         assert!(!called.get(), "the declared check is skipped when exited is true");
+    }
+
+    /// A connector that opens a real session at its spawn size, but blocks
+    /// inside `connect` until the test releases its gate — so the test can issue
+    /// a resize while the slot is still connecting (the window in which the
+    /// shell's one-shot resize report would otherwise reach no live connection).
+    struct GatedLive {
+        sock: std::path::PathBuf,
+        gate: std::sync::Mutex<Option<Receiver<()>>>,
+    }
+
+    impl Connector for GatedLive {
+        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
+            if let Some(rx) = self.gate.lock().unwrap().take() {
+                let _ = rx.recv(); // released when the test drops its sender
+            }
+            let (conn, events) = Connection::open(&self.sock, None, capability::ALL)
+                .map_err(|e| ConnectFailure::Message(e.to_string()))?;
+            let size = match conn.info() {
+                Ok(info) => Size::new(info.cols.max(1), info.rows.max(1)),
+                Err(_) => Size::new(80, 24),
+            };
+            conn.attach(None)
+                .map_err(|e| ConnectFailure::Message(e.to_string()))?;
+            Ok(Connected { conn, events, size })
+        }
+    }
+
+    /// Drive the manager until its live pane reports `want` as its session size
+    /// (pumping the in-band `Resized` the real session emits after a resize), or
+    /// the budget runs out.
+    fn wait_until_pane_size(mgr: &mut SessionManager, want: Size) -> bool {
+        let mut ring = false;
+        for _ in 0..500 {
+            mgr.poll();
+            mgr.pump_output(&mut ring);
+            if let MainState::Live(pane) = mgr.state() {
+                if pane.session_size() == want {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_resize_while_connecting_is_applied_when_the_session_goes_live() {
+        // A content session attaches at its spawn-time default size (here the
+        // cat session's 80x24, standing in for the daemon's default). The shell
+        // reports the content rect's size once, while the slot is still
+        // connecting, so that resize reaches no live connection. The manager
+        // must remember it and re-apply it the moment the session goes live, so
+        // the pane reflows to fill its area instead of letterboxing the default
+        // grid — the "Edit in Vi opens vim shorter than the content area" bug
+        // (`rt-review-content-session-edit-in-vi-doesn-t-fill-the-content-area`).
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let (sock, _cleanup) = spawn_cat_session(home.path(), "review/editor");
+
+        let (gate_tx, gate_rx) = mpsc::channel();
+        let connector = std::sync::Arc::new(GatedLive {
+            sock,
+            gate: std::sync::Mutex::new(Some(gate_rx)),
+        });
+        let mut mgr = SessionManager::new("review", connector);
+        mgr.show(SessionRef::Review {
+            slot: "r1".into(),
+            role: "editor".into(),
+        });
+        assert!(connecting(&mgr), "the gated connect has not completed yet");
+
+        // Resize while still connecting: there is no live connection to receive
+        // it, so without the fix it is simply lost.
+        mgr.resize(50, 10);
+        assert!(connecting(&mgr), "a resize does not complete the connect");
+
+        // Release the gate: the session attaches at its 80x24 spawn size.
+        drop(gate_tx);
+
+        // Once live, the remembered 50x10 is re-applied, so the real session
+        // reflows and the pane ends up at the requested size, not the default.
+        assert!(
+            wait_until_pane_size(&mut mgr, Size::new(50, 10)),
+            "the session should reflow to the size requested while connecting"
+        );
     }
 
     #[test]
