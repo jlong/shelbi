@@ -11,6 +11,20 @@ use std::time::Duration;
 /// so it reads as a subtle fill rather than a coloured accent.
 pub const SELECTION_BG: Color = Color::Rgb(63, 63, 63);
 
+/// The glyph painted down the sidebar's rightmost column as the resize
+/// drag handle — a full-height light vertical rule.
+pub const DIVIDER_GLYPH: &str = "│";
+
+/// Resting color of the drag-handle line: the same dim gray the sidebar uses
+/// for quiet chrome, so the handle reads as a border rather than an accent
+/// until the pointer finds it.
+pub const DIVIDER_DIM: Color = Color::DarkGray;
+
+/// Highlight color of the drag-handle line while the pointer hovers it or a
+/// resize drag is underway — the cyan accent the sidebar title already uses,
+/// drawn bold so the whole rule brightens as an unmistakable affordance.
+pub const DIVIDER_ACTIVE: Color = Color::Cyan;
+
 /// Background fill for the small workflow-name badge on kanban cards.
 /// Kept a touch bluer/lighter than [`SELECTION_BG`] so the badge still
 /// reads as a distinct chip when it lands on a selected card (whose row

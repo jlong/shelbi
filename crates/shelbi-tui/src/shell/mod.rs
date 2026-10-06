@@ -664,6 +664,10 @@ struct ShellState {
     /// captures all mouse motion until the button is released, regardless of
     /// where the pointer travels.
     sidebar_dragging: bool,
+    /// `true` while the pointer hovers the divider column. Drives the drag
+    /// handle's hover highlight; only flipped (and repainted) when the pointer
+    /// crosses the column, so idle motion elsewhere stays cheap.
+    divider_hover: bool,
     /// The main-area size last reported to the live session.
     reported_main: Option<Size>,
     /// When `Some`, the user is typing a scrollback search query.
@@ -792,6 +796,7 @@ impl ShellState {
             sidebar_rect: Rect::default(),
             main_rect: Rect::default(),
             sidebar_dragging: false,
+            divider_hover: false,
             reported_main: None,
             search_input: None,
             should_reexec: false,
@@ -2187,6 +2192,19 @@ impl ShellState {
 
     fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+        // Hover tracking for the drag-handle line: any pointer motion over the
+        // divider column lights the handle; motion off it dims it again. Only
+        // flip (and repaint) when the state actually changes so the common case
+        // — motion that never touches the column — stays free. This runs ahead
+        // of the routing below and falls through, so motion is still forwarded
+        // to a live pane as before.
+        if matches!(m.kind, MouseEventKind::Moved) {
+            let hovering = self.on_divider(m.column, m.row);
+            if hovering != self.divider_hover {
+                self.divider_hover = hovering;
+                self.dirty = true;
+            }
+        }
         // The sidebar/main divider drag takes priority over everything else,
         // including the review's mouse routing: while a review is open the panel
         // sits in the sidebar's column, so the divider between panel and content
@@ -2221,8 +2239,10 @@ impl ShellState {
             if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
                 self.client.focus_main();
             }
+            let panel_rect = self.sidebar_content_rect();
+            let main_rect = self.main_rect;
             if let Some(r) = self.review.as_mut() {
-                let action = r.handle_mouse(m, self.sidebar_rect, self.main_rect);
+                let action = r.handle_mouse(m, panel_rect, main_rect);
                 self.apply_review_action(action);
                 self.dirty = true;
             }
@@ -2241,6 +2261,16 @@ impl ShellState {
     /// border between the sidebar and the main pane.
     fn divider_col(&self) -> u16 {
         self.sidebar_rect.right().saturating_sub(1)
+    }
+
+    /// The sidebar area minus its rightmost column, which is reserved for the
+    /// drag-handle line. Sidebar/review content renders into — and hit-tests
+    /// against — this narrower rect so nothing paints over or clips the line.
+    fn sidebar_content_rect(&self) -> Rect {
+        Rect {
+            width: self.sidebar_rect.width.saturating_sub(1),
+            ..self.sidebar_rect
+        }
     }
 
     /// Whether `(col, row)` lands on the draggable divider between the sidebar
@@ -2303,7 +2333,7 @@ impl ShellState {
                 // focuses the sidebar (hit returns `None`), opening nothing.
                 self.client.focus_sidebar();
                 if let Some(view) = self.sidebar_view() {
-                    if let Some(sel) = view.hit(self.sidebar_rect, m.column, m.row) {
+                    if let Some(sel) = view.hit(self.sidebar_content_rect(), m.column, m.row) {
                         self.client.clamp_selection(view.selectable_count());
                         // Move selection to the clicked row.
                         while self.client.sidebar_selection() < sel {
@@ -2470,6 +2500,11 @@ fn draw(
     let (sidebar_rect, main_rect) = layout(area, display_width);
     state.sidebar_rect = sidebar_rect;
     state.main_rect = main_rect;
+    // The sidebar/review content stops one column short of the sidebar's right
+    // edge; that last column carries the drag-handle line (drawn after the
+    // content, below), lit while the pointer hovers it or a resize is underway.
+    let content_rect = state.sidebar_content_rect();
+    let divider_active = state.sidebar_dragging || state.divider_hover;
 
     // Report our viewport so the session reflows to fill the main area when we
     // are the most-recently-active client.
@@ -2539,7 +2574,7 @@ fn draw(
             // (`rt-review-screen-hangs-on-connecting`).
             if !is_review {
                 if let Some(view) = &sidebar_view {
-                    view.render(buf, sidebar_rect, selection, !focus_main, &sidebar_chrome);
+                    view.render(buf, content_rect, selection, !focus_main, &sidebar_chrome);
                 }
             }
 
@@ -2593,11 +2628,17 @@ fn draw(
         // into the sidebar's column (`sidebar_rect`), the content terminal view
         // into the main area (`main_rect`) — two columns, panel and content.
         if let Some(r) = review.as_mut() {
-            let cur = r.render(frame, sidebar_rect, main_rect, truecolor, focus_main);
+            let cur = r.render(frame, content_rect, main_rect, truecolor, focus_main);
             if overlay.is_none() {
                 cursor = cur;
             }
         }
+
+        // The drag-handle line down the sidebar's right edge, painted last so
+        // neither the nav sidebar nor the review panel (whichever holds that
+        // column) can cover it. Its column was kept clear by rendering the
+        // content one column narrower above.
+        render_divider(frame.buffer_mut(), sidebar_rect, divider_active);
 
         // Dim the main area under an open overlay so the modal reads as on top
         // (the overlay's own `Clear` un-dims the cells it occupies).
@@ -2630,6 +2671,31 @@ fn dim_area(buf: &mut ratatui::buffer::Buffer, area: Rect) {
             if let Some(cell) = buf.cell_mut((x, y)) {
                 cell.set_style(Style::default().add_modifier(Modifier::DIM));
             }
+        }
+    }
+}
+
+/// Paint the resize drag handle: a full-height vertical rule down the
+/// sidebar's rightmost column (`sidebar_rect.right() - 1`, the exact column a
+/// drag starts from). Dim by default, cyan/bold when `active` (the pointer is
+/// hovering it or a drag is in progress). Drawn after the sidebar/review
+/// content, whose own render was narrowed by one column so it never lands here.
+fn render_divider(buf: &mut ratatui::buffer::Buffer, sidebar_rect: Rect, active: bool) {
+    if sidebar_rect.width == 0 || sidebar_rect.height == 0 {
+        return;
+    }
+    let x = sidebar_rect.right().saturating_sub(1);
+    let style = if active {
+        Style::default()
+            .fg(crate::theme::DIVIDER_ACTIVE)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(crate::theme::DIVIDER_DIM)
+    };
+    for y in sidebar_rect.top()..sidebar_rect.bottom() {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_symbol(crate::theme::DIVIDER_GLYPH);
+            cell.set_style(style);
         }
     }
 }
@@ -3425,6 +3491,181 @@ mod tests {
         assert_eq!(st.client.sidebar_width(), 28);
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    // --- drag-handle line ---------------------------------------------------
+
+    /// A synthetic pointer-motion (no button) at `(col, row)`.
+    fn moved(col: u16, row: u16) -> crossterm::event::MouseEvent {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Render the sidebar exactly as `draw` layers it: content into the area
+    /// minus its last column, then the drag-handle line down that last column.
+    fn render_sidebar_and_divider(
+        st: &ShellState,
+        area: Rect,
+        active: bool,
+    ) -> ratatui::buffer::Buffer {
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        let content = Rect {
+            width: area.width.saturating_sub(1),
+            ..area
+        };
+        if let Some(view) = st.sidebar_view() {
+            view.render(&mut buf, content, 0, true, &st.sidebar_chrome());
+        }
+        render_divider(&mut buf, area, active);
+        buf
+    }
+
+    /// The line is a full-height `│` in the drag column (the sidebar's last
+    /// column, == `divider_col`) at two different sidebar widths.
+    #[test]
+    fn divider_line_fills_the_drag_column_at_two_widths() {
+        let st = test_state();
+        for width in [24u16, 50u16] {
+            let area = Rect::new(0, 0, width, 20);
+            let buf = render_sidebar_and_divider(&st, area, false);
+            let x = width - 1; // the drag column: sidebar_rect.right() - 1
+            for y in 0..area.height {
+                assert_eq!(
+                    buf[(x, y)].symbol(),
+                    crate::theme::DIVIDER_GLYPH,
+                    "width {width}: a `│` fills the drag column at row {y}"
+                );
+            }
+        }
+    }
+
+    /// The drawn column matches the column a drag actually starts from.
+    #[test]
+    fn divider_line_column_matches_the_drag_hit_column() {
+        let mut st = test_state();
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        let drag_col = st.divider_col();
+        let buf = render_sidebar_and_divider(&st, st.sidebar_rect, false);
+        assert!(st.on_divider(drag_col, 5), "the drag column is the hit column");
+        assert_eq!(
+            buf[(drag_col, 0)].symbol(),
+            crate::theme::DIVIDER_GLYPH,
+            "the line is drawn in the very column a drag begins from"
+        );
+    }
+
+    /// At rest the line is dim; while active (hover or drag) it brightens to the
+    /// accent and goes bold.
+    #[test]
+    fn divider_line_dims_at_rest_and_highlights_when_active() {
+        let st = test_state();
+        let area = Rect::new(0, 0, 28, 20);
+        let x = area.width - 1;
+
+        let dim = render_sidebar_and_divider(&st, area, false);
+        assert_eq!(dim[(x, 3)].fg, crate::theme::DIVIDER_DIM, "dim at rest");
+        assert!(
+            !dim[(x, 3)].modifier.contains(ratatui::style::Modifier::BOLD),
+            "the resting line is not bold"
+        );
+
+        let hot = render_sidebar_and_divider(&st, area, true);
+        assert_eq!(
+            hot[(x, 3)].fg,
+            crate::theme::DIVIDER_ACTIVE,
+            "accent color while active"
+        );
+        assert!(
+            hot[(x, 3)].modifier.contains(ratatui::style::Modifier::BOLD),
+            "the active line is bold"
+        );
+    }
+
+    /// Sidebar content stops one column short of the drag column, so it never
+    /// writes into — or gets clipped by — the line. Checked at the 24-column
+    /// minimum and a wide sidebar, with a right-aligned `idle` state that would
+    /// otherwise reach the edge.
+    #[test]
+    fn sidebar_content_never_touches_the_drag_column() {
+        let st = test_state(); // seeds one idle "alpha" workspace
+        for width in [24u16, 48u16] {
+            let area = Rect::new(0, 0, width, 20);
+            let content = Rect {
+                width: width - 1,
+                ..area
+            };
+            // Render content ONLY (no divider), so we can see whether it reaches
+            // the drag column on its own.
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            let view = st.sidebar_view().unwrap();
+            view.render(&mut buf, content, 0, true, &st.sidebar_chrome());
+
+            let drag_col = width - 1;
+            for y in 0..area.height {
+                let cell = &buf[(drag_col, y)];
+                assert!(
+                    cell.symbol() == " " || cell.symbol().is_empty(),
+                    "width {width}: content left the drag column clear at row {y}, got {:?}",
+                    cell.symbol()
+                );
+            }
+            // The right-aligned `idle` state still renders in full within the
+            // narrowed content — it is not clipped by reserving the column.
+            let rows: Vec<String> = (0..area.height)
+                .map(|y| {
+                    (0..content.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect();
+            assert!(
+                rows.iter().any(|r| r.contains("idle")),
+                "width {width}: the idle state renders unclipped, got:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    /// Pointer motion onto the drag column lights the hover state (and repaints);
+    /// motion off it clears it again. An in-progress drag also counts as active.
+    #[test]
+    fn divider_hover_follows_the_pointer_and_feeds_the_highlight() {
+        let mut st = test_state();
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        st.main_rect = Rect::new(28, 0, 92, 20);
+        let col = st.divider_col();
+
+        assert!(!st.divider_hover, "no hover before any motion");
+
+        st.dirty = false;
+        st.handle_mouse(moved(col, 5));
+        assert!(st.divider_hover, "motion onto the drag column sets hover");
+        assert!(st.dirty, "a hover flip repaints");
+
+        // Motion that stays on the column does not re-flip / re-dirty.
+        st.dirty = false;
+        st.handle_mouse(moved(col, 7));
+        assert!(st.divider_hover, "still hovering");
+        assert!(!st.dirty, "no repaint while the hover state is unchanged");
+
+        // Motion off the column clears it.
+        st.dirty = false;
+        st.handle_mouse(moved(col - 3, 5));
+        assert!(!st.divider_hover, "motion off the column clears hover");
+        assert!(st.dirty, "clearing the hover repaints");
+
+        // A drag is active even with no hover — the highlight tracks either.
+        st.divider_hover = false;
+        st.sidebar_dragging = true;
+        assert!(
+            st.sidebar_dragging || st.divider_hover,
+            "a drag in progress keeps the handle highlighted"
+        );
     }
 
     #[test]
