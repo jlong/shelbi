@@ -91,6 +91,19 @@ pub enum ConnectFailure {
     /// appears (`rt-tui-attach-retry-unbound-socket`). The string is the error
     /// shown only if the retries run out.
     Starting(String),
+    /// No live session exists yet, but one is *expected* to (re)appear, so this
+    /// is transient like [`Starting`]: the connect worker keeps retrying on the
+    /// `RetryPolicy` cadence and attaches as soon as a live session shows up.
+    /// Raised for the orchestrator when the project declares one (its config
+    /// loads) or an exited session with its name is already on disk — the shape
+    /// of a relaunch in progress: a daemon restart SIGTERMs the old
+    /// `<project>/orch` session and spawns a fresh one a beat later, and a TUI
+    /// that connects in that gap would otherwise settle on a permanent
+    /// "couldn't attach" error even though a healthy session arrives seconds
+    /// later (`rt-tui-shows-a-permanent-attach-error-when-the-orchestrator-is-relaunched`).
+    /// The string is the terminal error shown only if no live session appears
+    /// before the deadline (an exited session's last output line, when any).
+    Awaiting(String),
     /// Any other no-session / attach failure. The message is shown as-is and,
     /// for a session that *exited*, already carries its last output line (so a
     /// dead workspace or orchestrator surfaces why it's gone — the behavior the
@@ -145,6 +158,7 @@ impl Connector for LiveConnector {
                 // *why* the session isn't there — e.g. an orchestrator that
                 // exited at launch with `command not found: claude` — instead of
                 // only "no live session" (`rt-login-env-capture-empty-path`).
+                let exited = sessions.iter().any(|s| s.meta.name == want && !s.alive);
                 let last_line = sessions
                     .iter()
                     .find(|s| s.meta.name == want && !s.alive)
@@ -156,10 +170,20 @@ impl Connector for LiveConnector {
                 if let (SessionRef::Workspace(name), None) = (target, &last_line) {
                     return Err(ConnectFailure::Idle(idle_info(project, name)));
                 }
-                return Err(ConnectFailure::Message(no_live_session_error(
-                    &want,
-                    last_line.as_deref(),
-                )));
+                let msg = no_live_session_error(&want, last_line.as_deref());
+                // The orchestrator is relaunched out of band — a daemon restart
+                // SIGTERMs the old session and spawns a fresh one a beat later.
+                // If the TUI connected in that gap it finds only the exited
+                // session; rather than surfacing a terminal error the user must
+                // quit past, keep retrying until the new session binds
+                // (`rt-tui-shows-a-permanent-attach-error-when-the-orchestrator-is-relaunched`).
+                // `orchestrator_declared` is computed lazily, only when it could
+                // change the outcome (an exited session already proves one is
+                // expected), to avoid a config load on every workspace miss.
+                if should_await_session(target, exited, || orchestrator_declared(project)) {
+                    return Err(ConnectFailure::Awaiting(msg));
+                }
+                return Err(ConnectFailure::Message(msg));
             }
         };
         let (conn, events) = match Connection::open(&sess.sock, None, capability::ALL) {
@@ -191,6 +215,34 @@ impl Connector for LiveConnector {
             size,
         })
     }
+}
+
+/// Whether a missing live session for `target` should be *awaited* — kept
+/// retrying by the connect worker — rather than reported as a terminal failure.
+/// True only for the orchestrator, and only when a session is expected: an
+/// exited one with its name is already on disk (`exited`), or the project
+/// declares an orchestrator (`declared`). A relaunch in that window brings a
+/// live session up within the retry deadline, so the TUI never settles on a
+/// stale "couldn't attach" error across an orchestrator relaunch
+/// (`rt-tui-shows-a-permanent-attach-error-when-the-orchestrator-is-relaunched`).
+///
+/// `declared` is a closure so the (blocking) config load runs only when the
+/// cheap `exited` signal didn't already settle it. Pure given its inputs, so
+/// the classification is unit-testable without a sessions directory.
+fn should_await_session(
+    target: &SessionRef,
+    exited: bool,
+    declared: impl FnOnce() -> bool,
+) -> bool {
+    matches!(target, SessionRef::Orchestrator) && (exited || declared())
+}
+
+/// Whether `project` declares an orchestrator — i.e. its config loads. A
+/// declared orchestrator is expected to have (or soon have) a live session.
+/// Best-effort: a project whose config can't be read reads as "not declared"
+/// and the connect falls back to the exited-session signal.
+fn orchestrator_declared(project: &str) -> bool {
+    shelbi_state::load_project(project).is_ok()
 }
 
 /// Assemble an idle workspace's [`IdleInfo`] from the project config and (for a
@@ -300,11 +352,18 @@ impl SessionManager {
         }
     }
 
-    /// Begin showing `target`. No-op if it is already the live/connecting
-    /// target. The blocking connect runs on a worker thread; this returns at
-    /// once.
+    /// Begin showing `target`. The blocking connect runs on a worker thread;
+    /// this returns at once.
+    ///
+    /// Re-selecting the same target no-ops only while it is actively connecting
+    /// or already live — there is nothing to redo there. A *failed* (or idle)
+    /// binding instead re-attempts, so re-selecting Chat in the sidebar recovers
+    /// from a missed relaunch without a full quit/reopen
+    /// (`rt-tui-shows-a-permanent-attach-error-when-the-orchestrator-is-relaunched`).
     pub fn show(&mut self, target: SessionRef) {
-        if self.current_target() == Some(&target) {
+        if self.current_target() == Some(&target)
+            && matches!(self.slot, Slot::Connecting { .. } | Slot::Live(_))
+        {
             return;
         }
         let project = self.project.clone();
@@ -360,13 +419,16 @@ impl SessionManager {
                 pane: TerminalPane::new(c.size),
             })),
             Err(ConnectFailure::Idle(info)) => Slot::Idle { target, info },
-            // The worker only ever forwards a terminal outcome: it retries
-            // `Starting` itself and, on give-up, converts it to a `Message`. A
-            // `Starting` here would mean the worker didn't retry, so treat it as
-            // a plain failure rather than silently dropping it.
-            Err(ConnectFailure::Starting(error) | ConnectFailure::Message(error)) => {
-                Slot::Failed { target, error }
-            }
+            // The worker only ever forwards a terminal outcome: it retries the
+            // transient `Starting`/`Awaiting` signals itself and, on give-up,
+            // converts them to a `Message`. One arriving here would mean the
+            // worker didn't retry, so treat it as a plain failure rather than
+            // silently dropping it.
+            Err(
+                ConnectFailure::Starting(error)
+                | ConnectFailure::Awaiting(error)
+                | ConnectFailure::Message(error),
+            ) => Slot::Failed { target, error },
         };
         true
     }
@@ -489,16 +551,26 @@ impl ConnectJob {
         // thread, keeps the UI loop non-blocking — it only ever polls.
         let started = Instant::now();
         let mut result = self.connector.connect(&self.project, &self.target);
-        while let Err(ConnectFailure::Starting(_)) = &result {
+        while matches!(
+            &result,
+            Err(ConnectFailure::Starting(_) | ConnectFailure::Awaiting(_))
+        ) {
             if started.elapsed() >= self.retry.deadline {
-                // Give up: turn the transient "starting" signal into a terminal
-                // error so the user finally sees why the attach never completed.
-                if let Err(ConnectFailure::Starting(msg)) = result {
-                    result = Err(ConnectFailure::Message(format!(
+                // Give up: turn the transient signal into a terminal error so
+                // the user finally sees why the attach never completed.
+                result = match result {
+                    // A socket that never bound — name the give-up explicitly,
+                    // since the carried message only says "socket not up yet".
+                    Err(ConnectFailure::Starting(msg)) => Err(ConnectFailure::Message(format!(
                         "{msg} — not reachable after {:?}",
                         self.retry.deadline
-                    )));
-                }
+                    ))),
+                    // A session that never (re)appeared — surface its carried
+                    // message as-is: the exited session's last output line, when
+                    // any, which already explains why nothing is there.
+                    Err(ConnectFailure::Awaiting(msg)) => Err(ConnectFailure::Message(msg)),
+                    other => other,
+                };
                 break;
             }
             std::thread::sleep(self.retry.backoff);
@@ -751,6 +823,35 @@ mod tests {
         }
     }
 
+    /// A connector that reports the session as expected-but-not-live
+    /// (`Awaiting`) for the first `awaiting` calls — the shape of an
+    /// orchestrator relaunch where the TUI finds only the exited session on disk
+    /// — then opens a real socket and returns a live binding. Counts its calls
+    /// so a test can assert the worker retried.
+    struct AwaitingThenLive {
+        sock: std::path::PathBuf,
+        awaiting: usize,
+        calls: AtomicUsize,
+    }
+
+    impl Connector for AwaitingThenLive {
+        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.awaiting {
+                return Err(ConnectFailure::Awaiting("no live session `relaunch/orch`".into()));
+            }
+            let (conn, events) = Connection::open(&self.sock, None, capability::ALL)
+                .map_err(|e| ConnectFailure::Message(e.to_string()))?;
+            let size = match conn.info() {
+                Ok(info) => Size::new(info.cols.max(1), info.rows.max(1)),
+                Err(_) => Size::new(80, 24),
+            };
+            conn.attach(None)
+                .map_err(|e| ConnectFailure::Message(e.to_string()))?;
+            Ok(Connected { conn, events, size })
+        }
+    }
+
     /// A connector that always reports the session as still-starting, so the
     /// socket never comes up: the worker retries until the deadline, then fails.
     struct AlwaysStarting {
@@ -951,6 +1052,132 @@ mod tests {
         assert_eq!(
             starting_error("demo/orch"),
             "session `demo/orch` is starting (socket not up yet)"
+        );
+    }
+
+    #[test]
+    fn an_awaiting_orchestrator_retries_then_attaches_live() {
+        // AC4: the connector sees only an exited session first (`Awaiting`) and
+        // then a live one — the orchestrator relaunched as the TUI opened — and
+        // ends up attached, with no error ever shown.
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let (sock, _cleanup) = spawn_cat_session(home.path(), "relaunch/orch");
+
+        let connector = std::sync::Arc::new(AwaitingThenLive {
+            sock,
+            awaiting: 3,
+            calls: AtomicUsize::new(0),
+        });
+        let mut mgr = SessionManager::new("relaunch", connector.clone());
+        mgr.retry = RetryPolicy {
+            deadline: Duration::from_secs(5),
+            backoff: Duration::from_millis(10),
+        };
+        mgr.show(SessionRef::Orchestrator);
+
+        assert!(
+            poll_until_live(&mut mgr),
+            "the awaited connect should end in a live attach once the new session binds"
+        );
+        assert!(
+            matches!(mgr.state(), MainState::Live(_)),
+            "no error is shown across the relaunch — the slot is live"
+        );
+        assert!(
+            connector.calls.load(Ordering::SeqCst) >= 4,
+            "the worker should keep retrying past the awaiting attempts, not fail on the first"
+        );
+    }
+
+    #[test]
+    fn an_awaiting_session_that_never_appears_shows_its_carried_message() {
+        // On give-up, an `Awaiting` outcome surfaces its carried message as-is
+        // (the exited session's last output line) — not the `Starting` "not
+        // reachable" phrasing, which is about a socket that never bound.
+        struct AlwaysAwaiting;
+        impl Connector for AlwaysAwaiting {
+            fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
+                Err(ConnectFailure::Awaiting(
+                    "no live session `demo/orch` — last output: goodbye".into(),
+                ))
+            }
+        }
+        let mut mgr = SessionManager::new("demo", std::sync::Arc::new(AlwaysAwaiting));
+        mgr.retry = RetryPolicy {
+            deadline: Duration::from_millis(60),
+            backoff: Duration::from_millis(10),
+        };
+        mgr.show(SessionRef::Orchestrator);
+        poll_until_settled(&mut mgr);
+        match mgr.state() {
+            MainState::Failed(_, err) => assert_eq!(
+                err, "no live session `demo/orch` — last output: goodbye",
+                "the carried message is surfaced verbatim, with no give-up suffix"
+            ),
+            _ => panic!("an awaited session that never appears lands in MainState::Failed"),
+        }
+    }
+
+    #[test]
+    fn should_await_session_only_awaits_an_expected_orchestrator() {
+        // The orchestrator is awaited when an exited session is present or one is
+        // declared; with neither signal it is a terminal failure.
+        assert!(should_await_session(&SessionRef::Orchestrator, true, || false));
+        assert!(should_await_session(&SessionRef::Orchestrator, false, || true));
+        assert!(!should_await_session(&SessionRef::Orchestrator, false, || false));
+        // Workspaces and review content are never awaited — they keep their
+        // idle / terminal-message behavior.
+        assert!(!should_await_session(
+            &SessionRef::Workspace("alpha".into()),
+            true,
+            || true
+        ));
+        assert!(!should_await_session(
+            &SessionRef::Review {
+                slot: "r".into(),
+                role: "editor".into()
+            },
+            true,
+            || true
+        ));
+    }
+
+    #[test]
+    fn should_await_session_skips_the_declared_check_when_exited_settles_it() {
+        // The `declared` closure (a blocking config load) must not run when the
+        // cheap exited-session signal already proves a session is expected.
+        let called = std::cell::Cell::new(false);
+        assert!(should_await_session(&SessionRef::Orchestrator, true, || {
+            called.set(true);
+            true
+        }));
+        assert!(!called.get(), "the declared check is skipped when exited is true");
+    }
+
+    #[test]
+    fn re_showing_a_failed_target_re_attempts() {
+        // AC3: a failed main view re-attempts when the user re-selects it (e.g.
+        // Chat in the sidebar), so a missed relaunch never needs a quit/reopen.
+        let mut mgr = SessionManager::new("demo", std::sync::Arc::new(ExitedConnector));
+        mgr.retry = RetryPolicy {
+            deadline: Duration::from_millis(60),
+            backoff: Duration::from_millis(10),
+        };
+        mgr.show(SessionRef::Orchestrator);
+        poll_until_settled(&mut mgr);
+        assert!(
+            matches!(mgr.state(), MainState::Failed(..)),
+            "the exited session first settles as a failure"
+        );
+        // Re-selecting the same (failed) target kicks a fresh connect rather than
+        // no-opping, so the user can recover without a quit/reopen.
+        mgr.show(SessionRef::Orchestrator);
+        assert!(
+            connecting(&mgr),
+            "re-showing a failed target re-attempts instead of staying failed"
         );
     }
 }
