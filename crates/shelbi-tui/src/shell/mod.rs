@@ -2408,7 +2408,7 @@ fn draw(
     if state.reported_main != Some(main_size) {
         state.sessions.resize(main_size.cols, main_size.rows);
         // The review content view occupies only the content sub-rect.
-        if let Some(r) = state.review.as_ref() {
+        if let Some(r) = state.review.as_mut() {
             r.resize(main_rect);
         }
         state.reported_main = Some(main_size);

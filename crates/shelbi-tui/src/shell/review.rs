@@ -165,7 +165,7 @@ impl ReviewInterface {
 
     /// Report the review `area` (the whole main area) so the content view
     /// reflows to fill just its sub-rect.
-    pub fn resize(&self, area: Rect) {
+    pub fn resize(&mut self, area: Rect) {
         let (_panel, content) = split(area);
         self.content.resize(content.width, content.height);
     }
