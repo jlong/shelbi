@@ -11,8 +11,9 @@
 
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use shelbi_client::{Connection, SessionEvents};
+use shelbi_client::{ClientError, Connection, SessionEvents};
 use shelbi_proto::capability;
 use shelbi_term::Size;
 
@@ -82,11 +83,42 @@ pub enum ConnectFailure {
     /// A declared workspace with no session at all — the main area shows the
     /// idle-workspace placeholder rather than an error.
     Idle(IdleInfo),
+    /// The session was just launched (its `meta.json` is on disk and discovery
+    /// reports it alive) but its socket isn't accepting connections yet —
+    /// `Connection::open` returned ENOENT / ECONNREFUSED. This is *transient*:
+    /// the connect worker retries it with a short backoff rather than surfacing
+    /// an error, because the session's `sock` is bound a beat after its dir
+    /// appears (`rt-tui-attach-retry-unbound-socket`). The string is the error
+    /// shown only if the retries run out.
+    Starting(String),
     /// Any other no-session / attach failure. The message is shown as-is and,
     /// for a session that *exited*, already carries its last output line (so a
     /// dead workspace or orchestrator surfaces why it's gone — the behavior the
     /// orchestrator view already had).
     Message(String),
+}
+
+/// How the connect worker retries a session whose socket isn't up yet
+/// ([`ConnectFailure::Starting`]). A launched session binds its `sock` a beat
+/// after its dir appears, so the worker re-attempts the connect on this cadence
+/// until the socket is up or the deadline passes
+/// (`rt-tui-attach-retry-unbound-socket`).
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// Total time to keep retrying a still-starting session before giving up and
+    /// surfacing the error.
+    pub deadline: Duration,
+    /// Pause between attempts.
+    pub backoff: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            deadline: Duration::from_secs(15),
+            backoff: Duration::from_millis(250),
+        }
+    }
 }
 
 /// The blocking work of connecting to a session, injectable so the event loop
@@ -130,8 +162,23 @@ impl Connector for LiveConnector {
                 )));
             }
         };
-        let (conn, events) = Connection::open(&sess.sock, None, capability::ALL)
-            .map_err(|e| ConnectFailure::Message(e.to_string()))?;
+        let (conn, events) = match Connection::open(&sess.sock, None, capability::ALL) {
+            Ok(ce) => ce,
+            // The session dir (with `meta.json`) appears before its `sock` is
+            // bound, so a connect in that window fails with ENOENT (socket file
+            // absent) or ECONNREFUSED (file there, not yet listening). Discovery
+            // already told us the session is alive, so this is "still starting",
+            // not a failure — signal a retry (`rt-tui-attach-retry-unbound-socket`).
+            Err(ClientError::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Err(ConnectFailure::Starting(starting_error(&want)));
+            }
+            Err(e) => return Err(ConnectFailure::Message(e.to_string())),
+        };
         let size = match conn.info() {
             Ok(info) => Size::new(info.cols.max(1), info.rows.max(1)),
             Err(_) => Size::new(80, 24),
@@ -174,6 +221,12 @@ fn no_live_session_error(want: &str, last_line: Option<&str>) -> String {
         }
         _ => format!("no live session `{want}`"),
     }
+}
+
+/// The error shown when a just-launched session's socket never comes up within
+/// the retry deadline. Pure, so it's unit-testable without a real session.
+fn starting_error(want: &str) -> String {
+    format!("session `{want}` is starting (socket not up yet)")
 }
 
 /// The last non-empty line of a dead session's `<dir>/final.txt`, trimmed, or
@@ -223,6 +276,8 @@ pub struct SessionManager {
     project: String,
     connector: std::sync::Arc<dyn Connector>,
     slot: Slot,
+    /// How the connect worker retries a session whose socket isn't up yet.
+    retry: RetryPolicy,
 }
 
 /// What the main area should draw right now.
@@ -241,6 +296,7 @@ impl SessionManager {
             project: project.into(),
             connector,
             slot: Slot::Empty,
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -262,6 +318,7 @@ impl SessionManager {
             project,
             target: target.clone(),
             tx,
+            retry: self.retry,
         };
         let join = std::thread::Builder::new()
             .name("shelbi-shell-connect".into())
@@ -303,7 +360,13 @@ impl SessionManager {
                 pane: TerminalPane::new(c.size),
             })),
             Err(ConnectFailure::Idle(info)) => Slot::Idle { target, info },
-            Err(ConnectFailure::Message(error)) => Slot::Failed { target, error },
+            // The worker only ever forwards a terminal outcome: it retries
+            // `Starting` itself and, on give-up, converts it to a `Message`. A
+            // `Starting` here would mean the worker didn't retry, so treat it as
+            // a plain failure rather than silently dropping it.
+            Err(ConnectFailure::Starting(error) | ConnectFailure::Message(error)) => {
+                Slot::Failed { target, error }
+            }
         };
         true
     }
@@ -411,11 +474,36 @@ struct ConnectJob {
     project: String,
     target: SessionRef,
     tx: mpsc::Sender<Result<Connected, ConnectFailure>>,
+    retry: RetryPolicy,
 }
 
 impl ConnectJob {
     fn run(self) {
-        let result = self.connector.connect(&self.project, &self.target);
+        // Retry a session whose socket isn't up yet. A just-launched session has
+        // its dir (with `meta.json`) on disk a beat before its `sock` is bound,
+        // so a connect in that window returns `Starting` — we back off and try
+        // again rather than surfacing an error, until the socket is up or the
+        // deadline passes (`rt-tui-attach-retry-unbound-socket`). Every other
+        // outcome (a live attach, an idle workspace, an exited session) is
+        // terminal and forwarded at once. Running the wait here, on the worker
+        // thread, keeps the UI loop non-blocking — it only ever polls.
+        let started = Instant::now();
+        let mut result = self.connector.connect(&self.project, &self.target);
+        while let Err(ConnectFailure::Starting(_)) = &result {
+            if started.elapsed() >= self.retry.deadline {
+                // Give up: turn the transient "starting" signal into a terminal
+                // error so the user finally sees why the attach never completed.
+                if let Err(ConnectFailure::Starting(msg)) = result {
+                    result = Err(ConnectFailure::Message(format!(
+                        "{msg} — not reachable after {:?}",
+                        self.retry.deadline
+                    )));
+                }
+                break;
+            }
+            std::thread::sleep(self.retry.backoff);
+            result = self.connector.connect(&self.project, &self.target);
+        }
         // The UI may have moved on; a failed send just means nobody is waiting.
         let _ = self.tx.send(result);
     }
@@ -424,8 +512,8 @@ impl ConnectJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::Sender;
-    use std::time::{Duration, Instant};
 
     fn connecting(m: &SessionManager) -> bool {
         matches!(m.state(), MainState::Connecting(_))
@@ -634,5 +722,235 @@ mod tests {
         // A second request for the same target does not spawn another connect.
         mgr.show(SessionRef::Orchestrator);
         assert_eq!(mgr.current_target(), Some(&SessionRef::Orchestrator));
+    }
+
+    /// A connector that reports the session as still-starting (socket not up) for
+    /// the first `starting` calls, then opens a real session socket and returns a
+    /// live binding. Counts its calls so a test can assert the worker retried.
+    struct FlakyThenLive {
+        sock: std::path::PathBuf,
+        starting: usize,
+        calls: AtomicUsize,
+    }
+
+    impl Connector for FlakyThenLive {
+        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.starting {
+                return Err(ConnectFailure::Starting("socket not up yet".into()));
+            }
+            let (conn, events) = Connection::open(&self.sock, None, capability::ALL)
+                .map_err(|e| ConnectFailure::Message(e.to_string()))?;
+            let size = match conn.info() {
+                Ok(info) => Size::new(info.cols.max(1), info.rows.max(1)),
+                Err(_) => Size::new(80, 24),
+            };
+            conn.attach(None)
+                .map_err(|e| ConnectFailure::Message(e.to_string()))?;
+            Ok(Connected { conn, events, size })
+        }
+    }
+
+    /// A connector that always reports the session as still-starting, so the
+    /// socket never comes up: the worker retries until the deadline, then fails.
+    struct AlwaysStarting {
+        calls: AtomicUsize,
+    }
+
+    impl Connector for AlwaysStarting {
+        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ConnectFailure::Starting("session `x` is starting".into()))
+        }
+    }
+
+    /// A connector for a session that *exited*: a terminal message carrying the
+    /// dead session's last output line. Not retryable.
+    struct ExitedConnector;
+
+    impl Connector for ExitedConnector {
+        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
+            Err(ConnectFailure::Message(
+                "no live session `demo/orch` — last output: command not found: claude".into(),
+            ))
+        }
+    }
+
+    /// Spawn a genuine `shelbi_session::run` (a raw, no-echo `cat` child) on a
+    /// thread, returning the bound socket and a guard that kills it on drop. The
+    /// caller must hold `ENV_LOCK` (this sets the process-global `SHELBI_HOME`).
+    /// Mirrors the real-session scaffolding in `pty_input_tests`.
+    fn spawn_cat_session(home: &std::path::Path, name: &str) -> (std::path::PathBuf, CatCleanup) {
+        use shelbi_session::layout::SessionPaths;
+        use shelbi_session::RunArgs;
+        std::env::set_var("SHELBI_HOME", home);
+        let id = shelbi_session::layout::derive_id_now(name);
+        let paths = SessionPaths::new(&home.join("sessions"), &id);
+        let args = RunArgs {
+            id,
+            name: name.to_string(),
+            cwd: std::env::temp_dir(),
+            cols: 80,
+            rows: 24,
+            task: None,
+            raw_output_log: false,
+            child_argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "stty raw -echo 2>/dev/null; exec cat".into(),
+            ],
+            manage_daemon: false,
+        };
+        std::thread::spawn(move || shelbi_session::run(args));
+        let sock = paths.sock();
+        for _ in 0..500 {
+            if sock.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(sock.exists(), "the session socket should appear");
+        (sock.clone(), CatCleanup { sock })
+    }
+
+    struct CatCleanup {
+        sock: std::path::PathBuf,
+    }
+
+    impl Drop for CatCleanup {
+        fn drop(&mut self) {
+            if let Ok((conn, _)) = Connection::open(&self.sock, None, capability::ALL) {
+                let _ = conn.kill(Some(libc::SIGKILL));
+            }
+            std::env::remove_var("SHELBI_HOME");
+        }
+    }
+
+    /// Poll the manager until it reaches `MainState::Live`, or the budget runs
+    /// out. Returns whether it went live.
+    fn poll_until_live(mgr: &mut SessionManager) -> bool {
+        for _ in 0..500 {
+            mgr.poll();
+            if matches!(mgr.state(), MainState::Live(_)) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_still_starting_session_retries_then_attaches_live() {
+        // AC1: a connector that reports "socket not up" for the first few attempts
+        // and then succeeds ends in a live attach, with no error ever shown.
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let (sock, _cleanup) = spawn_cat_session(home.path(), "retry/orch");
+
+        let connector = std::sync::Arc::new(FlakyThenLive {
+            sock,
+            starting: 3,
+            calls: AtomicUsize::new(0),
+        });
+        let mut mgr = SessionManager::new("retry", connector.clone());
+        // A short backoff so the three "starting" attempts clear quickly; a
+        // generous deadline so the real attach has room.
+        mgr.retry = RetryPolicy {
+            deadline: Duration::from_secs(5),
+            backoff: Duration::from_millis(10),
+        };
+        mgr.show(SessionRef::Orchestrator);
+
+        assert!(
+            poll_until_live(&mut mgr),
+            "the retried connect should end in a live attach"
+        );
+        assert!(
+            matches!(mgr.state(), MainState::Live(_)),
+            "no error is shown — the slot is live"
+        );
+        // The worker retried past the three still-starting attempts.
+        assert!(
+            connector.calls.load(Ordering::SeqCst) >= 4,
+            "the worker should retry the still-starting attempts, not fail on the first"
+        );
+    }
+
+    #[test]
+    fn a_socket_that_never_appears_fails_after_the_bounded_wait() {
+        // AC2: a session whose socket never comes up retries until the deadline,
+        // then surfaces the error — and only then.
+        let connector = std::sync::Arc::new(AlwaysStarting {
+            calls: AtomicUsize::new(0),
+        });
+        let mut mgr = SessionManager::new("demo", connector.clone());
+        let deadline = Duration::from_millis(120);
+        mgr.retry = RetryPolicy {
+            deadline,
+            backoff: Duration::from_millis(10),
+        };
+
+        let start = Instant::now();
+        mgr.show(SessionRef::Orchestrator);
+        poll_until_settled(&mut mgr);
+        let elapsed = start.elapsed();
+
+        // It did not give up before the bounded wait elapsed.
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "the error should appear only after the bounded wait (took {elapsed:?})"
+        );
+        // It retried rather than failing on the first attempt.
+        assert!(
+            connector.calls.load(Ordering::SeqCst) > 1,
+            "a still-starting session should be retried"
+        );
+        match mgr.state() {
+            MainState::Failed(_, err) => {
+                assert!(err.contains("starting"), "carries the starting message: {err}");
+                assert!(err.contains("not reachable"), "names the give-up: {err}");
+            }
+            _ => panic!("a socket that never appears lands in MainState::Failed"),
+        }
+    }
+
+    #[test]
+    fn an_exited_session_shows_its_last_line_immediately() {
+        // AC3: an exited session's terminal message (with its last output line) is
+        // shown at once — the retry deadline is never waited on.
+        let mut mgr = SessionManager::new("demo", std::sync::Arc::new(ExitedConnector));
+        // A long deadline: if a terminal failure were (wrongly) retried, the test
+        // would stall well past this budget.
+        mgr.retry = RetryPolicy {
+            deadline: Duration::from_secs(30),
+            backoff: Duration::from_millis(10),
+        };
+
+        let start = Instant::now();
+        mgr.show(SessionRef::Orchestrator);
+        poll_until_settled(&mut mgr);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "an exited session fails immediately, without waiting the deadline (took {elapsed:?})"
+        );
+        match mgr.state() {
+            MainState::Failed(_, err) => assert_eq!(
+                err,
+                "no live session `demo/orch` — last output: command not found: claude"
+            ),
+            _ => panic!("an exited session lands in MainState::Failed with its last line"),
+        }
+    }
+
+    #[test]
+    fn starting_error_reads_as_a_terminal_message() {
+        assert_eq!(
+            starting_error("demo/orch"),
+            "session `demo/orch` is starting (socket not up yet)"
+        );
     }
 }
