@@ -14,6 +14,7 @@
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use ratatui::widgets::Clear;
 use ratatui::Frame;
 
 use std::path::Path;
@@ -306,6 +307,17 @@ impl ActiveOverlay {
     /// time.
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
         let rect = self.rect(area);
+        // Reset every cell in the overlay's rect to the default background
+        // before the overlay paints. In the tmux runtime each overlay was its
+        // own popup process with a fresh screen, so none of them clears first;
+        // drawn in-process over a live view, any cell the overlay doesn't paint
+        // (list-row padding, gaps between widgets) would otherwise show text
+        // from the view underneath — and `List`'s full-width selection bar only
+        // patches the *style* of those cells, so the underlying characters bled
+        // into the palette's highlighted row. `Clear` empties the symbols and
+        // resets the style (also undoing the shell's dim), giving each overlay
+        // the clean, opaque backdrop it assumes.
+        f.render_widget(Clear, rect);
         match self {
             ActiveOverlay::Palette(p) => p.render(f, rect),
             ActiveOverlay::ReviewConfirm { dialog, .. } => dialog.render(f, rect),
@@ -499,11 +511,168 @@ pub fn should_show_zen_intro(project: &str) -> bool {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::Terminal;
     use shelbi_app::nav::View;
     use shelbi_app::view::{NavItem, ReviewRow, ReviewState, WorkspaceBadge, WorkspaceRow};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// One of every [`ActiveOverlay`] variant, so the backdrop-clearing check
+    /// covers them all. The palette carries a selectable entry so its
+    /// highlighted row is exercised too.
+    fn every_overlay() -> Vec<ActiveOverlay> {
+        use shelbi_palette::{Entry, EntryKind};
+        let entry = Entry {
+            id: "view:tasks".into(),
+            label: "Issues".into(),
+            kind: EntryKind::Action,
+            subtitle: None,
+            shortcut: None,
+            decoration: None,
+            hidden_until_query: false,
+        };
+        vec![
+            ActiveOverlay::palette("alpha", vec![entry]),
+            ActiveOverlay::review_confirm(
+                "T-1",
+                "Fix the thing",
+                vec![overlay::review_confirm::Slot {
+                    name: "review-1".into(),
+                    occupant: None,
+                }],
+            ),
+            ActiveOverlay::review_busy_report("T-1", "Fix the thing", "every slot is busy"),
+            ActiveOverlay::reject_reason("T-1"),
+            ActiveOverlay::ErrorLog {
+                project: "alpha".into(),
+                viewer: overlay::error_log::Viewer::new(Vec::new()),
+            },
+            ActiveOverlay::ZenIntro {
+                project: "alpha".into(),
+                state: overlay::zen_intro::IntroState::default(),
+            },
+            ActiveOverlay::add_project(Path::new("/tmp/alpha")),
+        ]
+    }
+
+    /// Draw `ov` the way the shell does: the whole buffer is first filled with a
+    /// recognizable sentinel character under the DIM modifier (mimicking the
+    /// view and dimmed backdrop beneath an open overlay), then the overlay
+    /// renders over it — all in one frame, so the prefill and the overlay share
+    /// the one buffer. Returns the painted buffer and the overlay's rect.
+    fn draw_over_sentinel(ov: &mut ActiveOverlay) -> (ratatui::buffer::Buffer, Rect) {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut rect = Rect::default();
+        term.draw(|f| {
+            let area = f.area();
+            {
+                let buf = f.buffer_mut();
+                for y in area.top()..area.bottom() {
+                    for x in area.left()..area.right() {
+                        if let Some(cell) = buf.cell_mut((x, y)) {
+                            cell.set_char('X');
+                            cell.set_style(Style::default().add_modifier(Modifier::DIM));
+                        }
+                    }
+                }
+            }
+            rect = ov.rect(area);
+            ov.render(f, area);
+        })
+        .unwrap();
+        (term.backend().buffer().clone(), rect)
+    }
+
+    #[test]
+    fn every_overlay_clears_the_view_underneath_its_rect() {
+        for mut ov in every_overlay() {
+            let (buf, rect) = draw_over_sentinel(&mut ov);
+            for y in rect.top()..rect.bottom() {
+                for x in rect.left()..rect.right() {
+                    let cell = &buf[(x, y)];
+                    assert_ne!(
+                        cell.symbol(),
+                        "X",
+                        "underlying sentinel leaked through the overlay at ({x},{y})"
+                    );
+                    // The `Clear` must also drop the backdrop's DIM so the modal
+                    // reads at full brightness within its rect.
+                    assert!(
+                        !cell.modifier.contains(Modifier::DIM),
+                        "backdrop DIM leaked through the overlay at ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn palette_selected_row_highlight_holds_only_palette_text() {
+        use shelbi_palette::{Entry, EntryKind};
+        let entry = Entry {
+            id: "action:quit".into(),
+            label: "Quit Shelbi".into(),
+            kind: EntryKind::Action,
+            subtitle: None,
+            shortcut: None,
+            decoration: None,
+            hidden_until_query: false,
+        };
+        let mut ov = ActiveOverlay::palette("alpha", vec![entry]);
+        let (buf, rect) = draw_over_sentinel(&mut ov);
+
+        // Find the selected row: the one, inside the palette rect, whose cells
+        // carry the selection bg.
+        let mut found_row = false;
+        for y in rect.top()..rect.bottom() {
+            let selected_cells: Vec<u16> = (rect.left()..rect.right())
+                .filter(|&x| buf[(x, y)].bg == crate::theme::SELECTION_BG)
+                .collect();
+            if selected_cells.is_empty() {
+                continue;
+            }
+            found_row = true;
+            // The highlight bar reaches both edges of the list: the report
+            // showed underlying error text bleeding into the right of the
+            // selected row, so the bar must run from the left edge to the last
+            // column of the rect. Any interior cell without the bar is a
+            // wide-glyph continuation cell (empty symbol), never a visible gap.
+            let first = *selected_cells.first().unwrap();
+            let last = *selected_cells.last().unwrap();
+            assert_eq!(first, rect.left(), "the selection bar must start at the left edge");
+            assert_eq!(
+                last,
+                rect.right() - 1,
+                "the selection bar must reach the right edge, got {selected_cells:?}"
+            );
+            for x in first..=last {
+                if buf[(x, y)].bg != crate::theme::SELECTION_BG {
+                    assert_eq!(
+                        buf[(x, y)].symbol().trim(),
+                        "",
+                        "a visible gap in the selection bar at ({x},{y})"
+                    );
+                }
+            }
+            // No sentinel character survives anywhere in the highlighted row's
+            // span inside the rect — only the palette's own text.
+            for x in rect.left()..rect.right() {
+                assert_ne!(
+                    buf[(x, y)].symbol(),
+                    "X",
+                    "underlying text leaked into the palette's selected row at ({x},{y})"
+                );
+            }
+            let row: String = (rect.left()..rect.right())
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            assert!(row.contains("Quit Shelbi"), "selected row text: {row:?}");
+        }
+        assert!(found_row, "the palette should render a selected row");
     }
 
     fn keymaps() -> Keymaps {
