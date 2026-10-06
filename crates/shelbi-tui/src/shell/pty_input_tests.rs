@@ -256,3 +256,104 @@ fn every_key_but_ctrl_space_reaches_the_agent_over_a_real_pty() {
         "Ctrl+Space must not reach the agent (no NUL in the echoed stream): {out:?}"
     );
 }
+
+#[test]
+fn focus_chords_are_not_forwarded_but_backspace_is() {
+    // The vim-style focus moves (Ctrl+H / Ctrl+L) are intercepted by the shell
+    // and never reach the agent; plain Backspace still reaches it. Proven
+    // against a real PTY whose `cat` echoes exactly the bytes it receives.
+    let _lock = crate::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("SHELBI_HOME", home.path());
+    let name = "tuifocus/orch";
+    let id = shelbi_session::layout::derive_id_now(name);
+    let paths = SessionPaths::new(&home.path().join("sessions"), &id);
+
+    let args = RunArgs {
+        id: id.clone(),
+        name: name.to_string(),
+        cwd: std::env::temp_dir(),
+        cols: 80,
+        rows: 24,
+        task: None,
+        raw_output_log: false,
+        child_argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "stty raw -echo 2>/dev/null; exec cat".into(),
+        ],
+        manage_daemon: false,
+    };
+    let _session = std::thread::spawn(move || shelbi_session::run(args));
+    let sock = paths.sock();
+    wait_for(Duration::from_secs(5), || sock.exists().then_some(()))
+        .expect("the session socket should appear");
+    let _cleanup = Cleanup { sock: sock.clone() };
+
+    let (observer, obs_events) =
+        Connection::open(&sock, None, capability::ALL).expect("observer connects");
+    observer.attach(None).expect("observer attaches");
+    wait_for(Duration::from_secs(2), || {
+        obs_events
+            .try_recv()
+            .and_then(|ev| matches!(ev, SessionEvent::Resync { .. }).then_some(()))
+    });
+    let mut out: Vec<u8> = Vec::new();
+
+    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let mut st = ShellState::new("tuifocus", Arc::new(DirectConnector { sock: sock.clone() }), caps);
+    st.show(RowTarget::Session(SessionRef::Orchestrator));
+    wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        matches!(st.sessions.state(), MainState::Live(_)).then_some(())
+    })
+    .expect("the shell's main area should bind the session live");
+    // `show` on a session takes main focus.
+    assert!(st.focus_is_main(), "a live session starts focused");
+
+    // --- plain Backspace still reaches the agent ------------------------------
+    let bs_expected = {
+        let kev = KeyEvent::new(KeyCode::Backspace, NONE);
+        let (k, m) = super::terminal_view::map_key(&kev).unwrap();
+        encode_key(k, m, KeyEncoding::default())
+    };
+    assert!(
+        !bs_expected.is_empty() && !bs_expected.contains(&0x08),
+        "Backspace encodes to a non-empty, non-BS (0x08) sequence: {bs_expected:?}",
+    );
+    st.handle_key(KeyEvent::new(KeyCode::Backspace, NONE));
+    let saw_bs = wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        drain(&obs_events, &mut out);
+        contains(&out, &bs_expected).then_some(())
+    });
+    assert!(
+        saw_bs.is_some(),
+        "plain Backspace should reach the agent; expected {bs_expected:?} within {out:?}",
+    );
+
+    // --- Ctrl+H moves focus to the sidebar and is NOT forwarded ---------------
+    // Ctrl+H would encode to BS (0x08) if it were forwarded; assert no 0x08
+    // appears after this point.
+    let before = out.len();
+    st.handle_key(KeyEvent::new(KeyCode::Char('h'), CTRL));
+    assert!(!st.focus_is_main(), "Ctrl+H moves focus to the sidebar");
+    let settle = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle {
+        pump(&mut st);
+        drain(&obs_events, &mut out);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !out[before..].contains(&0x08),
+        "Ctrl+H must not reach the agent (no BS byte echoed): {:?}",
+        &out[before..],
+    );
+
+    // --- Ctrl+L moves focus back to the main pane -----------------------------
+    st.handle_key(KeyEvent::new(KeyCode::Char('l'), CTRL));
+    assert!(st.focus_is_main(), "Ctrl+L moves focus back to the main pane");
+}
