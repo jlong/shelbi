@@ -1763,12 +1763,38 @@ impl Default for GlobalState {
 pub struct SidebarPrefs {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub collapsed_machines: BTreeSet<String>,
+    /// The sidebar width in columns the user last dragged the divider to.
+    /// `None` (absent on an older `state.json`) means "never resized" — the
+    /// client falls back to its default width. The value is the user's raw
+    /// choice; the client clamps it to the current window at render time
+    /// without overwriting what's on disk, so a stint in a narrow window
+    /// doesn't shrink the remembered width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<u16>,
 }
 
 impl SidebarPrefs {
     pub fn is_default(&self) -> bool {
-        self.collapsed_machines.is_empty()
+        self.collapsed_machines.is_empty() && self.sidebar_width.is_none()
     }
+}
+
+/// Persist the user's chosen sidebar width to `~/.shelbi/state.json`.
+/// Routed through [`update_global_state`] so the other fields (Zen intro,
+/// first-run hint, collapsed machines) are preserved against concurrent
+/// writers. Idempotent — a no-op when the width is already stored.
+pub fn set_sidebar_width(width: u16) -> Result<()> {
+    update_global_state(|state| {
+        state.sidebar.sidebar_width = Some(width);
+        Ok(())
+    })
+}
+
+/// The user's saved sidebar width, or `None` if the divider has never been
+/// dragged. Read once at TUI startup to seed the client's width. Missing
+/// file → `None` (today's default — the client uses its built-in width).
+pub fn sidebar_width() -> Result<Option<u16>> {
+    Ok(read_global_state()?.sidebar.sidebar_width)
 }
 
 /// Flip the collapse state for `machine` in `~/.shelbi/state.json` and
@@ -2275,6 +2301,55 @@ mod global_state_tests {
         let s = read_global_state().unwrap();
         assert!(s.sidebar.collapsed_machines.is_empty());
         assert_eq!(s.extra.get("tmux_palette_key"), Some(&serde_json::json!("C-p")));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// `set_sidebar_width` persists the chosen width to
+    /// `~/.shelbi/state.json::sidebar.sidebar_width`, and `sidebar_width`
+    /// reads it back — so the dragged divider survives a TUI respawn. An
+    /// unset width reads back as `None` (the client's default-width path).
+    #[test]
+    fn sidebar_width_round_trips_through_state_file() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Never set → None (the default-width path).
+        assert_eq!(sidebar_width().unwrap(), None);
+
+        // A set value round-trips through disk.
+        set_sidebar_width(34).unwrap();
+        assert_eq!(sidebar_width().unwrap(), Some(34));
+
+        // A later change overwrites it.
+        set_sidebar_width(26).unwrap();
+        assert_eq!(sidebar_width().unwrap(), Some(26));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Saving a sidebar width must not clobber unrelated global fields —
+    /// the collapse set, Zen intro flag, and catch-all `extra` survive.
+    #[test]
+    fn set_sidebar_width_preserves_other_global_fields() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        toggle_sidebar_machine_collapsed("hub").unwrap();
+        let mut s = read_global_state().unwrap();
+        s.extra
+            .insert("tmux_palette_key".to_string(), serde_json::json!("M-z"));
+        s.zen_intro_seen = true;
+        write_global_state(&s).unwrap();
+
+        set_sidebar_width(30).unwrap();
+        let after = read_global_state().unwrap();
+        assert_eq!(after.sidebar.sidebar_width, Some(30));
+        assert!(after.sidebar.collapsed_machines.contains("hub"));
+        assert!(after.zen_intro_seen);
+        assert_eq!(after.extra.get("tmux_palette_key"), Some(&serde_json::json!("M-z")));
+
         std::env::remove_var("SHELBI_HOME");
     }
 }

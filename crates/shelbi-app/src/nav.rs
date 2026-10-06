@@ -114,6 +114,28 @@ pub struct ClientState {
 /// sidebar width so the ported client looks identical.
 pub const DEFAULT_SIDEBAR_WIDTH: u16 = 28;
 
+/// The minimum sidebar width in columns. The user can't drag the divider
+/// any narrower than this — matches the tmux build's `SIDEBAR_MIN_COLS`.
+pub const SIDEBAR_MIN_COLS: u16 = 24;
+
+/// Clamp a desired sidebar width into the allowed range for a window of
+/// `window_width` columns: at least [`SIDEBAR_MIN_COLS`], and at most half
+/// the window so the main pane is never narrower than the sidebar.
+///
+/// This is both the live drag clamp (the user's chosen width, bounded to
+/// the current window) and the display clamp: when the window is too narrow
+/// to honor the minimum, the upper bound (half the window) wins — the
+/// sidebar shrinks for display while the saved value is left untouched, so
+/// widening the window later restores the user's choice.
+pub fn clamp_sidebar_width(desired: u16, window_width: u16) -> u16 {
+    // Half the window, but always leave at least one column for each side.
+    let max = (window_width / 2).max(1);
+    // The minimum can't exceed the maximum (a very narrow window), or the
+    // clamp would be inverted — collapse both bounds to `max` there.
+    let min = SIDEBAR_MIN_COLS.min(max);
+    desired.clamp(min, max)
+}
+
 impl Default for ClientState {
     fn default() -> Self {
         ClientState {
@@ -258,6 +280,31 @@ pub struct GlobalFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_sidebar_width_enforces_min_and_half_window() {
+        // A comfortable window: the user's choice wins within [24, width/2].
+        assert_eq!(clamp_sidebar_width(30, 120), 30, "in-range width is kept");
+        assert_eq!(clamp_sidebar_width(10, 120), 24, "below the minimum clamps up to 24");
+        assert_eq!(
+            clamp_sidebar_width(100, 120),
+            60,
+            "above half the window clamps down so main stays at least as wide"
+        );
+        // Exactly half is allowed (main == sidebar).
+        assert_eq!(clamp_sidebar_width(60, 120), 60);
+    }
+
+    #[test]
+    fn clamp_sidebar_width_handles_a_window_too_narrow_for_the_minimum() {
+        // Window/2 (20) is below the 24 minimum: the half-window bound wins,
+        // so the sidebar shrinks for display rather than overflowing main.
+        assert_eq!(clamp_sidebar_width(28, 40), 20);
+        assert_eq!(clamp_sidebar_width(50, 40), 20);
+        // Degenerate widths never panic and keep at least one column.
+        assert_eq!(clamp_sidebar_width(28, 1), 1);
+        assert_eq!(clamp_sidebar_width(28, 0), 1);
+    }
 
     #[test]
     fn default_client_starts_on_sidebar_and_issues() {
