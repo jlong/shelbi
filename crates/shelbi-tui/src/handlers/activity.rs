@@ -42,6 +42,10 @@ fn dispatch_global(app: &mut ActivityApp, action: GlobalAction) {
         // view at least doesn't fall through to the activity map (which
         // could shadow it with another binding).
         GlobalAction::OpenPalette => {}
+        // Focus moves between the sidebar and main pane are a single-process
+        // shell concern, intercepted there before a key reaches this handler.
+        // The standalone activity process has no such split, so they're no-ops.
+        GlobalAction::FocusSidebar | GlobalAction::FocusMain => {}
     }
 }
 

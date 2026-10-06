@@ -33,6 +33,12 @@ pub enum GlobalAction {
     Quit,
     ZenToggle,
     OpenPalette,
+    /// Move keyboard focus left: to the nav sidebar (or, while a review is
+    /// open, the review panel). Vim-style `Ctrl+H`.
+    FocusSidebar,
+    /// Move keyboard focus right: to the main pane (or, while a review is
+    /// open, the review content view). Vim-style `Ctrl+L`.
+    FocusMain,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -110,6 +116,8 @@ impl Action {
                 GlobalAction::Quit => "Quit shelbi",
                 GlobalAction::ZenToggle => "Toggle Zen Mode",
                 GlobalAction::OpenPalette => "Open command palette",
+                GlobalAction::FocusSidebar => "Focus the nav sidebar (left)",
+                GlobalAction::FocusMain => "Focus the main pane (right)",
             },
             Action::Sidebar(a) => match a {
                 SidebarAction::Quit => "Quit sidebar",
@@ -177,6 +185,8 @@ impl Action {
                 GlobalAction::Quit => &["ctrl-c"],
                 GlobalAction::ZenToggle => &["alt-z"],
                 GlobalAction::OpenPalette => &["ctrl-p"],
+                GlobalAction::FocusSidebar => &["ctrl-h"],
+                GlobalAction::FocusMain => &["ctrl-l"],
             },
             Action::Sidebar(a) => match a {
                 SidebarAction::Quit => &["q", "ctrl-c"],
@@ -265,6 +275,8 @@ impl Action {
                 GlobalAction::Quit => "quit",
                 GlobalAction::ZenToggle => "zen_toggle",
                 GlobalAction::OpenPalette => "open_palette",
+                GlobalAction::FocusSidebar => "focus_sidebar",
+                GlobalAction::FocusMain => "focus_main",
             },
             Action::Sidebar(a) => match a {
                 SidebarAction::Quit => "quit",
@@ -328,6 +340,8 @@ impl Action {
             GlobalAction::Quit,
             GlobalAction::ZenToggle,
             GlobalAction::OpenPalette,
+            GlobalAction::FocusSidebar,
+            GlobalAction::FocusMain,
         ];
         const SIDEBAR: &[SidebarAction] = &[
             SidebarAction::Quit,

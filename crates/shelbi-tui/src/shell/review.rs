@@ -181,6 +181,36 @@ impl ReviewInterface {
         }
     }
 
+    /// Move focus to the panel (the shell's `FocusSidebar` / Ctrl+H while a
+    /// review owns the main area). Inert while a gated merge runs, so the
+    /// focus can't change mid-merge — matching the Tab toggle (AC #4).
+    pub fn focus_panel(&mut self) {
+        if self.panel.merging {
+            return;
+        }
+        self.focus = ReviewFocus::Panel;
+    }
+
+    /// Move focus to the content view (the shell's `FocusMain` / Ctrl+L),
+    /// but only when a content session is live — the same guard Tab uses, so
+    /// focus never lands on an empty/connecting content pane. Inert while a
+    /// gated merge runs.
+    pub fn focus_content(&mut self) {
+        if self.panel.merging {
+            return;
+        }
+        if matches!(self.content.state(), MainState::Live(_)) {
+            self.focus = ReviewFocus::Content;
+        }
+    }
+
+    /// Whether the content view currently holds focus. For the shell's focus
+    /// routing and tests.
+    #[cfg(test)]
+    pub fn content_focused(&self) -> bool {
+        matches!(self.focus, ReviewFocus::Content)
+    }
+
     fn handle_content_key(&mut self, k: KeyEvent) -> ReviewAction {
         // Tab returns focus to the panel; everything else goes to the agent.
         if k.code == KeyCode::Tab && k.modifiers.is_empty() {
@@ -450,6 +480,30 @@ mod tests {
         let mut it = iface();
         // Content is still Connecting (NeverConnector), so Tab stays on panel.
         assert_eq!(it.handle_key(key(KeyCode::Tab)), ReviewAction::None);
+        assert_eq!(it.focus, ReviewFocus::Panel);
+    }
+
+    #[test]
+    fn focus_content_is_a_noop_until_the_content_is_live() {
+        // `Ctrl+L` targets the content view, but — like Tab — it only lands
+        // there when a content session is live. NeverConnector keeps it
+        // Connecting, so focus stays on the panel.
+        let mut it = iface();
+        it.focus_content();
+        assert_eq!(it.focus, ReviewFocus::Panel);
+        it.focus_panel();
+        assert_eq!(it.focus, ReviewFocus::Panel);
+    }
+
+    #[test]
+    fn focus_moves_are_inert_while_merging() {
+        // The review is inert to competing input during a gated merge, so the
+        // focus-move methods can't change focus mid-merge (AC #4 parity).
+        let mut it = iface();
+        it.set_merging(true);
+        it.focus_content();
+        assert_eq!(it.focus, ReviewFocus::Panel);
+        it.focus_panel();
         assert_eq!(it.focus, ReviewFocus::Panel);
     }
 }

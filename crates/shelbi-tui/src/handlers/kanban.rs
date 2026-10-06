@@ -54,6 +54,10 @@ pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Ou
             // the zen-state machinery), so it's a no-op here.
             GlobalAction::ZenToggle => Outcome::Continue,
             GlobalAction::OpenPalette => Outcome::OpenPalette,
+            // Sidebar/main focus moves belong to the single-process shell,
+            // which intercepts them before the key reaches this handler. The
+            // standalone board process has no such split, so they're no-ops.
+            GlobalAction::FocusSidebar | GlobalAction::FocusMain => Outcome::Continue,
         };
     }
 

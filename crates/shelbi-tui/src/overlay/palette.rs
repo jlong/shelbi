@@ -424,7 +424,7 @@ impl Palette {
             selected: self.selected,
             commands_focused: true,
             projects: None,
-            footer: "↑↓ navigate · Enter run · Esc agent · Tab sidebar",
+            footer: "↑↓ navigate · Enter run · Esc agent · Tab sidebar · ^H/^L focus panes",
         };
         render(f, area, &view);
     }
@@ -499,6 +499,21 @@ mod tests {
         let hits = p.results();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0.id, "action:toggle-zen");
+    }
+
+    #[test]
+    fn footer_advertises_the_focus_pane_chords() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let p = Palette::new("alpha", vec![entry("view:tasks", "Issues")]);
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| p.render(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(text.contains("focus"), "the footer advertises the focus keys: {text:?}");
+        assert!(text.contains("^H/^L"), "the footer names the focus chords: {text:?}");
     }
 
     #[test]

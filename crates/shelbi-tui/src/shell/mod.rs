@@ -1104,10 +1104,61 @@ impl ShellState {
             self.dirty = true;
             return;
         }
+        // Vim-style focus moves (`Ctrl+H` / `Ctrl+L` by default) are global:
+        // they fire from a focused terminal session the same as from the
+        // sidebar, so they're intercepted here before focus routing and the
+        // key is never forwarded to the session. Routing them through the
+        // keymap means they only match the unambiguous `Char('h')`/`Char('l')`
+        // + CONTROL form — on a terminal without keyboard-enhancement, Ctrl+H
+        // arrives as `Backspace` and so can't be confused for this action
+        // (`chord_from_event` maps it to `Key::Backspace`, which `ctrl-h`
+        // never matches), leaving plain Backspace to reach the session.
+        if let Some(action) = self.focus_move_action(&k) {
+            self.move_focus(action);
+            self.dirty = true;
+            return;
+        }
         if self.focus_is_main() {
             self.handle_main_key(k);
         } else {
             self.handle_sidebar_key(k);
+        }
+    }
+
+    /// Resolve `k` to a focus-move action (`FocusSidebar` / `FocusMain`) via
+    /// the global keymap, or `None` for any other key. The keymap lookup is
+    /// what keeps Ctrl+H distinct from Backspace (see [`ShellState::handle_key`]).
+    fn focus_move_action(&self, k: &KeyEvent) -> Option<GlobalAction> {
+        let chord = crate::keymap::chord_from_event(*k)?;
+        match self.keymaps.global.dispatch(chord) {
+            Some(a @ (GlobalAction::FocusSidebar | GlobalAction::FocusMain)) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Carry out a focus-move action. With a review open the review interface
+    /// owns the main area, so the moves step between its panel (left) and its
+    /// content view (right); otherwise they step between the nav sidebar
+    /// (left) and the main pane (right). Moving to the pane that already has
+    /// focus is a harmless no-op.
+    fn move_focus(&mut self, action: GlobalAction) {
+        if matches!(self.main_view, MainView::Review(_)) {
+            // The review always owns the main area while open (opening it
+            // focuses main); keep that invariant, then move within it.
+            self.client.focus_main();
+            if let Some(r) = self.review.as_mut() {
+                match action {
+                    GlobalAction::FocusSidebar => r.focus_panel(),
+                    GlobalAction::FocusMain => r.focus_content(),
+                    _ => {}
+                }
+            }
+            return;
+        }
+        match action {
+            GlobalAction::FocusSidebar => self.client.focus_sidebar(),
+            GlobalAction::FocusMain => self.client.focus_main(),
+            _ => {}
         }
     }
 
@@ -2962,6 +3013,92 @@ mod tests {
         st.handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
         assert!(st.overlay.is_none(), "Tab closes the palette");
         assert_eq!(st.client.focus(), Focus::Sidebar, "Tab moves focus to the sidebar");
+    }
+
+    #[test]
+    fn ctrl_h_focuses_the_sidebar_and_ctrl_l_the_main_pane() {
+        // The vim-style focus moves work from either side, from any main view.
+        let mut st = test_state();
+        st.client.focus_main();
+        // Ctrl+H (Char('h') + CONTROL) moves focus left to the nav sidebar.
+        st.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(st.client.focus(), Focus::Sidebar, "Ctrl+H focuses the sidebar");
+        // Ctrl+L moves focus right to the main pane.
+        st.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(st.client.focus(), Focus::Main, "Ctrl+L focuses the main pane");
+    }
+
+    #[test]
+    fn focus_move_to_the_pane_that_already_has_focus_is_a_noop() {
+        let mut st = test_state();
+        st.client.focus_sidebar();
+        st.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(st.client.focus(), Focus::Sidebar);
+        st.client.focus_main();
+        st.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(st.client.focus(), Focus::Main);
+    }
+
+    #[test]
+    fn ctrl_h_and_ctrl_l_resolve_to_the_focus_actions() {
+        let st = test_state();
+        assert_eq!(
+            st.focus_move_action(&KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+            Some(GlobalAction::FocusSidebar),
+        );
+        assert_eq!(
+            st.focus_move_action(&KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            Some(GlobalAction::FocusMain),
+        );
+    }
+
+    #[test]
+    fn backspace_is_never_mistaken_for_a_focus_move() {
+        // On a terminal without keyboard enhancement Ctrl+H arrives as
+        // Backspace; it must not steal focus, and plain Backspace stays a
+        // session key. The action only matches the unambiguous Char('h') +
+        // CONTROL form, so every Backspace shape resolves to no focus move.
+        let st = test_state();
+        assert!(
+            st.focus_move_action(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+                .is_none(),
+            "plain Backspace is not a focus move",
+        );
+        assert!(
+            st.focus_move_action(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL))
+                .is_none(),
+            "Ctrl+Backspace is not Ctrl+H either",
+        );
+    }
+
+    #[test]
+    fn focus_moves_stay_within_an_open_review() {
+        // While a review owns the main area the moves step between its panel
+        // and content view, never out to the nav sidebar: client focus stays
+        // on the main pane (`rt-tui-review`).
+        let mut st = test_state();
+        st.main_view = MainView::Review("t-1".into());
+        st.review = Some(ReviewInterface::new(
+            "proj",
+            st.connector.clone(),
+            "t-1",
+            "review-1",
+            "/wt",
+            "Vim",
+            true,
+        ));
+        st.client.focus_main();
+        // Ctrl+H targets the review panel; client focus stays on main.
+        st.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(st.client.focus(), Focus::Main, "focus never leaves the review");
+        assert!(
+            !st.review.as_ref().unwrap().content_focused(),
+            "the panel holds focus after Ctrl+H",
+        );
+        // Ctrl+L targets the content view. With no live content it stays on
+        // the panel (the same guard Tab uses) but never leaves the review.
+        st.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(st.client.focus(), Focus::Main);
     }
 
     #[test]
