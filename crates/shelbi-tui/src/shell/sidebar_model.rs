@@ -119,10 +119,9 @@ fn nav_items() -> Vec<NavItem> {
             label: "Activity".into(),
             view: View::Activity,
         },
-        NavItem {
-            label: "Machines".into(),
-            view: View::Machines,
-        },
+        // Machines is reachable from the command palette (Ctrl+P → Machines),
+        // not the sidebar nav — this keeps the shell's nav at parity with main
+        // (Chat / Issues / Activity). See `overlays::build_command_model`.
     ]
 }
 

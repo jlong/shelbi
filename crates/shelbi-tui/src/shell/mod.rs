@@ -2914,51 +2914,14 @@ mod tests {
         assert_eq!(st.client.focus(), Focus::Sidebar);
     }
 
-    /// A sidebar with every native-view nav entry (Chat/Issues/Activity/Machines),
-    /// one workspace, and no reviews.
-    fn state_with_machines_nav() -> ShellState {
-        let caps = Caps { kitty: true, truecolor: true, nested: None };
-        let mut st = ShellState::new("proj", Arc::new(NoopConnector), caps);
-        st.apply_snapshot(ShellSnapshot {
-            sidebar: Some(SidebarModel {
-                project_label: "proj".into(),
-                nav: vec![
-                    NavItem { label: "Chat".into(), view: View::Session("orch".into()) },
-                    NavItem { label: "Issues".into(), view: View::Issues },
-                    NavItem { label: "Activity".into(), view: View::Activity },
-                    NavItem { label: "Machines".into(), view: View::Machines },
-                ],
-                workspaces: vec![WorkspaceRow {
-                    name: "alpha".into(),
-                    machine: "hub".into(),
-                    is_remote: false,
-                    current_task: None,
-                    agent: None,
-                    badge: shelbi_app::view::WorkspaceBadge::Idle,
-                }],
-                reviews: vec![],
-                config_error: None,
-                board_loading: false,
-                collapsed_machines: Default::default(),
-                board_banner: None,
-                daemon_version_line: None,
-                daemon_version_mismatch: false,
-                status_line: String::new(),
-                zen_mode: shelbi_state::ZenModeState::Off,
-                unread_errors: 0,
-            }),
-            board: None,
-            activity: None,
-            machines: None,
-        });
-        st
-    }
-
     #[test]
-    fn issues_activity_and_machines_open_in_the_main_area_from_the_sidebar() {
-        let mut st = state_with_machines_nav();
+    fn issues_and_activity_open_in_the_main_area_from_the_sidebar() {
+        // Machines moved to the palette; the sidebar nav is Chat / Issues /
+        // Activity only (parity with main). The three-item nav is what
+        // `test_state` already carries.
+        let mut st = test_state();
         st.client.focus_sidebar();
-        // Rows: 0 Chat, 1 Issues, 2 Activity, 3 Machines, 4 alpha.
+        // Rows: 0 Chat, 1 Issues, 2 Activity, 3 alpha.
         st.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // Issues
         st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(st.main_view, MainView::Native(View::Issues)));
@@ -2968,10 +2931,59 @@ mod tests {
         st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(st.main_view, MainView::Native(View::Activity)));
 
-        st.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // Machines
-        st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(st.main_view, MainView::Native(View::Machines)));
+        // No sidebar row routes to the Machines view any more.
+        let view = st.sidebar_view().expect("sidebar built");
+        assert!(
+            (0..view.selectable_count())
+                .filter_map(|i| view.target_at(i))
+                .all(|t| t != RowTarget::Native(View::Machines)),
+            "the Machines view is not reachable from the sidebar nav"
+        );
+    }
+
+    #[test]
+    fn machines_opens_from_the_command_palette() {
+        // Requirement: Ctrl+P → Machines opens the Machines view even though it
+        // has no sidebar nav row.
+        let mut st = test_state();
+        st.open_palette();
+        let entry = {
+            let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+                panic!("palette should be open");
+            };
+            p.results()
+                .into_iter()
+                .map(|(e, _)| e)
+                .find(|e| e.id == "view:machines")
+                .expect("palette lists a Machines command")
+        };
+        st.run_entry(&entry);
+        assert!(
+            matches!(st.main_view, MainView::Native(View::Machines)),
+            "running the palette's Machines command shows the Machines view"
+        );
         assert_eq!(st.client.view(), &View::Machines);
+    }
+
+    #[test]
+    fn restoring_the_machines_view_works_and_the_nav_has_no_machines_row() {
+        // A persisted `machines` view (ClientState) restores into the main area,
+        // and because Machines is palette-only the sidebar nav highlights no row
+        // as the Machines view.
+        let mut st = test_state();
+        st.apply_restored_view(View::Machines);
+        assert!(
+            matches!(st.main_view, MainView::Native(View::Machines)),
+            "the remembered Machines view restores into the main area"
+        );
+        let view = st.sidebar_view().expect("sidebar built");
+        let nav_targets: Vec<_> = (0..view.selectable_count())
+            .filter_map(|i| view.target_at(i))
+            .collect();
+        assert!(
+            !nav_targets.contains(&RowTarget::Native(View::Machines)),
+            "no sidebar row routes to the Machines view, got: {nav_targets:?}"
+        );
     }
 
     /// A synthetic left-click at `(col, row)` in absolute terminal coordinates.
@@ -3264,7 +3276,7 @@ mod tests {
         // The shell installs the executor-routing move persister so board moves go
         // through the shelbi-app executor (daemon-backed when the setting is on);
         // the standalone process keeps its default direct path (move_persister None).
-        let st = state_with_machines_nav();
+        let st = test_state();
         assert!(
             st.kanban.move_persister.is_some(),
             "the shell's board moves route through the executor"
@@ -3277,7 +3289,7 @@ mod tests {
 
     #[test]
     fn the_last_view_is_restored_when_switching_back_to_a_project() {
-        let mut st = state_with_machines_nav();
+        let mut st = test_state();
         // Open Activity on this project; it is recorded as the project's view.
         st.show(RowTarget::Native(View::Activity));
         assert_eq!(st.client.view(), &View::Activity);
@@ -3294,7 +3306,7 @@ mod tests {
         use crate::machines::{MachineEntry, MachinesData, WorkspaceRow as MachineWsRow};
         use shelbi_core::MachineKind;
 
-        let mut st = state_with_machines_nav();
+        let mut st = test_state();
         // Feed the machines view one machine with one workspace.
         st.machines.apply_data(MachinesData {
             display_name: Some("proj".into()),
