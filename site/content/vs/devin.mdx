@@ -15,7 +15,7 @@ summary: >-
 | **What it is** | Open-source orchestrator for coding agents in the terminal | Hosted "AI software engineer" you delegate tickets to |
 | **Where it runs** | Your machines — a hub plus any box reachable over SSH | Cognition's cloud, in isolated per-session VMs (enterprise VPC optional) |
 | **Intelligence** | Agent-agnostic: drives Claude Code, Codex, aider — anything with a CLI | Bundled SWE-1.6 plus an Adaptive router over Claude, GPT, and Gemini |
-| **Parallelism** | A fixed worker pool in tmux panes, spread across machines | Many parallel cloud sessions, each its own VM, plus subagents |
+| **Parallelism** | A fixed worker pool of attachable sessions, spread across machines | Many parallel cloud sessions, each its own VM, plus subagents |
 | **Review** | Two-pane TUI; per-task git worktree; inspect and merge the diff yourself | Autonomous pull request reviewed in your existing SCM |
 | **State** | Plain markdown and YAML files under `~/.shelbi` | Cognition's hosted platform, surfaced via web app, REST API, and dashboards |
 | **Pricing** | Free and open source; you pay only your own compute and agent CLIs | Free → $20 Pro → $200 Max → Teams → Enterprise, metered in ACUs |
@@ -27,8 +27,9 @@ summary: >-
 Cognition's cloud VMs and bills it as Agent Compute Units, where roughly one
 ACU is fifteen minutes of active work — great until light or bursty use turns
 into an unpredictable per-task cost. Shelbi runs entirely on hardware you
-already have: "no daemons, no servers," just `ssh`, `tmux`, `git`, and your
-agent CLI. Point it at the Mac mini in your closet and a Linux workstation,
+already have: no cloud VMs and no hosted platform, just the `shelbi`
+binary, `ssh`, `git`, and your agent CLI. Point it at the Mac mini in your
+closet and a Linux workstation,
 declare a few workers on each, and your spare compute becomes the fleet — with
 no VM clock running.
 

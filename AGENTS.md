@@ -1,9 +1,11 @@
 # Shelbi
 
-Shelbi is an open-source agent orchestrator built on tmux: you talk to one
-orchestrator agent, which dispatches tasks to worker agents (Claude Code,
-Codex, aider, anything with a CLI) running in parallel tmux panes, locally and
-over SSH. The repo is a Rust workspace plus a Next.js marketing/docs site.
+Shelbi is an open-source agent orchestrator: you talk to one orchestrator
+agent, which dispatches tasks to worker agents (Claude Code, Codex, aider,
+anything with a CLI) running in parallel, locally and over SSH. Each agent runs
+in its own Shelbi session (a small detached process owning one PTY), so Shelbi
+has no dependency beyond its own binary, `git`, and the agent CLI. The repo is
+a Rust workspace plus a Next.js marketing/docs site.
 
 ## Layout
 
@@ -12,7 +14,15 @@ over SSH. The repo is a Rust workspace plus a Next.js marketing/docs site.
 - `crates/shelbi-orchestrator`: orchestrator bootstrap, dispatch, workspace
   lifecycle, workflow actions, and git integration
 - `crates/shelbi-state`: markdown + frontmatter state IO
-- `crates/shelbi-tmux`: tmux send-keys / capture-pane abstractions
+- `crates/shelbi-proto`: frame and message types for the session protocol
+- `crates/shelbi-session`: the `shelbi __session` process (one PTY + one
+  headless terminal emulator per session, detached from its launcher)
+- `crates/shelbi-client`: client side of the session protocol (discover, spawn,
+  connect, request, stream output and events)
+- `crates/shelbi-term`: toolkit-independent session rendering (emulator,
+  scrollback, selection, search, input encoding)
+- `crates/shelbi-app`: shared, toolkit-independent application model (nav,
+  command registry, view models, background refresh)
 - `crates/shelbi-tui`: ratatui dashboard
 - `crates/shelbi-palette`: fuzzy command palette (Ctrl+P by default) for the TUI
 - `crates/shelbi-agent`: pluggable agent CLI runners
@@ -26,8 +36,8 @@ over SSH. The repo is a Rust workspace plus a Next.js marketing/docs site.
 ## Build, test, lint
 
 - `cargo build --workspace`
-- `cargo test --workspace` (some shelbi-orchestrator tests drive a real tmux
-  server; they skip silently if `tmux` is not on PATH)
+- `cargo test --workspace` (session tests run real PTYs in-process; no external
+  binary is required)
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - Site: `cd site && npm run lint && npm run build`
 

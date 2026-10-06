@@ -1,0 +1,25 @@
+[package]
+name = "shelbi-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Runtime-agnostic client for shelbi session processes (discover, spawn, connect)"
+
+[dependencies]
+shelbi-proto = { workspace = true }
+# The detached-spawn recipe and the session on-disk layout / lifetime lock live
+# here; the client delegates `spawn` to it and reads its `meta.json` + lock for
+# discovery. No tokio — the dependency is plain-threaded like this crate.
+shelbi-session = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+shelbi-session = { workspace = true }
+tempfile = "3"
+libc = { workspace = true }
+anyhow = { workspace = true }

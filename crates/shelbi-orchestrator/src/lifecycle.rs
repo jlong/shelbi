@@ -457,7 +457,7 @@ mod tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "lifecycle-test".into(),
             label: None,
             display_name: None,

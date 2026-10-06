@@ -4,14 +4,24 @@ members = [
     "crates/shelbi-core",
     "crates/shelbi-state",
     "crates/shelbi-ssh",
-    "crates/shelbi-tmux",
     "crates/shelbi-agent",
     "crates/shelbi-orchestrator",
     "crates/shelbi-tui",
     "crates/shelbi-palette",
+    "crates/shelbi-app",
     "crates/shelbi-cli",
+    "crates/shelbi-proto",
+    "crates/shelbi-client",
+    "crates/shelbi-term",
+    "crates/shelbi-session",
 ]
 default-members = ["crates/shelbi-cli"]
+# `vendor/*` holds vendored third-party forks (e.g. `alacritty_terminal`, the
+# client-side terminal emulator chosen in the `rt-spike-emulator-replay`
+# spike). They are path dependencies of workspace crates but NOT workspace
+# members, so `cargo clippy --workspace -- -D warnings` never lints upstream
+# code and `cargo test --workspace` never runs their suites.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.10.0"
@@ -48,16 +58,37 @@ unicode-width = "0.1"
 libc = "0.2"
 regex = "1"
 tungstenite = "0.29"
+# Key-input encoder for `shelbi-term` (MIT). Chosen in the remove-tmux plan,
+# "Shared client crates": termwiz owns the fiddly key-encoding tables
+# (application-cursor keys, modify-other-keys, and the kitty keyboard
+# protocol). We use only its `input` encoder, never its terminal backend, so
+# default features are off. `shelbi-term` wraps it behind neutral key types.
+termwiz = { version = "0.23", default-features = false }
+# PTY ownership for the `shelbi __session` process. Chosen in the remove-tmux
+# plan (covers ConPTY on Windows behind the same API); the Phase 0 runtime
+# spike proved controlling-terminal, group-kill, and no-descriptor-leak
+# behavior against this exact version.
+portable-pty = "0.9"
+
+# Client-side terminal emulator, vendored under `vendor/` (Apache-2.0). Chosen
+# in the `rt-spike-emulator-replay` Phase 0 spike as a fork because attach
+# replay needs full access to state the upstream crate keeps private. A
+# dependency only for now; `shelbi-term` / `rt-term` wire it to real rendering.
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
 
 # internal crates
 shelbi-core = { path = "crates/shelbi-core" }
 shelbi-state = { path = "crates/shelbi-state" }
 shelbi-ssh = { path = "crates/shelbi-ssh" }
-shelbi-tmux = { path = "crates/shelbi-tmux" }
 shelbi-agent = { path = "crates/shelbi-agent" }
 shelbi-orchestrator = { path = "crates/shelbi-orchestrator" }
 shelbi-tui = { path = "crates/shelbi-tui" }
 shelbi-palette = { path = "crates/shelbi-palette" }
+shelbi-app = { path = "crates/shelbi-app" }
+shelbi-proto = { path = "crates/shelbi-proto" }
+shelbi-client = { path = "crates/shelbi-client" }
+shelbi-term = { path = "crates/shelbi-term" }
+shelbi-session = { path = "crates/shelbi-session" }
 
 [profile.release]
 lto = "thin"

@@ -1,45 +1,63 @@
 ---
 title: shelbi attach
 order: 30
-summary: Attach your terminal to a workspace's tmux pane.
+summary: Attach your terminal to a workspace's session, rendered full-screen.
 ---
 
 ```text
-shelbi attach [OPTIONS] <ID>
+shelbi attach [OPTIONS] <WORKSPACE>
 ```
 
-`shelbi attach` connects your terminal to a
-[workspace](/docs/concepts/workspaces)'s tmux pane, dropping you straight into
-the agent's session so you can watch or drive it interactively.
+`shelbi attach` wires your terminal to a
+[workspace](/docs/concepts/workspaces)'s Shelbi session, dropping you straight
+into the agent so you can watch or drive it interactively. The session is
+rendered full-screen: Shelbi draws the agent's screen rather than piping raw
+bytes, so attaching from an 80-column terminal to a session sized for a wide
+desktop window stays legible, and several terminals can view the same session
+at once.
 
-Where [`shelbi open`](/docs/cli/open) focuses (and, if needed, creates) the pane
-*inside* the Shelbi tmux session, `attach` wires *your* terminal to the
-workspace's pane directly.
+Where [`shelbi open`](/docs/cli/open) ensures a workspace's session is up so the
+TUI can show it, `attach` connects *your* terminal to that session directly,
+from any terminal on the hub or over SSH. No terminal multiplexer is involved:
+the session is a small Shelbi process that owns the agent's PTY and outlives the
+connection, so detaching leaves the agent running.
+
+Detach with the configured key (default `Ctrl+]`); Shelbi shows the detach hint
+on a one-line bar. Detaching never stops the agent.
 
 ## Arguments
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
-| `<ID>` | string | — | Workspace to attach to (required). |
+| `<WORKSPACE>` | string | — | Name of the workspace (session) to attach to (required). |
 
 ## Flags
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
+| `--detach-key <DETACH_KEY>` | string | `ctrl-]` | Key that detaches from the session. |
 | `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
 | `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
 
 ## Examples
 
-Attach your terminal to the `alpha` workspace's pane:
+Attach your terminal to the `alpha` workspace's session:
 
 ```bash
 shelbi attach alpha
 ```
 
+Attach with a different detach key:
+
+```bash
+shelbi attach alpha --detach-key ctrl-b
+```
+
 ## See also
 
 - [Workspaces](/docs/concepts/workspaces) — what a workspace is and how its
-  pane is created and owned.
-- [`shelbi open`](/docs/cli/open) — focus (or create) a workspace's pane inside
-  the Shelbi tmux session rather than attaching your own terminal to it.
+  session is created and owned.
+- [`shelbi open`](/docs/cli/open) — ensure a workspace's session is up so the
+  TUI can show it, rather than attaching your own terminal to it.
+- [`shelbi session`](/docs/cli/session) — the low-level debug surface over the
+  same sessions (`ls`, `new`, `kill`, `send`, `snapshot`).

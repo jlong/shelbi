@@ -57,15 +57,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// [legacy spawn flow] Spawn a one-shot agent on a machine. The
-    /// workspace-based flow (`shelbi task start` + the project YAML's
-    /// `workspaces:` block) is canonical now; `spawn` keeps working for
-    /// projects that haven't migrated.
-    Spawn(commands::spawn::Args),
-    /// [legacy spawn flow] List agents written by `shelbi spawn`.
-    /// `shelbi workspace list` is the canonical view of the workspace pool
-    /// and what `shelbi send`/`task start` operate against.
-    List,
     /// Print the orchestrator's bootstrap snapshot. Bare `shelbi status`
     /// emits a concise human summary; `--full` emits the LLM-consumable
     /// payload (board + workspaces + zen + handoff-presence);
@@ -92,7 +83,7 @@ enum Cmd {
     Send { id: String, message: String },
     /// Push a message to a task's workspace via the file-based message log
     /// (`<worktree>/.shelbi/messages/<task-id>.log`). Distinct from `send`:
-    /// `send` injects keystrokes into a tmux pane; `message` appends a
+    /// `send` injects keystrokes into the agent session; `message` appends a
     /// durable JSON record the workspace tails and (best-effort) acks.
     ///
     /// The push being durable is NOT the same as the worker having read it:
@@ -123,60 +114,12 @@ enum Cmd {
         #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "120")]
         wait: Option<u64>,
     },
-    /// [legacy spawn flow] Tail a spawn-agent's recent output. Workspaces
-    /// don't write to the legacy log — use `tmux capture-pane` against
-    /// `shelbi-<project>:<workspace>` (local) or
-    /// `shelbi-w-<workspace>:agent` (remote) instead.
-    Tail {
-        id: String,
-        #[arg(long, default_value_t = 40)]
-        lines: usize,
-    },
-    /// [legacy spawn flow] Show a spawn-agent's working-tree diff. For
-    /// workspaces the worktree is at
-    /// `<machine.work_dir>/.shelbi/wt/<workspace>` — run `git -C` there
-    /// directly.
-    Diff { id: String },
-    /// Merge a workspace's branch into the project's default branch.
-    Merge {
-        id: String,
-        /// Push branch + open a GitHub PR instead of a local merge.
-        #[arg(long)]
-        pr: bool,
-    },
-    /// [legacy spawn flow] Archive a spawn agent (keep the log, drop the
-    /// worktree). Workspaces are durable slots — use
-    /// `shelbi workspace stop <name>` to release the slot's in-flight task
-    /// instead.
-    Archive { id: String },
-    /// Focus the workspace's tmux pane, creating it (with the agent
-    /// running) if it doesn't exist yet. Single entry point for both
-    /// the sidebar click-to-focus path and the dispatch path — the
-    /// "exists?" check lives here so callers don't have to branch on it.
-    ///
-    /// For LOCAL workspaces, an empty pane is created with this same
-    /// command re-entered under `--as-pane` (the wrapper that owns the
-    /// agent subprocess and emits a `pane_alive=false` event on exit).
-    ///
-    /// For REMOTE workspaces, the pane is a proxy window that
-    /// `ssh -t … tmux attach -t shelbi-w-<name>` into the workspace's
-    /// own remote tmux session — the lifecycle wrapper isn't deployed
-    /// to remote machines.
+    /// Ensure a workspace's session is up so the TUI can show it: a no-op for a
+    /// workspace mid-task (dispatch owns its agent session), or a plain
+    /// interactive login shell in the worktree for an idle workspace.
     Open {
         /// Name of the workspace to open.
         name: String,
-        /// Internal re-entry flag. When set, this process *is* the
-        /// pane's top-level command: it fork+execs the agent runner,
-        /// waits, and emits the `pane_alive=false` event on any exit
-        /// path (including SIGHUP/SIGTERM/SIGINT). Not for direct use.
-        #[arg(long, hide = true)]
-        as_pane: bool,
-        /// Internal re-entry flag set by `shelbi task resume`. When set
-        /// alongside `--as-pane`, the wrapper launches a claude runner with
-        /// `--continue` so the pane reloads its prior conversation instead of
-        /// starting cold. Not for direct use.
-        #[arg(long, hide = true)]
-        resume: bool,
     },
     /// Manage the project's Kanban issue board.
     Issue {
@@ -215,6 +158,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::agent::AgentCmd,
     },
+    /// Find or install a compatible `shelbi` binary on the project's remote
+    /// machines: `setup <name>`, `status [<name>]`.
+    Machine {
+        #[command(subcommand)]
+        cmd: commands::machine::MachineCmd,
+    },
     /// Manage the project's workflow definitions (status sets).
     Workflow {
         #[command(subcommand)]
@@ -252,10 +201,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<commands::daemon::DaemonCmd>,
     },
-    /// Attach the terminal to a workspace's tmux pane.
-    Attach { id: String },
+    /// Attach this terminal to a workspace's session, rendered full-screen.
+    /// Detach with the configured key (default Ctrl+]).
+    Attach {
+        /// Name of the workspace (session) to attach to.
+        workspace: String,
+        /// Key that detaches from the session. Default `ctrl-]`.
+        #[arg(long, default_value = "ctrl-]")]
+        detach_key: String,
+    },
     /// Initialize a Shelbi project. `shelbi init -y` detects the repository,
-    /// runner, tmux, and workspace plan, then scaffolds it without prompts.
+    /// runner, and workspace plan, then scaffolds it without prompts.
     /// If both Claude and Codex are installed, add `--runner claude` or
     /// `--runner codex`.
     ///
@@ -273,7 +229,7 @@ enum Cmd {
     /// ~/.shelbi/projects/<name>.yaml. Idempotent — setup is skipped when a
     /// project is already on disk.
     Wizard,
-    /// Start the orchestrator agent in the project's tmux session window 1.
+    /// Start the orchestrator agent as the project's orchestrator session.
     Orchestrate(commands::orchestrate::Args),
     /// Machine-readable orchestrator transport primitives.
     Orchestrator {
@@ -305,41 +261,22 @@ enum Cmd {
         #[arg(value_name = "NAME")]
         name: Option<String>,
     },
-    /// Cleanly tear down the running project from the command line — the
-    /// teardown counterpart to `shelbi reload`. Closes the orchestrator
-    /// pane, the shelbi-owned TUI panes (sidebar + tasks/machines), and
-    /// both of the project's tmux sessions (`shelbi-<project>` and the
-    /// hidden `_shelbi-<project>` views stash).
+    /// Quit the current project: end its sessions (after the orchestrator
+    /// writes its handoff so the next open resumes with context) and mark it
+    /// closed. Other projects keep running. Worktrees and branches are left
+    /// intact, so the work resumes on the next launch.
     ///
-    /// Workspace worktrees and branches are left intact: a workspace
-    /// mid-task keeps its durable worktree + branch on disk, so the work
-    /// resumes on the next launch and only the panes are stopped. If any
-    /// workspace still holds an active task you're warned and asked to
-    /// confirm — pass `-y` to skip. Before its pane is torn down the
-    /// orchestrator is given the chance to write
-    /// `agents/orchestrator/handoff.md`, so a later relaunch resumes with
-    /// context. Running it on an already-stopped project is a clean no-op.
-    Quit,
-    /// (internal) Run the sidebar ratatui process inside the dashboard's
-    /// left pane. Not for direct use.
-    #[command(hide = true)]
-    #[command(name = "__sidebar")]
-    Sidebar { project: String },
-    /// (internal) Run the Kanban tasks view inside the hidden stash pane.
-    /// Not for direct use.
-    #[command(hide = true)]
-    #[command(name = "__tasks")]
-    Tasks { project: String },
-    /// (internal) Run the activity-feed ratatui view inside the hidden
-    /// stash pane. Not for direct use.
-    #[command(hide = true)]
-    #[command(name = "__activity")]
-    Activity { project: String },
-    /// (internal) Run the review-panel ratatui view inside the review
-    /// interface's third pane. Not for direct use.
-    #[command(hide = true)]
-    #[command(name = "__review-panel")]
-    ReviewPanel { project: String, task: String },
+    /// Pass `--all` to quit Shelbi entirely: close every project, end all
+    /// sessions, and stop the hub daemon (nothing restarts it).
+    ///
+    /// With no daemon running, nothing is open — this reports that and exits
+    /// cleanly.
+    Quit {
+        /// Quit Shelbi entirely (every project + the hub daemon) instead of
+        /// just the current project.
+        #[arg(long)]
+        all: bool,
+    },
     /// (internal) Own the Codex app-server, exact orchestrator thread, and
     /// remote TUI for one project. Not for direct use.
     #[command(hide = true)]
@@ -389,8 +326,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::action::ActionCmd,
     },
-    /// Open the palette as a tmux popup. Bound to Ctrl+P by default.
-    Popup,
     /// (internal) Crash-recovery check the orchestrator pane wrapper
     /// runs once at start. Not for direct use.
     #[command(hide = true)]
@@ -401,6 +336,12 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__zen-heartbeat")]
     ZenHeartbeat { project: String },
+    /// (internal) Start the on-demand hub daemon if it isn't already running,
+    /// waiting for its socket. The CLI/TUI open paths call the same helper; this
+    /// exposes it for ops and tests. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__ensure-daemon")]
+    EnsureDaemon,
     /// (internal) Graceful-exit clear the orchestrator pane wrapper
     /// runs after the agent returns. Not for direct use.
     #[command(hide = true)]
@@ -415,41 +356,9 @@ enum Cmd {
         project: String,
         /// Short exit token — `exit:<code>` or `signal:SIG<NAME>`.
         reason: String,
-        /// The orchestrator pane's tmux id (`$TMUX_PANE`), for the output-tail
-        /// capture. Optional: absent/empty just yields a record with no tail.
+        /// Reserved; the orchestrator runs as a session now, so no pane id is
+        /// captured. Absent/empty yields a record with no output tail.
         pane: Option<String>,
-    },
-    /// (internal) Run the palette picker — meant to be invoked inside a
-    /// `tmux display-popup`. Not for direct use.
-    #[command(hide = true)]
-    #[command(name = "__palette")]
-    Palette { project: String },
-    /// (internal) Render the "Load for review" dialog — a confirm (one slot) or
-    /// a picker (many) — meant to be invoked inside a `tmux display-popup` by
-    /// the sidebar. Writes the chosen slot name to `--out` and exits 0 on Load,
-    /// non-zero on cancel. `--slot`/`--occupant` are positional pairs (one per
-    /// review slot; an empty occupant means free). Not for direct use.
-    #[command(hide = true)]
-    #[command(name = "__review-confirm")]
-    ReviewConfirm {
-        #[arg(long)]
-        title: String,
-        #[arg(long)]
-        out: String,
-        #[arg(long = "slot")]
-        slots: Vec<String>,
-        #[arg(long = "occupant")]
-        occupants: Vec<String>,
-    },
-    /// (internal) Render the reject-reason prompt — a bordered textbox plus
-    /// `[ Reject ]` / `[ Cancel ]` buttons, meant to be invoked inside a
-    /// `tmux display-popup` by the review panel. Writes the typed reason to
-    /// `--out` and exits 0 on submit, non-zero on cancel. Not for direct use.
-    #[command(hide = true)]
-    #[command(name = "__review-reject-reason")]
-    ReviewRejectReason {
-        #[arg(long)]
-        out: String,
     },
     /// (internal) Launch wrapper the Review agent runs in place of a workflow
     /// `review:` serve command. Starts the command in its own session /
@@ -463,12 +372,27 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
-    /// (internal) Render the persistent error-log viewer — meant to be invoked
-    /// inside a `tmux display-popup` by the sidebar's unread-errors button (or
-    /// inline by the palette's "Open error log" entry). Not for direct use.
+    /// (internal) The per-session process (remove-tmux backend): own one PTY
+    /// and one headless terminal emulator, answer terminal queries with no
+    /// client attached, serve clients on a Unix socket, and on child exit write
+    /// `exit.json` + `final.txt`. Normally launched detached by a client via
+    /// `shelbi_session::spawn_detached`, never run by hand. Not for direct use.
     #[command(hide = true)]
-    #[command(name = "__error-log")]
-    ErrorLog { project: String },
+    #[command(name = "__session")]
+    SessionProcess(commands::session::Args),
+    /// (internal) Bridge one stdio channel to every session on this machine
+    /// (remove-tmux remote backend). Started by the hub over `ssh <host> shelbi
+    /// relay`; it reads/writes the relay protocol on stdin/stdout and holds no
+    /// session state. Not for direct use.
+    #[command(hide = true)]
+    Relay(commands::relay::Args),
+    /// Inspect and drive the session backend directly: `ls`, `new`, `kill`,
+    /// `send`, `snapshot`. A debug surface over `shelbi-client` /
+    /// `shelbi-session` (`shelbi attach <workspace>` is the rendered client).
+    Session {
+        #[command(subcommand)]
+        cmd: commands::session_cli::SessionCmd,
+    },
 }
 
 fn main() -> Result<()> {
@@ -499,8 +423,6 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         None => default_entry(cli.project.clone()),
-        Some(Cmd::Spawn(args)) => commands::spawn::run(cli.project, args),
-        Some(Cmd::List) => commands::list::run(cli.project),
         Some(Cmd::Status { cmd, full, handoff }) => {
             commands::status::run(cli.project, cmd, full, handoff)
         }
@@ -513,15 +435,7 @@ fn main() -> Result<()> {
             in_response_to,
             wait,
         }) => commands::message::run(cli.project, status, id, kind, body, in_response_to, wait),
-        Some(Cmd::Tail { id, lines }) => commands::tail::run(cli.project, id, lines),
-        Some(Cmd::Diff { id }) => commands::diff::run(cli.project, id),
-        Some(Cmd::Merge { id, pr }) => commands::merge::run(cli.project, id, pr),
-        Some(Cmd::Archive { id }) => commands::archive::run(cli.project, id),
-        Some(Cmd::Open {
-            name,
-            as_pane,
-            resume,
-        }) => commands::open::run(cli.project, name, as_pane, resume),
+        Some(Cmd::Open { name }) => commands::open::run(cli.project, name),
         Some(Cmd::Issue { cmd }) => commands::issue::run(cli.project, cmd),
         Some(Cmd::Task { cmd }) => {
             eprintln!(
@@ -537,6 +451,7 @@ fn main() -> Result<()> {
             commands::workspace::run(cli.project, cmd)
         }
         Some(Cmd::Agent { cmd }) => commands::agent::run(cli.project, cmd),
+        Some(Cmd::Machine { cmd }) => commands::machine::run(cli.project, cmd),
         Some(Cmd::Workflow { cmd }) => commands::workflow::run(cli.project, cmd),
         Some(Cmd::Project { cmd }) => commands::project::run(cli.project, cmd),
         Some(Cmd::Config { cmd }) => {
@@ -554,7 +469,10 @@ fn main() -> Result<()> {
         Some(Cmd::MsrvCheck) => commands::msrv_check::run(),
         Some(Cmd::Guard { cmd }) => commands::guard::run(cli.project, cmd),
         Some(Cmd::Action { cmd }) => commands::action::run(cli.project, cmd),
-        Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
+        Some(Cmd::Attach {
+            workspace,
+            detach_key,
+        }) => commands::session_cli::attach_workspace(cli.project, workspace, detach_key),
         Some(Cmd::Init(mut args)) => {
             if !init_has_project_root {
                 // A global `--root` is propagated into the subcommand's field
@@ -567,13 +485,7 @@ fn main() -> Result<()> {
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
         Some(Cmd::Orchestrator { cmd }) => commands::orchestrator::run(cli.project, cmd),
         Some(Cmd::Reload { target, name }) => commands::reload::run(cli.project, target, name),
-        Some(Cmd::Quit) => commands::quit::run(cli.project, cli.yes),
-        Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
-        Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),
-        Some(Cmd::Activity { project }) => shelbi_tui::run_activity(&project).context("activity"),
-        Some(Cmd::ReviewPanel { project, task }) => {
-            shelbi_tui::run_review_panel(&project, &task).context("review-panel")
-        }
+        Some(Cmd::Quit { all }) => commands::quit::run(cli.project, all),
         Some(Cmd::CodexOrchestrator {
             project,
             first_launch,
@@ -581,39 +493,15 @@ fn main() -> Result<()> {
             shelbi_orchestrator::wake::run_codex_bridge(&project, first_launch)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))
         }
-        Some(Cmd::Popup) => commands::popup::run(),
-        Some(Cmd::Palette { project }) => commands::palette::run(project),
-        Some(Cmd::ReviewConfirm {
-            title,
-            out,
-            slots,
-            occupants,
-        }) => {
-            // Zip the positional `--slot`/`--occupant` pairs into slots; an
-            // empty occupant means the slot is free.
-            let slots = slots
-                .into_iter()
-                .zip(occupants.into_iter().chain(std::iter::repeat(String::new())))
-                .map(|(name, occ)| commands::review_confirm::Slot {
-                    name,
-                    occupant: (!occ.is_empty()).then_some(occ),
-                })
-                .collect();
-            // The sidebar reads the chosen slot from `--out`; the exit code
-            // (0 = Load, non-zero = cancel) gates whether it reads it.
-            let loaded = commands::review_confirm::run(title, out, slots)?;
-            std::process::exit(if loaded { 0 } else { 1 });
-        }
-        Some(Cmd::ReviewRejectReason { out }) => {
-            // The review panel reads our exit code (0 = submitted, non-zero =
-            // cancelled) and, on submit, the reason written to `--out`.
-            let submitted = commands::review_reject::run(out)?;
-            std::process::exit(if submitted { 0 } else { 1 });
-        }
         Some(Cmd::ReviewServe { cmd }) => commands::review_serve::run(cmd),
-        Some(Cmd::ErrorLog { project }) => commands::error_log::run(project),
+        Some(Cmd::SessionProcess(args)) => commands::session::run(args),
+        Some(Cmd::Relay(args)) => commands::relay::run(args),
+        Some(Cmd::Session { cmd }) => commands::session_cli::run(cli.project, cmd),
         Some(Cmd::ZenOrchStart { project }) => commands::zen_lifecycle::orch_start(&project),
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),
+        Some(Cmd::EnsureDaemon) => {
+            shelbi_state::ensure_daemon_running().map_err(|e| anyhow::anyhow!(e.to_string()))
+        }
         Some(Cmd::ZenOrchExit { project }) => commands::zen_lifecycle::orch_exit(&project),
         Some(Cmd::OrchRecordExit {
             project,
@@ -773,24 +661,16 @@ fn run_wizard_then_dispatch(first_run: bool) -> Result<()> {
 
 /// Initialize the tracing subscriber.
 ///
-/// For internal TUI-owning subcommands (`__sidebar`, `__tasks`,
-/// `__activity`, `__codex-orchestrator`) we route output to
-/// `~/.shelbi/logs/tui.log` instead of stderr. The process
-/// shares its TTY with ratatui's draw cycle, and any stray stderr write
-/// corrupts the cursor position — leaving raw `tracing` lines bleeding across
-/// the sidebar until the next full repaint (e.g. a resize). For all other
-/// commands the default stderr writer is fine.
+/// For the single-process TUI (bare `shelbi`) and the internal
+/// `__codex-orchestrator` process we route output to `~/.shelbi/logs/tui.log`
+/// instead of stderr. The process shares its TTY with ratatui's draw cycle, and
+/// any stray stderr write corrupts the cursor position — leaving raw `tracing`
+/// lines bleeding across the screen until the next full repaint (e.g. a
+/// resize). For all other commands the default stderr writer is fine.
 fn init_tracing(cmd: Option<&Cmd>) {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_env("SHELBI_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    let is_tui = matches!(
-        cmd,
-        Some(Cmd::Sidebar { .. })
-            | Some(Cmd::Tasks { .. })
-            | Some(Cmd::Activity { .. })
-            | Some(Cmd::ReviewPanel { .. })
-            | Some(Cmd::CodexOrchestrator { .. })
-    );
+    let is_tui = matches!(cmd, None | Some(Cmd::CodexOrchestrator { .. }));
     if is_tui {
         if let Some(file) = open_tui_log_file() {
             let _ = fmt()
@@ -1138,35 +1018,89 @@ mod cli_tests {
     /// `--as-pane` re-entry flag is hidden from `--help` but still
     /// parseable so the wrapper-spawn line from focus_or_create lands.
     #[test]
-    fn open_parses_with_and_without_as_pane() {
+    fn open_parses_a_workspace_name() {
         let plain = Cli::parse_from(["shelbi", "open", "alpha"]);
         match plain.cmd {
-            Some(Cmd::Open {
-                ref name, as_pane, ..
-            }) if name == "alpha" && !as_pane => {}
-            other => panic!("expected Open {{ alpha, as_pane=false }}, got {other:?}"),
+            Some(Cmd::Open { ref name }) if name == "alpha" => {}
+            other => panic!("expected Open {{ alpha }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_parses_a_workspace_and_detach_key() {
+        let a = Cli::parse_from(["shelbi", "attach", "alpha"]);
+        match a.cmd {
+            Some(Cmd::Attach {
+                ref workspace,
+                ref detach_key,
+            }) if workspace == "alpha" && detach_key == "ctrl-]" => {}
+            other => panic!("expected Attach {{ alpha, ctrl-] }}, got {other:?}"),
+        }
+        let b = Cli::parse_from(["shelbi", "attach", "beta", "--detach-key", "ctrl-q"]);
+        match b.cmd {
+            Some(Cmd::Attach {
+                ref workspace,
+                ref detach_key,
+            }) if workspace == "beta" && detach_key == "ctrl-q" => {}
+            other => panic!("expected Attach {{ beta, ctrl-q }}, got {other:?}"),
+        }
+    }
+
+    /// The hidden `__session` process entry still parses after being renamed
+    /// off the `Session` variant (now the user-facing `shelbi session` group),
+    /// and it stays out of `--help`.
+    #[test]
+    fn session_process_entry_is_hidden_but_parseable() {
+        let cli = Cli::parse_from([
+            "shelbi",
+            "__session",
+            "--id",
+            "abc",
+            "--name",
+            "demo/orch",
+            "--cwd",
+            "/tmp",
+            "--cols",
+            "80",
+            "--rows",
+            "24",
+            "--",
+            "/bin/sh",
+        ]);
+        assert!(matches!(cli.cmd, Some(Cmd::SessionProcess(_))));
+        let help = Cli::try_parse_from(["shelbi", "--help"])
+            .expect_err("--help exits through clap")
+            .to_string();
+        assert!(!help.contains("__session"), "internal entry leaked into help: {help}");
+    }
+
+    /// The user-facing `shelbi session` group parses each debug subcommand.
+    #[test]
+    fn session_group_parses_its_subcommands() {
+        use commands::session_cli::SessionCmd;
+
+        let ls = Cli::parse_from(["shelbi", "session", "ls"]);
+        assert!(matches!(ls.cmd, Some(Cmd::Session { cmd: SessionCmd::Ls })));
+
+        let new = Cli::parse_from([
+            "shelbi", "session", "new", "--name", "demo/orch", "--", "/bin/sh", "-c", "exec cat",
+        ]);
+        match new.cmd {
+            Some(Cmd::Session {
+                cmd: SessionCmd::New { name, command, cols, rows, .. },
+            }) => {
+                assert_eq!(name, "demo/orch");
+                assert_eq!(command, vec!["/bin/sh", "-c", "exec cat"]);
+                assert_eq!((cols, rows), (80, 24), "defaults apply");
+            }
+            other => panic!("expected session new, got {other:?}"),
         }
 
-        let wrapped = Cli::parse_from(["shelbi", "open", "delta", "--as-pane"]);
-        match wrapped.cmd {
-            Some(Cmd::Open {
-                ref name, as_pane, ..
-            }) if name == "delta" && as_pane => {}
-            other => panic!("expected Open {{ delta, as_pane=true }}, got {other:?}"),
-        }
-
-        // `shelbi task resume` re-enters the wrapper with `--as-pane --resume`;
-        // both flags parse together so the wrapper can select `--continue`.
-        let resumed = Cli::parse_from(["shelbi", "open", "alpha", "--as-pane", "--resume"]);
-        match resumed.cmd {
-            Some(Cmd::Open {
-                ref name,
-                as_pane,
-                resume,
-                ..
-            }) if name == "alpha" && as_pane && resume => {}
-            other => panic!("expected Open {{ alpha, as_pane, resume }}, got {other:?}"),
-        }
+        let send = Cli::parse_from(["shelbi", "session", "send", "alpha", "hi", "--enter"]);
+        assert!(matches!(
+            send.cmd,
+            Some(Cmd::Session { cmd: SessionCmd::Send { enter: true, .. } })
+        ));
     }
 
     #[test]
@@ -1200,6 +1134,23 @@ mod cli_tests {
         assert!(
             !help.contains("__codex-orchestrator"),
             "internal bridge command leaked into help: {help}"
+        );
+    }
+
+    #[test]
+    fn relay_command_is_hidden_but_parseable() {
+        let cli = Cli::parse_from(["shelbi", "relay"]);
+        assert!(
+            matches!(cli.cmd, Some(Cmd::Relay(_))),
+            "`shelbi relay` should parse as the relay command"
+        );
+
+        let help = Cli::try_parse_from(["shelbi", "--help"])
+            .expect_err("--help exits through clap")
+            .to_string();
+        assert!(
+            !help.contains("relay"),
+            "the machine-facing relay command leaked into help: {help}"
         );
     }
 
@@ -1449,13 +1400,13 @@ mod cli_tests {
     /// `root` module tests; this test just pins the parse surface.
     #[test]
     fn root_flag_parses_before_and_after_subcommand() {
-        let pre = Cli::parse_from(["shelbi", "--root", "/tmp/r1", "list"]);
+        let pre = Cli::parse_from(["shelbi", "--root", "/tmp/r1", "status"]);
         assert_eq!(pre.root.as_deref(), Some(std::path::Path::new("/tmp/r1")));
-        assert!(matches!(pre.cmd, Some(Cmd::List)));
-        let post = Cli::parse_from(["shelbi", "list", "--root", "/tmp/r2"]);
+        assert!(matches!(pre.cmd, Some(Cmd::Status { .. })));
+        let post = Cli::parse_from(["shelbi", "status", "--root", "/tmp/r2"]);
         assert_eq!(post.root.as_deref(), Some(std::path::Path::new("/tmp/r2")));
-        assert!(matches!(post.cmd, Some(Cmd::List)));
-        let absent = Cli::parse_from(["shelbi", "list"]);
+        assert!(matches!(post.cmd, Some(Cmd::Status { .. })));
+        let absent = Cli::parse_from(["shelbi", "status"]);
         assert!(absent.root.is_none());
     }
 }

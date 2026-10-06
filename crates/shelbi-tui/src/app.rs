@@ -266,23 +266,6 @@ pub struct App {
     /// pane doesn't flood `tui.log` at the 200ms render cadence; cleared
     /// once the size recovers. See [`App::note_sidebar_area`].
     last_collapse_warn: Option<Instant>,
-    /// Name of the tmux window last seen active in this project's session,
-    /// tracked by [`App::poll_active_window`] so an *externally-initiated*
-    /// window switch (a native tmux tab / prefix key, not a Shelbi nav click)
-    /// runs the same per-window setup a click would. `None` until the first
-    /// poll observes the active window. Only a *change* triggers setup, so a
-    /// window that's already current (including one we just switched to
-    /// ourselves) is a no-op.
-    last_active_window: Option<String>,
-    /// Builtin view name last seen occupying the dashboard's right slot,
-    /// tracked by [`App::poll_current_view`] so a view swapped in from the
-    /// Ctrl+P palette (a separate process this one can't observe directly)
-    /// moves the sidebar highlight onto the matching nav row. Read back from
-    /// the `SHELBI_CURRENT_VIEW` session env that [`shelbi_orchestrator::show_view`]
-    /// writes on every swap. `None` until the first poll observes a view. Only a
-    /// *change* re-seats the highlight, so plain cursor-preview navigation
-    /// (which doesn't swap the pane) is never snapped back.
-    last_current_view: Option<String>,
 }
 
 /// A review load running on a worker thread. Holds the channel the thread
@@ -324,8 +307,6 @@ impl App {
             review_job: None,
             render_panics: 0,
             last_collapse_warn: None,
-            last_active_window: None,
-            last_current_view: None,
         }
     }
 
@@ -845,28 +826,17 @@ impl App {
 
     pub fn activate_view(&mut self, view: &View) {
         match view {
-            View::Builtin(name) => match shelbi_orchestrator::show_view(&self.project_name, name) {
-                Ok(()) => self.status_line = format!("▶ {name}"),
-                Err(e) => self.log_error(&format!("show view `{name}` failed"), e),
-            },
+            // legacy tmux dashboard removed: the builtin views are now native
+            // panes in the single-process shell, no out-of-process view swap.
+            View::Builtin(name) => self.status_line = format!("▶ {name}"),
             View::Workspace(name) => {
                 match shelbi_orchestrator::focus_workspace(&self.project_name, name) {
                     Ok(()) => self.status_line = format!("▶ {name}"),
                     Err(e) => self.log_error(&format!("focus `{name}` failed"), e),
                 }
             }
-            View::Agent(id) => {
-                let target = format!("shelbi-{}:{}", self.project_name, id);
-                let out = run_tmux(["select-window", "-t", &target]);
-                if !out {
-                    self.log_error_message(&format!(
-                        "couldn't switch to `{id}` — window not in this session \
-                         (remote workspaces need `tmux attach -t shelbi-w-{id}` for now)"
-                    ));
-                } else {
-                    self.status_line = format!("▶ {id}");
-                }
-            }
+            // legacy tmux dashboard removed: no tmux window to select-window to.
+            View::Agent(id) => self.status_line = format!("▶ {id}"),
             View::ReviewTask(id) => {
                 // Branch on the task's review sub-state, not merely which
                 // section it renders in. A *pending-load* row isn't on a review
@@ -1093,192 +1063,30 @@ impl App {
         }
     }
 
-    /// Build (and focus) the review interface for a task whose review slot has
-    /// just finished loading, falling back to a plain window switch when the
-    /// embed can't be constructed. Split out of [`App::poll_review_load`] so
-    /// the borrow of the in-flight job is released before the tmux round-trip.
-    ///
-    /// This closes the gap where clicking a Ready-for-Review row whose slot had
-    /// to be launched first booted the review agent but left the review panel
-    /// unopened: the click and the panel now land in one action, matching the
-    /// already-live click path in [`App::open_ready_review`]. Reusing
-    /// [`shelbi_orchestrator::review_ui::open_review_interface`] means the panel
-    /// shows the same review sub-state and branch/server details either way.
-    fn open_loaded_review_interface(&mut self, task_id: &str, target: &str) {
-        use shelbi_orchestrator::review_ui::ReviewOpenOutcome;
-        match shelbi_orchestrator::review_ui::open_review_interface(&self.project_name, task_id) {
-            Ok(ReviewOpenOutcome::Opened(_)) => {
-                self.status_line = format!("▶ reviewing {task_id}");
-            }
-            // Remote slot: the workspace window was already focused by
-            // `open_review_interface`; surface its note rather than re-focusing.
-            Ok(ReviewOpenOutcome::RemoteFallback(note)) => self.status_line = note,
-            // Loading / NeedsLaunch / an error (including the unit-test env with
-            // no tmux) mean the interface couldn't be embedded here. Don't kick
-            // off another load — that risks a launch loop — just focus the
-            // freshly loaded window so the review is at least on screen (the
-            // dashboard sidebar stays put; switching windows relocates nothing).
-            _ => {
-                let _ = run_tmux(["select-window", "-t", target]);
-                self.status_line = format!("▶ reviewing {task_id}");
-            }
-        }
+    /// Record that a task's review slot finished loading. Split out of
+    /// [`App::poll_review_load`] so the borrow of the in-flight job is released
+    /// first. The legacy tmux dashboard built/focused a three-pane review
+    /// interface here; the single-process shell owns that now, so this only
+    /// updates the status line.
+    fn open_loaded_review_interface(&mut self, task_id: &str, _target: &str) {
+        // legacy tmux dashboard removed: the single-process shell owns the
+        // review interface now (see `shell::review`); the sidebar model only
+        // records that the load landed.
+        self.status_line = format!("▶ reviewing {task_id}");
     }
 
-    /// Open the review interface for a Ready-for-review task. Delegates to
-    /// [`shelbi_orchestrator::review_ui::open_review_interface`], which builds
-    /// the three-column layout inside the review workspace's own window and
-    /// switches to it.
-    ///
-    /// When the assigned review slot's window was never launched (its first
-    /// use) or was reaped, `open_review_interface` returns
-    /// [`ReviewOpenOutcome::NeedsLaunch`] instead of failing — the first-run
-    /// regression from window-per-workspace, where the embed used to target a
-    /// nonexistent window and silently no-op. Here that launches the slot in
-    /// the background (checkout + boot the review agent/server, same async
-    /// load the Queued confirm uses) and switches to it once it's up; the
-    /// user re-activates the now-live Ready row to get the embedded interface.
+    /// Reflect selection of a Ready-for-review task. The legacy tmux dashboard
+    /// opened an embedded three-column review interface in the review
+    /// workspace's own tmux window here; the single-process shell drives review
+    /// now, so this only updates the status line.
     fn open_ready_review(&mut self, id: &str) {
-        use shelbi_orchestrator::review_ui::ReviewOpenOutcome;
-        match shelbi_orchestrator::review_ui::open_review_interface(&self.project_name, id) {
-            Ok(ReviewOpenOutcome::Opened(_)) => self.status_line = format!("▶ reviewing {id}"),
-            Ok(ReviewOpenOutcome::Loading) => {
-                self.status_line = format!("loading review for {id}…")
-            }
-            Ok(ReviewOpenOutcome::RemoteFallback(note)) => self.status_line = note,
-            Ok(ReviewOpenOutcome::NeedsLaunch { workspace }) => {
-                self.start_review_load(id.to_string(), workspace)
-            }
-            Err(e) => self.log_error(&format!("review `{id}` failed"), e),
-        }
+        // legacy tmux dashboard removed: opening the embedded review interface
+        // was a tmux-pane operation. The single-process shell drives review
+        // now; the sidebar model only reflects the selection.
+        self.status_line = format!("▶ reviewing {id}");
     }
 
-    /// Detect an externally-initiated tmux window switch and run the same
-    /// per-window setup a Shelbi nav click would. Called once per sidebar
-    /// loop tick (like [`App::poll_review_load`]): it reads the session's
-    /// currently-active window and, when it has *changed* since the last
-    /// tick, dispatches into the shared setup routine for that window.
-    ///
-    /// This closes the gap where arriving at a review window via a native
-    /// tmux tab / prefix key (a `select-window` Shelbi didn't initiate) left
-    /// the window half-initialized — the review sidebar/interface was only
-    /// ever stood up on an explicit nav click. Now both paths converge on
-    /// [`App::open_ready_review`] → [`shelbi_orchestrator::review_ui::open_review_interface`],
-    /// whose reuse guard makes re-entering an already-set-up window a no-op
-    /// (no duplicate panel, no re-init). Non-review windows (dashboard, dev
-    /// slots, anything not a serving review slot) map to nothing and are
-    /// left untouched.
-    ///
-    /// Note the window we switch to ourselves inside the setup routine is
-    /// itself an active-window change; the next tick observes it, re-maps to
-    /// the same task, and the idempotent reuse path re-focuses it — harmless.
-    pub fn poll_active_window(&mut self) {
-        let Some(active) = self.active_window_name() else {
-            return;
-        };
-        self.on_active_window(active);
-    }
 
-    /// Move the sidebar highlight onto whichever builtin view now occupies the
-    /// dashboard's right slot, so a view activated from the Ctrl+P palette (a
-    /// separate process that swaps the pane without touching this one's
-    /// selection) doesn't leave the highlight stranded on the previously-shown
-    /// row. Reads the `SHELBI_CURRENT_VIEW` session env that
-    /// [`shelbi_orchestrator::show_view`] writes on every swap — the shared
-    /// point both the palette and the sidebar's own Enter path funnel through,
-    /// so the two selections can't drift. The tmux read is split from the logic
-    /// ([`App::sync_current_view`]) so the routing is unit-testable without a
-    /// live tmux server.
-    pub fn poll_current_view(&mut self) {
-        let view = self.current_view_name();
-        self.sync_current_view(view);
-    }
-
-    /// Change-tracking half of [`App::poll_current_view`]. A no-op when `view`
-    /// matches the last-seen view (the guard that keeps plain cursor-preview
-    /// navigation — which doesn't swap the pane — from being snapped back to the
-    /// shown row every tick); on a change, the highlight re-seats onto the nav
-    /// row whose builtin matches. A view that isn't one of the three nav
-    /// builtins (a workspace / review window, which lives outside the right
-    /// slot) updates the tracker but leaves the highlight alone.
-    fn sync_current_view(&mut self, view: Option<String>) {
-        if self.last_current_view == view {
-            return;
-        }
-        self.last_current_view = view.clone();
-        let Some(view) = view else {
-            return;
-        };
-        let target = view.as_str();
-        if let Some(idx) = self.rows().iter().position(|r| {
-            matches!(r, Row::Nav { view: View::Builtin(n), .. } if *n == target)
-        }) {
-            self.sidebar_index = idx;
-        }
-    }
-
-    /// Name of the builtin view currently swapped into the dashboard's right
-    /// slot, read from the `SHELBI_CURRENT_VIEW` session env, or `None` when the
-    /// env is unset or tmux can't be queried (no server, unit-test env).
-    /// `show-environment KEY` prints `KEY=value` when set and `-KEY` when unset,
-    /// so a line with no `=` (or an empty value) resolves to `None`.
-    fn current_view_name(&self) -> Option<String> {
-        let session = format!("shelbi-{}", self.project_name);
-        let out = capture_tmux(["show-environment", "-t", &session, "SHELBI_CURRENT_VIEW"])?;
-        let (_key, value) = out.trim().split_once('=')?;
-        (!value.is_empty()).then(|| value.to_string())
-    }
-
-    /// Rebuild a review window's own panel (left-nav) pane if it has died in
-    /// place while that window is the active one. The panel is run-once, so a
-    /// crash / accidental Ctrl-C closes it without tearing the interface down,
-    /// and — the panel process being dead — it can't rebuild itself. This
-    /// dashboard-side loop survives the panel's death, so it heals it here on
-    /// the normal poll cadence: [`App::poll_active_window`] only runs setup on a
-    /// window *change*, so a panel that dies while its review window is already
-    /// current would otherwise sit vanished until the user navigated away and
-    /// back. Idempotent — a live panel is left untouched, and [`open_ready_review`]
-    /// (via the interface's own reuse guard) tears down and respawns only a dead
-    /// one.
-    pub fn poll_review_panes(&mut self) {
-        let Some(active) = self.active_window_name() else {
-            return;
-        };
-        let Some(task_id) = review_task_for_window(&active, &self.ready_review) else {
-            return;
-        };
-        if shelbi_orchestrator::review_ui::review_panel_pane_dead(&self.project_name, &task_id) {
-            self.open_ready_review(&task_id);
-        }
-    }
-
-    /// Change-tracking + dispatch half of [`App::poll_active_window`], split
-    /// out from the tmux read so the routing is unit-testable with a synthetic
-    /// window name. A no-op when `active` matches the last-seen window (the
-    /// idempotent guard that keeps a window we're already on — including one we
-    /// just switched to ourselves — from re-running setup every tick); a
-    /// non-review window updates the tracker and does nothing else.
-    fn on_active_window(&mut self, active: String) {
-        if self.last_active_window.as_deref() == Some(active.as_str()) {
-            return; // No change since the last tick — nothing to set up.
-        }
-        self.last_active_window = Some(active.clone());
-        if let Some(task_id) = review_task_for_window(&active, &self.ready_review) {
-            self.open_ready_review(&task_id);
-        }
-    }
-
-    /// Name of the tmux window currently active in this project's session
-    /// (`shelbi-<project>`), or `None` when tmux can't be queried (no server,
-    /// unit-test env). Targets the session so the reported window is the one
-    /// the attached client is viewing, regardless of which pane hosts the
-    /// sidebar.
-    fn active_window_name(&self) -> Option<String> {
-        let session = format!("shelbi-{}", self.project_name);
-        capture_tmux(["display-message", "-p", "-t", &session, "#{window_name}"])
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
 
     /// Flip `state.json::zen_mode` between On and Off via the shared
     /// [`shelbi_state::toggle_zen_mode`] path — same read/write/log
@@ -1331,42 +1139,6 @@ impl App {
         }
     }
 
-    /// Open the persistent error log in a centered `tmux display-popup` running
-    /// `shelbi __error-log <project>`, the same modal surface style as the
-    /// palette / review-load popups. The subcommand marks every entry read on
-    /// open, so on return we re-read the unread count from disk (dropping the
-    /// button) — recomputed rather than zeroed so an error that arrived while the
-    /// popup was up still shows. Blocks the sidebar loop while the popup is up,
-    /// exactly as the review-load confirm does.
-    pub fn open_error_log(&mut self) {
-        let bin = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                self.log_error("open error log failed", e);
-                return;
-            }
-        };
-        let cmd = format!(
-            "{} __error-log {}",
-            shelbi_agent::shell_escape(&bin.to_string_lossy()),
-            shelbi_agent::shell_escape(&self.project_name),
-        );
-        // `-B` suppresses tmux's own popup border so only the viewer's titled
-        // block frames the modal (one border, not two) — the same convention the
-        // review-load / reject popups use since they also draw their own border.
-        run_tmux([
-            "display-popup",
-            "-B",
-            "-E",
-            "-w",
-            "80%",
-            "-h",
-            "60%",
-            cmd.as_str(),
-        ]);
-        // The popup marked the log read on open; reconcile the button from disk.
-        self.unread_errors = shelbi_state::unread_error_count(&self.project_name).unwrap_or(0);
-    }
 }
 
 /// One rendered line in the sidebar. Section headers are inert dividers;
@@ -1563,11 +1335,8 @@ pub struct ReviewEntry {
     /// `machine:port` URL badge (Serving only); `None` while Loading / Pending.
     pub location: Option<String>,
     /// Name of the `review`-tagged workspace this task is loaded onto, when
-    /// assigned (Serving / Loading). This is also the task's tmux **window
-    /// name** (`shelbi-<proj>:<workspace>`), so the active-window-change
-    /// detector ([`App::poll_active_window`]) can map a window the user
-    /// switched to back to the review task whose interface it must stand up.
-    /// `None` for a Pending task not yet on a slot (no window to switch to).
+    /// assigned (Serving / Loading). `None` for a Pending task not yet on a
+    /// slot.
     pub workspace: Option<String>,
     /// Which lifecycle state drives this row's section + glyph.
     pub state: ReviewState,
@@ -1970,98 +1739,17 @@ fn status_order(s: Status) -> u8 {
 /// same pattern the reject-reason popup uses. Blocks until the popup closes,
 /// which is exactly the modal behavior we want.
 fn review_load_dialog(
-    title: &str,
-    slots: &[shelbi_orchestrator::load::ReviewSlot],
+    _title: &str,
+    _slots: &[shelbi_orchestrator::load::ReviewSlot],
 ) -> Option<String> {
-    let bin = std::env::current_exe().ok()?;
-    let bin = bin.to_string_lossy();
-    // Per-process temp path — the sidebar handles one load prompt at a time
-    // (the popup blocks its loop), so the pid alone avoids collisions.
-    let out = std::env::temp_dir().join(format!("shelbi-review-load-{}.txt", std::process::id()));
-    let mut cmd = format!(
-        "{} __review-confirm --title {} --out {}",
-        shelbi_agent::shell_escape(&bin),
-        shelbi_agent::shell_escape(title),
-        shelbi_agent::shell_escape(&out.to_string_lossy()),
-    );
-    for slot in slots {
-        cmd.push_str(&format!(
-            " --slot {} --occupant {}",
-            shelbi_agent::shell_escape(&slot.name),
-            shelbi_agent::shell_escape(
-                slot.occupant.as_ref().map(|o| o.title.as_str()).unwrap_or("")
-            ),
-        ));
-    }
-    // Height scales with the slot count: title + blank + N slot rows + blank +
-    // buttons, inside the border. The one/zero-slot variants collapse to a
-    // short confirm, so floor at 9 to keep them from clipping.
-    let height = (slots.len() as u16 + 6).max(9);
-    let _ = std::fs::remove_file(&out);
-    // `-B` suppresses tmux's own popup border so only the widget's cyan titled
-    // block frames the modal (one border, not two).
-    let ok = run_tmux([
-        "display-popup",
-        "-B",
-        "-E",
-        "-w",
-        "60",
-        "-h",
-        &height.to_string(),
-        cmd.as_str(),
-    ]);
-    let chosen = ok
-        .then(|| std::fs::read_to_string(&out).ok())
-        .flatten()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let _ = std::fs::remove_file(&out);
-    chosen
+    // legacy tmux dashboard removed: the review-load confirm was a modal
+    // `tmux display-popup`. The single-process shell drives the review-load
+    // confirm through its own overlay (`overlay::review_confirm`), so this
+    // legacy sidebar path no longer launches one.
+    None
 }
 
-/// Run `tmux ARGS`. Returns true on success.
-fn run_tmux<I, S>(args: I) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    std::process::Command::new("tmux")
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
-/// Run `tmux ARGS` and return its trimmed-of-nothing stdout on success, or
-/// `None` when tmux isn't reachable or the command failed (no server, a bad
-/// target, the unit-test env). The caller trims/filters as needed.
-fn capture_tmux<I, S>(args: I) -> Option<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    let out = std::process::Command::new("tmux").args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Map the newly-active tmux window `window` to the Ready-for-Review task
-/// whose interface must be stood up, or `None` when the window isn't a
-/// serving review slot (the dashboard, a dev workspace, an unrecognized
-/// window — none need review setup). A review task's tmux window is named for
-/// the `review`-tagged workspace it's loaded onto (the entry's `workspace`
-/// field), so the match is a direct name comparison. Pure so the window→task
-/// routing is unit-testable without a live tmux server.
-fn review_task_for_window(window: &str, ready: &[ReviewEntry]) -> Option<String> {
-    ready
-        .iter()
-        .find(|e| e.workspace.as_deref() == Some(window))
-        .map(|e| e.task_id.clone())
-}
 
 #[cfg(test)]
 mod tests {
@@ -2322,7 +2010,7 @@ mod tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "demo".into(),
             label: None,
             display_name: None,
@@ -4733,163 +4421,14 @@ mod tests {
         );
     }
 
-    fn serving_entry(task_id: &str, workspace: &str) -> ReviewEntry {
-        ReviewEntry {
-            task_id: task_id.into(),
-            title: format!("{task_id} title"),
-            branch: format!("shelbi/{task_id}"),
-            location: Some(format!("hub:{workspace}")),
-            workspace: Some(workspace.into()),
-            state: ReviewState::Serving,
-        }
-    }
 
-    #[test]
-    fn review_task_for_window_maps_a_serving_slots_window_to_its_task() {
-        let ready = vec![
-            serving_entry("alpha", "review-1"),
-            serving_entry("beta", "review-2"),
-        ];
-        // A window named for a serving review slot resolves to the task on it.
-        assert_eq!(
-            review_task_for_window("review-2", &ready).as_deref(),
-            Some("beta")
-        );
-        // Non-review windows (dashboard, dev slots) and unknown names map to
-        // nothing — those need no review setup.
-        assert!(review_task_for_window("dashboard", &ready).is_none());
-        assert!(review_task_for_window("w-some-dev-task", &ready).is_none());
-        assert!(review_task_for_window("review-3", &ready).is_none());
-    }
 
-    #[test]
-    fn review_task_for_window_ignores_entries_without_a_workspace() {
-        // A Pending entry (not on a slot yet) carries no workspace, so it can
-        // never match a window — there's no window to have switched to.
-        let ready = vec![ReviewEntry {
-            task_id: "pending".into(),
-            title: "Pending".into(),
-            branch: "shelbi/pending".into(),
-            location: None,
-            workspace: None,
-            state: ReviewState::Pending,
-        }];
-        assert!(review_task_for_window("", &ready).is_none());
-        assert!(review_task_for_window("review-1", &ready).is_none());
-    }
 
-    #[test]
-    fn on_active_window_dispatches_setup_only_on_a_change_to_a_review_window() {
-        // The setup path's error now routes to the persistent log, so isolate
-        // SHELBI_HOME to a fresh dir and assert the log rather than the footer.
-        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_home();
-        let _home_env = EnvVarGuard::set("SHELBI_HOME", &home);
 
-        let mut app = App::new_sidebar("demo");
-        app.ready_review = vec![serving_entry("alpha", "review-1")];
 
-        // First switch to a review window dispatches setup. With no tmux/
-        // project in the unit-test env `open_review_interface` errors, which now
-        // lands in the error log naming the task — proof the window→task route
-        // fired.
-        app.on_active_window("review-1".into());
-        assert_eq!(app.last_active_window.as_deref(), Some("review-1"));
-        let after_first = shelbi_state::read_errors("demo").unwrap();
-        assert!(
-            after_first.iter().any(|e| e.message.contains("alpha")),
-            "setup should have dispatched for the task on review-1, log: {after_first:?}"
-        );
 
-        // Re-entering the same window is a no-op: no new error is logged.
-        app.on_active_window("review-1".into());
-        assert_eq!(
-            shelbi_state::read_errors("demo").unwrap().len(),
-            after_first.len(),
-            "re-entering an already-current window must not re-run setup",
-        );
-    }
 
-    #[test]
-    fn on_active_window_leaves_non_review_windows_untouched() {
-        let mut app = App::new_sidebar("demo");
-        app.ready_review = vec![serving_entry("alpha", "review-1")];
 
-        // Switching to the dashboard (or any non-review window) tracks the
-        // change but runs no setup and leaves the status line alone.
-        app.on_active_window("dashboard".into());
-        assert_eq!(app.last_active_window.as_deref(), Some("dashboard"));
-        assert!(
-            app.status_line.is_empty(),
-            "a non-review window must not touch the status line, got: {}",
-            app.status_line
-        );
-    }
 
-    /// Activating a nav area (from the Ctrl+P palette, which swaps the pane out
-    /// of process and can't touch this App's selection) re-seats the sidebar
-    /// highlight onto the matching builtin row — the two activation paths funnel
-    /// through the same `SHELBI_CURRENT_VIEW` signal, so they can't drift. The
-    /// three builtins each land on their own row (Chat/orch → 0, Issues/tasks →
-    /// 1, Activity → 2).
-    #[test]
-    fn sync_current_view_moves_highlight_to_the_activated_nav_builtin() {
-        let mut app = App::new_sidebar("demo");
-        // The three nav builtins occupy sidebar rows 0/1/2.
-        assert!(matches!(
-            app.rows().first(),
-            Some(Row::Nav { view: View::Builtin("orch"), .. })
-        ));
 
-        // Chat starts selected; activating Activity moves the highlight to it.
-        app.sidebar_index = 0;
-        app.sync_current_view(Some("activity".into()));
-        assert_eq!(app.sidebar_index, 2, "Activity is the third nav row");
-
-        // Each builtin lands on its own row.
-        app.sync_current_view(Some("tasks".into()));
-        assert_eq!(app.sidebar_index, 1, "Issues/tasks is the second nav row");
-        app.sync_current_view(Some("orch".into()));
-        assert_eq!(app.sidebar_index, 0, "Chat/orch is the first nav row");
-    }
-
-    /// The sync is change-tracked: re-observing the already-shown view is a
-    /// no-op, so plain cursor-preview navigation (moving the highlight without
-    /// swapping the pane) is never snapped back to the shown row on the next
-    /// poll tick.
-    #[test]
-    fn sync_current_view_does_not_fight_preview_navigation() {
-        let mut app = App::new_sidebar("demo");
-        // Right pane currently shows Chat; the tracker has caught up.
-        app.sync_current_view(Some("orch".into()));
-        assert_eq!(app.sidebar_index, 0);
-
-        // User arrows down to preview Activity without activating it. The pane
-        // hasn't swapped, so the view is still "orch" — a repeat poll must leave
-        // the previewed selection where it is.
-        app.sidebar_index = 2;
-        app.sync_current_view(Some("orch".into()));
-        assert_eq!(
-            app.sidebar_index, 2,
-            "an unchanged view must not snap the preview cursor back"
-        );
-    }
-
-    /// A view that isn't one of the nav builtins — a workspace or review window,
-    /// which lives in its own tmux window rather than the dashboard's right slot
-    /// — updates the tracker but leaves the highlight untouched, so activating
-    /// one from the palette keeps the sidebar consistent with the (unchanged)
-    /// right pane.
-    #[test]
-    fn sync_current_view_ignores_non_nav_views() {
-        let mut app = App::new_sidebar("demo");
-        app.sync_current_view(Some("orch".into()));
-        app.sidebar_index = 1;
-
-        app.sync_current_view(Some("review".into()));
-        assert_eq!(
-            app.sidebar_index, 1,
-            "a non-nav view must not move the nav highlight"
-        );
-    }
 }

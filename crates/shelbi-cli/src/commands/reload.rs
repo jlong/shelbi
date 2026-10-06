@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
-use shelbi_orchestrator::handoff::HandoffOutcome;
-use shelbi_orchestrator::{PaneReloadStatus, ReloadReport, ReloadTarget};
+use shelbi_orchestrator::ReloadTarget;
 use shelbi_state::WorkspaceSettingsTemplateOutcome;
 
 use super::init::print_agent_materialize_outcome;
@@ -34,29 +33,15 @@ pub fn run(
     let target =
         ReloadTarget::parse(target.as_deref(), name.as_deref()).map_err(|e| anyhow!(e))?;
 
-    // A targeted pane reload respawns one pane in place and deliberately
-    // skips the whole-hub self-heal (root/subdir re-materialization,
-    // workflow + statuses compatibility migration, agent-workspace and
-    // settings-template repair, legacy-marker sweep). Each target carries
-    // its own dependency refresh: `chat` self-heals the agent automation
-    // before re-deploying the orchestrator context, and the TUI panes render
-    // derived state straight from disk.
+    // On the session runtime, `reload` restarts the daemon, re-execs attached
+    // clients, and replaces the orchestrator *session* (workers keep running).
+    // There are no per-pane processes to reload, so a targeted pane reload no
+    // longer applies — every invocation runs the whole-project reload.
     if !matches!(target, ReloadTarget::All) {
-        let project_name = require_project(project_opt)?;
-        let outcomes = if matches!(target, ReloadTarget::Chat) {
-            Some(self_heal_zen_automation(&project_name, false)?)
-        } else {
-            None
-        };
-        let report =
-            shelbi_orchestrator::reload_target(&project_name, &target).map_err(|e| anyhow!(e))?;
-        print_report(&project_name, &report);
-        if let Some(outcomes) = outcomes {
-            for outcome in outcomes {
-                print_agent_materialize_outcome(&outcome);
-            }
-        }
-        return Ok(());
+        eprintln!(
+            "note: targeted pane reloads no longer apply on the session runtime; \
+             reloading the whole project"
+        );
     }
 
     run_all(project_opt)
@@ -105,8 +90,17 @@ fn run_all(project_opt: Option<String>) -> Result<()> {
     // the residual findings).
     let upgrade = crate::commands::config_upgrade::run_for_project(&project_name);
     print_config_upgrade_summary(&project_name, &upgrade);
-    let report = shelbi_orchestrator::reload(&project_name).map_err(|e| anyhow!(e))?;
-    print_report(&project_name, &report);
+    // Session-runtime reload: restart the daemon, re-exec attached clients, and
+    // replace the orchestrator session (workers left running).
+    let ops = super::reload_session::LiveReload {
+        project: project_name.clone(),
+    };
+    let report = super::reload_session::run(&ops)?;
+    println!("reload · {project_name} (session runtime)");
+    println!("  · handoff   {}", report.handoff_status);
+    println!("  ✓ clients   signalled to re-exec");
+    println!("  ✓ daemon    restarted on the current binary");
+    println!("  ✓ orch      session replaced (workers left running)");
     for outcome in outcomes {
         print_agent_materialize_outcome(&outcome);
     }
@@ -249,76 +243,10 @@ fn print_workspace_settings_template_outcome(outcome: &WorkspaceSettingsTemplate
     }
 }
 
-fn print_report(project: &str, r: &ReloadReport) {
-    println!("reload · {project}");
-    // A whole-hub reload attempts every pane; a targeted reload leaves the
-    // untouched panes `NotAttempted`. Skip those so a targeted reload prints
-    // only the pane(s) it actually respawned.
-    print_pane_if_attempted("sidebar", &r.sidebar);
-    print_pane_if_attempted("tasks", &r.tasks);
-    print_pane_if_attempted("machines", &r.machines);
-    print_pane_if_attempted("activity", &r.activity);
-    if let Some(h) = &r.handoff {
-        print_handoff(h);
-    }
-    print_pane_if_attempted("orch", &r.orchestrator);
-    if let Some(ws) = &r.workspace {
-        print_pane(&format!("ws:{}", ws.name), &ws.status);
-    }
-}
 
-fn print_pane_if_attempted(name: &str, status: &PaneReloadStatus) {
-    if matches!(status, PaneReloadStatus::NotAttempted) {
-        return;
-    }
-    print_pane(name, status);
-}
 
-fn print_handoff(outcome: &HandoffOutcome) {
-    match outcome {
-        HandoffOutcome::NativeThread => {
-            println!("  · handoff   skipped (Codex native thread retained)");
-        }
-        HandoffOutcome::Written { path } => {
-            println!("  ✓ handoff   captured ({})", path.display());
-        }
-        HandoffOutcome::PaneNotAlive => {
-            println!("  · handoff   skipped (orchestrator pane not running)");
-        }
-        HandoffOutcome::Timeout => {
-            println!(
-                "  ⚠ handoff   timed out waiting for the orchestrator to write \
-                 handoff.md; next start will be cold"
-            );
-        }
-        HandoffOutcome::SendFailed { reason } => {
-            println!("  ⚠ handoff   couldn't ask the orchestrator: {reason}");
-        }
-        HandoffOutcome::SubmitUnconfirmed { detail } => {
-            println!(
-                "  ⚠ handoff   request delivered but not confirmed submitted \
-                 ({detail}); next start may be cold"
-            );
-        }
-    }
-}
 
-fn print_pane(name: &str, status: &PaneReloadStatus) {
-    match status {
-        PaneReloadStatus::Respawned { target } => {
-            println!("  ✓ {name:<9} respawned ({target})");
-        }
-        PaneReloadStatus::Created { target } => {
-            println!("  ✓ {name:<9} created   ({target})");
-        }
-        PaneReloadStatus::Missing => {
-            println!("  ⚠ {name:<9} no stored pane id; skipped");
-        }
-        PaneReloadStatus::Failed { target, reason } => {
-            println!("  ✗ {name:<9} failed ({target}): {reason}");
-        }
-        PaneReloadStatus::NotAttempted => {
-            println!("  · {name:<9} not attempted");
-        }
-    }
-}
+
+
+
+

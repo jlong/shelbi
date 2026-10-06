@@ -242,6 +242,18 @@ pub enum Error {
     #[error("{0}")]
     UnknownWriteOutcome(String),
 
+    /// A daemon job was cancelled before it could spawn, kill, or write state:
+    /// its generation was superseded (a launch timed out and the task was
+    /// redispatched) or its project was quit. The job stops cleanly and does
+    /// nothing rather than acting on a now-stale intent — the canonical case is
+    /// an abandoned launch that wakes after its rollback and would otherwise
+    /// start an agent on the wrong task. Distinct from [`Error::Command`] (a
+    /// real failure) so callers can tell "deliberately stood down" apart from
+    /// "something broke". See `shelbi_orchestrator::cancel` and
+    /// `docs/removing-tmux/phase3-daemon.md`.
+    #[error("{0}")]
+    Cancelled(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -295,6 +307,14 @@ impl Error {
     /// with the specific recovery command before returning.
     pub fn is_unknown_write_outcome(&self) -> bool {
         matches!(self, Error::UnknownWriteOutcome(_))
+    }
+
+    /// True for a job that stood down because its generation was superseded or
+    /// its project was quit (see [`Error::Cancelled`]). Callers use this to
+    /// treat a cancelled dispatch/launch as a clean no-op rather than a failure
+    /// worth rolling back or surfacing as an error.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Error::Cancelled(_))
     }
 }
 

@@ -1,0 +1,79 @@
+---
+title: shelbi machine
+order: 24
+summary: Find or install a compatible shelbi binary on the project's remote machines.
+---
+
+```text
+shelbi machine <COMMAND> [OPTIONS]
+```
+
+`shelbi machine` manages the `shelbi` binary on the project's remote machines.
+Because each worker runs in its own Shelbi session, every machine that takes
+tasks needs a compatible `shelbi` binary of its own. These commands find one or
+install it, and report each machine's status.
+
+Machines are declared under the `machines:` block of the project YAML. The hub
+reaches them over SSH.
+
+## Subcommands
+
+| Subcommand | Description |
+| --- | --- |
+| `setup <NAME>` | Find or install a compatible `shelbi` on a remote machine. Probes the machine's interactive-login PATH for a compatible binary; otherwise installs the matching release to `~/.shelbi/bin/shelbi`. Idempotent: a second run with a compatible binary already in place changes nothing. |
+| `status [<NAME>]` | Show each machine's reachability, resolved `shelbi` path, version, and whether it is compatible with this hub. With `NAME`, shows just that one. |
+
+### `setup`
+
+The hub probes the remote's interactive-login shell for a `shelbi` on `PATH`. A
+compatible binary found there is used as-is. A package-manager install that is
+too old is never overwritten: Shelbi installs its own copy at
+`~/.shelbi/bin/shelbi` alongside it and uses that. The resolved path is recorded
+per machine and shown by `status`.
+
+```text
+shelbi machine setup <NAME>
+```
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<NAME>` | string | — | Machine name, as declared under `machines:` in the project YAML (required). |
+
+### `status`
+
+```text
+shelbi machine status [<NAME>]
+```
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `[<NAME>]` | string | all machines | Machine to inspect. Omit to show every declared machine. |
+
+## Flags
+
+Every subcommand accepts the same options:
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
+
+## Examples
+
+Install or verify `shelbi` on the `devbox` machine:
+
+```bash
+shelbi machine setup devbox
+```
+
+Check every declared machine:
+
+```bash
+shelbi machine status
+```
+
+## See also
+
+- [Workspaces](/docs/concepts/workspaces) — how remote workspaces run their
+  agents in sessions on their own machines.
+- [`shelbi attach`](/docs/cli/attach) — attach to a session on any machine.

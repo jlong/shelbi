@@ -14,14 +14,26 @@ shelbi-state = { workspace = true }
 shelbi-orchestrator = { workspace = true }
 shelbi-agent = { workspace = true }
 shelbi-palette = { workspace = true }
-shelbi-tmux = { workspace = true }
 shelbi-ssh = { workspace = true }
+# The single-process TUI shell renders over shelbi-app's view models and shows
+# sessions through shelbi-term / shelbi-client. alacritty_terminal types are
+# read directly when painting the emulator grid into a ratatui buffer, exactly
+# as `shelbi attach` does.
+shelbi-app = { workspace = true }
+shelbi-term = { workspace = true }
+shelbi-client = { workspace = true }
+shelbi-proto = { workspace = true }
+alacritty_terminal = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+# The post-first-frame kitty-protocol probe polls stdin with a short timeout
+# (`shell::caps`), so a headless terminal that never answers the query can't
+# stall the first draw (`rt-tui-headless-startup-block`).
+libc = { workspace = true }
 
 [dev-dependencies]
 # The sidebar's degraded-render test seeds an on-disk board snapshot for a
@@ -29,3 +41,9 @@ tracing = { workspace = true }
 # the freshness-guard tests drive the poller's reaper paths against a `github`
 # board via the injectable fake `gh` runner. Both live behind this feature.
 shelbi-state = { workspace = true, features = ["test-support"] }
+# The shell's real-PTY key-echo test (AC4) spawns a genuine `shelbi_session::run`
+# on a thread and reads the echoed bytes back through a client, so it needs the
+# session server and a temp `SHELBI_HOME` (`libc`, for the kill signal, is a
+# regular dependency above).
+shelbi-session = { workspace = true }
+tempfile = "3"

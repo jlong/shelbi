@@ -15,7 +15,7 @@
 //! 1. Snapshot a [`PaneBaseline`] BEFORE delivering anything — was the pane
 //!    already mid-turn, did the title already carry `shelbi:working`? Both
 //!    poison the corresponding submit signals for THIS delivery.
-//! 2. Deliver the text WITHOUT its Enter ([`shelbi_tmux::send_text`]), let
+//! 2. Deliver the text WITHOUT its Enter (the backend's `send_text`), let
 //!    the pane settle, then send Enter as a separate key event
 //!    ([`deliver_text`]) — an Enter riding the same instant as the paste is
 //!    exactly the keystroke that gets eaten.
@@ -39,8 +39,10 @@
 //! hooks consume and acknowledge by `msg_id`. Sending that body here as well
 //! would duplicate delivery and weaken the restart-safe message channel.
 
-use shelbi_core::{AgentRunnerSpec, Error, Host, Result, TmuxAddr};
+use shelbi_core::{AgentRunnerSpec, Error, Host, Result};
 use shelbi_state::PaneMarker;
+
+use crate::session_backend::{backend, SessionBackend, SessionTarget};
 
 /// Verification capability for the runner receiving a pane injection.
 ///
@@ -135,17 +137,19 @@ impl PaneBaseline {
     /// "not busy / no marker" — the conservative direction: a signal that
     /// might be stale is only ever *suppressed* when the baseline says so,
     /// and an SSH hiccup here shouldn't mute real signals.
-    pub fn capture(host: &Host, addr: &TmuxAddr, profile: SubmitProfile) -> Self {
+    pub fn capture(host: &Host, addr: &SessionTarget, profile: SubmitProfile) -> Self {
         // Delivery-only runners have no pane chrome Shelbi may interpret.
         // Avoid three pointless captures (especially expensive over SSH) and
         // make the capability boundary explicit before any UI inspection.
         if !profile.has_ui_verifier() {
             return PaneBaseline::fresh(profile);
         }
-        let screen =
-            shelbi_tmux::capture_history(host, addr, PROMPT_SUBMIT_SCROLLBACK).unwrap_or_default();
-        let visible_screen = shelbi_tmux::capture(host, addr).unwrap_or_default();
-        let title = shelbi_tmux::pane_title(host, addr).unwrap_or_default();
+        let target = addr.clone();
+        let screen = backend()
+            .history(host, &target, PROMPT_SUBMIT_SCROLLBACK)
+            .unwrap_or_default();
+        let visible_screen = backend().snapshot(host, &target).unwrap_or_default();
+        let title = backend().title(host, &target).unwrap_or_default();
         Self::from_snapshots(profile, &screen, &visible_screen, &title)
     }
 
@@ -240,7 +244,7 @@ pub enum SubmitStatus {
 /// a short settle, then Enter as its own key event. This is the delivery
 /// half of a verified send; pair it with [`verify_submitted`] — or call
 /// [`send_verified`], which does both.
-pub fn deliver_text(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
+pub fn deliver_text(host: &Host, addr: &SessionTarget, text: &str) -> Result<()> {
     // An empty Enter is not a message and Claude leaves its empty box looking
     // "cleared", which would otherwise be indistinguishable from a successful
     // submission. Reject it before touching the pane instead of recording a
@@ -250,10 +254,17 @@ pub fn deliver_text(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
             "verified-submit refuses an empty message".to_string(),
         ));
     }
+    // Serialize concurrent injections into the same pane. Two threads pasting
+    // into one target (e.g. a hub dispatch and a manual `shelbi send` racing)
+    // could otherwise interleave their text + Enter. Held across the whole
+    // text → settle → Enter sequence and released when this returns; locks for
+    // different targets are independent, so unrelated panes never contend.
+    let target = addr.clone();
+    let _injection = backend().injection_lock(&target);
     deliver_text_with(
-        || shelbi_tmux::send_text(host, addr, text),
+        || backend().send_text(host, &target, text),
         || std::thread::sleep(SUBMIT_SETTLE),
-        || shelbi_tmux::send_enter(host, addr),
+        || backend().send_enter(host, &target),
     )
 }
 
@@ -276,7 +287,7 @@ fn deliver_text_with(
 /// whether the pane was busy at baseline (queued input vs. stuck prompt).
 pub fn send_verified(
     host: &Host,
-    addr: &TmuxAddr,
+    addr: &SessionTarget,
     text: &str,
     baseline: &PaneBaseline,
 ) -> Result<SubmitStatus> {
@@ -289,7 +300,7 @@ pub fn send_verified(
 /// retaining the shared text/settle/Enter and submission-verification path.
 pub fn send_verified_guarded(
     host: &Host,
-    addr: &TmuxAddr,
+    addr: &SessionTarget,
     text: &str,
     baseline: &PaneBaseline,
     may_submit: impl Fn() -> bool,
@@ -318,7 +329,7 @@ pub fn send_verified_guarded(
 /// could fire a partial message.
 pub fn verify_submitted(
     host: &Host,
-    addr: &TmuxAddr,
+    addr: &SessionTarget,
     text: &str,
     baseline: &PaneBaseline,
 ) -> SubmitStatus {
@@ -327,7 +338,7 @@ pub fn verify_submitted(
 
 fn verify_submitted_guarded(
     host: &Host,
-    addr: &TmuxAddr,
+    addr: &SessionTarget,
     text: &str,
     baseline: &PaneBaseline,
     may_submit: impl Fn() -> bool,
@@ -337,18 +348,19 @@ fn verify_submitted_guarded(
             detail: "verification_unsupported",
         };
     }
+    let target = addr.clone();
     verify_submitted_with_profile(
         text,
         || wait_for_prompt_submitted(host, addr, text, baseline, PROMPT_SUBMIT_WAIT),
-        || shelbi_tmux::capture(host, addr).unwrap_or_default(),
+        || backend().snapshot(host, &target).unwrap_or_default(),
         || {
             if !may_submit() {
                 return false;
             }
-            if let Err(e) = shelbi_tmux::send_enter(host, addr) {
+            if let Err(e) = backend().send_enter(host, &target) {
                 eprintln!(
                     "shelbi: retry Enter to {} after stalled submit failed: {e}",
-                    addr.target(),
+                    addr.label(),
                 );
             }
             true
@@ -431,7 +443,7 @@ fn verify_submitted_with(
 /// cleared-box signal *is* trustworthy because it types the text into the box.
 pub fn verify_seeded(
     host: &Host,
-    addr: &TmuxAddr,
+    addr: &SessionTarget,
     baseline: &PaneBaseline,
     timeout: std::time::Duration,
 ) -> bool {
@@ -442,15 +454,17 @@ pub fn verify_seeded(
     if !baseline.profile.has_ui_verifier() {
         return false;
     }
+    let target = addr.clone();
     let start = std::time::Instant::now();
     loop {
         let title = if baseline.profile == SubmitProfile::ClaudeUi && !baseline.title_working {
-            shelbi_tmux::pane_title(host, addr).unwrap_or_default()
+            backend().title(host, &target).unwrap_or_default()
         } else {
             String::new()
         };
-        let screen =
-            shelbi_tmux::capture_history(host, addr, PROMPT_SUBMIT_SCROLLBACK).unwrap_or_default();
+        let screen = backend()
+            .history(host, &target, PROMPT_SUBMIT_SCROLLBACK)
+            .unwrap_or_default();
         if seed_busy_signal(&title, &screen, baseline) {
             return true;
         }
@@ -521,15 +535,16 @@ fn seed_busy_signal(title: &str, screen: &str, baseline: &PaneBaseline) -> bool 
 ///    Enter on a mid-turn pane queues the message and clears the box.
 fn wait_for_prompt_submitted(
     host: &Host,
-    addr: &TmuxAddr,
+    addr: &SessionTarget,
     text: &str,
     baseline: &PaneBaseline,
     timeout: std::time::Duration,
 ) -> bool {
+    let target = addr.clone();
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if baseline.profile == SubmitProfile::ClaudeUi && !baseline.title_working {
-            let title = shelbi_tmux::pane_title(host, addr).unwrap_or_default();
+            let title = backend().title(host, &target).unwrap_or_default();
             if title_signals_submit(&title) {
                 return true;
             }
@@ -540,8 +555,9 @@ fn wait_for_prompt_submitted(
         // much more durable signal that Enter landed, and the scrollback
         // keeps it visible even if a burst of output has scrolled the
         // footer.
-        let screen =
-            shelbi_tmux::capture_history(host, addr, PROMPT_SUBMIT_SCROLLBACK).unwrap_or_default();
+        let screen = backend()
+            .history(host, &target, PROMPT_SUBMIT_SCROLLBACK)
+            .unwrap_or_default();
         if screen_shows_submitted_profile(&screen, text, baseline.busy, baseline.profile) {
             return true;
         }
@@ -856,13 +872,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
-    fn tmux_available() -> bool {
-        std::process::Command::new("tmux")
-            .arg("-V")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
+
 
     fn runner(command: &str) -> AgentRunnerSpec {
         AgentRunnerSpec {
@@ -946,10 +956,7 @@ mod tests {
 
     #[test]
     fn delivery_rejects_empty_text_before_touching_the_pane() {
-        let addr = TmuxAddr {
-            session: "does-not-exist".into(),
-            window: "agent".into(),
-        };
+        let addr = SessionTarget::slot("does-not-exist", "agent");
         let error = deliver_text(&Host::Local, &addr, "  \n\t")
             .expect_err("empty text must not false-confirm a bare Enter");
         assert!(error.to_string().contains("refuses an empty message"));
@@ -974,10 +981,7 @@ mod tests {
     #[test]
     fn non_claude_verification_returns_immediately_without_ui_assumptions() {
         let baseline = PaneBaseline::fresh(SubmitProfile::DeliveryOnly);
-        let addr = TmuxAddr {
-            session: "does-not-exist".into(),
-            window: "agent".into(),
-        };
+        let addr = SessionTarget::slot("does-not-exist", "agent");
         assert_eq!(
             verify_submitted(&Host::Local, &addr, "hello", &baseline),
             SubmitStatus::DeliveredUnverified {
@@ -1127,10 +1131,7 @@ mod tests {
         // return `false` so the caller records an explicit `unverified` dispatch
         // instead of a busy signal it cannot observe.
         let baseline = PaneBaseline::fresh(SubmitProfile::DeliveryOnly);
-        let addr = TmuxAddr {
-            session: "does-not-exist".into(),
-            window: "agent".into(),
-        };
+        let addr = SessionTarget::slot("does-not-exist", "agent");
         assert!(!verify_seeded(
             &Host::Local,
             &addr,
@@ -1171,410 +1172,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn verified_submit_drives_terminal_fixture_across_twenty_trials() {
-        // A tiny terminal fixture that behaves like an idle Claude input box:
-        // draw the box, block reading one line, then replace it with a busy
-        // footer once Enter is received. This exercises the real tmux text +
-        // separate Enter calls, not merely the state-machine closures above.
-        if !tmux_available() {
-            eprintln!("skipping: tmux not on PATH");
-            return;
-        }
-        // Serialize the private-server env pin against the rest of the suite,
-        // then run every session on our own tmux server so a concurrent
-        // teardown elsewhere can't drop a client mid-command.
-        let _lock = crate::test_lock::acquire();
-        crate::tmux_test_support::use_private_tmux_server();
-        // A long-lived holder keeps the private server alive across all twenty
-        // trials, so the gap between a trial's `kill-session` and the next
-        // `new-session` never empties (and thus exits) the server. Skip if the
-        // sandbox denies socket access, matching the repo's optional-tmux
-        // convention.
-        let holder = format!("shelbi-submit-holder-{}", std::process::id());
-        if !crate::tmux_test_support::try_start_session(&holder, "holder") {
-            eprintln!("skipping: tmux cannot create a server here");
-            return;
-        }
 
-        let tmp = tempfile::tempdir().unwrap();
-        let script = tmp.path().join("fake-claude.sh");
-        std::fs::write(
-            &script,
-            // `sleep 600`, never `sleep 2`: the busy footer must persist long
-            // enough for `send_verified` to observe it under CI load, and the
-            // pane must not exit and risk emptying the private server.
-            "#!/bin/sh\n\
-             stty -echo\n\
-             printf '\\033[2J\\033[H────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  ? for shortcuts\\n'\n\
-             IFS= read -r line\n\
-             printf '\\033[2J\\033[H✳ Working on message\\n────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  esc to interrupt\\n'\n\
-             sleep 600\n",
-        )
-        .unwrap();
 
-        for trial in 0..20 {
-            let session = format!("shelbi-submit-test-{}-{trial}", std::process::id());
-            let started = std::process::Command::new("tmux")
-                .args([
-                    "new-session",
-                    "-d",
-                    "-s",
-                    &session,
-                    "-n",
-                    "agent",
-                    "sh",
-                    script.to_str().unwrap(),
-                ])
-                .status();
-            assert!(
-                matches!(started, Ok(status) if status.success()),
-                "trial {trial}: failed to start fixture session on the private server"
-            );
 
-            let addr = TmuxAddr {
-                session: session.clone(),
-                window: "agent".into(),
-            };
-            let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while std::time::Instant::now() < ready_deadline {
-                if shelbi_tmux::capture(&Host::Local, &addr)
-                    .unwrap_or_default()
-                    .contains("? for shortcuts")
-                {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
 
-            let baseline = PaneBaseline::capture(&Host::Local, &addr, SubmitProfile::ClaudeUi);
-            let result = send_verified(
-                &Host::Local,
-                &addr,
-                &format!("idle message trial {trial}"),
-                &baseline,
-            );
-            crate::tmux_test_support::kill_session(&session);
-            assert_eq!(
-                result.unwrap(),
-                SubmitStatus::Submitted {
-                    detail: "busy_observed"
-                },
-                "trial {trial} did not submit"
-            );
-        }
 
-        crate::tmux_test_support::kill_session(&holder);
-    }
-
-    #[test]
-    fn seed_verify_drives_real_tmux_idle_vs_busy() {
-        // Functional check on a real tmux server that the launch-seed verifier
-        // distinguishes the two states the dispatch race produces:
-        //   * an idle, empty input box (the seed's Enter was dropped — claude
-        //     sits at `Ctx 0`): must NOT confirm, so dispatch retries/aborts
-        //     instead of falsely reporting `in_progress`.
-        //   * a genuinely busy pane (the seed submitted): must confirm.
-        // The pure-logic core is covered above; this exercises the real
-        // `capture_history` / `pane_title` path the seed verifier walks.
-        if !tmux_available() {
-            eprintln!("skipping: tmux not on PATH");
-            return;
-        }
-        let _lock = crate::test_lock::acquire();
-        crate::tmux_test_support::use_private_tmux_server();
-        // Holder keeps the private server alive across both fixture runs so a
-        // fixture's exit can't empty and take down the server mid-test.
-        let holder = format!("shelbi-seed-holder-{}", std::process::id());
-        if !crate::tmux_test_support::try_start_session(&holder, "holder") {
-            eprintln!("skipping: tmux cannot create a server here");
-            return;
-        }
-        let tmp = tempfile::tempdir().unwrap();
-
-        // Idle box that never goes busy — the bug's symptom. `sleep 600` so the
-        // pane can't exit before the verifier finishes sampling it.
-        let idle_script = tmp.path().join("idle-seed.sh");
-        std::fs::write(
-            &idle_script,
-            "#!/bin/sh\n\
-             printf '\\033[2J\\033[H────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  ? for shortcuts\\n'\n\
-             sleep 600\n",
-        )
-        .unwrap();
-
-        // A pane that comes up already processing — a seed that submitted.
-        let busy_script = tmp.path().join("busy-seed.sh");
-        std::fs::write(
-            &busy_script,
-            "#!/bin/sh\n\
-             printf '\\033[2J\\033[H✳ Working on the seeded prompt\\n────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  esc to interrupt\\n'\n\
-             sleep 600\n",
-        )
-        .unwrap();
-
-        let run = |script: &std::path::Path, marker: &str| -> Option<bool> {
-            let session = format!(
-                "shelbi-seed-test-{}-{}",
-                std::process::id(),
-                marker.replace(' ', "_")
-            );
-            let started = std::process::Command::new("tmux")
-                .args([
-                    "new-session",
-                    "-d",
-                    "-s",
-                    &session,
-                    "-n",
-                    "agent",
-                    "sh",
-                    script.to_str().unwrap(),
-                ])
-                .status();
-            // The holder guarantees a live server, so a failure here is real.
-            assert!(
-                matches!(started, Ok(status) if status.success()),
-                "failed to start fixture session `{session}` on the private server"
-            );
-            let addr = TmuxAddr {
-                session: session.clone(),
-                window: "agent".into(),
-            };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                if shelbi_tmux::capture(&Host::Local, &addr)
-                    .unwrap_or_default()
-                    .contains(marker)
-                {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            let baseline = PaneBaseline::fresh(SubmitProfile::ClaudeUi);
-            let confirmed = verify_seeded(
-                &Host::Local,
-                &addr,
-                &baseline,
-                std::time::Duration::from_millis(600),
-            );
-            crate::tmux_test_support::kill_session(&session);
-            Some(confirmed)
-        };
-
-        let idle_confirmed = run(&idle_script, "? for shortcuts").expect("idle fixture ran");
-        assert!(
-            !idle_confirmed,
-            "an idle empty box (dropped seed) must not read as a submitted dispatch"
-        );
-
-        let busy_confirmed = run(&busy_script, "esc to interrupt").expect("busy fixture ran");
-        assert!(
-            busy_confirmed,
-            "a busy pane (submitted seed) must confirm the dispatch"
-        );
-
-        crate::tmux_test_support::kill_session(&holder);
-    }
-
-    /// Opt-in acceptance path against the actual Claude Code TUI. Unlike the
-    /// lightweight terminal fixture above, this test has no conditional
-    /// return: once explicitly selected it fails when tmux, Claude, auth,
-    /// hooks, or any one of the twenty submissions is unavailable.
-    ///
-    /// Run serially so another live test cannot reuse the tmux server while
-    /// this one is sampling titles and screens:
-    ///
-    /// `cargo test -p shelbi-orchestrator live_claude_idle_twenty_and_busy_queue -- --ignored --nocapture --test-threads=1`
-    #[test]
-    #[ignore = "requires an authenticated live Claude CLI and tmux; see test docs for the exact command"]
-    fn live_claude_idle_twenty_and_busy_queue() {
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
-
-        let tmux = Command::new("tmux")
-            .arg("-V")
-            .status()
-            .expect("live acceptance requires tmux on PATH");
-        assert!(tmux.success(), "tmux -V failed");
-        let claude = Command::new("claude")
-            .arg("--version")
-            .status()
-            .expect("live acceptance requires claude on PATH");
-        assert!(claude.success(), "claude --version failed");
-
-        let tmp = tempfile::tempdir().expect("create live-Claude workdir");
-        let hooks = tmp.path().join(".shelbi/hooks");
-        let settings_dir = tmp.path().join(".claude");
-        std::fs::create_dir_all(&hooks).unwrap();
-        std::fs::create_dir_all(&settings_dir).unwrap();
-        let working = hooks.join("pane-working");
-        let idle = hooks.join("pane-idle");
-        std::fs::write(
-            &working,
-            "#!/bin/sh\nprintf '\\033]2;shelbi:working\\007'\nprintf 'working\\n' >> .shelbi/live-working.log\n",
-        )
-        .unwrap();
-        std::fs::write(
-            &idle,
-            "#!/bin/sh\nprintf '\\033]2;shelbi:idle\\007'\nprintf 'idle\\n' >> .shelbi/live-idle.log\n",
-        )
-        .unwrap();
-        for hook in [&working, &idle] {
-            let mut permissions = std::fs::metadata(hook).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(hook, permissions).unwrap();
-        }
-        std::fs::write(
-            settings_dir.join("settings.json"),
-            r#"{
-  "hooks": {
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": ".shelbi/hooks/pane-working"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": ".shelbi/hooks/pane-idle"}]}]
-  }
-}"#,
-        )
-        .unwrap();
-
-        let session = format!("shelbi-live-submit-{}", std::process::id());
-        struct SessionGuard(String);
-        impl Drop for SessionGuard {
-            fn drop(&mut self) {
-                let _ = Command::new("tmux")
-                    .args(["kill-session", "-t", &self.0])
-                    .status();
-            }
-        }
-        let guard = SessionGuard(session.clone());
-        let model = std::env::var("SHELBI_LIVE_CLAUDE_MODEL").unwrap_or_else(|_| "haiku".into());
-        let started = Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session,
-                "-n",
-                "agent",
-                "-x",
-                "120",
-                "-y",
-                "40",
-                "-c",
-                tmp.path().to_str().unwrap(),
-                "claude",
-                "--model",
-                &model,
-                "--effort",
-                "low",
-                "--permission-mode",
-                "auto",
-                "--setting-sources",
-                "project",
-                "--disable-slash-commands",
-                "--no-chrome",
-            ])
-            .status()
-            .expect("start live Claude tmux session");
-        assert!(started.success(), "tmux could not start live Claude");
-
-        let addr = TmuxAddr {
-            session: session.clone(),
-            window: "agent".into(),
-        };
-        assert!(
-            crate::ready::wait_for_claude_ready(
-                &Host::Local,
-                &addr,
-                std::time::Duration::from_secs(60),
-            )
-            .expect("probe live Claude readiness"),
-            "Claude did not reach its input box; capture:\n{}",
-            shelbi_tmux::capture(&Host::Local, &addr).unwrap_or_default(),
-        );
-
-        let wait_for_stops = |expected_stops: usize, label: &str, timeout_secs: u64| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-            while std::time::Instant::now() < deadline {
-                let stops = std::fs::read_to_string(tmp.path().join(".shelbi/live-idle.log"))
-                    .unwrap_or_default()
-                    .lines()
-                    .count();
-                if stops >= expected_stops {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            panic!(
-                "live Claude {label} never reached {expected_stops} completed turns; capture:\n{}",
-                shelbi_tmux::capture(&Host::Local, &addr).unwrap_or_default(),
-            );
-        };
-
-        for trial in 0..20 {
-            let baseline = PaneBaseline::capture(&Host::Local, &addr, SubmitProfile::ClaudeUi);
-            assert!(
-                !baseline.actively_busy,
-                "idle trial {trial} started from a busy pane"
-            );
-            let status = send_verified(
-                &Host::Local,
-                &addr,
-                &format!("Reply with only OK-{trial}."),
-                &baseline,
-            )
-            .unwrap();
-            assert!(
-                matches!(status, SubmitStatus::Submitted { .. }),
-                "idle trial {trial} was not verified: {status:?}"
-            );
-            wait_for_stops(trial + 1, &format!("idle trial {trial}"), 90);
-        }
-
-        let baseline = PaneBaseline::capture(&Host::Local, &addr, SubmitProfile::ClaudeUi);
-        let status = send_verified(
-            &Host::Local,
-            &addr,
-            "Use Bash to run `sleep 45`, then reply with DONE.",
-            &baseline,
-        )
-        .unwrap();
-        assert!(matches!(status, SubmitStatus::Submitted { .. }));
-
-        let busy_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let busy_baseline = loop {
-            let candidate = PaneBaseline::capture(&Host::Local, &addr, SubmitProfile::ClaudeUi);
-            if candidate.actively_busy {
-                break candidate;
-            }
-            assert!(
-                std::time::Instant::now() < busy_deadline,
-                "Claude never entered a live busy state; capture:\n{}",
-                shelbi_tmux::capture(&Host::Local, &addr).unwrap_or_default(),
-            );
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        };
-        let queued = send_verified(
-            &Host::Local,
-            &addr,
-            "After the current turn, reply with QUEUED-OK.",
-            &busy_baseline,
-        )
-        .unwrap();
-        assert!(
-            matches!(
-                queued,
-                SubmitStatus::Submitted { .. } | SubmitStatus::StillInBox
-            ),
-            "busy-pane note was neither submitted nor visibly queued: {queued:?}"
-        );
-        // The sleep turn is completion 21. The queued note must then start a
-        // real follow-up turn and reach completion 22 without another keypress.
-        // This pins the accepted busy-pane contract end to end, rather than
-        // merely accepting text that remains visible forever.
-        wait_for_stops(22, "busy queued follow-up", 120);
-
-        eprintln!("live verified-submit acceptance passed: idle=20/20 busy=queued-and-processed");
-        drop(guard);
-    }
 
     #[test]
     fn verifier_retries_enter_once_then_confirms() {

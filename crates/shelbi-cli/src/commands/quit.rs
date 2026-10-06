@@ -1,277 +1,264 @@
-//! `shelbi quit` — cleanly tear down the running project's shelbi-owned
-//! surfaces from the command line. The teardown counterpart to
-//! `shelbi reload`: where reload respawns the orchestrator pane and the
-//! shelbi-owned TUI panes (sidebar + tasks/machines) in place, quit closes
-//! them and the project's two tmux sessions (`shelbi-<project>` and the
-//! hidden `_shelbi-<project>` views stash) and exits.
+//! `shelbi quit` for the single-process (session-backend) runtime — restoring
+//! the command `rt-cutover-delete` removed with the tmux-era `quit.rs`.
 //!
-//! This is the CLI sibling of the palette's "Quit Project" entry
-//! ([`super::teardown::quit_project_with_progress`]) and mirrors the
-//! in-TUI global-quit (Ctrl+C). It shares the same non-destructive
-//! contract as those paths: a workspace mid-task keeps its durable
-//! worktree + branch on disk, so quitting only stops the panes — the work
-//! resumes on the next launch. When a live workspace still holds an
-//! active-category task the user is warned and asked to confirm (bypass
-//! with `-y`), since that workspace's agent session is being closed.
+//! With the session backend there are no panes to tear down: quitting is a
+//! daemon operation. The palette already offers "Quit Project" / "Quit Shelbi"
+//! through the daemon's [`ClientMsg::QuitProject`](shelbi_proto::control::ClientMsg::QuitProject)
+//! / [`QuitShelbi`](shelbi_proto::control::ClientMsg::QuitShelbi) (`rt-tui-project-quit`);
+//! this command is the shell sibling, a **thin client** over that same control
+//! socket:
 //!
-//! Before the orchestrator pane is torn down it is given the same handoff
-//! courtesy as reload: it may write `agents/orchestrator/handoff.md`, which
-//! the next launch ingests-and-deletes so a relaunch resumes with context.
-//! The handoff module sweeps any stale file before requesting a fresh write
-//! and only reports `Written` on success, so quit never leaves a stale
-//! handoff a future reload would mis-ingest.
+//! - `shelbi quit` sends `QuitProject` for the resolved current project — the
+//!   daemon ends that project's sessions (after asking its orchestrator to
+//!   write a handoff), drains its quit barrier, and marks it closed. Other
+//!   projects keep running.
+//! - `shelbi quit --all` sends `QuitShelbi` — the daemon closes every project,
+//!   ends all sessions, acks, then stops. The projects are closed before the
+//!   sessions end, so no session watchdog resurrects the daemon.
+//!
+//! Both block on the daemon's ack via [`shelbi_client::ControlClient`]. The
+//! orchestrator handoff and the close-before-end ordering live in
+//! [`shelbi_orchestrator::quit`], invoked by the daemon's control handler — this
+//! command does not reimplement them.
+//!
+//! When no daemon is running, nothing is open: the command reports that and
+//! exits 0, so `shelbi quit` is a clean no-op on an idle machine (the daemon
+//! idle-exits once the last project closes, so "no daemon" and "nothing open"
+//! are the same state).
+//!
+//! The IO is behind the [`QuitOps`] seam so the routing — daemon-running gate,
+//! project vs all, the ack wait — is unit-testable without a daemon or a
+//! control socket.
 
-use std::io::{self, IsTerminal, Write};
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
-use shelbi_core::MachineKind;
-use shelbi_orchestrator::handoff::HandoffOutcome;
-use shelbi_orchestrator::workspace as orch_workspace;
-
-use super::quit_project::{list_active_workspaces, ActiveWorkspace};
 use super::require_project;
 
-/// Tear down the resolved project's shelbi-owned surfaces. Idempotent: a
-/// project with no live sessions is a clean no-op.
-pub fn run(project_opt: Option<String>, yes: bool) -> Result<()> {
-    let project_name = require_project(project_opt)?;
-
-    // Idempotency: with neither the dashboard nor the views stash live there
-    // is nothing to tear down. Checking both (rather than only the main
-    // session) also mops up a partially-torn-down project whose stash
-    // lingered — teardown below is idempotent, so re-running is always safe.
-    let main = format!("shelbi-{project_name}");
-    let stash = format!("_shelbi-{project_name}");
-    if !session_exists(&main) && !session_exists(&stash) {
-        println!("shelbi: project '{project_name}' is not running — nothing to quit.");
-        return Ok(());
-    }
-
-    // Warn + confirm when a live workspace pane holds an active-category
-    // task: quitting closes the pane its agent is running in. The worktree
-    // and branch survive (work resumes next launch), so this is
-    // non-destructive — but the running agent session is stopped, so the
-    // user opts in unless they passed `-y`.
-    let active = list_active_workspaces(&project_name);
-    let busy = busy_workspaces(&active);
-    if !busy.is_empty() && !yes && !confirm_teardown(&project_name, &busy)? {
-        println!("shelbi: quit aborted — nothing was torn down.");
-        return Ok(());
-    }
-
-    // Give the live orchestrator the chance to write its handoff before its
-    // pane dies, exactly as reload does.
-    match shelbi_orchestrator::handoff::request_orchestrator_handoff(&project_name) {
-        Ok(outcome) => print_handoff(&outcome),
-        Err(e) => eprintln!("shelbi: warning: handoff request failed: {e}"),
-    }
-
-    teardown_workspaces_and_stash(&project_name);
-
-    // Record the close and tell the user before the final self-kill: if
-    // `shelbi quit` was itself run from inside the dashboard session, killing
-    // it below SIGHUPs this process, so everything user-visible and durable
-    // must already be flushed by the time that kill fires.
-    let _ = shelbi_state::append_project_event(&project_name, "closed", "user:quit-cli");
-    println!(
-        "shelbi: quit \"{project_name}\" — orchestrator + TUI panes closed and both tmux \
-         sessions torn down; worktrees and branches left intact."
-    );
-    let _ = io::stdout().flush();
-
-    kill_session_quiet(&main);
-    Ok(())
+/// The side effects a quit performs, behind a trait so the routing is testable
+/// with a stubbed daemon.
+pub(crate) trait QuitOps {
+    /// Whether a hub daemon is currently running (its single-instance lock is
+    /// held). When it is not, nothing is open — the daemon idle-exits once the
+    /// last project closes.
+    fn daemon_running(&self) -> bool;
+    /// Quit one project through the control socket, blocking until the daemon
+    /// acks. The daemon ends the project's sessions (after its handoff), drains
+    /// its quit barrier, and marks it closed; other projects are untouched.
+    fn quit_project(&self, project: &str) -> Result<()>;
+    /// Quit Shelbi through the control socket, blocking until the daemon acks.
+    /// The daemon closes every project, ends all sessions, then stops; nothing
+    /// restarts it.
+    fn quit_all(&self) -> Result<()>;
 }
 
-/// The active-category workspaces from `list_active_workspaces` — those
-/// whose live pane is assigned an in-progress (active) task rather than
-/// sitting idle. Pure so the confirmation trigger is unit-testable without
-/// standing up tmux + a project fixture.
-fn busy_workspaces(active: &[ActiveWorkspace]) -> Vec<&ActiveWorkspace> {
-    active.iter().filter(|w| w.task != "idle").collect()
+/// What a quit did, for reporting / assertions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum QuitReport {
+    /// No daemon was running — nothing to quit.
+    NothingOpen,
+    /// The named project was quit (its sessions ended, it is closed).
+    Project(String),
+    /// Shelbi was quit entirely (every project closed, the daemon stopped).
+    All,
 }
 
-/// Prompt on stderr for confirmation before closing panes that host a
-/// running agent. Returns whether to proceed. A non-interactive invocation
-/// (piped stdin) can't answer, so it declines with a hint to pass `-y` —
-/// the safe default is to leave the running agents alone.
-fn confirm_teardown(project: &str, busy: &[&ActiveWorkspace]) -> Result<bool> {
-    eprintln!(
-        "shelbi: {} workspace{} in project '{project}' still hold an active issue:",
-        busy.len(),
-        if busy.len() == 1 { "" } else { "s" }
-    );
-    for w in busy {
-        eprintln!("  · {} ({}) — issue {}", w.name, w.state, w.task);
-    }
-    eprintln!(
-        "Quitting closes their panes. Worktrees and branches are left intact, so the work \
-         resumes on next launch — but the running agent sessions will be stopped."
-    );
-
-    if !io::stdin().is_terminal() {
-        eprintln!("shelbi: refusing to close active workspaces non-interactively; re-run with -y to confirm.");
-        return Ok(false);
-    }
-
-    eprint!("Proceed? [y/N] ");
-    let _ = io::stderr().flush();
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return Ok(false);
-    }
-    Ok(is_affirmative(&input))
-}
-
-/// Whether a prompt answer means "yes". Trimmed and case-insensitive;
-/// anything but `y`/`yes` (including an empty EOF read) is a "no" so the
-/// destructive path is never entered by accident.
-fn is_affirmative(answer: &str) -> bool {
-    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-}
-
-/// Kill every declared workspace pane plus the hidden `_shelbi-<project>`
-/// views stash, and remove the Shelbi-managed commit guard from the hub
-/// checkout. The main dashboard session is left for the caller to kill last
-/// (see [`run`]). Mirrors the palette teardown's
-/// [`super::teardown`] step order minus the progress UI.
-fn teardown_workspaces_and_stash(project: &str) {
-    // Clear any zen crash-heartbeat so the next launch doesn't mistake this
-    // clean shutdown for an orchestrator that died mid-flight.
-    let _ = shelbi_state::zen_clear_crash(project);
-
-    if let Ok(p) = shelbi_state::load_project(project) {
-        // Local workspace panes die with the dashboard session below, but a
-        // remote workspace lives in its own tmux session on another machine
-        // and must be killed explicitly. Best-effort per workspace: an
-        // unresolved machine/addr or an unreachable host is skipped rather
-        // than blocking the rest of the teardown.
-        for workspace in &p.workspaces {
-            let Some(machine) = p.machine(&workspace.machine) else {
-                continue;
-            };
-            let host = machine.host();
-            let Ok(addr) = orch_workspace::workspace_tmux_addr(&p, workspace) else {
-                continue;
-            };
-            let _ = orch_workspace::kill_workspace_pane(&host, &addr, &workspace.name);
+/// `shelbi quit` (`--all` for the whole hub). Resolves the current project only
+/// when it is actually needed (a running daemon, not `--all`), so the
+/// nothing-open path never fails on project resolution.
+pub fn run(project_opt: Option<String>, all: bool) -> Result<()> {
+    let report = run_with(&LiveQuit, all, || require_project(project_opt))?;
+    match report {
+        QuitReport::NothingOpen => {
+            println!("shelbi: nothing is running — nothing to quit.");
         }
-
-        // Nothing Shelbi installed should linger past teardown — drop the
-        // context-scoped commit guard from the hub checkout. Best-effort, and
-        // a user-authored hook is never touched.
-        if let Some(hub) = p.machines.iter().find(|m| matches!(m.kind, MachineKind::Local)) {
-            let _ = shelbi_orchestrator::githook::uninstall_hub_branch_guard(&hub.work_dir);
-        }
-    }
-
-    // Kill the hidden views stash. It never hosts the invoking shell, so this
-    // is safe in the foreground; the main session is killed last by `run`.
-    kill_session_quiet(&format!("_shelbi-{project}"));
-}
-
-/// Print the handoff outcome as one status line. Mirrors reload's reporting
-/// so the two teardown/respawn paths read consistently. Every variant is
-/// "okay to proceed" — only the wording differs.
-fn print_handoff(outcome: &HandoffOutcome) {
-    match outcome {
-        HandoffOutcome::NativeThread => {
-            println!("  · handoff  skipped (Codex native thread retained)");
-        }
-        HandoffOutcome::Written { path } => {
-            println!("  ✓ handoff  captured ({})", path.display());
-        }
-        HandoffOutcome::PaneNotAlive => {
-            println!("  · handoff  skipped (orchestrator pane not running)");
-        }
-        HandoffOutcome::Timeout => {
-            println!("  ⚠ handoff  timed out; next launch starts cold");
-        }
-        HandoffOutcome::SendFailed { reason } => {
-            println!("  ⚠ handoff  couldn't ask the orchestrator: {reason}");
-        }
-        HandoffOutcome::SubmitUnconfirmed { detail } => {
+        QuitReport::Project(project) => {
             println!(
-                "  ⚠ handoff  delivered but not confirmed submitted ({detail}); \
-                 next launch may be cold"
+                "shelbi: quit \"{project}\" — its sessions were ended (after the orchestrator \
+                 handoff) and it is now closed; other projects keep running. Worktrees and \
+                 branches are left intact."
+            );
+        }
+        QuitReport::All => {
+            println!(
+                "shelbi: quit Shelbi — every project was closed, all sessions ended, and the hub \
+                 daemon stopped. Worktrees and branches are left intact."
             );
         }
     }
+    Ok(())
 }
 
-/// True when a tmux session named `session` currently exists. Any failure
-/// (tmux absent, server down, non-zero exit) reads as "not running" — the
-/// idempotent no-op path.
-fn session_exists(session: &str) -> bool {
-    std::process::Command::new("tmux")
-        .args(["has-session", "-t", session])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// The quit routing, exercised by both production and the tests. `resolve_project`
+/// is deferred so it runs only on the `QuitProject` path.
+pub(crate) fn run_with(
+    ops: &dyn QuitOps,
+    all: bool,
+    resolve_project: impl FnOnce() -> Result<String>,
+) -> Result<QuitReport> {
+    // No daemon → nothing is open. Report and exit cleanly, for both forms.
+    if !ops.daemon_running() {
+        return Ok(QuitReport::NothingOpen);
+    }
+
+    if all {
+        ops.quit_all()?;
+        Ok(QuitReport::All)
+    } else {
+        let project = resolve_project()?;
+        ops.quit_project(&project)?;
+        Ok(QuitReport::Project(project))
+    }
 }
 
-/// Kill a tmux session, swallowing output. Idempotent — a raced or absent
-/// target exits non-zero but there is nothing actionable to report, so
-/// stderr is silenced (unlike [`super::run_tmux`], which surfaces failures).
-fn kill_session_quiet(session: &str) {
-    let _ = std::process::Command::new("tmux")
-        .args(["kill-session", "-t", session])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+/// The production [`QuitOps`]: the daemon-running gate is the single-instance
+/// lock, and each quit is a control-socket round-trip through
+/// [`shelbi_client::ControlClient`].
+struct LiveQuit;
+
+impl QuitOps for LiveQuit {
+    fn daemon_running(&self) -> bool {
+        shelbi_state::daemon_lock_held()
+    }
+
+    fn quit_project(&self, project: &str) -> Result<()> {
+        let mut client = connect()?;
+        client
+            .quit_project(project)
+            .map_err(|e| anyhow!("quitting project `{project}`: {e}"))
+    }
+
+    fn quit_all(&self) -> Result<()> {
+        let mut client = connect()?;
+        client
+            .quit_shelbi()
+            .map_err(|e| anyhow!("quitting Shelbi: {e}"))
+    }
+}
+
+/// Connect to the daemon's control socket, retrying briefly. `daemon_running`
+/// gated on the lock, but a daemon mid-startup may hold the lock before the
+/// control socket answers, so we retry for a short window rather than racing.
+fn connect() -> Result<shelbi_client::ControlClient> {
+    let sock = shelbi_state::control_socket_path().map_err(|e| anyhow!(e))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION) {
+            Ok(c) => return Ok(c),
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "could not reach the hub daemon's control socket at {}: {e}",
+                        sock.display()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
-    fn ws(name: &str, state: &'static str, task: &str) -> ActiveWorkspace {
-        ActiveWorkspace {
-            name: name.to_string(),
-            state,
-            task: task.to_string(),
+    /// A stubbed daemon recording the quit calls the command makes.
+    struct StubDaemon {
+        running: bool,
+        calls: Mutex<Vec<String>>,
+    }
+    impl StubDaemon {
+        fn new(running: bool) -> Self {
+            Self {
+                running,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+    impl QuitOps for StubDaemon {
+        fn daemon_running(&self) -> bool {
+            self.running
+        }
+        fn quit_project(&self, project: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("project:{project}"));
+            Ok(())
+        }
+        fn quit_all(&self) -> Result<()> {
+            self.calls.lock().unwrap().push("all".into());
+            Ok(())
         }
     }
 
     #[test]
-    fn busy_workspaces_selects_only_those_with_an_active_task() {
-        let active = vec![
-            ws("alpha", "working", "task-1"),
-            ws("bravo", "idle", "idle"),
-            ws("charlie", "awaiting input", "task-2, task-3"),
-        ];
-        let busy = busy_workspaces(&active);
-        let names: Vec<&str> = busy.iter().map(|w| w.name.as_str()).collect();
-        assert_eq!(names, vec!["alpha", "charlie"]);
+    fn quit_sends_quit_project_for_the_current_project() {
+        // AC1: `shelbi quit` ends the current project's sessions and leaves
+        // other projects running. The command sends exactly one QuitProject for
+        // the resolved project and nothing else (no QuitShelbi, which would
+        // stop the daemon and take other projects down with it).
+        let daemon = StubDaemon::new(true);
+        let report = run_with(&daemon, false, || Ok("alpha".to_string())).unwrap();
+        assert_eq!(report, QuitReport::Project("alpha".to_string()));
+        assert_eq!(daemon.calls(), vec!["project:alpha"]);
     }
 
     #[test]
-    fn busy_workspaces_is_empty_when_every_workspace_is_idle() {
-        let active = vec![ws("alpha", "idle", "idle"), ws("bravo", "idle", "idle")];
-        assert!(busy_workspaces(&active).is_empty());
+    fn quit_all_sends_quit_shelbi_and_never_resolves_a_project() {
+        // AC2: `shelbi quit --all` ends every session and stops the daemon. It
+        // sends QuitShelbi and must not resolve a current project (so it works
+        // from anywhere, e.g. not inside a project's work_dir).
+        let daemon = StubDaemon::new(true);
+        let report = run_with(&daemon, true, || {
+            panic!("--all must not resolve a current project")
+        })
+        .unwrap();
+        assert_eq!(report, QuitReport::All);
+        assert_eq!(daemon.calls(), vec!["all"]);
     }
 
     #[test]
-    fn busy_workspaces_is_empty_for_no_active_workspaces() {
-        assert!(busy_workspaces(&[]).is_empty());
+    fn quit_with_no_daemon_reports_nothing_open_and_does_not_connect() {
+        // AC3: with no daemon running, `shelbi quit` exits 0 with a clear
+        // message. It must short-circuit before resolving a project or making
+        // any control-socket call.
+        let daemon = StubDaemon::new(false);
+        let report = run_with(&daemon, false, || {
+            panic!("must not resolve a project when no daemon is running")
+        })
+        .unwrap();
+        assert_eq!(report, QuitReport::NothingOpen);
+        assert!(daemon.calls().is_empty(), "no quit call should be sent");
     }
 
     #[test]
-    fn affirmative_accepts_only_y_and_yes_case_insensitively() {
-        for ok in ["y", "Y", "yes", "YES", "  yes  ", "Yes\n"] {
-            assert!(is_affirmative(ok), "{ok:?} should be affirmative");
+    fn quit_all_with_no_daemon_also_reports_nothing_open() {
+        // The nothing-open gate applies to both forms.
+        let daemon = StubDaemon::new(false);
+        let report = run_with(&daemon, true, || unreachable!()).unwrap();
+        assert_eq!(report, QuitReport::NothingOpen);
+        assert!(daemon.calls().is_empty());
+    }
+
+    #[test]
+    fn quit_surfaces_a_daemon_error() {
+        // A failed control-socket round-trip must surface, not be swallowed.
+        struct FailDaemon;
+        impl QuitOps for FailDaemon {
+            fn daemon_running(&self) -> bool {
+                true
+            }
+            fn quit_project(&self, _project: &str) -> Result<()> {
+                anyhow::bail!("control socket went away")
+            }
+            fn quit_all(&self) -> Result<()> {
+                unreachable!()
+            }
         }
-    }
-
-    #[test]
-    fn affirmative_rejects_everything_else_including_empty() {
-        // An empty read (EOF on a piped stdin) must decline so the
-        // destructive path is never entered by accident.
-        for no in ["", "\n", "n", "no", "nope", "sure", "ya", "1"] {
-            assert!(!is_affirmative(no), "{no:?} should not be affirmative");
-        }
+        let err = run_with(&FailDaemon, false, || Ok("alpha".to_string())).unwrap_err();
+        assert!(err.to_string().contains("went away"), "err: {err}");
     }
 }

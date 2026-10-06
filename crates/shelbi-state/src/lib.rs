@@ -21,6 +21,9 @@ use shelbi_core::{
 
 mod agent_workspaces;
 pub mod board_index;
+pub mod change_bus;
+mod daemon_lifecycle;
+mod daemon_poller;
 pub mod disk;
 pub mod done_history;
 pub mod error_log;
@@ -32,6 +35,12 @@ pub mod github_store;
 mod hub_config;
 mod hub_version;
 mod issue_cache;
+pub mod machine_state;
+pub mod migration;
+pub use migration::{
+    all_workspace_migration_states, set_workspace_migration_state, workspace_migrated,
+    workspace_migration_state, MigrationState,
+};
 pub use issue_cache::BOARD_CACHE_TTL;
 #[cfg(any(test, feature = "test-support"))]
 pub use issue_cache::seed_board_snapshot_for_test;
@@ -116,6 +125,14 @@ pub use hub_config::{
     hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
     HubConfig, ProjectMeta, ProjectSummary,
 };
+pub use daemon_lifecycle::{
+    daemon_lock_held, ensure_daemon_running, hub_lock_path, stop_daemon,
+};
+pub use change_bus::{
+    publish_change, publish_layout, subscribe_changes, ChangeNotification, ChangeSubscription,
+    LayoutEvent,
+};
+pub use daemon_poller::{acquire_poller_lock, poller_lock_path, PollerLock};
 pub use hub_version::{
     classify_daemon_version, daemon_version_status, ensure_daemon_matches_for_mutation,
     probe_daemon_hello, read_daemon_ack, DaemonHello, DaemonProbe, DaemonVersionStatus,
@@ -152,7 +169,7 @@ pub use event_log::{
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
     append_limit_resume_event, append_marker_deferred_event, append_marker_skipped_event,
     append_github_merge_reconcile_event, append_merge_event, append_message_ack_event,
-    append_message_event, append_project_event,
+    append_message_event, append_migration_event, append_project_event,
     append_push_event,
     append_rebase_event, append_review_ready_event, append_review_slot_override_event,
     append_send_event, append_settings_selfheal_event, append_supervision_event,
@@ -173,7 +190,7 @@ pub use event_log::{
 };
 pub use workspace_status::{
     clear_expected_teardown, clear_review_serve_pgid, clear_workspace_status,
-    consume_expected_teardown, expected_teardown_marker_path, hub_socket_path,
+    consume_expected_teardown, control_socket_path, expected_teardown_marker_path, hub_socket_path,
     load_workspace_status, mark_expected_teardown, parse_pane_title_marker, parse_pane_title_state,
     read_review_serve_pgid, review_serve_pgid_path, save_workspace_status, supervision_shutdown_key,
     workspace_status_path, workspaces_dir, PaneMarker, WorkspaceState, WorkspaceStatus,
@@ -1564,6 +1581,29 @@ pub struct State {
     /// [`shelbi_tui::kanban::ColumnExpansion`] for the in-memory model.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub kanban_column_overrides: BTreeMap<String, KanbanColumnOverride>,
+    /// Whether the project is currently open. Set when the project is opened
+    /// (`ensure_dashboard`) and cleared when it is quit, this is the single
+    /// source of truth for "open" in Phase 3 of the remove-tmux effort
+    /// (`docs/removing-tmux/phase3-daemon.md`): the on-demand daemon's idle
+    /// exit and its per-project poller manager both key off the open set.
+    /// Deliberately *not* derived from the orchestrator session existing, so
+    /// supervision can restart a dead orchestrator in a project that is still
+    /// open. Defaults to `false` and is skipped when `false`, so a closed
+    /// project's `state.json` stays byte-identical to before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open: bool,
+    /// Per-workspace tmux → session-backend migration state for the Phase 6
+    /// cutover (`rt-cutover-migration`), keyed by workspace name. A workspace is
+    /// [`MigrationState::Pending`] until its legacy tmux session is proven gone,
+    /// then [`MigrationState::Migrated`]; dispatch to a pending workspace is
+    /// refused so the new backend never starts a second agent in a worktree a
+    /// surviving tmux agent still holds. Empty (and omitted from the file) on
+    /// the tmux runtime and for a freshly-migrated install, so an untouched
+    /// `state.json` stays byte-identical to before this field existed. See
+    /// [`crate::migration`]; `rt-cutover-delete` removes it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace_migration: BTreeMap<String, MigrationState>,
     /// Forward-compat catch-all: any `state.json` key this binary doesn't
     /// recognize (a field a newer binary added) is captured here and written
     /// back verbatim, instead of being silently dropped on the next
@@ -1660,9 +1700,8 @@ pub fn state_path(project: &str) -> Result<PathBuf> {
 // Global runtime state (~/.shelbi/state.json)
 
 /// Global cross-project runtime state at `~/.shelbi/state.json`. Tracks
-/// preferences that follow the user across every project: the most
-/// recent tmux palette binding (so the orchestrator can unbind it
-/// cleanly on rebind / project switch), the one-shot acknowledgement
+/// preferences that follow the user across every project: the one-shot
+/// acknowledgement
 /// of the Zen Mode intro popover (so the explanation doesn't re-fire in
 /// every project the user opens), the one-shot getting-started hint, and
 /// the sidebar's per-machine collapse state (a UI preference that follows
@@ -1673,11 +1712,6 @@ pub fn state_path(project: &str) -> Result<PathBuf> {
 /// `Eq` for it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GlobalState {
-    /// The exact tmux key string passed to `tmux bind-key -n …` on the
-    /// most recent install (e.g. `C-p`, `M-z`). `None` means no shelbi
-    /// session has installed a palette binding yet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tmux_palette_key: Option<String>,
     /// Set to `true` once the user has dismissed the Zen Mode intro
     /// popover with "Don't show this again" checked. The popover gates
     /// on this flag before rendering on every `off → on` toggle.
@@ -1711,7 +1745,6 @@ fn default_first_run_seen() -> bool {
 impl Default for GlobalState {
     fn default() -> Self {
         Self {
-            tmux_palette_key: None,
             zen_intro_seen: false,
             first_run_seen: true,
             sidebar: SidebarPrefs::default(),
@@ -1741,8 +1774,8 @@ impl SidebarPrefs {
 /// Flip the collapse state for `machine` in `~/.shelbi/state.json` and
 /// return whether the machine is now collapsed. Reads the current
 /// [`GlobalState`], mutates the set, and writes it back — the rest of
-/// the file is preserved (no overwriting `tmux_palette_key`,
-/// `zen_intro_seen`, or `first_run_seen`). Used by the sidebar's Space/Enter
+/// the file is preserved (no overwriting `zen_intro_seen` or
+/// `first_run_seen`). Used by the sidebar's Space/Enter
 /// handler when focus is on a `MachineGroup` row.
 pub fn toggle_sidebar_machine_collapsed(machine: &str) -> Result<bool> {
     update_global_state(|state| {
@@ -1882,6 +1915,93 @@ pub fn claim_first_run_hint() -> Result<bool> {
 }
 
 #[cfg(test)]
+mod open_record_tests {
+    use super::*;
+    use crate::test_lock::LOCK;
+
+    fn fresh_home() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-open-record-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(p.join("projects")).unwrap();
+        p
+    }
+
+    #[test]
+    fn open_flag_defaults_closed_and_round_trips() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A project with no state.json reads as closed, and the missing-file
+        // default write stays byte-identical to "no open key".
+        assert!(!is_project_open("p").unwrap(), "missing state → closed");
+
+        set_project_open("p", true).unwrap();
+        assert!(is_project_open("p").unwrap(), "set open → open");
+
+        set_project_open("p", false).unwrap();
+        assert!(!is_project_open("p").unwrap(), "cleared → closed");
+        // The cleared state serializes without the `open` key (skip-if-false).
+        let text = fs::read_to_string(state_path("p").unwrap()).unwrap();
+        assert!(!text.contains("\"open\""), "closed state omits the key: {text}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn list_open_projects_reports_only_registered_open_ones() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Register three projects (the *.yaml stem is the id) and open two.
+        for name in ["alpha", "beta", "gamma"] {
+            fs::write(home.join("projects").join(format!("{name}.yaml")), b"").unwrap();
+        }
+        set_project_open("alpha", true).unwrap();
+        set_project_open("gamma", true).unwrap();
+        // beta stays closed; an unregistered-but-open project is ignored because
+        // it has no *.yaml registration.
+        set_project_open("ghost", true).unwrap();
+
+        let open = list_open_projects().unwrap();
+        assert_eq!(open, vec!["alpha".to_string(), "gamma".to_string()]);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn open_flag_preserves_other_state_fields() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        set_zen_mode_direct("p", ZenModeState::On);
+        set_project_open("p", true).unwrap();
+        let s = read_state("p").unwrap();
+        assert_eq!(s.zen_mode, ZenModeState::On, "open write must not clobber zen_mode");
+        assert!(s.open);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Set zen_mode without the daemon-version gate `set_zen_mode` applies.
+    fn set_zen_mode_direct(project: &str, mode: ZenModeState) {
+        update_state(project, |st| {
+            st.zen_mode = mode;
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
 mod global_state_tests {
     use super::*;
     use crate::test_lock::LOCK;
@@ -1906,7 +2026,6 @@ mod global_state_tests {
         std::env::set_var("SHELBI_HOME", &home);
         let s = read_global_state().unwrap();
         assert_eq!(s, GlobalState::default());
-        assert!(s.tmux_palette_key.is_none());
         assert!(
             s.first_run_seen,
             "an unarmed/missing state file must not onboard an existing project"
@@ -1946,7 +2065,12 @@ mod global_state_tests {
         .unwrap();
 
         let state = read_global_state().unwrap();
-        assert_eq!(state.tmux_palette_key.as_deref(), Some("M-z"));
+        // A removed field (`tmux_palette_key`) an older binary wrote is now an
+        // unknown key: it must survive in `extra`, not be dropped.
+        assert_eq!(
+            state.extra.get("tmux_palette_key"),
+            Some(&serde_json::json!("M-z"))
+        );
         assert_eq!(
             state.extra.get("telemetry_opt_in"),
             Some(&serde_json::json!(false))
@@ -1963,19 +2087,6 @@ mod global_state_tests {
         assert_eq!(disk["telemetry_opt_in"], serde_json::json!(false));
         assert_eq!(disk["future"], serde_json::json!([1, 2]));
 
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn round_trips_tmux_palette_key() {
-        let _g = LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        let mut s = read_global_state().unwrap();
-        s.tmux_palette_key = Some("M-z".into());
-        write_global_state(&s).unwrap();
-        let read_back = read_global_state().unwrap();
-        assert_eq!(read_back.tmux_palette_key.as_deref(), Some("M-z"));
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -2061,7 +2172,9 @@ mod global_state_tests {
         );
 
         let mut armed = read_global_state().unwrap();
-        armed.tmux_palette_key = Some("C-p".to_string());
+        armed
+            .extra
+            .insert("tmux_palette_key".to_string(), serde_json::json!("C-p"));
         armed
             .extra
             .insert("legacy_setting".to_string(), serde_json::json!(7));
@@ -2131,14 +2244,15 @@ mod global_state_tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         let mut s = read_global_state().unwrap();
-        s.tmux_palette_key = Some("M-z".into());
+        s.extra
+            .insert("tmux_palette_key".to_string(), serde_json::json!("M-z"));
         s.zen_intro_seen = true;
         s.first_run_seen = true;
         write_global_state(&s).unwrap();
 
         toggle_sidebar_machine_collapsed("hub").unwrap();
         let after = read_global_state().unwrap();
-        assert_eq!(after.tmux_palette_key.as_deref(), Some("M-z"));
+        assert_eq!(after.extra.get("tmux_palette_key"), Some(&serde_json::json!("M-z")));
         assert!(after.zen_intro_seen);
         assert!(after.first_run_seen);
         assert!(after.sidebar.collapsed_machines.contains("hub"));
@@ -2160,7 +2274,7 @@ mod global_state_tests {
         std::fs::write(home.join("state.json"), r#"{"tmux_palette_key":"C-p"}"#).unwrap();
         let s = read_global_state().unwrap();
         assert!(s.sidebar.collapsed_machines.is_empty());
-        assert_eq!(s.tmux_palette_key.as_deref(), Some("C-p"));
+        assert_eq!(s.extra.get("tmux_palette_key"), Some(&serde_json::json!("C-p")));
         std::env::remove_var("SHELBI_HOME");
     }
 }
@@ -2453,6 +2567,60 @@ pub fn set_workspace_filter(project: &str, filter: Option<&str>) -> Result<()> {
     })
 }
 
+/// Record (`true`) or clear (`false`) a project's open flag in its
+/// `state.json`. Routed through [`update_state`] so concurrent writers (a
+/// heartbeat tick, a filter change) don't lose the change, and idempotent — a
+/// no-op when already in the requested state. See [`State::open`].
+pub fn set_project_open(project: &str, open: bool) -> Result<()> {
+    update_state(project, |state| {
+        state.open = open;
+        Ok(())
+    })
+}
+
+/// Whether `project` is currently marked open. A missing `state.json` reads as
+/// closed (the [`State::default`] has `open: false`).
+pub fn is_project_open(project: &str) -> Result<bool> {
+    Ok(read_state(project)?.open)
+}
+
+/// Every registered project currently marked open, sorted by name.
+///
+/// Scans `~/.shelbi/projects/*.yaml` for registered project ids (the same
+/// source [`crate::list_projects`] uses) and keeps the ones whose `state.json`
+/// has `open: true`. A project whose state can't be read is treated as closed
+/// rather than aborting the scan, so one unreadable file never hides the rest
+/// of the open set. The daemon's idle-exit monitor and per-project poller
+/// manager both consume this.
+pub fn list_open_projects() -> Result<Vec<String>> {
+    let dir = projects_dir()?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut open = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(shelbi_core::Error::Io)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        if is_project_open(name).unwrap_or(false) {
+            open.push(name.to_string());
+        }
+    }
+    open.sort();
+    Ok(open)
+}
+
 /// Compose the persistence key for a Kanban column override. The key
 /// combines `workflow_name` and `status_id` so a column override scoped
 /// to one workflow's view never bleeds into another workflow that
@@ -2586,6 +2754,44 @@ pub fn parse_agent_file(text: &str) -> Result<AgentFile> {
         agent,
         body: body.to_string(),
     })
+}
+
+#[cfg(test)]
+mod agent_tmux_addr_load_tests {
+    use super::*;
+
+    /// Cutover: a persisted agent record written by the old tmux runtime carries
+    /// a `tmux:` address. After the cutover the `tmux` field is gone, but such a
+    /// record must still *load without error* — `Agent` has no
+    /// `deny_unknown_fields`, so an unknown `tmux:` key is simply dropped rather
+    /// than failing the parse.
+    #[test]
+    fn agent_record_with_tmux_address_loads() {
+        let text = "\
+---
+id: feat-x
+project: demo
+machine: hub
+runner: claude
+branch: jlong/feat-x
+worktree: /tmp/wt/feat-x
+status: running
+created: 2026-01-01T00:00:00Z
+updated: 2026-01-01T00:00:00Z
+tmux:
+  session: shelbi-w-feat-x
+  window: agent
+legacy_backend_field: whatever
+---
+body
+";
+        let parsed = parse_agent_file(text).expect("legacy tmux-addr agent record must load");
+        assert_eq!(parsed.agent.id, "feat-x");
+        // The `tmux:` key (and any other legacy field) is ignored on load, not a
+        // parse error.
+        assert_eq!(parsed.agent.machine, "hub");
+        assert_eq!(parsed.body.trim(), "body");
+    }
 }
 
 /// Append a line to the agent's `.log.md`. Each line is timestamped.
@@ -3874,7 +4080,7 @@ mod tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: name.into(),
             label: None,
             display_name: None,

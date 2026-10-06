@@ -266,7 +266,7 @@ pub fn resume_review_task(
     let machine = project
         .machine(&ws.machine)
         .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
-    let addr = crate::workspace::workspace_tmux_addr(&project, &ws)?;
+    let addr = crate::workspace::workspace_target(&project, &ws)?;
     // A probe error reads as alive, matching the resume pass's own gate: never
     // clobber a pane we can't prove is gone.
     if crate::workspace::workspace_slot_alive(&machine.host(), &addr).unwrap_or(true) {
@@ -443,7 +443,7 @@ fn load_review_task_locked(
         let machine = project
             .machine(&ws.machine)
             .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
-        let addr = crate::workspace::workspace_tmux_addr(&project, &ws)?;
+        let addr = crate::workspace::workspace_target(&project, &ws)?;
         if crate::workspace::workspace_slot_alive(&machine.host(), &addr).unwrap_or(false) {
             tracing::debug!(
                 project = %project_name,
@@ -451,7 +451,7 @@ fn load_review_task_locked(
                 workspace = %workspace_name,
                 "review-load no-op: slot already serving this task (live pane)",
             );
-            return Ok(addr.target());
+            return Ok(addr.label());
         }
     }
 
@@ -974,7 +974,7 @@ fn dispatch_task_onto(
     // auto-loader.
     let _ = shelbi_state::clear_review_load_failures_for_task(project_name, &tf.task.id);
 
-    Ok(addr.target())
+    Ok(addr.label())
 }
 
 /// One task auto-dispatched onto a workspace by [`dispatch_active_gate`].
@@ -1144,7 +1144,7 @@ fn release_supplanted_workspace(project: &Project, workspace_name: &str) {
         return;
     };
     let host = machine.host();
-    let Ok(addr) = crate::workspace::workspace_tmux_addr(project, ws) else {
+    let Ok(addr) = crate::workspace::workspace_target(project, ws) else {
         return;
     };
     if let Err(e) = crate::workspace::kill_workspace_pane(&host, &addr, workspace_name) {
@@ -1242,7 +1242,7 @@ mod tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "demo".into(),
             label: None,
             display_name: None,
@@ -1796,53 +1796,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn resume_review_task_skips_a_slot_a_concurrent_load_already_brought_up() {
-        // The poller's resume pass reads "assigned, no window" while a manual
-        // load is between writing the assignment and spawning the pane, then
-        // blocks on the review-load lock behind it. Once the lock is held the
-        // slot is live, so the resume must leave that pane alone. Relaunching it
-        // killed the fresh pane and reseeded the agent.
-        if std::process::Command::new("tmux").arg("-V").output().is_err() {
-            eprintln!("skipping: tmux not on PATH");
-            return;
-        }
-        let first_pane = || {
-            std::process::Command::new("tmux")
-                .args(["list-panes", "-t", "shelbi-demo:review-1", "-F", "#{pane_id}"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default()
-        };
-        let _g = crate::test_lock::acquire();
-        crate::tmux_test_support::use_private_tmux_server();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        shelbi_state::save_project(&tagged_project()).unwrap();
-        shelbi_state::save_task("demo", &review_task("t-loading", "review-1"), "body").unwrap();
 
-        // Dead slot: the resume proceeds to a real load (which fails at dispatch
-        // in the test env), never the alive short-circuit.
-        let dead = resume_review_task("demo", "t-loading", "review-1");
-        assert!(!matches!(dead, Ok(None)), "a dead slot must be resumed, got {dead:?}");
-
-        // The concurrent load's pane is up: the resume is a no-op.
-        crate::tmux_test_support::start_session("shelbi-demo", "review-1");
-        let pane_before = first_pane();
-        assert!(matches!(
-            resume_review_task("demo", "t-loading", "review-1"),
-            Ok(None)
-        ));
-        assert_eq!(
-            first_pane(),
-            pane_before,
-            "the live pane must not be respawned"
-        );
-
-        crate::tmux_test_support::kill_session("shelbi-demo");
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
 
     // -- auto-load / manual race guards (on disk, reject before dispatch) ----
 

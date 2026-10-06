@@ -23,7 +23,7 @@ The file's location depends on the project's
 
 A project's **id** is the config file's basename: `~/.shelbi/projects/shelbi.yaml`
 has the id `shelbi`. The id is the machine-facing key: it names the state
-folder (`~/.shelbi/projects/<id>/`), the settings file, the tmux session, the
+folder (`~/.shelbi/projects/<id>/`), the settings file, the project's sessions, the
 event-log `project=<id>` field, and is what `--project` / `$SHELBI_PROJECT`
 match against. It must be a valid slug: lowercase ASCII letters, digits, `-`,
 and `_`, starting with a letter or digit. A file whose stem breaks that rule
@@ -124,7 +124,7 @@ workspaces:
 | `workspace_permissions_mode` | string | no | — | Explicit project-wide permission ceiling rendered into the workspace settings template. Unset (the default) passes no `--permission-mode` and renders no `defaultMode`, so agents run under your own `~/.claude/settings.json` `permissions.defaultMode`. Set it to clamp every agent's requested mode downward. |
 | `heartbeat` | [Heartbeat](#heartbeat) | no | `60s` / `5m` | Adaptive hub heartbeat written to `events.log` so the orchestrator's watch fires on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. |
 | `disk` | [Disk](#disk) | no | `20` / `20` | Hub disk management: the size cap on the shared cargo `target/` and the low-disk free-space warning threshold. Both default to 20 GiB and are elided from the wire form when unset. |
-| `git` | [Git](#git) | no | all defaults | Base branch, generated task branch prefix, and merge strategy for `shelbi merge` and Zen's auto-merge. |
+| `git` | [Git](#git) | no | all defaults | Base branch, generated task branch prefix, and merge strategy for the review merge and Zen's auto-merge. |
 | `review` | [Review](#review) | no | all defaults | Review-interface behavior. Today just `diff_command`, the **View Diff** escape hatch for a diff tool that reviews a revision range instead of git's directory-diff pair. |
 | `issue_tracker` | [IssueTracker](#issue_tracker) | no | `file_system` | Which backend the board lives in: `file_system` (local markdown, the default) or `github` (issues in a repo). See [GitHub Issues backend](/docs/concepts/github-issues). |
 
@@ -402,14 +402,14 @@ disk:
 ## git
 
 Where workspace branches are based, how generated task branches are named,
-and how they integrate back. See [the merge command](/docs/cli/merge).
+and how they integrate back. See [understanding workflows](/docs/guides/understanding-workflows).
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `base_branch` | string | no | `default_branch` | Branch new work is based on and merged into. Falls back to the project's `default_branch`. |
 | `branch` | string | no | none | Full branch-name template for generated task branches when a task omits `branch:`. Rendered with `{{var}}` substitution, including `{{github_user}}` (authenticated GitHub username) and `{{id}}` (task id), plus the task's frontmatter params. So `branch: '{{github_user}}/{{id}}'` yields e.g. `jlong/fix-login`. Mutually exclusive with `branch_prefix`. |
 | `branch_prefix` | string | no | none | Shorthand alternative to `branch`: when a task omits `branch:`, Shelbi cuts `<branch_prefix>/<task-id>`. Use it when a bare prefix is all you need and you don't want to spell out a full `{{var}}` template. Mutually exclusive with `branch` — declaring both in one `git:` block fails the load. |
-| `merge_strategy` | `squash` \| `merge` \| `rebase` | no | `squash` | How `shelbi merge` integrates a workspace branch. Zen exact-ref auto-integration currently supports `squash`; other strategies require human PR merge. |
+| `merge_strategy` | `squash` \| `merge` \| `rebase` | no | `squash` | How a reviewed workspace branch is integrated. Zen exact-ref auto-integration currently supports `squash`; other strategies require human PR merge. |
 
 ```yaml
 git:

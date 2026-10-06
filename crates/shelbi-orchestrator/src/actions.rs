@@ -1964,7 +1964,7 @@ mod tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "fixture".into(),
             label: None,
             display_name: None,
@@ -2039,7 +2039,7 @@ mod tests {
                 integration: None,
             },
         );
-        let project = Project {
+        let project = Project { session: Default::default(),
             name: "fixture".into(),
             label: None,
             display_name: None,
@@ -2132,7 +2132,7 @@ mod tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "fixture".into(),
             label: None,
             display_name: None,
@@ -2232,7 +2232,7 @@ mod tests {
                 integration: None,
             },
         );
-        let project = Project {
+        let project = Project { session: Default::default(),
             name: "fixture".into(),
             label: None,
             display_name: None,
@@ -2376,7 +2376,7 @@ mod tests {
                 integration: None,
             },
         );
-        let project = Project {
+        let project = Project { session: Default::default(),
             name: "fixture".into(),
             label: None,
             display_name: None,
@@ -2712,7 +2712,7 @@ mod tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "fixture".into(),
             label: None,
             display_name: None,

@@ -275,7 +275,7 @@ fn rm(project: &str, name: &str, force: bool) -> Result<()> {
 
     // Kill any live pane, then tear down the worktree. Both are best-effort /
     // idempotent so a partially-provisioned workspace still removes cleanly.
-    let addr = orch_workspace::workspace_tmux_addr(&p, &workspace).map_err(|e| anyhow!(e))?;
+    let addr = orch_workspace::workspace_target(&p, &workspace).map_err(|e| anyhow!(e))?;
     if let Err(e) = orch_workspace::kill_workspace_pane(&machine.host(), &addr, name) {
         eprintln!("warning: killing pane for `{name}`: {e}");
     }
@@ -343,6 +343,34 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
     for line in render_list_with_occupied(&p.workspaces, &assigned, &review_by_ws, &occupied, &modes)?
     {
         println!("{line}");
+    }
+
+    // Cutover: call out workspaces still pending the tmux→session migration, so
+    // the user can see why dispatch to them is paused. Only surfaced when
+    // something is actually pending, so the table is unchanged for a
+    // fully-migrated install.
+    {
+        if let Ok(states) = shelbi_state::all_workspace_migration_states(project) {
+            let pending: Vec<&str> = p
+                .workspaces
+                .iter()
+                .filter(|w| {
+                    matches!(
+                        states.get(&w.name),
+                        Some(shelbi_state::MigrationState::Pending)
+                    )
+                })
+                .map(|w| w.name.as_str())
+                .collect();
+            if !pending.is_empty() {
+                println!(
+                    "\nmigration pending: {} — dispatch paused until each workspace's \
+                     previous-runtime tmux session is confirmed gone (reopen the project \
+                     to re-run migration)",
+                    pending.join(", ")
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -470,7 +498,7 @@ fn occupied_idle_workspaces(
         })?;
         let host = machine.host();
         let addr =
-            orch_workspace::workspace_tmux_addr(project, workspace).map_err(|e| anyhow!(e))?;
+            orch_workspace::workspace_target(project, workspace).map_err(|e| anyhow!(e))?;
         match orch_workspace::probe_workspace_slot(&host, &addr, deadline) {
             orch_workspace::SlotProbe::Dead => {}
             orch_workspace::SlotProbe::Alive { user_shell } => {
@@ -618,7 +646,7 @@ fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
         )
     })?;
     let host = machine.host();
-    let addr = orch_workspace::workspace_tmux_addr(&p, workspace).map_err(|e| anyhow!(e))?;
+    let addr = orch_workspace::workspace_target(&p, workspace).map_err(|e| anyhow!(e))?;
 
     // Release/park the task BEFORE killing the pane. The stranded-slot resume
     // only acts on a *dead* review pane whose task is still assigned on disk;
@@ -1383,7 +1411,7 @@ workspaces:
 
     #[test]
     fn add_then_rm_round_trips_the_pool_yaml() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -1428,7 +1456,7 @@ workspaces:
 
     #[test]
     fn save_workspace_config_writes_local_yaml_for_in_repo_projects() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -1452,7 +1480,7 @@ workspaces:
     /// nothing is loaded there.
     #[test]
     fn active_task_for_finds_in_progress_or_review_assignment() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         register_project(&home, "p");
@@ -1484,7 +1512,7 @@ workspaces:
 
     #[test]
     fn release_moves_in_flight_back_to_todo_and_unassigns() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         register_project(&home, "p");
@@ -1568,7 +1596,7 @@ workspaces:
 
     #[test]
     fn release_is_noop_when_workspace_has_no_in_flight_task() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         register_project(&home, "p");

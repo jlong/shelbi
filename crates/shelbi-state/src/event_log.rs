@@ -1233,7 +1233,14 @@ pub fn append_workspace_event(
     let prev_str = prev.map(|s| s.as_str()).unwrap_or("none");
     append_event_line(&format!(
         "{ts} project={project} workspace={workspace} {prev_str} -> {new}"
-    ))
+    ))?;
+    // Push a change notification to any subscribed client so a UI can refresh
+    // the affected workspace row without polling (Phase 3 pushed notifications,
+    // `rt-daemon-poller`). A no-op when nobody is subscribed. `append_workspace_
+    // event` is called exactly on a real pane-title state transition, so this
+    // fires once per workspace change and no more.
+    crate::publish_change(crate::ChangeNotification::Workspace { project, workspace });
+    Ok(())
 }
 
 /// Append a blocking-dialog transition line to `~/.shelbi/events.log`:
@@ -1832,6 +1839,31 @@ pub fn append_project_event(project: &str, action: &str, reason: &str) -> Result
     append_event_line(&format!("{ts} project={project} {action} reason={reason}"))
 }
 
+/// Append `<rfc3339> project=<project> migration workspace=<ws> outcome=<outcome> detail=<detail>`
+/// to `~/.shelbi/events.log`. Emitted for every step of the Phase 6 tmux →
+/// session-backend migration (`rt-cutover-migration`): a workspace marked
+/// `migrated` (local session gone / tmux absent, remote `shelbi-w-<ws>`
+/// confirmed absent), left `pending` (remote unreachable, or a kill that could
+/// not be verified), and a consented remote kill (`killed`). `outcome` is a
+/// short stable token; `detail` carries the session name or the reason
+/// (`-` when there's nothing extra to say). Both fold to single tokens so the
+/// line stays parseable.
+pub fn append_migration_event(
+    project: &str,
+    workspace: &str,
+    outcome: &str,
+    detail: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let workspace = sanitize_field(workspace);
+    let outcome = sanitize_reason(outcome);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} project={project} migration workspace={workspace} outcome={outcome} detail={detail}"
+    ))
+}
+
 /// Append `<rfc3339> project=<project> handoff outcome=<outcome> detail=<detail>`
 /// to `~/.shelbi/events.log`. Emitted once per orchestrator handoff attempt on
 /// every teardown/reload path (quit, quit-project, reload), so a failed or
@@ -2360,9 +2392,12 @@ pub struct ReviewReadyEvent<'a> {
     pub title: &'a str,
     /// The review workspace's name.
     pub workspace: &'a str,
-    /// The tmux pane target of the review slot (`session:window`), so the
-    /// orchestrator jumps straight to it rather than grepping `tmux list-panes`.
-    pub pane: &'a str,
+    /// The review slot's agent session name (`<project>/ws/<slot>`), so the
+    /// orchestrator jumps straight to it (`shelbi session snapshot <slot>` /
+    /// `shelbi attach <slot>`) rather than rediscovering the slot. The
+    /// session-backend name of the review workspace's agent, which the review
+    /// interface's editor/diff helpers sit beside as `<project>/review/<slot>/<role>`.
+    pub session: &'a str,
     /// The checked-out review worktree path, so the reviewer opens the exact
     /// tree rather than reverse-engineering it from `git worktree list`.
     pub worktree: &'a str,
@@ -2379,7 +2414,7 @@ pub struct ReviewReadyEvent<'a> {
 /// Append the `review-ready` signal to `~/.shelbi/events.log`:
 ///
 /// ```text
-/// <rfc3339> review-ready project=<p> task=<id> workspace=<ws> state=serving pane=<target> worktree=<path>[ port=<port>][ url=<url>] title=<title…> notes=<notes…>
+/// <rfc3339> review-ready project=<p> task=<id> workspace=<ws> state=serving session=<name> worktree=<path>[ port=<port>][ url=<url>] title=<title…> notes=<notes…>
 /// ```
 ///
 /// Emitted by the hub poller on the *edge* into the review slot's `serving`
@@ -2395,7 +2430,7 @@ pub struct ReviewReadyEvent<'a> {
 /// rather than an ordinary task/workspace transition, even though it carries
 /// `task=` / `workspace=` metadata. Identifier fields (`project`, `task`,
 /// `workspace`) are pinned to the strict [`sanitize_field`] allowlist; the
-/// location and free-text fields (`pane`, `worktree`, `url`, `title`, `notes`)
+/// location and free-text fields (`session`, `worktree`, `url`, `title`, `notes`)
 /// fold whitespace to underscores via [`sanitize_reason`] so their `:` / `/`
 /// separators survive while the line stays a single parseable record. `title`
 /// and `notes` are length-bounded so one over-long task can't blow up the line.
@@ -2404,13 +2439,13 @@ pub fn append_review_ready_event(ev: &ReviewReadyEvent) -> Result<()> {
     let project = sanitize_field(ev.project);
     let task_id = sanitize_field(ev.task_id);
     let workspace = sanitize_field(ev.workspace);
-    let pane = sanitize_reason(ev.pane);
+    let session = sanitize_reason(ev.session);
     let worktree = sanitize_reason(ev.worktree);
     let title = sanitize_reason(&truncate_with_ellipsis(ev.title, REVIEW_READY_TITLE_BUDGET));
     let notes = sanitize_reason(&truncate_with_ellipsis(ev.notes, REVIEW_READY_NOTES_BUDGET));
     let mut line = format!(
         "{ts} review-ready project={project} task={task_id} workspace={workspace} \
-         state=serving pane={pane} worktree={worktree}"
+         state=serving session={session} worktree={worktree}"
     );
     if let Some(port) = ev.port {
         line.push_str(&format!(" port={port}"));
@@ -3417,7 +3452,7 @@ mod tests {
             task_id: "fix-login",
             title: "Fix the login redirect loop",
             workspace: "review",
-            pane: "shelbi-demo:review",
+            session: "demo/ws/review",
             worktree: "/repo/.shelbi/wt/review",
             port: Some(4310),
             url: Some("http://localhost:4310"),
@@ -3434,7 +3469,7 @@ mod tests {
         assert!(line.contains(" task=fix-login "));
         assert!(line.contains(" workspace=review "));
         assert!(line.contains(" state=serving "));
-        assert!(line.contains(" pane=shelbi-demo:review "));
+        assert!(line.contains(" session=demo/ws/review "));
         assert!(line.contains(" worktree=/repo/.shelbi/wt/review "));
         assert!(line.contains(" port=4310 "));
         assert!(line.contains(" url=http://localhost:4310 "));
@@ -3467,7 +3502,7 @@ mod tests {
             task_id: "diff-only",
             title: "",
             workspace: "review",
-            pane: "shelbi-demo:review",
+            session: "demo/ws/review",
             worktree: "/repo/.shelbi/wt/review",
             port: None,
             url: None,

@@ -26,8 +26,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use shelbi_core::{Error, Host, Result, TmuxAddr};
+use shelbi_core::{Error, Host, Result};
 
+use crate::session_backend::{backend, SessionBackend, SessionTarget};
 use crate::submit::{self, SubmitStatus};
 
 /// Hard cap on how long we'll block a reload/quit waiting for the
@@ -156,14 +157,10 @@ fn request_orchestrator_handoff_inner(project_name: &str) -> Result<HandoffOutco
         .ok_or_else(|| Error::UnknownRunner(project.orchestrator.runner.clone()))?;
     let profile = submit::SubmitProfile::for_runner(runner);
 
-    let session = format!("shelbi-{project_name}");
-    if !local_session_exists(&session)? {
-        return Ok(HandoffOutcome::PaneNotAlive);
-    }
-    let Some(pane_id) = read_orch_pane_id(&session)? else {
-        return Ok(HandoffOutcome::PaneNotAlive);
-    };
-    if !pane_alive(&pane_id)? {
+    // The orchestrator runs as the `<project>/orch` session; deliver the
+    // handoff request into it. A dead/absent session reads `PaneNotAlive`.
+    let target = SessionTarget::session(format!("shelbi-{project_name}"));
+    if !backend().probe(&Host::Local, &target, None).is_alive() {
         return Ok(HandoffOutcome::PaneNotAlive);
     }
 
@@ -176,19 +173,12 @@ fn request_orchestrator_handoff_inner(project_name: &str) -> Result<HandoffOutco
     let _ = std::fs::remove_file(&handoff_path);
 
     let request = handoff_request_message();
-    // Deliver AND verify the submission through the shared verified-submit
-    // path the worker nudges use. This fixes two bugs at once:
-    //   * the parallel-teardown buffer collision — `submit`/`shelbi_tmux`
-    //     stage the paste through a per-invocation-unique buffer, so two
-    //     projects handing off at the same instant can no longer clobber or
-    //     delete each other's staged text (the old hardcoded `shelbi-handoff`
-    //     buffer name races); and
-    //   * the paste/Enter submission race — the Enter is sent as a separate
-    //     key event after a settle, then we confirm the pane actually went
-    //     busy (retrying Enter once), rather than trusting that tmux exited 0.
-    let addr = TmuxAddr::pane_id(pane_id);
-    let baseline = submit::PaneBaseline::capture(&Host::Local, &addr, profile);
-    let status = match submit::send_verified(&Host::Local, &addr, &request, &baseline) {
+    // Deliver AND verify the submission through the shared verified-submit path
+    // the worker nudges use: the Enter is sent as a separate key event after a
+    // settle, then we confirm the orchestrator actually went busy (retrying
+    // Enter once), rather than trusting the delivery call's own exit.
+    let baseline = submit::PaneBaseline::capture(&Host::Local, &target, profile);
+    let status = match submit::send_verified(&Host::Local, &target, &request, &baseline) {
         Ok(status) => status,
         Err(e) => return Ok(HandoffOutcome::SendFailed { reason: e.to_string() }),
     };
@@ -390,79 +380,15 @@ fn handoff_request_message() -> String {
     )
 }
 
-/// `tmux has-session -t <name>` on the local server.
-fn local_session_exists(session: &str) -> Result<bool> {
-    let target = shelbi_tmux::session_target(session);
-    let out = std::process::Command::new("tmux")
-        .args(["has-session", "-t", &target])
-        .output()
-        .map_err(Error::Io)?;
-    Ok(out.status.success())
-}
-
-/// Read `SHELBI_PANE_orch` from the session's tmux environment. Returns
-/// `None` when the var is unset (older session before
-/// `ensure_dashboard` pinned it) or empty.
-fn read_orch_pane_id(session: &str) -> Result<Option<String>> {
-    let target = shelbi_tmux::session_target(session);
-    let out = std::process::Command::new("tmux")
-        .args([
-            "show-environment",
-            "-t",
-            &target,
-            "SHELBI_PANE_orch",
-        ])
-        .output()
-        .map_err(Error::Io)?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    let line = String::from_utf8_lossy(&out.stdout);
-    let line = line.trim();
-    if line.starts_with('-') {
-        return Ok(None);
-    }
-    let Some((_, value)) = line.split_once('=') else {
-        return Ok(None);
-    };
-    if value.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(value.to_string()))
-    }
-}
-
-/// `tmux list-panes -a -F #{pane_id}` — true when the given pane id
-/// shows up in the live pane list. Catches the case where the
-/// orchestrator pane crashed (or was manually killed) after
-/// `SHELBI_PANE_orch` was set but before we asked.
-fn pane_alive(pane_id: &str) -> Result<bool> {
-    let out = std::process::Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_id}"])
-        .output()
-        .map_err(Error::Io)?;
-    if !out.status.success() {
-        return Ok(false);
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    Ok(stdout.lines().any(|l| l.trim() == pane_id))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
 
-    fn tmux_available() -> bool {
-        std::process::Command::new("tmux")
-            .arg("-V")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
+
 
     fn project_with_runner(name: &str, command: &str) -> shelbi_core::Project {
-        shelbi_core::Project {
+        shelbi_core::Project { session: Default::default(),
             name: "demo".into(),
             label: None,
             display_name: None,
@@ -518,92 +444,7 @@ mod tests {
         assert!(msg.contains("Handoff"), "request missing section: {msg}");
     }
 
-    #[test]
-    fn handoff_request_submits_through_verified_path_on_real_tmux() {
-        // The core fix: the (long, multi-line) handoff request must actually
-        // get *submitted* to the orchestrator pane — the paste/Enter race the
-        // verified-submit path closes — not merely pasted. This drives a fake
-        // Claude pane through the same `send_verified` sequence
-        // `request_orchestrator_handoff` now uses and asserts the pane went
-        // busy (proof Enter landed), exercising the real tmux paste-buffer +
-        // separate-Enter + confirm-busy path rather than the pure closures.
-        if !tmux_available() {
-            eprintln!("skipping: tmux not on PATH");
-            return;
-        }
-        let _lock = crate::test_lock::acquire();
-        crate::tmux_test_support::use_private_tmux_server();
-        // Holder keeps the private server alive so the fixture's exit can't
-        // empty and take down the server; skip if the sandbox denies sockets.
-        let holder = format!("shelbi-handoff-holder-{}", std::process::id());
-        if !crate::tmux_test_support::try_start_session(&holder, "holder") {
-            eprintln!("skipping: tmux cannot create a server here");
-            return;
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let script = tmp.path().join("fake-claude.sh");
-        fs::write(
-            &script,
-            // `sleep 600`, never `sleep 2`: the busy footer must outlive the
-            // verifier's poll under CI load, and the pane must not exit early.
-            "#!/bin/sh\n\
-             stty -echo\n\
-             printf '\\033[2J\\033[H────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  ? for shortcuts\\n'\n\
-             IFS= read -r line\n\
-             printf '\\033[2J\\033[H✳ Working on message\\n────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  esc to interrupt\\n'\n\
-             sleep 600\n",
-        )
-        .unwrap();
 
-        let session = format!("shelbi-handoff-test-{}", std::process::id());
-        let started = std::process::Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session,
-                "-n",
-                "agent",
-                "sh",
-                script.to_str().unwrap(),
-            ])
-            .status();
-        // The holder guarantees a live server, so a failure here is real.
-        assert!(
-            matches!(started, Ok(status) if status.success()),
-            "failed to start fixture session on the private server"
-        );
-
-        let addr = TmuxAddr {
-            session: session.clone(),
-            window: "agent".into(),
-        };
-        let ready_deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < ready_deadline {
-            if shelbi_tmux::capture(&Host::Local, &addr)
-                .unwrap_or_default()
-                .contains("? for shortcuts")
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        let baseline = submit::PaneBaseline::capture(&Host::Local, &addr, submit::SubmitProfile::ClaudeUi);
-        let result = submit::send_verified(
-            &Host::Local,
-            &addr,
-            &handoff_request_message(),
-            &baseline,
-        );
-        crate::tmux_test_support::kill_session(&session);
-        crate::tmux_test_support::kill_session(&holder);
-
-        assert!(
-            matches!(result, Ok(SubmitStatus::Submitted { .. })),
-            "handoff request must verify as submitted, got {result:?}"
-        );
-    }
 
     #[test]
     fn handoff_outcome_variants_distinguish_proceed_reasons() {

@@ -9,17 +9,15 @@
 //! that changes a column's membership renumbers it before returning, so
 //! callers can treat `priority` as a stable position index.
 
-use std::str::FromStr;
-
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
 use shelbi_state::IssueStore;
 use shelbi_core::{
-    default_workflow, validate_branch, validate_task_id, validate_workflow_name, Column,
-    Owner, StatusCategory, Issue, Workflow, MAX_TASK_ID_LEN,
+    default_workflow, Column, Issue, Owner, StatusCategory, Workflow,
 };
+use shelbi_proto::control::{AddSpec, EditSpec, MutationKind, SubOp};
 
-use super::require_project;
+use super::{mutate_client, require_project};
 
 #[derive(Debug, Subcommand)]
 pub enum IssueCmd {
@@ -308,15 +306,6 @@ pub struct EditArgs {
     pub reason: Option<String>,
 }
 
-/// One in-place body substitution, in command-line order. Literal and regex
-/// variants interleave, so they share a single ordered list rather than two
-/// per-kind vectors — see [`ordered_substitutions`].
-#[derive(Debug, Clone, PartialEq)]
-enum SubOp {
-    Literal { from: String, to: String },
-    Regex { pattern: String, replacement: String },
-}
-
 pub fn run(project_opt: Option<String>, cmd: IssueCmd) -> Result<()> {
     let project = require_project(project_opt)?;
     // Version gate: board mutations against a stale daemon (old binary
@@ -340,28 +329,36 @@ pub fn run(project_opt: Option<String>, cmd: IssueCmd) -> Result<()> {
             to,
             reason,
             skip_transition_actions,
-        } => move_to(
+        } => mutate_client::run_mutation(
             &project,
             &id,
-            &to,
-            reason.as_deref(),
-            skip_transition_actions,
+            MutationKind::Move {
+                to,
+                reason,
+                skip_transition_actions,
+            },
         ),
-        IssueCmd::Assign { id, to, force } => assign(&project, &id, &to, force),
-        IssueCmd::Unassign { id } => unassign(&project, &id),
+        IssueCmd::Assign { id, to, force } => {
+            mutate_client::run_mutation(&project, &id, MutationKind::Assign { to, force })
+        }
+        IssueCmd::Unassign { id } => {
+            mutate_client::run_mutation(&project, &id, MutationKind::Unassign)
+        }
         IssueCmd::Start {
             id,
             workspace,
             branch,
             reason,
             force,
-        } => start(
+        } => mutate_client::run_mutation(
             &project,
             &id,
-            workspace.as_deref(),
-            branch.as_deref(),
-            reason.as_deref(),
-            force,
+            MutationKind::Start {
+                workspace,
+                branch,
+                reason,
+                force,
+            },
         ),
         IssueCmd::Resume {
             id,
@@ -435,110 +432,6 @@ fn workspace_occupied_by(
         }))
 }
 
-/// The issue — other than `exclude_id` — that `workspace_name` is actively
-/// assigned to right now, decided from **local, authoritative** state rather
-/// than the daemon's published index.
-///
-/// This is the release guard behind the supplant decision: a dispatch tears down
-/// the card's prior assignee only when that workspace is still on THIS card (or
-/// idle). If it has since been re-dispatched to another issue this returns that
-/// issue, so the release is skipped rather than killing a live worker mid-task on
-/// an unrelated card.
-///
-/// Why not the published index: on a remote (GitHub) backend `read_board` serves
-/// the daemon's `board-index.json`, which lags local routing — an assignment
-/// write never bumps a GitHub `updatedAt`, and a parked or dead daemon stops
-/// republishing entirely. In the 2026-10-04 incident the prior assignee had been
-/// re-dispatched to another card *after* the last refresh and the daemon then
-/// died: the index still showed that card in `todo` (and the old guard only
-/// counted `in_progress`/`review`), so the workspace read as idle and its live
-/// worker was killed. Assignment for a remote backend lives only in the local
-/// overlay (`assignments/<id>`), which every dispatch writes synchronously
-/// (`set_fields` → `set_task_assignment`) and `read_board`'s overlay re-resolve
-/// folds in. That overlay is the authoritative routing record here: any
-/// non-terminal issue other than `exclude_id` routed to the workspace counts as
-/// busy, whatever column a stale index shows it in.
-///
-/// Returns:
-/// - `Ok(Some(issue))` — the workspace is busy on another non-terminal issue;
-///   the caller skips the release and logs it.
-/// - `Ok(None)` — the workspace is definitively free (on THIS card or idle);
-///   the caller releases its pane.
-/// - `Err(_)` — can't confirm (the overlay read failed, or local state names
-///   another issue but the board isn't `Warm` enough to rule out that it has
-///   since gone terminal). The caller errs toward NOT releasing.
-fn workspace_busy_with_other(
-    project: &str,
-    workspace_name: &str,
-    exclude_id: &str,
-) -> Result<Option<Issue>> {
-    let cfg = shelbi_state::load_project(project)
-        .map_err(|e| anyhow!(e))?
-        .issue_tracker;
-    if !cfg.backend.is_remote() {
-        // Local (`file_system`) board: assignment lives in the card frontmatter
-        // and the directory read is always authoritative (`BoardState::Warm`).
-        // The open board is open-only, so every row is non-terminal — any card
-        // assigned to this workspace other than the one being dispatched counts,
-        // whatever column it is parked in.
-        return Ok(shelbi_state::read_board(project)
-            .map_err(|e| anyhow!(e))?
-            .into_issues()
-            .into_iter()
-            .map(|tf| tf.task)
-            .find(|task| {
-                task.assigned_to.as_deref() == Some(workspace_name) && task.id != exclude_id
-            }));
-    }
-
-    // Remote backend: the local assignment overlay is the authoritative routing
-    // record. Every dispatch writes it synchronously, so it never lags the way
-    // the daemon's published index can.
-    let mut others: Vec<String> = shelbi_state::task_assignments(project)
-        .map_err(|e| anyhow!(e))?
-        .into_iter()
-        .filter(|(id, ws)| ws == workspace_name && id != exclude_id)
-        .map(|(id, _)| id)
-        .collect();
-    if others.is_empty() {
-        // Authoritative: nothing else is routed to this workspace, so it is on
-        // THIS card or idle — safe to release.
-        return Ok(None);
-    }
-
-    // At least one other issue is routed here. Confirm it is still non-terminal
-    // before counting it busy: a terminal card's marker can linger, and a stale
-    // marker alone must not block a legitimate release. The open board drops
-    // terminal cards, so presence there is the confirmation — and it holds even
-    // for a `Stale` index, which is exactly the incident shape (the routed card
-    // still listed, in whatever column).
-    let state = shelbi_state::read_board(project).map_err(|e| anyhow!(e))?;
-    if let Some(task) = state
-        .issues()
-        .iter()
-        .find(|tf| others.contains(&tf.task.id))
-        .map(|tf| tf.task.clone())
-    {
-        return Ok(Some(task));
-    }
-
-    // None of the routed issues are in the open board. A `Warm` board is the
-    // current open-only set, so their absence proves they have gone terminal and
-    // the workspace is free. A board that isn't warm (stale, cold, unreachable)
-    // can't prove that, so we can't confirm — err toward NOT releasing.
-    match state {
-        shelbi_state::BoardState::Warm(_) => Ok(None),
-        _ => {
-            others.sort();
-            Err(anyhow!(
-                "the prior assignee `{workspace_name}` is routed to `{}` in the local overlay but \
-                 the board index isn't warm enough to confirm whether it is still active",
-                others.join("`, `"),
-            ))
-        }
-    }
-}
-
 /// Refuse to dispatch or assign onto a workspace already running a *different*
 /// in-flight issue. Shared by `issue assign`, `issue start`, and `issue resume`
 /// so an assignment a dispatch would refuse is refused up front — the two can
@@ -582,6 +475,9 @@ fn load_issue(project: &str, id: &str) -> Result<shelbi_state::IssueFile> {
         .ok_or_else(|| anyhow!("issue `{id}` not found"))
 }
 
+/// `shelbi issue add` — resolve the body source (client-side stdin), build the
+/// [`AddSpec`], and run the mutation. All creation logic (id generation, body
+/// defaulting, the orchestrator wake) lives in `shelbi_orchestrator::mutate`.
 fn add(project: &str, args: AddArgs) -> Result<()> {
     // Only consult stdin when NO explicit body source was passed. `-d` /
     // `--description` already carries the body, so touching `stdin()` would
@@ -592,7 +488,30 @@ fn add(project: &str, args: AddArgs) -> Result<()> {
     } else {
         None
     };
-    add_with_stdin(project, args, stdin_body)
+    // Body precedence: `-d` and piped stdin are two spellings of the same input,
+    // so supplying both is ambiguous — refuse rather than silently discard
+    // either one. With neither, the body stays `None` and the library defaults
+    // it to the title (so the "default to title" shaping lives in one place).
+    let body = match (args.description, stdin_body) {
+        (Some(_), Some(_)) => bail!(
+            "both --description and piped stdin were given — pass the body one way \
+             (drop -d, or close stdin)"
+        ),
+        (Some(d), None) => Some(d),
+        (None, Some(s)) => Some(s.trim_end().to_string()),
+        (None, None) => None,
+    };
+    let spec = AddSpec {
+        title: args.title,
+        id: args.id,
+        status: args.status,
+        body,
+        depends_on: args.depends_on,
+        prefers_machine: args.prefers_machine,
+        workflow: args.workflow,
+        branch: args.branch,
+    };
+    mutate_client::run_mutation(project, "", MutationKind::Add(Box::new(spec)))
 }
 
 /// Whether `add` should consult stdin for the body. False when an explicit
@@ -629,111 +548,6 @@ fn read_piped_stdin() -> Result<Option<String>> {
         return Ok(None);
     }
     Ok(Some(buf))
-}
-
-fn add_with_stdin(project: &str, args: AddArgs, stdin_body: Option<String>) -> Result<()> {
-    let column = Column::from_str(&args.status).map_err(|e| anyhow!(e))?;
-    let id = match args.id {
-        Some(id) => {
-            validate_task_id(&id).map_err(|e| anyhow!(e))?;
-            if shelbi_state::task_path(project, &id)
-                .map_err(|e| anyhow!(e))?
-                .exists()
-            {
-                bail!("issue id `{id}` already exists");
-            }
-            id
-        }
-        None => generate_unique_id(project, &args.title)?,
-    };
-
-    if let Some(name) = args.workflow.as_deref() {
-        validate_workflow_name(name).map_err(|e| anyhow!(e))?;
-    }
-    // Body precedence: `-d` and piped stdin are two spellings of the same
-    // input, so supplying both is ambiguous — refuse rather than silently
-    // discard either one. With neither, the body defaults to the title.
-    let body = match (args.description, stdin_body) {
-        (Some(_), Some(_)) => bail!(
-            "both --description and piped stdin were given — pass the body one way \
-             (drop -d, or close stdin)"
-        ),
-        (Some(d), None) => format!("{d}\n"),
-        (None, Some(s)) => format!("{}\n", s.trim_end()),
-        (None, None) => format!("{}\n", args.title),
-    };
-    // Route creation through the board seam. `add` appends to the column
-    // (priority = current length), validates deps (self-ref / unknown id /
-    // cycle), and is create-exclusive — the authoritative no-overwrite
-    // guarantee. The up-front existence checks above stay as advisory races.
-    let store = cached_issue_store(project)?;
-    let spec = shelbi_state::NewIssue {
-        id: id.clone(),
-        title: args.title.clone(),
-        column: column.clone(),
-        body,
-        workflow: args.workflow.clone(),
-        branch: args.branch.clone(),
-        depends_on: dedup_preserving_order(args.depends_on.clone()),
-        prefers_machine: args.prefers_machine.clone(),
-        zen: None,
-        launch: None,
-        params: std::collections::BTreeMap::new(),
-        priority: None,
-    };
-    let created = store.add(spec).map_err(|e| anyhow!(e))?;
-
-    // Wake the orchestrator when a card is created DIRECTLY into an
-    // agent-owned status. `move` appends a transition event (which carries
-    // `to_category=` — the orchestrator's start signal for `ready`); `add`
-    // used to append nothing, so `issue add --status todo` created the card
-    // but never woke the orchestrator, unlike moving into `todo`. We now
-    // emit a creation event so the two paths behave identically.
-    //
-    // The backlog inbox stays quiet: it's the triage stage, has no reaction
-    // rule, and firing on every `issue add "title"` (the default) would wake
-    // the orchestrator for work that isn't ready. A creation is not a move,
-    // so `from == to == <created status>` — the line reports the card came
-    // into existence in that status rather than fabricating a source column.
-    // A failed append only loses the wake signal (the card itself is already
-    // persisted), so we warn rather than roll back the creation — matching
-    // `start` / `resume`, not `move`'s rollback-on-append-failure.
-    if column.category() != StatusCategory::Backlog {
-        let project_yaml = shelbi_state::load_project(project).ok();
-        let workflow_name = project_yaml
-            .as_ref()
-            .map(|p| shelbi_state::resolve_task_workflow_name(p, &created).to_string())
-            .unwrap_or_else(|| created.workflow_or_default().to_string());
-        if let Err(e) = shelbi_state::append_task_event(
-            project,
-            &created.id,
-            &workflow_name,
-            column.clone(),
-            column.clone(),
-            "user:cli:add",
-        ) {
-            eprintln!("warning: append_task_event failed: {e}");
-        }
-    }
-
-    println!(
-        "✓ {} created in {column} (priority {})",
-        created.id, created.priority
-    );
-    Ok(())
-}
-
-/// Stable de-dup that preserves first-occurrence order. Used so a user
-/// passing `--depends-on a --depends-on a --depends-on b` lands as `[a, b]`.
-fn dedup_preserving_order(items: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        if seen.insert(item.clone()) {
-            out.push(item);
-        }
-    }
-    out
 }
 
 /// The full board rendering used by both `shelbi issue list` (no flags)
@@ -952,39 +766,6 @@ fn depends(project: &str, args: DependsArgs) -> Result<()> {
     Ok(())
 }
 
-fn move_to(
-    project: &str,
-    id: &str,
-    to: &str,
-    reason: Option<&str>,
-    skip_transition_actions: bool,
-) -> Result<()> {
-    // The move itself — target resolution, the in-progress branch cut, the
-    // edge's gated merge, the status write + event, the post-merge cleanup —
-    // is `shelbi_orchestrator::transition::move_issue`, shared with the TUI
-    // board so a transition's actions run the same from either surface. This
-    // wrapper only owns the terminal output.
-    use shelbi_orchestrator::transition::{move_issue, MoveError, MoveRequest};
-    let outcome = move_issue(
-        &MoveRequest {
-            project,
-            id,
-            to,
-            reason: reason.unwrap_or("user:cli"),
-            workspace_fallback: "cli",
-            skip_transition_actions,
-        },
-        &mut |w| eprintln!("warning: {w}"),
-    )
-    .map_err(|e| match e {
-        MoveError::Move(e) | MoveError::LoadProject(e) | MoveError::BranchCut(e) => anyhow!(e),
-        e @ (MoveError::Merge { .. } | MoveError::EventAppend { .. }) => anyhow!("{e}"),
-    })?;
-
-    println!("✓ {id} → {}", outcome.column);
-    Ok(())
-}
-
 /// Load the workflow assigned to `issue`. Project defaults are resolved via
 /// project config; a workflow that can't be loaded — whatever the reason —
 /// falls back to the canonical default workflow with a stderr warning.
@@ -1072,17 +853,6 @@ fn dispatch_destination_status<'a>(
     start_destination_status(workflow)
 }
 
-/// The required workspace tags of the status `issue start` lands the card in —
-/// the set a workspace's effective tags must be a superset of to take this
-/// issue (see the tag-routing check in [`start`]). Empty when the workflow has
-/// no such status or it declares no `tags:`.
-fn required_active_tags(project: &str, issue: &Issue) -> Result<std::collections::BTreeSet<String>> {
-    let workflow = resolve_task_workflow(project, issue)?;
-    Ok(dispatch_destination_status(&workflow, &issue.column)
-        .map(|s| s.tags.iter().cloned().collect())
-        .unwrap_or_default())
-}
-
 fn resolve_active_agent_for_dispatch(project: &str, issue: &Issue) -> Result<String> {
     use shelbi_orchestrator::dispatch::{resolve_dispatch_agent, DispatchDecision};
     use shelbi_state::DEVELOPER_AGENT;
@@ -1127,108 +897,6 @@ fn resolve_active_agent_for_dispatch(project: &str, issue: &Issue) -> Result<Str
             Ok(DEVELOPER_AGENT.to_string())
         }
     }
-}
-
-/// Guard against routing a normal dev issue onto a review slot. A review slot is
-/// a workspace whose [effective tags](shelbi_core::Project::effective_tags)
-/// (its own ∪ its machine's) include `review` — the canonical marker
-/// (`config_upgrade_apply` migrates the legacy `role: review` onto it, and the
-/// poller gates review handling on it). Such slots exist only to load a
-/// handed-off branch and serve it for a human; they're filled by the poller's
-/// `autoload_review_queue`, which does NOT go through these CLI handlers, so the
-/// legitimate review-load path is unaffected by this guard.
-///
-/// Without `--force` a review-slot target is rejected with a message naming the
-/// tag and pointing at the review queue. With `--force` the override is allowed
-/// but recorded on `~/.shelbi/events.log` (best-effort — a logging failure
-/// warns rather than blocking the deliberate human action).
-fn guard_review_slot(
-    project_yaml: &shelbi_core::Project,
-    workspace: &shelbi_core::WorkspaceSpec,
-    workspace_name: &str,
-    task_id: &str,
-    force: bool,
-) -> Result<()> {
-    if !project_yaml.effective_tags(workspace).contains("review") {
-        return Ok(());
-    }
-    if !force {
-        bail!(
-            "workspace `{workspace_name}` is a review slot (tagged `review`) — review issues \
-             load via the review queue, not direct dispatch; pick a non-review workspace \
-             (or pass --force to override)"
-        );
-    }
-    if let Err(e) =
-        shelbi_state::append_review_slot_override_event(task_id, workspace_name, "user:force")
-    {
-        eprintln!("warning: append_review_slot_override_event failed: {e}");
-    }
-    Ok(())
-}
-
-fn assign(project: &str, id: &str, workspace: &str, force: bool) -> Result<()> {
-    let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    let ws = project_yaml.workspace(workspace).ok_or_else(|| {
-        anyhow!(
-            "workspace `{workspace}` not declared in project `{project}` (known: {})",
-            project_yaml
-                .workspaces
-                .iter()
-                .map(|w| w.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })?;
-    // Refuse a review slot unless explicitly forced (logged). Review slots are
-    // filled by the review autoloader, never by direct assignment.
-    guard_review_slot(&project_yaml, ws, workspace, id, force)?;
-    // `id` must exist — surface a clear error before the assignment write.
-    load_issue(project, id)?;
-    // Apply the same occupancy rule `issue start` enforces, so an assignment a
-    // dispatch would refuse is refused up front — a card is never left assigned
-    // to a workspace already running a different in-flight issue.
-    ensure_workspace_dispatchable(project, workspace, id)?;
-    let store = cached_issue_store(project)?;
-    store
-        .set_fields(
-            id,
-            shelbi_state::IssueFields {
-                assigned_to: Some(Some(workspace.to_string())),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| anyhow!(e))?;
-    // A fresh assignment un-parks the issue, so a previously-parked card can be
-    // re-served. Best-effort — a stale marker only ever suppresses an auto-load.
-    let _ = store.clear_parked(id);
-    println!("✓ {id} assigned to {workspace}");
-    Ok(())
-}
-
-fn unassign(project: &str, id: &str) -> Result<()> {
-    let tf = load_issue(project, id)?;
-    // Unassigning a review-column (handoff) issue from its slot is a *park*: it
-    // must stay unloaded, not be re-grabbed by the review auto-loader on the
-    // next tick. `park_review_task` clears `assigned_to` and sets the parked
-    // marker in one locked write. A non-review issue is a plain unassign.
-    let store = cached_issue_store(project)?;
-    if tf.task.column == Column::review() {
-        store.park_review(id).map_err(|e| anyhow!(e))?;
-        println!("✓ {id} unassigned (parked — won't auto-reload for review)");
-        return Ok(());
-    }
-    store
-        .set_fields(
-            id,
-            shelbi_state::IssueFields {
-                assigned_to: Some(None),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| anyhow!(e))?;
-    println!("✓ {id} unassigned");
-    Ok(())
 }
 
 /// Sort a single column's listing into the canonical board order the stores use
@@ -1332,424 +1000,6 @@ fn prio(project: &str, args: PrioArgs) -> Result<()> {
     Ok(())
 }
 
-fn start(
-    project: &str,
-    id: &str,
-    workspace_arg: Option<&str>,
-    branch_arg: Option<&str>,
-    reason: Option<&str>,
-    force: bool,
-) -> Result<()> {
-    let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    let mut tf = load_issue(project, id)?;
-
-    // Resolve workspace: explicit --workspace wins; otherwise reuse issue.assigned_to.
-    let workspace_name = workspace_arg
-        .map(str::to_string)
-        .or_else(|| tf.task.assigned_to.clone())
-        .ok_or_else(|| {
-            anyhow!(
-                "issue `{id}` has no assigned workspace — pass `--workspace NAME` or run \
-                 `shelbi issue assign {id} --to <workspace>` first"
-            )
-        })?;
-    let workspace = project_yaml.workspace(&workspace_name).ok_or_else(|| {
-        anyhow!(
-            "workspace `{workspace_name}` not declared in project `{project}` (known: {})",
-            project_yaml
-                .workspaces
-                .iter()
-                .map(|w| w.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })?;
-
-    // Refuse to dispatch a normal dev issue onto a review slot (a `review`-tagged
-    // workspace) unless explicitly forced (logged). Review slots serve
-    // handed-off branches for a human via the review autoloader — dispatching
-    // dev work onto one is almost always a routing mistake. This is the hard CLI
-    // backstop for the soft orchestrator instruction that excludes review slots
-    // from auto-dispatch.
-    guard_review_slot(&project_yaml, workspace, &workspace_name, id, force)?;
-
-    // Tag routing (Plans/generic-review-via-workflow-primitives): if the
-    // active status the issue is entering requires workspace tags, the chosen
-    // workspace's *effective* tags (its own ∪ its machine's) must be a
-    // superset. An empty required set — the default for every stock status —
-    // accepts any workspace, so this is a no-op until a workflow opts in.
-    let required = required_active_tags(project, &tf.task)?;
-    if !required.is_empty() {
-        let effective = project_yaml.effective_tags(workspace);
-        let missing: Vec<&str> = required
-            .iter()
-            .filter(|t| !effective.contains(t.as_str()))
-            .map(String::as_str)
-            .collect();
-        if !missing.is_empty() {
-            bail!(
-                "workspace `{workspace_name}` can't take issue `{id}`: its active status \
-                 requires tag(s) {required:?} but the workspace's effective tags are \
-                 {effective:?} (missing {missing:?}) — assign a workspace tagged accordingly"
-            );
-        }
-    }
-
-    // Refuse to clobber a user shell. Clicking an idle workspace in the
-    // sidebar opens a plain shell in its window (marked with a tmux user
-    // option — see `shelbi_orchestrator::workspace::USER_SHELL_OPTION`);
-    // dispatching would kill that shell out from under the user, since
-    // `start_workspace_on_task` resets the pane. The workspace becomes
-    // dispatchable again the moment the shell exits. Best-effort: a probe
-    // failure (ssh blip) degrades to the historical reset-the-pane
-    // behavior rather than blocking dispatch.
-    if let Some(ws_machine) = project_yaml.machine(&workspace.machine) {
-        if let Ok(ws_addr) =
-            shelbi_orchestrator::workspace::workspace_tmux_addr(&project_yaml, workspace)
-        {
-            let shell_open = shelbi_orchestrator::workspace::workspace_user_shell_open(
-                &ws_machine.host(),
-                &ws_addr,
-            )
-            .unwrap_or(false);
-            if shell_open {
-                bail!(
-                    "workspace `{workspace_name}` is occupied by a user shell (opened from \
-                     the sidebar) — exit the shell there, or dispatch to another workspace"
-                );
-            }
-        }
-    }
-
-    // Refuse to clobber another in-flight issue on the same workspace. Pulling
-    // a workspace off mid-issue is intentional — make the user do it explicitly
-    // via `issue move <other> --to todo` first. Resolved from live board state
-    // (the daemon-owned index `workspace list` reads), never the dispatch-only
-    // `board-snapshot.json`, which could pin a done card's stale `in_progress`
-    // entry and lock an idle workspace out of dispatch indefinitely.
-    ensure_workspace_dispatchable(project, &workspace_name, id)?;
-
-    // Cut the branch on the hub if it hasn't been already (depends_on
-    // aware — see `shelbi_orchestrator::lifecycle`). Doing this BEFORE
-    // `start_workspace_on_task` means the workspace's `sync_worktree` sees an
-    // existing branch and just checks it out; for a hub-local workspace
-    // they share the repo, so the cut we just made is the same ref the
-    // workspace will resolve. An explicit `--branch` override still wins:
-    // it bypasses the lifecycle cut and tells `sync_worktree` to use
-    // that ref directly (the *release issue* pattern, Plans/workflows.md
-    // §12).
-    if branch_arg.is_none() {
-        let updated =
-            shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress(&project_yaml, id)
-                .map_err(|e| anyhow!(e))?;
-        tf = updated;
-    }
-    let branch = branch_arg
-        .map(str::to_string)
-        .or_else(|| tf.task.branch.clone())
-        .map(Ok)
-        .unwrap_or_else(|| {
-            let workflow = shelbi_state::load_task_workflow(project, &project_yaml, &tf.task)
-                .unwrap_or_else(|_| shelbi_core::default_workflow());
-            shelbi_orchestrator::branch::branch_name_for_task(
-                &project_yaml,
-                Some(&workflow),
-                &tf.task,
-            )
-            .map_err(|e| anyhow!(e))
-        })?;
-
-    // Resolve which agent runs in the spawned pane. `shelbi issue start`
-    // is always putting the issue into `in_progress`, so we look up the
-    // workflow's active status and ask the dispatch resolver which
-    // agent answers for it under the project's current Zen state. The
-    // CLI is an explicit user invocation, so we don't honor the
-    // "owner: user + Zen off → skip" rule here — the user typed the
-    // command, that's the intent override. We still surface the
-    // resolver's verdict via the `agent=` field on StartSpec so the
-    // worktree picks up the right `instructions.md` + skills mount.
-    let agent_name =
-        resolve_active_agent_for_dispatch(project, &tf.task).map_err(|e| anyhow!(e))?;
-
-    // Where the dispatch lands the card. Normally `in-progress`; but a card
-    // already parked in a custom agent-owned active gate (e.g.
-    // `adversarial-review`) stays in that gate — the `move_status` below is then
-    // a no-op and the gate's own agent (resolved just above from the same
-    // destination status) takes over in place, instead of the card being yanked
-    // back to `in-progress` under the developer. Resolved from the same workflow
-    // + current column as the agent, so the two can never disagree.
-    let dest_column = {
-        let workflow =
-            resolve_task_workflow(project, &tf.task).unwrap_or_else(|_| default_workflow());
-        dispatch_destination_status(&workflow, &tf.task.column)
-            .map(|s| Column::from_status_id(&s.id))
-            .unwrap_or_else(Column::in_progress)
-    };
-
-    // Persist the in_progress move BEFORE spawning the pane (F7). Ordering
-    // is load-bearing: if we spawned first and the process died before the
-    // save, an agent would be running against a card still sitting in
-    // `todo`, and auto-dispatch (which selects from `todo`) could hand the
-    // same issue to a second workspace — two agents on one branch. The
-    // conflict guard above only inspects the `in_progress` column, which
-    // the un-persisted first start never reached. By moving the card first
-    // the board reflects the in-flight work the instant the agent can
-    // exist. `original` snapshots the pre-move frontmatter so an explicit
-    // spawn failure can roll the card back rather than strand it in
-    // `in_progress` pointing at a pane that never launched.
-    let original = tf.task.clone();
-    let prev_column = tf.task.column.clone();
-    let store = cached_issue_store(project)?;
-    // `move_status` appends the card to `dest_column` and renumbers both the
-    // source and destination columns; the follow-up `set_fields` records the
-    // workspace + branch. Two locked writes through the store replace the old
-    // whole-task save + manual renumber. When the card is already in its
-    // destination (a dispatch onto the agent-owned active gate it is parked in),
-    // this is a no-op and only the assignment below changes.
-    if prev_column != dest_column {
-        store
-            .move_status(id, &dest_column, reason.unwrap_or("user:cli"))
-            .map_err(|e| anyhow!(e))?;
-    }
-    store
-        .set_fields(
-            id,
-            shelbi_state::IssueFields {
-                assigned_to: Some(Some(workspace_name.clone())),
-                branch: Some(Some(branch.clone())),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| anyhow!(e))?;
-
-    println!("→ launching {workspace_name} on {id} (branch: {branch}, agent: {agent_name})");
-
-    // Bound the launch phase. `start_workspace_on_task` already caps its
-    // *internal* readiness/submit waits, but the steps before the pane is even
-    // created — the dispatch + git-worktree locks, a `git fetch` on a fresh
-    // branch cut, and the auto-mode + runner-availability SSH probes — have no
-    // ceiling of their own and can each block indefinitely on a wedged network
-    // or a lock held by a crashed peer. Left unbounded, a single stuck step
-    // hangs `shelbi issue start` forever with the card already moved to
-    // `in_progress` and assigned but no pane and no dispatch event: the
-    // phantom-in_progress bug (observed 2026-07-15 on alpha). Run the launch on
-    // a worker thread and cap the wait; on timeout we record a
-    // `dispatch … status=failed` event, roll the card back, and fail loudly.
-    //
-    // Owned clones are moved into the thread so a genuinely-stuck launch can be
-    // abandoned rather than joined: we never block on the hung thread, and the
-    // OS reaps it (releasing any process-scoped locks it holds) when this
-    // short-lived CLI process exits moments later.
-    let launch_deadline = shelbi_orchestrator::workspace::launch_timeout();
-    let (tx, rx) = std::sync::mpsc::channel();
-    {
-        let project_owned = project_yaml.clone();
-        let workspace_owned = workspace.clone();
-        let task_id_owned = id.to_string();
-        let branch_owned = branch.clone();
-        let body_owned = tf.body.clone();
-        let agent_owned = agent_name.clone();
-        // The issue-level `launch:` override rides into the thread as an owned
-        // clone; `StartSpec` borrows it back below.
-        let launch_owned = tf.task.launch.clone();
-        std::thread::spawn(move || {
-            let result = shelbi_orchestrator::workspace::start_workspace_on_task(
-                shelbi_orchestrator::workspace::StartSpec {
-                    project: &project_owned,
-                    workspace: &workspace_owned,
-                    task_id: &task_id_owned,
-                    branch: &branch_owned,
-                    task_body: &body_owned,
-                    agent: Some(agent_owned.as_str()),
-                    launch_override: launch_owned.as_ref(),
-                },
-            );
-            // The receiver is gone if we already timed out — ignore the error.
-            let _ = tx.send(result);
-        });
-    }
-
-    // Wait for the launch, measuring the deadline from the LAST progress signal
-    // (a dispatch event recorded for this task/workspace) rather than one wall
-    // clock from here — a slow `git fetch` / `gh` call during launch extends the
-    // deadline instead of aborting a launch that is still moving (see
-    // `await_launch`). On a genuine timeout we first check whether the launch
-    // has meanwhile completed before undoing anything.
-    let mut launched_late = false;
-    let addr = match await_launch(&rx, launch_deadline, LAUNCH_POLL_INTERVAL, || {
-        dispatch_progress_token(project, id, &workspace_name)
-    }) {
-        LaunchWait::Completed(addr) => addr,
-        LaunchWait::SpawnFailed(e) => {
-            // Spawn failed cleanly. Roll the card back to its pre-start position
-            // AND tear down any pane the aborted launch left behind, so a failed
-            // launch never leaves a live worker stranded on a `todo` card (which
-            // the poller's orphan reaper would then race to kill).
-            rollback_and_teardown(
-                project,
-                &project_yaml,
-                workspace,
-                &original,
-                &tf.body,
-                prev_column.clone(),
-                id,
-            );
-            return Err(anyhow!(e).context("launching workspace"));
-        }
-        LaunchWait::Panicked => {
-            // Worker thread panicked before sending its result. Treat as a failed
-            // launch: record it, roll the card back + tear the pane down, surface.
-            if let Err(le) = shelbi_state::append_dispatch_event(
-                project,
-                id,
-                &workspace_name,
-                "failed",
-                "launch_thread_panicked",
-            ) {
-                eprintln!("warning: append_dispatch_event failed: {le}");
-            }
-            rollback_and_teardown(
-                project,
-                &project_yaml,
-                workspace,
-                &original,
-                &tf.body,
-                prev_column.clone(),
-                id,
-            );
-            return Err(anyhow!(
-                "launching workspace `{workspace_name}` on `{id}` failed: the launch thread \
-                 terminated unexpectedly before reporting a result"
-            ));
-        }
-        LaunchWait::IdleTimeout if launch_appears_complete(&project_yaml, workspace, id) => {
-            // The deadline elapsed with the launch thread abandoned, but the
-            // launch actually completed — a live pane for this workspace plus a
-            // confirmed/verified dispatch signal. Report a late success and LEAVE
-            // the card `in_progress`: rolling it back now would strand a live
-            // worker mid-task on a `todo` card. No `status=failed` event fires.
-            launched_late = true;
-            shelbi_orchestrator::workspace::workspace_tmux_addr(&project_yaml, workspace)
-                .map_err(|e| anyhow!(e))?
-        }
-        LaunchWait::IdleTimeout => {
-            // Launch blew past the ceiling with no completion in sight — the
-            // worker thread is still blocked on git/ssh/a stale lock. Record a
-            // failed-dispatch event so the stall is visible in
-            // `~/.shelbi/events.log` (not something you find by `ps`-grepping a
-            // stuck process), roll the card back, tear down any pane the launch
-            // spawned, and fail loudly. The abandoned thread dies with this
-            // process.
-            if let Err(le) = shelbi_state::append_dispatch_event(
-                project,
-                id,
-                &workspace_name,
-                "failed",
-                &format!("launch_timeout_after_{}s", launch_deadline.as_secs()),
-            ) {
-                eprintln!("warning: append_dispatch_event failed: {le}");
-            }
-            rollback_and_teardown(
-                project,
-                &project_yaml,
-                workspace,
-                &original,
-                &tf.body,
-                prev_column.clone(),
-                id,
-            );
-            return Err(anyhow!(
-                "launching workspace `{workspace_name}` on `{id}` timed out after {}s with no \
-                 completion signal — dispatch aborted, the issue rolled back to `{prev_column}`, \
-                 and the launched pane torn down. The launch likely blocked on git/ssh or a \
-                 stale lock; check the workspace, then re-run the dispatch.",
-                launch_deadline.as_secs(),
-            ));
-        }
-    };
-
-    // Spawn succeeded (possibly late) — record the dispatch event now (only
-    // successful starts get an events.log line; a rolled-back start leaves no
-    // misleading dispatch record).
-    if prev_column != dest_column {
-        let base_reason = reason.unwrap_or("user:cli:start");
-        let dispatched_reason = dispatch_reason_with_agent(base_reason, &agent_name);
-        let workflow = shelbi_state::resolve_task_workflow_name(&project_yaml, &tf.task);
-        if let Err(e) = shelbi_state::append_task_event(
-            project,
-            id,
-            workflow,
-            prev_column.clone(),
-            dest_column.clone(),
-            &dispatched_reason,
-        ) {
-            eprintln!("warning: append_task_event failed: {e}");
-        }
-    }
-
-    // Release the workspace this card was previously assigned to — but ONLY when
-    // that workspace is still working on THIS card (or has gone idle). The
-    // reassignment above already moved the card onto `workspace_name`; the prior
-    // assignee's pane would otherwise be left running against a card it no longer
-    // owns, so a gate-to-gate move (`in-progress -> adversarial-review`) still
-    // needs it torn down. What it must NOT do is tear down a prior assignee that
-    // has since been re-dispatched to a *different* issue — that pane holds a
-    // live worker mid-task on an unrelated card, and releasing on the card's
-    // stale `assigned_to` alone would kill it. Fires only once the new pane is
-    // confirmed up (this block runs after a successful launch), so a failed
-    // dispatch that rolls the card back never strands the prior worker.
-    // Best-effort throughout: a dead/absent pane or a board-read hiccup must not
-    // undo the authoritative reassignment already persisted.
-    if let Some(prev_ws_name) =
-        supplanted_workspace(original.assigned_to.as_deref(), &workspace_name)
-    {
-        match workspace_busy_with_other(project, prev_ws_name, id) {
-            // Still on this card (or idle) — safe to reclaim its pane.
-            Ok(None) => release_supplanted_pane(project, &project_yaml, prev_ws_name, id),
-            // Re-dispatched elsewhere — leave its live worker alone, and record a
-            // `skipped` line naming the issue it is busy with so the non-release
-            // is visible in `events.log` rather than silent.
-            Ok(Some(busy)) => {
-                if let Err(e) = shelbi_state::append_dispatch_event(
-                    project,
-                    id,
-                    prev_ws_name,
-                    "skipped",
-                    &format!(
-                        "prior assignee is now active on `{}`; its pane was left running",
-                        busy.id
-                    ),
-                ) {
-                    eprintln!("warning: append_dispatch_event failed: {e}");
-                }
-            }
-            // Board read failed — err toward NOT releasing. A possibly orphaned
-            // pane on this card is recoverable; killing an unrelated live worker
-            // on a false negative is not.
-            Err(e) => eprintln!(
-                "warning: couldn't check whether the prior assignee `{prev_ws_name}` is still \
-                 on `{id}` ({e}) — leaving its pane alone; kill a stale worker by hand if one \
-                 is left"
-            ),
-        }
-    }
-
-    if launched_late {
-        println!(
-            "✓ {id} → in_progress on {workspace_name} ({}) — launch confirmed after the {}s \
-             deadline; card left in_progress rather than rolled back",
-            addr.target(),
-            launch_deadline.as_secs(),
-        );
-    } else {
-        println!(
-            "✓ {id} → in_progress on {workspace_name} ({})",
-            addr.target()
-        );
-    }
-    Ok(())
-}
-
 /// Undo the in_progress move `start` persisted before spawning, after the
 /// spawn itself failed. Re-saves the pre-move frontmatter and renumbers
 /// both the column we bumped the card out of and `in_progress` (where the
@@ -1777,285 +1027,6 @@ fn rollback_start(project: &str, original: &Issue, _body: &str, prev_column: Col
     Ok(())
 }
 
-/// Roll the in_progress move back AND tear down the pane the failed launch
-/// spawned. A genuine launch failure must not leave a live worker stranded on a
-/// rolled-back (`todo`) card: nothing else owns that pane once the card is no
-/// longer active, and the poller's orphan reaper would otherwise race to kill it
-/// a tick later — turning a clean abort into a killed-mid-task worker. Both
-/// halves are best-effort and each surfaces its own failure so a half-cleaned
-/// board is never silent.
-fn rollback_and_teardown(
-    project: &str,
-    project_yaml: &shelbi_core::Project,
-    workspace: &shelbi_core::WorkspaceSpec,
-    original: &Issue,
-    body: &str,
-    prev_column: Column,
-    id: &str,
-) {
-    if let Err(re) = rollback_start(project, original, body, prev_column.clone()) {
-        eprintln!(
-            "warning: `{id}` launch failed and the rollback also failed ({re}); run \
-             `shelbi issue move {id} --to {prev_column}` to recover"
-        );
-    }
-    if let Err(te) = teardown_workspace_pane(project_yaml, workspace) {
-        eprintln!(
-            "warning: `{id}` launch failed; tearing down the workspace pane on `{}` also failed \
-             ({te}) — check the pane and kill it by hand if a stale worker is left",
-            workspace.name
-        );
-    }
-}
-
-/// Kill a workspace's tmux pane. Used on the launch-failure path to reclaim the
-/// pane an aborted dispatch left running. Resolving the machine/host/addr can
-/// fail on a mis-declared workspace; those surface as `Err` so the caller can
-/// warn rather than silently skipping the teardown.
-fn teardown_workspace_pane(
-    project_yaml: &shelbi_core::Project,
-    workspace: &shelbi_core::WorkspaceSpec,
-) -> Result<()> {
-    let machine = project_yaml.machine(&workspace.machine).ok_or_else(|| {
-        anyhow!(
-            "machine `{}` for workspace `{}` is not declared",
-            workspace.machine,
-            workspace.name
-        )
-    })?;
-    let host = machine.host();
-    let addr = shelbi_orchestrator::workspace::workspace_tmux_addr(project_yaml, workspace)
-        .map_err(|e| anyhow!(e))?;
-    shelbi_orchestrator::workspace::kill_workspace_pane(&host, &addr, &workspace.name)
-        .map_err(|e| anyhow!(e))
-}
-
-/// Is `workspace`'s tmux slot live right now? Resolves the machine/addr the same
-/// way [`teardown_workspace_pane`] does and asks tmux (local: the window;
-/// remote: the session). Errors on a mis-declared workspace — the addr won't
-/// resolve — which the caller treats as "can't confirm" rather than guessing.
-fn workspace_pane_liveness(
-    project_yaml: &shelbi_core::Project,
-    workspace: &shelbi_core::WorkspaceSpec,
-) -> Result<bool> {
-    let machine = project_yaml.machine(&workspace.machine).ok_or_else(|| {
-        anyhow!(
-            "machine `{}` for workspace `{}` is not declared",
-            workspace.machine,
-            workspace.name
-        )
-    })?;
-    let host = machine.host();
-    let addr = shelbi_orchestrator::workspace::workspace_tmux_addr(project_yaml, workspace)
-        .map_err(|e| anyhow!(e))?;
-    shelbi_orchestrator::workspace::workspace_slot_alive(&host, &addr).map_err(|e| anyhow!(e))
-}
-
-/// Tear down the pane of the card's prior assignee `prev_ws_name` and record a
-/// `released` dispatch event — but only when a live pane is actually taken down.
-/// The caller has already established that `prev_ws_name` is still on THIS card
-/// (or idle), so the teardown can't kill a worker that has moved to another
-/// issue.
-///
-/// An idle slot (no live pane) is a no-op that records nothing: the `released`
-/// line is reserved for a real teardown so it never implies a worker was killed
-/// when none was running. A workspace that won't resolve is left alone (teardown
-/// would hit the same error) and records nothing.
-fn release_supplanted_pane(
-    project: &str,
-    project_yaml: &shelbi_core::Project,
-    prev_ws_name: &str,
-    id: &str,
-) {
-    let Some(prev_ws) = project_yaml.workspace(prev_ws_name) else {
-        return;
-    };
-    match workspace_pane_liveness(project_yaml, prev_ws) {
-        // Idle slot: nothing to reclaim, nothing to record.
-        Ok(false) => {}
-        // A live pane on this card — reclaim it and log the release.
-        Ok(true) => {
-            if let Err(e) = teardown_workspace_pane(project_yaml, prev_ws) {
-                eprintln!(
-                    "warning: releasing the supplanted workspace pane on `{prev_ws_name}` \
-                     failed ({e}) — check it and kill a stale worker by hand if one is left"
-                );
-            } else if let Err(e) = shelbi_state::append_dispatch_event(
-                project,
-                id,
-                prev_ws_name,
-                "released",
-                "supplanted by a new workspace taking over the card's active status",
-            ) {
-                eprintln!("warning: append_dispatch_event failed: {e}");
-            }
-        }
-        // Can't confirm liveness (the addr won't resolve) — teardown would hit
-        // the same error, so leave it and record nothing rather than over-claim
-        // a release that didn't happen.
-        Err(e) => eprintln!(
-            "warning: couldn't probe the supplanted pane on `{prev_ws_name}` ({e}) — left \
-             alone; kill a stale worker by hand if one is left"
-        ),
-    }
-}
-
-/// Poll cadence of [`await_launch`]. Small enough that a completed or
-/// newly-progressing launch is noticed promptly, large enough not to hammer
-/// `events.log` while a slow launch settles.
-const LAUNCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Terminal outcome of [`await_launch`].
-enum LaunchWait {
-    /// The launch thread returned a live pane address.
-    Completed(shelbi_core::TmuxAddr),
-    /// The launch thread returned an error (a clean spawn failure).
-    SpawnFailed(shelbi_core::Error),
-    /// The launch thread panicked before reporting (the channel disconnected).
-    Panicked,
-    /// The idle deadline elapsed with no launch progress and the thread still
-    /// running — an abandoned, apparently-stuck launch.
-    IdleTimeout,
-}
-
-/// Wait for the launch worker thread, measuring the timeout from the LAST
-/// observed launch-progress signal rather than one wall clock from the CLI's
-/// start.
-///
-/// `progress_token` returns a value that changes whenever the launch records new
-/// progress (a fresh dispatch event for this task/workspace — the message
-/// channel coming up, a confirm landing). Each change resets the idle clock, so
-/// a launch that keeps moving — a cold `git fetch`, slow `gh` calls, staged pane
-/// bring-up — extends its own deadline instead of being aborted mid-flight. Only
-/// `idle_deadline` of true silence with the thread still running yields
-/// [`LaunchWait::IdleTimeout`]; a thread that reports (success or error) is
-/// noticed within `poll_interval` regardless.
-fn await_launch(
-    rx: &std::sync::mpsc::Receiver<shelbi_core::Result<shelbi_core::TmuxAddr>>,
-    idle_deadline: std::time::Duration,
-    poll_interval: std::time::Duration,
-    mut progress_token: impl FnMut() -> u64,
-) -> LaunchWait {
-    use std::sync::mpsc::RecvTimeoutError;
-    let mut last_token = progress_token();
-    let mut last_progress = std::time::Instant::now();
-    loop {
-        match rx.recv_timeout(poll_interval) {
-            Ok(Ok(addr)) => return LaunchWait::Completed(addr),
-            Ok(Err(e)) => return LaunchWait::SpawnFailed(e),
-            Err(RecvTimeoutError::Disconnected) => return LaunchWait::Panicked,
-            Err(RecvTimeoutError::Timeout) => {
-                let token = progress_token();
-                if token != last_token {
-                    last_token = token;
-                    last_progress = std::time::Instant::now();
-                }
-                if last_progress.elapsed() >= idle_deadline {
-                    return LaunchWait::IdleTimeout;
-                }
-            }
-        }
-    }
-}
-
-/// The launch-progress token [`await_launch`] watches: the number of dispatch
-/// events recorded for this task/workspace so far. It grows as the launch
-/// records progress (`status=message-channel`, then `status=confirmed`/
-/// `unverified`/`stuck`/…), so a change means the launch is still moving. Any
-/// read failure returns 0 — a stable token that simply doesn't reset the idle
-/// clock, which is the conservative choice (it can only shorten the wait, never
-/// extend it past the deadline forever).
-fn dispatch_progress_token(project: &str, task_id: &str, workspace: &str) -> u64 {
-    let Ok(path) = shelbi_state::events_log_path() else {
-        return 0;
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return 0;
-    };
-    count_dispatch_events(&text, project, task_id, workspace, &[])
-}
-
-/// Does the launch look genuinely complete? True when a live, non-user-shell
-/// pane exists for the workspace AND a confirm-level dispatch signal
-/// (`status=confirmed` — a busy seed observed or a verified submit — or
-/// `status=unverified` — delivered on a runner with no pane verifier) was
-/// recorded for this task. This is the safety net for a launch that timed out
-/// (its worker thread abandoned) yet actually succeeded: leaving the card
-/// `in_progress` here avoids rolling back and killing a live, working pane.
-///
-/// A live pane with only the earlier `status=message-channel` and no confirm is
-/// deliberately NOT "complete": that is exactly the never-confirmed launch the
-/// caller must roll back and tear down, so the reaper has nothing to reap.
-fn launch_appears_complete(
-    project_yaml: &shelbi_core::Project,
-    workspace: &shelbi_core::WorkspaceSpec,
-    task_id: &str,
-) -> bool {
-    let Some(machine) = project_yaml.machine(&workspace.machine) else {
-        return false;
-    };
-    let host = machine.host();
-    let Ok(addr) = shelbi_orchestrator::workspace::workspace_tmux_addr(project_yaml, workspace)
-    else {
-        return false;
-    };
-    let alive = matches!(
-        shelbi_orchestrator::workspace::probe_workspace_slot(
-            &host,
-            &addr,
-            shelbi_orchestrator::workspace::probe_deadline(),
-        ),
-        shelbi_orchestrator::workspace::SlotProbe::Alive { user_shell: false }
-    );
-    if !alive {
-        return false;
-    }
-    let text = shelbi_state::events_log_path()
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default();
-    count_dispatch_events(
-        &text,
-        &project_yaml.name,
-        task_id,
-        &workspace.name,
-        &["confirmed", "unverified"],
-    ) > 0
-}
-
-/// Count `dispatch project=<p> task=<id> workspace=<ws> status=<s> …` lines in
-/// an events.log body for one project/task/workspace. When `statuses` is
-/// non-empty, only lines whose `status=` is one of them count; an empty
-/// `statuses` counts every dispatch line for the triple. Split out so both the
-/// progress token and the completion check share one parser (and so it is
-/// unit-testable without touching disk).
-///
-/// `events.log` is hub-global and workspace names are unique only within a
-/// project, so the match is scoped to `project`: a line that carries `project=`
-/// must match it, while a legacy line without one (pre-upgrade binary) counts on
-/// task+workspace alone, as today.
-fn count_dispatch_events(
-    log: &str,
-    project: &str,
-    task_id: &str,
-    workspace: &str,
-    statuses: &[&str],
-) -> u64 {
-    let proj_tok = format!("project={project} ");
-    let task_tok = format!("task={task_id} ");
-    let ws_tok = format!("workspace={workspace} ");
-    log.lines()
-        .filter(|l| l.contains(" dispatch ") && l.contains(&task_tok) && l.contains(&ws_tok))
-        .filter(|l| !l.contains("project=") || l.contains(&proj_tok))
-        .filter(|l| {
-            statuses.is_empty()
-                || statuses
-                    .iter()
-                    .any(|s| l.contains(&format!("status={s} ")) || l.ends_with(&format!("status={s}")))
-        })
-        .count() as u64
-}
-
 /// Compose the dispatch event's `reason=` value by appending the
 /// resolved agent name. `append_task_event` folds the embedded space into
 /// an underscore so the final on-the-wire shape is
@@ -2063,20 +1034,6 @@ fn count_dispatch_events(
 /// the activity-feed parser without breaking the single-token contract.
 fn dispatch_reason_with_agent(base: &str, agent: &str) -> String {
     format!("{base} agent={agent}")
-}
-
-/// The workspace, if any, whose pane a dispatch supplants: the card's previous
-/// assignee, but only when a *different* workspace is taking over. `None` when
-/// the card had no prior assignee (a fresh dispatch) or the same workspace is
-/// re-dispatched (a resume / same-slot restart releases nothing). Split out so
-/// the release decision behind criterion (b) — "the previous workspace's pane is
-/// released rather than orphaned when the card moves to a different agent-owned
-/// status" — is unit-testable without spawning a live pane.
-fn supplanted_workspace<'a>(prev_assigned: Option<&'a str>, new_workspace: &str) -> Option<&'a str> {
-    match prev_assigned {
-        Some(prev) if prev != new_workspace => Some(prev),
-        _ => None,
-    }
 }
 
 /// `shelbi issue resume` — relaunch the assigned workspace on the issue it is
@@ -2217,7 +1174,7 @@ fn resume(
         }
     }
 
-    println!("✓ {id} resumed on {workspace_name} ({})", addr.target());
+    println!("✓ {id} resumed on {workspace_name} ({})", addr.label());
     Ok(())
 }
 
@@ -2315,6 +1272,10 @@ where
     ops
 }
 
+/// `shelbi issue edit` — resolve the body source (client-side stdin / file read
+/// / `$EDITOR`), then build an [`EditSpec`] and run the mutation. Substitution
+/// application, append composition, field validation, and the write live in
+/// `shelbi_orchestrator::mutate`.
 fn edit(project: &str, args: EditArgs) -> Result<()> {
     // Only consult stdin when NO explicit body source was passed. `--body` /
     // `--body-file` already carry the body, so touching `stdin()` would
@@ -2337,73 +1298,18 @@ fn edit(project: &str, args: EditArgs) -> Result<()> {
         }
         return super::launch_editor(&path);
     }
-    let ordering = ordered_substitutions(
+    if args.prefers_machine.is_some() && args.no_prefers_machine {
+        bail!("--prefers-machine and --no-prefers-machine are mutually exclusive");
+    }
+    // Recover the exact command-line order of `--sub`/`--sub-regex` (clap can't).
+    let subs = ordered_substitutions(
         std::env::args_os().map(|s| s.to_string_lossy().into_owned()),
         &args,
     );
-    edit_non_interactive(project, args, stdin_body, ordering)
-}
 
-/// Apply one or more literal/regex substitutions to `body` in order, returning
-/// the new body plus a per-op replacement count. Errors (writing nothing) on an
-/// invalid regex, an empty literal/pattern, or — unless `allow_no_match` — a
-/// substitution that matched zero occurrences.
-fn apply_substitutions(
-    body: &str,
-    ops: &[SubOp],
-    allow_no_match: bool,
-) -> Result<(String, Vec<(String, usize)>)> {
-    let mut current = body.to_string();
-    let mut report: Vec<(String, usize)> = Vec::new();
-    for op in ops {
-        let (label, count, next) = match op {
-            SubOp::Literal { from, to } => {
-                if from.is_empty() {
-                    bail!("--sub OLD must not be empty");
-                }
-                let count = current.matches(from.as_str()).count();
-                let next = current.replace(from.as_str(), to);
-                (format!("`{from}` → `{to}`"), count, next)
-            }
-            SubOp::Regex {
-                pattern,
-                replacement,
-            } => {
-                if pattern.is_empty() {
-                    bail!("--sub-regex PATTERN must not be empty");
-                }
-                let re = regex::Regex::new(pattern)
-                    .map_err(|e| anyhow!("invalid --sub-regex pattern `{pattern}`: {e}"))?;
-                let count = re.find_iter(&current).count();
-                let next = re.replace_all(&current, replacement.as_str()).into_owned();
-                (
-                    format!("/{pattern}/ → `{replacement}`"),
-                    count,
-                    next,
-                )
-            }
-        };
-        if count == 0 && !allow_no_match {
-            bail!(
-                "substitution {label} matched zero occurrences — the issue body is \
-                 unchanged (pass --allow-no-match to permit a no-op substitution)"
-            );
-        }
-        current = next;
-        report.push((label, count));
-    }
-    Ok((current, report))
-}
-
-/// Compose the new body from the body sources (`--body`/`--body-file`/stdin),
-/// honoring `--append`. Returns `None` when no body source was supplied (a
-/// title-only or field-only edit leaves the body untouched). At most one body
-/// source may be given.
-fn resolve_body_edit(
-    args: &EditArgs,
-    stdin_body: &Option<String>,
-    existing: &str,
-) -> Result<Option<String>> {
+    // Resolve the single body source from the flags/stdin available only to the
+    // client (the daemon can't read this process's stdin or cwd files). Pass the
+    // RAW text through — the library trims and composes (`--append`).
     let file_body = match &args.body_file {
         Some(path) => Some(
             std::fs::read_to_string(path)
@@ -2411,188 +1317,42 @@ fn resolve_body_edit(
         ),
         None => None,
     };
-    let sources = [
-        args.body.clone(),
-        file_body,
-        stdin_body.clone(),
-    ];
-    let provided: Vec<String> = sources.into_iter().flatten().collect();
-    if provided.len() > 1 {
+    let sources: Vec<String> = [args.body.clone(), file_body, stdin_body]
+        .into_iter()
+        .flatten()
+        .collect();
+    if sources.len() > 1 {
         bail!(
             "multiple body sources given — pass the body exactly one way \
              (--body, --body-file, or piped stdin)"
         );
     }
-    let source = provided.into_iter().next();
-    match source {
-        None => {
-            if args.append {
-                bail!("--append needs a body source (--body, --body-file, or piped stdin)");
-            }
-            Ok(None)
-        }
-        Some(text) => {
-            let text = text.trim_end();
-            if args.append {
-                let mut b = existing.to_string();
-                if !b.is_empty() {
-                    if !b.ends_with('\n') {
-                        b.push('\n');
-                    }
-                    // Blank-line separator so an appended acceptance criterion
-                    // reads as its own paragraph rather than joining the prior
-                    // line.
-                    if !b.ends_with("\n\n") {
-                        b.push('\n');
-                    }
-                }
-                b.push_str(text);
-                b.push('\n');
-                Ok(Some(b))
-            } else {
-                Ok(Some(format!("{text}\n")))
-            }
-        }
-    }
-}
-
-/// Whether the issue's current column is an `active`-category status under its
-/// workflow (e.g. `in_progress`). A body/field edit to such an issue won't reach
-/// the already-running worker until it is re-dispatched.
-fn task_column_is_active(project: &str, issue: &Issue) -> bool {
-    // Stock status ids carry their category directly, so a routine edit on a
-    // project without materialized workflow files doesn't emit a spurious
-    // workflow-load warning just to compute this hint.
-    if Column::core().contains(&issue.column) {
-        return issue.column.category() == StatusCategory::Active;
-    }
-    // Custom status id: resolve its category through the issue's workflow.
-    resolve_task_workflow(project, issue)
-        .ok()
-        .and_then(|wf| {
-            wf.status(issue.column.as_str())
-                .map(|s| s.category == StatusCategory::Active)
-        })
-        .unwrap_or(false)
-}
-
-fn edit_non_interactive(
-    project: &str,
-    args: EditArgs,
-    stdin_body: Option<String>,
-    ordering: Vec<SubOp>,
-) -> Result<()> {
-    if args.prefers_machine.is_some() && args.no_prefers_machine {
-        bail!("--prefers-machine and --no-prefers-machine are mutually exclusive");
-    }
-    let has_body_source =
-        args.body.is_some() || args.body_file.is_some() || stdin_body.is_some() || args.append;
-    if !ordering.is_empty() && has_body_source {
-        bail!(
-            "--sub/--sub-regex operate in place and can't be combined with a whole-body \
-             edit (--body/--body-file/stdin/--append)"
-        );
-    }
-
-    let mut tf = load_issue(project, &args.id)?;
-    let mut fields: Vec<&str> = Vec::new();
-
-    // --- validate every touched field BEFORE mutating, so an invalid input
-    // leaves the issue file untouched. ---
-    if let Some(name) = args.workflow.as_deref() {
-        validate_workflow_name(name).map_err(|e| anyhow!(e))?;
-        let path = shelbi_state::workflow_path(project, name).map_err(|e| anyhow!(e))?;
-        if !path.exists() {
-            bail!(
-                "workflow `{name}` does not exist (no {}) — create it first or pick an \
-                 existing workflow",
-                path.display()
-            );
-        }
-    }
-    if let Some(branch) = args.branch.as_deref() {
-        validate_branch(branch).map_err(|e| anyhow!(e))?;
-    }
-
-    // --- compute the new body (substitutions OR a whole-body source). ---
-    if !ordering.is_empty() {
-        let (new_body, report) =
-            apply_substitutions(&tf.body, &ordering, args.allow_no_match)?;
-        for (label, count) in &report {
-            println!("  {label}: {count} replacement(s)");
-        }
-        tf.body = new_body;
-        fields.push("body");
-    } else if let Some(new_body) = resolve_body_edit(&args, &stdin_body, &tf.body)? {
-        tf.body = new_body;
-        fields.push("body");
-    }
-
-    // --- apply the frontmatter field edits. ---
-    if let Some(title) = &args.title {
-        tf.task.title = title.clone();
-        fields.push("title");
-    }
-    if let Some(name) = &args.workflow {
-        tf.task.workflow = Some(name.clone());
-        fields.push("workflow");
-    }
-    if let Some(branch) = &args.branch {
-        tf.task.branch = Some(branch.clone());
-        fields.push("branch");
-    }
-    if let Some(machine) = &args.prefers_machine {
-        tf.task.prefers_machine = Some(machine.clone());
-        fields.push("prefers_machine");
+    let source = sources.into_iter().next();
+    let (body_replace, body_append) = match (source, args.append) {
+        (None, true) => bail!("--append needs a body source (--body, --body-file, or piped stdin)"),
+        (None, false) => (None, None),
+        (Some(text), true) => (None, Some(text)),
+        (Some(text), false) => (Some(text), None),
+    };
+    let prefers_machine = if let Some(m) = args.prefers_machine {
+        Some(Some(m))
     } else if args.no_prefers_machine {
-        tf.task.prefers_machine = None;
-        fields.push("prefers_machine");
-    }
-
-    if fields.is_empty() {
-        // Every supplied flag resolved to a no-op (e.g. only --allow-no-match).
-        println!("(no change)");
-        return Ok(());
-    }
-
-    // Route exactly the touched fields through the store's partial update, so
-    // the edit reaches whichever backend is live (a github title/body edit
-    // PATCHes the issue; the meta block carries workflow/branch/machine).
-    let mut updates = shelbi_state::IssueFields::default();
-    if fields.contains(&"title") {
-        updates.title = Some(tf.task.title.clone());
-    }
-    if fields.contains(&"workflow") {
-        updates.workflow = Some(tf.task.workflow.clone());
-    }
-    if fields.contains(&"branch") {
-        updates.branch = Some(tf.task.branch.clone());
-    }
-    if fields.contains(&"prefers_machine") {
-        updates.prefers_machine = Some(tf.task.prefers_machine.clone());
-    }
-    if fields.contains(&"body") {
-        updates.body = Some(tf.body.clone());
-    }
-    cached_issue_store(project)?
-        .set_fields(&args.id, updates)
-        .map_err(|e| anyhow!(e))?;
-
-    let fields_csv = fields.join(",");
-    let reason = args.reason.as_deref().unwrap_or("user:cli");
-    if let Err(e) = shelbi_state::append_task_edit_event(project, &args.id, &fields_csv, reason) {
-        eprintln!("warning: append_task_edit_event failed: {e}");
-    }
-
-    println!("✓ {} edited ({fields_csv})", args.id);
-    if task_column_is_active(project, &tf.task) {
-        eprintln!(
-            "warning: `{}` is in an active status ({}) — this edit will NOT reach the \
-             running worker until the issue is re-dispatched (`shelbi issue start`)",
-            args.id, tf.task.column
-        );
-    }
-    Ok(())
+        Some(None)
+    } else {
+        None
+    };
+    let spec = EditSpec {
+        title: args.title,
+        body_replace,
+        body_append,
+        subs,
+        allow_no_match: args.allow_no_match,
+        workflow: args.workflow,
+        branch: args.branch,
+        prefers_machine,
+        reason: args.reason,
+    };
+    mutate_client::run_mutation(project, &args.id, MutationKind::Edit(Box::new(spec)))
 }
 
 fn rm(project: &str, id: &str) -> Result<()> {
@@ -2605,60 +1365,11 @@ fn rm(project: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-
-/// Slugify a title to a kebab-case id, appending `-2`, `-3`, ... if the
-/// base collides with an existing issue file.
-fn generate_unique_id(project: &str, title: &str) -> Result<String> {
-    let base = slugify(title);
-    if base.is_empty() {
-        bail!("could not generate id from title `{title}` — pass --id explicitly");
-    }
-    let issues = shelbi_state::tasks_dir(project).map_err(|e| anyhow!(e))?;
-    let mut candidate = base.clone();
-    let mut n: u32 = 2;
-    while issues.join(format!("{candidate}.md")).exists() {
-        candidate = format!("{base}-{n}");
-        n += 1;
-    }
-    // Reword the length error so it points at the title the user actually
-    // typed rather than the slugified id they never saw.
-    if candidate.len() > MAX_TASK_ID_LEN {
-        bail!(
-            "title is too long: it slugifies to a {}-byte id (max {MAX_TASK_ID_LEN}) — \
-             the generated workspace branch would exceed GitHub's 255-byte ref limit. \
-             Shorten the title or pass --id with an explicit shorter id.",
-            candidate.len(),
-        );
-    }
-    Ok(candidate)
-}
-
-fn slugify(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last_was_hyphen = true; // true to trim leading hyphens
-    for c in s.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-            last_was_hyphen = false;
-        } else if !last_was_hyphen {
-            out.push('-');
-            last_was_hyphen = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
     use crate::commands::test_support::ENV_LOCK as TEST_LOCK;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     fn fresh_home() -> PathBuf {
@@ -2677,12 +1388,6 @@ mod tests {
         // Tests that need a richer project overwrite this via
         // `write_project_yaml*` with the same name.
         write_project_yaml(&p, "p");
-        p
-    }
-
-    fn short_test_socket(tag: &str) -> PathBuf {
-        let p = PathBuf::from(format!("/tmp/shb-cli-{}-{tag}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&p);
         p
     }
 
@@ -2706,18 +1411,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn slugify_basic() {
-        assert_eq!(
-            slugify("Fix login bug on Safari"),
-            "fix-login-bug-on-safari"
-        );
-        assert_eq!(slugify("  Hello, World!  "), "hello-world");
-        assert_eq!(slugify("CSV → JSON"), "csv-json");
-        assert_eq!(slugify("---"), "");
-        assert_eq!(slugify("Already-kebab-OK"), "already-kebab-ok");
-    }
-
     fn add_args(title: &str) -> AddArgs {
         AddArgs {
             title: title.into(),
@@ -2729,75 +1422,6 @@ mod tests {
             workflow: None,
             branch: None,
         }
-    }
-
-    #[test]
-    fn add_persists_piped_stdin_as_body() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let piped = "Ship the thing.\n\n## Acceptance Criteria\n- [ ] it ships\n";
-        add_with_stdin("p", add_args("Piped body"), Some(piped.into())).unwrap();
-
-        let tf = shelbi_state::load_task("p", "piped-body").unwrap();
-        assert_eq!(
-            tf.body,
-            "Ship the thing.\n\n## Acceptance Criteria\n- [ ] it ships\n"
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn add_into_ready_status_wakes_the_orchestrator() {
-        // `shelbi issue add --status todo` must append the same
-        // `to_category=ready reason=user:*` signal `move` does, so creating a
-        // card directly in an agent-owned ready status wakes the orchestrator
-        // exactly like promoting one into it.
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let mut args = add_args("Wake test");
-        args.id = Some("wake-test".into());
-        args.status = "todo".into();
-        add_with_stdin("p", args, None).unwrap();
-
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 1, "exactly one creation event: {log}");
-        let line = lines[0];
-        assert!(line.contains(" task=wake-test "), "line: {line}");
-        assert!(line.contains(" todo -> todo "), "line: {line}");
-        assert!(line.contains(" reason=user:cli:add "), "line: {line}");
-        assert!(line.ends_with(" to_category=ready"), "line: {line}");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn add_into_backlog_stays_quiet() {
-        // The default `issue add` lands in the backlog inbox (triage stage,
-        // no reaction rule). It must NOT append a task event — firing on every
-        // filed issue would wake the orchestrator for work that isn't ready.
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        add_with_stdin("p", add_args("Just triage"), None).unwrap();
-
-        let log =
-            std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
-        assert!(
-            !log.contains(" task=just-triage "),
-            "backlog creation must emit no task event: {log}"
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -2815,512 +1439,6 @@ mod tests {
     }
 
     #[test]
-    fn add_rejects_description_flag_combined_with_piped_stdin() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let mut args = add_args("Ambiguous");
-        args.description = Some("flag body".into());
-        let err = add_with_stdin("p", args, Some("piped body".into()))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("both --description and piped stdin"),
-            "err: {err}"
-        );
-        // The refusal must happen before the issue file is written.
-        assert!(shelbi_state::load_task("p", "ambiguous").is_err());
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn add_description_flag_and_title_default_unchanged_without_stdin() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let mut args = add_args("With flag");
-        args.description = Some("flag body".into());
-        add_with_stdin("p", args, None).unwrap();
-        let tf = shelbi_state::load_task("p", "with-flag").unwrap();
-        assert_eq!(tf.body, "flag body\n");
-
-        add_with_stdin("p", add_args("Bare title"), None).unwrap();
-        let tf = shelbi_state::load_task("p", "bare-title").unwrap();
-        assert_eq!(tf.body, "Bare title\n");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn generate_unique_id_rejects_titles_that_produce_overlong_ids() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        // A title whose slug exceeds the limit by a few bytes is enough to
-        // trip the workspace branch over GitHub's 255-byte ref cap.
-        let long_title = "a".repeat(MAX_TASK_ID_LEN + 10);
-        let err = generate_unique_id("p", &long_title)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("title is too long"), "err: {err}");
-        assert!(err.contains(&MAX_TASK_ID_LEN.to_string()), "err: {err}");
-
-        // A title at exactly the limit slugifies to the limit and is accepted.
-        let exact = "a".repeat(MAX_TASK_ID_LEN);
-        let id = generate_unique_id("p", &exact).unwrap();
-        assert_eq!(id.len(), MAX_TASK_ID_LEN);
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn move_to_writes_default_reason_to_events_log() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        shelbi_state::save_task("p", &task_in(Column::backlog(), "a"), "").unwrap();
-        move_to("p", "a", "todo", None, false).unwrap();
-
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 1);
-        let line = lines[0];
-        // Workflow-aware shape: `<ts> task=<id> workflow=<name> <from> ->
-        // <to> reason=<r> from_category=<c> to_category=<c>` (§10).
-        assert!(line.contains(" task=a "), "line: {line}");
-        assert!(line.contains(" workflow=default "), "line: {line}");
-        assert!(line.contains(" backlog -> todo "), "line: {line}");
-        assert!(line.contains(" reason=user:cli "), "line: {line}");
-        assert!(line.contains(" from_category=backlog "), "line: {line}");
-        assert!(line.ends_with(" to_category=ready"), "line: {line}");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn move_to_with_reason_flag_overrides_default() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        // `move_to` now runs the depends_on-aware branch cut on hub when
-        // a card lands in `in_progress` — see `commands::issue::move_to`.
-        // The hook needs both a loadable project YAML and a real git
-        // repo at the hub's `work_dir`, so we provision them up front.
-        crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
-
-        shelbi_state::save_task("p", &task_in(Column::todo(), "b"), "").unwrap();
-        move_to(
-            "p",
-            "b",
-            "in_progress",
-            Some("orchestrator:auto-dispatch workspace=alpha"),
-            false,
-        )
-        .unwrap();
-
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 1);
-        // sanitize_reason folds whitespace to underscores so the `reason=`
-        // value stays a single token even with the `from_category=` /
-        // `to_category=` annotations trailing it (§10 shape).
-        assert!(
-            lines[0].contains(" reason=orchestrator:auto-dispatch_workspace=alpha "),
-            "line: {}",
-            lines[0],
-        );
-        assert!(
-            lines[0].ends_with(" to_category=active"),
-            "line: {}",
-            lines[0],
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn move_to_records_orchestrator_backlog_promotion() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        shelbi_state::save_task("p", &task_in(Column::backlog(), "promo"), "").unwrap();
-        move_to(
-            "p",
-            "promo",
-            "todo",
-            Some("orchestrator:zen-promote category=2"),
-            false,
-        )
-        .unwrap();
-
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 1);
-        let line = lines[0];
-        assert!(line.contains(" task=promo "), "line: {line}");
-        assert!(line.contains(" backlog -> todo "), "line: {line}");
-        assert!(
-            line.contains(" reason=orchestrator:zen-promote_category=2 "),
-            "line: {line}"
-        );
-        assert!(line.contains(" from_category=backlog "), "line: {line}");
-        assert!(line.ends_with(" to_category=ready"), "line: {line}");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn move_to_rolls_back_when_event_append_permission_denied() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        let sock = short_test_socket("move-denied");
-        std::env::set_var("SHELBI_HOME", &home);
-        std::env::set_var("SHELBI_HUB_SOCK", &sock);
-
-        shelbi_state::save_task("p", &task_in(Column::backlog(), "denied"), "").unwrap();
-        let log_path = shelbi_state::events_log_path().unwrap();
-        std::fs::write(&log_path, "").unwrap();
-        std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o444)).unwrap();
-
-        let err = move_to(
-            "p",
-            "denied",
-            "todo",
-            Some("orchestrator:zen-promote category=2"),
-            false,
-        )
-        .unwrap_err()
-        .to_string();
-        std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        assert!(err.contains("failed to append issue event"), "err: {err}");
-        assert!(err.contains("rolled back to backlog"), "err: {err}");
-        let tf = shelbi_state::load_task("p", "denied").unwrap();
-        assert_eq!(tf.task.column, Column::backlog());
-        let log = std::fs::read_to_string(&log_path).unwrap();
-        assert!(
-            !log.contains("task=denied"),
-            "failed move must not leave a missing-transition success: {log}"
-        );
-
-        let _ = std::fs::remove_file(&sock);
-        std::env::remove_var("SHELBI_HUB_SOCK");
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn move_to_no_op_emits_no_event() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        shelbi_state::save_task("p", &task_in(Column::todo(), "c"), "").unwrap();
-        // Already in `todo` — move_task short-circuits, no event line.
-        move_to("p", "c", "todo", None, false).unwrap();
-
-        let path = shelbi_state::events_log_path().unwrap();
-        assert!(
-            !path.exists() || std::fs::read_to_string(&path).unwrap().is_empty(),
-            "no-op move must not write an events.log line",
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn move_to_rejects_status_missing_from_workflow() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        // Stand in for `shelbi init` — the workflow loader requires
-        // the project's status catalogue to be on disk.
-        shelbi_state::save_project_statuses("p", &shelbi_core::default_project_statuses()).unwrap();
-
-        // Author a workflow that omits `review` — moves to it must fail.
-        let wf_dir = shelbi_state::workflows_dir("p").unwrap();
-        std::fs::create_dir_all(&wf_dir).unwrap();
-        std::fs::write(
-            wf_dir.join("research.yaml"),
-            r#"name: research
-statuses:
-  - { id: backlog,     owner: user                          }
-  - { id: todo,        owner: agent, agent: orchestrator    }
-  - { id: in-progress, owner: agent, agent: developer       }
-  - { id: done,        owner: user                          }
-"#,
-        )
-        .unwrap();
-
-        let mut issue = task_in(Column::todo(), "d");
-        issue.workflow = Some("research".into());
-        shelbi_state::save_task("p", &issue, "").unwrap();
-
-        let err = move_to("p", "d", "review", None, false)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("workflow `research`"), "{err}");
-        // The error lists valid status ids (stable identifiers) in kebab
-        // form. Pull out the `(valid: ...)` segment so the assertion on
-        // "review missing from the workflow" isn't fooled by the
-        // destination id (`review`) that opens the message.
-        let valid = err
-            .split_once("(valid:")
-            .and_then(|(_, tail)| tail.split_once(')'))
-            .map(|(list, _)| list.trim())
-            .unwrap_or("");
-        assert!(valid.contains("backlog"), "{err}");
-        assert!(valid.contains("done"), "{err}");
-        assert!(!valid.contains("review"), "{err}");
-
-        // Issue must stay put — no event written.
-        let path = shelbi_state::events_log_path().unwrap();
-        assert!(
-            !path.exists() || std::fs::read_to_string(&path).unwrap().is_empty(),
-            "rejected move must not write an events.log line",
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn move_to_custom_status_is_a_valid_target() {
-        // An issue's position is a status id, so ANY status the workflow
-        // declares — including a custom `qa` status with no legacy column
-        // backing — is a reachable `issue move` target. A status the
-        // workflow does NOT declare still errors, naming the declared ids.
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        // Project catalogue = defaults + a custom `qa` status.
-        let mut statuses = shelbi_core::default_project_statuses();
-        statuses.statuses.push(shelbi_core::ProjectStatus {
-            id: "qa".into(),
-            name: "QA".into(),
-            category: shelbi_core::StatusCategory::Handoff,
-        });
-        shelbi_state::save_project_statuses("p", &statuses).unwrap();
-
-        let wf_dir = shelbi_state::workflows_dir("p").unwrap();
-        std::fs::create_dir_all(&wf_dir).unwrap();
-        std::fs::write(
-            wf_dir.join("qa.yaml"),
-            r#"name: qa
-statuses:
-  - { id: backlog,     owner: user                       }
-  - { id: todo,        owner: agent, agent: orchestrator  }
-  - { id: in-progress, owner: agent, agent: developer     }
-  - { id: qa,          owner: user                        }
-  - { id: done,        owner: user                        }
-"#,
-        )
-        .unwrap();
-
-        let mut issue = task_in(Column::todo(), "t");
-        issue.workflow = Some("qa".into());
-        shelbi_state::save_task("p", &issue, "").unwrap();
-
-        // `--to qa`: a declared custom status is now a real move target and
-        // the issue lands there (its stored position id is the custom id).
-        move_to("p", "t", "qa", None, false).unwrap();
-        assert_eq!(
-            shelbi_state::load_task("p", "t")
-                .unwrap()
-                .task
-                .column
-                .as_str(),
-            "qa",
-        );
-
-        // A status absent from this workflow (`review`) still errors, and
-        // the valid-status list names the declared ids (never the undeclared
-        // target). Issue stays put.
-        let err = move_to("p", "t", "review", None, false)
-            .unwrap_err()
-            .to_string();
-        let valid = err
-            .split_once("(valid:")
-            .and_then(|(_, tail)| tail.split_once(')'))
-            .map(|(l, _)| l.trim())
-            .unwrap_or("");
-        assert!(valid.contains("backlog"), "{err}");
-        assert!(valid.contains("qa"), "{err}");
-        assert!(!valid.contains("review"), "{err}");
-        assert_eq!(
-            shelbi_state::load_task("p", "t")
-                .unwrap()
-                .task
-                .column
-                .as_str(),
-            "qa",
-            "rejected move must not relocate the issue",
-        );
-
-        // A core status the workflow declares still moves successfully.
-        move_to("p", "t", "done", None, false).unwrap();
-        assert_eq!(
-            shelbi_state::load_task("p", "t").unwrap().task.column,
-            Column::done(),
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn move_to_skip_transition_actions_advances_without_running_them() {
-        // `--skip-transition-actions` recovery escape hatch: a `review -> done`
-        // edge that declares `merge` + `delete_branch` still advances the card,
-        // but NONE of the actions fire. Firing the merge here would fail (no
-        // repo/PR in this test), so a clean advance is itself proof the action
-        // list was bypassed — and the line is stamped `actions=skipped`,
-        // independent of the user-supplied `--reason`.
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let wf_dir = shelbi_state::workflows_dir("p").unwrap();
-        std::fs::create_dir_all(&wf_dir).unwrap();
-        std::fs::write(
-            wf_dir.join("mergewf.yaml"),
-            r#"name: mergewf
-statuses:
-  - { id: backlog,     owner: user                       }
-  - { id: todo,        owner: agent, agent: orchestrator  }
-  - { id: in-progress, owner: agent, agent: developer     }
-  - { id: review,      owner: user                        }
-  - { id: done,        owner: user                        }
-transitions:
-  - { from: review, to: done, actions: [merge, delete_branch] }
-"#,
-        )
-        .unwrap();
-
-        let mut issue = task_in(Column::review(), "t");
-        issue.workflow = Some("mergewf".into());
-        shelbi_state::save_task("p", &issue, "").unwrap();
-
-        move_to("p", "t", "done", Some("recovery:pr-merged-by-hand"), true).unwrap();
-
-        // Card advanced despite the merge-declaring edge.
-        assert_eq!(
-            shelbi_state::load_task("p", "t").unwrap().task.column,
-            Column::done(),
-        );
-
-        // Exactly one line — the issue move. No `merge … status=…` line, because
-        // the action list never ran. The line carries BOTH the user's
-        // `reason=` and a distinct `actions=skipped` marker.
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 1, "log: {log}");
-        let line = lines[0];
-        assert!(line.contains(" review -> done "), "line: {line}");
-        assert!(line.contains(" reason=recovery:pr-merged-by-hand "), "line: {line}");
-        assert!(line.ends_with(" actions=skipped"), "line: {line}");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn move_to_without_skip_flag_still_runs_the_merge_action() {
-        // The complement: WITHOUT the flag, the same `review -> done` edge fires
-        // its `merge`, which fails here (the issue has no branch/PR) and aborts
-        // the move — the card stays in `review`. This is the pre-existing
-        // behavior the flag deliberately does NOT change, and it proves the
-        // action actually runs when the flag is absent.
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        let sock = short_test_socket("move-merge-run");
-        std::env::set_var("SHELBI_HOME", &home);
-        std::env::set_var("SHELBI_HUB_SOCK", &sock);
-        // The gated merge needs a loadable project YAML + repo to be reached.
-        crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
-
-        let wf_dir = shelbi_state::workflows_dir("p").unwrap();
-        std::fs::create_dir_all(&wf_dir).unwrap();
-        std::fs::write(
-            wf_dir.join("mergewf.yaml"),
-            r#"name: mergewf
-statuses:
-  - { id: backlog,     owner: user                       }
-  - { id: todo,        owner: agent, agent: orchestrator  }
-  - { id: in-progress, owner: agent, agent: developer     }
-  - { id: review,      owner: user                        }
-  - { id: done,        owner: user                        }
-transitions:
-  - { from: review, to: done, actions: [merge] }
-"#,
-        )
-        .unwrap();
-
-        let mut issue = task_in(Column::review(), "t");
-        issue.workflow = Some("mergewf".into());
-        shelbi_state::save_task("p", &issue, "").unwrap();
-
-        let err = move_to("p", "t", "done", None, false)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("merge"), "err: {err}");
-        assert_eq!(
-            shelbi_state::load_task("p", "t").unwrap().task.column,
-            Column::review(),
-            "a failed merge must leave the card in review, not advance it",
-        );
-
-        std::env::remove_var("SHELBI_HUB_SOCK");
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn move_to_canceled_succeeds_and_round_trips() {
-        // The headline acceptance: a default-workflow issue can be moved to
-        // the archived `canceled` status, and it round-trips through disk.
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        shelbi_state::save_project_statuses("p", &shelbi_core::default_project_statuses()).unwrap();
-        // A default-workflow issue (no explicit `workflow:` field).
-        shelbi_state::save_task("p", &task_in(Column::todo(), "c"), "").unwrap();
-
-        move_to("p", "c", "canceled", None, false).unwrap();
-        let reloaded = shelbi_state::load_task("p", "c").unwrap();
-        assert_eq!(reloaded.task.column, Column::canceled());
-        assert_eq!(reloaded.task.column.as_str(), "canceled");
-        assert_eq!(
-            reloaded.task.column.category(),
-            shelbi_core::StatusCategory::Archived,
-        );
-
-        // The move emitted an events-log line with the archived category.
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        assert!(log.contains(" todo -> canceled "), "{log}");
-        assert!(log.contains("to_category=archived"), "{log}");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
     fn list_workflow_filter_composes_with_column_and_ready() {
         // Three issues across two workflows; verify the filter wiring on
         // each list mode (default / --column / --ready) returns Ok and
@@ -3328,7 +1446,7 @@ transitions:
         // Output assertions live behind a refactor (split compute from
         // render); the smoke test catches accidental regressions in the
         // wiring.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3407,162 +1525,6 @@ workspaces:
         .unwrap();
     }
 
-    /// Project YAML with one plain dev workspace (`dev`) and one `review`-tagged
-    /// slot (`review`) — the fixture for the review-slot dispatch guard.
-    fn write_project_yaml_with_review(home: &std::path::Path, name: &str) {
-        std::fs::create_dir_all(home.join("projects")).unwrap();
-        std::fs::write(
-            home.join(format!("projects/{name}.yaml")),
-            format!(
-                r#"name: {name}
-repo: /tmp/{name}
-default_branch: main
-orchestrator:
-  runner: claude
-agent_runners:
-  claude:
-    command: claude
-    flags: []
-machines:
-  - name: local
-    kind: local
-    work_dir: /tmp/{name}
-workspaces:
-  - {{ name: dev, machine: local, runner: claude }}
-  - {{ name: review, machine: local, runner: claude, tags: [review] }}
-"#
-            ),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn assign_rejects_a_review_slot_without_force() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        write_project_yaml_with_review(&home, "p");
-        shelbi_state::save_task("p", &task_in(Column::todo(), "t"), "").unwrap();
-
-        let err = assign("p", "t", "review", false).unwrap_err().to_string();
-        assert!(err.contains("review slot"), "err: {err}");
-        assert!(err.contains("--force"), "err should point to --force: {err}");
-        // The issue was NOT assigned.
-        let after = shelbi_state::load_task("p", "t").unwrap();
-        assert_eq!(after.task.assigned_to, None);
-        // No override event was logged (the guard rejected before logging).
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
-            .unwrap_or_default();
-        assert!(!log.contains("review-slot-override"), "unexpected: {log}");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn assign_with_force_routes_to_review_slot_and_logs_the_override() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        write_project_yaml_with_review(&home, "p");
-        shelbi_state::save_task("p", &task_in(Column::todo(), "t"), "").unwrap();
-
-        assign("p", "t", "review", true).unwrap();
-        // The forced assignment landed.
-        let after = shelbi_state::load_task("p", "t").unwrap();
-        assert_eq!(after.task.assigned_to.as_deref(), Some("review"));
-        // …and an auditable override line was written.
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        assert!(
-            log.contains("review-slot-override")
-                && log.contains(" task=t ")
-                && log.contains(" workspace=review ")
-                && log.contains("reason=user:force"),
-            "override not logged: {log}",
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn assign_to_a_non_review_workspace_is_unchanged() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        write_project_yaml_with_review(&home, "p");
-        shelbi_state::save_task("p", &task_in(Column::todo(), "t"), "").unwrap();
-
-        // A plain dev slot: assigned with no force and no override event.
-        assign("p", "t", "dev", false).unwrap();
-        let after = shelbi_state::load_task("p", "t").unwrap();
-        assert_eq!(after.task.assigned_to.as_deref(), Some("dev"));
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
-            .unwrap_or_default();
-        assert!(!log.contains("review-slot-override"), "unexpected: {log}");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn start_rejects_a_review_slot_without_force() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        write_project_yaml_with_review(&home, "p");
-        shelbi_state::save_task("p", &task_in(Column::todo(), "t"), "").unwrap();
-
-        // The guard fires right after workspace resolution, before any pane
-        // spawn / git work — so this returns the rejection without needing tmux.
-        let err = start("p", "t", Some("review"), None, None, false)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("review slot"), "err: {err}");
-        assert!(err.contains("--force"), "err: {err}");
-        // The card never moved out of todo.
-        let after = shelbi_state::load_task("p", "t").unwrap();
-        assert_eq!(after.task.column, Column::todo());
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn move_to_falls_back_when_project_workflow_file_is_absent() {
-        // The CLI-transition ENOENT bug: the project YAML loads fine, the
-        // issue has no explicit `workflow:`, and the workflow file the
-        // project default resolves to is not on disk (e.g. a state layout
-        // the running daemon version never materialized, or an in-repo
-        // `workflows/` blipped by a git checkout). This used to hard-fail
-        // the transition with a bare `io: No such file or directory`;
-        // it must instead fall back to the built-in default workflow and
-        // complete the move.
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        write_project_yaml(&home, "p");
-        shelbi_state::save_task("p", &task_in(Column::backlog(), "f"), "").unwrap();
-
-        move_to("p", "f", "todo", None, false).unwrap();
-
-        assert_eq!(
-            shelbi_state::load_task("p", "f").unwrap().task.column,
-            Column::todo(),
-        );
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        assert!(log.contains(" task=f "), "{log}");
-        assert!(log.contains(" backlog -> todo "), "{log}");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
     fn materialize_default_agents_for_test(project: &str) {
         // The workflow loader rejects `agent:` references that don't
         // point at a real `agents/<name>/` directory. The resolver's
@@ -3606,125 +1568,6 @@ workspaces:
     }
 
     #[test]
-    fn count_dispatch_events_scopes_by_project_task_workspace_and_status() {
-        // The launch-progress token and the completion check both key off this
-        // parser, so it must count only THIS project+task+workspace's dispatch
-        // lines and, when asked, only the confirm-level statuses.
-        let log = "\
-2026-09-08T04:30:06Z dispatch project=acme task=t1 workspace=alpha status=message-channel detail=mode=hooks
-2026-09-08T04:30:17Z dispatch project=acme task=t1 workspace=alpha status=confirmed detail=seed_busy_observed
-2026-09-08T04:30:20Z dispatch project=acme task=t2 workspace=alpha status=confirmed detail=seed_busy_observed
-2026-09-08T04:30:25Z dispatch project=acme task=t1 workspace=bravo status=confirmed detail=seed_busy_observed
-2026-09-08T04:30:30Z dispatch project=acme task=t1 workspace=alpha status=unverified detail=verification_unsupported";
-
-        // Every dispatch line for the (project, task, workspace) triple.
-        assert_eq!(count_dispatch_events(log, "acme", "t1", "alpha", &[]), 3);
-        // A different task / workspace is not counted.
-        assert_eq!(count_dispatch_events(log, "acme", "t2", "alpha", &[]), 1);
-        assert_eq!(count_dispatch_events(log, "acme", "t1", "bravo", &[]), 1);
-        // Confirm-level statuses only — message-channel is excluded, so a
-        // never-confirmed launch (message-channel alone) reads as 0.
-        assert_eq!(
-            count_dispatch_events(log, "acme", "t1", "alpha", &["confirmed", "unverified"]),
-            2
-        );
-        // A trailing `status=confirmed` with no detail (end-of-line) still counts.
-        let trailing =
-            "2026-09-08T04:30:17Z dispatch project=acme task=t1 workspace=alpha status=confirmed";
-        assert_eq!(
-            count_dispatch_events(trailing, "acme", "t1", "alpha", &["confirmed"]),
-            1
-        );
-    }
-
-    #[test]
-    fn count_dispatch_events_is_scoped_to_the_project() {
-        // Same-named workspace in two projects: one project's dispatch lines must
-        // not count toward the other's (the hub-global `events.log` collision this
-        // fixes). A legacy line with no `project=` still counts on task+workspace
-        // alone, for backward compatibility during the upgrade window.
-        let log = "\
-2026-09-08T04:30:17Z dispatch project=proj-a task=t1 workspace=alpha status=confirmed detail=d
-2026-09-08T04:30:20Z dispatch project=proj-b task=t1 workspace=alpha status=confirmed detail=d
-2026-09-08T04:30:25Z dispatch task=t1 workspace=alpha status=confirmed detail=legacy_no_project";
-
-        // Project A sees its own line plus the legacy unscoped one.
-        assert_eq!(count_dispatch_events(log, "proj-a", "t1", "alpha", &[]), 2);
-        // Project B likewise — crucially NOT project A's line.
-        assert_eq!(count_dispatch_events(log, "proj-b", "t1", "alpha", &[]), 2);
-    }
-
-    #[test]
-    fn await_launch_reports_completion_spawn_failure_and_panic() {
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        // A thread that reports Ok is Completed within a poll interval, even with
-        // a token that never advances.
-        let (tx, rx) = mpsc::channel();
-        tx.send(Ok(shelbi_core::TmuxAddr {
-            session: "s".into(),
-            window: "w".into(),
-        }))
-        .unwrap();
-        assert!(matches!(
-            await_launch(&rx, Duration::from_secs(60), Duration::from_millis(10), || 0),
-            LaunchWait::Completed(_)
-        ));
-
-        // A clean spawn error is SpawnFailed.
-        let (tx, rx) = mpsc::channel::<shelbi_core::Result<shelbi_core::TmuxAddr>>();
-        tx.send(Err(shelbi_core::Error::Other("boom".into()))).unwrap();
-        assert!(matches!(
-            await_launch(&rx, Duration::from_secs(60), Duration::from_millis(10), || 0),
-            LaunchWait::SpawnFailed(_)
-        ));
-
-        // A dropped sender (panicked thread) is Panicked.
-        let (tx, rx) = mpsc::channel::<shelbi_core::Result<shelbi_core::TmuxAddr>>();
-        drop(tx);
-        assert!(matches!(
-            await_launch(&rx, Duration::from_secs(60), Duration::from_millis(10), || 0),
-            LaunchWait::Panicked
-        ));
-    }
-
-    #[test]
-    fn await_launch_times_out_on_silence_but_a_moving_launch_extends_its_deadline() {
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        // Sender never reports and the token never changes: the short idle
-        // deadline elapses and we get IdleTimeout.
-        let (_tx, rx) = mpsc::channel::<shelbi_core::Result<shelbi_core::TmuxAddr>>();
-        assert!(matches!(
-            await_launch(&rx, Duration::from_millis(30), Duration::from_millis(5), || 7),
-            LaunchWait::IdleTimeout
-        ));
-
-        // A token that advances on every check keeps resetting the idle clock, so
-        // even a deadline far shorter than the total wait never fires. Bound the
-        // test by stopping after a fixed number of advances.
-        let (_tx, rx) = mpsc::channel::<shelbi_core::Result<shelbi_core::TmuxAddr>>();
-        let mut ticks: u64 = 0;
-        let outcome = await_launch(&rx, Duration::from_millis(20), Duration::from_millis(2), || {
-            ticks += 1;
-            // Advance for a while (resetting the clock each check), then freeze so
-            // the deadline can finally elapse and the test terminates.
-            ticks.min(50)
-        });
-        assert!(
-            matches!(outcome, LaunchWait::IdleTimeout),
-            "a launch that stops progressing eventually times out",
-        );
-        assert!(
-            ticks > 20,
-            "a progressing launch must have survived many idle-deadline windows \
-             before the token froze (got {ticks} checks)",
-        );
-    }
-
-    #[test]
     fn start_event_line_carries_agent_segment_via_move_to_round_trip() {
         // Acceptance (a) end-to-end check: the on-disk line shape after
         // emission contains the `_agent=<name>` segment. We exercise the
@@ -3732,7 +1575,7 @@ workspaces:
         // composed reason (mirrors what `start()` writes) so the test
         // doesn't need to stand up a real tmux pane to spawn the
         // workspace.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -3764,7 +1607,7 @@ workspaces:
         // start` resolves the active status's agent and lands on
         // `developer`. The resolver doesn't care about Zen mode for an
         // `owner: agent` status, so this passes regardless of state.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_default_agents_for_test("p");
@@ -3798,7 +1641,7 @@ statuses:
         // bundled `developer` agent — that way the spawn path still
         // mounts agent context, instead of silently dispatching with
         // nothing.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_default_agents_for_test("p");
@@ -3908,7 +1751,7 @@ statuses:
         // already sitting in the agent-owned `adversarial-review` gate resolves
         // to that gate's agent, not the developer of `in-progress`. Asserted
         // through the dispatch resolver, not a spawned pane.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_default_agents_for_test("p");
@@ -3934,22 +1777,11 @@ statuses:
     }
 
     #[test]
-    fn supplanted_workspace_releases_only_a_different_prior_assignee() {
-        // Criterion (b): a card moving to a different agent-owned status hands
-        // off to a new workspace, so the prior one is released (returned here so
-        // `start` tears its pane down). A fresh dispatch (no prior) or a
-        // same-slot re-dispatch (resume) releases nothing.
-        assert_eq!(supplanted_workspace(Some("bravo"), "charlie"), Some("bravo"));
-        assert_eq!(supplanted_workspace(Some("bravo"), "bravo"), None);
-        assert_eq!(supplanted_workspace(None, "charlie"), None);
-    }
-
-    #[test]
     fn resume_without_assignment_or_workspace_flag_errors() {
         // A resume needs to know which workspace holds the in-flight work.
         // With no `assigned_to` and no `--workspace`, it must fail cleanly
         // (before touching any pane) rather than guessing.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
@@ -3966,7 +1798,7 @@ statuses:
     fn resume_rejects_unknown_workspace() {
         // An explicit `--workspace` that isn't declared in the project must
         // be rejected with the known-workspaces list, same as `start`/`assign`.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         // provision_hub_repo_for_project declares no workspaces, so any name
@@ -3978,29 +1810,6 @@ statuses:
             .unwrap_err()
             .to_string();
         assert!(err.contains("workspace `ghost` not declared"), "err: {err}");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn move_to_missing_workflow_falls_back_to_default() {
-        // An issue pinned to a workflow the project hasn't authored falls
-        // back to the canonical default — same five statuses, so a move
-        // to `review` still succeeds.
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let mut issue = task_in(Column::todo(), "e");
-        issue.workflow = Some("nonexistent".into());
-        shelbi_state::save_task("p", &issue, "").unwrap();
-
-        move_to("p", "e", "review", None, false).unwrap();
-
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        assert!(log.contains(" task=e "), "{log}");
-        assert!(log.contains(" todo -> review "), "{log}");
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -4025,79 +1834,6 @@ statuses:
             allow_no_match: false,
             reason: None,
         }
-    }
-
-    /// Seed an issue with a body and an `updated_at` in the past so an edit's
-    /// timestamp bump is observable.
-    fn seed_task(project: &str, id: &str, column: Column, body: &str) {
-        let mut issue = task_in(column, id);
-        issue.updated_at = "2000-01-01T00:00:00Z".parse().unwrap();
-        shelbi_state::save_task(project, &issue, body).unwrap();
-    }
-
-    #[test]
-    fn edit_title_leaves_id_stable_and_bumps_updated_at() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        seed_task("p", "issue-one", Column::backlog(), "body\n");
-        let mut args = edit_args("issue-one");
-        args.title = Some("A brand new title".into());
-        edit_non_interactive("p", args, None, Vec::new()).unwrap();
-
-        let tf = shelbi_state::load_task("p", "issue-one").unwrap();
-        assert_eq!(tf.task.id, "issue-one", "id must never be re-slugged");
-        assert_eq!(tf.task.title, "A brand new title");
-        assert_eq!(tf.body, "body\n", "title-only edit leaves body");
-        assert!(
-            tf.task.updated_at > "2000-01-01T00:00:00Z".parse::<chrono::DateTime<Utc>>().unwrap(),
-            "updated_at must be bumped",
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn edit_body_sources_replace_and_conflict() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        // --body replaces.
-        seed_task("p", "b1", Column::backlog(), "old\n");
-        let mut a = edit_args("b1");
-        a.body = Some("fresh body".into());
-        edit_non_interactive("p", a, None, Vec::new()).unwrap();
-        assert_eq!(shelbi_state::load_task("p", "b1").unwrap().body, "fresh body\n");
-
-        // --body-file replaces.
-        seed_task("p", "b2", Column::backlog(), "old\n");
-        let file = home.join("body.md");
-        std::fs::write(&file, "from file\n").unwrap();
-        let mut a = edit_args("b2");
-        a.body_file = Some(file.clone());
-        edit_non_interactive("p", a, None, Vec::new()).unwrap();
-        assert_eq!(shelbi_state::load_task("p", "b2").unwrap().body, "from file\n");
-
-        // stdin replaces.
-        seed_task("p", "b3", Column::backlog(), "old\n");
-        edit_non_interactive("p", edit_args("b3"), Some("piped\n".into()), Vec::new()).unwrap();
-        assert_eq!(shelbi_state::load_task("p", "b3").unwrap().body, "piped\n");
-
-        // Two body sources at once is an error; the file stays untouched.
-        seed_task("p", "b4", Column::backlog(), "keep\n");
-        let mut a = edit_args("b4");
-        a.body = Some("one".into());
-        let err = edit_non_interactive("p", a, Some("two".into()), Vec::new())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("multiple body sources"), "err: {err}");
-        assert_eq!(shelbi_state::load_task("p", "b4").unwrap().body, "keep\n");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -4126,257 +1862,6 @@ statuses:
             edit_should_read_stdin(&a),
             "--append with no --body/--body-file still reads stdin as its source"
         );
-    }
-
-    #[test]
-    fn edit_append_keeps_prior_content() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        seed_task("p", "app", Column::backlog(), "Original.\n");
-        let mut a = edit_args("app");
-        a.append = true;
-        edit_non_interactive("p", a, Some("- [ ] new criterion\n".into()), Vec::new()).unwrap();
-
-        let body = shelbi_state::load_task("p", "app").unwrap().body;
-        assert!(body.starts_with("Original.\n"), "prior kept: {body:?}");
-        assert!(body.contains("- [ ] new criterion"), "appended: {body:?}");
-
-        // --append with no body source is an error.
-        seed_task("p", "app2", Column::backlog(), "x\n");
-        let mut a = edit_args("app2");
-        a.append = true;
-        let err = edit_non_interactive("p", a, None, Vec::new())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--append needs a body source"), "err: {err}");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn edit_frontmatter_fields_and_unknown_workflow_rejected() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        // Materialize a real workflow file so the existence check passes.
-        let wf_dir = shelbi_state::workflows_dir("p").unwrap();
-        std::fs::create_dir_all(&wf_dir).unwrap();
-        std::fs::write(wf_dir.join("research.yaml"), "name: research\n").unwrap();
-
-        seed_task("p", "fm", Column::backlog(), "b\n");
-        let mut a = edit_args("fm");
-        a.workflow = Some("research".into());
-        a.branch = Some("feature/fm".into());
-        a.prefers_machine = Some("alpha".into());
-        edit_non_interactive("p", a, None, Vec::new()).unwrap();
-        let tf = shelbi_state::load_task("p", "fm").unwrap();
-        assert_eq!(tf.task.workflow.as_deref(), Some("research"));
-        assert_eq!(tf.task.branch.as_deref(), Some("feature/fm"));
-        assert_eq!(tf.task.prefers_machine.as_deref(), Some("alpha"));
-
-        // --no-prefers-machine clears the hint.
-        let mut a = edit_args("fm");
-        a.no_prefers_machine = true;
-        edit_non_interactive("p", a, None, Vec::new()).unwrap();
-        assert_eq!(
-            shelbi_state::load_task("p", "fm").unwrap().task.prefers_machine,
-            None
-        );
-
-        // An unknown workflow is rejected without touching the file.
-        seed_task("p", "fm2", Column::backlog(), "b\n");
-        let mut a = edit_args("fm2");
-        a.workflow = Some("ghost".into());
-        a.title = Some("should not persist".into());
-        let err = edit_non_interactive("p", a, None, Vec::new())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("workflow `ghost` does not exist"), "err: {err}");
-        let tf = shelbi_state::load_task("p", "fm2").unwrap();
-        assert_eq!(tf.task.title, "fm2", "title must not have changed");
-        assert_eq!(tf.task.workflow, None);
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn edit_prefers_machine_flags_are_mutually_exclusive() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        seed_task("p", "pm", Column::backlog(), "b\n");
-        let mut a = edit_args("pm");
-        a.prefers_machine = Some("alpha".into());
-        a.no_prefers_machine = true;
-        let err = edit_non_interactive("p", a, None, Vec::new())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("mutually exclusive"), "err: {err}");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn apply_substitutions_literal_counts_and_replaces_all() {
-        let ops = vec![SubOp::Literal {
-            from: "foo".into(),
-            to: "bar".into(),
-        }];
-        let (out, report) = apply_substitutions("foo foo baz foo", &ops, false).unwrap();
-        assert_eq!(out, "bar bar baz bar");
-        assert_eq!(report.len(), 1);
-        assert_eq!(report[0].1, 3, "reports 3 replacements");
-    }
-
-    #[test]
-    fn apply_substitutions_chain_in_order_with_regex_capture() {
-        // Later subs see earlier subs' output; regex replacement references a
-        // capture group.
-        let ops = vec![
-            SubOp::Literal {
-                from: "cat".into(),
-                to: "dog".into(),
-            },
-            SubOp::Regex {
-                pattern: r"dog-(\d+)".into(),
-                replacement: "hound-$1".into(),
-            },
-        ];
-        let (out, _) = apply_substitutions("cat-7 and cat-9", &ops, false).unwrap();
-        assert_eq!(out, "hound-7 and hound-9");
-    }
-
-    #[test]
-    fn apply_substitutions_zero_match_errors_unless_allowed() {
-        let ops = vec![SubOp::Literal {
-            from: "absent".into(),
-            to: "x".into(),
-        }];
-        let err = apply_substitutions("body text", &ops, false)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("zero occurrences"), "err: {err}");
-
-        // With --allow-no-match the no-op is tolerated and the body is unchanged.
-        let (out, report) = apply_substitutions("body text", &ops, true).unwrap();
-        assert_eq!(out, "body text");
-        assert_eq!(report[0].1, 0);
-    }
-
-    #[test]
-    fn apply_substitutions_invalid_regex_errors() {
-        let ops = vec![SubOp::Regex {
-            pattern: "(".into(),
-            replacement: "x".into(),
-        }];
-        let err = apply_substitutions("body", &ops, true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("invalid --sub-regex pattern"), "err: {err}");
-    }
-
-    #[test]
-    fn edit_substitution_persists_and_rejects_body_combo() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        seed_task("p", "s1", Column::backlog(), "path/to/old.rs\n");
-        let mut a = edit_args("s1");
-        a.sub = vec!["old.rs".into(), "new.rs".into()];
-        let ops = vec![SubOp::Literal {
-            from: "old.rs".into(),
-            to: "new.rs".into(),
-        }];
-        edit_non_interactive("p", a, None, ops).unwrap();
-        assert_eq!(
-            shelbi_state::load_task("p", "s1").unwrap().body,
-            "path/to/new.rs\n"
-        );
-
-        // Substitutions can't combine with a whole-body edit.
-        seed_task("p", "s2", Column::backlog(), "old\n");
-        let mut a = edit_args("s2");
-        a.body = Some("whole".into());
-        let ops = vec![SubOp::Literal {
-            from: "old".into(),
-            to: "new".into(),
-        }];
-        let err = edit_non_interactive("p", a, None, ops)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("can't be combined"), "err: {err}");
-        assert_eq!(shelbi_state::load_task("p", "s2").unwrap().body, "old\n");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn edit_emits_task_edit_event() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        seed_task("p", "ev", Column::backlog(), "b\n");
-        let mut a = edit_args("ev");
-        a.title = Some("New".into());
-        a.reason = Some("fixing typo".into());
-        edit_non_interactive("p", a, None, Vec::new()).unwrap();
-
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        assert!(log.contains(" task=ev "), "log: {log}");
-        assert!(log.contains(" edited "), "log: {log}");
-        assert!(log.contains("fields=title"), "log: {log}");
-        assert!(log.contains("reason=fixing_typo"), "log: {log}");
-        // Classified as a Issue event so the feed/poller observe it.
-        let line = log.lines().next().unwrap();
-        assert_eq!(
-            shelbi_state::EventEnvelope::from_log_line(line).kind,
-            shelbi_state::EventKind::Task,
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn edit_missing_id_errors() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let mut a = edit_args("ghost");
-        a.title = Some("x".into());
-        let err = edit_non_interactive("p", a, None, Vec::new())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("ghost"), "err names the id: {err}");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn task_column_is_active_true_for_in_progress() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let active = task_in(Column::in_progress(), "z");
-        assert!(task_column_is_active("p", &active));
-        let idle = task_in(Column::todo(), "z");
-        assert!(!task_column_is_active("p", &idle));
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -4419,50 +1904,6 @@ statuses:
                 },
             ]
         );
-    }
-
-    #[test]
-    fn unassign_parks_a_review_column_task() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        // A handoff card sitting under review, still pinned to the slot serving
-        // it. Unassigning it is a *park*: it stays in review, loses its owner,
-        // and gets marked so the auto-loader won't re-grab it on the next tick.
-        let mut t = task_in(Column::review(), "fix-docs");
-        t.assigned_to = Some("review".into());
-        shelbi_state::save_task("p", &t, "body").unwrap();
-
-        unassign("p", "fix-docs").unwrap();
-
-        let after = shelbi_state::load_task("p", "fix-docs").unwrap().task;
-        assert_eq!(after.assigned_to, None);
-        assert_eq!(after.column, Column::review());
-        assert!(shelbi_state::is_task_parked("p", "fix-docs").unwrap());
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn unassign_does_not_park_a_non_review_task() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        // A plain in-progress card: unassign clears the owner but never parks —
-        // parking is a review-slot concept only.
-        let mut t = task_in(Column::in_progress(), "wip");
-        t.assigned_to = Some("alpha".into());
-        shelbi_state::save_task("p", &t, "body").unwrap();
-
-        unassign("p", "wip").unwrap();
-
-        let after = shelbi_state::load_task("p", "wip").unwrap().task;
-        assert_eq!(after.assigned_to, None);
-        assert!(!shelbi_state::is_task_parked("p", "wip").unwrap());
-
-        std::env::remove_var("SHELBI_HOME");
     }
 
     // --- GitHub-backed command paths -----------------------------------------
@@ -4584,7 +2025,7 @@ workspaces:
 
     #[test]
     fn show_renders_a_github_only_issue_with_no_local_file() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         write_github_project_yaml(&home, "gh");
@@ -4597,86 +2038,6 @@ workspaces:
             !shelbi_state::task_path("gh", "t").unwrap().exists(),
             "no local task markdown file should be required or created"
         );
-
-        shelbi_state::clear_test_gh_runner();
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn assign_persists_the_owner_through_the_github_store_without_a_local_file() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        write_github_project_yaml(&home, "gh");
-        install_gh_issue_runner(gh_issue_json("t", "todo"));
-
-        assign("gh", "t", "dev", false).expect("assign through the github store");
-
-        // The owner is recoverable by re-reading through a freshly resolved
-        // store — the assignment overlay the daemon's ownership scans consult —
-        // even though GitHub itself stores no assignment.
-        let owner = shelbi_state::issue_store_for("gh")
-            .unwrap()
-            .get("t")
-            .unwrap()
-            .unwrap()
-            .task
-            .assigned_to;
-        assert_eq!(owner.as_deref(), Some("dev"));
-        // No phantom local task file was written.
-        assert!(!shelbi_state::task_path("gh", "t").unwrap().exists());
-
-        shelbi_state::clear_test_gh_runner();
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn unassign_clears_the_owner_through_the_github_store() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        write_github_project_yaml(&home, "gh");
-        install_gh_issue_runner(gh_issue_json("t", "todo"));
-
-        assign("gh", "t", "dev", false).unwrap();
-        unassign("gh", "t").expect("unassign through the github store");
-
-        let owner = shelbi_state::issue_store_for("gh")
-            .unwrap()
-            .get("t")
-            .unwrap()
-            .unwrap()
-            .task
-            .assigned_to;
-        assert_eq!(owner, None);
-
-        shelbi_state::clear_test_gh_runner();
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn start_resolves_the_owner_through_the_github_store() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        write_github_project_yaml(&home, "gh");
-        install_gh_issue_runner(gh_issue_json("t", "todo"));
-
-        // With no `--workspace` and no assignment on the (GitHub-backed) issue,
-        // `start` must fail cleanly with the "no assigned workspace" error —
-        // proving it resolved `assigned_to` through the store (which reads the
-        // github backend, not a local task file) before touching any pane.
-        let err = start("gh", "t", None, None, None, false)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("no assigned workspace"),
-            "start should surface the no-owner error read through the github store: {err}"
-        );
-        assert!(!shelbi_state::task_path("gh", "t").unwrap().exists());
 
         shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
@@ -4710,18 +2071,6 @@ workspaces:
         shelbi_state::write_board_index("gh", &idx).unwrap();
     }
 
-    /// Seed a **stale** daemon index for the `gh` project — the identity still
-    /// matches (so the file serves) but `stale` is flagged, so `read_board` maps
-    /// it to [`shelbi_state::BoardState::Stale`]. Models a parked/dead daemon
-    /// whose last-published board has aged out, the shape of the 2026-10-04
-    /// incident.
-    fn write_gh_index_stale(board: Vec<shelbi_state::IssueFile>) {
-        let mut idx = shelbi_state::BoardIndex::fresh(board);
-        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
-        idx.stale = true;
-        shelbi_state::write_board_index("gh", &idx).unwrap();
-    }
-
     /// The incident: a card that finished (its PR merged, moving it to a terminal
     /// column out-of-band) was never cleared from `board-snapshot.json`, so the
     /// stale entry pinned its workspace as `in_progress` and locked it out of
@@ -4729,7 +2078,7 @@ workspaces:
     /// drops closed cards) instead, so the stranded snapshot entry is inert.
     #[test]
     fn workspace_occupied_by_ignores_a_done_card_stranded_in_the_stale_snapshot() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         write_github_project_yaml(&home, "gh");
@@ -4761,7 +2110,7 @@ workspaces:
     /// column. The card excluded by id is never its own occupant.
     #[test]
     fn workspace_occupied_by_reports_a_live_in_progress_card_with_its_real_column() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         write_github_project_yaml(&home, "gh");
@@ -4795,268 +2144,6 @@ workspaces:
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The supplant guard's core case: a dispatch must NOT tear down the prior
-    /// assignee once that workspace has been re-dispatched to a *different*
-    /// issue. `workspace_busy_with_other` surfaces that other issue so the
-    /// release block takes the `skipped` branch — leaving the live worker and
-    /// its issue untouched — instead of killing it mid-task. The decision is read
-    /// from the local assignment overlay (authoritative routing), with the open
-    /// board confirming the routed card is still non-terminal.
-    #[test]
-    fn workspace_busy_with_other_reports_a_different_active_issue() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        write_github_project_yaml(&home, "gh");
-
-        // `alpha` was the prior assignee of `handed-off`, but is now routed to
-        // `other-task` in the local overlay, and that card is still open.
-        shelbi_state::set_task_assignment("gh", "other-task", Some("alpha")).unwrap();
-        write_gh_index(vec![issue_file(task_assigned(
-            "other-task",
-            Column::in_progress(),
-            "alpha",
-        ))]);
-
-        let busy = workspace_busy_with_other("gh", "alpha", "handed-off")
-            .unwrap()
-            .expect("alpha is active on a different issue");
-        assert_eq!(busy.id, "other-task");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// A workspace serving a `review`-column task on a different issue is just as
-    /// busy as one holding an `in_progress` card — the guard counts any open
-    /// routed issue regardless of column, so a dispatch never tears down a review
-    /// slot serving an unrelated card.
-    #[test]
-    fn workspace_busy_with_other_counts_a_review_slot() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        write_github_project_yaml(&home, "gh");
-        shelbi_state::set_task_assignment("gh", "under-review", Some("alpha")).unwrap();
-        write_gh_index(vec![issue_file(task_assigned(
-            "under-review",
-            Column::review(),
-            "alpha",
-        ))]);
-
-        let busy = workspace_busy_with_other("gh", "alpha", "handed-off")
-            .unwrap()
-            .expect("alpha is serving a review on a different issue");
-        assert_eq!(busy.id, "under-review");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// The two release-fires cases: the prior assignee is still on THIS card (the
-    /// original gate-to-gate move the release was written for) or has gone idle.
-    /// Both yield `None`, so the release proceeds — a real teardown when a pane
-    /// is up, a no-op when idle. The card being dispatched is excluded by id, so
-    /// an overlay marker that still points at it never reads as "busy elsewhere".
-    #[test]
-    fn workspace_busy_with_other_none_when_on_this_card_or_idle() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        write_github_project_yaml(&home, "gh");
-
-        // Still on this card: the overlay routes `handed-off` to alpha and
-        // nothing else. (The gate-to-gate case — alpha is released.)
-        shelbi_state::set_task_assignment("gh", "handed-off", Some("alpha")).unwrap();
-        write_gh_index(vec![issue_file(task_assigned(
-            "handed-off",
-            Column::in_progress(),
-            "alpha",
-        ))]);
-        assert!(
-            workspace_busy_with_other("gh", "alpha", "handed-off")
-                .unwrap()
-                .is_none(),
-            "the card being dispatched is excluded, so the prior assignee reads as free"
-        );
-
-        // Idle: the overlay routes nothing to alpha at all.
-        shelbi_state::set_task_assignment("gh", "handed-off", None).unwrap();
-        write_gh_index(Vec::new());
-        assert!(
-            workspace_busy_with_other("gh", "alpha", "handed-off")
-                .unwrap()
-                .is_none(),
-            "an idle prior assignee has no other active issue"
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// The incident shape (2026-10-04), the reason the first pass was reworked: the
-    /// prior assignee A was re-dispatched to another card *after* the last board
-    /// refresh, and the daemon then died, so the published index is **stale** and
-    /// still lists that card in `todo`. Reading occupancy from the index alone
-    /// (its old `in_progress`/`review` filter) read A as idle and killed its live
-    /// worker. Deciding from the local overlay — authoritative and never lagged —
-    /// surfaces the routed card from a stale index all the same, so the release is
-    /// skipped and A's pane is left alone.
-    #[test]
-    fn workspace_busy_with_other_reads_the_overlay_past_a_stale_index() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        write_github_project_yaml(&home, "gh");
-
-        // Local overlay (authoritative) routes `other-task` to alpha.
-        shelbi_state::set_task_assignment("gh", "other-task", Some("alpha")).unwrap();
-        // The published index is stale and still shows `other-task` in `todo` —
-        // the exact state the old guard misread as "alpha is idle".
-        write_gh_index_stale(vec![issue_file(task_assigned(
-            "other-task",
-            Column::todo(),
-            "alpha",
-        ))]);
-
-        let busy = workspace_busy_with_other("gh", "alpha", "handed-off")
-            .unwrap()
-            .expect("alpha is routed to another open issue, even from a stale index");
-        assert_eq!(
-            busy.id, "other-task",
-            "a todo card from a stale index still counts — the release must be skipped"
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// The overlay can retain a marker for a card that has since gone terminal
-    /// (its merge cleared the column but not the marker). A `Warm` board is the
-    /// current open-only set, so a routed id absent from it is confirmed terminal
-    /// and the prior assignee reads as free — the release proceeds rather than
-    /// being blocked forever by a lingering marker.
-    #[test]
-    fn workspace_busy_with_other_frees_a_terminal_marker_against_a_warm_board() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        write_github_project_yaml(&home, "gh");
-
-        // Overlay still routes `done-task` to alpha, but the card has closed and
-        // the warm index no longer lists it.
-        shelbi_state::set_task_assignment("gh", "done-task", Some("alpha")).unwrap();
-        write_gh_index(Vec::new());
-
-        assert!(
-            workspace_busy_with_other("gh", "alpha", "handed-off")
-                .unwrap()
-                .is_none(),
-            "a routed id absent from a warm (open-only) board is terminal — alpha is free"
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// When the overlay routes another issue to A but the board **isn't warm**
-    /// (stale/cold/unreachable) and doesn't list that id, we can't prove whether
-    /// it is still active. The guard returns `Err` so the caller errs toward NOT
-    /// releasing — a possibly-orphaned pane is recoverable; killing an unrelated
-    /// live worker on a false negative is not.
-    #[test]
-    fn workspace_busy_with_other_cant_confirm_on_a_stale_board_missing_the_routed_id() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        write_github_project_yaml(&home, "gh");
-
-        // Overlay routes `other-task` to alpha, but the stale index doesn't carry
-        // it (so presence can't confirm it, and staleness can't deny it either).
-        shelbi_state::set_task_assignment("gh", "other-task", Some("alpha")).unwrap();
-        write_gh_index_stale(Vec::new());
-
-        assert!(
-            workspace_busy_with_other("gh", "alpha", "handed-off").is_err(),
-            "an unconfirmable stale board must not authorize a release"
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// `issue assign` applies the same occupancy rule as `issue start`: a
-    /// workspace already running another in-flight issue is refused up front, so
-    /// a card is never left assigned to a workspace that cannot run it.
-    #[test]
-    fn assign_refuses_a_workspace_already_running_another_in_progress_issue() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        write_github_project_yaml(&home, "gh");
-        install_gh_issue_runner(gh_issue_json("t", "todo"));
-        write_gh_index(vec![issue_file(task_assigned(
-            "busy-1",
-            Column::in_progress(),
-            "dev",
-        ))]);
-
-        let err = assign("gh", "t", "dev", false).unwrap_err().to_string();
-        assert!(
-            err.contains("busy-1") && err.contains("in_progress"),
-            "assign should refuse a busy workspace naming the live card: {err}"
-        );
-        // The assignment did NOT land — no overlay was written.
-        let owner = shelbi_state::issue_store_for("gh")
-            .unwrap()
-            .get("t")
-            .unwrap()
-            .unwrap()
-            .task
-            .assigned_to;
-        assert_eq!(owner, None);
-
-        shelbi_state::clear_test_gh_runner();
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// The regression: `issue assign` is not blocked by a stale snapshot
-    /// occupant when the live index shows the workspace idle.
-    #[test]
-    fn assign_ignores_a_stale_snapshot_occupant() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        write_github_project_yaml(&home, "gh");
-        install_gh_issue_runner(gh_issue_json("t", "todo"));
-
-        // Snapshot falsely claims `dev` is busy; the live index is clean.
-        shelbi_state::seed_board_snapshot_for_test(
-            "gh",
-            &[issue_file(task_assigned(
-                "stranded",
-                Column::in_progress(),
-                "dev",
-            ))],
-        );
-        write_gh_index(Vec::new());
-
-        assign("gh", "t", "dev", false).expect("assign must not be blocked by a stale snapshot");
-        let owner = shelbi_state::issue_store_for("gh")
-            .unwrap()
-            .get("t")
-            .unwrap()
-            .unwrap()
-            .task
-            .assigned_to;
-        assert_eq!(owner.as_deref(), Some("dev"));
-
-        shelbi_state::clear_test_gh_runner();
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
     // --- prio: reorder from the live index, on any workflow ------------------
 
     /// A fully-defaulted [`PrioArgs`] with the one chosen move set — the shape
@@ -5078,7 +2165,7 @@ workspaces:
     /// it — proving the path is workflow-agnostic and move-fresh.
     #[test]
     fn prio_reorders_from_the_live_index_not_the_stale_snapshot() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         write_github_project_yaml(&home, "gh");

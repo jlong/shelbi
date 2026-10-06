@@ -355,6 +355,12 @@ fn refresh_with_store(
 
     if changed > 0 {
         emit_board_refreshed(project, &fetched_at_return, changed, remaining_return, rest_fallback);
+        // Push a change notification to any subscribed client so a UI can
+        // refresh its board without polling (Phase 3 pushed notifications). A
+        // no-op when nobody is subscribed, so a quiet sidebar pays nothing.
+        shelbi_state::publish_change(shelbi_state::ChangeNotification::Board {
+            project: project.to_string(),
+        });
     }
     // Announce each newly-observed reopen, independent of `changed`. Best-effort,
     // and no store call — the loop stays read-only against GitHub.
@@ -679,36 +685,11 @@ fn project_uses_remote_backend(project: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Project names with a live `shelbi-<name>` tmux session. Mirrors the
-/// discovery `shelbi quit` uses; the hidden `_shelbi-<name>` stash sessions are
-/// excluded (their prefix is `_shelbi-`, not `shelbi-`). Empty when tmux is
-/// unreachable.
+/// Currently open projects, from the open-project record
+/// (`shelbi_state::list_open_projects`, the daemon-lifecycle source of truth).
+/// Empty when the record is unreadable so a refresh degrades safely.
 fn open_project_names() -> Vec<String> {
-    let listing = std::process::Command::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    parse_open_project_names(&listing)
-}
-
-/// Extract `<name>` from each `shelbi-<name>` session line, skipping the
-/// `_shelbi-` stash sessions, blanks, and the prefix-only `shelbi-` line.
-fn parse_open_project_names(listing: &str) -> Vec<String> {
-    listing
-        .lines()
-        .filter_map(|line| {
-            let name = line.trim();
-            let rest = name.strip_prefix("shelbi-")?;
-            if rest.is_empty() {
-                None
-            } else {
-                Some(rest.to_string())
-            }
-        })
-        .collect()
+    shelbi_state::list_open_projects().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1483,12 +1464,6 @@ mod tests {
         let b = r.lock_for("bravo");
         assert!(Arc::ptr_eq(&a1, &a2), "same project ⇒ same lock");
         assert!(!Arc::ptr_eq(&a1, &b), "different project ⇒ different lock");
-    }
-
-    #[test]
-    fn parse_open_project_names_strips_prefix_and_skips_stash() {
-        let listing = "shelbi-alpha\n_shelbi-alpha\nplain\nshelbi-\n   shelbi-bravo\n";
-        assert_eq!(parse_open_project_names(listing), vec!["alpha", "bravo"]);
     }
 
     // --- Phase 3 integration: 403 → 429 → park → recovery ---------------------

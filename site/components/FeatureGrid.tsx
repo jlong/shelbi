@@ -23,15 +23,16 @@ import type { CSSProperties, ReactNode } from "react"
  * terminal chrome for a plain centered frame holding a single open-source mark
  * (see `OpenSourceVignette`). Details stay grounded in `crates/shelbi-tui` and
  * the CLI: the real board columns, the sidebar's `— Workspaces —` section with
- * `▾ hub` / `▾ devbox` groups and `⏵`/`·` badges, a tmux pane with a green
- * status bar and `❯` prompt, the `⎇ shelbi/<id>` branch meta, real `shelbi`
- * commands, and `tasks/*.md` + `workflows/*.yaml` paths.
+ * `▾ hub` / `▾ devbox` groups and `⏵`/`·` badges, an attached session with a
+ * `❯` prompt and the one-line `Ctrl+]` detach hint, the `⎇ shelbi/<id>` branch
+ * meta, real `shelbi` commands, and `tasks/*.md` + `workflows/*.yaml` paths.
  *
  * Motion is entirely CSS: the card lifts on hover (`hover:` on the `group`
  * card) and each vignette does one tasteful, feature-appropriate thing via
  * `group-hover:` — a card slides one column right, a worker's task types in, a
- * new tmux line prints, the review panel's Approve button presses and the PR
- * merges, the file cursor steps down, the open-source mark brightens. Ambient
+ * new line of agent output prints, the review panel's Approve button presses
+ * and the PR merges, the file cursor steps down, the open-source mark
+ * brightens. Ambient
  * life (the working dot,
  * the prompt cursor) uses `motion-safe:animate-pulse`. Every transform / loop
  * is gated behind `motion-safe:` (or reset with `motion-reduce:`) so
@@ -248,29 +249,30 @@ function MachinesVignette() {
 }
 
 /**
- * Made with tmux: a real tmux pane — a couple of muted output lines, a `❯`
- * prompt with a blinking block cursor, and the iconic green tmux status bar
- * along the bottom (session name, window list, host/clock). On hover a fresh
- * command's output line prints above the prompt.
+ * Attach from anywhere: `shelbi attach <workspace>` wiring a plain terminal to
+ * a worker's Shelbi session, rendered full-screen — a muted "attached" line, a
+ * slice of the agent's live output, a `❯` prompt with a blinking block cursor,
+ * and the one-line detach hint Shelbi renders along the bottom (`Ctrl+]`). On
+ * hover a fresh line of agent output prints above the prompt.
  */
-function TmuxVignette() {
+function AttachVignette() {
   return (
-    <MiniTerminal title="jlong@hub — tmux" bodyClassName="text-[10px] leading-relaxed">
+    <MiniTerminal title="jlong@laptop — shelbi attach" bodyClassName="text-[10px] leading-relaxed">
       <div className="p-2.5 pb-2">
         <div className="overflow-hidden whitespace-nowrap" style={{ color: TUI_FG }}>
           <span style={{ color: TUI_GREEN }}>❯ </span>shelbi attach alpha
         </div>
         <div className="overflow-hidden whitespace-nowrap" style={{ color: TUI_DARK_GRAY }}>
-          attached to alpha · pane 1
+          attached to alpha · Developer
         </div>
         <div className="overflow-hidden whitespace-nowrap" style={{ color: TUI_FG }}>
-          <span style={{ color: TUI_GREEN }}>❯ </span>shelbi task start deploy-staging-env
+          ● Deploy staging env
         </div>
         <div
           className="max-h-0 overflow-hidden whitespace-nowrap opacity-0 transition-all duration-300 ease-out motion-safe:group-hover:max-h-4 motion-safe:group-hover:opacity-100"
           style={{ color: TUI_GREEN }}
         >
-          ✓ deploy-staging-env → in_progress on alpha
+          ✓ ran migrations · 12 files changed
         </div>
         <div className="overflow-hidden whitespace-nowrap" style={{ color: TUI_FG }}>
           <span style={{ color: TUI_GREEN }}>❯ </span>
@@ -280,17 +282,16 @@ function TmuxVignette() {
           />
         </div>
       </div>
-      {/* The classic green tmux status bar: session name, window list, clock. */}
+      {/* The one-line detach hint Shelbi renders along the bottom of an
+          attached session: a plain hint bar, not a multiplexer status bar. */}
       <div
         className="flex items-center gap-2 px-2 py-1 text-[9px]"
-        style={{ background: TUI_GREEN, color: TUI_BG }}
+        style={{ background: CHROME_BAR_BG, borderTop: `1px solid ${CHROME_BAR_BORDER}`, color: TUI_DARK_GRAY }}
       >
-        <span className="font-semibold">[shelbi]</span>
-        <span style={{ opacity: 0.75 }}>0:orch</span>
-        <span className="font-semibold">1:agent*</span>
-        <span className="ml-auto" style={{ opacity: 0.75 }}>
-          &quot;hub&quot; 14:32
+        <span className="font-semibold" style={{ color: TUI_GRAY }}>
+          alpha
         </span>
+        <span className="ml-auto">Ctrl+] detach</span>
       </div>
     </MiniTerminal>
   )
@@ -471,14 +472,14 @@ const FEATURES: Feature[] = [
   },
   {
     label: "Workers on any machine",
-    body: "Any box you can SSH into can take tasks. If it runs tmux and an agent CLI, it's a worker.",
+    body: "Any box you can SSH into can take tasks. If it has git and an agent CLI, it's a worker.",
     vignette: <MachinesVignette />,
     place: "bottom",
   },
   {
-    label: "Made with tmux",
-    body: "Every worker runs in a real tmux pane. Attach to a session to watch an agent work or type to it directly.",
-    vignette: <TmuxVignette />,
+    label: "Attach from anywhere",
+    body: "Every worker runs in its own Shelbi session. Attach from any terminal to watch an agent work or type to it directly. No terminal multiplexer required.",
+    vignette: <AttachVignette />,
     place: "top",
   },
   {

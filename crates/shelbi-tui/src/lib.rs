@@ -1,23 +1,11 @@
-//! shelbi's two top-level entry points:
+//! shelbi's top-level entry point:
 //!
-//! - `run_main(project)` — set up the project's tmux session with the
-//!   dashboard layout (sidebar + orchestrator) and `exec tmux attach`.
-//!   This is what `shelbi` (no subcommand) invokes.
-//! - `run_sidebar(project)` — the minimal ratatui process that lives in
-//!   the dashboard's left pane: agent list, status footer, Ctrl+Space
-//!   palette.
-//!   Selecting an agent switches the tmux window. This is what
-//!   `shelbi __sidebar PROJECT` invokes.
+//! - `run_main(project)` — bring up the project's orchestrator session and
+//!   run the single-process ratatui shell that owns the whole screen and
+//!   shows worker sessions through shelbi-term / shelbi-client. This is what
+//!   `shelbi` (no subcommand) invokes.
 
-use std::io;
-
-use anyhow::{Context, Result};
-use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{backend::CrosstermBackend, Terminal};
+use anyhow::Result;
 
 mod activity;
 mod app;
@@ -25,12 +13,15 @@ mod error_report;
 mod handlers;
 mod kanban;
 mod keymap;
+mod machines;
+mod reachability;
+mod layout_sub;
 mod markdown;
-mod poller;
+pub mod overlay;
 mod review_panel;
+mod shell;
 mod sidebar;
 pub mod theme;
-mod zen_probe;
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
@@ -92,7 +83,7 @@ pub(crate) mod test_support {
                 integration: None,
             },
         );
-        let project = Project {
+        let project = Project { session: Default::default(),
             name: project_name.into(),
             label: None,
             display_name: None,
@@ -137,510 +128,110 @@ pub(crate) mod test_support {
 pub use activity::ActivityApp;
 pub use app::{App, Row, View, WorkspaceBadge, WorkspaceOverview};
 pub use kanban::KanbanApp;
-pub use poller::WorkspacePoller;
+pub use machines::MachinesApp;
 pub use sidebar::decoration_to_color;
+// The poller moved out of this crate into `shelbi-orchestrator` (Phase 3,
+// `rt-daemon-poller`) so it can run either here (the sidebar) or in
+// `shelbi daemon`. Re-exported at the old path so existing callers don't churn.
+pub use shelbi_orchestrator::poller::WorkspacePoller;
 
-/// Exact one-time orientation copy shown in the sidebar after the first
-/// project scaffold. Kept as one constant so persistence tests and the
-/// narrow-sidebar wrapping path cannot drift from the product wording.
-pub(crate) const FIRST_RUN_HINT: &str = "Ctrl+P palette · type E to edit settings";
-
-/// Set up the project's tmux session and attach to it. If we're already
-/// inside a tmux client, use `switch-client` instead of `attach` (tmux
-/// refuses to nest, modern tmux supports switching).
+/// Bring up the project's orchestrator session and run the single-process
+/// ratatui shell.
 pub fn run_main(project_name: &str) -> Result<()> {
-    // Bump the recently-used timestamp before bootstrapping the session
-    // so the picker's recency sort reflects this launch even if the
-    // tmux exec below replaces the process before normal shutdown.
-    // Best-effort — a missing/unwritable ~/.shelbi/shelbi.yaml should
-    // not block launching.
+    // Cutover gate (`rt-cutover-migration`): refuse to open a project whose
+    // legacy `shelbi-<p>` / `_shelbi-<p>` tmux session is still running from the
+    // previous runtime — opening beside it would run two pollers at once and
+    // could start a second agent in the hub worktree. A no-op when tmux is not
+    // installed / no such session exists. Checked first, before we touch the
+    // daemon or bootstrap the orchestrator session.
+    shelbi_orchestrator::migration::ensure_project_openable(project_name)?;
+
+    // Bump the recently-used timestamp before bootstrapping the session so the
+    // picker's recency sort reflects this launch. Best-effort — a
+    // missing/unwritable ~/.shelbi/shelbi.yaml should not block launching.
     let _ = shelbi_state::touch_project_launched(project_name);
 
-    shelbi_orchestrator::ensure_dashboard(project_name)
-        .with_context(|| format!("setting up dashboard for `{project_name}`"))?;
+    // Cutover migration pass (`rt-cutover-migration`): now that the open gate
+    // proved the local tmux session gone, record each workspace's migration
+    // state so dispatch knows which worktrees are proven idle. Local workspaces
+    // migrate; a remote stays pending until the hub reaches its machine and
+    // confirms (killing a surviving `shelbi-w-<ws>` only with the user's
+    // agreement). Best-effort — a pending workspace doesn't block opening;
+    // dispatch to it is what's refused. Runs here, before the shell takes over
+    // the screen, because its consent prompt needs a plain-terminal `[y/N]`; it
+    // probes tmux/SSH directly and needs neither the daemon nor the dashboard.
+    run_open_migration_pass(project_name);
 
-    let session = format!("shelbi-{project_name}");
-    let inside_tmux = std::env::var("TMUX").is_ok();
+    // Starting the on-demand hub daemon and bootstrapping the orchestrator
+    // dashboard session used to run synchronously here — the daemon socket wait
+    // and the cold orchestrator launch were the bulk of the "shelbi draws
+    // nothing for seconds" headless startup block. Both now run off the shell's
+    // UI thread (`shell::run` -> `ShellState::spawn_startup`) so the first frame
+    // draws immediately; the orchestrator session attaches when the bootstrap
+    // completes (`rt-tui-headless-startup-block`).
+    shell::run(project_name)
+}
 
-    let args: &[&str] = if inside_tmux {
-        &["switch-client", "-t"]
-    } else {
-        &["attach", "-t"]
+/// Run the cutover migration pass for `project_name` at open, prompting on
+/// stderr for consent before killing any surviving remote `shelbi-w-<ws>`
+/// session. Runs before the alt-screen is entered (from `run_main`), so a
+/// `[y/N]` prompt is safe. Best-effort: a probe or state-write failure is
+/// logged and leaves the affected workspace pending, which is the safe
+/// direction (dispatch to a pending workspace is refused, not silently run).
+fn run_open_migration_pass(project_name: &str) {
+    use std::io::{IsTerminal, Write};
+
+    let project = match shelbi_state::load_project(project_name) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(project = %project_name, error = %e, "migration pass: load_project failed");
+            return;
+        }
     };
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new("tmux")
-            .args(args)
-            .arg(&session)
-            .exec();
-        Err(err.into())
-    }
-    #[cfg(not(unix))]
-    {
-        let status = std::process::Command::new("tmux")
-            .args(args)
-            .arg(&session)
-            .status()?;
-        if !status.success() {
-            anyhow::bail!("tmux exited with {status}");
-        }
-        Ok(())
-    }
-}
-
-/// Run the minimal ratatui sidebar in the current pane.
-pub fn run_sidebar(project_name: &str) -> Result<()> {
-    // Load merged keymaps once — embedded builtins, then
-    // `~/.shelbi/keys.yaml::defaults`, then `projects.<project_name>`.
-    // Diagnostics route through `tracing` so they land in
-    // `~/.shelbi/logs/tui.log` instead of fighting ratatui for the pane
-    // TTY (eprintln! into the alt-screen pane interleaves with the
-    // sidebar redraw and corrupts the nav labels). Resolve them before
-    // `setup_terminal` so the count is ready for the status line.
-    let (keymaps, diags) = shelbi_state::keymap::load_keymaps(Some(project_name));
-    let startup_warnings = log_keymap_diagnostics(&diags);
-
-    let mut term = setup_terminal().context("setting up terminal")?;
-    let mut app = App::new_sidebar(project_name);
-    // `refresh` also probes daemon compatibility. Keeping that in the normal
-    // refresh path lets the footer clear itself after `shelbi daemon restart`.
-    app.refresh().ok();
-
-    // First-run probe: on fresh installs (no ~/.shelbi/config.yaml),
-    // verify Alt+Z is delivered and let the user pick a fallback if not.
-    // Best-effort: an error here defaults to Alt+Z so the sidebar still
-    // launches with a working binding on cooperative terminals.
-    let probe_chord =
-        zen_probe::ensure_zen_keymap(&mut term).unwrap_or(shelbi_state::ZenToggleChord::AltZ);
-    // Prefer the keys.yaml-resolved chord (so a migrated `zen_toggle`
-    // shows the right glyph even though `config.yaml` is now at default)
-    // and fall back to the probe's answer for chords the four-value
-    // [`ZenToggleChord`] enum can't represent.
-    app.zen_toggle_chord = keymaps.zen_toggle_chord(probe_chord);
-    app.keymaps = keymaps;
-
-    // Claim onboarding only after the interactive Zen-key probe is finished.
-    // Otherwise a user who exits during that probe could persist "seen"
-    // without the sidebar ever rendering the hint.
-    if let Some(status_line) = sidebar_startup_status_line(startup_warnings) {
-        app.status_line = status_line;
-    }
-
-    // Background poll loop: per-workspace `tmux display-message` every
-    // `workspace_poll_interval_secs`, parses the `shelbi:<state>` marker,
-    // persists transitions to `~/.shelbi/workspaces/<name>/status.yaml`
-    // and `~/.shelbi/events.log`. The handle's Drop joins the thread,
-    // so it shuts down when this function returns regardless of which
-    // exit path we took.
-    let _poller = WorkspacePoller::start(project_name);
-
-    // Route panic diagnostics to `tui.log`. The render loop catches a
-    // render-pass panic and repaints (see `draw_sidebar_self_healing`), but
-    // the panic hook still runs first — the *default* hook writes to stderr,
-    // which on this pane is the shared ratatui TTY and would bleed the panic
-    // message across the sidebar until the next full repaint. Sink it to
-    // `tracing` (→ `~/.shelbi/logs/tui.log`) instead so recovery stays clean.
-    std::panic::set_hook(Box::new(|info| {
-        tracing::error!("sidebar panic: {info}");
-    }));
-
-    let result = handlers::sidebar::sidebar_loop(&mut term, &mut app);
-
-    restore_terminal(&mut term).context("restoring terminal")?;
-    result
-}
-
-/// Run the Kanban tasks view in the current pane. Meant to be hosted in
-/// the project's hidden stash session and swapped into the dashboard via
-/// the palette. Parent shell wraps invocation in `while true; do …; done`
-/// so an accidental crash respawns instead of leaving an empty pane.
-pub fn run_tasks(project_name: &str) -> Result<()> {
-    // Load `keys.yaml` before the alt-screen swap. Diagnostics route
-    // through `tracing` (→ `~/.shelbi/logs/tui.log`) so they can't
-    // interleave with ratatui's redraw on the shared pane TTY. Bad
-    // config never blocks launch — affected actions fall back to
-    // built-in defaults. The sidebar pane surfaces a discoverable
-    // count in its status line.
-    let (keymaps, diags) = shelbi_state::keymap::load_keymaps(Some(project_name));
-    log_keymap_diagnostics(&diags);
-
-    let mut term = setup_terminal().context("setting up terminal")?;
-    let mut app = KanbanApp::new(project_name);
-    // Hand the footer renderer its own copy of the resolved keymaps; the
-    // handler keeps the `&keymaps` local below to dodge a borrow conflict
-    // with `&mut app`.
-    app.keymaps = keymaps.clone();
-    app.refresh();
-
-    let result = handlers::kanban::tasks_loop(&mut term, &mut app, &keymaps);
-
-    restore_terminal(&mut term).context("restoring terminal")?;
-    result
-}
-
-/// Run the activity-feed ratatui view in the current pane. Hosted in
-/// the hidden stash session and swapped in by the palette / sidebar —
-/// same lifecycle as `run_tasks`.
-pub fn run_activity(project_name: &str) -> Result<()> {
-    let mut term = setup_terminal().context("setting up terminal")?;
-    let mut app = ActivityApp::new(project_name);
-    app.refresh();
-
-    let result = handlers::activity::activity_loop(&mut term, &mut app);
-
-    restore_terminal(&mut term).context("restoring terminal")?;
-    result
-}
-
-/// Run the review-panel ratatui view in the current pane. Hosted in the
-/// third pane of the review interface (see
-/// [`shelbi_orchestrator::review_ui`]); swaps the middle content pane
-/// between the reviewer chat and the editor, and drives Approve / Reject.
-pub fn run_review_panel(project_name: &str, task_id: &str) -> Result<()> {
-    review_panel::run_review_panel(project_name, task_id)
-}
-
-/// `pub(crate)` shim so [`review_panel`] can reuse the shared terminal
-/// setup without duplicating the raw-mode / alt-screen dance.
-pub(crate) fn setup_terminal_pub() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
-    setup_terminal()
-}
-
-/// `pub(crate)` shim mirroring [`setup_terminal_pub`] for teardown.
-pub(crate) fn restore_terminal_pub<B: ratatui::backend::Backend + std::io::Write>(
-    term: &mut Terminal<B>,
-) -> Result<()> {
-    restore_terminal(term)
-}
-
-/// Enter raw mode + alt screen + mouse capture. Tmux only forwards mouse
-/// events to the pane when its `mouse` option is on — `ensure_dashboard`
-/// sets it on shelbi sessions, so callers don't need to plumb anything.
-/// Views that don't care about mouse just ignore the events.
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
-}
-
-fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
-    term: &mut Terminal<B>,
-) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(
-        term.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    term.show_cursor()?;
-    Ok(())
-}
-
-/// Route every keys.yaml load diagnostic through `tracing` so the TUI's
-/// `init_tracing` writer drops them into `~/.shelbi/logs/tui.log`
-/// instead of the shared pane TTY. Direct `eprintln!` after the
-/// alt-screen swap collides with ratatui's redraw cycle and corrupts
-/// whichever cells happen to be re-painting at the same moment — the
-/// observed failure mode is a sidebar with the warning text spliced
-/// through the nav labels. Returns the diagnostic count so the caller
-/// can surface a discoverable "⚠ N startup warnings" hint.
-fn log_keymap_diagnostics(diags: &[shelbi_state::keymap::KeymapDiagnostic]) -> usize {
-    use shelbi_state::keymap::KeymapDiagnostic;
-    for d in diags {
-        match d {
-            KeymapDiagnostic::Error {
-                message, location, ..
-            } => match location {
-                Some(loc) => tracing::error!("keys.yaml error: {message} (at {loc})"),
-                None => tracing::error!("keys.yaml error: {message}"),
-            },
-            KeymapDiagnostic::Warning {
-                message, location, ..
-            } => match location {
-                Some(loc) => tracing::warn!("keys.yaml warning: {message} (at {loc})"),
-                None => tracing::warn!("keys.yaml warning: {message}"),
-            },
-        }
-    }
-    diags.len()
-}
-
-/// Build the sidebar status-line text that surfaces a startup-warning
-/// count and points the user at the log file where the full diagnostic
-/// text lives. Kept tiny so the line still fits on a narrow sidebar.
-fn startup_warnings_status_line(count: usize) -> String {
-    let suffix = if count == 1 { "" } else { "s" };
-    format!("⚠ {count} startup warning{suffix} — see ~/.shelbi/logs/tui.log")
-}
-
-/// Claim and choose the sidebar's launch-time status line. The persisted
-/// first-run hint wins over keymap-warning copy so a genuinely fresh launch
-/// displays the required wording exactly; diagnostics are still written to
-/// the TUI log and surface on a later sidebar restart. A state error fails
-/// closed (no repeat-prone hint) while retaining the warning surface.
-fn sidebar_startup_status_line(startup_warnings: usize) -> Option<String> {
-    match shelbi_state::claim_first_run_hint() {
-        Ok(true) => return Some(FIRST_RUN_HINT.to_string()),
-        Ok(false) => {}
-        Err(error) => tracing::warn!(
-            %error,
-            "could not claim first-run hint; skipping non-durable onboarding copy"
-        ),
-    }
-
-    (startup_warnings > 0).then(|| startup_warnings_status_line(startup_warnings))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::{backend::TestBackend, Terminal};
-    use shelbi_state::keymap::{ErrorKind, KeymapDiagnostic, WarningKind};
-
-    fn warning(message: &str, location: Option<&str>) -> KeymapDiagnostic {
-        KeymapDiagnostic::Warning {
-            kind: WarningKind::LegacyZenToggleField,
-            message: message.into(),
-            location: location.map(str::to_string),
-        }
-    }
-
-    fn error(message: &str, location: Option<&str>) -> KeymapDiagnostic {
-        KeymapDiagnostic::Error {
-            kind: ErrorKind::UnknownAction,
-            message: message.into(),
-            location: location.map(str::to_string),
-        }
-    }
-
-    /// The diagnostic-routing helper returns the diagnostic count. The
-    /// caller uses this to drive the sidebar's status-line surface; if
-    /// the count drifts the hint silently disappears.
-    #[test]
-    fn log_keymap_diagnostics_returns_count() {
-        let diags = vec![
-            warning("legacy zen_toggle field", Some("config.yaml")),
-            error("unknown action `nope`", None),
-        ];
-        assert_eq!(log_keymap_diagnostics(&diags), 2);
-        assert_eq!(log_keymap_diagnostics(&[]), 0);
-    }
-
-    /// Plural / singular suffix on the status-line copy. One warning
-    /// reads "1 startup warning", two read "2 startup warnings"; both
-    /// point at the log file so the user knows where to look.
-    #[test]
-    fn startup_warnings_status_line_uses_correct_plural() {
-        let one = startup_warnings_status_line(1);
-        assert!(one.contains("1 startup warning "), "{one}");
-        assert!(one.contains("~/.shelbi/logs/tui.log"), "{one}");
-        let many = startup_warnings_status_line(3);
-        assert!(many.contains("3 startup warnings "), "{many}");
-    }
-
-    #[test]
-    fn armed_first_run_hint_is_exact_and_claimed_once() {
-        let _g = test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let home = std::env::temp_dir().join(format!(
-            "shelbi-tui-first-run-hint-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&home).unwrap();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        shelbi_state::arm_first_run_hint().unwrap();
-        assert_eq!(
-            sidebar_startup_status_line(2).as_deref(),
-            Some(FIRST_RUN_HINT),
-            "the onboarding copy must win over warning status on first launch"
-        );
-        assert!(shelbi_state::read_global_state().unwrap().first_run_seen);
-
-        let reload = sidebar_startup_status_line(0);
-        assert_eq!(reload, None, "a sidebar reload must not repeat the hint");
-
-        // Persisted legacy/global state with no field is deliberately not
-        // armed. Point at a second home to exercise serde's upgrade default,
-        // rather than relying only on the claim above.
-        let legacy_home = home.join("legacy");
-        std::fs::create_dir_all(&legacy_home).unwrap();
-        std::fs::write(legacy_home.join("state.json"), r#"{"zen_intro_seen":true}"#).unwrap();
-        std::env::set_var("SHELBI_HOME", &legacy_home);
-        assert_eq!(sidebar_startup_status_line(0), None);
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    /// Regression for the startup-warnings-interleave bug. The sidebar
-    /// must render its three nav labels (`💬 Chat`, `📋 Issues`,
-    /// `⚡ Activity`) uninterrupted even when a keys.yaml load produced
-    /// warnings. The pre-fix code `eprintln!`'d after the alt-screen
-    /// swap and the diagnostic text landed mid-label; the new path
-    /// routes diagnostics to `tracing` and surfaces a count in the
-    /// status line, so the nav labels stay clean.
-    #[test]
-    fn sidebar_nav_labels_render_uninterrupted_with_startup_warnings() {
-        let diags = vec![warning(
-            "config.yaml::keymap.zen_toggle has no keys.yaml::default for zen_toggle",
-            Some("config.yaml"),
-        )];
-        let count = log_keymap_diagnostics(&diags);
-        let mut app = App::new_sidebar("demo");
-        if count > 0 {
-            app.status_line = startup_warnings_status_line(count);
-        }
-
-        let backend = TestBackend::new(60, 20);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| sidebar::render_full(f, &mut app, f.area()))
-            .unwrap();
-        let buf = term.backend().buffer().clone();
-        let dumped: Vec<String> = (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().to_string())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .collect();
-        let joined = dumped.join("\n");
-
-        // Each nav label appears once, contiguously, in the rendered
-        // pane. TestBackend reserves a filler cell after each wide
-        // emoji glyph, so the buffer dump shows two spaces between the
-        // icon and the label text — that's the layout the user sees on
-        // a real terminal too, just collapsed to one cell.
-        for (emoji, text) in [("💬", "Chat"), ("📋", "Issues"), ("⚡", "Activity")] {
-            let label = format!("{emoji}  {text}");
-            assert!(
-                joined.matches(&label).count() == 1,
-                "expected `{label}` to render exactly once and contiguously, but got:\n{joined}",
+    // Consent prompt for a surviving remote session. A non-interactive stdin
+    // declines (leaves the workspace pending) rather than killing silently.
+    let mut consent = |kill: &shelbi_orchestrator::migration::MigrationKill<'_>| -> bool {
+        if !std::io::stdin().is_terminal() {
+            eprintln!(
+                "shelbi: workspace `{}` on machine `{}` still has a tmux session \
+                 `{}` from the previous runtime; not killing it (no terminal to \
+                 confirm). It stays pending — rerun `shelbi {}` in a terminal to \
+                 migrate it.",
+                kill.workspace, kill.machine, kill.session, kill.project
             );
+            return false;
         }
-
-        // And the status line surfaces a discoverable count.
-        assert!(
-            joined.contains("⚠ 1 startup warning"),
-            "expected startup-warning hint in:\n{joined}",
+        eprint!(
+            "shelbi: workspace `{}` on machine `{}` still has a tmux session `{}` \
+             from the previous runtime. Kill it so the new runtime can take over \
+             this workspace? [y/N] ",
+            kill.workspace, kill.machine, kill.session
         );
-        assert!(
-            joined.contains("~/.shelbi/logs/tui.log"),
-            "expected log-file pointer in:\n{joined}",
-        );
-
-        // No raw diagnostic text leaks onto the pane — only the count.
-        assert!(
-            !joined.contains("zen_toggle"),
-            "raw diagnostic text leaked onto the pane:\n{joined}",
-        );
-    }
-
-    /// Regression for the agents-workspaces variant of the
-    /// startup-warnings-interleave bug. A project YAML still using the
-    /// legacy `workers:` top-level key fires
-    /// `shelbi_state::warn_legacy_workers_key`; before the fix this was
-    /// an `eprintln!` that landed on the shared pane TTY mid-refresh
-    /// (the sidebar `App::refresh` path calls `load_project` on every
-    /// poll), splicing fragments of `shelbi: project \`<name>\` uses
-    /// the legacy \`workers:\`…` through ratatui's nav labels. The fix
-    /// routes the warning through `tracing::warn!` so the TUI's
-    /// file-backed writer captures it. This test asserts the contract
-    /// the render path now relies on: a refresh against a legacy
-    /// `workers:` YAML leaves the nav labels intact and does not
-    /// surface the deprecation copy anywhere in the rendered buffer.
-    #[test]
-    fn sidebar_renders_cleanly_when_project_yaml_uses_legacy_workers_key() {
-        let _g = test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let home = std::env::temp_dir().join(format!(
-            "shelbi-tui-sidebar-legacy-workers-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&home).unwrap();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        // Hand-author the project YAML with the legacy `workers:` key.
-        // `save_project` would round-trip through the canonical
-        // `workspaces:` form; we deliberately exercise the loader path
-        // that fires the deprecation warning.
-        let projects_dir = home.join("projects");
-        std::fs::create_dir_all(&projects_dir).unwrap();
-        let yaml = "\
-name: demo
-repo: /tmp/demo-legacy-workers
-default_branch: main
-machines:
-  - name: hub
-    kind: local
-    work_dir: /tmp/demo-legacy-workers
-orchestrator:
-  runner: claude
-agent_runners:
-  claude:
-    command: claude
-    flags: []
-workers:
-  - name: alpha
-    machine: hub
-    runner: claude
-workspace_poll_interval_secs: 5
-workspace_permissions_mode: auto
-";
-        std::fs::write(projects_dir.join("demo.yaml"), yaml).unwrap();
-
-        let mut app = App::new_sidebar("demo");
-        let _ = app.refresh();
-
-        let backend = TestBackend::new(60, 20);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| sidebar::render_full(f, &mut app, f.area()))
-            .unwrap();
-        let buf = term.backend().buffer().clone();
-        let joined: String = (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().to_string())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        for (emoji, text) in [("💬", "Chat"), ("📋", "Issues"), ("⚡", "Activity")] {
-            let label = format!("{emoji}  {text}");
-            assert!(
-                joined.matches(&label).count() == 1,
-                "expected `{label}` to render exactly once and contiguously, but got:\n{joined}",
-            );
+        let _ = std::io::stderr().flush();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            return false;
         }
+        matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    };
 
-        // The deprecation copy must not surface in the render buffer
-        // through any side channel (status line, error pane, etc.) —
-        // it belongs in the log file, not on the sidebar TTY. Each
-        // needle is a distinctive fragment of the warning message that
-        // would only land here via a regression.
-        for needle in ["workers:", "legacy", "future release"] {
-            assert!(
-                !joined.contains(needle),
-                "deprecation warning text leaked onto the sidebar pane:\n  \
-                 needle = {needle:?}\n  buffer:\n{joined}",
-            );
+    match shelbi_orchestrator::migration::run_migration_pass(&project, &mut consent) {
+        Ok(report) => {
+            let pending: Vec<&str> = report.pending().map(|w| w.workspace.as_str()).collect();
+            if !pending.is_empty() {
+                eprintln!(
+                    "shelbi: {} workspace(s) still pending migration: {}. Dispatch to \
+                     them is paused until their tmux session is confirmed gone; the \
+                     rest of `{}` works normally.",
+                    pending.len(),
+                    pending.join(", "),
+                    project_name
+                );
+            }
         }
-
-        std::env::remove_var("SHELBI_HOME");
+        Err(e) => {
+            tracing::debug!(project = %project_name, error = %e, "migration pass failed");
+        }
     }
 }

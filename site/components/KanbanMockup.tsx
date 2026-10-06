@@ -913,8 +913,8 @@ function buildActivityRows(state: AppState): Segment[][] {
 }
 
 // One line of the Claude Code session the Chat pane hosts — the orchestrator
-// agent IS a live Claude Code CLI running in a tmux pane, so this renders the
-// real Claude Code UI elements rather than a generic two-speaker chat:
+// agent IS a live Claude Code CLI running in a Shelbi session, so this renders
+// the real Claude Code UI elements rather than a generic two-speaker chat:
 // - `user`  — a `❯ ` prompt turn in the foreground color.
 // - `prose` — assistant narration, plain wrapped fg lines.
 // - `tool`  — a `⏺ Name(args)` tool-call bullet (green ⏺, bold-ish name).

@@ -1,10 +1,11 @@
 //! Hub-side Unix-socket listener for worker → hub messages.
 //!
-//! This is the runtime half of `shelbi daemon` (the OS-supervisor
-//! install/uninstall/status/restart plumbing lives in the sibling
-//! [`super::supervise`] module). Phases 1, 2, and 9 of the Worker →
+//! This is the runtime half of `shelbi daemon` (the on-demand
+//! restart/status plumbing lives in the sibling [`super::lifecycle`]
+//! module). Phases 1, 2, and 9 of the Worker →
 //! Orchestrator Communication feature (see
-//! `Plans/worker-orchestrator-communication.md` §5, §6, §9, §13).
+//! `Plans/worker-orchestrator-communication.md` §5, §6, §9, §13), and
+//! Phase 3 of the remove-tmux effort (`docs/removing-tmux/phase3-daemon.md`).
 //!
 //! ## Foreground (`shelbi daemon`, no subcommand)
 //!
@@ -25,6 +26,10 @@
 //!   event when the worker never confirms delivery.
 //! - `message-ack` (Phase 9) — emitted by the worker after it processes a
 //!   message; appends an `ack=worker` event and clears the pending entry.
+//! - `subscribe` (Phase 3, remove-tmux) — hands the connection to a streaming
+//!   loop that pushes change notifications (board and workspace changes) to the
+//!   client until it disconnects, so a UI need not poll. One-way: no ack, and
+//!   the existing one-shot verbs above are untouched.
 //!
 //! Unknown verbs and malformed payloads are logged to stderr
 //! (debug-escaped, so client-controlled bytes can't smuggle ANSI
@@ -197,14 +202,19 @@ struct Daemon {
     /// so a `refresh-board` socket request and a scheduled tick single-flight
     /// through the same per-project lock. See [`super::board`].
     board: super::board::BoardRefresher,
+    /// The shared shutdown flag. A `subscribe` handler blocks streaming change
+    /// notifications and watches this so SIGTERM stops it within a poll slice
+    /// instead of leaving it parked past the shutdown drain.
+    stop: Arc<AtomicBool>,
 }
 
 impl Daemon {
-    fn new(ack_timeout: Duration) -> Self {
+    fn new(ack_timeout: Duration, stop: Arc<AtomicBool>) -> Self {
         Self {
             pending: Arc::new(Mutex::new(PendingMap::new())),
             ack_timeout,
             board: super::board::BoardRefresher::default(),
+            stop,
         }
     }
 }
@@ -230,21 +240,30 @@ pub(super) fn run_foreground() -> Result<()> {
     // to events.log / the orchestrator handoff file and never blocks serving.
     let _ = crate::commands::config_upgrade::run_startup_pass();
 
-    // launchd/systemd hand a supervised process a minimal PATH that omits the
-    // Homebrew / version-manager bindir `gh` lives in, so every board-refresh
-    // tick's `gh auth token` probe fails and no index is ever published. Fix the
-    // running daemon in-process now, and rewrite an old supervisor unit (one
-    // installed before PATH was baked in) so the next relaunch is correct too.
-    super::supervise::ensure_gh_on_path();
-    super::supervise::heal_daemon_unit_path();
+    // Run with the user's interactive login-shell environment, not the minimal
+    // one a detached on-demand spawn inherits. `.zshrc` is where nvm/fnm/Homebrew
+    // PATH setup lives, so this is how the daemon's git/`gh`/ssh/workflow actions
+    // find their tools — replacing the baked minimal PATH that used to need
+    // healing to locate `gh`. Overlaid (not replaced) so anything the launcher
+    // set intentionally (e.g. SHELBI_ROOT in a test) survives.
+    apply_login_shell_env();
+
+    // Retire any leftover launchd/systemd supervisor unit so its KeepAlive /
+    // Restart=always loop can't fight the on-demand daemon. Idempotent; disclose
+    // whatever it removed on events.log.
+    retire_leftover_supervisor_units();
 
     // Tighten the umask around bind() so the socket inode is created
     // 0600 from the very start. Without this there is a window between
     // bind() and the chmod below where the socket carries the umask
     // default (typically world/group-connectable) and a local peer could
     // connect. Restore the previous umask immediately so nothing else the
-    // daemon creates inherits the restrictive value.
-    let prev_umask = unsafe { libc::umask(0o177) };
+    // daemon creates inherits the restrictive value. Mask only group/other
+    // (`0o077`), never owner-execute: `umask` is process-global, and clearing
+    // owner-x (e.g. `0o177`) strips the search bit from any directory created
+    // concurrently in this window, leaving it unusable (EACCES). `0o077` still
+    // yields a 0600 socket. See the matching note in `control::bind`.
+    let prev_umask = unsafe { libc::umask(0o077) };
     let bind_result = UnixListener::bind(&sock);
     unsafe { libc::umask(prev_umask) };
     let listener =
@@ -263,22 +282,50 @@ pub(super) fn run_foreground() -> Result<()> {
         eprintln!("shelbi daemon: failed to write PID file: {e}");
     }
 
-    let daemon = Daemon::new(ack_timeout_from_env());
+    let stop = Arc::new(AtomicBool::new(false));
+    let daemon = Daemon::new(ack_timeout_from_env(), stop.clone());
     eprintln!(
         "shelbi daemon: listening at {} (ack timeout {}s)",
         sock.display(),
         daemon.ack_timeout.as_secs()
     );
 
-    let stop = Arc::new(AtomicBool::new(false));
     install_shutdown_listener(stop.clone(), sock.clone())?;
     spawn_reaper(daemon.clone(), stop.clone());
     // The single board reader per hub: one refresh loop per open project,
     // publishing `board-index.json` on each project's configured cadence.
     super::board::spawn_refresh_manager(daemon.board.clone(), stop.clone());
+    // The per-project workspace-poller manager: one poller per open project.
+    // Phase 3, `rt-daemon-poller`.
+    super::poller::spawn_poller_manager(stop.clone());
+    // Exit when no project is open (the on-demand lifecycle: nothing to serve,
+    // and the next open restarts us). A short minimum-lifetime debounce keeps a
+    // just-started daemon alive long enough for the opener to record its open
+    // flag and for a restart to verify, and avoids thrash on project switches.
+    spawn_idle_monitor(stop.clone(), sock.clone());
+
+    // The mutation control socket, bound and accepting BEFORE the hub serve loop
+    // below starts answering hellos — so a client that waits on hub.sock and
+    // then connects to control.sock never races the bind. Its accept loop runs
+    // on its own thread (the hub serve below blocks this one) and watches the
+    // same `stop` flag, so SIGTERM stops both.
+    let control_sock = shelbi_state::control_socket_path().map_err(|e| anyhow!(e))?;
+    let control_listener = super::control::bind(&control_sock)?;
+    {
+        // The lifecycle ops carry the shared stop flag + hub socket so a
+        // `QuitShelbi` control command can stop this daemon (Phase 4f).
+        let lifecycle = std::sync::Arc::new(super::control::DaemonLifecycle {
+            stop: stop.clone(),
+            hub_sock: sock.clone(),
+        });
+        let control_state = super::control::ControlState::production(lifecycle);
+        let stop = stop.clone();
+        thread::spawn(move || super::control::serve(control_listener, control_state, stop));
+    }
 
     serve(&listener, &daemon, &stop);
 
+    let _ = fs::remove_file(&control_sock);
     let _ = fs::remove_file(&sock);
     // Best-effort: drop the PID file so the next start's cleanup
     // doesn't see us as a (now-dead) live daemon. The read path is
@@ -288,6 +335,121 @@ pub(super) fn run_foreground() -> Result<()> {
     }
     eprintln!("shelbi daemon: stopped");
     Ok(())
+}
+
+/// Overlay the user's interactive login-shell environment onto this process's
+/// environment. Captured once (`$SHELL -l -i -c env`, cached in `shelbi-core`)
+/// and applied over the inherited environment so subprocesses (git, `gh`, ssh,
+/// workflow actions) see the user's real PATH and config. When the capture fails
+/// `shelbi-core` returns the launcher's own environment as a fallback, so the
+/// overlay is a no-op in that case rather than clobbering the inherited values.
+fn apply_login_shell_env() {
+    for (key, value) in shelbi_core::login_shell_env() {
+        std::env::set_var(key, value);
+    }
+    // Pin the running `shelbi` binary ahead of the captured login `PATH`, and
+    // export `SHELBI_BIN`. A workflow `run:` command on the hub inherits this
+    // process's environment (it is a plain local subprocess), so a bare
+    // `shelbi` inside it resolves to *this* daemon's binary rather than a
+    // different install the login `PATH` happens to find first
+    // (`rt-session-path-pins-own-binary`). Sessions the daemon spawns pin
+    // themselves via `session_child_env`; a remote `run:` command runs under
+    // the remote host's own login env and is unaffected by this local pin.
+    if let Some(exe) = shelbi_core::current_shelbi_exe() {
+        let mut env = std::env::vars().collect();
+        shelbi_core::pin_shelbi_binary(&mut env, &exe);
+        for key in ["PATH", shelbi_core::SHELBI_BIN_VAR] {
+            if let Some(value) = env.get(key) {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+}
+
+/// Stop and remove any leftover launchd/systemd supervisor unit (the retired
+/// install path), disclosing each removal on `events.log`. Idempotent and
+/// best-effort — a host with no unit does nothing, and a disclosure hiccup never
+/// takes the daemon down.
+fn retire_leftover_supervisor_units() {
+    let removed = super::lifecycle::retire_supervisor_units();
+    for path in removed {
+        let body = format!("daemon-unit-retired unit={}", path.display());
+        if let Err(e) = shelbi_state::append_external_event(&body) {
+            tracing::debug!(error = %e, "shelbi daemon: failed to disclose daemon-unit-retired");
+        }
+        tracing::warn!(
+            unit = %path.display(),
+            "shelbi daemon: retired a leftover supervisor unit (daemon is now on-demand)",
+        );
+    }
+}
+
+/// Default minimum daemon lifetime before the idle monitor may trigger an exit.
+/// Covers the window where a just-opened project hasn't recorded its flag yet
+/// and the restart-verify window (which waits up to ~10s). Overridable with
+/// [`IDLE_GRACE_ENV`] (milliseconds) so tests drive it fast.
+const IDLE_GRACE: Duration = Duration::from_secs(15);
+/// Default interval between idle checks once past the grace period. Overridable
+/// with [`IDLE_POLL_ENV`] (milliseconds).
+const IDLE_POLL: Duration = Duration::from_secs(5);
+const IDLE_GRACE_ENV: &str = "SHELBI_DAEMON_IDLE_GRACE_MS";
+const IDLE_POLL_ENV: &str = "SHELBI_DAEMON_IDLE_POLL_MS";
+
+/// Parse a milliseconds env override, falling back to `default` on absence or a
+/// non-positive/unparseable value.
+fn duration_from_env_ms(key: &str, default: Duration) -> Duration {
+    match std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(ms) if ms > 0 => Duration::from_millis(ms),
+        _ => default,
+    }
+}
+
+/// Spawn the idle-exit monitor: after a minimum-lifetime grace, poll the
+/// open-project set and shut the daemon down once it is empty. Shutting down
+/// reuses the signal path — flip the shared stop flag, then self-connect to wake
+/// the blocking `accept()` so the main loop drains and exits.
+fn spawn_idle_monitor(stop: Arc<AtomicBool>, sock: PathBuf) {
+    let grace = duration_from_env_ms(IDLE_GRACE_ENV, IDLE_GRACE);
+    let poll = duration_from_env_ms(IDLE_POLL_ENV, IDLE_POLL);
+    thread::spawn(move || {
+        if !sleep_unless_stopped(&stop, grace, poll) {
+            return;
+        }
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let empty = shelbi_state::list_open_projects()
+                .map(|v| v.is_empty())
+                .unwrap_or(false);
+            if empty {
+                eprintln!("shelbi daemon: no project open, shutting down");
+                stop.store(true, Ordering::SeqCst);
+                // Wake the accept loop so it notices the flag and drains.
+                let _ = UnixStream::connect(&sock);
+                return;
+            }
+            if !sleep_unless_stopped(&stop, poll, poll) {
+                return;
+            }
+        }
+    });
+}
+
+/// Sleep for `total` in `slice`-sized steps, returning early (`false`) if the
+/// stop flag is set partway through so the monitor doesn't outlive a shutdown.
+/// Returns `true` if the full duration elapsed without a stop.
+fn sleep_unless_stopped(stop: &Arc<AtomicBool>, total: Duration, slice: Duration) -> bool {
+    let slice = slice.min(total).max(Duration::from_millis(10));
+    let mut waited = Duration::ZERO;
+    while waited < total {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        thread::sleep(slice);
+        waited += slice;
+    }
+    !stop.load(Ordering::SeqCst)
 }
 
 /// Decrements the live-connection counter when a handler thread exits —
@@ -670,6 +832,14 @@ fn handle_client(stream: UnixStream, daemon: &Daemon) {
         if line.trim().is_empty() {
             continue;
         }
+        // `subscribe` is not a one-shot request: it hands the connection over to
+        // a streaming loop that pushes change notifications until the client
+        // disconnects or the daemon shuts down. It takes over this connection, so
+        // the per-line read loop ends here.
+        if let Some(project_filter) = subscribe_project_filter(line) {
+            stream_changes(&stream, &daemon.stop, project_filter.as_deref());
+            return;
+        }
         match dispatch(line, daemon) {
             // A verb with a custom reply (e.g. `refresh-board` → the new
             // `fetched_at`) writes that reply, newline-terminated, in place of
@@ -687,6 +857,65 @@ fn handle_client(stream: UnixStream, daemon: &Daemon) {
                 // multi-message client connection. No ack — the sender
                 // must not mistake a rejection for delivery.
                 eprintln!("shelbi daemon: rejected message: {e}: {line:?}");
+            }
+        }
+    }
+}
+
+/// How long [`stream_changes`] blocks for the next notification before looping
+/// to re-check the shutdown flag. Short enough that SIGTERM stops a parked
+/// subscriber well within the shutdown drain.
+const SUBSCRIBE_POLL_SLICE: Duration = Duration::from_millis(250);
+
+/// If `line` is a `subscribe` frame, returns its optional project filter:
+/// `Some(None)` subscribes to every project's changes, `Some(Some(p))` to only
+/// project `p`'s. Returns `None` when the frame is not a subscribe, so it falls
+/// through to `dispatch`, which reports the real parse error.
+///
+/// Parsed separately from the full [`Message`] so the streaming decision in
+/// [`handle_client`] doesn't have to grow the one-shot dispatch path a sentinel
+/// return. A per-project client (a sidebar watching one board) passes its
+/// `project` so the daemon only wakes it for that project's churn; a client
+/// omits it to see everything.
+fn subscribe_project_filter(line: &str) -> Option<Option<String>> {
+    #[derive(Deserialize)]
+    struct SubFrame {
+        verb: String,
+        #[serde(default)]
+        project: Option<String>,
+    }
+    serde_json::from_str::<SubFrame>(line)
+        .ok()
+        .filter(|m| m.verb == "subscribe")
+        .map(|m| m.project)
+}
+
+/// Stream change notifications to a subscribed client until it disconnects or
+/// the daemon shuts down (Phase 3 pushed change notifications,
+/// `docs/removing-tmux/phase3-daemon.md`).
+///
+/// The client subscribes once and then only reads; the daemon pushes one NDJSON
+/// [`shelbi_state::ChangeNotification`] line per change (board moves, workspace
+/// status changes) that the board refresher and the poller publish to the
+/// in-process change bus. A failed write means the client is gone, so the loop
+/// exits and drops the subscription (pruned from the bus on the next publish).
+/// The connection carries no `ok` ack — it is a one-way push channel, distinct
+/// from the one-shot event/message verbs and from the mutation control socket
+/// `rt-mutations-daemon` adds.
+///
+/// `project`, when set, filters the stream to that one project: the daemon is
+/// hub-global and the bus carries every open project's changes, so a sidebar
+/// watching one board subscribes with its `project` and is woken only by its
+/// own churn, not a sibling project's.
+fn stream_changes(mut stream: &UnixStream, stop: &Arc<AtomicBool>, project: Option<&str>) {
+    let sub = shelbi_state::subscribe_changes();
+    while !stop.load(Ordering::SeqCst) {
+        if let Some(change) = sub.recv_timeout(SUBSCRIBE_POLL_SLICE) {
+            if project.is_some_and(|p| change.project() != p) {
+                continue; // another project's change — not this subscriber's
+            }
+            if stream.write_all(change.to_line().as_bytes()).is_err() {
+                return; // client disconnected
             }
         }
     }
@@ -881,7 +1110,7 @@ mod tests {
         // Tests that exercise the timeout branch override `ack_timeout`
         // locally; everything else uses the production default so the
         // unit tests reflect real config.
-        Daemon::new(DEFAULT_ACK_TIMEOUT)
+        Daemon::new(DEFAULT_ACK_TIMEOUT, Arc::new(AtomicBool::new(false)))
     }
 
     /// RAII guard: point `$SHELBI_HOME` at a fresh temp dir for the
@@ -1499,5 +1728,133 @@ mod tests {
             "drained event must land exactly once: {log}"
         );
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn a_subscribed_client_receives_a_pushed_change_notification() {
+        // Phase 3 pushed notifications: a `subscribe` frame hands the connection
+        // to the streaming loop, and a change published to the in-process bus
+        // (as the board refresher and poller do) is written to the client as one
+        // NDJSON line. The client never polls.
+        let stop = Arc::new(AtomicBool::new(false));
+        let d = Daemon::new(DEFAULT_ACK_TIMEOUT, stop.clone());
+        let (client, server) = UnixStream::pair().unwrap();
+        let handler = thread::spawn(move || handle_client(server, &d));
+
+        // Subscribe to one project unique to this test. The bus is
+        // process-global, so a concurrent test's publish (the board refresher,
+        // `append_workspace_event`) also reaches this subscriber; the
+        // server-side `project` filter drops those, so the only line that comes
+        // back is the one this test publishes. No race on which lands first.
+        let project = "serve-subscribe-test";
+        (&client)
+            .write_all(format!("{{\"verb\":\"subscribe\",\"project\":\"{project}\"}}\n").as_bytes())
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        // Publish on a short retry loop so the first publishes that race the
+        // handler's subscribe aren't lost — once it has subscribed, the queued
+        // notification reads back immediately. Deterministic within ~1s.
+        let mut reader = BufReader::new(&client);
+        let mut line = String::new();
+        let mut got = false;
+        for _ in 0..50 {
+            shelbi_state::publish_change(shelbi_state::ChangeNotification::Board {
+                project: project.into(),
+            });
+            match reader.read_line(&mut line) {
+                Ok(n) if n > 0 => {
+                    got = true;
+                    break;
+                }
+                _ => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        assert!(got, "subscriber received a change line");
+        assert_eq!(
+            line.trim(),
+            format!(r#"{{"change":"board","project":"{project}"}}"#)
+        );
+
+        // Stop flag unblocks the streaming loop within a poll slice.
+        stop.store(true, Ordering::SeqCst);
+        handler.join().unwrap();
+    }
+
+    #[test]
+    fn a_project_scoped_subscriber_ignores_other_projects_changes() {
+        // A client that subscribes with a `project` is woken only by that
+        // project's changes. A sibling project's churn is dropped server-side,
+        // so a per-project sidebar isn't refreshed for a board it isn't showing.
+        let stop = Arc::new(AtomicBool::new(false));
+        let d = Daemon::new(DEFAULT_ACK_TIMEOUT, stop.clone());
+        let (client, server) = UnixStream::pair().unwrap();
+        let handler = thread::spawn(move || handle_client(server, &d));
+
+        let mine = "serve-filter-mine";
+        let other = "serve-filter-other";
+        (&client)
+            .write_all(format!("{{\"verb\":\"subscribe\",\"project\":\"{mine}\"}}\n").as_bytes())
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        let mut reader = BufReader::new(&client);
+        let mut line = String::new();
+        let mut got = false;
+        for _ in 0..50 {
+            // Publish the other project's change first every iteration: if the
+            // filter leaked, it would arrive before mine and fail the assert.
+            shelbi_state::publish_change(shelbi_state::ChangeNotification::Board {
+                project: other.into(),
+            });
+            shelbi_state::publish_change(shelbi_state::ChangeNotification::Workspace {
+                project: mine.into(),
+                workspace: "alpha".into(),
+            });
+            match reader.read_line(&mut line) {
+                Ok(n) if n > 0 => {
+                    got = true;
+                    break;
+                }
+                _ => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        assert!(got, "project-scoped subscriber received its own change");
+        assert_eq!(
+            line.trim(),
+            format!(r#"{{"change":"workspace","project":"{mine}","workspace":"alpha"}}"#),
+            "only the subscriber's own project is streamed"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        handler.join().unwrap();
+    }
+
+    #[test]
+    fn subscribe_project_filter_parses_optional_project() {
+        assert_eq!(
+            subscribe_project_filter(r#"{"verb":"subscribe"}"#),
+            Some(None),
+            "subscribe with no project = all projects"
+        );
+        assert_eq!(
+            subscribe_project_filter(r#"{"verb":"subscribe","project":"p"}"#),
+            Some(Some("p".to_string())),
+            "subscribe with a project = that project only"
+        );
+        assert_eq!(
+            subscribe_project_filter(r#"{"verb":"event","project":"p"}"#),
+            None,
+            "a non-subscribe verb is not a subscribe frame"
+        );
+        assert_eq!(
+            subscribe_project_filter("not json"),
+            None,
+            "a malformed frame is not a subscribe frame"
+        );
     }
 }
