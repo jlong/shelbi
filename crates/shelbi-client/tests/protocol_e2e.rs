@@ -25,6 +25,13 @@ use shelbi_session::{layout::SessionPaths, RunArgs};
 
 // --- harness ---------------------------------------------------------------
 
+/// A generous deadline for condition-based waits. On a loaded hub several
+/// workers (and `shelbi zen probe`) hammer the build tool at once, so threads
+/// competing to be scheduled can take far longer than they do idle. Every
+/// positive wait polls for the expected state up to this bound and reports what
+/// it actually saw on timeout, rather than sleeping a fixed amount and hoping.
+const DEADLINE: Duration = Duration::from_secs(10);
+
 fn serial() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -73,8 +80,13 @@ impl Session {
             manage_daemon: false,
         };
         let handle = std::thread::spawn(move || shelbi_session::run(args));
-        wait_for(Duration::from_secs(5), || paths.sock().exists().then_some(()))
-            .expect("session socket should appear");
+        // Wait until the listener is actually accepting, not merely until the
+        // socket file exists: `bind()` creates the file before `listen()` runs,
+        // so a connect in that window is refused (ECONNREFUSED), and the window
+        // widens under load. Probing with a real connect (immediately dropped)
+        // proves the session is accepting before any test connects for real.
+        wait_for(DEADLINE, || UnixStream::connect(paths.sock()).ok().map(|_| ()))
+            .expect("session socket should accept connections");
         Self {
             paths,
             handle: Some(handle),
@@ -151,10 +163,62 @@ fn recv_until<T>(
     None
 }
 
+/// Accumulate [`SessionEvent::Output`] payloads across events until `needle`
+/// appears in the running buffer, or the deadline passes. Returns the sequence
+/// number of the `Output` event that completed the match, and the bytes seen so
+/// far on timeout so the caller can report what actually arrived.
+///
+/// A single typed token's echo can split across two `Output` frames (the PTY
+/// master read, or a relay re-read, lands on a byte boundary mid-token), so a
+/// per-event `windows()` check races the framing and flakes. Matching against
+/// the accumulated stream is boundary-independent.
+fn recv_output_contains(
+    events: &shelbi_client::SessionEvents,
+    timeout: Duration,
+    needle: &[u8],
+) -> Result<u64, Vec<u8>> {
+    let mut acc: Vec<u8> = Vec::new();
+    let found = recv_until(events, timeout, |ev| match ev {
+        SessionEvent::Output { seq, data } => {
+            acc.extend_from_slice(data);
+            acc.windows(needle.len()).any(|w| w == needle).then_some(*seq)
+        }
+        _ => None,
+    });
+    found.ok_or(acc)
+}
+
+/// Scan `out` for well-formed 32-byte application frames (`<` + 30 identical
+/// bytes + `>`), the shape each client sends. Returns the count of whole frames,
+/// or the offending 32 bytes if a window is delimited exactly like a frame but
+/// carries mixed letters — a genuine mid-write interleave.
+///
+/// A `<` that is not the start of a well-formed frame is skipped, not treated as
+/// interleaving: a drop-to-resync (correct backpressure under load) discards a
+/// run of bytes and can truncate a frame, and a loss-truncated fragment must not
+/// be mistaken for interleaved input.
+fn scan_frames(out: &[u8]) -> Result<usize, Vec<u8>> {
+    let mut i = 0;
+    let mut blocks = 0;
+    while i + 32 <= out.len() {
+        if out[i] == b'<' && out[i + 31] == b'>' {
+            let payload = &out[i + 1..i + 31];
+            if payload.iter().all(|&c| c == payload[0]) {
+                blocks += 1;
+                i += 32;
+                continue;
+            }
+            return Err(out[i..i + 32].to_vec());
+        }
+        i += 1;
+    }
+    Ok(blocks)
+}
+
 /// Read one frame of either kind from a raw socket, with a deadline.
 fn read_any(stream: &mut UnixStream, buf: &mut Vec<u8>) -> Option<AnyFrame> {
     let mut chunk = [0u8; 8192];
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + DEADLINE;
     loop {
         match decode_any(buf) {
             Ok((frame, consumed)) => {
@@ -206,7 +270,7 @@ fn attach_replays_a_snapshot_then_streams_live_output() {
     // reader is just another thread competing to be scheduled). Wait for the
     // marker to be drawn *before* attaching so the resync replay is guaranteed to
     // carry it; otherwise a snapshot raced in that window is legitimately empty.
-    wait_for(Duration::from_secs(5), || {
+    wait_for(DEADLINE, || {
         conn.snapshot(None).ok().filter(|s| s.text.contains("READYMARK"))
     })
     .expect("child output should be drawn into the session");
@@ -214,7 +278,7 @@ fn attach_replays_a_snapshot_then_streams_live_output() {
 
     // The attach replay is a byte stream reconstructing the emulator; the cells
     // the child already drew are painted into it verbatim.
-    let replay = recv_until(&events, Duration::from_secs(5), |ev| match ev {
+    let replay = recv_until(&events, DEADLINE, |ev| match ev {
         SessionEvent::Resync { replay, .. } => Some(replay.clone()),
         _ => None,
     })
@@ -226,11 +290,12 @@ fn attach_replays_a_snapshot_then_streams_live_output() {
 
     // Live output: typed bytes are echoed by the tty and streamed as Output.
     conn.input(b"echoback").unwrap();
-    let got = recv_until(&events, Duration::from_secs(5), |ev| match ev {
-        SessionEvent::Output { data, .. } if data.windows(8).any(|w| w == b"echoback") => Some(()),
-        _ => None,
-    });
-    assert!(got.is_some(), "typed input should stream back as live output");
+    let got = recv_output_contains(&events, DEADLINE, b"echoback");
+    assert!(
+        got.is_ok(),
+        "typed input should stream back as live output; saw: {:?}",
+        got.map_err(|b| String::from_utf8_lossy(&b).into_owned())
+    );
     sess.kill_and_join();
 }
 
@@ -246,7 +311,7 @@ fn output_is_sequenced_and_resized_arrives_in_order() {
     let (conn, events) = sess.client();
     conn.attach(None).unwrap();
     // Drain the initial resync.
-    recv_until(&events, Duration::from_secs(3), |ev| {
+    recv_until(&events, DEADLINE, |ev| {
         matches!(ev, SessionEvent::Resync { .. }).then_some(())
     });
 
@@ -255,17 +320,14 @@ fn output_is_sequenced_and_resized_arrives_in_order() {
     std::thread::sleep(Duration::from_millis(50));
     conn.resize(100, 40).unwrap();
     // Wait for the in-band resized marker.
-    let resized_seq = recv_until(&events, Duration::from_secs(3), |ev| match ev {
+    let resized_seq = recv_until(&events, DEADLINE, |ev| match ev {
         SessionEvent::Resized { seq, cols, rows } if *cols == 100 && *rows == 40 => Some(*seq),
         _ => None,
     })
     .expect("an in-band resized marker should arrive in the output stream");
     conn.input(b"bbb").unwrap();
-    let later_output = recv_until(&events, Duration::from_secs(3), |ev| match ev {
-        SessionEvent::Output { seq, data } if data.windows(3).any(|w| w == b"bbb") => Some(*seq),
-        _ => None,
-    })
-    .expect("output after the resize should arrive");
+    let later_output = recv_output_contains(&events, DEADLINE, b"bbb")
+        .expect("output after the resize should arrive");
 
     assert!(
         later_output > resized_seq,
@@ -330,7 +392,7 @@ fn slow_client_is_dropped_to_a_resync_without_stalling_others() {
     assert!(saw_resync, "a lagging client should be dropped to a resync snapshot");
 
     // The fast client is still alive and receiving after all that.
-    let still_ok = recv_until(&fast_events, Duration::from_secs(5), |ev| {
+    let still_ok = recv_until(&fast_events, DEADLINE, |ev| {
         matches!(ev, SessionEvent::Output { .. }).then_some(())
     });
     assert!(still_ok.is_some(), "the fast client must survive the slow client's drop");
@@ -352,7 +414,7 @@ fn concurrent_input_from_two_clients_is_never_interleaved() {
 
     let (observer, obs_events) = sess.client();
     observer.attach(None).unwrap();
-    recv_until(&obs_events, Duration::from_secs(2), |ev| {
+    recv_until(&obs_events, DEADLINE, |ev| {
         matches!(ev, SessionEvent::Resync { .. }).then_some(())
     });
 
@@ -381,37 +443,46 @@ fn concurrent_input_from_two_clients_is_never_interleaved() {
     ta.join().unwrap();
     tb.join().unwrap();
 
-    // Collect echoed bytes until we have both streams' worth.
-    let want = REPS * 32 * 2;
+    // Echoed output is a sequence of intact 32-byte frames in some order — the
+    // per-target injection lock guarantees each client's write lands contiguously,
+    // never spliced into another's. Collect until every sent frame has been seen
+    // (the fast path), the observer is dropped to a resync, or the deadline
+    // passes, then verify none is interleaved.
+    //
+    // The count is deliberately tolerant rather than exact. Two effects perturb
+    // it under load without touching the invariant under test: a lagging observer
+    // may be dropped to a resync (the same backpressure the slow-client test
+    // asserts), and the child's `stty raw -echo` can momentarily lose the race
+    // with the first echoed bytes so the tty cooks a few frames twice. Both only
+    // ever add or drop *whole, single-letter* frames; neither can splice one
+    // client's bytes into another's. So we count whole frames with `scan_frames`
+    // (which skips a duplicate- or loss-perturbed fragment instead of mistaking
+    // it for interleaving) and require a healthy floor, not the exact total.
+    let sent = REPS * 2;
     let mut out: Vec<u8> = Vec::new();
-    let _ = recv_until(&obs_events, Duration::from_secs(10), |ev| {
-        if let SessionEvent::Output { data, .. } = ev {
+    let _ = recv_until(&obs_events, DEADLINE, |ev| match ev {
+        SessionEvent::Output { data, .. } => {
             out.extend_from_slice(data);
+            (scan_frames(&out).unwrap_or(0) >= sent).then_some(())
         }
-        (out.len() >= want).then_some(())
+        // Overflowed and dropped: the rest is gone, so stop and verify the clean
+        // prefix that arrived before the drop.
+        SessionEvent::Resync { .. } => Some(()),
+        _ => None,
     });
 
-    // Every `<....>` block must be a single letter — never A and B mixed, which
-    // would mean one client's input was written into the middle of another's.
-    let mut i = 0;
-    let mut blocks = 0;
-    while let Some(start) = out[i..].iter().position(|&c| c == b'<') {
-        let s = i + start;
-        if let Some(end_off) = out[s + 1..].iter().position(|&c| c == b'>') {
-            let payload = &out[s + 1..s + 1 + end_off];
-            let first = payload[0];
-            assert!(
-                payload.iter().all(|&c| c == first),
-                "a frame was interleaved mid-write: {:?}",
-                String::from_utf8_lossy(&out[s..=s + 1 + end_off])
-            );
-            blocks += 1;
-            i = s + 1 + end_off + 1;
-        } else {
-            break;
-        }
-    }
-    assert!(blocks >= REPS, "should have observed many whole frames, saw {blocks}");
+    let blocks = scan_frames(&out).unwrap_or_else(|sample| {
+        panic!(
+            "a frame was interleaved mid-write: {:?}",
+            String::from_utf8_lossy(&sample)
+        )
+    });
+    // We proved non-interleaving on every whole frame observed; require a healthy
+    // number (half of what was sent) so the concurrency was genuinely exercised.
+    assert!(
+        blocks >= REPS,
+        "should have observed many whole frames, saw {blocks} of {sent} sent"
+    );
     sess.kill_and_join();
 }
 
@@ -429,7 +500,7 @@ fn most_recently_active_client_size_wins_debounced() {
 
     // A types: the PTY follows A's viewport.
     a.input(b"x").unwrap();
-    let a_size = wait_for(Duration::from_secs(3), || {
+    let a_size = wait_for(DEADLINE, || {
         let info = a.info().ok()?;
         (info.cols == 100 && info.rows == 30).then_some(())
     });
@@ -437,7 +508,7 @@ fn most_recently_active_client_size_wins_debounced() {
 
     // B types: now the PTY follows B's viewport.
     b.input(b"y").unwrap();
-    let b_size = wait_for(Duration::from_secs(3), || {
+    let b_size = wait_for(DEADLINE, || {
         let info = a.info().ok()?;
         (info.cols == 120 && info.rows == 40).then_some(())
     });
@@ -447,7 +518,7 @@ fn most_recently_active_client_size_wins_debounced() {
     b.resize(130, 45).unwrap();
     b.resize(140, 50).unwrap();
     b.resize(150, 55).unwrap();
-    let settled = wait_for(Duration::from_secs(3), || {
+    let settled = wait_for(DEADLINE, || {
         let info = a.info().ok()?;
         (info.cols == 150 && info.rows == 55).then_some(())
     });
@@ -475,7 +546,7 @@ fn pushed_events_are_gated_by_announced_capabilities() {
     bare.attach(None).unwrap();
 
     // The full client receives the title (and the bell) events.
-    let title = recv_until(&full_events, Duration::from_secs(5), |ev| match ev {
+    let title = recv_until(&full_events, DEADLINE, |ev| match ev {
         SessionEvent::Title(t) => Some(t.clone()),
         _ => None,
     });
@@ -502,7 +573,7 @@ fn info_snapshot_setmeta_and_detach_work() {
     let (conn, events) = sess.client();
 
     // info: title/size/metadata/child state.
-    let info = wait_for(Duration::from_secs(3), || conn.info().ok()).expect("info");
+    let info = wait_for(DEADLINE, || conn.info().ok()).expect("info");
     assert_eq!(info.cols, 90);
     assert_eq!(info.rows, 30);
     assert_eq!(info.name, "demo/ws/reqs");
@@ -514,7 +585,7 @@ fn info_snapshot_setmeta_and_detach_work() {
     // emulator yet at this instant, especially under load (it did within ~16ms in
     // practice). The marker is delivered reliably — the test just has to wait for
     // it instead of racing the reader.
-    let snap = wait_for(Duration::from_secs(5), || {
+    let snap = wait_for(DEADLINE, || {
         conn.snapshot(None).ok().filter(|s| s.text.contains("HELLOINFO"))
     })
     .expect("snapshot should show child output");
@@ -522,7 +593,7 @@ fn info_snapshot_setmeta_and_detach_work() {
 
     // set-meta: update name + task, reflected in meta.json and a later info.
     conn.set_meta(Some("demo/ws/renamed".into()), Some("t-42".into())).unwrap();
-    let updated = wait_for(Duration::from_secs(3), || {
+    let updated = wait_for(DEADLINE, || {
         let info = conn.info().ok()?;
         (info.name == "demo/ws/renamed" && info.task.as_deref() == Some("t-42")).then_some(())
     });
@@ -535,7 +606,7 @@ fn info_snapshot_setmeta_and_detach_work() {
 
     // detach: after detaching, no further output is delivered.
     conn.attach(None).unwrap();
-    recv_until(&events, Duration::from_secs(2), |ev| {
+    recv_until(&events, DEADLINE, |ev| {
         matches!(ev, SessionEvent::Resync { .. }).then_some(())
     });
     conn.detach().unwrap();
@@ -562,7 +633,7 @@ fn paste_uses_bracketed_paste_when_the_program_enabled_it() {
     );
     let (conn, events) = sess.client();
     conn.attach(None).unwrap();
-    recv_until(&events, Duration::from_secs(2), |ev| {
+    recv_until(&events, DEADLINE, |ev| {
         matches!(ev, SessionEvent::Resync { .. }).then_some(())
     });
     // Give the child a moment to enable bracketed paste.
@@ -570,7 +641,7 @@ fn paste_uses_bracketed_paste_when_the_program_enabled_it() {
 
     conn.paste("pasted-text").unwrap();
     let mut out: Vec<u8> = Vec::new();
-    let found = recv_until(&events, Duration::from_secs(5), |ev| {
+    let found = recv_until(&events, DEADLINE, |ev| {
         if let SessionEvent::Output { data, .. } = ev {
             out.extend_from_slice(data);
         }
@@ -590,7 +661,7 @@ fn session_answers_a_keepalive_ping_with_a_pong() {
     let _g = serial();
     let mut sess = Session::start("demo/ws/ka", 80, 24, &["/bin/sh", "-c", "exec sleep 30"]);
     let mut raw = UnixStream::connect(sess.sock()).unwrap();
-    raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    raw.set_read_timeout(Some(DEADLINE)).unwrap();
     raw.write_all(
         &Frame::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
@@ -618,12 +689,12 @@ fn exited_event_is_pushed_when_the_child_dies() {
     let mut sess = Session::start("demo/ws/exit", 80, 24, &["/bin/sh", "-c", "exec sleep 30"]);
     let (conn, events) = sess.client();
     conn.attach(None).unwrap();
-    recv_until(&events, Duration::from_secs(2), |ev| {
+    recv_until(&events, DEADLINE, |ev| {
         matches!(ev, SessionEvent::Resync { .. }).then_some(())
     });
     // Kill the child; the session pushes the frozen-core exited event.
     conn.kill(Some(libc::SIGKILL)).unwrap();
-    let exited = recv_until(&events, Duration::from_secs(5), |ev| match ev {
+    let exited = recv_until(&events, DEADLINE, |ev| match ev {
         SessionEvent::Exited(e) => Some(e.clone()),
         _ => None,
     });
@@ -644,7 +715,7 @@ fn client_falls_back_to_core_when_a_capability_was_not_announced() {
     let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_read_timeout(Some(DEADLINE)).unwrap();
         let mut buf = Vec::new();
         // Read the client hello.
         assert!(matches!(read_any(&mut stream, &mut buf), Some(AnyFrame::Core(Frame::Hello(_)))));

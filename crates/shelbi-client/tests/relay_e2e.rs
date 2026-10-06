@@ -32,6 +32,13 @@ use shelbi_session::RunArgs;
 
 // --- harness ---------------------------------------------------------------
 
+/// A generous deadline for condition-based waits. On a loaded hub several
+/// workers (and `shelbi zen probe`) hammer the build tool at once, and the relay
+/// adds an extra bridging hop, so threads competing to be scheduled can take far
+/// longer than they do idle. Every positive wait polls up to this bound and
+/// reports what it actually saw on timeout.
+const DEADLINE: Duration = Duration::from_secs(10);
+
 fn serial() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -92,8 +99,13 @@ impl Harness {
             manage_daemon: false,
         };
         let handle = std::thread::spawn(move || shelbi_session::run(args));
-        wait_for(Duration::from_secs(5), || paths.sock().exists().then_some(()))
-            .expect("session socket should appear");
+        // Wait until the listener is actually accepting, not merely until the
+        // socket file exists: `bind()` creates the file before `listen()` runs,
+        // so a connect in that window is refused (ECONNREFUSED), and the window
+        // widens under load. Probing with a real connect (immediately dropped)
+        // proves the session is accepting before the relay or any test connects.
+        wait_for(DEADLINE, || UnixStream::connect(paths.sock()).ok().map(|_| ()))
+            .expect("session socket should accept connections");
         self.sessions.push((paths.clone(), Some(handle)));
         paths
     }
@@ -163,6 +175,31 @@ fn recv_until<T>(
     None
 }
 
+/// Accumulate [`SessionEvent::Output`] payloads across events until `needle`
+/// appears in the running buffer, or the deadline passes. Returns the sequence
+/// number of the `Output` event that completed the match, else the bytes seen so
+/// far.
+///
+/// A single typed token's echo can split across two `Output` frames (the PTY
+/// master read, or the relay's re-read of the bridged stream, lands on a byte
+/// boundary mid-token), so a per-event `windows()` check races the framing and
+/// flakes. Matching against the accumulated stream is boundary-independent.
+fn recv_output_contains(
+    events: &SessionEvents,
+    timeout: Duration,
+    needle: &[u8],
+) -> Result<u64, Vec<u8>> {
+    let mut acc: Vec<u8> = Vec::new();
+    let found = recv_until(events, timeout, |ev| match ev {
+        SessionEvent::Output { seq, data } => {
+            acc.extend_from_slice(data);
+            acc.windows(needle.len()).any(|w| w == needle).then_some(*seq)
+        }
+        _ => None,
+    });
+    found.ok_or(acc)
+}
+
 /// Connect to a session named by its short id through the relay, with the full
 /// capability set.
 fn connect(channel: &RelayChannel, short_id: &str) -> (Connection, SessionEvents) {
@@ -194,10 +231,18 @@ fn relay_lists_and_bridges_three_sessions_at_once() {
     for (name, marker) in [("demo/ws/a", "AAA"), ("demo/ws/b", "BBB"), ("demo/ws/c", "CCC")] {
         let short = by_name(name).unwrap().short_id;
         let (conn, events) = connect(&channel, &short);
+        // Wait for the child's output to be drawn into the emulator before
+        // attaching, so the resync replay is guaranteed to carry the marker
+        // (a replay taken before the reader thread feeds the first output is
+        // legitimately empty).
+        wait_for(DEADLINE, || {
+            conn.snapshot(None).ok().filter(|s| s.text.contains(marker))
+        })
+        .unwrap_or_else(|| panic!("{name} output should be drawn into the session"));
         conn.attach(None).unwrap();
         // The resync is a byte stream reconstructing the emulator; the marker the
         // child already printed is painted into it verbatim.
-        let replay = recv_until(&events, Duration::from_secs(5), |ev| match ev {
+        let replay = recv_until(&events, DEADLINE, |ev| match ev {
             SessionEvent::Resync { replay, .. } => Some(replay.clone()),
             _ => None,
         })
@@ -223,9 +268,19 @@ fn relay_connection_matches_the_local_api() {
     let short = channel.list_sessions().unwrap()[0].short_id.clone();
     let (conn, events) = connect(&channel, &short);
 
+    // Wait for the child's output to be drawn into the emulator before attaching.
+    // The reader thread feeds the child's first output into the emulator a short
+    // moment after the socket appears (longer under load), so a resync replay
+    // taken before that lands is legitimately empty. Poll a snapshot for the
+    // marker first so the replay is guaranteed to carry it.
+    wait_for(DEADLINE, || {
+        conn.snapshot(None).ok().filter(|s| s.text.contains("HELLOINFO"))
+    })
+    .expect("child output should be drawn into the session");
+
     // attach → resync replay carrying the child's output.
     conn.attach(None).unwrap();
-    let replay = recv_until(&events, Duration::from_secs(5), |ev| match ev {
+    let replay = recv_until(&events, DEADLINE, |ev| match ev {
         SessionEvent::Resync { replay, .. } => Some(replay.clone()),
         _ => None,
     })
@@ -237,15 +292,16 @@ fn relay_connection_matches_the_local_api() {
 
     // input → tty echo streams back as output.
     conn.input(b"echoback").unwrap();
-    let echoed = recv_until(&events, Duration::from_secs(5), |ev| match ev {
-        SessionEvent::Output { data, .. } if data.windows(8).any(|w| w == b"echoback") => Some(()),
-        _ => None,
-    });
-    assert!(echoed.is_some(), "typed input should echo back over the relay");
+    let echoed = recv_output_contains(&events, DEADLINE, b"echoback");
+    assert!(
+        echoed.is_ok(),
+        "typed input should echo back over the relay; saw: {:?}",
+        echoed.map_err(|b| String::from_utf8_lossy(&b).into_owned())
+    );
 
     // resize → info reflects the new size (the active client's viewport).
     conn.resize(100, 40).unwrap();
-    let sized = wait_for(Duration::from_secs(3), || {
+    let sized = wait_for(DEADLINE, || {
         let info = conn.info().ok()?;
         (info.cols == 100 && info.rows == 40).then_some(())
     });
@@ -257,7 +313,7 @@ fn relay_connection_matches_the_local_api() {
 
     // kill → the frozen-core exited event is pushed.
     conn.kill(Some(libc::SIGKILL)).unwrap();
-    let exited = recv_until(&events, Duration::from_secs(5), |ev| {
+    let exited = recv_until(&events, DEADLINE, |ev| {
         matches!(ev, SessionEvent::Exited(_)).then_some(())
     });
     assert!(exited.is_some(), "kill should push an exited event over the relay");
@@ -284,15 +340,12 @@ fn relay_kill_mid_stream_resumes_by_sequence_number() {
     let short = channel1.list_sessions().unwrap()[0].short_id.clone();
     let (conn1, events1) = connect(&channel1, &short);
     conn1.attach(None).unwrap();
-    recv_until(&events1, Duration::from_secs(3), |ev| {
+    recv_until(&events1, DEADLINE, |ev| {
         matches!(ev, SessionEvent::Resync { .. }).then_some(())
     });
     conn1.input(b"first").unwrap();
-    let last_seq = recv_until(&events1, Duration::from_secs(5), |ev| match ev {
-        SessionEvent::Output { seq, data } if data.windows(5).any(|w| w == b"first") => Some(*seq),
-        _ => None,
-    })
-    .expect("should see the first output with a sequence number");
+    let last_seq = recv_output_contains(&events1, DEADLINE, b"first")
+        .expect("should see the first output with a sequence number");
 
     // Kill the relay mid-stream: sever its socket so the server end EOFs, and
     // drop the client side. The session itself keeps running — the relay held
@@ -315,7 +368,7 @@ fn relay_kill_mid_stream_resumes_by_sequence_number() {
     let (conn2, events2) = connect(&channel2, &short);
     conn2.attach(Some(last_seq)).unwrap();
     // The resync rebases us at or past where we were — never behind it.
-    let resync_seq = recv_until(&events2, Duration::from_secs(5), |ev| match ev {
+    let resync_seq = recv_until(&events2, DEADLINE, |ev| match ev {
         SessionEvent::Resync { seq, .. } => Some(*seq),
         _ => None,
     })
@@ -328,11 +381,8 @@ fn relay_kill_mid_stream_resumes_by_sequence_number() {
     // New output after the reconnect carries strictly higher sequence numbers —
     // no duplication of what we already saw, no loss of the new output.
     conn2.input(b"second").unwrap();
-    let next_seq = recv_until(&events2, Duration::from_secs(5), |ev| match ev {
-        SessionEvent::Output { seq, data } if data.windows(6).any(|w| w == b"second") => Some(*seq),
-        _ => None,
-    })
-    .expect("should receive output generated after the reconnect");
+    let next_seq = recv_output_contains(&events2, DEADLINE, b"second")
+        .expect("should receive output generated after the reconnect");
     assert!(
         next_seq > last_seq,
         "post-reconnect output must continue the sequence ({next_seq} > {last_seq})"
@@ -354,7 +404,7 @@ fn silent_channel_is_detected_as_unreachable_within_the_deadline() {
         RelayChannel::with_keepalive(Box::new(hub_read), Box::new(hub), ka).expect("channel");
 
     assert!(channel.is_reachable(), "a fresh channel starts reachable");
-    let became_unreachable = wait_for(Duration::from_secs(3), || {
+    let became_unreachable = wait_for(DEADLINE, || {
         (!channel.is_reachable()).then_some(())
     });
     assert!(
@@ -427,13 +477,20 @@ fn slow_stream_does_not_stall_another_on_the_same_channel() {
         }
     });
 
-    // Give the slow stream time to overflow, then confirm the fast stream keeps
-    // flowing across two checkpoints — it is not stalled by the slow one.
-    std::thread::sleep(Duration::from_millis(500));
-    let t1 = fast_outputs.load(Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(500));
-    let t2 = fast_outputs.load(Ordering::Relaxed);
-    assert!(t1 > 0, "the fast stream should be receiving output");
+    // Confirm the fast stream keeps flowing across two checkpoints — it is not
+    // stalled by the slow one, whose unread queue overflows concurrently. Poll
+    // for each checkpoint rather than sleeping a fixed amount, so a loaded hub
+    // that merely slows the throughput doesn't trip the test.
+    let t1 = wait_for(DEADLINE, || {
+        let n = fast_outputs.load(Ordering::Relaxed);
+        (n > 0).then_some(n)
+    })
+    .expect("the fast stream should be receiving output");
+    let t2 = wait_for(DEADLINE, || {
+        let n = fast_outputs.load(Ordering::Relaxed);
+        (n > t1).then_some(n)
+    })
+    .expect("the fast stream must keep flowing while the slow stream is stalled");
     assert!(
         t2 > t1,
         "the fast stream must keep flowing while the slow stream is stalled ({t1} -> {t2})"
@@ -441,7 +498,7 @@ fn slow_stream_does_not_stall_another_on_the_same_channel() {
 
     // The slow stream was dropped-to-replay: reading it now surfaces a resync
     // (its backlog was discarded and the session re-snapshotted).
-    let saw_resync = read_for_resync(slow_r, Duration::from_secs(5));
+    let saw_resync = read_for_resync(slow_r, DEADLINE);
     assert!(saw_resync, "the slow stream should have been dropped to a resync");
 
     stop.store(true, Ordering::Relaxed);
@@ -508,14 +565,15 @@ fn relay_bridges_a_frozen_core_session() {
     );
 
     conn.attach(None).unwrap();
-    let got = recv_until(&events, Duration::from_secs(5), |ev| match ev {
-        SessionEvent::Output { data, .. } if data.windows(7).any(|w| w == b"COREOUT") => Some(()),
-        _ => None,
-    });
-    assert!(got.is_some(), "core attach output should arrive through the relay");
+    let got = recv_output_contains(&events, DEADLINE, b"COREOUT");
+    assert!(
+        got.is_ok(),
+        "core attach output should arrive through the relay; saw: {:?}",
+        got.map_err(|b| String::from_utf8_lossy(&b).into_owned())
+    );
 
     conn.kill(None).unwrap();
-    let exited = recv_until(&events, Duration::from_secs(5), |ev| {
+    let exited = recv_until(&events, DEADLINE, |ev| {
         matches!(ev, SessionEvent::Exited(_)).then_some(())
     });
     assert!(exited.is_some(), "core exited event should arrive through the relay");
@@ -532,7 +590,7 @@ fn relay_bridges_a_frozen_core_session() {
 /// output on attach, and an exited event on kill.
 fn run_frozen_core_session(listener: UnixListener) {
     let (mut stream, _) = listener.accept().unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_read_timeout(Some(DEADLINE)).ok();
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut sent_hello = false;
