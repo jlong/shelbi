@@ -1326,12 +1326,23 @@ fn maybe_emit_heartbeat(
 /// or the volume can't be probed (`statvfs` unavailable/failed), the result is
 /// `None` and no warning is emitted.
 pub(crate) fn low_disk_free_bytes(project: &shelbi_core::Project) -> Option<u64> {
+    low_disk_free_bytes_with(project, shelbi_state::disk::free_space_bytes)
+}
+
+/// Core of [`low_disk_free_bytes`] with the free-space probe injected, so a
+/// test can feed a fixed byte count rather than racing two separate live reads
+/// of a real volume (any write between the two breaks an exact-equality check).
+/// `probe` returns the volume's free bytes, or `None` when it can't be read.
+fn low_disk_free_bytes_with(
+    project: &shelbi_core::Project,
+    probe: impl FnOnce(&std::path::Path) -> Option<u64>,
+) -> Option<u64> {
     let work_dir = project
         .machines
         .iter()
         .find(|m| matches!(m.kind, shelbi_core::MachineKind::Local))
         .map(|m| m.work_dir.as_path())?;
-    let free = shelbi_state::disk::free_space_bytes(work_dir)?;
+    let free = probe(work_dir)?;
     (free < project.disk.low_free_bytes()).then_some(free)
 }
 
@@ -7076,25 +7087,41 @@ Auto mode works better when it knows your environment. Takes about a minute.
 
     #[test]
     fn low_disk_free_bytes_warns_under_threshold_and_is_quiet_above() {
-        // Probe a real volume (the temp dir). With the threshold set absurdly
-        // high the volume is "below" it and the free count is reported; with a
-        // 0-GiB knob (folds to the 20 GiB default on a host with >20 GiB free,
-        // but be robust: use an explicit 1-byte-equivalent via a huge-then-tiny
-        // pair) the result flips to quiet. We bracket the real free value.
+        const GIB: u64 = 1024 * 1024 * 1024;
         let dir = std::env::temp_dir();
-        let real_free =
-            shelbi_state::disk::free_space_bytes(&dir).expect("temp dir has a probeable volume");
 
+        // Threshold logic, checked deterministically with an *injected* probe
+        // returning a fixed free count — never a second live read of a real
+        // volume that another process could change between the two reads (the
+        // old flake: `left: Some(88282615808), right: Some(88282619904)`, a
+        // 4 KiB write landing between them).
+        let mut p = local_project(&dir);
+
+        // Free below the threshold → warn, reporting exactly the probed bytes.
+        p.disk.low_free_gib = Some(100);
+        assert_eq!(low_disk_free_bytes_with(&p, |_| Some(GIB)), Some(GIB));
+
+        // Free above the threshold → quiet.
+        p.disk.low_free_gib = Some(1);
+        assert_eq!(low_disk_free_bytes_with(&p, |_| Some(50 * GIB)), None);
+
+        // Free exactly at the threshold → quiet (the comparison is strict `<`).
+        let at = p.disk.low_free_bytes();
+        assert_eq!(low_disk_free_bytes_with(&p, |_| Some(at)), None);
+
+        // An unprobeable volume → quiet.
+        assert_eq!(low_disk_free_bytes_with(&p, |_| None), None);
+
+        // Smoke the real probe against live thresholds, with no exact-value
+        // race: a threshold far above any real volume warns (`is_some`), and a
+        // 1 GiB threshold on a host with far more free stays quiet (`None`).
         let mut warn = local_project(&dir);
-        // Threshold above real free → warn, reporting the real free bytes.
-        warn.disk.low_free_gib = Some(real_free / (1024 * 1024 * 1024) + 1_000_000);
-        assert_eq!(low_disk_free_bytes(&warn), Some(real_free));
+        warn.disk.low_free_gib = Some(1_000_000); // ~1 PiB, above any real volume
+        assert!(low_disk_free_bytes(&warn).is_some());
 
-        let mut quiet = local_project(&dir);
-        // Threshold of 1 GiB on a host with far more free → quiet.
-        quiet.disk.low_free_gib = Some(1);
-        // Only assert quiet when the host genuinely has >1 GiB free (CI/dev do).
-        if real_free > 1024 * 1024 * 1024 {
+        if shelbi_state::disk::free_space_bytes(&dir).is_some_and(|f| f > GIB) {
+            let mut quiet = local_project(&dir);
+            quiet.disk.low_free_gib = Some(1);
             assert_eq!(low_disk_free_bytes(&quiet), None);
         }
     }
