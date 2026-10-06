@@ -90,9 +90,32 @@ fn project_of(session: &str) -> &str {
 }
 
 impl SessionProcessBackend {
+    /// Whether a discovered session is actually **usable**: its lock is held
+    /// *and* its socket is accepting connections. A locked session whose socket
+    /// refuses connections is the "alive but not listening" zombie — its process
+    /// is up (lock held) but its listener is gone, so no client can ever attach.
+    /// Treating it as not usable in the supervision probes
+    /// ([`probe`](SessionBackend::probe) /
+    /// [`enumerate_slots`](SessionBackend::enumerate_slots)) is what makes the
+    /// resume passes see the slot as gone and relaunch a fresh, working session
+    /// rather than reuse the stranded one
+    /// (`rt-review-session-alive-but-not-listening`).
+    ///
+    /// Scoped to those liveness probes (which already run on the poller cadence):
+    /// it opens a bare connect to the session, so applying it on the per-keystroke
+    /// `send_*` / per-tick `title` paths — which connect for real right after —
+    /// would just double the work, and a zombie there surfaces as a connect error
+    /// the caller already tolerates.
+    fn usable(&self, s: &DiscoveredSession) -> bool {
+        s.usable()
+    }
+
     /// Find the live session with the given logical name, if any. A dead
     /// session directory (lock not held) is skipped here — callers that want a
     /// dead session's final screen reach for it explicitly via the directory.
+    /// Lock-based (no socket probe): the callers (`send_*`, `kill`, `title`,
+    /// `resize`) open a real connection next, so a zombie surfaces there as a
+    /// connect error rather than warranting a second probe connect.
     fn find_live(&self, name: &str) -> Option<DiscoveredSession> {
         self.discover()
             .into_iter()
@@ -192,11 +215,14 @@ impl SessionBackend for SessionProcessBackend {
             // when it cannot be reached (never collapsed to Dead).
             return remote_session::probe(host, &name);
         }
-        // A local scan is a filesystem read: it always produces a definitive
-        // answer, so the deadline is irrelevant and the probe is never
-        // Unreachable. A name that no live session carries is Dead.
+        // A local scan is a filesystem read plus (for a live-by-lock session) a
+        // cheap connect probe: it always produces a definitive answer, so the
+        // deadline is irrelevant and the probe is never Unreachable. A name no
+        // *usable* session carries is Dead — including a zombie whose process is
+        // up but whose socket refuses connections, so supervision relaunches it
+        // instead of treating the stranded slot as alive.
         match self.find_any(&name) {
-            Some(s) if s.alive => Liveness::Alive,
+            Some(s) if self.usable(&s) => Liveness::Alive,
             _ => Liveness::Dead,
         }
     }
@@ -357,7 +383,7 @@ impl SessionBackend for SessionProcessBackend {
         let slots = self
             .discover()
             .into_iter()
-            .filter(|s| s.alive)
+            .filter(|s| self.usable(s))
             .filter_map(|s| {
                 s.meta
                     .name
