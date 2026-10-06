@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::OnceLock;
@@ -238,7 +239,73 @@ pub const SCRUBBED_TERMINAL_VARS: &[&str] = &["TMUX", "TMUX_PANE", "TERM_PROGRAM
 /// is nothing to install on a remote host. This is the shared helper the daemon
 /// and the session spawner both build the child environment from.
 pub fn session_child_env() -> BTreeMap<String, String> {
-    build_session_env(login_shell_env())
+    let mut env = build_session_env(login_shell_env());
+    if let Some(exe) = current_shelbi_exe() {
+        pin_shelbi_binary(&mut env, &exe);
+    }
+    env
+}
+
+/// Environment variable naming the exact `shelbi` binary a session (and any
+/// workflow `run:` command on the hub) should invoke, for scripts and hooks
+/// that want the precise path instead of relying on `PATH` resolution. See
+/// [`pin_shelbi_binary`].
+pub const SHELBI_BIN_VAR: &str = "SHELBI_BIN";
+
+/// The running `shelbi` executable, canonicalized, for pinning onto a session
+/// (or the daemon's own) environment. `None` only when `current_exe()` itself
+/// fails — a degenerate case in which we leave `PATH` untouched rather than
+/// guess, and the login-shell `PATH` resolves `shelbi` as before.
+pub fn current_shelbi_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    // Canonicalize so the pinned dir and `SHELBI_BIN` name the real file (a
+    // `~/bin/shelbi-next` wrapper execs the real binary, and `current_exe`
+    // already reports the exec'd target), falling back to the raw path if the
+    // file can't be resolved (e.g. it was replaced out from under us).
+    Some(std::fs::canonicalize(&exe).unwrap_or(exe))
+}
+
+/// Pin `exe` as *the* `shelbi` binary in `env`: put its parent directory first
+/// on `PATH` (appearing exactly once) and set [`SHELBI_BIN_VAR`] to the
+/// executable's full path.
+///
+/// A bare `shelbi` run inside the resulting environment then resolves to the
+/// binary that launched the session, even when the captured login `PATH` puts a
+/// *different* install's `shelbi` earlier (`rt-session-path-pins-own-binary`:
+/// a side-by-side `shelbi-next` install whose `SHELBI_ROOT` and binary diverged
+/// from the main-line `shelbi` that `PATH` found first). A single-install host
+/// already has the exe dir somewhere on `PATH`; this just moves it to the front
+/// without duplicating it.
+pub fn pin_shelbi_binary(env: &mut BTreeMap<String, String>, exe: &Path) {
+    env.insert(
+        SHELBI_BIN_VAR.to_string(),
+        exe.to_string_lossy().into_owned(),
+    );
+    if let Some(dir) = exe.parent().filter(|d| !d.as_os_str().is_empty()) {
+        let path = env.get("PATH").map(String::as_str).unwrap_or("");
+        env.insert("PATH".to_string(), prepend_path_entry(dir, path));
+    }
+}
+
+/// Build a `PATH` string with `dir` as the first entry, preserving the order of
+/// the remaining entries and dropping any entry that names `dir` itself (so the
+/// directory appears exactly once). An empty/absent input `PATH` yields just
+/// `dir`.
+fn prepend_path_entry(dir: &Path, path: &str) -> String {
+    let mut out = dir.to_string_lossy().into_owned();
+    if path.is_empty() {
+        return out;
+    }
+    for entry in path.split(':') {
+        // Skip a duplicate of the pinned dir; keep every other entry verbatim
+        // (including an empty entry, which POSIX reads as the current dir).
+        if Path::new(entry) == dir {
+            continue;
+        }
+        out.push(':');
+        out.push_str(entry);
+    }
+    out
 }
 
 /// The pure transform [`session_child_env`] applies to a captured environment:
@@ -482,6 +549,64 @@ mod tests {
         });
         assert_eq!(third.get("PATH").map(String::as_str), Some("/captured/bin"));
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn pin_puts_the_exe_dir_first_even_when_another_shelbi_is_ahead() {
+        // The captured login PATH puts a *different* install's dir (holding its
+        // own `shelbi`) first. After pinning, the running exe's dir must lead.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "PATH".to_string(),
+            "/Users/dev/bin:/usr/bin:/bin".to_string(),
+        );
+        pin_shelbi_binary(&mut env, Path::new("/Users/dev/.shelbi-next/bin/shelbi"));
+
+        let path = env.get("PATH").expect("PATH is set");
+        let first = path.split(':').next();
+        assert_eq!(
+            first,
+            Some("/Users/dev/.shelbi-next/bin"),
+            "the running exe's dir must be the first PATH entry, got {path:?}"
+        );
+    }
+
+    #[test]
+    fn pin_does_not_duplicate_the_exe_dir_already_on_path() {
+        // The exe dir is already on PATH (single-install host): it must move to
+        // the front and appear exactly once, not be duplicated.
+        let mut env = BTreeMap::new();
+        env.insert(
+            "PATH".to_string(),
+            "/usr/bin:/Users/dev/bin:/bin".to_string(),
+        );
+        pin_shelbi_binary(&mut env, Path::new("/Users/dev/bin/shelbi"));
+
+        let path = env.get("PATH").expect("PATH is set");
+        assert_eq!(path, "/Users/dev/bin:/usr/bin:/bin");
+        let occurrences = path.split(':').filter(|e| *e == "/Users/dev/bin").count();
+        assert_eq!(occurrences, 1, "exe dir must not be duplicated in {path:?}");
+    }
+
+    #[test]
+    fn pin_sets_shelbi_bin_to_the_exe_path() {
+        let mut env = BTreeMap::new();
+        env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        pin_shelbi_binary(&mut env, Path::new("/opt/shelbi/bin/shelbi"));
+
+        assert_eq!(
+            env.get(SHELBI_BIN_VAR).map(String::as_str),
+            Some("/opt/shelbi/bin/shelbi")
+        );
+    }
+
+    #[test]
+    fn pin_with_empty_path_yields_just_the_exe_dir() {
+        // A missing/empty PATH must not grow a stray trailing colon (which POSIX
+        // reads as the current dir) — the result is exactly the exe dir.
+        let mut env = BTreeMap::new();
+        pin_shelbi_binary(&mut env, Path::new("/opt/shelbi/bin/shelbi"));
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/opt/shelbi/bin"));
     }
 
     #[test]

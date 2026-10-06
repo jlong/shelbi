@@ -347,6 +347,23 @@ fn apply_login_shell_env() {
     for (key, value) in shelbi_core::login_shell_env() {
         std::env::set_var(key, value);
     }
+    // Pin the running `shelbi` binary ahead of the captured login `PATH`, and
+    // export `SHELBI_BIN`. A workflow `run:` command on the hub inherits this
+    // process's environment (it is a plain local subprocess), so a bare
+    // `shelbi` inside it resolves to *this* daemon's binary rather than a
+    // different install the login `PATH` happens to find first
+    // (`rt-session-path-pins-own-binary`). Sessions the daemon spawns pin
+    // themselves via `session_child_env`; a remote `run:` command runs under
+    // the remote host's own login env and is unaffected by this local pin.
+    if let Some(exe) = shelbi_core::current_shelbi_exe() {
+        let mut env = std::env::vars().collect();
+        shelbi_core::pin_shelbi_binary(&mut env, &exe);
+        for key in ["PATH", shelbi_core::SHELBI_BIN_VAR] {
+            if let Some(value) = env.get(key) {
+                std::env::set_var(key, value);
+            }
+        }
+    }
 }
 
 /// Stop and remove any leftover launchd/systemd supervisor unit (the retired
