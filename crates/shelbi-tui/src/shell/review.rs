@@ -38,9 +38,6 @@ use crate::review_panel::{render_full, PanelEffect, ReviewPanel};
 use super::session::{Connector, MainState, SessionManager, SessionRef};
 use super::terminal_view::MouseOutcome;
 
-/// The panel column's width, clamped to leave room for the content view.
-const PANEL_WIDTH: u16 = 32;
-
 /// Keyboard focus within the review interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewFocus {
@@ -115,13 +112,17 @@ impl ReviewInterface {
         &self.task_id
     }
 
-    /// Bind the content view to Chat (the agent session).
+    /// Bind the content view to Chat (the agent session). Re-selecting Chat
+    /// while it is the current but *failed* target re-attaches — `SessionManager::show`
+    /// re-attempts a failed/idle binding, so this is the retry path for a content
+    /// connect that timed out (`rt-review-screen-hangs-on-connecting`).
     pub fn show_chat(&mut self) {
         self.content.show(SessionRef::Workspace(self.slot.clone()));
     }
 
     /// Bind the content view to a daemon-spawned role session. The caller has
-    /// already ensured it exists (the daemon's half).
+    /// already ensured it exists (the daemon's half). Re-selecting the same role
+    /// while it is the current but failed target re-attaches.
     pub fn show_role(&mut self, role: ReviewRole) {
         self.content.show(SessionRef::Review {
             slot: self.slot.clone(),
@@ -163,10 +164,13 @@ impl ReviewInterface {
         self.content.pump_output(ring)
     }
 
-    /// Report the review `area` (the whole main area) so the content view
-    /// reflows to fill just its sub-rect.
-    pub fn resize(&mut self, area: Rect) {
-        let (_panel, content) = split(area);
+    /// Report the content `area` so the content view reflows to fill it. The
+    /// panel now occupies the sidebar column, so the content view fills the whole
+    /// main area (`rt-review-screen-hangs-on-connecting`: review panel replaces
+    /// the sidebar, two columns). `&mut self` so the content `SessionManager`
+    /// records the last requested size and re-applies it when the session goes
+    /// live (`rt-review-content-session-edit-in-vi-doesn-t-fill-the-content-area`).
+    pub fn resize(&mut self, content: Rect) {
         self.content.resize(content.width, content.height);
     }
 
@@ -242,7 +246,12 @@ impl ReviewInterface {
                 }
                 ReviewAction::None
             }
-            KeyCode::Char('q') | KeyCode::Esc => {
+            // Esc leaves the review loaded and returns to the nav sidebar (like
+            // the back arrow) — `rt-review-screen-hangs-on-connecting` AC.
+            KeyCode::Esc => ReviewAction::Back,
+            // `q` is the explicit teardown: end the editor/diff/server sessions
+            // and free the slot's port.
+            KeyCode::Char('q') => {
                 self.panel.request_quit();
                 if self.panel.should_quit {
                     ReviewAction::Close
@@ -263,9 +272,14 @@ impl ReviewInterface {
         }
     }
 
-    /// Handle a mouse event within the review `area` (the whole main area).
-    pub fn handle_mouse(&mut self, m: MouseEvent, area: Rect) -> ReviewAction {
-        let (panel_rect, content_rect) = split(area);
+    /// Handle a mouse event. `panel_rect` is the sidebar column the panel now
+    /// occupies; `content_rect` is the main area the content view fills.
+    pub fn handle_mouse(
+        &mut self,
+        m: MouseEvent,
+        panel_rect: Rect,
+        content_rect: Rect,
+    ) -> ReviewAction {
         let in_panel = contains(panel_rect, m.column, m.row);
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.focus = if in_panel {
@@ -301,16 +315,17 @@ impl ReviewInterface {
 
     // -- render --------------------------------------------------------------
 
-    /// Render the panel beside the content view. Returns the cursor position
+    /// Render the panel into `panel_rect` (the sidebar column) and the content
+    /// view into `content_rect` (the main area). Returns the cursor position
     /// when the content view is focused and live.
     pub fn render(
         &mut self,
         frame: &mut Frame,
-        area: Rect,
+        panel_rect: Rect,
+        content_rect: Rect,
         truecolor: bool,
         focus_main: bool,
     ) -> Option<(u16, u16)> {
-        let (panel_rect, content_rect) = split(area);
         // Panel first (render_full borrows the frame's buffer internally).
         render_full(frame, &mut self.panel, panel_rect);
         // Then the content view into the remaining buffer.
@@ -326,7 +341,10 @@ impl ReviewInterface {
             MainState::Failed(r, err) => super::render_placeholder(
                 buf,
                 content_rect,
-                &format!("Couldn't attach to {}: {err}", r.display()),
+                &format!(
+                    "Couldn't attach to {}: {err} — select it again to retry.",
+                    r.display()
+                ),
             ),
             // The review agent's chat session should always be live; if it isn't
             // up yet, treat it like "no session here" rather than the dev-slot
@@ -381,19 +399,6 @@ fn map_effect(effect: PanelEffect) -> ReviewAction {
         PanelEffect::Approve => ReviewAction::Approve,
         PanelEffect::RejectPrompt => ReviewAction::Reject,
     }
-}
-
-/// Split the review `area` into (panel, content).
-fn split(area: Rect) -> (Rect, Rect) {
-    let w = PANEL_WIDTH.min(area.width.saturating_sub(1).max(1));
-    let panel = Rect::new(area.x, area.y, w, area.height);
-    let content = Rect::new(
-        area.x + w,
-        area.y,
-        area.width.saturating_sub(w),
-        area.height,
-    );
-    (panel, content)
 }
 
 fn contains(area: Rect, x: u16, y: u16) -> bool {
@@ -473,6 +478,15 @@ mod tests {
     fn q_closes_when_not_merging() {
         let mut it = iface();
         assert_eq!(it.handle_key(key(KeyCode::Char('q'))), ReviewAction::Close);
+    }
+
+    #[test]
+    fn esc_goes_back_and_leaves_the_review_loaded() {
+        // Esc returns to the nav sidebar (Back) rather than tearing the review
+        // down — it must not quit, and it is a distinct action from `q`'s Close.
+        let mut it = iface();
+        assert_eq!(it.handle_key(key(KeyCode::Esc)), ReviewAction::Back);
+        assert!(!it.panel.should_quit, "Esc does not quit the review");
     }
 
     #[test]

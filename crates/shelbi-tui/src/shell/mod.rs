@@ -1778,10 +1778,16 @@ impl ShellState {
                 self.spawn_review_opener(action);
             }
             ReviewAction::Back => {
-                // Leave the interface loaded (daemon sessions stay); just return
-                // to the orchestrator chat.
+                // Leave the interface loaded (daemon sessions stay) and return to
+                // the normal nav sidebar: drop the review panel, restore the view
+                // that was active before the review opened, and put focus back on
+                // the sidebar with its selection intact (opening a review never
+                // changed the selection). `rt-review-screen-hangs-on-connecting`.
                 self.review = None;
-                self.show(RowTarget::Session(SessionRef::Orchestrator));
+                let view = self.client.view().clone();
+                self.apply_restored_view(view);
+                self.client.focus_sidebar();
+                self.dirty = true;
             }
             ReviewAction::Close => self.close_review(&project, &task),
         }
@@ -2181,6 +2187,12 @@ impl ShellState {
 
     fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+        // The sidebar/main divider drag takes priority over everything else,
+        // including the review's mouse routing: while a review is open the panel
+        // sits in the sidebar's column, so the divider between panel and content
+        // is still draggable and a divider press must neither select a panel
+        // item nor reach the content view.
+        //
         // An in-progress divider drag captures all mouse motion until the
         // button releases, wherever the pointer travels.
         if self.sidebar_dragging {
@@ -2193,12 +2205,27 @@ impl ShellState {
             return;
         }
         // A press on the divider column starts a drag — and is swallowed so it
-        // never selects a sidebar row or reaches the main pane.
+        // never selects a sidebar/panel row or reaches the main/content pane.
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
             && self.on_divider(m.column, m.row)
         {
             self.sidebar_dragging = true;
             self.update_sidebar_drag(m.column);
+            return;
+        }
+        // While a review is open the panel occupies the sidebar column and the
+        // content view the main area, so the review interface owns clicks in
+        // both rects — except the divider press-drag-release handled above
+        // (`rt-review-screen-hangs-on-connecting`).
+        if matches!(self.main_view, MainView::Review(_)) {
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.client.focus_main();
+            }
+            if let Some(r) = self.review.as_mut() {
+                let action = r.handle_mouse(m, self.sidebar_rect, self.main_rect);
+                self.apply_review_action(action);
+                self.dirty = true;
+            }
             return;
         }
         if contains(self.sidebar_rect, m.column, m.row) {
@@ -2301,19 +2328,10 @@ impl ShellState {
 
     fn handle_main_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
-        // A click in the main area focuses it.
+        // A click in the main area focuses it. (An open review's clicks are
+        // routed in `handle_mouse` before reaching here, across both columns.)
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.client.focus_main();
-        }
-        // The review interface owns main-area mouse when it is open.
-        if matches!(self.main_view, MainView::Review(_)) {
-            let area = self.main_rect;
-            if let Some(r) = self.review.as_mut() {
-                let action = r.handle_mouse(m, area);
-                self.apply_review_action(action);
-                self.dirty = true;
-            }
-            return;
         }
 
         // Native views handle their own mouse. The board's hit maps and the
@@ -2458,7 +2476,8 @@ fn draw(
     let main_size = Size::new(main_rect.width, main_rect.height);
     if state.reported_main != Some(main_size) {
         state.sessions.resize(main_size.cols, main_size.rows);
-        // The review content view occupies only the content sub-rect.
+        // The review content view fills the whole main area (the panel now sits
+        // in the sidebar column), so it reflows to the same `main_rect`.
         if let Some(r) = state.review.as_mut() {
             r.resize(main_rect);
         }
@@ -2514,9 +2533,14 @@ fn draw(
         {
             let buf = frame.buffer_mut();
 
-            // Sidebar.
-            if let Some(view) = &sidebar_view {
-                view.render(buf, sidebar_rect, selection, !focus_main, &sidebar_chrome);
+            // Sidebar — the nav sidebar, except while a review is open: then the
+            // review panel takes the sidebar's column (rendered at the frame
+            // level below), so there are only two columns, panel and content
+            // (`rt-review-screen-hangs-on-connecting`).
+            if !is_review {
+                if let Some(view) = &sidebar_view {
+                    view.render(buf, sidebar_rect, selection, !focus_main, &sidebar_chrome);
+                }
             }
 
             // Main area (session / review-fallback; native views drawn above).
@@ -2565,10 +2589,11 @@ fn draw(
             }
         }
 
-        // The review interface (panel + content terminal view) renders with a
-        // mutable frame borrow.
+        // The review interface renders with a mutable frame borrow: the panel
+        // into the sidebar's column (`sidebar_rect`), the content terminal view
+        // into the main area (`main_rect`) — two columns, panel and content.
         if let Some(r) = review.as_mut() {
-            let cur = r.render(frame, main_rect, truecolor, focus_main);
+            let cur = r.render(frame, sidebar_rect, main_rect, truecolor, focus_main);
             if overlay.is_none() {
                 cursor = cur;
             }
@@ -3299,6 +3324,74 @@ mod tests {
             shelbi_state::sidebar_width().unwrap(),
             Some(38),
             "the released width is saved under ~/.shelbi/"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn dragging_the_divider_while_a_review_is_open_resizes_the_panel() {
+        // While a review is open the panel sits in the sidebar's column, so the
+        // divider between panel and content is still draggable — and the divider
+        // press-drag-release takes priority over the review's mouse routing: the
+        // press begins a drag instead of reaching the panel or the content view
+        // (`rt-review-screen-hangs-on-connecting`).
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = temp_home("review-divider-drag");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut st = test_state();
+        // A review is open: the panel occupies the sidebar column, the content
+        // view the main area.
+        st.main_view = MainView::Review("t-1".into());
+        st.review = Some(ReviewInterface::new(
+            "proj",
+            Arc::new(NoopConnector),
+            "t-1",
+            "rev-1",
+            "/tmp/wt",
+            "vim",
+            false,
+        ));
+        // A 120-wide window: panel [0,28), content [28,120). Divider col = 27.
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        st.main_rect = Rect::new(28, 0, 92, 20);
+        assert_eq!(st.divider_col(), 27);
+        let focus_before = st.client.focus();
+
+        // Press on the divider begins a drag — it does not reach the review
+        // (which, on a left press, would focus the main/content pane).
+        st.handle_mouse(left_click(27, 5));
+        assert!(st.sidebar_dragging, "a divider press begins a drag even over a review");
+        assert!(
+            matches!(st.main_view, MainView::Review(_)),
+            "the review stays open"
+        );
+        assert_eq!(
+            st.client.focus(),
+            focus_before,
+            "the divider press did not reach the review's content/panel routing"
+        );
+
+        // Drag right: the panel's right edge follows the pointer.
+        st.handle_mouse(drag_left(40, 5));
+        assert_eq!(st.client.sidebar_width(), 41, "the panel width tracks the pointer");
+
+        // Release persists the chosen width and ends the drag; the review is
+        // still open.
+        st.handle_mouse(up_left(40, 5));
+        assert!(!st.sidebar_dragging, "release ends the drag");
+        assert_eq!(st.client.sidebar_width(), 41);
+        assert!(
+            matches!(st.main_view, MainView::Review(_)),
+            "the review is still open after the resize"
+        );
+        assert_eq!(
+            shelbi_state::sidebar_width().unwrap(),
+            Some(41),
+            "the released panel width is saved under ~/.shelbi/"
         );
 
         std::env::remove_var("SHELBI_HOME");

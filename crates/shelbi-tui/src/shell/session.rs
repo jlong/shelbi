@@ -1298,4 +1298,65 @@ mod tests {
             "re-showing a failed target re-attempts instead of staying failed"
         );
     }
+
+    /// A connector that opens a *real* session socket which accepts the
+    /// connection but never answers the hello — the live review hang. It bounds
+    /// the connect with a short handshake timeout and maps the result the way
+    /// [`LiveConnector`] does, so the manager must settle in `Failed`, not sit on
+    /// `Connecting` (`rt-review-screen-hangs-on-connecting`).
+    struct SilentSocketConnector {
+        sock: std::path::PathBuf,
+    }
+
+    impl Connector for SilentSocketConnector {
+        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
+            match Connection::open_with_timeout(
+                &self.sock,
+                None,
+                capability::ALL,
+                Duration::from_millis(150),
+            ) {
+                Ok(_) => Err(ConnectFailure::Message("unexpected hello".into())),
+                Err(e) => Err(ConnectFailure::Message(e.to_string())),
+            }
+        }
+    }
+
+    #[test]
+    fn a_session_that_accepts_but_never_answers_ends_in_failed_not_connecting() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let accepted = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(2));
+                drop(stream);
+            }
+        });
+
+        let mut mgr = SessionManager::new(
+            "demo",
+            std::sync::Arc::new(SilentSocketConnector { sock }),
+        );
+        let start = Instant::now();
+        mgr.show(SessionRef::Workspace("review".into()));
+        poll_until_settled(&mut mgr);
+        let elapsed = start.elapsed();
+
+        // It did not sit on "Connecting…" — it resolved to a terminal failure
+        // carrying the handshake-timeout message.
+        match mgr.state() {
+            MainState::Failed(_, err) => assert!(
+                err.contains("handshake timeout"),
+                "the failure should name the handshake timeout, got {err:?}"
+            ),
+            _ => panic!("a silent session must land in MainState::Failed, not Connecting"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the connect ended near the bound, not forever (took {elapsed:?})"
+        );
+        let _ = accepted.join();
+    }
 }

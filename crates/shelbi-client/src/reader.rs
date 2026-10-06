@@ -92,7 +92,7 @@ pub enum SessionEvent {
 /// `events`, replies to `replies`, and answers keepalive pings on `write`.
 /// Returns when the stream ends (EOF, error, or after an `exited` event).
 pub(crate) fn spawn(
-    read_half: Box<dyn Read + Send>,
+    read_half: Box<dyn crate::transport::ReadTimeout + Send>,
     write: SharedWrite,
     events: Sender<SessionEvent>,
     replies: Sender<Reply>,
@@ -101,7 +101,7 @@ pub(crate) fn spawn(
 }
 
 fn run(
-    mut read_half: Box<dyn Read + Send>,
+    mut read_half: Box<dyn crate::transport::ReadTimeout + Send>,
     write: SharedWrite,
     events: Sender<SessionEvent>,
     replies: Sender<Reply>,
