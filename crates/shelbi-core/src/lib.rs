@@ -18,8 +18,8 @@ pub use agent_manifest::{
 pub use error::{Error, GhTokenProbeFailure, Result};
 pub use integration::{CapabilityLadder, IntegrationMode};
 pub use login_env::{
-    build_session_env, capture_env_bounded, login_shell_env, session_child_env,
-    SCRUBBED_TERMINAL_VARS,
+    build_session_env, capture_env_bounded, current_shelbi_exe, login_shell_env,
+    pin_shelbi_binary, session_child_env, SCRUBBED_TERMINAL_VARS, SHELBI_BIN_VAR,
 };
 pub use model::{
     checks_for_task, checks_for_task_in_workflow, ci_timeout_for_workflow,
