@@ -112,6 +112,22 @@ impl ReviewInterface {
         &self.task_id
     }
 
+    /// Tighten the content view's connect-retry policy and re-arm the connect
+    /// with it (test seam). The initial connect started in [`new`](Self::new)
+    /// with the default 15 s deadline, so a test that wants to observe the
+    /// give-up without waiting 15 s sets a short policy and reconnects.
+    #[cfg(test)]
+    pub(crate) fn set_content_retry(&mut self, retry: super::session::RetryPolicy) {
+        self.content.set_retry(retry);
+        self.content.reconnect();
+    }
+
+    /// The content view's current [`MainState`] (test accessor).
+    #[cfg(test)]
+    pub(crate) fn content_state(&self) -> MainState<'_> {
+        self.content.state()
+    }
+
     /// Bind the content view to Chat (the agent session). Re-selecting Chat
     /// while it is the current but *failed* target re-attaches — `SessionManager::show`
     /// re-attempts a failed/idle binding, so this is the retry path for a content
@@ -408,8 +424,11 @@ fn contains(area: Rect, x: u16, y: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shell::session::{ConnectFailure, Connected};
+    use crate::shell::session::{ConnectFailure, Connected, RetryPolicy};
     use crossterm::event::KeyModifiers;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     /// A connector that never resolves — the content view stays Connecting, so
     /// these pure-routing tests touch no real session.
@@ -418,6 +437,52 @@ mod tests {
         fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
             Err(ConnectFailure::Message("test: no session".into()))
         }
+    }
+
+    /// A connector that connects to a real Unix socket whose listener is gone, so
+    /// every connect is **refused** — the "alive but not listening" zombie the
+    /// review agent became. It maps the refused connect the way
+    /// [`LiveConnector`](super::super::session::LiveConnector) does (a refused
+    /// socket is "still starting"), so driving it exercises the real review
+    /// content path's retry-then-give-up, not a hand-fed terminal error. Touches
+    /// no real HOME / `~/.shelbi`: the socket lives in a tempdir.
+    struct RefusingConnector {
+        sock: PathBuf,
+    }
+
+    impl Connector for RefusingConnector {
+        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
+            use shelbi_client::{ClientError, Connection};
+            use shelbi_proto::capability;
+            match Connection::open(&self.sock, None, capability::ALL) {
+                Ok(_) => Err(ConnectFailure::Message("unexpected hello".into())),
+                // A refused (or absent) socket is the transient "still starting"
+                // signal the worker retries — exactly LiveConnector's mapping.
+                Err(ClientError::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    Err(ConnectFailure::Starting(
+                        "session `demo/ws/review-1` is starting (socket not up yet)".into(),
+                    ))
+                }
+                Err(e) => Err(ConnectFailure::Message(e.to_string())),
+            }
+        }
+    }
+
+    /// Bind a Unix socket in a tempdir, then drop the listener so the path is
+    /// left behind but every connect to it is refused — a stand-in for the
+    /// zombie review agent (process up, socket refusing). Returns the tempdir
+    /// (kept alive by the caller) and the socket path.
+    fn refusing_socket() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        drop(listener);
+        (dir, sock)
     }
 
     fn iface() -> ReviewInterface {
@@ -519,5 +584,82 @@ mod tests {
         assert_eq!(it.focus, ReviewFocus::Panel);
         it.focus_panel();
         assert_eq!(it.focus, ReviewFocus::Panel);
+    }
+
+    /// Drive `it.poll()` until the content view leaves Connecting, or the budget
+    /// runs out. Returns whether it settled.
+    fn poll_content_until_settled(it: &mut ReviewInterface) -> bool {
+        for _ in 0..400 {
+            it.poll();
+            if !matches!(it.content_state(), MainState::Connecting(_)) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn a_refusing_content_socket_ends_in_failed_not_connecting_forever() {
+        // The review agent's socket refuses every connect (the zombie): the
+        // content view must retry for the deadline and then settle in Failed with
+        // a clear message — it must never sit on "Connecting to …" indefinitely
+        // (`rt-review-session-alive-but-not-listening`). Driven through the real
+        // ReviewInterface content path, not SessionManager alone.
+        let (_dir, sock) = refusing_socket();
+        let mut it = ReviewInterface::new(
+            "demo",
+            Arc::new(RefusingConnector { sock }),
+            "fix-login",
+            "review-1",
+            "/wt",
+            "Vim",
+            true,
+        );
+        // Tighten the retry so the give-up is observable in well under a second.
+        it.set_content_retry(RetryPolicy {
+            deadline: Duration::from_millis(120),
+            backoff: Duration::from_millis(10),
+        });
+
+        let start = Instant::now();
+        assert!(
+            poll_content_until_settled(&mut it),
+            "the refusing content connect must settle, not hang on Connecting",
+        );
+        let elapsed = start.elapsed();
+
+        match it.content_state() {
+            MainState::Failed(_, err) => {
+                assert!(
+                    err.contains("starting") && err.contains("not reachable"),
+                    "the failure names the give-up, got {err:?}",
+                );
+            }
+            other => panic!("expected the content view to fail, got {:?}", state_label(other)),
+        }
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the give-up happened near the bound, not forever (took {elapsed:?})",
+        );
+
+        // Re-selecting Chat re-attempts: it goes back to Connecting (one more
+        // retry round) rather than staying stuck on the failure.
+        it.show_chat();
+        assert!(
+            matches!(it.content_state(), MainState::Connecting(_)),
+            "re-selecting Chat re-arms the connect",
+        );
+    }
+
+    /// A readable label for a non-Failed `MainState`, for test panics.
+    fn state_label(s: MainState<'_>) -> &'static str {
+        match s {
+            MainState::Empty => "Empty",
+            MainState::Connecting(_) => "Connecting",
+            MainState::Live(_) => "Live",
+            MainState::Idle(_) => "Idle",
+            MainState::Failed(_, _) => "Failed",
+        }
     }
 }

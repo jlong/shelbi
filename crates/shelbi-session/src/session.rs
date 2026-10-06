@@ -693,7 +693,24 @@ fn spawn_keepalive_thread(shared: Arc<Shared>) {
     });
 }
 
+/// Backoff after an `accept()` that failed on resource exhaustion
+/// (`EMFILE`/`ENFILE`), so the loop doesn't hot-spin while file descriptors free
+/// up. Short enough that a client reconnecting in that window still lands.
+const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
 /// Accept client connections, one serving thread each.
+///
+/// The accept loop must never quietly abandon the listener while the process
+/// lives on: a session that stops accepting connections but keeps running is the
+/// "alive but not listening" zombie — discovery still reports it live (its lock
+/// is held), so every client keeps choosing it and none can attach, stranding
+/// them on "Connecting…" forever. So a **transient** `accept()` error (a client
+/// that aborted between connect and accept, an interrupted syscall, or a
+/// momentary fd exhaustion) is logged and retried, never fatal. A **fatal** one
+/// (the listener fd itself is unusable and can't recover) asks the main loop to
+/// tear the whole session down, so the process *exits* and releases its lock —
+/// discovery then correctly reports it dead and supervision relaunches it. Keep
+/// the listener, or exit: never linger as a zombie.
 fn spawn_accept_thread(shared: Arc<Shared>, listener: UnixListener) {
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -702,10 +719,45 @@ fn spawn_accept_thread(shared: Arc<Shared>, listener: UnixListener) {
                     let shared = shared.clone();
                     thread::spawn(move || serve_client(stream, shared));
                 }
-                Err(_) => break,
+                Err(e) if is_transient_accept_error(&e) => {
+                    // The listener is still valid; keep serving. Back off only on
+                    // resource exhaustion so the loop doesn't spin while fds free.
+                    if is_resource_exhaustion(&e) {
+                        thread::sleep(ACCEPT_RETRY_BACKOFF);
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    // The listener is unrecoverable. Rather than drop it and leave
+                    // a zombie (process up, socket refusing), ask the main loop to
+                    // shut the session down cleanly so it exits and is relaunched.
+                    TERMINATE.store(true, Ordering::SeqCst);
+                    break;
+                }
             }
         }
     });
+}
+
+/// Whether an `accept()` error is transient — the listener is still valid and
+/// the loop should keep serving. A connection aborted between connect and accept
+/// (`ECONNABORTED`), an interrupted syscall (`EINTR`), a spurious `WouldBlock`,
+/// or a momentary descriptor exhaustion (`EMFILE`/`ENFILE`) must never take the
+/// listener down.
+fn is_transient_accept_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    if matches!(e.kind(), Interrupted | ConnectionAborted | WouldBlock) {
+        return true;
+    }
+    is_resource_exhaustion(e)
+}
+
+/// Whether an `accept()` error is file-descriptor exhaustion (`EMFILE` /
+/// `ENFILE`) — transient (fds free up) but worth a brief backoff so the loop
+/// doesn't hot-spin. These have no stable [`std::io::ErrorKind`], so match the
+/// raw OS error.
+fn is_resource_exhaustion(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
 }
 
 fn install_signal_handlers() {
@@ -742,4 +794,39 @@ fn write_exit(paths: &SessionPaths, exit: &ChildExit) -> Result<()> {
     std::fs::write(paths.exit(), json)
         .with_context(|| format!("writing {}", paths.exit().display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_accept_errors_do_not_take_the_listener_down() {
+        use std::io::{Error, ErrorKind};
+        // A client that aborted between connect and accept, an interrupted
+        // syscall, and a spurious would-block are all transient: keep serving.
+        assert!(is_transient_accept_error(&Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        assert!(is_transient_accept_error(&Error::from(ErrorKind::Interrupted)));
+        assert!(is_transient_accept_error(&Error::from(ErrorKind::WouldBlock)));
+        // Descriptor exhaustion is transient too — and flagged for a backoff.
+        let emfile = Error::from_raw_os_error(libc::EMFILE);
+        assert!(is_transient_accept_error(&emfile));
+        assert!(is_resource_exhaustion(&emfile));
+        let enfile = Error::from_raw_os_error(libc::ENFILE);
+        assert!(is_transient_accept_error(&enfile));
+        assert!(is_resource_exhaustion(&enfile));
+    }
+
+    #[test]
+    fn a_fatal_accept_error_is_not_classified_transient() {
+        use std::io::Error;
+        // An unrecoverable listener error (e.g. the fd is no longer a socket):
+        // not transient, so the loop exits the process instead of spinning or
+        // silently abandoning the listener.
+        let fatal = Error::from_raw_os_error(libc::ENOTSOCK);
+        assert!(!is_transient_accept_error(&fatal));
+        assert!(!is_resource_exhaustion(&fatal));
+    }
 }

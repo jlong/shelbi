@@ -58,7 +58,7 @@ pub mod transport;
 
 pub use connect::{Connection, SessionEvents};
 pub use control::{ControlClient, Notice, Subscription};
-pub use discovery::{list, reap_dead, DiscoveredSession};
+pub use discovery::{list, probe_socket, reap_dead, DiscoveredSession, SocketReachability};
 pub use error::ClientError;
 pub use reader::SessionEvent;
 pub use relay::{serve_relay, RelayChannel, RelayStream};

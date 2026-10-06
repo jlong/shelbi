@@ -545,6 +545,13 @@ impl SessionManager {
         }
     }
 
+    /// Override the retry policy (test seam, so a test needn't wait the full
+    /// 15 s deadline to observe the give-up).
+    #[cfg(test)]
+    pub(crate) fn set_retry(&mut self, retry: RetryPolicy) {
+        self.retry = retry;
+    }
+
     /// Report the main area's size to the live session so it reflows to fill
     /// it when the shell is the most-recently-active client. The size is
     /// remembered (even with no live session) and re-applied when a session
