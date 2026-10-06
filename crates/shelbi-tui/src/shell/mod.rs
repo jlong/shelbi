@@ -660,6 +660,10 @@ struct ShellState {
     /// Rects from the last draw, for mouse hit-testing.
     sidebar_rect: Rect,
     main_rect: Rect,
+    /// `true` while the user is dragging the sidebar/main divider. The drag
+    /// captures all mouse motion until the button is released, regardless of
+    /// where the pointer travels.
+    sidebar_dragging: bool,
     /// The main-area size last reported to the live session.
     reported_main: Option<Size>,
     /// When `Some`, the user is typing a scrollback search query.
@@ -748,8 +752,19 @@ impl ShellState {
         // winds down when the shell state drops.
         let mut machines = MachinesApp::new(project);
         machines.enable_reachability();
+        // Seed the sidebar width from the user's saved choice (if any). The
+        // stored value is the raw user choice; `draw` clamps it to the live
+        // window at render time without overwriting the saved value. A read
+        // error (or a never-dragged divider) leaves the built-in default.
+        let client = {
+            let mut c = ClientState::new(project);
+            if let Ok(Some(w)) = shelbi_state::sidebar_width() {
+                c.set_sidebar_width(w);
+            }
+            c
+        };
         Self {
-            client: ClientState::new(project),
+            client,
             sessions: SessionManager::new(project, connector.clone()),
             connector,
             lifecycle,
@@ -776,6 +791,7 @@ impl ShellState {
             main_view: MainView::Session,
             sidebar_rect: Rect::default(),
             main_rect: Rect::default(),
+            sidebar_dragging: false,
             reported_main: None,
             search_input: None,
             should_reexec: false,
@@ -2113,6 +2129,27 @@ impl ShellState {
     }
 
     fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        // An in-progress divider drag captures all mouse motion until the
+        // button releases, wherever the pointer travels.
+        if self.sidebar_dragging {
+            match m.kind {
+                MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Down(MouseButton::Left) => self.update_sidebar_drag(m.column),
+                MouseEventKind::Up(MouseButton::Left) => self.end_sidebar_drag(),
+                _ => {}
+            }
+            return;
+        }
+        // A press on the divider column starts a drag — and is swallowed so it
+        // never selects a sidebar row or reaches the main pane.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.on_divider(m.column, m.row)
+        {
+            self.sidebar_dragging = true;
+            self.update_sidebar_drag(m.column);
+            return;
+        }
         if contains(self.sidebar_rect, m.column, m.row) {
             self.handle_sidebar_mouse(m);
             return;
@@ -2120,6 +2157,47 @@ impl ShellState {
         if contains(self.main_rect, m.column, m.row) {
             self.handle_main_mouse(m);
         }
+    }
+
+    /// The divider column: the sidebar's rightmost column, i.e. the visual
+    /// border between the sidebar and the main pane.
+    fn divider_col(&self) -> u16 {
+        self.sidebar_rect.right().saturating_sub(1)
+    }
+
+    /// Whether `(col, row)` lands on the draggable divider between the sidebar
+    /// and the main pane.
+    fn on_divider(&self, col: u16, row: u16) -> bool {
+        let r = self.sidebar_rect;
+        r.width > 0
+            && r.height > 0
+            && col == self.divider_col()
+            && row >= r.top()
+            && row < r.bottom()
+    }
+
+    /// Update the sidebar width from a drag pointing at `pointer_col`. The
+    /// sidebar's right edge follows the pointer (the pointer column is the
+    /// sidebar's new last column), clamped to [24, half the window]. The live
+    /// value drives the next `draw`, which reflows the main pane and resizes
+    /// the attached session; the choice is persisted on release.
+    fn update_sidebar_drag(&mut self, pointer_col: u16) {
+        let window_width = self.sidebar_rect.width + self.main_rect.width;
+        let desired = pointer_col.saturating_add(1);
+        let clamped = shelbi_app::nav::clamp_sidebar_width(desired, window_width);
+        self.client.set_sidebar_width(clamped);
+        self.dirty = true;
+    }
+
+    /// End a divider drag and persist the chosen width so it survives a
+    /// restart. Best-effort: a disk failure surfaces in the status line but
+    /// never crashes the UI (the width just won't be remembered).
+    fn end_sidebar_drag(&mut self) {
+        self.sidebar_dragging = false;
+        if let Err(e) = shelbi_state::set_sidebar_width(self.client.sidebar_width()) {
+            self.status = Some(format!("sidebar width save failed: {e}"));
+        }
+        self.dirty = true;
     }
 
     fn handle_sidebar_mouse(&mut self, m: crossterm::event::MouseEvent) {
@@ -2316,7 +2394,11 @@ fn draw(
         width: term.size()?.width,
         height: term.size()?.height,
     };
-    let (sidebar_rect, main_rect) = layout(area, state.sidebar_width());
+    // Clamp the saved width to the live window for display only (at least 24,
+    // at most half the window). A narrow window shrinks the sidebar on screen
+    // without touching the saved value, so widening restores the user's choice.
+    let display_width = shelbi_app::nav::clamp_sidebar_width(state.sidebar_width(), area.width);
+    let (sidebar_rect, main_rect) = layout(area, display_width);
     state.sidebar_rect = sidebar_rect;
     state.main_rect = main_rect;
 
@@ -2995,6 +3077,146 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    /// A synthetic left-button drag to `(col, row)` (button held, moving).
+    fn drag_left(col: u16, row: u16) -> crossterm::event::MouseEvent {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A synthetic left-button release at `(col, row)`.
+    fn up_left(col: u16, row: u16) -> crossterm::event::MouseEvent {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A temp `SHELBI_HOME` for a test that reads or writes global state;
+    /// unique per call so parallel tests don't collide (callers still hold
+    /// `ENV_LOCK` around the env mutation).
+    fn temp_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-shell-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    #[test]
+    fn dragging_the_divider_resizes_the_sidebar_and_persists() {
+        // A press on the divider, drags, then a release: the width tracks the
+        // pointer (clamped to [24, half the window]) and the released value is
+        // saved to `~/.shelbi/state.json`.
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = temp_home("divider-drag");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut st = test_state();
+        // A 120-wide window: sidebar [0,28), main [28,120). Divider col = 27.
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        st.main_rect = Rect::new(28, 0, 92, 20);
+        assert_eq!(st.divider_col(), 27);
+
+        // Press on the divider starts a drag (and selects nothing).
+        let selection_before = st.selection();
+        st.handle_mouse(left_click(27, 5));
+        assert!(st.sidebar_dragging, "a press on the divider begins a drag");
+        assert_eq!(st.selection(), selection_before, "the press selected no row");
+
+        // Drag right: the sidebar's right edge follows the pointer.
+        st.handle_mouse(drag_left(40, 5));
+        assert_eq!(st.client.sidebar_width(), 41, "width tracks the pointer (col+1)");
+
+        // Drag far left: clamped up to the 24-column minimum.
+        st.handle_mouse(drag_left(2, 5));
+        assert_eq!(st.client.sidebar_width(), 24, "clamped to the minimum");
+
+        // Drag far right: clamped down to half the window (60).
+        st.handle_mouse(drag_left(100, 5));
+        assert_eq!(st.client.sidebar_width(), 60, "clamped to half the window");
+
+        // Settle on a mid value and release — the width persists.
+        st.handle_mouse(drag_left(37, 5));
+        assert_eq!(st.client.sidebar_width(), 38);
+        st.handle_mouse(up_left(37, 5));
+        assert!(!st.sidebar_dragging, "release ends the drag");
+        assert_eq!(st.client.sidebar_width(), 38);
+        assert_eq!(
+            shelbi_state::sidebar_width().unwrap(),
+            Some(38),
+            "the released width is saved under ~/.shelbi/"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn a_click_on_the_divider_opens_no_row_and_no_main_click() {
+        // Press+release on the divider with no movement: it begins and ends a
+        // (zero-delta) drag — it must not select a sidebar row or open a view.
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = temp_home("divider-click");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut st = test_state();
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        st.main_rect = Rect::new(28, 0, 92, 20);
+        // Start on a session view so an accidental row-open would be visible.
+        st.show(RowTarget::Session(SessionRef::Orchestrator));
+        let selection_before = st.selection();
+
+        st.handle_mouse(left_click(27, 5));
+        st.handle_mouse(up_left(27, 5));
+        assert_eq!(st.selection(), selection_before, "no sidebar row was selected");
+        assert!(
+            matches!(st.main_view, MainView::Session),
+            "the divider click opened no new view"
+        );
+        // The width is unchanged (col 27 → 28, the resting width).
+        assert_eq!(st.client.sidebar_width(), 28);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn a_saved_sidebar_width_restores_on_construction() {
+        // A width saved under ~/.shelbi/ is seeded into a freshly-built shell —
+        // the dragged width survives quitting and reopening shelbi.
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = temp_home("saved-width");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        shelbi_state::set_sidebar_width(33).unwrap();
+        let caps = Caps { kitty: true, truecolor: true, nested: None };
+        let st = ShellState::new("proj", Arc::new(NoopConnector), caps);
+        assert_eq!(
+            st.client.sidebar_width(),
+            33,
+            "the saved width is restored on construction"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     /// A synthetic wheel event (`up` scrolls up, else down) over `(col, row)`.
