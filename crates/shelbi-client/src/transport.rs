@@ -15,12 +15,32 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
 use crate::error::ClientError;
 
+/// A [`Read`] whose reads can be bounded by a timeout. Used only to bound the
+/// hello handshake so a channel that accepts the connection but never answers
+/// can't block the connect forever; the timeout is cleared before the reader
+/// thread starts, so steady-state output reads block normally
+/// (`rt-review-screen-hangs-on-connecting`).
+pub trait ReadTimeout: Read {
+    /// Apply a read timeout to this half (`None` clears it). A channel with no
+    /// socket-level timeout (the relay) is free to make this a no-op — its reads
+    /// are already bounded by the relay keepalive.
+    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl ReadTimeout for UnixStream {
+    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        UnixStream::set_read_timeout(self, dur)
+    }
+}
+
 /// The owned read and write halves a [`Transport`] splits into: boxed so a
-/// local socket and a relay stream are the same type.
-pub type TransportHalves = (Box<dyn Read + Send>, Box<dyn Write + Send>);
+/// local socket and a relay stream are the same type. The read half carries
+/// [`ReadTimeout`] so the connect can bound the hello handshake.
+pub type TransportHalves = (Box<dyn ReadTimeout + Send>, Box<dyn Write + Send>);
 
 /// A bidirectional byte channel to one session, splittable into independent,
 /// owned read and write halves.

@@ -346,6 +346,16 @@ impl Read for RelayStreamReader {
     }
 }
 
+impl crate::transport::ReadTimeout for RelayStreamReader {
+    /// No-op: a relay stream has no socket-level read timeout. Its reads are
+    /// already bounded by the relay keepalive (silence past the deadline surfaces
+    /// as [`ClientError::RelayUnreachable`](crate::ClientError::RelayUnreachable)),
+    /// so the hello handshake over a relay does not need this extra bound.
+    fn set_read_timeout(&self, _dur: Option<std::time::Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The write half of a [`RelayStream`]: wraps each whole session frame the
 /// [`Connection`](crate::Connection) writes in one `Data` envelope.
 struct RelayStreamWriter {

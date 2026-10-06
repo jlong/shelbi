@@ -27,6 +27,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use shelbi_proto::{
     capability, ClientColors, ExtFrame, Frame, Hello, Info, Input, Kill, Resize, SetMeta, Snapshot,
@@ -64,6 +65,14 @@ impl SessionEvents {
     }
 }
 
+/// How long [`Connection::open`] waits for the session's hello before giving up.
+/// A session that accepts the connection but never completes the handshake (a
+/// wedged session, or one from an older build this client can't speak to) would
+/// otherwise block the connect — and the caller's "Connecting…" view — forever
+/// (`rt-review-screen-hangs-on-connecting`). Generous enough to never trip a
+/// healthy local session.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A live connection to one session, past the hello handshake.
 pub struct Connection {
     /// The write half, shared with the reader thread (which writes keepalive
@@ -92,8 +101,26 @@ impl Connection {
         colors: Option<ClientColors>,
         capabilities: &[&str],
     ) -> Result<(Self, SessionEvents), ClientError> {
+        Self::open_with_timeout(sock, colors, capabilities, HANDSHAKE_TIMEOUT)
+    }
+
+    /// Like [`open`](Connection::open) but with an explicit hello-handshake
+    /// timeout. Exposed mainly so a caller (or a test) can bound the connect
+    /// more tightly than the default [`HANDSHAKE_TIMEOUT`]; `open` is the normal
+    /// entry point.
+    pub fn open_with_timeout(
+        sock: &Path,
+        colors: Option<ClientColors>,
+        capabilities: &[&str],
+        handshake_timeout: Duration,
+    ) -> Result<(Self, SessionEvents), ClientError> {
         let stream = UnixStream::connect(sock)?;
-        Self::handshake(stream, colors, capabilities)
+        Self::connect_with_timeout(
+            Box::new(LocalTransport(stream)),
+            colors,
+            capabilities,
+            Some(handshake_timeout),
+        )
     }
 
     /// Like [`open`](Connection::open) but over an already-connected Unix
@@ -107,6 +134,22 @@ impl Connection {
         Self::connect(Box::new(LocalTransport(stream)), colors, capabilities)
     }
 
+    /// Like [`handshake`](Connection::handshake) but with an explicit
+    /// hello-handshake timeout (used by tests that connect a raw socket pair).
+    pub fn handshake_with_timeout(
+        stream: UnixStream,
+        colors: Option<ClientColors>,
+        capabilities: &[&str],
+        handshake_timeout: Option<Duration>,
+    ) -> Result<(Self, SessionEvents), ClientError> {
+        Self::connect_with_timeout(
+            Box::new(LocalTransport(stream)),
+            colors,
+            capabilities,
+            handshake_timeout,
+        )
+    }
+
     /// Open a connection over any [`Transport`] — a local socket or one logical
     /// stream of a [`RelayChannel`](crate::relay::RelayChannel). Exchanges the
     /// [`Hello`] frames, starts the reader, and returns the connection and event
@@ -116,6 +159,21 @@ impl Connection {
         transport: Box<dyn Transport>,
         colors: Option<ClientColors>,
         capabilities: &[&str],
+    ) -> Result<(Self, SessionEvents), ClientError> {
+        Self::connect_with_timeout(transport, colors, capabilities, Some(HANDSHAKE_TIMEOUT))
+    }
+
+    /// The shared connect path, with the hello-handshake read bounded by
+    /// `handshake_timeout` (`None` leaves it unbounded — used only by callers
+    /// that have their own bound). A session that accepts the connection but
+    /// never answers the hello surfaces [`ClientError::HandshakeTimeout`] after
+    /// the deadline instead of blocking forever
+    /// (`rt-review-screen-hangs-on-connecting`).
+    fn connect_with_timeout(
+        transport: Box<dyn Transport>,
+        colors: Option<ClientColors>,
+        capabilities: &[&str],
+        handshake_timeout: Option<Duration>,
     ) -> Result<(Self, SessionEvents), ClientError> {
         let (mut read_half, mut write_half) = transport.split()?;
 
@@ -129,11 +187,22 @@ impl Connection {
         write_half.write_all(&hello)?;
         write_half.flush()?;
 
+        // Bound the hello read so a channel that accepts the connection but never
+        // answers can't wedge the connect forever (the "Connecting…" hang). The
+        // timeout is cleared below before the reader thread starts: steady-state
+        // output reads must block until output arrives.
+        if let Some(t) = handshake_timeout {
+            read_half.set_read_timeout(Some(t)).map_err(ClientError::Io)?;
+        }
         // Read the session's hello off the read half (frame by frame off a small
         // local buffer; any output the session sends before we attach cannot
         // arrive yet because we have not attached, so the first frame is the
         // hello).
-        let (announced, session_protocol_version) = read_session_hello(&mut read_half)?;
+        let hello_result = read_session_hello(&mut read_half);
+        // Always clear the handshake timeout before the reader takes the half,
+        // even on error (the half is dropped on the error path anyway).
+        let _ = read_half.set_read_timeout(None);
+        let (announced, session_protocol_version) = hello_result?;
 
         let write: SharedWrite = Arc::new(Mutex::new(write_half));
         let (event_tx, event_rx) = channel::<SessionEvent>();
@@ -263,7 +332,12 @@ impl Connection {
 
 /// Read frames from `stream` until the session's [`Hello`] arrives, returning the
 /// announced capabilities and the session's protocol version.
-fn read_session_hello(stream: &mut dyn Read) -> Result<(Vec<String>, u16), ClientError> {
+///
+/// When `stream` has a read timeout set (the handshake bound), a read that times
+/// out surfaces as [`ClientError::HandshakeTimeout`] so a session that accepts
+/// the connection but never answers ends the connect instead of blocking it
+/// (`rt-review-screen-hangs-on-connecting`).
+fn read_session_hello<R: Read + ?Sized>(stream: &mut R) -> Result<(Vec<String>, u16), ClientError> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -275,9 +349,64 @@ fn read_session_hello(stream: &mut dyn Read) -> Result<(Vec<String>, u16), Clien
             Err(shelbi_proto::ProtoError::Incomplete { .. }) => {}
             Err(e) => return Err(ClientError::Protocol(e)),
         }
-        match stream.read(&mut chunk)? {
-            0 => return Err(ClientError::UnexpectedEof),
-            n => buf.extend_from_slice(&chunk[..n]),
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err(ClientError::UnexpectedEof),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            // A socket read timeout (the handshake bound) returns WouldBlock or
+            // TimedOut depending on the platform; either means the session never
+            // sent its hello in time.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(ClientError::HandshakeTimeout)
+            }
+            Err(e) => return Err(ClientError::Io(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shelbi_proto::capability;
+    use std::os::unix::net::UnixListener;
+    use std::time::Instant;
+
+    /// A session socket that *accepts* the connection but never sends its hello
+    /// (the live hang: a wedged or older-build session). The connect must give
+    /// up within the handshake timeout rather than block forever.
+    #[test]
+    fn a_socket_that_accepts_but_never_answers_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        // Accept on a thread and hold the connection open without ever writing,
+        // so the client's hello read has nothing to decode.
+        let accepted = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Keep the accepted end alive (and silent) past the client's bound.
+            std::thread::sleep(Duration::from_secs(2));
+            drop(stream);
+        });
+
+        let timeout = Duration::from_millis(150);
+        let start = Instant::now();
+        let result = Connection::open_with_timeout(&sock, None, capability::ALL, timeout);
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(ClientError::HandshakeTimeout) => {}
+            Err(other) => panic!("expected HandshakeTimeout, got {other:?}"),
+            Ok(_) => panic!("a silent session must not complete the connect"),
+        }
+        // It gave up near the deadline, not instantly and not forever.
+        assert!(
+            elapsed >= timeout && elapsed < Duration::from_secs(1),
+            "the connect should end right after the bound (took {elapsed:?})",
+        );
+        let _ = accepted.join();
     }
 }

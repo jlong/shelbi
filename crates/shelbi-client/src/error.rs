@@ -22,6 +22,14 @@ pub enum ClientError {
     #[error("connection closed before a reply was received")]
     UnexpectedEof,
 
+    /// The session accepted the connection but did not send its hello within the
+    /// handshake deadline — a wedged session, or one from an older build whose
+    /// handshake this client can't complete. The connect surfaces this (bounded)
+    /// instead of blocking forever on the hello read
+    /// (`rt-review-screen-hangs-on-connecting`).
+    #[error("session accepted the connection but did not answer within the handshake timeout")]
+    HandshakeTimeout,
+
     /// The daemon and client speak incompatible control protocols; relaunch.
     #[error("hub daemon control protocol {daemon} != client {client}; run `shelbi daemon restart`")]
     ControlProtocolMismatch { daemon: u32, client: u32 },
