@@ -3,6 +3,34 @@
 use ratatui::style::Color;
 use std::time::Duration;
 
+/// The sidebar's solid background (`color/background`, #000000). The sidebar
+/// paints this across its whole area — including the half-block bleed rows,
+/// whose glyphs carry the fill as their *foreground* on this background — so
+/// the search fill and the selection fills read against a true black rather
+/// than the terminal's own (often lighter) default background.
+pub const BACKGROUND: Color = Color::Rgb(0, 0, 0);
+
+/// Normal sidebar text (`color/gray`, #bababa): unselected nav labels, the
+/// workspace and review names, and the search box's label and shortcut.
+pub const TEXT: Color = Color::Rgb(186, 186, 186);
+
+/// The selected nav label (`color/white`, #ffffff), drawn bold on the
+/// selection fill. Only the nav label brightens on selection; the workspace
+/// and review rows keep their normal [`TEXT`] colour under the fill.
+pub const TEXT_SELECTED: Color = Color::Rgb(255, 255, 255);
+
+/// Muted sidebar chrome (`color/muted`, #7a7a7a): section headers, the idle `·`
+/// bullet, right-aligned agent / idle labels, the `⎇` branch line, and the
+/// version line.
+pub const MUTED: Color = Color::Rgb(122, 122, 122);
+
+/// The sidebar accent (`color/cyan`, #00a6b2): the project name (bold) and the
+/// ready-for-review `✓` (bold).
+pub const ACCENT: Color = Color::Rgb(0, 166, 178);
+
+/// A working workspace's `⏵` badge (`color/green`, #5acd25).
+pub const BUSY_GREEN: Color = Color::Rgb(90, 205, 37);
+
 /// Background fill for the selected / focused row across the whole TUI —
 /// the sidebar nav selection, the kanban card selection, and the filter
 /// dropdowns all paint with this one colour so selection styling can't
@@ -11,14 +39,13 @@ use std::time::Duration;
 /// so it reads as a subtle fill rather than a coloured accent.
 pub const SELECTION_BG: Color = Color::Rgb(63, 63, 63);
 
-/// Fill for the sidebar's search box — a quieter gray than [`SELECTION_BG`] so
-/// the box reads as an always-present input affordance rather than an active
-/// selection. The Figma `color/search` token is #292929, which reads clearly
-/// on Figma's near-black sidebar but all but vanishes on a lighter terminal
-/// default background (John's Ghostty is ~#1c1c1c). We nudge it up to #333333
-/// so the box stays clearly lighter than the sidebar on real dark terminals
-/// while remaining distinctly darker than the #3f3f3f selection fill.
-pub const SEARCH_BG: Color = Color::Rgb(51, 51, 51);
+/// Fill for the sidebar's search box (`color/search`, #292929) — a quieter gray
+/// than [`SELECTION_BG`] so the box reads as an always-present input affordance
+/// rather than an active selection. The sidebar now paints its whole area with
+/// [`BACKGROUND`] (#000000), so this Figma token reads clearly against the true
+/// black it sits on (it would all but vanish on a lighter terminal default like
+/// John's Ghostty ~#1c1c1c, which the painted background removes from play).
+pub const SEARCH_BG: Color = Color::Rgb(41, 41, 41);
 
 /// The command palette's panel fill (`color/search` in the Figma design,
 /// `#292929`). A touch lighter than the app's near-black background so the
@@ -42,13 +69,14 @@ pub const PALETTE_MUTED: Color = Color::Rgb(122, 122, 122);
 pub const PALETTE_GREEN: Color = Color::Rgb(90, 205, 37);
 
 /// The glyph painted down the sidebar's rightmost column as the resize
-/// drag handle — a full-height light vertical rule.
-pub const DIVIDER_GLYPH: &str = "│";
+/// drag handle and right-edge divider — a full-height left one-eighth block
+/// (`▏`, the Figma `color/divider` rule) that reads as a thin border.
+pub const DIVIDER_GLYPH: &str = "▏";
 
-/// Resting color of the drag-handle line: the same dim gray the sidebar uses
-/// for quiet chrome, so the handle reads as a border rather than an accent
-/// until the pointer finds it.
-pub const DIVIDER_DIM: Color = Color::DarkGray;
+/// Resting color of the divider / drag-handle line (`color/divider`, #414141):
+/// a dim gray that reads as a border rather than an accent until the pointer
+/// finds it.
+pub const DIVIDER_DIM: Color = Color::Rgb(65, 65, 65);
 
 /// Highlight color of the drag-handle line while the pointer hovers it or a
 /// resize drag is underway — the cyan accent the sidebar title already uses,

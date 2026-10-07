@@ -34,7 +34,8 @@ use shelbi_state::ZenModeState;
 use super::session::SessionRef;
 use crate::keymap::format_chord_or_unbound;
 use crate::sidebar::{decoration_to_color, nav_lines, BLEED_ABOVE, BLEED_BELOW};
-use crate::theme::{SEARCH_BG, SELECTION_BG};
+use crate::theme::{ACCENT, BACKGROUND, BUSY_GREEN, MUTED, SEARCH_BG, SELECTION_BG, TEXT, TEXT_SELECTED};
+use shelbi_palette::DecorationColor;
 
 /// Exact one-time orientation copy shown in the sidebar footer after the first
 /// project scaffold. One constant so persistence and wrapping paths can't drift
@@ -236,11 +237,12 @@ impl SidebarView {
             .split(body_region);
         let header = split[0];
         let body = split[1];
-        // The box spans the three cell rows 2–4; it needs rows 2, 3 and 4
-        // present (height ≥ 5). The trailing margin (row 5) is optional.
-        let search = (header.height >= 5).then(|| {
+        // Header rhythm: a blank row (0), the project title (1), a blank row
+        // (2), then the 2-row search box drawn across the three cell rows 3–5
+        // (`▄` / label / `▀`). The box needs all three rows present (height ≥ 6).
+        let search = (header.height >= 6).then(|| {
             Rect {
-                y: header.y + 2,
+                y: header.y + 3,
                 height: 3,
                 ..header
             }
@@ -351,6 +353,12 @@ impl SidebarView {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        // Paint the whole sidebar `color/background` (#000000) first so every
+        // later span lands on a true black: the search fill, the selection
+        // fills, and especially the half-block bleed rows, whose glyphs carry
+        // their fill as a *foreground* and rely on this background showing
+        // through their other half.
+        buf.set_style(area, Style::default().bg(BACKGROUND));
         let geo = self.geometry(area);
 
         self.render_header(buf, geo.header, geo.search, chrome);
@@ -376,13 +384,17 @@ impl SidebarView {
         if header.width == 0 || header.height == 0 {
             return;
         }
+        // The title sits on row 1 (a blank row above it); fall back to row 0 on
+        // a header clamped to a single row.
+        let title_y = header.y + if header.height >= 2 { 1 } else { 0 };
         let title_rect = Rect {
-            height: 1.min(header.height),
+            y: title_y,
+            height: 1,
             ..header
         };
         Paragraph::new(Line::from(Span::styled(
             self.project_label.clone(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )))
         .render(title_rect.inner(LIST_INDENT), buf);
 
@@ -391,16 +403,25 @@ impl SidebarView {
         }
     }
 
-    /// Render the leading `Row::Nav` rows as a full-width block: a separator
-    /// line between (and bracketing) each item, the selected item's fill
-    /// spanning edge to edge, its adjacent separators carrying the half-block
-    /// bleed. Text keeps the 1-col indent of the rest of the list.
+    /// Render the leading `Row::Nav` rows as an inset block: a separator line
+    /// between (and bracketing) each item, the selected item's fill spanning the
+    /// inset width (one column in from each edge, matching the search box), its
+    /// adjacent separators carrying the half-block bleed. The label keeps a
+    /// further 1-col inner pad inside that inset.
     fn render_nav(&self, buf: &mut Buffer, area: Rect, sel_row: Option<usize>, focused: bool) {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        // The nav item bounds — fill, half-block bleed, and label — are inset one
+        // column from each side, exactly like the search box above, so the
+        // selection block reads as the same width. The gutter columns stay on
+        // the painted #000000 background.
+        let inner = area.inner(LIST_INDENT);
+        if inner.width == 0 {
+            return;
+        }
         let nav_n = self.nav_n();
-        let width = area.width as usize;
+        let width = inner.width as usize;
         let selected = sel_row.filter(|&r| r < nav_n);
 
         let mut lines: Vec<Line> = Vec::with_capacity(nav_lines(nav_n));
@@ -429,7 +450,7 @@ impl SidebarView {
                 ));
             }
         }
-        Paragraph::new(lines).render(area, buf);
+        Paragraph::new(lines).render(inner, buf);
     }
 
     /// Render everything after the nav block as a normal variable-height list
@@ -536,13 +557,13 @@ impl SidebarView {
             let style = if self.daemon_version_mismatch {
                 Style::default().fg(Color::Red)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(MUTED)
             };
             spans.push(Span::styled(line, style));
         }
         if let Some(banner) = &self.board_banner {
             let stale = banner.contains("stale") || banner.contains("no daemon");
-            let color = if stale { Color::Yellow } else { Color::DarkGray };
+            let color = if stale { Color::Yellow } else { MUTED };
             let prefix = if spans.is_empty() { "" } else { "  " };
             spans.push(Span::styled(
                 format!("{prefix}{banner}"),
@@ -593,10 +614,10 @@ struct SidebarGeometry {
     footer: Rect,
 }
 
-/// Height of the header block: project title (row 0), a half-row margin
-/// (row 1), the 2-row search box drawn across three cell rows with the
-/// half-block bleed (rows 2–4: `▄` top, label, `▀` bottom), and a half-row
-/// margin (row 5). The nav block's own leading separator sits below that.
+/// Height of the header block: a blank row (0), the project title (row 1), a
+/// blank row (2), and the 2-row search box drawn across three cell rows with
+/// the half-block bleed (rows 3–5: `▄` top, label, `▀` bottom). The nav block's
+/// own leading separator sits directly below that.
 const HEADER_H: u16 = 6;
 
 /// 1-col horizontal padding shared by the title, the search box, the nav
@@ -750,14 +771,14 @@ fn nav_item_line(
     let text = format!(" {glyph} {label}");
     if selected {
         let pad = width.saturating_sub(text.chars().count());
-        let fg = if focused { Color::White } else { Color::Gray };
+        let fg = if focused { TEXT_SELECTED } else { TEXT };
         let mut style = Style::default().fg(fg).bg(SELECTION_BG);
         if focused {
             style = style.add_modifier(Modifier::BOLD);
         }
         Line::from(Span::styled(format!("{text}{}", " ".repeat(pad)), style))
     } else {
-        Line::from(Span::styled(text, Style::default().fg(Color::Gray)))
+        Line::from(Span::styled(text, Style::default().fg(TEXT)))
     }
 }
 
@@ -766,7 +787,7 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
         Row::Nav { .. } => ListItem::new(Line::raw("")), // nav never reaches the rest-list
         Row::Section(label) => ListItem::new(Line::from(Span::styled(
             format!("— {label} —"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(MUTED),
         ))),
         Row::ConfigError(message) => {
             let style = Style::default().fg(Color::Red);
@@ -779,9 +800,7 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
         Row::Blank => ListItem::new(Line::raw("")),
         Row::Loading => ListItem::new(Line::from(Span::styled(
             "  Loading…",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
         ))),
         Row::MachineGroup {
             name,
@@ -795,8 +814,7 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
             let left = vec![Span::styled(format!("{glyph} {name}"), header_style)];
             if *collapsed {
                 let right_label = format!("({total}, {active} active)");
-                let spans =
-                    right_align(left, right_label, Style::default().fg(Color::DarkGray), width);
+                let spans = right_align(left, right_label, Style::default().fg(MUTED), width);
                 ListItem::new(Line::from(spans))
             } else {
                 ListItem::new(Line::from(left))
@@ -814,7 +832,7 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
                 Span::raw(leading),
                 Span::styled(
                     format!("{} ", badge.glyph()),
-                    Style::default().fg(decoration_to_color(badge.decoration_color())),
+                    Style::default().fg(badge_color(badge.decoration_color())),
                 ),
                 Span::styled(name.clone(), name_style(selected, focused)),
             ];
@@ -822,7 +840,7 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
                 Some(a) => title_case(a),
                 None => "idle".to_string(),
             };
-            let spans = right_align(left, right_label, Style::default().fg(Color::DarkGray), width);
+            let spans = right_align(left, right_label, Style::default().fg(MUTED), width);
             ListItem::new(Line::from(spans))
         }
         Row::Review {
@@ -833,10 +851,13 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
             ..
         } => {
             let dec = state.decoration();
-            let badge = Span::styled(
-                format!("{} ", dec.glyph),
-                Style::default().fg(decoration_to_color(dec.color)),
-            );
+            // The ready `✓` is bold cyan; the queued `·` and loading `▶` keep
+            // their weight.
+            let mut badge_style = Style::default().fg(badge_color(dec.color));
+            if matches!(state, ReviewState::Serving) {
+                badge_style = badge_style.add_modifier(Modifier::BOLD);
+            }
+            let badge = Span::styled(format!("{} ", dec.glyph), badge_style);
             // Badge is one glyph plus a trailing space; keep the title within the
             // remaining width so a long title clips with `…` rather than
             // overflowing. A right-aligned location then drops before the title.
@@ -846,17 +867,14 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
                 Some(loc) => right_align(
                     vec![badge, title_span],
                     loc.clone(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(MUTED),
                     width,
                 ),
                 None => vec![badge, title_span],
             };
-            let branch_style = if selected {
-                let fg = if focused { Color::Gray } else { Color::DarkGray };
-                Style::default().fg(fg).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
+            // The `⎇ branch` line is muted in every state; the selection fill
+            // (not a text change) marks a selected review row.
+            let branch_style = Style::default().fg(MUTED);
             // Branch line: a 2-col indent, the `⎇` glyph, then the branch
             // truncated with `…` to fit (matching the Figma review row).
             const BRANCH_INDENT: &str = "  ";
@@ -872,18 +890,27 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
     }
 }
 
-/// Selected-row text style: white/bold when focused, dim gray when not. The row
-/// fill comes from the list's highlight style, so this sets only fg/weight.
-fn name_style(selected: bool, focused: bool) -> Style {
-    if selected {
-        let fg = if focused { Color::White } else { Color::Gray };
-        let mut s = Style::default().fg(fg);
-        if focused {
-            s = s.add_modifier(Modifier::BOLD);
-        }
-        s
-    } else {
-        Style::default().fg(Color::Gray)
+/// Workspace / review / machine-name text style — always the normal
+/// `color/gray` (#bababa). Unlike the nav label, these rows keep their text
+/// colour when selected; only the `color/selection` row fill (from the list's
+/// highlight style) marks the selection. Kept as a fn so every list row routes
+/// its name through one place.
+fn name_style(_selected: bool, _focused: bool) -> Style {
+    Style::default().fg(TEXT)
+}
+
+/// Colour for a row badge glyph (the workspace `⏵`/`·`, the review `✓`/`·`),
+/// mapping the shared [`DecorationColor`] to the sidebar's exact Figma tokens:
+/// the busy green, the muted bullet, the ready cyan, the normal gray. The
+/// remaining decorations (yellow / red state badges) fall back to the shared
+/// [`decoration_to_color`] mapping.
+fn badge_color(c: DecorationColor) -> Color {
+    match c {
+        DecorationColor::Green => BUSY_GREEN,
+        DecorationColor::DarkGray => MUTED,
+        DecorationColor::Cyan => ACCENT,
+        DecorationColor::Gray => TEXT,
+        other => decoration_to_color(other),
     }
 }
 
@@ -940,8 +967,8 @@ fn truncate_ellipsis(s: &str, max: usize) -> String {
 /// a half-row of padding above the label), the label row on a solid fill, and
 /// an upper-half-block row below (fill in its top half, a half-row of padding
 /// below). The half-block glyphs carry the fill as their *foreground* on the
-/// default background, so the eye reads the fill as half a cell tall on those
-/// rows. The chord is dropped when there isn't room for it.
+/// sidebar's painted #000000 background, so the eye reads the fill as half a
+/// cell tall on those rows. The chord is dropped when there isn't room for it.
 fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -955,7 +982,8 @@ fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
     let bottom = top + 2;
 
     // Top / bottom half-block bleed rows: the fill as the glyph's foreground on
-    // the default background, exactly like the nav selection bleed.
+    // the sidebar's painted black background, exactly like the nav selection
+    // bleed.
     let bleed_style = Style::default().fg(SEARCH_BG);
     if label_y > top {
         Paragraph::new(Line::from(Span::styled(BLEED_ABOVE.repeat(width), bleed_style)))
@@ -976,17 +1004,20 @@ fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
     };
     let chord_w = chord_hint.chars().count();
 
+    // Both the label and the shortcut are the normal `color/gray` (#bababa), not
+    // dimmed — the Figma search box reads them at the same weight.
     let mut spans = vec![Span::styled(
         label.to_string(),
-        Style::default().fg(Color::Gray).bg(SEARCH_BG),
+        Style::default().fg(TEXT).bg(SEARCH_BG),
     )];
-    // Append the chord hint only when the label and it both fit.
+    // Append the chord hint only when the label and it both fit. The trailing
+    // space in `chord_hint` keeps ~1 col of right padding inside the box.
     if chord_w > 0 && label_w + chord_w < width {
         let pad = width - label_w - chord_w;
         spans.push(Span::styled(" ".repeat(pad), Style::default().bg(SEARCH_BG)));
         spans.push(Span::styled(
             chord_hint,
-            Style::default().fg(Color::DarkGray).bg(SEARCH_BG),
+            Style::default().fg(TEXT).bg(SEARCH_BG),
         ));
     }
     Paragraph::new(Line::from(spans)).render(Rect { y: label_y, height: 1, ..area }, buf);
@@ -1285,11 +1316,13 @@ mod tests {
         );
     }
 
-    /// The selected nav item's adjacent lines carry the full-width half-block
-    /// bleed (U+2584 above, U+2580 below); the selection fill spans the column
-    /// edge to edge while the label text keeps the 1-col indent.
+    /// The selected nav item's fill and its half-block bleed (U+2584 above,
+    /// U+2580 below) are inset one column from each edge — the same width as the
+    /// search box — with the gutter columns left on the #000000 background. The
+    /// selected label is white + bold; an unselected label is plain #bababa with
+    /// no fill.
     #[test]
-    fn selected_nav_item_renders_full_width_half_block_bleed() {
+    fn selected_nav_item_renders_inset_half_block_bleed() {
         let width = 24u16;
         let model = empty_model();
         let view = SidebarView::build(&model);
@@ -1303,17 +1336,27 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let rows = dump(&term);
 
-        let tasks_y = row_y(&rows, "Issues");
-        assert_eq!(
-            rows[tasks_y - 1],
-            BLEED_ABOVE.repeat(width as usize),
-            "the line above the selection is full-width U+2584"
-        );
-        assert_eq!(
-            rows[tasks_y + 1],
-            BLEED_BELOW.repeat(width as usize),
-            "the line below the selection is full-width U+2580"
-        );
+        let issues_y = row_y(&rows, "Issues") as u16;
+        // Gutters stay on the painted background; the inset region carries the
+        // selection fill. (Columns 2–3 hold the double-width icon continuation,
+        // which the TestBackend leaves unflushed, so sample single-width cells.)
+        assert_eq!(buf[(0, issues_y)].bg, BACKGROUND, "left gutter stays on the background, not the fill");
+        assert_eq!(buf[(width - 1, issues_y)].bg, BACKGROUND, "right gutter stays on the background, not the fill");
+        assert_eq!(buf[(1, issues_y)].bg, SELECTION_BG, "the inset starts one column in with the selection fill");
+        for x in (width - 4)..(width - 1) {
+            assert_eq!(buf[(x, issues_y)].bg, SELECTION_BG, "right-edge padding carries the fill, col {x}");
+        }
+
+        // Bleed rows above and below span only the inset region.
+        let above = issues_y - 1;
+        let below = issues_y + 1;
+        for x in 1..(width - 1) {
+            assert_eq!(buf[(x, above)].symbol(), BLEED_ABOVE, "bleed above is U+2584, col {x}");
+            assert_eq!(buf[(x, above)].fg, SELECTION_BG, "bleed above carries the fill as fg, col {x}");
+            assert_eq!(buf[(x, below)].symbol(), BLEED_BELOW, "bleed below is U+2580, col {x}");
+        }
+        assert_eq!(buf[(0, above)].symbol(), " ", "the bleed gutter stays blank");
+        assert_eq!(buf[(width - 1, above)].symbol(), " ", "the bleed right gutter stays blank");
         // Unselected items keep plain blank separators.
         let chat_y = row_y(&rows, "Chat");
         assert!(
@@ -1321,17 +1364,21 @@ mod tests {
             "the line above unselected Chat stays blank, got: {:?}",
             rows[chat_y - 1]
         );
-        // Selection fill paints edge to edge; column 0 is the indent gutter.
-        let ty = tasks_y as u16;
-        assert_eq!(
-            buf[(0, ty)].bg,
-            SELECTION_BG,
-            "left edge (indent gutter) carries the selection fill"
+
+        // Selected label: white + bold. Unselected label: #bababa, no fill.
+        let issues_x = rows[issues_y as usize].find('I').unwrap() as u16;
+        assert_eq!(buf[(issues_x, issues_y)].fg, TEXT_SELECTED, "selected nav label is white");
+        assert!(
+            buf[(issues_x, issues_y)].modifier.contains(Modifier::BOLD),
+            "selected nav label is bold"
         );
-        for x in (width - 4)..width {
-            assert_eq!(buf[(x, ty)].bg, SELECTION_BG, "right edge padding carries the fill, col {x}");
-        }
-        assert_eq!(buf[(0, ty)].symbol(), " ", "column 0 is the indent gutter, not the label");
+        let chat_x = rows[chat_y].find('C').unwrap() as u16;
+        assert_eq!(buf[(chat_x, chat_y as u16)].fg, TEXT, "unselected nav label is #bababa");
+        assert_eq!(buf[(chat_x, chat_y as u16)].bg, BACKGROUND, "unselected nav label has no fill");
+        assert!(
+            !buf[(chat_x, chat_y as u16)].modifier.contains(Modifier::BOLD),
+            "unselected nav label is not bold"
+        );
     }
 
     // --- workspaces ---------------------------------------------------------
@@ -1545,17 +1592,63 @@ mod tests {
         assert!(rows[alpha_y].contains('⏵'), "busy row carries the ⏵ glyph, got: {:?}", rows[alpha_y]);
         assert!(rows[alpha_y].contains("Developer"), "busy row right-aligns the agent, got: {:?}", rows[alpha_y]);
         let glyph_x = rows[alpha_y].find('⏵').unwrap() as u16;
-        assert_eq!(buf[(glyph_x, alpha_y as u16)].fg, Color::Green, "busy glyph is green");
+        assert_eq!(buf[(glyph_x, alpha_y as u16)].fg, BUSY_GREEN, "busy glyph is the #5acd25 green");
+        // The workspace name and its right-aligned agent are #bababa / #7a7a7a.
+        let name_x = rows[alpha_y].find("alpha").unwrap() as u16;
+        assert_eq!(buf[(name_x, alpha_y as u16)].fg, TEXT, "workspace name is #bababa");
+        let dev_x = rows[alpha_y].find("Developer").unwrap() as u16;
+        assert_eq!(buf[(dev_x, alpha_y as u16)].fg, MUTED, "agent label is muted #7a7a7a");
 
         let charlie_y = row_y(&rows, "charlie");
         assert!(rows[charlie_y].contains('·'), "idle row carries the · glyph, got: {:?}", rows[charlie_y]);
         assert!(rows[charlie_y].contains("idle"), "idle row shows the idle placeholder, got: {:?}", rows[charlie_y]);
+        let bullet_x = rows[charlie_y].find('·').unwrap() as u16;
+        assert_eq!(buf[(bullet_x, charlie_y as u16)].fg, MUTED, "idle bullet is muted #7a7a7a");
+    }
+
+    /// The selected workspace row fills with `color/selection` (#3f3f3f), inset
+    /// one column from the left edge; the gutter stays on the #000000
+    /// background. The row's text colour is unchanged (only the fill marks it).
+    #[test]
+    fn selected_workspace_row_fills_inset_selection() {
+        let mut model = empty_model();
+        model.workspaces = vec![
+            ws("alpha", "hub", Some("t-1"), Some("developer"), WorkspaceBadge::Working),
+            ws("charlie", "hub", None, None, WorkspaceBadge::Idle),
+        ];
+        let view = SidebarView::build(&model);
+        let width = 30u16;
+        let backend = TestBackend::new(width, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        // 3 nav items precede the workspaces; ordinal 3 is the first workspace.
+        term.draw(|f| {
+            let area = f.area();
+            view.render(f.buffer_mut(), area, 3, true, &default_chrome())
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term);
+
+        let alpha_y = row_y(&rows, "alpha") as u16;
+        assert_eq!(buf[(0, alpha_y)].bg, BACKGROUND, "the left gutter stays on the background");
+        assert_eq!(buf[(1, alpha_y)].bg, SELECTION_BG, "the fill starts one column in");
+        // The fill runs to roughly one column before the divider column.
+        assert_eq!(buf[(width - 2, alpha_y)].bg, SELECTION_BG, "the fill extends to the right inset");
+        // Text colour is unchanged under the fill.
+        let name_x = rows[alpha_y as usize].find("alpha").unwrap() as u16;
+        assert_eq!(buf[(name_x, alpha_y)].fg, TEXT, "selected workspace name keeps #bababa");
+
+        // The unselected row below has no fill.
+        let charlie_y = row_y(&rows, "charlie") as u16;
+        assert_eq!(buf[(1, charlie_y)].bg, BACKGROUND, "an unselected row has no fill");
     }
 
     // --- header / search ----------------------------------------------------
 
-    /// The header renders the project name in the accent cyan and a filled
-    /// search box carrying `🔍 Search` and the resolved palette chord.
+    /// The header renders a blank row, the project name in the accent cyan on
+    /// row 1, a blank row, then the filled search box (rows 3–5) carrying
+    /// `🔍 Search` and the resolved palette chord. The whole area is painted on
+    /// the #000000 background.
     #[test]
     fn header_renders_project_title_and_search_box() {
         let mut model = empty_model();
@@ -1565,21 +1658,25 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| {
             let area = f.area();
-            view.render(f.buffer_mut(), area, 0, true, &default_chrome())
+            view.render(f.buffer_mut(), area, 1, true, &default_chrome()) // Issues selected
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
         let rows = dump(&term);
         let joined = rows.join("\n");
 
-        // Title on the first row, in cyan bold.
+        // A blank row sits above the title; the title is on row 1, accent cyan.
+        assert!(rows[0].trim().is_empty(), "a blank row sits above the title, got: {:?}", rows[0]);
+        assert_eq!(buf[(1, 0)].bg, BACKGROUND, "the sidebar paints the #000000 background");
         let title_y = row_y(&rows, "My project");
-        assert_eq!(title_y, 0, "project title is the first row, got:\n{joined}");
+        assert_eq!(title_y, 1, "project title is on the second row, got:\n{joined}");
         let title_x = rows[title_y].find('M').unwrap() as u16;
-        assert_eq!(buf[(title_x, title_y as u16)].fg, Color::Cyan, "title is cyan");
+        assert_eq!(buf[(title_x, title_y as u16)].fg, ACCENT, "title is the accent cyan #00a6b2");
+        assert!(rows[2].trim().is_empty(), "a blank row sits below the title, got: {:?}", rows[2]);
 
         // Search box with the magnifier, label, and the mac/linux palette chord.
         let search_y = row_y(&rows, "Search");
+        assert_eq!(search_y, 4, "the search label row is row 4, got:\n{joined}");
         let want_chord = match DisplayStyle::detect() {
             DisplayStyle::Mac => "⌃P",
             DisplayStyle::Linux => "Ctrl+P",
@@ -1596,22 +1693,35 @@ mod tests {
         for x in 5..39u16 {
             assert_eq!(buf[(x, sy)].bg, SEARCH_BG, "search box fills its row, col {x}");
         }
+        // The label and the shortcut are both the normal #bababa (not dimmed).
+        // (Column math, not `str::find`, since the double-width 🔍 makes byte
+        // offsets diverge from columns.) The label " 🔍 Search" renders from the
+        // box's inset left edge (x=1): space (1), 🔍 (2–3), space (4), S (5).
+        assert_eq!(buf[(5, sy)].fg, TEXT, "search label 'S' is #bababa");
+        // The shortcut is right-aligned; scan in from the right for its last
+        // glyph (past the one trailing space of inner padding).
+        let chord_cell_x = (6..40u16)
+            .rev()
+            .find(|&x| buf[(x, sy)].symbol().trim() != "")
+            .expect("the shortcut renders a glyph");
+        assert_eq!(buf[(chord_cell_x, sy)].fg, TEXT, "search shortcut is #bababa, not dimmed");
 
         // The box is 2 rows tall, drawn with the half-block bleed: a `▄` row of
         // lower-half blocks above the label and a `▀` row of upper-half blocks
-        // below it, both carrying the search fill as their *foreground* (the
-        // half shows the fill; the cell background stays the terminal default).
+        // below it, both carrying the search fill as their *foreground* on the
+        // #000000 background (the half shows the fill; the cell background stays
+        // black).
         let top_y = sy - 1;
         let bottom_y = sy + 1;
         for x in 1..39u16 {
             assert_eq!(buf[(x, top_y)].symbol(), "▄", "top bleed row is lower-half blocks, col {x}");
             assert_eq!(buf[(x, top_y)].fg, SEARCH_BG, "top bleed carries the fill as fg, col {x}");
+            assert_eq!(buf[(x, top_y)].bg, BACKGROUND, "top bleed keeps the black background, col {x}");
             assert_eq!(buf[(x, bottom_y)].symbol(), "▀", "bottom bleed row is upper-half blocks, col {x}");
             assert_eq!(buf[(x, bottom_y)].fg, SEARCH_BG, "bottom bleed carries the fill as fg, col {x}");
         }
-        // A blank half-row margin sits above (below the title) and below the box.
+        // A blank half-row margin sits above the box (below the title).
         assert!(rows[(top_y - 1) as usize].trim().is_empty(), "blank margin above the box, got: {:?}", rows[(top_y - 1) as usize]);
-        assert!(rows[(bottom_y + 1) as usize].trim().is_empty(), "blank margin below the box, got: {:?}", rows[(bottom_y + 1) as usize]);
     }
 
     /// A click anywhere in the 2-row box — including the `▄` / `▀` half-block
@@ -1621,14 +1731,14 @@ mod tests {
     fn search_box_hit_covers_all_three_cell_rows() {
         let view = SidebarView::build(&empty_model());
         let area = Rect { x: 0, y: 0, width: 40, height: 20 };
-        // Rows 2, 3, 4 are the box (`▄`, label, `▀`); row 0 is the title, row 1
-        // and row 5 the margins, row 6 the nav's leading separator.
-        for y in 2..=4u16 {
+        // Rows 3, 4, 5 are the box (`▄`, label, `▀`); row 0 is blank, row 1 the
+        // title, row 2 blank, row 6 the nav's leading separator.
+        for y in 3..=5u16 {
             assert!(view.search_box_hit(area, 3, y), "click on box row {y} hits the search box");
         }
-        assert!(!view.search_box_hit(area, 3, 0), "title row is not the search box");
-        assert!(!view.search_box_hit(area, 3, 1), "top margin is not the search box");
-        assert!(!view.search_box_hit(area, 3, 5), "bottom margin is not the search box");
+        assert!(!view.search_box_hit(area, 3, 1), "title row is not the search box");
+        assert!(!view.search_box_hit(area, 3, 2), "the margin above the box is not the search box");
+        assert!(!view.search_box_hit(area, 3, 6), "the nav separator below the box is not the search box");
         // The gutter column (0) and the divider-adjacent last column fall
         // outside the inset box.
         assert!(!view.search_box_hit(area, 0, 3), "left gutter is outside the inset box");
@@ -1640,7 +1750,7 @@ mod tests {
     fn taller_search_box_shifts_nav_click_targets_down() {
         let view = SidebarView::build(&empty_model());
         let area = Rect { x: 0, y: 0, width: 40, height: 20 };
-        // Header is 6 rows (0 title, 1 margin, 2–4 box, 5 margin); the nav's
+        // Header is 6 rows (0 blank, 1 title, 2 blank, 3–5 box); the nav's
         // leading separator is row 6, so the first nav item ("Chat") sits on
         // row 7.
         assert_eq!(view.hit(area, 3, 7), Some(0), "first nav item is on row 7 and selects index 0");
