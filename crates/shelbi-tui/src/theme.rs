@@ -11,6 +11,11 @@ use std::time::Duration;
 /// so it reads as a subtle fill rather than a coloured accent.
 pub const SELECTION_BG: Color = Color::Rgb(63, 63, 63);
 
+/// Fill for the sidebar's search box — a darker gray than [`SELECTION_BG`] so
+/// the box reads as a quiet, always-present input affordance rather than an
+/// active selection. Matches the Figma `color/search` token (#292929).
+pub const SEARCH_BG: Color = Color::Rgb(41, 41, 41);
+
 /// The glyph painted down the sidebar's rightmost column as the resize
 /// drag handle — a full-height light vertical rule.
 pub const DIVIDER_GLYPH: &str = "│";

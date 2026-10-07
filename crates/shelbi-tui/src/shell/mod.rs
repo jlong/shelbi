@@ -61,7 +61,6 @@ use shelbi_app::CommandKind;
 use shelbi_core::{ConfigMode, IssueTrackerConfig};
 use shelbi_orchestrator::project_create::{self, ResolvedProjectRoot};
 use shelbi_state::keymap::{load_keymaps, DisplayStyle, GlobalAction, KeyChord, Keymaps};
-use shelbi_state::ZenToggleChord;
 use shelbi_term::Size;
 
 use crate::activity::ActivityApp;
@@ -649,9 +648,6 @@ struct ShellState {
     /// Platform convention for rendering chord hints in the sidebar footer —
     /// detected once at construction so per-frame rendering never re-probes.
     display_style: DisplayStyle,
-    /// Chord that toggles Zen Mode, resolved from the keymaps once at startup.
-    /// Drives the sidebar footer's off-state hotkey hint.
-    zen_toggle_chord: ZenToggleChord,
     /// Launch-time sidebar status line (first-run hint / startup-warning count),
     /// claimed once at construction and stamped onto each refreshed sidebar
     /// model. Empty when there is nothing to surface.
@@ -740,9 +736,6 @@ impl ShellState {
             .first_chord_for(GlobalAction::OpenPalette)
             .copied();
         let display_style = DisplayStyle::detect();
-        // Resolve the Zen toggle chord for the footer hint, falling back to the
-        // Alt+Z default for bindings the preset enum can't represent.
-        let zen_toggle_chord = keymaps.zen_toggle_chord(ZenToggleChord::default());
         // Claim the one-time first-run hint, else surface any keymap-diagnostic
         // count. Mirrors the former sidebar's launch status line.
         let startup_status = sidebar::sidebar_startup_status_line(diags.len());
@@ -790,7 +783,6 @@ impl ShellState {
             machines,
             keymaps,
             display_style,
-            zen_toggle_chord,
             startup_status,
             main_view: MainView::Session,
             sidebar_rect: Rect::default(),
@@ -881,7 +873,7 @@ impl ShellState {
     /// The per-frame sidebar footer inputs (keybind hint + Zen glyph), owned so
     /// the draw closure holds no borrow of the rest of the shell state.
     fn sidebar_chrome(&self) -> sidebar::SidebarChrome {
-        sidebar::SidebarChrome::from_keymaps(&self.keymaps, self.display_style, self.zen_toggle_chord)
+        sidebar::SidebarChrome::from_keymaps(&self.keymaps, self.display_style)
     }
 
     fn selection(&self) -> usize {
@@ -2345,6 +2337,13 @@ impl ShellState {
                 // focuses the sidebar (hit returns `None`), opening nothing.
                 self.client.focus_sidebar();
                 if let Some(view) = self.sidebar_view() {
+                    // A click on the search box opens the command palette, the
+                    // same as pressing the palette chord.
+                    if view.search_box_hit(self.sidebar_content_rect(), m.column, m.row) {
+                        self.open_palette();
+                        self.dirty = true;
+                        return;
+                    }
                     if let Some(sel) = view.hit(self.sidebar_content_rect(), m.column, m.row) {
                         self.client.clamp_selection(view.selectable_count());
                         // Move selection to the clicked row.
@@ -3505,6 +3504,24 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
+    #[test]
+    fn a_click_on_the_search_box_opens_the_palette() {
+        // The search box sits on the third header row; clicking it opens the
+        // command palette, the same as the palette chord.
+        let mut st = test_state();
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        st.main_rect = Rect::new(28, 0, 92, 20);
+        st.show(RowTarget::Session(SessionRef::Orchestrator));
+        assert!(st.overlay.is_none(), "no overlay before the click");
+
+        // Header layout: title (row 0), blank (row 1), search box (row 2).
+        st.handle_mouse(left_click(3, 2));
+        assert!(
+            matches!(st.overlay, Some(ActiveOverlay::Palette(_))),
+            "clicking the search box opens the command palette"
+        );
+    }
+
     // --- drag-handle line ---------------------------------------------------
 
     /// A synthetic pointer-motion (no button) at `(col, row)`.
@@ -3724,11 +3741,11 @@ mod tests {
         let mut st = test_state();
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_main();
-        // Visual-parity sidebar geometry: rows 0-1 are the title + blank, then
-        // the nav block interleaves items with separator lines — Chat on y=3,
-        // Issues on y=5, Activity on y=7 (even rows between are inert
-        // separators). Click Issues.
-        st.handle_mouse(left_click(2, 5));
+        // Sidebar geometry: rows 0-3 are the header (title, blank, search box,
+        // blank), then the nav block interleaves items with separator lines —
+        // Chat on y=5, Issues on y=7, Activity on y=9 (even rows between are
+        // inert separators). Click Issues.
+        st.handle_mouse(left_click(2, 7));
         assert_eq!(st.selection(), 1, "selection moved to Issues");
         assert!(
             matches!(st.main_view, MainView::Native(View::Issues)),
@@ -3737,8 +3754,8 @@ mod tests {
         // A native view keeps sidebar focus, exactly as Enter does.
         assert_eq!(st.client.focus(), Focus::Sidebar);
 
-        // Clicking Activity (y=7) switches the main area again.
-        st.handle_mouse(left_click(2, 7));
+        // Clicking Activity (y=9) switches the main area again.
+        st.handle_mouse(left_click(2, 9));
         assert_eq!(st.selection(), 2, "selection moved to Activity");
         assert!(matches!(st.main_view, MainView::Native(View::Activity)));
     }
@@ -3748,10 +3765,10 @@ mod tests {
         let mut st = test_state();
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_sidebar();
-        // After the nav block (ends y=8) comes a blank (y=9), the
-        // "— Workspaces —" header (y=10), then the single flat workspace alpha
-        // on y=11 (selectable ordinal 3).
-        st.handle_mouse(left_click(2, 11));
+        // After the nav block (ends y=10) comes a blank (y=11), the
+        // "— Workspaces —" header (y=12), then the single flat workspace alpha
+        // on y=13 (selectable ordinal 3).
+        st.handle_mouse(left_click(2, 13));
         assert_eq!(st.selection(), 3, "selection moved to alpha");
         assert!(
             matches!(st.main_view, MainView::Session),
@@ -3789,8 +3806,8 @@ mod tests {
         }));
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_sidebar();
-        // The single flat workspace `alpha` sits on y=11 (see the click test).
-        st.handle_mouse(left_click(2, 11));
+        // The single flat workspace `alpha` sits on y=13 (see the click test).
+        st.handle_mouse(left_click(2, 13));
         assert!(matches!(st.main_view, MainView::Session));
         assert_eq!(
             st.sessions.current_target(),
@@ -3945,15 +3962,15 @@ mod tests {
         // Open Activity first so we can prove a header/blank click doesn't change it.
         st.show(RowTarget::Native(View::Activity));
         let before = st.selection();
-        // y=10 is the "— Workspaces —" section header.
-        st.handle_mouse(left_click(2, 10));
+        // y=12 is the "— Workspaces —" section header (header grew to 4 rows).
+        st.handle_mouse(left_click(2, 12));
         assert_eq!(st.selection(), before, "a header click doesn't move the selection");
         assert!(
             matches!(st.main_view, MainView::Native(View::Activity)),
             "a header click opens nothing"
         );
-        // y=13 is blank space below the last row (alpha, y=11).
-        st.handle_mouse(left_click(2, 13));
+        // y=15 is blank space below the last row (alpha, y=13).
+        st.handle_mouse(left_click(2, 15));
         assert_eq!(st.selection(), before, "a blank click doesn't move the selection");
         assert!(matches!(st.main_view, MainView::Native(View::Activity)));
     }

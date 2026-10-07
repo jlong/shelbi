@@ -4,12 +4,16 @@
 //!
 //! The model logic lives in [`shelbi_app::view::SidebarModel`] (built off the
 //! UI thread by [`super::sidebar_model`]); this module only lays those rows out
-//! and maps a selection / click to what the main area should show. It mirrors
-//! the old renderer section for section: a full-width nav block with the
-//! half-block selection bleed, the machine-grouped workspace pool with
-//! per-state badges, the two review sections rendered as two-line entries, and
-//! the footer (keybind hint, daemon-version row, zen row, first-run hint, and
-//! the unread-errors button).
+//! and maps a selection / click to what the main area should show. Laid out
+//! top to bottom to match John's Figma "Navigation" design: a header (project
+//! title + a filled search box that opens the command palette), a full-width
+//! nav block with the half-block selection bleed, the machine-grouped
+//! workspace pool with per-state badges, the two review sections rendered as
+//! two-line entries (dim `⎇ branch` line, truncated with `…`), and the footer
+//! (daemon-version row, the `ZEN MODE ON` band shown only while Zen is on, the
+//! one-time first-run hint, and the unread-errors button). The old `^P palette
+//! q quit` / `^G Zen mode` footer hint lines are gone; those actions stay
+//! reachable through the palette and their existing keys.
 //!
 //! Selection is a single flat index over the *selectable* rows (section
 //! headers / blanks are skipped), exactly as [`shelbi_app::nav::ClientState`]
@@ -24,13 +28,13 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph, StatefulWidget, Wid
 
 use shelbi_app::nav::View;
 use shelbi_app::view::{ReviewState, SidebarModel, WorkspaceBadge};
-use shelbi_state::keymap::{DisplayStyle, GlobalAction, Keymaps, SidebarAction};
-use shelbi_state::{ZenModeState, ZenToggleChord};
+use shelbi_state::keymap::{DisplayStyle, GlobalAction, Keymaps};
+use shelbi_state::ZenModeState;
 
 use super::session::SessionRef;
 use crate::keymap::format_chord_or_unbound;
 use crate::sidebar::{decoration_to_color, nav_lines, BLEED_ABOVE, BLEED_BELOW};
-use crate::theme::SELECTION_BG;
+use crate::theme::{SEARCH_BG, SELECTION_BG};
 
 /// Exact one-time orientation copy shown in the sidebar footer after the first
 /// project scaffold. One constant so persistence and wrapping paths can't drift
@@ -45,6 +49,10 @@ const ERROR_BUTTON_H: u16 = 3;
 /// something's wrong, legible in both light and dark terminals.
 const ERROR_BUTTON_BG: Color = Color::Rgb(110, 70, 70);
 
+/// Fill for the `ZEN MODE ON` band — the Figma `color/zen` token (#007f00), a
+/// deep green that reads as a steady "on" bar behind bold white text.
+const ZEN_BAND_BG: Color = Color::Rgb(0, 127, 0);
+
 /// What a selectable sidebar row routes to when opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowTarget {
@@ -58,39 +66,24 @@ pub enum RowTarget {
     Machine(String),
 }
 
-/// Per-frame footer inputs that aren't board state: the preformatted keybind
-/// hint and the Zen-toggle glyph. Owned (no borrow of the shell state) so the
-/// draw closure can disjointly borrow the rest of the state.
+/// Per-frame footer/header input that isn't board state: the resolved
+/// palette-open chord shown in the search box's `⌘K`-style hint. Owned (no
+/// borrow of the shell state) so the draw closure can disjointly borrow the
+/// rest of the state.
 pub struct SidebarChrome {
-    /// `"<palette> palette  <quit> quit"`, each chord resolved for the host
-    /// platform (or `<unbound>` when missing).
-    keybinds: String,
-    /// The Zen-toggle hotkey glyph for the off-state hint; `None` suppresses
-    /// the hint (no chord bound).
-    zen_glyph: Option<&'static str>,
+    /// The palette-open chord resolved for the host platform (e.g. `⌃P` on
+    /// macOS, `Ctrl+P` elsewhere), or `<unbound>` when no chord is bound.
+    palette: String,
 }
 
 impl SidebarChrome {
     /// Build the chrome from the resolved keymaps + platform convention.
-    pub fn from_keymaps(
-        keymaps: &Keymaps,
-        display_style: DisplayStyle,
-        zen_toggle_chord: ZenToggleChord,
-    ) -> Self {
-        let keybinds = format!(
-            "{} palette  {} quit",
-            format_chord_or_unbound(
+    pub fn from_keymaps(keymaps: &Keymaps, display_style: DisplayStyle) -> Self {
+        SidebarChrome {
+            palette: format_chord_or_unbound(
                 keymaps.global.first_chord_for(GlobalAction::OpenPalette),
                 display_style,
             ),
-            format_chord_or_unbound(
-                keymaps.sidebar.first_chord_for(SidebarAction::Quit),
-                display_style,
-            ),
-        );
-        SidebarChrome {
-            keybinds,
-            zen_glyph: zen_toggle_chord.glyph(),
         }
     }
 }
@@ -203,8 +196,10 @@ impl SidebarView {
             .count()
     }
 
-    /// Footer height: the three fixed rows (keybinds / version / zen) plus the
-    /// status row's height (0 when empty, 2 for the first-run hint, else 1).
+    /// Footer height: the three fixed rows (version / blank / zen band) plus the
+    /// status row's height (0 when empty, 2 for the first-run hint, else 1). The
+    /// zen band paints only while Zen is on, but the row is always reserved so
+    /// the version line never shifts when Zen toggles.
     fn footer_height(&self) -> u16 {
         3 + self.status_row_height()
     }
@@ -219,9 +214,11 @@ impl SidebarView {
         }
     }
 
-    /// Split the sidebar `area` into (title, nav, rest-list, footer) rects — the
-    /// shared geometry the renderer and the click map both derive from. `rest`
-    /// is `None` when the body is too short to hold anything past the nav block.
+    /// Split the sidebar `area` into (header, search, nav, rest-list, footer)
+    /// rects — the shared geometry the renderer and the click map both derive
+    /// from. `search` is `None` when the header is too short to hold the box;
+    /// `rest` is `None` when the body is too short to hold anything past the nav
+    /// block.
     fn geometry(&self, area: Rect) -> SidebarGeometry {
         let outer = Layout::default()
             .direction(Direction::Vertical)
@@ -229,12 +226,23 @@ impl SidebarView {
             .split(area);
         let body_region = outer[0];
         let footer = outer[1];
-        // Title is two rows (label + blank), then the body.
-        let list = Layout::default()
+        // Header holds the project title (row 0), a blank (row 1), the search
+        // box (row 2), and a blank (row 3); then the body.
+        let header_h = HEADER_H.min(body_region.height);
+        let split = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Min(1)])
+            .constraints([Constraint::Length(header_h), Constraint::Min(0)])
             .split(body_region);
-        let body = list[1];
+        let header = split[0];
+        let body = split[1];
+        let search = (header.height > 2).then(|| {
+            Rect {
+                y: header.y + 2,
+                height: 1,
+                ..header
+            }
+            .inner(LIST_INDENT)
+        });
         let nav_height = (nav_lines(self.nav_n()) as u16).min(body.height);
         let nav = Rect {
             height: nav_height,
@@ -252,7 +260,24 @@ impl SidebarView {
         } else {
             None
         };
-        SidebarGeometry { nav, rest, footer }
+        SidebarGeometry {
+            header,
+            search,
+            nav,
+            rest,
+            footer,
+        }
+    }
+
+    /// Whether `(x, y)` lands on the search box — the shell maps a click here to
+    /// opening the command palette, the same as pressing the palette chord.
+    pub fn search_box_hit(&self, area: Rect, x: u16, y: u16) -> bool {
+        if area.width == 0 || area.height == 0 || !contains(area, x, y) {
+            return false;
+        }
+        self.geometry(area)
+            .search
+            .is_some_and(|s| contains(s, x, y))
     }
 
     /// Map a click at viewer `(x, y)` to the selection index of the row there,
@@ -325,29 +350,41 @@ impl SidebarView {
         }
         let geo = self.geometry(area);
 
-        // Title — strong color, blank line below for breathing room. The title
-        // rect is the two rows above the nav block, re-indented like the list.
-        let title_rect = Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: 2.min(area.height),
-        };
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                self.project_label.clone(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )),
-            Line::raw(""),
-        ])
-        .render(title_rect.inner(LIST_INDENT), buf);
+        self.render_header(buf, geo.header, geo.search, chrome);
 
         let sel_row = self.selected_row(selection);
         self.render_nav(buf, geo.nav, sel_row, focused);
         if let Some(rest) = geo.rest {
             self.render_rest(buf, rest, sel_row, focused);
         }
-        self.render_footer(buf, geo.footer, chrome);
+        self.render_footer(buf, geo.footer);
+    }
+
+    /// Render the header block: the project title in the accent cyan on the
+    /// first row, and the filled search box two rows below it.
+    fn render_header(
+        &self,
+        buf: &mut Buffer,
+        header: Rect,
+        search: Option<Rect>,
+        chrome: &SidebarChrome,
+    ) {
+        if header.width == 0 || header.height == 0 {
+            return;
+        }
+        let title_rect = Rect {
+            height: 1.min(header.height),
+            ..header
+        };
+        Paragraph::new(Line::from(Span::styled(
+            self.project_label.clone(),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )))
+        .render(title_rect.inner(LIST_INDENT), buf);
+
+        if let Some(search) = search {
+            render_search_box(buf, search, &chrome.palette);
+        }
     }
 
     /// Render the leading `Row::Nav` rows as a full-width block: a separator
@@ -411,10 +448,10 @@ impl SidebarView {
         StatefulWidget::render(list, area, buf, &mut state);
     }
 
-    fn render_footer(&self, buf: &mut Buffer, area: Rect, chrome: &SidebarChrome) {
-        // Vertical rhythm: [status?] keybinds, version, zen-row. The zen row
-        // keeps the same y whether Zen is On or Off so toggling never nudges
-        // the line above.
+    fn render_footer(&self, buf: &mut Buffer, area: Rect) {
+        // Vertical rhythm: [status?] version, blank, zen-band. The blank keeps
+        // the version line put whether or not the band paints, so toggling Zen
+        // never nudges the line above.
         let has_status = !self.status_line.is_empty();
         let mut constraints = Vec::with_capacity(if has_status { 4 } else { 3 });
         if has_status {
@@ -460,14 +497,10 @@ impl SidebarView {
             idx += 1;
         }
 
-        Paragraph::new(Line::from(Span::styled(
-            chrome.keybinds.clone(),
-            Style::default().fg(Color::DarkGray),
-        )))
-        .render(content_row(rows[idx]), buf);
+        self.render_version_row(buf, content_row(rows[idx]));
         idx += 1;
 
-        self.render_version_row(buf, content_row(rows[idx]));
+        // Blank spacer row between the version line and the zen band.
         idx += 1;
 
         let zen_area = if show_button {
@@ -475,7 +508,7 @@ impl SidebarView {
         } else {
             rows[idx]
         };
-        self.render_zen_row(buf, zen_area, chrome);
+        self.render_zen_row(buf, zen_area);
 
         if show_button {
             let button = Rect {
@@ -518,58 +551,51 @@ impl SidebarView {
         Paragraph::new(Line::from(spans)).render(area, buf);
     }
 
-    /// Zen row: a full-width green band carrying `ZEN MODE ON` when on; a dim
-    /// `<hotkey> Zen mode` hint when off/paused (suppressed when no chord is
-    /// bound).
-    fn render_zen_row(&self, buf: &mut Buffer, area: Rect, chrome: &SidebarChrome) {
+    /// Zen row: a full-width green band carrying a bold `ZEN MODE ON` only while
+    /// Zen is on. Off or paused paints nothing — the row stays blank so the
+    /// version line above keeps its place.
+    fn render_zen_row(&self, buf: &mut Buffer, area: Rect) {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        if matches!(self.zen_mode, ZenModeState::On) {
-            let style = Style::default()
-                .bg(Color::Rgb(0, 127, 0))
-                .fg(Color::Rgb(255, 255, 255))
-                .add_modifier(Modifier::BOLD);
-            let width = area.width as usize;
-            let label = "ZEN MODE ON";
-            let label_w = label.chars().count();
-            let line = if width <= label_w {
-                label.chars().take(width).collect::<String>()
-            } else {
-                let pad = width - label_w;
-                let left = 1;
-                let right = pad - left;
-                format!("{}{}{}", " ".repeat(left), label, " ".repeat(right))
-            };
-            Paragraph::new(Line::from(Span::styled(line, style))).render(area, buf);
+        if !matches!(self.zen_mode, ZenModeState::On) {
             return;
         }
-
-        let inner = area.inner(Margin {
-            horizontal: 1,
-            vertical: 0,
-        });
-        let Some(glyph) = chrome.zen_glyph else {
-            return;
+        let style = Style::default()
+            .bg(ZEN_BAND_BG)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD);
+        let width = area.width as usize;
+        let label = "ZEN MODE ON";
+        let label_w = label.chars().count();
+        let line = if width <= label_w {
+            label.chars().take(width).collect::<String>()
+        } else {
+            let pad = width - label_w;
+            let left = 1;
+            let right = pad - left;
+            format!("{}{}{}", " ".repeat(left), label, " ".repeat(right))
         };
-        Paragraph::new(Line::from(Span::styled(
-            format!("{glyph} Zen mode"),
-            Style::default().fg(Color::DarkGray),
-        )))
-        .render(inner, buf);
+        Paragraph::new(Line::from(Span::styled(line, style))).render(area, buf);
     }
 }
 
 /// The sidebar's derived sub-rects (see [`SidebarView::geometry`]).
 struct SidebarGeometry {
+    header: Rect,
+    search: Option<Rect>,
     nav: Rect,
     rest: Option<Rect>,
     footer: Rect,
 }
 
-/// 1-col horizontal padding shared by the title, the nav labels, and the
-/// rest-of-list rows. The nav section's full-width fill deliberately bypasses
-/// it while its label text re-applies it.
+/// Height of the header block: project title (row 0), a blank (row 1), the
+/// search box (row 2), and a blank (row 3).
+const HEADER_H: u16 = 4;
+
+/// 1-col horizontal padding shared by the title, the search box, the nav
+/// labels, and the rest-of-list rows. The nav section's full-width fill
+/// deliberately bypasses it while its label text re-applies it.
 const LIST_INDENT: Margin = Margin {
     horizontal: 1,
     vertical: 0,
@@ -805,7 +831,11 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
                 format!("{} ", dec.glyph),
                 Style::default().fg(decoration_to_color(dec.color)),
             );
-            let title_span = Span::styled(title.clone(), name_style(selected, focused));
+            // Badge is one glyph plus a trailing space; keep the title within the
+            // remaining width so a long title clips with `…` rather than
+            // overflowing. A right-aligned location then drops before the title.
+            let title_text = truncate_ellipsis(title, width.saturating_sub(2));
+            let title_span = Span::styled(title_text, name_style(selected, focused));
             let line1 = match location {
                 Some(loc) => right_align(
                     vec![badge, title_span],
@@ -821,7 +851,16 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let line2 = Line::from(Span::styled(format!("  {branch}"), branch_style));
+            // Branch line: a 2-col indent, the `⎇` glyph, then the branch
+            // truncated with `…` to fit (matching the Figma review row).
+            const BRANCH_INDENT: &str = "  ";
+            const BRANCH_MARKER: &str = "⎇ ";
+            let avail = width.saturating_sub(BRANCH_INDENT.len() + BRANCH_MARKER.chars().count());
+            let branch_text = truncate_ellipsis(branch, avail);
+            let line2 = Line::from(Span::styled(
+                format!("{BRANCH_INDENT}{BRANCH_MARKER}{branch_text}"),
+                branch_style,
+            ));
             ListItem::new(vec![Line::from(line1), line2])
         }
     }
@@ -869,6 +908,68 @@ fn title_case(s: &str) -> String {
     match chars.next() {
         Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
+    }
+}
+
+/// Truncate `s` to at most `max` columns (by char count), appending `…` when it
+/// would overflow. `max == 0` yields an empty string; `max == 1` yields `…`.
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+    let keep: String = s.chars().take(max - 1).collect();
+    format!("{keep}…")
+}
+
+/// Draw the search box: a full-width filled bar with a `🔍 Search` label on the
+/// left and a right-aligned palette-chord hint (e.g. `⌃P`). The whole box is
+/// painted with the search background first so the fill is solid regardless of
+/// how wide the emoji renders; the chord is dropped when there isn't room.
+fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = area.width as usize;
+    let label = " 🔍 Search";
+    let label_w = label.chars().count();
+    let chord_hint = if chord.is_empty() {
+        String::new()
+    } else {
+        format!("{chord} ")
+    };
+    let chord_w = chord_hint.chars().count();
+
+    let mut spans = vec![Span::styled(
+        label.to_string(),
+        Style::default().fg(Color::Gray).bg(SEARCH_BG),
+    )];
+    // Append the chord hint only when the label and it both fit.
+    if chord_w > 0 && label_w + chord_w < width {
+        let pad = width - label_w - chord_w;
+        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(SEARCH_BG)));
+        spans.push(Span::styled(
+            chord_hint,
+            Style::default().fg(Color::DarkGray).bg(SEARCH_BG),
+        ));
+    }
+    let row = Rect {
+        height: 1,
+        ..area
+    };
+    Paragraph::new(Line::from(spans)).render(row, buf);
+    // Re-fill the background last: a double-width glyph resets its trailing
+    // continuation cell when the text is laid down, so paint over every cell to
+    // keep the box a solid bar. Setting bg leaves the symbols and fg intact.
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            buf[(x, y)].set_bg(SEARCH_BG);
+        }
     }
 }
 
@@ -1072,25 +1173,21 @@ mod tests {
         }
     }
 
-    fn chrome(palette: Option<&str>, quit: Option<&str>, zen: ZenToggleChord) -> SidebarChrome {
+    fn chrome(palette: Option<&str>) -> SidebarChrome {
         let mut keymaps = Keymaps::default();
         if let Some(c) = palette {
             keymaps
                 .global
                 .by_action
                 .insert(GlobalAction::OpenPalette, vec![KeyChord::parse(c).unwrap()]);
+        } else {
+            keymaps.global.by_action.remove(&GlobalAction::OpenPalette);
         }
-        if let Some(c) = quit {
-            keymaps
-                .sidebar
-                .by_action
-                .insert(SidebarAction::Quit, vec![KeyChord::parse(c).unwrap()]);
-        }
-        SidebarChrome::from_keymaps(&keymaps, DisplayStyle::detect(), zen)
+        SidebarChrome::from_keymaps(&keymaps, DisplayStyle::detect())
     }
 
     fn default_chrome() -> SidebarChrome {
-        chrome(Some("ctrl-p"), Some("q"), ZenToggleChord::AltZ)
+        chrome(Some("ctrl-p"))
     }
 
     /// Flatten a rendered sidebar into per-row strings.
@@ -1289,7 +1386,7 @@ mod tests {
     fn single_machine_skips_group_header_and_indent() {
         let mut model = empty_model();
         model.workspaces = vec![ws("alpha", "hub", Some("t-1"), Some("qa"), WorkspaceBadge::Working)];
-        let rows = render_rows(&model, 0, 28, 16);
+        let rows = render_rows(&model, 0, 28, 20);
         let joined = rows.join("\n");
 
         assert!(joined.contains("Workspaces"));
@@ -1371,29 +1468,122 @@ mod tests {
         );
     }
 
-    // --- footer -------------------------------------------------------------
-
+    /// The branch line carries the `⎇` marker and truncates a long branch with
+    /// `…` so it never overflows the sidebar width.
     #[test]
-    fn footer_renders_default_chords_per_platform() {
-        let rows = render_rows_with(&empty_model(), 0, true, &default_chrome(), 40, 16);
-        let joined = rows.join("\n");
-        let want = match DisplayStyle::detect() {
-            DisplayStyle::Mac => "⌃P palette  q quit",
-            DisplayStyle::Linux => "Ctrl+P palette  q quit",
-        };
-        assert!(joined.contains(want), "expected {want:?} in:\n{joined}");
-    }
-
-    #[test]
-    fn footer_shows_unbound_for_missing_binding() {
-        let c = chrome(None, None, ZenToggleChord::AltZ);
-        let rows = render_rows_with(&empty_model(), 0, true, &c, 40, 16);
-        let joined = rows.join("\n");
+    fn review_branch_line_shows_marker_and_truncates() {
+        let mut model = empty_model();
+        model.reviews = vec![review(
+            "wh",
+            "Validate webhook payloads",
+            "shelbi/validate-webhook-payloads-and-signatures",
+            None,
+            ReviewState::Pending,
+        )];
+        let rows = render_rows(&model, 0, 26, 22);
+        // The title row carries "Validate webhook" (capital V); the branch line
+        // is the lowercase slug below it.
+        let title_y = row_y(&rows, "Validate webhook");
+        let branch_line = &rows[title_y + 1];
+        assert!(branch_line.contains('⎇'), "branch line carries the ⎇ marker, got: {branch_line:?}");
+        assert!(branch_line.contains('…'), "a too-long branch truncates with …, got: {branch_line:?}");
         assert!(
-            joined.contains("<unbound> palette  <unbound> quit"),
-            "expected <unbound> markers in:\n{joined}"
+            branch_line.contains("shelbi/validate"),
+            "the branch prefix is still visible, got: {branch_line:?}"
         );
     }
+
+    /// A flat (single-machine) layout: the busy row shows the green `⏵` glyph and
+    /// a right-aligned agent name; the idle row shows the dim `·` and `idle`.
+    #[test]
+    fn workspace_rows_show_busy_and_idle_glyphs_with_right_label() {
+        let mut model = empty_model();
+        model.workspaces = vec![
+            ws("alpha", "hub", Some("t-1"), Some("developer"), WorkspaceBadge::Working),
+            ws("charlie", "hub", None, None, WorkspaceBadge::Idle),
+        ];
+        let view = SidebarView::build(&model);
+        let backend = TestBackend::new(30, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            view.render(f.buffer_mut(), area, 0, true, &default_chrome())
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term);
+
+        let alpha_y = row_y(&rows, "alpha");
+        assert!(rows[alpha_y].contains('⏵'), "busy row carries the ⏵ glyph, got: {:?}", rows[alpha_y]);
+        assert!(rows[alpha_y].contains("Developer"), "busy row right-aligns the agent, got: {:?}", rows[alpha_y]);
+        let glyph_x = rows[alpha_y].find('⏵').unwrap() as u16;
+        assert_eq!(buf[(glyph_x, alpha_y as u16)].fg, Color::Green, "busy glyph is green");
+
+        let charlie_y = row_y(&rows, "charlie");
+        assert!(rows[charlie_y].contains('·'), "idle row carries the · glyph, got: {:?}", rows[charlie_y]);
+        assert!(rows[charlie_y].contains("idle"), "idle row shows the idle placeholder, got: {:?}", rows[charlie_y]);
+    }
+
+    // --- header / search ----------------------------------------------------
+
+    /// The header renders the project name in the accent cyan and a filled
+    /// search box carrying `🔍 Search` and the resolved palette chord.
+    #[test]
+    fn header_renders_project_title_and_search_box() {
+        let mut model = empty_model();
+        model.project_label = "My project".into();
+        let view = SidebarView::build(&model);
+        let backend = TestBackend::new(40, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            view.render(f.buffer_mut(), area, 0, true, &default_chrome())
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term);
+        let joined = rows.join("\n");
+
+        // Title on the first row, in cyan bold.
+        let title_y = row_y(&rows, "My project");
+        assert_eq!(title_y, 0, "project title is the first row, got:\n{joined}");
+        let title_x = rows[title_y].find('M').unwrap() as u16;
+        assert_eq!(buf[(title_x, title_y as u16)].fg, Color::Cyan, "title is cyan");
+
+        // Search box with the magnifier, label, and the mac/linux palette chord.
+        let search_y = row_y(&rows, "Search");
+        let want_chord = match DisplayStyle::detect() {
+            DisplayStyle::Mac => "⌃P",
+            DisplayStyle::Linux => "Ctrl+P",
+        };
+        assert!(rows[search_y].contains('🔍'), "search box shows the magnifier, got: {:?}", rows[search_y]);
+        assert!(rows[search_y].contains(want_chord), "search box shows the palette chord {want_chord:?}, got: {:?}", rows[search_y]);
+        // The box is a solid fill across the row. The magnifier is double-width,
+        // so the single column after it is a wide-char continuation the
+        // TestBackend never flushes (the emoji covers it on a real terminal);
+        // assert the leading gutter cell and the whole single-width region past
+        // the emoji, which proves the bar spans the full box width.
+        let sy = search_y as u16;
+        assert_eq!(buf[(1, sy)].bg, SEARCH_BG, "search box fills the leading cell");
+        for x in 5..39u16 {
+            assert_eq!(buf[(x, sy)].bg, SEARCH_BG, "search box fills its row, col {x}");
+        }
+    }
+
+    /// With no palette chord bound the search box falls back to the `<unbound>`
+    /// marker rather than a key hint.
+    #[test]
+    fn search_box_shows_unbound_when_palette_unbound() {
+        let rows = render_rows_with(&empty_model(), 0, true, &chrome(None), 40, 20);
+        let search_y = row_y(&rows, "Search");
+        assert!(
+            rows[search_y].contains("<unbound>"),
+            "search box shows <unbound> when no palette chord is bound, got: {:?}",
+            rows[search_y]
+        );
+    }
+
+    // --- footer -------------------------------------------------------------
 
     #[test]
     fn first_run_hint_wraps_without_clipping_at_sidebar_max_width() {
@@ -1417,59 +1607,60 @@ mod tests {
     #[test]
     fn zen_row_renders_full_width_band_when_on() {
         let mut model = empty_model();
+        model.daemon_version_line = Some("daemon 0.9.0 · cli 0.9.0".into());
         model.zen_mode = ZenModeState::On;
         let rows = render_rows_with(&model, 0, true, &default_chrome(), 24, 16);
         let joined = rows.join("\n");
         assert!(joined.contains("ZEN MODE ON"), "expected ZEN MODE ON in:\n{joined}");
         assert!(!joined.contains("┌─") && !joined.contains("└─"), "no border chrome, got:\n{joined}");
-        let keybind_y = row_y(&rows, "palette");
+        // The band is the bottom row, full width, with one blank spacer row
+        // between it and the version line above.
+        let version_y = row_y(&rows, "daemon 0.9.0");
         let zen_y = row_y(&rows, "ZEN MODE ON");
-        assert_eq!(zen_y, keybind_y + 2, "one blank row between keybinds and zen, got:\n{joined}");
+        assert_eq!(zen_y, version_y + 2, "one blank row between version and zen, got:\n{joined}");
+        assert_eq!(zen_y, rows.len() - 1, "the zen band is the bottom row, got:\n{joined}");
+        assert!(
+            rows[zen_y - 1].trim().is_empty(),
+            "a blank spacer sits above the band, got: {:?}",
+            rows[zen_y - 1]
+        );
         assert_eq!(rows[zen_y].chars().count(), 24, "zen row spans full width, got: {:?}", rows[zen_y]);
     }
 
+    /// Off: no band and — unlike the old sidebar — no `Zen mode` hint line.
     #[test]
-    fn zen_row_renders_hotkey_hint_when_off() {
+    fn zen_off_shows_no_band_and_no_hint() {
         let mut model = empty_model();
         model.zen_mode = ZenModeState::Off;
-        let c = chrome(Some("ctrl-p"), Some("q"), ZenToggleChord::AltZ);
-        let rows = render_rows_with(&model, 0, true, &c, 24, 16);
+        let rows = render_rows_with(&model, 0, true, &default_chrome(), 24, 16);
         let joined = rows.join("\n");
         assert!(!joined.contains("ZEN MODE ON"), "no band when off, got:\n{joined}");
-        assert!(joined.contains("⌥Z Zen mode"), "expected hotkey hint, got:\n{joined}");
+        assert!(!joined.contains("Zen mode"), "no hotkey hint line, got:\n{joined}");
     }
 
     #[test]
-    fn paused_shows_hotkey_hint_not_green_band() {
+    fn paused_shows_no_band() {
         let mut model = empty_model();
         model.zen_mode = ZenModeState::Paused;
         let rows = render_rows_with(&model, 0, true, &default_chrome(), 24, 16);
         let joined = rows.join("\n");
         assert!(!joined.contains("ZEN MODE ON"), "paused shows no band, got:\n{joined}");
-        assert!(joined.contains("⌥Z Zen mode"), "paused still shows the hint, got:\n{joined}");
+        assert!(!joined.contains("Zen mode"), "paused shows no hint, got:\n{joined}");
     }
 
     #[test]
-    fn no_hint_when_chord_is_none() {
-        let mut model = empty_model();
-        model.zen_mode = ZenModeState::Off;
-        let c = chrome(Some("ctrl-p"), Some("q"), ZenToggleChord::None);
-        let rows = render_rows_with(&model, 0, true, &c, 24, 16);
-        assert!(!rows.join("\n").contains("Zen mode"), "no hint when no chord bound");
-    }
-
-    #[test]
-    fn keybind_line_stays_put_across_zen_toggle() {
+    fn version_line_stays_put_across_zen_toggle() {
         let mut off = empty_model();
+        off.daemon_version_line = Some("daemon 0.9.0 · cli 0.9.0".into());
         off.zen_mode = ZenModeState::Off;
         let off_rows = render_rows_with(&off, 0, true, &default_chrome(), 24, 16);
-        let mut on = empty_model();
+        let mut on = off.clone();
         on.zen_mode = ZenModeState::On;
         let on_rows = render_rows_with(&on, 0, true, &default_chrome(), 24, 16);
         assert_eq!(
-            row_y(&off_rows, "palette"),
-            row_y(&on_rows, "palette"),
-            "keybind line must not move when toggling Zen"
+            row_y(&off_rows, "daemon 0.9.0"),
+            row_y(&on_rows, "daemon 0.9.0"),
+            "version line must not move when toggling Zen"
         );
     }
 
@@ -1592,3 +1783,6 @@ mod tests {
         view.render(&mut buf, area, 0, true, &default_chrome()); // must not panic
     }
 }
+
+
+
