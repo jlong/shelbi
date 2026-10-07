@@ -1545,6 +1545,16 @@ fn poll_one(
         return;
     };
 
+    // Reap any "alive but not listening" zombie session left beside this slot's
+    // live session — a predecessor whose listener died but whose process (and
+    // lock) lingers, so discovery keeps offering it beside its replacement. Left
+    // around it is an attach a client can land on and fail
+    // (`rt-re-entering-a-review-fails-to-attach`). Done up front, before the
+    // review-slot short-circuit below, so it covers review agent slots too (the
+    // exact case in the bug); it only fires when a newer live sibling exists, so
+    // it never reaps the slot's one good session.
+    maybe_reap_zombie_sessions(project, workspace, &host, &addr);
+
     // Ready handoff is a file marker the workspace writes when it's done, read
     // independently of the pane title. We check it *before* the pane-title
     // state below (and unconditionally, even if the pane has since died or
@@ -4154,6 +4164,37 @@ fn review_slot_has_loaded_marker(
 /// relaunch + re-dispatch the same task (the card never leaves its active
 /// status), emit a `supervision=gave-up reason=crash-loop` line when the
 /// crash-loop cap trips, or do nothing.
+/// Reap any "alive but not listening" zombie session sharing this slot's name
+/// with a newer live sibling, logging one `supervision=reap-zombie` line per
+/// reaped session. Local panes only (a remote machine reaps its own). Runs every
+/// tick but is a no-op unless a real duplicate is present
+/// (`rt-re-entering-a-review-fails-to-attach`).
+fn maybe_reap_zombie_sessions(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    host: &shelbi_core::Host,
+    addr: &crate::session_backend::SessionTarget,
+) {
+    if !matches!(host, shelbi_core::Host::Local) {
+        return;
+    }
+    for short_id in backend().reap_zombie_duplicates(host, addr) {
+        if let Err(e) = shelbi_state::append_supervision_event(
+            &project.name,
+            Some(&workspace.name),
+            "reap-zombie",
+            &short_id,
+        ) {
+            tracing::warn!(workspace = %workspace.name, error = %e, "append_supervision_event failed");
+        }
+        tracing::info!(
+            workspace = %workspace.name,
+            session = %short_id,
+            "reaped an alive-but-not-listening zombie session beside its live replacement",
+        );
+    }
+}
+
 fn maybe_supervise_workspace(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,

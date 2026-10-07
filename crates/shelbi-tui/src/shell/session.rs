@@ -150,8 +150,14 @@ impl Connector for LiveConnector {
         let want = discovery_name(project, target);
         let sessions =
             shelbi_client::list(&root).map_err(|e| ConnectFailure::Message(e.to_string()))?;
-        let sess = match sessions.iter().find(|s| s.meta.name == want && s.alive) {
-            Some(s) => s.clone(),
+        // Several sessions can share a name (a relaunch racing a not-yet-reaped
+        // predecessor, or a zombie lingering beside its replacement), so choose
+        // the *usable* one deliberately — lock held and socket accepting, newest
+        // first — rather than take whatever `list` returned first. Taking the
+        // first `alive` one could land on the zombie, whose socket refuses the
+        // connect (`rt-re-entering-a-review-fails-to-attach`).
+        let sess = match shelbi_client::choose_session(&sessions, &want) {
+            Some(s) => s,
             None => {
                 // No live session. If a *dead* one with this name left a
                 // `final.txt`, surface its last output line so the TUI explains
@@ -190,13 +196,24 @@ impl Connector for LiveConnector {
             Ok(ce) => ce,
             // The session dir (with `meta.json`) appears before its `sock` is
             // bound, so a connect in that window fails with ENOENT (socket file
-            // absent) or ECONNREFUSED (file there, not yet listening). Discovery
-            // already told us the session is alive, so this is "still starting",
-            // not a failure — signal a retry (`rt-tui-attach-retry-unbound-socket`).
+            // absent) or ECONNREFUSED (file there, not yet listening). A session
+            // whose listener died *after* accepting — the zombie we may still land
+            // on when a replacement is coming up — instead tears the connection
+            // mid-hello: ENOTCONN, EPIPE, or ECONNRESET. Discovery told us a
+            // session with this name is alive, so every one of these is "still
+            // starting / racing a relaunch", not a terminal failure — signal a
+            // retry so a usable session (or the reaped zombie's replacement) is
+            // picked up on the next attempt
+            // (`rt-tui-attach-retry-unbound-socket`,
+            // `rt-re-entering-a-review-fails-to-attach`).
             Err(ClientError::Io(e))
                 if matches!(
                     e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
                 ) =>
             {
                 return Err(ConnectFailure::Starting(starting_error(&want)));
@@ -1326,6 +1343,55 @@ mod tests {
                 Ok(_) => Err(ConnectFailure::Message("unexpected hello".into())),
                 Err(e) => Err(ConnectFailure::Message(e.to_string())),
             }
+        }
+    }
+
+    #[test]
+    fn live_connector_attaches_to_the_live_session_not_a_same_named_zombie() {
+        // Two sessions share the discovery name `ztest/ws/review`: a real live
+        // `cat` session, and an "alive but not listening" zombie (lock held, but
+        // its socket refuses every connect) that is even *newer*. The production
+        // `LiveConnector` must choose the live one — a successful attach proves it,
+        // since landing on the zombie would have failed the connect
+        // (`rt-re-entering-a-review-fails-to-attach`).
+        use shelbi_session::lock::SessionLock;
+        use std::os::unix::net::UnixListener;
+
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let (_live_sock, _cleanup) = spawn_cat_session(home.path(), "ztest/ws/review");
+
+        // A same-named zombie dir: a held lock (so discovery reports it alive), a
+        // far-future launch time (so a naive "prefer newest" would pick it), and a
+        // bound-then-dropped socket (so every connect is refused).
+        let zid = shelbi_session::layout::derive_id("ztest/ws/review", 999_999, 1);
+        let zdir = home.path().join("sessions").join(&zid);
+        std::fs::create_dir_all(&zdir).unwrap();
+        let zmeta = shelbi_session::Meta {
+            id: zid.clone(),
+            name: "ztest/ws/review".into(),
+            argv: vec!["cat".into()],
+            cwd: zdir.clone(),
+            task: None,
+            launched_at: "2999-01-01T00:00:00Z".into(),
+            protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            pid: 0,
+        };
+        std::fs::write(zdir.join("meta.json"), zmeta.to_json().unwrap()).unwrap();
+        let _zlock = SessionLock::acquire(&zdir.join("lock")).expect("hold the zombie's lock");
+        let zsock = zdir.join("sock");
+        let z = UnixListener::bind(&zsock).unwrap();
+        drop(z);
+        if !zsock.exists() {
+            return; // platform removed the socket file on drop; refusing case N/A
+        }
+
+        match LiveConnector.connect("ztest", &SessionRef::Workspace("review".into())) {
+            // We reached a live binding (info + attach succeeded against the cat).
+            Ok(connected) => assert!(connected.size.cols >= 1),
+            Err(_) => panic!("the connector must attach to the live session, not the zombie"),
         }
     }
 
