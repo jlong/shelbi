@@ -465,6 +465,105 @@ pub fn probe_review_slot_serving(
     }
 }
 
+/// Whether the task's resolved workflow declares a review server with a
+/// `ready:` health check — the signal the poller probes (see
+/// [`probe_review_slot_serving`]) to confirm the branch is actually serving.
+///
+/// `true` only when a `review:` block declares a `ready:` probe. `false` for a
+/// diff-only review (no `review:` block at all) **or** a `review:` block with no
+/// `ready:` probe: in either case there is no server health check to wait on, so
+/// a live review-agent session is itself the "serving" signal rather than a
+/// precondition the slot sits in **Loading** forever waiting for. A failure to
+/// load the task or its workflow degrades to `false` (no health check to wait
+/// on) rather than propagating.
+pub fn review_workflow_has_health_check(project: &Project, task_id: &str) -> bool {
+    let Ok(Some(tf)) = shelbi_state::issue_store_for_project(project)
+        .and_then(|store| store.get(task_id))
+    else {
+        return false;
+    };
+    let Ok(workflow) = shelbi_state::load_task_workflow(&project.name, project, &tf.task) else {
+        return false;
+    };
+    workflow_declares_health_check(&workflow)
+}
+
+/// Pure half of [`review_workflow_has_health_check`]: a workflow declares a
+/// health check exactly when its `review:` block carries a `ready:` probe. The
+/// serve command alone is not a health check — there is nothing to poll — so a
+/// `review:` block without `ready:` reads the same as no block at all.
+pub fn workflow_declares_health_check(workflow: &shelbi_core::Workflow) -> bool {
+    workflow
+        .review
+        .as_ref()
+        .and_then(|r| r.ready.as_ref())
+        .is_some()
+}
+
+/// Pure decision: does a review slot read as **serving** (Ready for Review, ✓)?
+///
+/// Two independent signals satisfy it, so this is an `||`:
+///
+/// - `marker_names_task` — the durable `.claude/shelbi-review-loaded` marker
+///   names this task. The poller writes it once a declared server's `ready:`
+///   probe passes (or the agent writes it itself), so this is the "server is
+///   confirmed up" path.
+/// - a **URL-less review** — the workflow declares no health-checkable server
+///   (`!declares_health_check`) and the slot's review-agent session is live
+///   (`session_alive`). A review with nothing to probe (a diff-only or
+///   ContextStore-style review) has no server to wait on, so the live agent
+///   *is* the serving signal.
+///
+/// A review that *does* declare a health check stays **Loading** (this returns
+/// `false`) until its marker lands — i.e. it keeps waiting for the server's
+/// health check, never promoting on liveness alone.
+pub fn review_slot_serving(
+    marker_names_task: bool,
+    declares_health_check: bool,
+    session_alive: bool,
+) -> bool {
+    marker_names_task || (!declares_health_check && session_alive)
+}
+
+/// Whether `task_id`'s review slot reads as serving, wiring the two signals
+/// [`review_slot_serving`] combines: the `.claude/shelbi-review-loaded` marker
+/// (read off the slot's worktree) and — for a URL-less review — a live
+/// review-agent session. A mis-configured machine reads as "not serving".
+///
+/// Used by the sidebar so a live, URL-less review promotes to **Ready for
+/// Review** immediately, without waiting for the poll tick that writes its
+/// marker. Under-claiming ready (the task shows Loading a beat longer) is the
+/// conservative failure, so any probe error degrades to "not serving".
+pub fn review_slot_is_serving(
+    project: &Project,
+    workspace: &WorkspaceSpec,
+    task_id: &str,
+) -> bool {
+    let Some(machine) = project.machine(&workspace.machine) else {
+        return false;
+    };
+    let host = machine.host();
+    let marker = workspace_review_loaded_marker(machine, workspace);
+    let marker_names_task = matches!(
+        read_review_loaded_marker(&host, &marker),
+        Ok(Some(marked)) if marked == task_id
+    );
+    // Short-circuit before the (more expensive) liveness probe: a marker hit is
+    // authoritative on its own, and a review that declares a health check never
+    // promotes on liveness, so neither needs the session probe.
+    if marker_names_task {
+        return true;
+    }
+    if review_workflow_has_health_check(project, task_id) {
+        return false;
+    }
+    let session_alive = workspace_target(project, workspace)
+        .ok()
+        .map(|target| workspace_pane_alive(&host, &target).unwrap_or(false))
+        .unwrap_or(false);
+    review_slot_serving(false, false, session_alive)
+}
+
 /// Run a single review `ready:` probe on `host`, `cd`-ing into the review
 /// worktree (then the recipe `workdir`, if any) and exporting the same
 /// `SLOT`/`PORT`/`SHELBI_*` env the serve recipe was rendered against. Returns
@@ -7864,6 +7963,76 @@ transitions:
         clear_review_loaded_marker(&Host::Local, &marker).unwrap();
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn review_slot_serving_promotes_a_live_url_less_review() {
+        // A review whose workflow declares no health-checkable server (no
+        // `ready:` probe) has nothing to probe, so a live review-agent session
+        // is itself the serving signal — it reads ✓ Ready for Review even with
+        // no marker yet. This is the ContextStore-style review in the bug.
+        assert!(
+            review_slot_serving(false, false, true),
+            "live + no health check + no marker → serving"
+        );
+        // Session not up yet (still starting) → not serving (shows Loading).
+        assert!(
+            !review_slot_serving(false, false, false),
+            "no health check but session not live yet → loading"
+        );
+    }
+
+    #[test]
+    fn review_slot_serving_keeps_a_health_checked_review_loading_until_its_marker() {
+        // A review that DOES declare a server with a `ready:` health check never
+        // promotes on liveness alone: it keeps waiting for the server's health
+        // check, which lands as the marker. So a live agent whose server isn't
+        // up yet (no marker) still reads Loading.
+        assert!(
+            !review_slot_serving(false, true, true),
+            "health-checked + live but no marker → still loading (server not up)"
+        );
+        // Once the probe passes the poller writes the marker — now serving.
+        assert!(
+            review_slot_serving(true, true, true),
+            "marker present → serving regardless of health-check gating"
+        );
+    }
+
+    #[test]
+    fn workflow_declares_health_check_only_with_a_ready_probe() {
+        let base = "\
+name: wf
+statuses:
+  - { id: review, name: Review, category: handoff, owner: user }
+";
+        // A `review:` block with a `ready:` probe → there IS a server to poll.
+        let with_probe = shelbi_core::Workflow::from_yaml_str(&format!(
+            "{base}review:\n  serve: npm run dev -- -p $SLOT\n  ready: curl -sf http://localhost:$SLOT\n  url: http://localhost:$SLOT\n"
+        ))
+        .unwrap();
+        assert!(workflow_declares_health_check(&with_probe));
+
+        // A serve command with no `ready:` probe is not a health check — there
+        // is nothing to poll, so a live agent is the serving signal.
+        let serve_only = shelbi_core::Workflow::from_yaml_str(&format!(
+            "{base}review:\n  serve: npm run dev -- -p $SLOT\n"
+        ))
+        .unwrap();
+        assert!(!workflow_declares_health_check(&serve_only));
+
+        // No `review:` block at all (a diff-only / URL-less review).
+        let no_block = shelbi_core::Workflow::from_yaml_str(base).unwrap();
+        assert!(!workflow_declares_health_check(&no_block));
+    }
+
+    #[test]
+    fn review_slot_serving_honours_the_marker_for_every_review_shape() {
+        // The durable marker is authoritative on its own: a diff-only review
+        // whose agent wrote the marker reads serving even if we can't see a live
+        // session this instant.
+        assert!(review_slot_serving(true, false, false));
+        assert!(review_slot_serving(true, true, false));
     }
 
     #[test]

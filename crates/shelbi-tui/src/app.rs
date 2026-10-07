@@ -1270,7 +1270,7 @@ impl Row {
                 color: DecorationColor::Default,
             }),
             Row::Workspace { badge, .. } => Some(badge.decoration()),
-            // Serving → cyan ✓ (server up, human can look); Loading → yellow ▶
+            // Serving → cyan ✓ (server up, human can look); Loading → muted ▶
             // (assigned, server still coming up); Pending → dim · (waiting for
             // a review slot). `▶` (U+25B6) is free to use here — the "active
             // workspace" Working badge is a *different* glyph, `⏵` (U+23F5) —
@@ -1283,7 +1283,9 @@ impl Row {
                 },
                 ReviewState::Loading => Decoration {
                     glyph: "▶".into(),
-                    color: DecorationColor::Yellow,
+                    // Muted `#7a7a7a`, not yellow: a still-starting review reads
+                    // as quiet chrome, not an alert (matches the shell sidebar).
+                    color: DecorationColor::Muted,
                 },
                 ReviewState::Pending => Decoration {
                     glyph: "·".into(),
@@ -1538,25 +1540,21 @@ fn split_review_sections(
     (ready, queued)
 }
 
-/// Whether `task_id`'s review slot is confirmed serving: its
-/// `.claude/shelbi-review-loaded` marker exists and names this task. A missing
-/// marker, a marker naming a different task (slot reused before the new server
-/// came up), a mis-configured machine, or a read error all read as "not serving
-/// yet" — the conservative call, since under-claiming ready (task shows Loading)
-/// is strictly safer than pointing a human at a dead server.
+/// Whether `task_id`'s review slot is confirmed serving. Delegates to the shared
+/// [`shelbi_orchestrator::workspace::review_slot_is_serving`] so this legacy
+/// sidebar and the shell's `SidebarModel` can't drift on the rule: the
+/// `.claude/shelbi-review-loaded` marker names this task, **or** the workflow
+/// declares no health-checkable server and the review-agent session is live (a
+/// URL-less review has no server to probe). A missing/stale marker, a
+/// mis-configured machine, or a read error all read as "not serving yet" — the
+/// conservative call, since under-claiming ready is safer than pointing a human
+/// at a dead server.
 fn review_workspace_is_serving(
     project: &shelbi_core::Project,
     workspace: &shelbi_core::WorkspaceSpec,
     task_id: &str,
 ) -> bool {
-    let Some(machine) = project.machine(&workspace.machine) else {
-        return false;
-    };
-    let marker = shelbi_orchestrator::workspace::workspace_review_loaded_marker(machine, workspace);
-    matches!(
-        shelbi_orchestrator::workspace::read_review_loaded_marker(&machine.host(), &marker),
-        Ok(Some(marked)) if marked == task_id
-    )
+    shelbi_orchestrator::workspace::review_slot_is_serving(project, workspace, task_id)
 }
 
 /// Build the sidebar's view of declared workspaces from the project YAML and
@@ -2821,7 +2819,7 @@ mod tests {
             ready_hdr < loading_y && loading_y < queued_hdr,
             "loading row is under the Ready header, not Queued"
         );
-        // The serving row paints a cyan ✓; the loading row a yellow ▶ (no ✓);
+        // The serving row paints a cyan ✓; the loading row a muted ▶ (no ✓);
         // the pending row a dim ·.
         let serving_dec = serving_row.decoration().unwrap();
         assert_eq!(serving_dec.glyph, "✓");
@@ -2835,7 +2833,11 @@ mod tests {
         let loading_dec = loading_row.decoration().unwrap();
         assert_ne!(loading_dec.glyph, "✓", "a loading row never shows the ✓");
         assert_eq!(loading_dec.glyph, "▶", "loading row uses the play triangle");
-        assert_eq!(loading_dec.color, shelbi_palette::DecorationColor::Yellow);
+        assert_eq!(
+            loading_dec.color,
+            shelbi_palette::DecorationColor::Muted,
+            "a still-loading review uses the muted tint, never alert-yellow"
+        );
 
         let pending_row = rows
             .iter()
@@ -4148,7 +4150,7 @@ mod tests {
         assert_eq!(d.glyph, "✓");
         assert_eq!(d.color, DecorationColor::Cyan);
 
-        // Loading (assigned, server still coming up) → yellow ▶.
+        // Loading (assigned, server still coming up) → muted ▶.
         let loading = Row::Review {
             title: "Homepage nav".into(),
             branch: "shelbi/nav".into(),
@@ -4158,7 +4160,7 @@ mod tests {
         };
         let d = loading.decoration().unwrap();
         assert_eq!(d.glyph, "▶");
-        assert_eq!(d.color, DecorationColor::Yellow);
+        assert_eq!(d.color, DecorationColor::Muted);
 
         // Pending (waiting for a review slot) → dim ·.
         let queued = Row::Review {

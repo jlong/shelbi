@@ -5219,8 +5219,12 @@ fn resume_dev_workspace(
 ///   **Ready for Review**, deterministically) and record the `serving`
 ///   sub-state (so `shelbi workspace status` no longer reads "hasn't been
 ///   polled"). Authoritative.
-/// - **Issue assigned + probe not yet passing** (booting, or a diff-only review
-///   with no probe) → not authoritative; fall through to observe the pane.
+/// - **Issue assigned + probe not yet passing, workflow declares a health
+///   check** (the server is still booting) → not authoritative; fall through to
+///   observe the pane.
+/// - **Issue assigned + workflow declares no health check + agent session live**
+///   (a diff-only or URL-less review — nothing to probe) → the live agent is the
+///   serving signal: write the marker and record `serving`. Authoritative.
 /// - **No review task assigned** → the slot's task is resolved; reap any
 ///   orphaned server it left listening (see [`maybe_reap_orphaned_review_slot`]).
 fn handle_review_slot(
@@ -5250,10 +5254,34 @@ fn handle_review_slot(
                     );
                     true
                 }
-                // Not confirmed serving yet (still booting, or a diff-only
-                // review with no probe). Leave the marker to the agent and let
-                // the caller observe the pane's own loading/blocked state.
-                None => false,
+                // The `ready:` probe couldn't confirm serving this tick. Split
+                // the two reasons:
+                //
+                // - The workflow declares a health-checkable server but it isn't
+                //   up yet (still booting): leave the marker to the probe and let
+                //   the caller observe the pane's own loading/blocked state.
+                // - The workflow declares no health check at all (a diff-only or
+                //   URL-less review — e.g. ContextStore's): there is no server to
+                //   wait on, so a live review-agent session is itself the serving
+                //   signal. Write the marker (id alone, no URL) and record the
+                //   `serving` sub-state so the slot stops reading "Loading"
+                //   forever. Without this a fully working URL-less review sits
+                //   under Ready for Review with a perpetual loading glyph.
+                None => {
+                    let no_health_check = !crate::workspace::review_workflow_has_health_check(
+                        project, &task_id,
+                    );
+                    let alive = crate::workspace::workspace_pane_alive(host, addr)
+                        .unwrap_or(false);
+                    if no_health_check && alive {
+                        ensure_review_marker_and_serving_state(
+                            project, workspace, host, &marker, &task_id, None, last_known,
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                }
             }
         }
         AssignedReviewTask::None => {

@@ -28,6 +28,7 @@ pub fn decoration_to_color(c: DecorationColor) -> Color {
         DecorationColor::Default => Color::Reset,
         DecorationColor::Gray => Color::Gray,
         DecorationColor::DarkGray => Color::DarkGray,
+        DecorationColor::Muted => crate::theme::PALETTE_MUTED,
         DecorationColor::Green => Color::Green,
         DecorationColor::Yellow => Color::Yellow,
         DecorationColor::Red => Color::Red,

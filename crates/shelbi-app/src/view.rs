@@ -184,7 +184,10 @@ impl ReviewState {
             },
             ReviewState::Loading => Decoration {
                 glyph: "▶".into(),
-                color: DecorationColor::Yellow,
+                // Muted `#7a7a7a`, not yellow: a still-starting review is quiet
+                // chrome, not an alert. A loading glyph only shows while the
+                // review session is actually coming up.
+                color: DecorationColor::Muted,
             },
             ReviewState::Pending => Decoration {
                 glyph: "·".into(),
@@ -829,5 +832,33 @@ mod tests {
         assert_eq!(model.entries.len(), 2);
         assert_eq!(model.unread, 1);
         assert_eq!(model.entries[0].source.as_deref(), Some("kanban"));
+    }
+
+    #[test]
+    fn serving_review_badge_is_cyan_check() {
+        // A live, URL-less review resolves to Serving (see
+        // `shelbi_orchestrator::workspace::review_slot_serving`), and Serving
+        // must read as a cyan ✓ — the "ready for review" mark.
+        let dec = ReviewState::Serving.decoration();
+        assert_eq!(dec.glyph, "✓");
+        assert_eq!(dec.color, DecorationColor::Cyan);
+    }
+
+    #[test]
+    fn loading_review_badge_is_muted_not_yellow() {
+        // A review whose declared server isn't up yet stays Loading, and its ▶
+        // must render in the design's muted tint (`#7a7a7a` via
+        // `DecorationColor::Muted`), never the old alert-yellow.
+        let dec = ReviewState::Loading.decoration();
+        assert_eq!(dec.glyph, "▶");
+        assert_eq!(dec.color, DecorationColor::Muted);
+        assert_ne!(dec.color, DecorationColor::Yellow);
+    }
+
+    #[test]
+    fn pending_review_badge_is_muted_dot() {
+        let dec = ReviewState::Pending.decoration();
+        assert_eq!(dec.glyph, "·");
+        assert_eq!(dec.color, DecorationColor::DarkGray);
     }
 }
