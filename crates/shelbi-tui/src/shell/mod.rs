@@ -2717,12 +2717,17 @@ fn render_divider(buf: &mut ratatui::buffer::Buffer, sidebar_rect: Rect, active:
         return;
     }
     let x = sidebar_rect.right().saturating_sub(1);
+    // Keep the divider column on the sidebar's black background so the thin
+    // `▏` rule blends with the painted sidebar rather than the terminal default.
     let style = if active {
         Style::default()
             .fg(crate::theme::DIVIDER_ACTIVE)
+            .bg(crate::theme::BACKGROUND)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(crate::theme::DIVIDER_DIM)
+        Style::default()
+            .fg(crate::theme::DIVIDER_DIM)
+            .bg(crate::theme::BACKGROUND)
     };
     for y in sidebar_rect.top()..sidebar_rect.bottom() {
         if let Some(cell) = buf.cell_mut((x, y)) {
@@ -3578,16 +3583,17 @@ mod tests {
 
     #[test]
     fn a_click_on_the_search_box_opens_the_palette() {
-        // The search box sits on the third header row; clicking it opens the
-        // command palette, the same as the palette chord.
+        // The search box sits on header rows 3–5; clicking it opens the command
+        // palette, the same as the palette chord.
         let mut st = test_state();
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.main_rect = Rect::new(28, 0, 92, 20);
         st.show(RowTarget::Session(SessionRef::Orchestrator));
         assert!(st.overlay.is_none(), "no overlay before the click");
 
-        // Header layout: title (row 0), blank (row 1), search box (row 2).
-        st.handle_mouse(left_click(3, 2));
+        // Header layout: blank (row 0), title (row 1), blank (row 2), search
+        // box (rows 3–5).
+        st.handle_mouse(left_click(3, 4));
         assert!(
             matches!(st.overlay, Some(ActiveOverlay::Palette(_))),
             "clicking the search box opens the command palette"
@@ -3626,7 +3632,7 @@ mod tests {
         buf
     }
 
-    /// The line is a full-height `│` in the drag column (the sidebar's last
+    /// The line is a full-height `▏` in the drag column (the sidebar's last
     /// column, == `divider_col`) at two different sidebar widths.
     #[test]
     fn divider_line_fills_the_drag_column_at_two_widths() {
@@ -3639,7 +3645,7 @@ mod tests {
                 assert_eq!(
                     buf[(x, y)].symbol(),
                     crate::theme::DIVIDER_GLYPH,
-                    "width {width}: a `│` fills the drag column at row {y}"
+                    "width {width}: a `▏` fills the drag column at row {y}"
                 );
             }
         }
