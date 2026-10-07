@@ -884,10 +884,14 @@ impl ShellState {
         self.client.sidebar_width()
     }
 
-    /// Open a sidebar target: a session shows in the main area and takes focus;
-    /// a native view just swaps the main area (focus stays on the sidebar until
-    /// the user steps in with Ctrl+Space). Records the target as the current
-    /// project's remembered view (via [`ClientState::set_view`]) so a later
+    /// Open a sidebar target and move focus to the main area: a session attaches
+    /// in the main area, a native view swaps it, and a review builds its
+    /// interface there — every one of them takes main focus, so opening a row
+    /// (click, Space, or Enter) lands the user on what they opened regardless of
+    /// its kind. (Plain selection moves — arrows / j / k — never call this, so
+    /// they leave focus on the sidebar and the main view unchanged.) Records the
+    /// target as the current project's remembered view (via
+    /// [`ClientState::set_view`]) so a later
     /// [`switch_project`](Self::switch_project) back to this project restores it
     /// — the per-client last-view-per-project memory the plan wants.
     fn show(&mut self, target: RowTarget) {
@@ -927,6 +931,10 @@ impl ShellState {
                 self.review = None;
                 self.client.set_view(v.clone());
                 self.main_view = MainView::Native(v);
+                // Opening a native view takes main focus too, so the keyboard
+                // drives the board / feed / machines list immediately — the same
+                // as opening a session.
+                self.client.focus_main();
             }
             RowTarget::Review(id) => {
                 // Review has no `View` variant (it is a transient interface, not a
@@ -2019,10 +2027,16 @@ impl ShellState {
             .map(|v| v.selectable_count())
             .unwrap_or(0);
         match k.code {
-            KeyCode::Up => self.client.select_up(),
-            KeyCode::Down | KeyCode::Tab => self.client.select_down(count),
+            // Arrow keys and Vim j/k move the selection only — they never open
+            // the row or move focus to the main area (the main view stays put;
+            // it changes only on open, below).
+            KeyCode::Up | KeyCode::Char('k') => self.client.select_up(),
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => self.client.select_down(count),
             KeyCode::BackTab => self.client.select_up(),
-            KeyCode::Enter => self.activate_selection(),
+            // Space or Enter opens the selected row and moves focus to the main
+            // area (`activate_selection` → `show`, which focuses main for every
+            // row type).
+            KeyCode::Enter | KeyCode::Char(' ') => self.activate_selection(),
             // `q` closes the UI (the default quit): agents keep running and a
             // reopen reattaches. Quit-project / quit-Shelbi are the palette's
             // (Phase 4d) job, routed through [`ShellState::quit`].
@@ -3236,10 +3250,58 @@ mod tests {
         assert_eq!(st.selection(), 1, "Down → Issues");
         st.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(st.selection(), 2, "Tab → Activity");
-        // Enter on a native view swaps the main area and keeps sidebar focus.
+        // Enter opens the selected native view and moves focus to the main area.
         st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(st.main_view, MainView::Native(View::Activity)));
-        assert_eq!(st.client.focus(), Focus::Sidebar);
+        assert_eq!(st.client.focus(), Focus::Main);
+    }
+
+    #[test]
+    fn sidebar_j_and_k_move_the_selection_without_opening_or_focusing_main() {
+        // j/k mirror Down/Up: they move the selection only. Focus stays on the
+        // sidebar and the main view is untouched until the row is opened.
+        let mut st = test_state();
+        // Open Issues so there is a concrete main view to watch, then step back
+        // to the sidebar to navigate.
+        st.show(RowTarget::Native(View::Issues));
+        st.client.focus_sidebar();
+        assert_eq!(st.selection(), 0, "starts on Chat");
+        st.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(st.selection(), 1, "j → Issues");
+        st.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(st.selection(), 2, "j → Activity");
+        st.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(st.selection(), 1, "k → Issues");
+        assert_eq!(
+            st.client.focus(),
+            Focus::Sidebar,
+            "navigation keeps focus on the sidebar",
+        );
+        assert!(
+            matches!(st.main_view, MainView::Native(View::Issues)),
+            "navigation does not change what the main area shows",
+        );
+    }
+
+    #[test]
+    fn space_opens_the_selected_row_and_focuses_main() {
+        // Space is an open key, exactly like Enter: it opens the selected row
+        // and moves focus to the main area.
+        let mut st = test_state();
+        st.client.focus_sidebar();
+        st.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)); // Issues
+        st.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(matches!(st.main_view, MainView::Native(View::Issues)));
+        assert_eq!(st.client.focus(), Focus::Main, "Space opens and focuses main");
+
+        // Space on a session row attaches its session and also focuses main.
+        // Opening focused main, so step back to the sidebar to navigate.
+        st.client.focus_sidebar();
+        st.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // Activity
+        st.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // alpha
+        st.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(matches!(st.main_view, MainView::Session));
+        assert_eq!(st.client.focus(), Focus::Main);
     }
 
     #[test]
@@ -3255,6 +3317,9 @@ mod tests {
         assert!(matches!(st.main_view, MainView::Native(View::Issues)));
         assert_eq!(st.client.view(), &View::Issues, "the view is recorded for the project");
 
+        // Opening moved focus to the main area, so step back to the sidebar
+        // before navigating again (Ctrl+L→sidebar is the user's way back).
+        st.client.focus_sidebar();
         st.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // Activity
         st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(st.main_view, MainView::Native(View::Activity)));
@@ -3758,13 +3823,16 @@ mod tests {
             matches!(st.main_view, MainView::Native(View::Issues)),
             "the click opened the Issues view"
         );
-        // A native view keeps sidebar focus, exactly as Enter does.
-        assert_eq!(st.client.focus(), Focus::Sidebar);
+        // Clicking a row moves focus to the main area, for a native view the
+        // same as a session (so the click lands the user on what they opened).
+        assert_eq!(st.client.focus(), Focus::Main);
 
-        // Clicking Activity (y=11) switches the main area again.
+        // Clicking Activity (y=11) switches the main area again and keeps main
+        // focus.
         st.handle_mouse(left_click(2, 11));
         assert_eq!(st.selection(), 2, "selection moved to Activity");
         assert!(matches!(st.main_view, MainView::Native(View::Activity)));
+        assert_eq!(st.client.focus(), Focus::Main);
     }
 
     #[test]
@@ -3994,6 +4062,11 @@ mod tests {
         assert!(
             matches!(st.main_view, MainView::Session),
             "wheel scrolling opens nothing"
+        );
+        assert_eq!(
+            st.client.focus(),
+            Focus::Sidebar,
+            "wheel scrolling never moves focus to main",
         );
         st.handle_mouse(wheel(true, 2, 2)); // scroll up
         assert_eq!(st.selection(), 0, "wheel up moved the selection back");
