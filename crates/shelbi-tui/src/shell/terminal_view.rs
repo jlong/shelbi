@@ -44,6 +44,28 @@ pub enum MouseOutcome {
     Ignored,
 }
 
+/// Where a left-button gesture is in its lifecycle. A gesture's ownership is
+/// decided once, at press time: a plain press is *buffered* (we don't yet know
+/// whether it will become a click or a drag), the first motion turns it into a
+/// Shelbi selection, and a release with no motion is a click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragState {
+    /// No left button is down.
+    Idle,
+    /// Left is down at this viewer cell but has not moved yet — we don't know
+    /// whether it will become a click or a drag. The first motion makes it a
+    /// Shelbi selection anchored here; a release with no motion is a click.
+    /// `forward_click` records what that click does: forward a press+release to
+    /// the program (the program is reporting and nothing reclaimed the gesture)
+    /// or, when clear, just drop the stale highlight (a bare Shelbi click).
+    Pressed { col: u16, row: u16, forward_click: bool },
+    /// A Shelbi selection drag is underway.
+    Selecting,
+    /// The gesture belongs to the program (the Alt escape hatch): every event
+    /// is forwarded, press through release.
+    Program,
+}
+
 /// One session rendered into the main area.
 pub struct TerminalPane {
     view: TerminalView,
@@ -54,6 +76,8 @@ pub struct TerminalPane {
     pub bell: bool,
     /// Set once the session's child has exited.
     pub exited: Option<shelbi_proto::Exited>,
+    /// Lifecycle of the current left-button gesture (selection vs. click).
+    drag: DragState,
 }
 
 impl TerminalPane {
@@ -63,6 +87,7 @@ impl TerminalPane {
             session_size,
             bell: false,
             exited: None,
+            drag: DragState::Idle,
         }
     }
 
@@ -127,7 +152,23 @@ impl TerminalPane {
             return None;
         }
         self.view.on_user_input();
+        // A key sent to the session dismisses any lingering selection highlight
+        // (one of the three things that end it; the others are the next click
+        // and new output). Copy chords never reach here — the shell consumes
+        // them before forwarding (see `is_copy_key`).
+        self.view.clear_selection();
         Some(bytes)
+    }
+
+    /// The current non-empty selection as text, for an explicit copy (Cmd+C /
+    /// Ctrl+Shift+C). `None` when there is no selection, or it is empty (a bare
+    /// click), so the copy chord is a harmless no-op rather than clobbering the
+    /// clipboard with an empty string.
+    pub fn selection_copy(&self) -> Option<String> {
+        if self.view.selection().is_none_or(|s| s.is_empty()) {
+            return None;
+        }
+        self.view.selection_text().filter(|t| !t.is_empty())
     }
 
     pub fn encode_focus(&self, focused: bool) -> Option<Vec<u8>> {
@@ -179,59 +220,179 @@ impl TerminalPane {
         let reporting = mode.intersects(TermMode::MOUSE_MODE);
         let shift = m.modifiers.contains(KeyModifiers::SHIFT);
         let placement = viewport::fit(self.session_size, viewer);
-        match input::mouse_owner(reporting, shift) {
-            input::MouseOwner::Shelbi => self.shelbi_mouse(m, pane_col, pane_row, &placement),
-            input::MouseOwner::Program => {
-                let Some(ev) = map_mouse(m, pane_col, pane_row) else {
-                    return MouseOutcome::Ignored;
-                };
-                let modes = input::MouseModes {
-                    reporting,
-                    sgr: mode.contains(TermMode::SGR_MOUSE),
-                };
-                match input::encode_mouse(&ev, modes, &placement) {
-                    Some(bytes) => MouseOutcome::Forward(bytes),
-                    None => MouseOutcome::Ignored,
-                }
+        match m.kind {
+            // The left button is the selection/click gesture — a small state
+            // machine (see `DragState`) decides per gesture between a Shelbi
+            // selection and a forwarded click.
+            MouseEventKind::Down(CtMouseButton::Left)
+            | MouseEventKind::Drag(CtMouseButton::Left)
+            | MouseEventKind::Up(CtMouseButton::Left) => {
+                self.left_mouse(m, pane_col, pane_row, &placement)
             }
+            // Wheel and the other buttons keep the simple ownership policy: the
+            // program gets them when it is reporting (unless Shift reclaims
+            // them); otherwise the wheel scrolls Shelbi's scrollback.
+            _ => match input::mouse_owner(reporting, shift) {
+                input::MouseOwner::Shelbi => match m.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.view.scroll_up(3);
+                        MouseOutcome::Handled
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.view.scroll_down(3);
+                        MouseOutcome::Handled
+                    }
+                    _ => MouseOutcome::Ignored,
+                },
+                input::MouseOwner::Program => self.forward_mouse(m, pane_col, pane_row, &placement),
+            },
         }
     }
 
-    /// Shelbi-owned mouse: wheel scrolls scrollback; Shift+drag selects; a
-    /// finished drag copies.
-    fn shelbi_mouse(
+    /// Encode a mouse event for the program, if a session cell lies under it.
+    fn forward_mouse(
+        &self,
+        m: &CtMouseEvent,
+        col: u16,
+        row: u16,
+        placement: &Placement,
+    ) -> MouseOutcome {
+        let Some(ev) = map_mouse(m, col, row) else {
+            return MouseOutcome::Ignored;
+        };
+        match input::encode_mouse(&ev, self.mouse_modes(), placement) {
+            Some(bytes) => MouseOutcome::Forward(bytes),
+            None => MouseOutcome::Ignored,
+        }
+    }
+
+    fn mouse_modes(&self) -> input::MouseModes {
+        let mode = self.view.emulator().mode();
+        input::MouseModes {
+            reporting: mode.intersects(TermMode::MOUSE_MODE),
+            sgr: mode.contains(TermMode::SGR_MOUSE),
+        }
+    }
+
+    /// Left-button handling: a plain drag selects (even when the program has
+    /// mouse reporting on), a plain click reaches the program, Shift forces a
+    /// selection, and Alt forwards the whole gesture to the program (the escape
+    /// hatch for programs that need drags). A finished selection copies.
+    fn left_mouse(
         &mut self,
         m: &CtMouseEvent,
         col: u16,
         row: u16,
         placement: &Placement,
     ) -> MouseOutcome {
+        let reporting = self.view.emulator().mode().intersects(TermMode::MOUSE_MODE);
+        let shift = m.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = m.modifiers.contains(KeyModifiers::ALT);
         match m.kind {
-            MouseEventKind::ScrollUp => {
-                self.view.scroll_up(3);
-                MouseOutcome::Handled
-            }
-            MouseEventKind::ScrollDown => {
-                self.view.scroll_down(3);
-                MouseOutcome::Handled
-            }
             MouseEventKind::Down(CtMouseButton::Left) => {
-                if let Some(p) = self.view.viewer_point_to_grid(placement, col, row) {
-                    self.view.begin_selection(p);
+                // A new press ends any lingering highlight (the "next click"
+                // rule) and we defer the selection-vs-click decision to the
+                // first motion. Alt+reporting is the one exception: it hands the
+                // whole gesture to the program up front.
+                self.view.clear_selection();
+                if reporting && !shift && alt {
+                    self.drag = DragState::Program;
+                    return self.forward_mouse(m, col, row, placement);
                 }
+                // A click (no drag) forwards to the program only when the
+                // program is reporting and did not reclaim the gesture via
+                // Shift; otherwise a bare click is Shelbi's and does nothing.
+                let forward_click = reporting && !shift;
+                self.drag = DragState::Pressed { col, row, forward_click };
                 MouseOutcome::Handled
             }
-            MouseEventKind::Drag(CtMouseButton::Left) => {
-                if let Some(p) = self.view.viewer_point_to_grid(placement, col, row) {
-                    self.view.update_selection(p);
+            MouseEventKind::Drag(CtMouseButton::Left) => match self.drag {
+                DragState::Program => self.forward_mouse(m, col, row, placement),
+                DragState::Pressed { col: c0, row: r0, .. } => {
+                    // First motion: this gesture is a drag, so it is a Shelbi
+                    // selection anchored at the press point.
+                    if let Some(p) = self.view.viewer_point_to_grid(placement, c0, r0) {
+                        self.view.begin_selection(p);
+                    }
+                    if let Some(p) = self.view.viewer_point_to_grid(placement, col, row) {
+                        self.view.update_selection(p);
+                    }
+                    self.drag = DragState::Selecting;
+                    MouseOutcome::Handled
                 }
-                MouseOutcome::Handled
-            }
-            MouseEventKind::Up(CtMouseButton::Left) => match self.view.selection_text() {
-                Some(text) if !text.is_empty() => MouseOutcome::Copy(text),
-                _ => MouseOutcome::Handled,
+                DragState::Selecting => {
+                    if let Some(p) = self.view.viewer_point_to_grid(placement, col, row) {
+                        self.view.update_selection(p);
+                    }
+                    MouseOutcome::Handled
+                }
+                DragState::Idle => MouseOutcome::Handled,
             },
+            MouseEventKind::Up(CtMouseButton::Left) => {
+                match std::mem::replace(&mut self.drag, DragState::Idle) {
+                    DragState::Program => self.forward_mouse(m, col, row, placement),
+                    DragState::Selecting => self.finish_selection(),
+                    DragState::Pressed { col: c0, row: r0, forward_click } => {
+                        if forward_click {
+                            // A plain click while the program is reporting: now
+                            // that we know it never became a drag, forward the
+                            // buffered press and this release as a clean click.
+                            self.forward_click(c0, r0, col, row, placement)
+                        } else {
+                            // A bare Shelbi click: the old highlight was already
+                            // dropped on the press; nothing more to do.
+                            MouseOutcome::Handled
+                        }
+                    }
+                    DragState::Idle => MouseOutcome::Ignored,
+                }
+            }
             _ => MouseOutcome::Ignored,
+        }
+    }
+
+    /// Resolve a finished selection drag: copy it when it actually spans text,
+    /// otherwise drop the stray highlight of a drag that never left its anchor.
+    fn finish_selection(&mut self) -> MouseOutcome {
+        let dragged = self.view.selection().is_some_and(|s| !s.is_empty());
+        match self.view.selection_text() {
+            Some(text) if dragged && !text.is_empty() => MouseOutcome::Copy(text),
+            _ => {
+                self.view.clear_selection();
+                MouseOutcome::Handled
+            }
+        }
+    }
+
+    /// Forward a buffered click (press at `c0,r0`, release at `cr,rr`) to the
+    /// program as a press immediately followed by a release.
+    fn forward_click(
+        &self,
+        c0: u16,
+        r0: u16,
+        cr: u16,
+        rr: u16,
+        placement: &Placement,
+    ) -> MouseOutcome {
+        let modes = self.mouse_modes();
+        let ev = |action, col, row| input::MouseEvent {
+            action,
+            button: input::MouseButton::Left,
+            col,
+            row,
+            mods: Modifiers::default(),
+        };
+        let mut bytes = Vec::new();
+        if let Some(down) = input::encode_mouse(&ev(input::MouseAction::Press, c0, r0), modes, placement) {
+            bytes.extend_from_slice(&down);
+        }
+        if let Some(up) = input::encode_mouse(&ev(input::MouseAction::Release, cr, rr), modes, placement) {
+            bytes.extend_from_slice(&up);
+        }
+        if bytes.is_empty() {
+            MouseOutcome::Ignored
+        } else {
+            MouseOutcome::Forward(bytes)
         }
     }
 
@@ -266,6 +427,10 @@ fn render_grid(
     let offset = emu.display_offset() as i32;
     let rrows = placement.rows;
     let rcols = placement.cols;
+    // The selection's grid-line coordinates line up with `display_iter`'s point
+    // lines (both are screen-relative: line 0 is the top of the visible grid),
+    // so a cell is highlighted exactly when the selection contains its point.
+    let selection = view.selection();
 
     for indexed in grid.display_iter() {
         let srow = indexed.point.line.0 + offset;
@@ -290,7 +455,16 @@ fn render_grid(
             continue;
         }
         out.set_char(if cell.c == '\0' { ' ' } else { cell.c });
-        out.set_style(cell_style(cell, truecolor));
+        let mut style = cell_style(cell, truecolor);
+        if selection
+            .is_some_and(|s| s.contains(indexed.point.line.0, indexed.point.column.0 as u16))
+        {
+            // Reverse video is the toolkit- and theme-independent highlight (the
+            // same device the detach hint uses), so the selection reads on any
+            // palette without choosing a background color.
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        out.set_style(style);
     }
 
     if emu.mode().contains(TermMode::SHOW_CURSOR) {
@@ -515,6 +689,21 @@ pub(crate) fn is_actionable(k: &KeyEvent) -> bool {
     !matches!(k.kind, KeyEventKind::Release)
 }
 
+/// Whether `k` is a "copy the selection" chord: Cmd+C (macOS, when the terminal
+/// passes `super+c` through rather than handling it itself) or the portable
+/// Ctrl+Shift+C. A plain Ctrl+C (no Shift) is deliberately *not* matched, so an
+/// interrupt still reaches the agent. The shell consumes a matched chord
+/// whether or not a selection exists, so it never forwards a stray `c` /
+/// Ctrl+C to the session.
+pub(crate) fn is_copy_key(k: &KeyEvent) -> bool {
+    if !matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+        return false;
+    }
+    let m = k.modifiers;
+    m.contains(KeyModifiers::SUPER)
+        || (m.contains(KeyModifiers::CONTROL) && m.contains(KeyModifiers::SHIFT))
+}
+
 /// Build the OSC 52 copy sequence for `text`.
 pub(crate) fn osc52(text: &str) -> Vec<u8> {
     selection::osc52_copy(text)
@@ -636,20 +825,29 @@ mod tests {
     #[test]
     fn program_mouse_click_translates_through_a_letterbox() {
         // Session 80x24 shown in a 100x30 viewer: 10-col / 3-row letterbox
-        // margins. A program-owned click at viewer cell (15, 5) must reach the
-        // program as session cell (5, 2) → SGR 1-based (6, 3).
+        // margins. A program-owned click at viewer cell (15, 5) maps to session
+        // cell (5, 2) → SGR 1-based (6, 3). The press is buffered (we don't yet
+        // know if it will become a drag); the release with no motion forwards
+        // the click as a press immediately followed by a release.
         let mut pane = TerminalPane::new(Size::new(80, 24));
         enable_sgr_mouse(&mut pane);
-        let ev = mouse(MouseEventKind::Down(CtMouseButton::Left), 15, 5, KM::NONE);
-        match pane.on_mouse(&ev, 15, 5, Size::new(100, 30)) {
-            MouseOutcome::Forward(bytes) => assert_eq!(bytes, b"\x1b[<0;6;3M".to_vec()),
-            other => panic!("a program click should forward translated coords, got {other:?}"),
+        let down = mouse(MouseEventKind::Down(CtMouseButton::Left), 15, 5, KM::NONE);
+        assert!(
+            matches!(pane.on_mouse(&down, 15, 5, Size::new(100, 30)), MouseOutcome::Handled),
+            "the press is buffered until we know click-vs-drag"
+        );
+        let up = mouse(MouseEventKind::Up(CtMouseButton::Left), 15, 5, KM::NONE);
+        match pane.on_mouse(&up, 15, 5, Size::new(100, 30)) {
+            MouseOutcome::Forward(bytes) => assert_eq!(bytes, b"\x1b[<0;6;3M\x1b[<0;6;3m".to_vec()),
+            other => panic!("a program click forwards press+release on release, got {other:?}"),
         }
         // A click in the letterbox margin covers no session cell → nothing is
         // forwarded.
-        let margin = mouse(MouseEventKind::Down(CtMouseButton::Left), 2, 5, KM::NONE);
+        let margin_down = mouse(MouseEventKind::Down(CtMouseButton::Left), 2, 5, KM::NONE);
+        pane.on_mouse(&margin_down, 2, 5, Size::new(100, 30));
+        let margin_up = mouse(MouseEventKind::Up(CtMouseButton::Left), 2, 5, KM::NONE);
         assert!(
-            matches!(pane.on_mouse(&margin, 2, 5, Size::new(100, 30)), MouseOutcome::Ignored),
+            matches!(pane.on_mouse(&margin_up, 2, 5, Size::new(100, 30)), MouseOutcome::Ignored),
             "a click in the letterbox margin maps to no session cell"
         );
     }
@@ -657,15 +855,145 @@ mod tests {
     #[test]
     fn program_mouse_click_translates_through_a_clip() {
         // Session 120x40 clipped into an 80x24 viewer (anchored top-left). The
-        // bottom-right visible cell (79, 23) maps straight through; a click past
-        // the clipped window covers nothing.
+        // bottom-right visible cell (79, 23) maps straight through; the click
+        // forwards on release.
         let mut pane = TerminalPane::new(Size::new(120, 40));
         enable_sgr_mouse(&mut pane);
-        let ev = mouse(MouseEventKind::Down(CtMouseButton::Left), 79, 23, KM::NONE);
-        match pane.on_mouse(&ev, 79, 23, Size::new(80, 24)) {
-            MouseOutcome::Forward(bytes) => assert_eq!(bytes, b"\x1b[<0;80;24M".to_vec()),
+        let down = mouse(MouseEventKind::Down(CtMouseButton::Left), 79, 23, KM::NONE);
+        assert!(matches!(
+            pane.on_mouse(&down, 79, 23, Size::new(80, 24)),
+            MouseOutcome::Handled
+        ));
+        let up = mouse(MouseEventKind::Up(CtMouseButton::Left), 79, 23, KM::NONE);
+        match pane.on_mouse(&up, 79, 23, Size::new(80, 24)) {
+            MouseOutcome::Forward(bytes) => {
+                assert_eq!(bytes, b"\x1b[<0;80;24M\x1b[<0;80;24m".to_vec())
+            }
             other => panic!("a clipped-window click should forward, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn plain_drag_selects_even_when_the_program_wants_the_mouse() {
+        // The headline behavior: with the program reporting the mouse, a plain
+        // (no-modifier) left drag is Shelbi's selection, never forwarded, and
+        // the release copies.
+        let mut pane = TerminalPane::new(Size::new(20, 3));
+        enable_sgr_mouse(&mut pane);
+        pane.view.feed(b"hello world");
+        let down = mouse(MouseEventKind::Down(CtMouseButton::Left), 0, 0, KM::NONE);
+        assert!(matches!(
+            pane.on_mouse(&down, 0, 0, Size::new(20, 3)),
+            MouseOutcome::Handled
+        ));
+        let drag = mouse(MouseEventKind::Drag(CtMouseButton::Left), 4, 0, KM::NONE);
+        assert!(
+            matches!(pane.on_mouse(&drag, 4, 0, Size::new(20, 3)), MouseOutcome::Handled),
+            "a drag selects locally, never forwarded, even with program reporting on"
+        );
+        let up = mouse(MouseEventKind::Up(CtMouseButton::Left), 4, 0, KM::NONE);
+        match pane.on_mouse(&up, 4, 0, Size::new(20, 3)) {
+            MouseOutcome::Copy(text) => assert_eq!(text, "hello"),
+            other => panic!("a finished plain drag copies the selection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alt_drag_forwards_to_the_program() {
+        // The escape hatch: Alt+drag hands the whole gesture to a reporting
+        // program (press, motion, release all forwarded) and selects nothing.
+        let mut pane = TerminalPane::new(Size::new(20, 3));
+        enable_sgr_mouse(&mut pane);
+        pane.view.feed(b"hello world");
+        let down = mouse(MouseEventKind::Down(CtMouseButton::Left), 0, 0, KM::ALT);
+        // Press: SGR button 0 + Alt bit (8) at 1-based (1,1).
+        match pane.on_mouse(&down, 0, 0, Size::new(20, 3)) {
+            MouseOutcome::Forward(bytes) => assert_eq!(bytes, b"\x1b[<8;1;1M".to_vec()),
+            other => panic!("Alt+press forwards to the program, got {other:?}"),
+        }
+        let drag = mouse(MouseEventKind::Drag(CtMouseButton::Left), 4, 0, KM::ALT);
+        match pane.on_mouse(&drag, 4, 0, Size::new(20, 3)) {
+            // motion bit (32) + button 0 + Alt (8) = 40, at 1-based (5,1).
+            MouseOutcome::Forward(bytes) => assert_eq!(bytes, b"\x1b[<40;5;1M".to_vec()),
+            other => panic!("Alt+drag forwards to the program, got {other:?}"),
+        }
+        let up = mouse(MouseEventKind::Up(CtMouseButton::Left), 4, 0, KM::ALT);
+        assert!(
+            matches!(pane.on_mouse(&up, 4, 0, Size::new(20, 3)), MouseOutcome::Forward(_)),
+            "Alt+release forwards too"
+        );
+        assert!(
+            pane.selection_copy().is_none(),
+            "Alt+drag never builds a Shelbi selection"
+        );
+    }
+
+    #[test]
+    fn selection_persists_until_a_key_is_sent() {
+        // After a drag-select the highlight stays (selection_copy still yields
+        // the text) through a copy chord, and a key sent to the session clears
+        // it.
+        let mut pane = TerminalPane::new(Size::new(20, 3));
+        pane.view.feed(b"hello world");
+        let down = mouse(MouseEventKind::Down(CtMouseButton::Left), 0, 0, KM::NONE);
+        pane.on_mouse(&down, 0, 0, Size::new(20, 3));
+        let drag = mouse(MouseEventKind::Drag(CtMouseButton::Left), 4, 0, KM::NONE);
+        pane.on_mouse(&drag, 4, 0, Size::new(20, 3));
+        let up = mouse(MouseEventKind::Up(CtMouseButton::Left), 4, 0, KM::NONE);
+        assert!(matches!(pane.on_mouse(&up, 4, 0, Size::new(20, 3)), MouseOutcome::Copy(_)));
+        // Highlight (and copyable text) survive the release.
+        assert_eq!(pane.selection_copy().as_deref(), Some("hello"));
+        // A key sent to the session dismisses it.
+        pane.encode_key(&KeyEvent::new(KeyCode::Char('x'), KM::NONE));
+        assert!(pane.selection_copy().is_none(), "a session keypress clears the selection");
+    }
+
+    #[test]
+    fn a_new_click_clears_the_previous_highlight() {
+        let mut pane = TerminalPane::new(Size::new(20, 3));
+        pane.view.feed(b"hello world");
+        // Select "hello".
+        pane.on_mouse(&mouse(MouseEventKind::Down(CtMouseButton::Left), 0, 0, KM::NONE), 0, 0, Size::new(20, 3));
+        pane.on_mouse(&mouse(MouseEventKind::Drag(CtMouseButton::Left), 4, 0, KM::NONE), 4, 0, Size::new(20, 3));
+        pane.on_mouse(&mouse(MouseEventKind::Up(CtMouseButton::Left), 4, 0, KM::NONE), 4, 0, Size::new(20, 3));
+        assert!(pane.selection_copy().is_some());
+        // A fresh press elsewhere clears the old highlight.
+        pane.on_mouse(&mouse(MouseEventKind::Down(CtMouseButton::Left), 8, 0, KM::NONE), 8, 0, Size::new(20, 3));
+        assert!(pane.selection_copy().is_none(), "a new click clears the highlight");
+    }
+
+    #[test]
+    fn selected_cells_render_reversed() {
+        let mut pane = TerminalPane::new(Size::new(20, 1));
+        pane.view.feed(b"hello world");
+        // Select "hello" (cols 0..=4).
+        pane.on_mouse(&mouse(MouseEventKind::Down(CtMouseButton::Left), 0, 0, KM::NONE), 0, 0, Size::new(20, 1));
+        pane.on_mouse(&mouse(MouseEventKind::Drag(CtMouseButton::Left), 4, 0, KM::NONE), 4, 0, Size::new(20, 1));
+        assert!(matches!(
+            pane.on_mouse(&mouse(MouseEventKind::Up(CtMouseButton::Left), 4, 0, KM::NONE), 4, 0, Size::new(20, 1)),
+            MouseOutcome::Copy(_)
+        ));
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buf = Buffer::empty(area);
+        pane.render(&mut buf, area, true);
+        let reversed = |x: u16| buf[(x, 0)].modifier.contains(Modifier::REVERSED);
+        for x in 0..=4 {
+            assert!(reversed(x), "selected cell {x} should be reverse-video");
+        }
+        assert!(!reversed(5), "the space after the selection is not highlighted");
+        assert!(!reversed(6), "'w' past the selection is not highlighted");
+    }
+
+    #[test]
+    fn copy_key_recognizes_cmd_c_and_ctrl_shift_c_only() {
+        // Cmd+C (SUPER) and Ctrl+Shift+C are copy chords.
+        assert!(is_copy_key(&KeyEvent::new(KeyCode::Char('c'), KM::SUPER)));
+        assert!(is_copy_key(&KeyEvent::new(KeyCode::Char('c'), KM::CONTROL | KM::SHIFT)));
+        assert!(is_copy_key(&KeyEvent::new(KeyCode::Char('C'), KM::CONTROL | KM::SHIFT)));
+        // A bare Ctrl+C (interrupt) is NOT — it must still reach the agent.
+        assert!(!is_copy_key(&KeyEvent::new(KeyCode::Char('c'), KM::CONTROL)));
+        // A plain typed `c` is not a copy chord.
+        assert!(!is_copy_key(&KeyEvent::new(KeyCode::Char('c'), KM::NONE)));
     }
 
     #[test]

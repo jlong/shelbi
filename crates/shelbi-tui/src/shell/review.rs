@@ -237,6 +237,15 @@ impl ReviewInterface {
             self.focus = ReviewFocus::Panel;
             return ReviewAction::None;
         }
+        // Cmd+C / Ctrl+Shift+C copies the content view's selection and is
+        // consumed, never forwarded (no stray `c` / Ctrl+C to the editor). Same
+        // rule as the main-area terminal (see the shell's `handle_main_key`).
+        if super::terminal_view::is_copy_key(&k) {
+            if let Some(text) = self.content.live_pane_mut().and_then(|p| p.selection_copy()) {
+                super::copy_to_clipboard(&text);
+            }
+            return ReviewAction::None;
+        }
         if let Some(p) = self.content.live_pane_mut() {
             if let Some(bytes) = p.encode_key(&k) {
                 self.content.send_input(&bytes);

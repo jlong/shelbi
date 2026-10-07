@@ -424,7 +424,7 @@ impl Palette {
             selected: self.selected,
             commands_focused: true,
             projects: None,
-            footer: "↑↓ navigate · Enter run · Esc agent · Tab sidebar · ^H/^L focus panes",
+            footer: "↑↓ navigate · Enter run · Esc agent · Tab sidebar · ^H/^L focus · drag selects (⌥drag → app) · ⌘C/^⇧C copy",
         };
         render(f, area, &view);
     }
@@ -514,6 +514,23 @@ mod tests {
             .collect();
         assert!(text.contains("focus"), "the footer advertises the focus keys: {text:?}");
         assert!(text.contains("^H/^L"), "the footer names the focus chords: {text:?}");
+    }
+
+    #[test]
+    fn footer_documents_selection_and_copy() {
+        use ratatui::{backend::TestBackend, Terminal};
+        // A wide terminal so the one-line footer is not truncated.
+        let p = Palette::new("alpha", vec![entry("view:tasks", "Issues")]);
+        let mut term = Terminal::new(TestBackend::new(160, 12)).unwrap();
+        term.draw(|f| p.render(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(text.contains("selects"), "footer documents drag-select: {text:?}");
+        assert!(text.contains("⌥drag"), "footer documents the Alt+drag escape hatch: {text:?}");
+        assert!(text.contains("copy"), "footer documents the copy chord: {text:?}");
     }
 
     #[test]

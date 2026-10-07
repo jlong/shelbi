@@ -2067,6 +2067,18 @@ impl ShellState {
             _ => {}
         }
 
+        // Cmd+C / Ctrl+Shift+C copies the current selection to the clipboard
+        // and is consumed here — never forwarded — so no stray `c` / Ctrl+C
+        // reaches the agent. With no selection it is a harmless no-op (we still
+        // swallow it rather than risk sending an interrupt).
+        if terminal_view::is_copy_key(&k) {
+            if let Some(text) = self.sessions.live_pane_mut().and_then(|p| p.selection_copy()) {
+                copy_to_clipboard(&text);
+            }
+            self.dirty = true;
+            return;
+        }
+
         // A scrollback search prompt captures typing.
         if let Some(mut buf) = self.search_input.take() {
             match k.code {
