@@ -367,39 +367,91 @@ pub fn zombies_to_reap<'a>(
 mod tests {
     use super::*;
     use shelbi_proto::{Frame, Hello};
-    use std::io::Write;
-    use std::os::unix::net::UnixListener;
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
 
     /// A stand-in session socket that *answers the hello* — binds `sock` and,
-    /// from a detached accept loop, replies to every connection with a [`Hello`]
-    /// frame (then closes it). This is what the hello-round-trip probe
+    /// from a detached accept loop, serves every connection the way a real
+    /// session does: it reads the client's hello *first*, replies with its own
+    /// [`Hello`] frame, then keeps the connection open (draining to EOF) until
+    /// the client closes it. This is what the hello-round-trip probe
     /// ([`probe_reachable`]) needs to classify a listener as truly
     /// [`Reachable`](SocketReachability::Reachable); a bare `UnixListener` that
-    /// never writes would read as [`Wedged`](SocketReachability::Wedged). The
-    /// accept loop owns the listener, so the socket stays bound for the test; the
-    /// thread is intentionally detached (the test process exits at the end).
+    /// never writes would read as [`Wedged`](SocketReachability::Wedged).
+    ///
+    /// Reading the client's hello before replying — and not dropping the stream
+    /// while unread client bytes are still buffered — matters on Linux: closing
+    /// a Unix stream socket that still holds unread data resets the connection
+    /// (sends an RST), which can discard the hello reply in flight or fail the
+    /// probe's own write, so the probe reads the session as
+    /// [`Wedged`](SocketReachability::Wedged) and the test flakes. macOS is more
+    /// forgiving, which is why the reply-then-drop version passed locally but
+    /// failed on CI. Each connection is served on its own thread so one slow
+    /// client never blocks the accept loop; the accept loop owns the listener,
+    /// so the socket stays bound for the test, and every thread is intentionally
+    /// detached (the test process exits at the end).
     fn hello_listener(sock: &Path) -> UnixListener {
         let listener = UnixListener::bind(sock).unwrap();
         let accept = listener.try_clone().unwrap();
         std::thread::spawn(move || {
-            let reply = Frame::Hello(Hello {
-                protocol_version: shelbi_proto::PROTOCOL_VERSION,
-                colors: None,
-                capabilities: Vec::new(),
-            })
-            .encode()
-            .unwrap();
             for stream in accept.incoming() {
                 match stream {
-                    Ok(mut s) => {
-                        let _ = s.write_all(&reply);
-                        let _ = s.flush();
+                    Ok(stream) => {
+                        std::thread::spawn(move || serve_hello(stream));
                     }
                     Err(_) => break,
                 }
             }
         });
         listener
+    }
+
+    /// Serve one probe connection like a real session handler: read the client's
+    /// hello, reply with ours, then drain the connection until the client closes
+    /// it. Any error (the client hung up, a malformed frame) just ends the
+    /// handler — this is a test stand-in, not a hardened server.
+    fn serve_hello(mut stream: UnixStream) {
+        // Read the client's hello before replying, so we never close with its
+        // bytes still unread (which would reset the connection on Linux).
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match Frame::decode(&buf) {
+                Ok((Frame::Hello(_), _)) => break,
+                // Anything other than a hello first is a protocol error; drop.
+                Ok(_) => return,
+                Err(shelbi_proto::ProtoError::Incomplete { .. }) => {}
+                Err(_) => return,
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) => return, // client closed before sending its hello
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => return,
+            }
+        }
+
+        let reply = Frame::Hello(Hello {
+            protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            colors: None,
+            capabilities: Vec::new(),
+        })
+        .encode()
+        .unwrap();
+        if stream.write_all(&reply).is_err() || stream.flush().is_err() {
+            return;
+        }
+
+        // Stay open until the client closes the connection, draining whatever it
+        // sends. This mirrors a real session's handler lifetime and ensures the
+        // close is driven by the client (the probe), never by us dropping unread
+        // data out from under it.
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
     }
 
     #[test]
