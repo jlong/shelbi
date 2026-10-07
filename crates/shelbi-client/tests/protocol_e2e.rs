@@ -793,3 +793,166 @@ fn discovery_lists_sessions_and_reaps_dead_directories() {
 
     sess.kill_and_join();
 }
+
+/// Count the file descriptors this process currently has open. The session runs
+/// in-process (on a `run()` thread), so a client connection that is dropped
+/// without winding down leaves *both* ends held in this one process — the
+/// client's reader thread (parked on `read`, holding the socket) and the
+/// session's per-connection handler — and both show up here. Portable across the
+/// crate's platforms: Linux exposes `/proc/self/fd`, macOS `/dev/fd`. The read
+/// opens one transient fd, counted identically every call so deltas cancel.
+fn open_fd_count() -> usize {
+    for dir in ["/proc/self/fd", "/dev/fd"] {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            return rd.count();
+        }
+    }
+    0
+}
+
+#[test]
+fn dropping_a_throwaway_connection_leaks_nothing() {
+    // The `rt-find-the-5s-connection-to-the-review-session` leak: a caller that
+    // opens a `Connection`, makes one request, and drops it — exactly what the
+    // backend's per-tick `snapshot`/`info`/`title`/liveness polls do, about every
+    // 5 s against a serving review slot. Each such connection completes the hello
+    // (so the server's handshake timeout never reaps it) and then goes idle. If
+    // dropping the `Connection` doesn't actively close the channel, its reader
+    // thread stays parked on `read` holding the socket open, which keeps the
+    // session's handler and its three descriptors alive — one leaked set per poll,
+    // until the session runs out of descriptors. `Connection`'s `Drop` must shut
+    // the channel down so both ends wind up; 200 open/request/drop cycles then
+    // leave the fd count flat.
+    let _g = serial();
+    let mut sess = Session::start("demo/ws/dropconn", 80, 24, &["/bin/sh", "-c", "exec sleep 60"]);
+
+    // One open + request + drop, mirroring a backend poll.
+    let cycle = |sess: &Session| {
+        let (conn, _events) = sess.client();
+        let _ = conn.info().expect("info reply");
+        drop(conn);
+    };
+
+    // Warm up so first-connection lazy allocations settle, then baseline once the
+    // fd count stops moving.
+    for _ in 0..5 {
+        cycle(&sess);
+    }
+    let base = wait_for(DEADLINE, {
+        let mut last = 0usize;
+        let mut stable = 0u8;
+        move || {
+            let now = open_fd_count();
+            if now == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = now;
+            }
+            (stable >= 2).then_some(last)
+        }
+    })
+    .expect("fd count settles before the run");
+
+    for _ in 0..200 {
+        cycle(&sess);
+    }
+
+    // Both the client reader threads and the session handlers must have wound
+    // down, so the fd count returns to the baseline. A per-connection leak would
+    // grow it by several descriptors each cycle — hundreds total.
+    let after = wait_for(DEADLINE, || {
+        let now = open_fd_count();
+        (now <= base + 8).then_some(now)
+    })
+    .unwrap_or_else(open_fd_count);
+    assert!(
+        after <= base + 8,
+        "descriptors leaked across 200 open/request/drop cycles: base={base}, after={after}",
+    );
+
+    sess.kill_and_join();
+}
+
+/// Best-effort live thread count for this process (the in-process session shares
+/// it). `ps` is portable enough for a diagnostic: Linux exposes `thcount`, macOS
+/// lists one line per thread under `ps -M`. Returns `None` if neither works.
+#[cfg(test)]
+fn live_thread_count() -> Option<usize> {
+    use std::process::Command;
+    let pid = std::process::id().to_string();
+    if let Ok(o) = Command::new("ps").args(["-o", "thcount=", "-p", &pid]).output() {
+        if o.status.success() {
+            if let Ok(n) = String::from_utf8_lossy(&o.stdout).trim().parse::<usize>() {
+                return Some(n);
+            }
+        }
+    }
+    if let Ok(o) = Command::new("ps").args(["-M", "-p", &pid]).output() {
+        if o.status.success() {
+            // One header line plus one line per thread.
+            let lines = String::from_utf8_lossy(&o.stdout).lines().count();
+            return Some(lines.saturating_sub(1));
+        }
+    }
+    None
+}
+
+/// Live soak: drive the production review-slot poll (open a `Connection`,
+/// `snapshot`+`info`, drop) against a real session at the ~5 s poll cadence for
+/// several minutes, sampling the process fd and thread counts. This is the
+/// automated stand-in for the task's "leave a review open in the TUI for 30
+/// minutes" check — same shape, compressed so it fits a test run. Ignored by
+/// default (it is a timed soak); run with:
+///   cargo test -p shelbi-client --test protocol_e2e -- --ignored --nocapture live_review_poll_soak_stays_flat
+#[test]
+#[ignore = "timed soak; run explicitly to capture live fd/thread numbers"]
+fn live_review_poll_soak_stays_flat() {
+    let _g = serial();
+    let mut sess = Session::start("demo/ws/soak", 80, 24, &["/bin/sh", "-c", "exec sleep 600"]);
+
+    let poll = |sess: &Session| {
+        let (conn, _events) = sess.client();
+        let _ = conn.snapshot(None);
+        let _ = conn.info();
+        drop(conn);
+    };
+
+    // Warm up, then baseline.
+    for _ in 0..3 {
+        poll(&sess);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let base_fds = open_fd_count();
+    let base_threads = live_thread_count();
+    eprintln!("SOAK baseline: fds={base_fds} threads={base_threads:?}");
+
+    // 36 polls at a 5 s cadence ~= 3 minutes (shortened from 30 at the real
+    // cadence to keep the run tractable; the per-poll shape is identical).
+    let polls = 36usize;
+    for i in 0..polls {
+        poll(&sess);
+        if i % 6 == 0 {
+            eprintln!(
+                "SOAK t={}s: fds={} threads={:?}",
+                i * 5,
+                open_fd_count(),
+                live_thread_count(),
+            );
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+
+    let after_fds = open_fd_count();
+    let after_threads = live_thread_count();
+    eprintln!("SOAK final: fds={after_fds} threads={after_threads:?}");
+    assert!(
+        after_fds <= base_fds + 8,
+        "fds grew over the soak: base={base_fds}, after={after_fds}",
+    );
+    if let (Some(b), Some(a)) = (base_threads, after_threads) {
+        assert!(a <= b + 4, "threads grew over the soak: base={b}, after={a}");
+    }
+
+    sess.kill_and_join();
+}

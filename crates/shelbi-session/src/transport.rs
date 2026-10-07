@@ -21,7 +21,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use shelbi_proto::{
     decode_any, AnyFrame, ExtFrame, Frame, Hello, InfoData, Resync, SnapshotData,
@@ -51,6 +51,35 @@ const CLIENT_QUEUE_LIMIT: usize = 2048;
 /// merely *slow* client still drains a little each `write` and is never dropped
 /// here — the bounded [`Outbox`] and its [`Resync`] recovery handle backlog.
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a freshly accepted connection has to complete the [`Hello`]
+/// handshake before the server closes it and winds its threads down.
+///
+/// Accepting a connection costs a reader thread, a writer thread, and three file
+/// descriptors. A peer that connects and then never sends its hello (it wedged
+/// mid-handshake, or it opened the socket and walked away) holds all of that: the
+/// reader parks in `read` with nothing to decode, and `serve_client` cannot
+/// return while the reader is parked. With no bound one such peer leaks a handler
+/// per connect until the session hits `EMFILE` and can serve no one
+/// (`rt-find-the-5s-connection-to-the-review-session`). A connection that has not
+/// produced a decodable hello within this window is treated as dead: the reader
+/// returns, `serve_client` tears the connection down, and both threads exit. A
+/// healthy client sends its hello as its first bytes (sub-millisecond for the
+/// local/relay peer), so this never trips a real handshake; the bound is cleared
+/// the moment the hello arrives, so steady-state reads block normally afterward.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The effective hello-handshake deadline. The default is [`HELLO_TIMEOUT`];
+/// `SHELBI_HELLO_TIMEOUT_MS` overrides it (read fresh per connection — connects
+/// are infrequent, so the cost is irrelevant), used only by the leak tests to
+/// drive the reap on a short clock rather than waiting out the 5 s default.
+fn hello_timeout() -> Duration {
+    std::env::var("SHELBI_HELLO_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(HELLO_TIMEOUT)
+}
 
 // Capability bits, derived from a client's hello capability list. Stored in an
 // `AtomicU16` on the channel so the broadcast path reads them lock-free.
@@ -413,6 +442,12 @@ fn client_writer(
 }
 
 /// Read and dispatch request frames until the client disconnects or errors.
+///
+/// Until the client's [`Hello`] arrives, reads are bounded by [`HELLO_TIMEOUT`]:
+/// a peer that connects but never completes the handshake is dropped so its
+/// reader/writer threads and descriptors can't leak (see [`HELLO_TIMEOUT`]). Once
+/// the hello is in, the bound is cleared and subsequent reads block normally —
+/// a connected, handshaken client that simply sits idle is expected and kept.
 fn read_loop(
     mut stream: UnixStream,
     shared: &Arc<Shared>,
@@ -420,22 +455,64 @@ fn read_loop(
 ) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut hello_seen = false;
+    // Absolute deadline for the whole pre-hello phase, so a peer that dribbles
+    // bytes without ever completing the hello still can't hold the handler past
+    // the window — each pre-hello read is bounded by the time left, not a fresh
+    // full timeout.
+    let window = hello_timeout();
+    let hello_deadline = Instant::now() + window;
+    // Best-effort: `set_read_timeout` on a socket whose peer has already closed
+    // errors (EINVAL on macOS). That is never a reason to abandon the connection
+    // — buffered frames may still be waiting and the read below returns them (or
+    // a prompt EOF). The bound matters only for a still-connected silent peer,
+    // and on a live socket the call succeeds, so ignoring the error is safe.
+    let _ = stream.set_read_timeout(Some(window));
     loop {
         loop {
             match decode_any(&buf) {
                 Ok((frame, consumed)) => {
                     buf.drain(..consumed);
+                    let is_hello = matches!(&frame, AnyFrame::Core(Frame::Hello(_)));
                     handle_frame(frame, shared, ch);
+                    if is_hello && !hello_seen {
+                        // Handshake done: drop the bound so steady-state reads
+                        // (which wait for input that may be minutes away) block.
+                        hello_seen = true;
+                        let _ = stream.set_read_timeout(None);
+                    }
                 }
                 Err(shelbi_proto::ProtoError::Incomplete { .. }) => break,
                 Err(_) => return Ok(()), // malformed/unknown: stop serving this peer
             }
         }
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            return Ok(());
+        if !hello_seen {
+            // Tighten the per-read timeout to the time left in the window, so the
+            // pre-hello phase as a whole can't outlast `HELLO_TIMEOUT`.
+            let remaining = hello_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            let _ = stream.set_read_timeout(Some(remaining));
         }
-        buf.extend_from_slice(&chunk[..n]);
+        match stream.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            // A read timeout (WouldBlock/TimedOut, platform-dependent) before the
+            // hello means the peer never handshook in time: drop it so the handler
+            // and its descriptors are released. After the hello the bound is
+            // cleared, so this branch can only fire pre-hello.
+            Err(e)
+                if !hello_seen
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 

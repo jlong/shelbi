@@ -432,8 +432,10 @@ fn slow_stream_does_not_stall_another_on_the_same_channel() {
     // Drive both streams at the transport level so the slow one's inbound queue
     // actually overflows (a full `Connection` would auto-drain it). Both attach
     // so the sessions flood them; only the fast one is ever read.
-    let (mut fast_r, mut fast_w) = Box::new(channel.open(&fast_id).unwrap()).split().unwrap();
-    let (slow_r, mut slow_w) = Box::new(channel.open(&slow_id).unwrap()).split().unwrap();
+    let (mut fast_r, mut fast_w, _fast_shutdown) =
+        Box::new(channel.open(&fast_id).unwrap()).split().unwrap();
+    let (slow_r, mut slow_w, _slow_shutdown) =
+        Box::new(channel.open(&slow_id).unwrap()).split().unwrap();
 
     for w in [&mut fast_w, &mut slow_w] {
         w.write_all(
