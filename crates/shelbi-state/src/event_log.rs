@@ -2561,8 +2561,10 @@ pub fn append_rebase_event(
 /// after it rebases a workspace's branch: the (possibly rewritten) local tip is
 /// pushed to `origin` so the review / PR see the reconciled commit rather than
 /// a stale pre-rework remote tip. `status` is `up-to-date`, `pushed`,
-/// `force-pushed`, or `failed`; a `failed` push blocks the handoff, so this
-/// line is the trail explaining why a task didn't advance to review.
+/// `force-pushed`, `failed`, or `blocked`; a `failed` (transient, retried) or
+/// `blocked` (terminal — origin carries foreign commits a force would clobber,
+/// or the retry cap was hit) push does not advance the handoff, so this line is
+/// the trail explaining why a task didn't advance to review.
 ///
 /// Same task-scoped shape (no leading `project=`) as [`append_rebase_event`];
 /// whitespace in every field folds to underscores so the record stays a single

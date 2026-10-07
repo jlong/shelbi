@@ -292,6 +292,28 @@ pub fn workspace_ready_refused_marker(machine: &Machine, workspace: &WorkspaceSp
         .join("shelbi-ready-refused")
 }
 
+/// The handoff-**push** retry ledger for a workspace:
+/// `<worktree>/.claude/shelbi-push-blocked`.
+///
+/// The ready handoff pushes the workspace branch to origin before advancing the
+/// card (see `poller::push_workspace_branch_before_handoff`). When that push is
+/// rejected it leaves the ready marker in place and retries next tick — which,
+/// unbounded, looped for over an hour in the incident this fixes. This sidecar
+/// bounds that: it records the current local tip, the transient-failure attempt
+/// count, and whether the push is terminally blocked (a [`PushOutcome::Blocked`]
+/// foreign-commit refusal, or the retry cap exceeded). While a tip stays blocked
+/// the poller skips re-attempting the push entirely (no tight loop) and re-emits
+/// nothing; a *new* local tip (the worker committed a fix) resets the ledger so
+/// the next tip gets a fresh budget. A successful push clears it. Lives under
+/// `.claude/` for the same gitignore reason as the ready marker itself, and uses
+/// the [`read_deferred_marker`] / [`write_deferred_marker`] / [`clear_deferred_marker`]
+/// trio.
+pub fn workspace_push_blocked_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
+    workspace_worktree(machine, workspace)
+        .join(".claude")
+        .join("shelbi-push-blocked")
+}
+
 /// Read the deferral sidecar, returning the recorded error-class token (trimmed)
 /// or `None` when it's absent or empty. Host-aware, matching the ready marker: a
 /// local workspace reads straight off disk; a remote one routes `cat` through
@@ -1179,8 +1201,18 @@ pub enum PushOutcome {
     NoRemote,
     /// The push couldn't be performed or was rejected against a configured
     /// origin. `reason` explains why so the events.log row (and the blocked
-    /// handoff) are actionable.
+    /// handoff) are actionable. A `Failed` is treated as *transient* by the
+    /// caller — it retries (capped) next tick, because a rejected push is often
+    /// a read→push race the next observation resolves.
     Failed { reason: String },
+    /// The push would have to overwrite a remote tip that carries commits the
+    /// local branch does not contain (not a rebase/amend of the remote work —
+    /// foreign commits from another clone). Forcing would clobber them, so we
+    /// refuse to force and hand this to a human. Unlike [`PushOutcome::Failed`],
+    /// this is *terminal*: the caller must stop retrying (nothing the poller can
+    /// do changes the verdict) and surface it, rather than looping. `reason`
+    /// names the divergence.
+    Blocked { reason: String },
 }
 
 impl PushOutcome {
@@ -1192,6 +1224,7 @@ impl PushOutcome {
             PushOutcome::Pushed { forced: true, .. } => "force-pushed",
             PushOutcome::NoRemote => "no-remote",
             PushOutcome::Failed { .. } => "failed",
+            PushOutcome::Blocked { .. } => "blocked",
         }
     }
 
@@ -1213,14 +1246,22 @@ impl PushOutcome {
             }
             PushOutcome::NoRemote => "no_origin_remote".to_string(),
             PushOutcome::Failed { reason } => reason.clone(),
+            PushOutcome::Blocked { reason } => reason.clone(),
         }
     }
 
     /// True when the handoff may proceed: either the remote now carries the
-    /// local tip, or there is no remote to strand it on. Only
-    /// [`PushOutcome::Failed`] returns false.
+    /// local tip, or there is no remote to strand it on. Both
+    /// [`PushOutcome::Failed`] and [`PushOutcome::Blocked`] return false.
     pub fn handed_off_local_tip(&self) -> bool {
-        !matches!(self, PushOutcome::Failed { .. })
+        !matches!(self, PushOutcome::Failed { .. } | PushOutcome::Blocked { .. })
+    }
+
+    /// True for the *terminal* [`PushOutcome::Blocked`] — the push can never
+    /// succeed by retrying (the remote carries foreign commits), so the caller
+    /// must stop retrying and surface it for a human, rather than looping.
+    pub fn is_blocked(&self) -> bool {
+        matches!(self, PushOutcome::Blocked { .. })
     }
 }
 
@@ -1244,6 +1285,33 @@ where
     S: AsRef<std::ffi::OsStr>,
 {
     shelbi_ssh::run_with_deadline(host, argv, POLLER_GIT_DEADLINE)
+}
+
+/// Read the local tip of `refs/heads/<branch>` in `worktree`, or `None` when
+/// the branch is missing or git can't be read. Used by the poller to key the
+/// handoff-push retry ledger on the exact commit being pushed, so a new tip
+/// (the worker committed a fix) resets the retry budget instead of staying
+/// stuck on a prior tip's give-up verdict.
+pub fn local_branch_tip(host: &Host, worktree: &Path, branch: &str) -> Option<String> {
+    let wt = worktree.to_string_lossy().into_owned();
+    let out = shelbi_ssh::run(
+        host,
+        [
+            "git",
+            "-C",
+            &wt,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ],
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
 }
 
 /// Read the exact tip `origin/<branch>` currently points at, querying the
@@ -1280,29 +1348,35 @@ fn origin_branch_tip(host: &Host, wt: &str, branch: &str) -> std::result::Result
     Ok(None)
 }
 
-/// Read the local remote-tracking ref `refs/remotes/origin/<branch>` — our
-/// last-known state of the remote, used as the `--force-with-lease` anchor.
-/// `None` when there's no tracking ref (branch never pushed with `-u` from this
-/// worktree, or a fetch never populated it).
-fn tracking_ref_sha(host: &Host, wt: &str, branch: &str) -> Option<String> {
-    let out = shelbi_ssh::run(
-        host,
-        [
-            "git",
-            "-C",
-            wt,
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/remotes/origin/{branch}^{{commit}}"),
-        ],
-    )
-    .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!sha.is_empty()).then_some(sha)
+/// Decide whether `remote` is safe to overwrite with a force-push of `local`:
+/// true when every commit reachable from `remote` but not from `local` has a
+/// patch-equivalent commit in `local` — i.e. `local` is a rebase/amend of
+/// `remote`'s work, so overwriting the remote tip loses no commit. False when
+/// `remote` carries at least one commit with no patch-equivalent in `local`
+/// (foreign work pushed by another clone): forcing would clobber it.
+///
+/// Implemented with `git cherry <local> <remote>`, which lists the commits
+/// reachable from `remote` but not from `local`, each prefixed `-` when `local`
+/// already has an equivalent patch (so it was rebased) or `+` when it does not
+/// (foreign). Any `+` line means the remote has unrebased work → not safe.
+///
+/// Conservative on error: a git failure (or output we can't parse) returns
+/// `false` so we refuse to force when we cannot *prove* containment. This runs
+/// entirely on local refs (no network) just after the live remote tip was
+/// fetched into the worktree, so an error here is a real local-git problem, not
+/// a transient, and blocking (never clobbering) is the safe default.
+fn remote_tip_contained_in_local(host: &Host, wt: &str, remote: &str, local: &str) -> bool {
+    let out = match shelbi_ssh::run(host, ["git", "-C", wt, "cherry", local, remote]) {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Every listed commit must be `-` (patch-equivalent present in `local`).
+    // A single `+` line is a foreign commit → not contained.
+    !stdout
+        .lines()
+        .map(str::trim)
+        .any(|l| l.starts_with('+'))
 }
 
 /// Push `worktree`'s local `branch` tip to `origin` so a handoff hands off the
@@ -1321,13 +1395,31 @@ fn tracking_ref_sha(host: &Host, wt: &str, branch: &str) -> Option<String> {
 /// - Local tip already on origin → [`PushOutcome::UpToDate`], no push.
 /// - Remote tip is an ancestor of the local tip (ordinary progress) or the
 ///   branch is new on origin → fast-forward `git push`.
-/// - Remote tip is *not* an ancestor (rebase/amend rewrote the branch) →
-///   `git push --force-with-lease=<branch>:<observed-remote-tip>`. The lease
-///   pins the exact tip just observed, so a concurrent push landing between the
-///   observation and our push aborts the force instead of being clobbered.
-/// - Any failure (rejected push, lease stale, git error) →
+/// - Remote tip is *not* an ancestor (rebase/amend rewrote the branch), **and**
+///   the local branch patch-contains the remote tip's commits (it is a rebase
+///   of that work — see [`remote_tip_contained_in_local`]) →
+///   `git push --force-with-lease=<branch>:<freshly-read-remote-tip>` on the
+///   **first** attempt. Leasing against the live tip just read means the lease
+///   matches immediately on a quiescent remote, so the force lands at once
+///   instead of looping. The containment check — not the lease — is what makes
+///   the force safe against a foreign push; the lease only guards the tiny
+///   read→push window (if origin changes in it, the lease aborts → `Failed`,
+///   retried next tick).
+/// - Remote tip is *not* an ancestor and carries commits the local branch does
+///   NOT patch-contain (foreign work from another clone) → [`PushOutcome::Blocked`];
+///   we refuse to force (forcing would clobber it) and the caller stops retrying
+///   and surfaces it for a human.
+/// - Any transient failure (rejected push, lease race, git error) →
 ///   [`PushOutcome::Failed`]; the caller must NOT hand the task off on the
-///   stale remote tip.
+///   stale remote tip, and retries it (capped) next tick.
+///
+/// History: this used to lease against the stale local remote-tracking ref
+/// (`refs/remotes/origin/<branch>`), which the handoff loop never refreshes for
+/// the task branch (its rebase step fetches only the *base* branch). When that
+/// ref didn't match the live remote tip, the force was rejected as `stale info`
+/// every tick and the handoff looped for over an hour until some unrelated fetch
+/// happened to refresh the ref. Leasing against the freshly-read live tip and
+/// guarding safety with the explicit containment check above removes that loop.
 ///
 /// Pushes the durable branch ref (`refs/heads/<branch>`), not `HEAD` — a prior
 /// step may have detached the worktree's HEAD, but the branch ref is what the
@@ -1406,21 +1498,31 @@ pub fn push_workspace_branch_to_origin(host: &Host, worktree: &Path, branch: &st
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
     let mut argv: Vec<String> = vec!["git".into(), "-C".into(), wt.clone(), "push".into()];
     if forced {
-        // Lease against our *last-known* remote state — the remote-tracking ref
-        // `refs/remotes/origin/<branch>`, which after the workspace's initial
-        // `push -u` (and an un-fetched local rebase/amend) still holds the tip
-        // we ourselves last published. Leasing against that, NOT the fresh
-        // `origin_branch_tip` read above, is what makes the force safe: if a
-        // *different* clone advanced origin since our last push, the tracking
-        // ref won't match the live tip and git aborts the force instead of
-        // clobbering the unseen commit. Leasing against the just-read live tip
-        // would defeat that guard (it would always match). Fall back to the
-        // observed tip only when there is no tracking ref to lease against
-        // (best-effort; still guards the read→push window).
-        let lease = tracking_ref_sha(host, &wt, branch)
-            .or_else(|| remote_sha.clone())
-            .unwrap_or_default();
-        argv.push(format!("--force-with-lease={branch}:{lease}"));
+        // The remote tip was rewritten out from under us. Only overwrite it if
+        // the local branch *patch-contains* that tip — i.e. the local branch is
+        // a rebase/amend of the remote's commits, not a divergent branch that
+        // dropped foreign work. If the remote carries commits the local branch
+        // doesn't contain, refuse to force (forcing would clobber them) and let
+        // the caller surface it to a human. This content check — not the lease —
+        // is the real safety guard against clobbering a concurrent push.
+        let remote = remote_sha.as_deref().unwrap_or_default();
+        if !remote_tip_contained_in_local(host, &wt, remote, &local_sha) {
+            return PushOutcome::Blocked {
+                reason: format!(
+                    "remote_has_unrebased_commits:origin_tip_{}_not_contained_in_local",
+                    remote.get(..7).unwrap_or(remote),
+                ),
+            };
+        }
+        // Lease against the freshly-read live remote tip (`origin_branch_tip`
+        // above). On a quiescent remote it matches on the first attempt, so the
+        // force lands immediately rather than looping on `stale info` the way a
+        // stale remote-tracking-ref lease did (see the function doc's History).
+        // The lease still guards the tiny read→push window: if origin advances
+        // between that read and this push, the live tip no longer equals the
+        // lease and git aborts the force (→ `Failed`, retried next tick) instead
+        // of clobbering the unseen commit.
+        argv.push(format!("--force-with-lease={branch}:{remote}"));
     }
     argv.push("origin".into());
     argv.push(refspec);
@@ -11675,16 +11777,17 @@ mod push_git_tests {
     }
 
     #[test]
-    fn force_with_lease_refuses_to_clobber_a_concurrent_push() {
-        // The lease pins the tip we observed. If a *different* clone advances
-        // origin between our observation and our push, the force must be
-        // rejected (not silently overwrite the other push) so the handoff
-        // blocks rather than losing a concurrent commit.
+    fn blocks_rather_than_clobbering_a_remote_with_foreign_commits() {
+        // A *different* clone pushed real work onto origin/feature that our
+        // local branch does not contain. Force-pushing would clobber it, so the
+        // push must refuse to force — returning `Blocked` (terminal, surfaced to
+        // a human) rather than attempting the push at all — and leave origin
+        // exactly as the concurrent push left it.
         if !git_available() {
             eprintln!("skipping: git not on PATH");
             return;
         }
-        let (repo, bare) = init_repo_with_origin("lease-race");
+        let (repo, bare) = init_repo_with_origin("foreign-commits");
 
         run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
         commit_file(&repo, "feature.txt", "v0\n", "feature v0");
@@ -11698,8 +11801,8 @@ mod push_git_tests {
         run_git_in(&repo, &["checkout", "-q", "feature"]);
         assert!(run_git_in(&repo, &["rebase", "-q", "main"]).status.success());
 
-        // A second clone advances origin/feature out from under us — this is
-        // the concurrent push the lease exists to detect.
+        // A second clone advances origin/feature with a commit that is NOT a
+        // rebase of our work — genuine foreign work.
         let other = repo.with_file_name(format!(
             "{}-other",
             repo.file_name().unwrap().to_string_lossy()
@@ -11719,12 +11822,14 @@ mod push_git_tests {
             .success());
         let concurrent_tip = origin_tip(&bare, "feature");
 
-        // Our push observed the pre-race tip; the lease must now fail.
+        // The remote carries a commit our local branch doesn't contain → block,
+        // don't force.
         let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
         assert!(
-            matches!(&outcome, PushOutcome::Failed { .. }),
-            "stale lease must fail the push, got {outcome:?}"
+            matches!(&outcome, PushOutcome::Blocked { .. }),
+            "a remote with foreign commits must block, got {outcome:?}"
         );
+        assert!(outcome.is_blocked() && !outcome.handed_off_local_tip());
         assert_eq!(
             origin_tip(&bare, "feature"),
             concurrent_tip,
@@ -11734,6 +11839,58 @@ mod push_git_tests {
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&bare);
         let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn rebased_branch_leases_against_the_fresh_tip_and_lands_on_the_first_push() {
+        // The incident: a branch rebased onto a moved base (its remote tip is a
+        // patch-equivalent of the local work, just at an old sha) must force on
+        // the FIRST attempt, leasing against the freshly-read live remote tip —
+        // not loop rejecting `stale info`. We assert the push both lands and
+        // used a lease pinned to the observed remote tip (so a concurrent push
+        // in the read→push window would still have aborted it).
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, bare) = init_repo_with_origin("lease-fresh-tip");
+
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "feature\n", "feature work");
+        assert!(run_git_in(&repo, &["push", "-q", "-u", "origin", "feature"])
+            .status
+            .success());
+        let remote_tip = origin_tip(&bare, "feature");
+
+        // Rebase onto an advanced main — rewrites the feature commit to a new
+        // sha that is a patch-equivalent of the pushed one (safe to force).
+        run_git_in(&repo, &["checkout", "-q", "main"]);
+        commit_file(&repo, "prereq.txt", "prereq\n", "prereq landed");
+        run_git_in(&repo, &["checkout", "-q", "feature"]);
+        assert!(run_git_in(&repo, &["rebase", "-q", "main"]).status.success());
+        let reworked = head_sha(&repo);
+        assert_ne!(reworked, remote_tip);
+
+        // Deliberately leave the local remote-tracking ref STALE: an un-fetched
+        // worktree is exactly the incident's state. The old code leased against
+        // this ref and could reject; the fix leases against the live tip read
+        // inside the push, so the force lands on the first attempt regardless.
+        let tracked = branch_sha(&repo, "origin/feature");
+        assert_eq!(tracked, remote_tip, "tracking ref starts at the pushed tip");
+
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        match &outcome {
+            PushOutcome::Pushed { forced, local_sha, remote_before } => {
+                assert!(*forced, "a rebased branch must force");
+                assert_eq!(local_sha, &reworked);
+                assert_eq!(remote_before.as_deref(), Some(remote_tip.as_str()));
+            }
+            other => panic!("expected a forced Pushed on the first attempt, got {other:?}"),
+        }
+        assert_eq!(origin_tip(&bare, "feature"), reworked);
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&bare);
     }
 }
 

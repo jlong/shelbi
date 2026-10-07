@@ -3714,15 +3714,154 @@ fn rebase_workspace_branch_before_handoff(
     }
 }
 
+/// Max transient handoff-push failures for one local tip before the push is
+/// declared terminally blocked and retries stop. The common case (a rebased
+/// branch leasing against the freshly-read remote tip) lands on the first
+/// attempt, so this only bounds a genuinely stuck push — a persistent network
+/// outage, or a lease that keeps racing — instead of the unbounded ~every-10s
+/// loop the incident showed (482 retries over ~75 minutes before a force
+/// finally landed).
+const MAX_HANDOFF_PUSH_ATTEMPTS: u32 = 5;
+
+/// Parsed [`workspace_push_blocked_marker`] body: the handoff-push retry state
+/// for the current local tip. Encoded as `<tip> <attempts> <retry|blocked>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PushRetryLedger {
+    /// The local branch tip these counts apply to. A different tip (the worker
+    /// committed a fix) resets the budget.
+    tip: String,
+    /// Transient failures seen so far for `tip`.
+    attempts: u32,
+    /// True once the push is terminally blocked for `tip` (a foreign-commit
+    /// refusal, or the retry cap exceeded): the poller stops re-attempting.
+    blocked: bool,
+}
+
+impl PushRetryLedger {
+    fn parse(s: &str) -> Option<Self> {
+        let mut it = s.split_whitespace();
+        let tip = it.next()?.to_string();
+        let attempts = it.next()?.parse().ok()?;
+        let blocked = matches!(it.next(), Some("blocked"));
+        Some(Self { tip, attempts, blocked })
+    }
+
+    fn encode(&self) -> String {
+        format!(
+            "{} {} {}",
+            self.tip,
+            self.attempts,
+            if self.blocked { "blocked" } else { "retry" }
+        )
+    }
+
+    /// True when a recorded ledger says the push is terminally blocked for
+    /// exactly `tip` — the poller then skips the push without re-attempting or
+    /// re-emitting.
+    fn blocks(prior: Option<&PushRetryLedger>, tip: &str) -> bool {
+        matches!(prior, Some(p) if p.blocked && p.tip == tip)
+    }
+}
+
+/// What the poller should do with a failed handoff push. Pure decision over the
+/// prior ledger, the current tip, and whether the push was *terminally* blocked
+/// (a [`PushOutcome::Blocked`] foreign-commit refusal) vs a transient failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PushFailureAction {
+    /// Keep retrying next tick; emit `push status=failed`. Carries the updated
+    /// ledger to persist.
+    Retry(PushRetryLedger),
+    /// Stop retrying; emit `push status=blocked`, nudge the worker. `cap` is
+    /// true when the block is from exhausting [`MAX_HANDOFF_PUSH_ATTEMPTS`]
+    /// transient retries (vs an immediate foreign-commit refusal), so the event
+    /// reason can say which. Carries the updated (blocked) ledger.
+    Block { ledger: PushRetryLedger, cap: bool },
+}
+
+/// Pure retry policy: given the prior ledger (if any), the current local `tip`,
+/// and whether the outcome was a terminal block, decide the next ledger + the
+/// action. A terminal block stops immediately; a transient failure increments
+/// the per-tip attempt count and blocks once it reaches
+/// [`MAX_HANDOFF_PUSH_ATTEMPTS`]. A failure on a *different* tip than the ledger
+/// records starts its count fresh.
+fn decide_push_failure(
+    prior: Option<&PushRetryLedger>,
+    tip: &str,
+    terminal_block: bool,
+) -> PushFailureAction {
+    let prior_attempts = prior.filter(|p| p.tip == tip).map(|p| p.attempts).unwrap_or(0);
+    if terminal_block {
+        return PushFailureAction::Block {
+            ledger: PushRetryLedger {
+                tip: tip.to_string(),
+                attempts: prior_attempts,
+                blocked: true,
+            },
+            cap: false,
+        };
+    }
+    let attempts = prior_attempts.saturating_add(1);
+    if attempts >= MAX_HANDOFF_PUSH_ATTEMPTS {
+        PushFailureAction::Block {
+            ledger: PushRetryLedger {
+                tip: tip.to_string(),
+                attempts,
+                blocked: true,
+            },
+            cap: true,
+        }
+    } else {
+        PushFailureAction::Retry(PushRetryLedger {
+            tip: tip.to_string(),
+            attempts,
+            blocked: false,
+        })
+    }
+}
+
+/// The in-pane message a worker gets when its handoff push is terminally
+/// blocked — names the branch and why, so it's actionable without reading
+/// `events.log`. (Workers can't force-push themselves; this tells them exactly
+/// what a human needs to untangle.)
+fn push_blocked_message(branch: &str, cap: bool, reason: &str) -> String {
+    if cap {
+        format!(
+            "Handoff push blocked: pushing `{branch}` to origin kept failing \
+             ({reason}) and hit the retry cap, so Shelbi stopped retrying. The \
+             ready marker is still in place. Check origin / the network; once \
+             the cause is resolved, re-touch the branch (a new commit) to retry."
+        )
+    } else {
+        format!(
+            "Handoff push blocked: origin/`{branch}` carries commit(s) your local \
+             branch does not contain ({reason}), so Shelbi refused to force-push \
+             over them (it would clobber that work). A human needs to reconcile \
+             origin/`{branch}` with your branch. The ready marker is still in \
+             place; once the branch is a clean rebase of origin, the handoff \
+             retries automatically."
+        )
+    }
+}
+
 /// Push the workspace's local branch tip to `origin` before the handoff's
 /// column move, so review / the PR see the exact reconciled commit rather than
 /// a stale pre-rework remote tip.
 ///
 /// Returns `true` when the handoff may proceed — the remote now carries the
 /// local tip (`up-to-date`, `pushed`, `force-pushed`) or the repo has no origin
-/// to strand it on (`no-remote`). Returns `false` on a genuine push failure
-/// (rejected, lease stale, network), in which case the caller must NOT advance
-/// the task: the ready marker is left in place so the push retries next tick.
+/// to strand it on (`no-remote`). Returns `false` when the push did not hand off
+/// the local tip, in which case the caller must NOT advance the task:
+///
+/// - A **transient** failure (rejected, lease race, network) leaves the ready
+///   marker in place and retries next tick, but only up to
+///   [`MAX_HANDOFF_PUSH_ATTEMPTS`] times for the same local tip — then it is
+///   declared blocked rather than looped forever (the incident this fixes).
+/// - A **terminal block** (origin carries foreign commits a force would clobber,
+///   or the retry cap was hit) emits `push status=blocked`, nudges the worker,
+///   and stops re-attempting: subsequent ticks skip the push entirely until the
+///   worker changes the branch tip. The retry/block state is tracked in the
+///   per-workspace [`workspace_push_blocked_marker`] sidecar.
+///
 /// Every outcome is written to `events.log` so a blocked handoff is traceable.
 ///
 /// Resolution mirrors [`rebase_workspace_branch_before_handoff`]; a resolution
@@ -3762,17 +3901,47 @@ fn push_workspace_branch_before_handoff(
     };
 
     let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
+    let marker = shelbi_orchestrator::workspace::workspace_push_blocked_marker(machine, workspace);
+
+    // Key the retry ledger on the exact local tip we're about to push, so a
+    // worker that commits a fix gets a fresh retry budget (its new tip won't
+    // match a prior tip's give-up verdict). Unreadable tip → empty key: the cap
+    // still bounds the loop, we just can't detect a tip change.
+    let tip = shelbi_orchestrator::workspace::local_branch_tip(host, &worktree, &branch)
+        .unwrap_or_default();
+    let prior = shelbi_orchestrator::workspace::read_deferred_marker(host, &marker)
+        .ok()
+        .flatten()
+        .and_then(|s| PushRetryLedger::parse(&s));
+
+    // Already terminally blocked for this exact tip: don't re-attempt the push
+    // (no tight loop) and don't re-emit — it was surfaced once already. Leave
+    // the card in-progress with the ready marker in place; a new commit resets
+    // the ledger and the handoff retries.
+    if PushRetryLedger::blocks(prior.as_ref(), &tip) {
+        tracing::debug!(
+            workspace = %workspace.name,
+            task = %task_id,
+            branch = %branch,
+            "handoff push terminally blocked for the current tip; skipping (surfaced earlier)",
+        );
+        return false;
+    }
+
     let outcome = shelbi_orchestrator::workspace::push_workspace_branch_to_origin(
         host, &worktree, &branch,
     );
 
     let status = outcome.status_token();
     let detail = outcome.detail();
-    if let Err(e) = append_push_event(task_id, &workspace.name, &branch, status, &detail) {
-        tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_push_event failed");
-    }
 
     if outcome.handed_off_local_tip() {
+        // Success (or no-remote): the local tip is on origin. Clear any retry
+        // ledger so a future failure starts fresh.
+        let _ = shelbi_orchestrator::workspace::clear_deferred_marker(host, &marker);
+        if let Err(e) = append_push_event(task_id, &workspace.name, &branch, status, &detail) {
+            tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_push_event failed");
+        }
         tracing::info!(
             workspace = %workspace.name,
             task = %task_id,
@@ -3781,17 +3950,60 @@ fn push_workspace_branch_before_handoff(
             detail = %detail,
             "handoff push outcome",
         );
-        true
-    } else {
-        tracing::warn!(
-            workspace = %workspace.name,
-            task = %task_id,
-            branch = %branch,
-            detail = %detail,
-            "handoff push failed; the local branch tip was NOT handed off to origin",
-        );
-        false
+        return true;
     }
+
+    // Failed or Blocked. Drive the retry ledger: a transient failure retries
+    // (capped), a terminal block (foreign commits) stops immediately.
+    let action = decide_push_failure(prior.as_ref(), &tip, outcome.is_blocked());
+    match action {
+        PushFailureAction::Retry(ledger) => {
+            let _ = shelbi_orchestrator::workspace::write_deferred_marker(
+                host,
+                &marker,
+                &ledger.encode(),
+            );
+            if let Err(e) = append_push_event(task_id, &workspace.name, &branch, "failed", &detail) {
+                tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_push_event failed");
+            }
+            tracing::warn!(
+                workspace = %workspace.name,
+                task = %task_id,
+                branch = %branch,
+                attempts = ledger.attempts,
+                detail = %detail,
+                "handoff push failed; will retry next tick (capped)",
+            );
+        }
+        PushFailureAction::Block { ledger, cap } => {
+            let _ = shelbi_orchestrator::workspace::write_deferred_marker(
+                host,
+                &marker,
+                &ledger.encode(),
+            );
+            let reason = if cap {
+                format!("retry-cap-exceeded:{detail}")
+            } else {
+                detail.clone()
+            };
+            if let Err(e) =
+                append_push_event(task_id, &workspace.name, &branch, "blocked", &reason)
+            {
+                tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_push_event failed");
+            }
+            let body = push_blocked_message(&branch, cap, &reason);
+            shelbi_orchestrator::workspace::push_worker_directive(host, &worktree, task_id, &body);
+            tracing::warn!(
+                workspace = %workspace.name,
+                task = %task_id,
+                branch = %branch,
+                cap = cap,
+                reason = %reason,
+                "handoff push blocked; stopping retries and surfacing for a human",
+            );
+        }
+    }
+    false
 }
 
 /// Detach the finishing worker's worktree from its task branch after a ready
@@ -8862,10 +9074,12 @@ transitions:
 
     #[test]
     fn review_marker_blocks_handoff_when_push_to_origin_fails() {
-        // A failed push (here: a stale force-with-lease because origin was
-        // advanced by a concurrent clone) must NOT hand the task off on the
-        // stale remote tip: the task stays in-progress, the ready marker is left
-        // in place to retry, and a `push ... status=failed` line is emitted.
+        // Origin was advanced by a concurrent clone with a commit our branch
+        // does not contain. The handoff push must refuse to force over it
+        // (clobbering foreign work) and NOT hand the task off: the task stays
+        // in-progress, the ready marker is left in place, origin keeps the
+        // concurrent commit, and a terminal `push ... status=blocked` line is
+        // emitted (surfaced for a human) rather than looping on a failed force.
         if !git_available() {
             eprintln!("skipping: git not on PATH");
             return;
@@ -8998,27 +9212,42 @@ transitions:
         );
         assert!(
             marker.exists(),
-            "the ready marker must be left in place so the push retries next tick",
+            "the ready marker must be left in place (a new commit retries)",
         );
         // Origin still carries the concurrent commit — nothing was clobbered.
         assert_eq!(
             String::from_utf8_lossy(&git_in(&bare, &["rev-parse", "shelbi/fix-login"]).stdout)
                 .trim(),
             concurrent_tip,
-            "the concurrent push must survive; our force must have been rejected",
+            "the concurrent push must survive; we must have refused to force",
         );
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         assert!(
             log.lines().any(|l| l.contains(" push ")
                 && l.contains(" task=fix-login ")
-                && l.contains(" status=failed ")),
-            "a failed push event must be emitted; log: {log:?}",
+                && l.contains(" status=blocked ")
+                && l.contains("unrebased")),
+            "a terminal blocked push event naming the divergence must be emitted; log: {log:?}",
         );
         assert!(
             !log.lines().any(|l| l.contains(" task=fix-login ")
                 && l.contains(" in_progress -> review ")),
             "no review transition must be logged; log: {log:?}",
+        );
+
+        // The block is terminal: the push-blocked sidecar records it so the next
+        // tick skips the push entirely rather than re-attempting (no tight loop).
+        let sidecar = shelbi_orchestrator::workspace::workspace_push_blocked_marker(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        let recorded = shelbi_orchestrator::workspace::read_deferred_marker(&Host::Local, &sidecar)
+            .unwrap()
+            .expect("push-blocked sidecar must be written");
+        assert!(
+            recorded.ends_with(" blocked"),
+            "sidecar must mark the current tip terminally blocked; got {recorded:?}",
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -11920,6 +12149,113 @@ transitions:
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- handoff-push retry ledger ------------------------------------------
+
+    #[test]
+    fn push_retry_ledger_round_trips() {
+        let l = PushRetryLedger {
+            tip: "abc123".into(),
+            attempts: 3,
+            blocked: true,
+        };
+        assert_eq!(PushRetryLedger::parse(&l.encode()), Some(l.clone()));
+        let r = PushRetryLedger {
+            tip: "def456".into(),
+            attempts: 1,
+            blocked: false,
+        };
+        assert_eq!(PushRetryLedger::parse(&r.encode()), Some(r));
+        // Garbage / empty parses to None rather than a bogus ledger.
+        assert_eq!(PushRetryLedger::parse(""), None);
+        assert_eq!(PushRetryLedger::parse("onlytip"), None);
+    }
+
+    #[test]
+    fn push_blocks_only_a_matching_blocked_tip() {
+        let blocked = PushRetryLedger {
+            tip: "abc".into(),
+            attempts: 5,
+            blocked: true,
+        };
+        assert!(PushRetryLedger::blocks(Some(&blocked), "abc"));
+        // A different tip (worker committed a fix) is NOT blocked.
+        assert!(!PushRetryLedger::blocks(Some(&blocked), "xyz"));
+        // A non-blocked (still-retrying) ledger never short-circuits.
+        let retrying = PushRetryLedger {
+            tip: "abc".into(),
+            attempts: 2,
+            blocked: false,
+        };
+        assert!(!PushRetryLedger::blocks(Some(&retrying), "abc"));
+        assert!(!PushRetryLedger::blocks(None, "abc"));
+    }
+
+    #[test]
+    fn transient_push_failures_retry_then_block_at_the_cap() {
+        // Drive the pure policy through repeated transient failures on one tip:
+        // it must retry (incrementing) up to the cap, then block — never loop
+        // unbounded (the incident was 482 retries).
+        let tip = "sha-1";
+        let mut prior: Option<PushRetryLedger> = None;
+        let mut blocked_at = None;
+        for attempt in 1..=(MAX_HANDOFF_PUSH_ATTEMPTS + 3) {
+            match decide_push_failure(prior.as_ref(), tip, false) {
+                PushFailureAction::Retry(l) => {
+                    assert!(!l.blocked);
+                    assert_eq!(l.attempts, attempt);
+                    assert!(attempt < MAX_HANDOFF_PUSH_ATTEMPTS);
+                    prior = Some(l);
+                }
+                PushFailureAction::Block { ledger, cap } => {
+                    assert!(cap, "a transient cap-exceed must be a cap block");
+                    assert!(ledger.blocked);
+                    assert_eq!(ledger.attempts, MAX_HANDOFF_PUSH_ATTEMPTS);
+                    blocked_at = Some(attempt);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            blocked_at,
+            Some(MAX_HANDOFF_PUSH_ATTEMPTS),
+            "must block exactly at the retry cap"
+        );
+    }
+
+    #[test]
+    fn foreign_commit_block_is_terminal_on_the_first_failure() {
+        // A terminal block (PushOutcome::Blocked — origin has foreign commits)
+        // stops immediately, with no transient retries first.
+        let action = decide_push_failure(None, "sha-1", true);
+        match action {
+            PushFailureAction::Block { ledger, cap } => {
+                assert!(!cap, "a foreign-commit block is not a cap block");
+                assert!(ledger.blocked);
+                assert_eq!(ledger.attempts, 0);
+            }
+            other => panic!("expected an immediate Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_new_tip_resets_the_retry_budget() {
+        // After blocking on one tip, a failure on a *different* tip starts its
+        // own fresh count — the worker's fix shouldn't inherit the old verdict.
+        let old = PushRetryLedger {
+            tip: "old".into(),
+            attempts: MAX_HANDOFF_PUSH_ATTEMPTS,
+            blocked: true,
+        };
+        match decide_push_failure(Some(&old), "new", false) {
+            PushFailureAction::Retry(l) => {
+                assert_eq!(l.tip, "new");
+                assert_eq!(l.attempts, 1, "a new tip starts counting from zero");
+                assert!(!l.blocked);
+            }
+            other => panic!("expected a fresh Retry for the new tip, got {other:?}"),
+        }
     }
 }
 
