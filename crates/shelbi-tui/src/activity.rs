@@ -168,6 +168,11 @@ pub enum SystemKind {
     Dispatch,
     /// `rebase task=… workspace=… status=…` — a branch rebased onto base.
     Rebase,
+    /// `push task=… workspace=… branch=… status=up-to-date|pushed|force-pushed|failed|blocked detail=…`
+    /// — the handoff push of a workspace branch to origin. The `blocked` /
+    /// `failed` cases are the ones that stall a task in-progress, so the feed
+    /// surfaces them in a warning tint instead of leaving them unparsed.
+    Push,
     /// `worktree-detach task=… workspace=… status=…` — a worktree released.
     WorktreeDetach,
     /// `merge task=… workspace=… base=… status=ok|failed detail=…` — an
@@ -1022,6 +1027,26 @@ pub fn parse_event_line(line: &str) -> Event {
             target: kv.get("task").cloned(),
             status: kv.get("status").cloned(),
             detail: kv.get("workspace").cloned(),
+            raw,
+        });
+    }
+
+    if let Some(body) = rest.strip_prefix("push ") {
+        let kv = parse_kv(body);
+        // The `detail=` tail carries the force range on success or the reason
+        // on a failed / blocked push; keep it as the row's dim tail so the feed
+        // shows *why* a handoff didn't advance. A `-` placeholder collapses to None.
+        let detail = kv
+            .get("detail")
+            .filter(|d| d.as_str() != "-")
+            .map(|d| humanize_token(d));
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Push,
+            project,
+            target: kv.get("task").cloned(),
+            status: kv.get("status").cloned(),
+            detail,
             raw,
         });
     }
@@ -1902,6 +1927,12 @@ fn render_system_event(
                 system_task_title(app, sys.target.as_deref()),
             )
         }
+        SystemKind::Push => (
+            system_chip("push"),
+            "pushed",
+            push_status_color(status),
+            system_task_title(app, sys.target.as_deref()),
+        ),
         SystemKind::WorktreeDetach => {
             let (name, color) = agent_display(sys.detail.as_deref());
             let ok = status == Some("ok");
@@ -2043,6 +2074,17 @@ fn detail_secondary(sys: &SystemEvent) -> Option<String> {
         SystemKind::Dispatch | SystemKind::Rebase | SystemKind::WorktreeDetach => {
             sys.status.as_deref().map(humanize_token)
         }
+        SystemKind::Push => {
+            // Status token, plus the reason/range tail so a blocked or failed
+            // push shows *why* the handoff didn't advance, not just that it didn't.
+            let status = sys.status.as_deref().map(humanize_token);
+            match (status, sys.detail.as_deref()) {
+                (Some(s), Some(reason)) => Some(format!("{s}: {reason}")),
+                (Some(s), None) => Some(s),
+                (None, Some(reason)) => Some(reason.to_string()),
+                (None, None) => None,
+            }
+        }
         SystemKind::Merge => {
             // The status token, plus the refusal reason when the merge failed,
             // so the feed shows *why* an accept-merge didn't land.
@@ -2070,6 +2112,7 @@ fn event_task_id(ev: &Event) -> Option<&str> {
         Event::System(sys) => match sys.kind {
             SystemKind::Dispatch
             | SystemKind::Rebase
+            | SystemKind::Push
             | SystemKind::WorktreeDetach
             | SystemKind::Merge
             | SystemKind::Message => sys.target.as_deref(),
@@ -2113,6 +2156,19 @@ fn rebase_status_color(status: Option<&str>) -> Color {
     match status {
         Some("conflict") => Color::LightRed,
         Some("succeeded") => Color::Green,
+        _ => Color::Gray,
+    }
+}
+
+/// Tint for a handoff-`push` row. `blocked` (a force refused over foreign
+/// commits, or the retry cap hit — a human must step in) is the loud red;
+/// `failed` (a transient reject still retrying) is yellow; everything that
+/// handed the tip off reads calm (green for a real push, gray for a no-op).
+fn push_status_color(status: Option<&str>) -> Color {
+    match status {
+        Some("blocked") => Color::LightRed,
+        Some("failed") => Color::Yellow,
+        Some("pushed") | Some("force-pushed") => Color::Green,
         _ => Color::Gray,
     }
 }
@@ -3009,7 +3065,7 @@ mod tests {
 
     #[test]
     fn parses_the_required_infra_kinds_without_unknown_fallback() {
-        // Acceptance — ssh/dispatch/rebase/worktree-detach/closed/handoff
+        // Acceptance — ssh/dispatch/rebase/push/worktree-detach/closed/handoff
         // each classify to a structured System event, never Unknown.
         let cases: &[(&str, SystemKind, Option<&str>, Option<&str>)] = &[
             (
@@ -3023,6 +3079,12 @@ mod tests {
                 SystemKind::Rebase,
                 Some("t"),
                 Some("up-to-date"),
+            ),
+            (
+                "2026-07-22T14:00:00+00:00 push task=t workspace=alpha branch=b status=blocked detail=remote_has_unrebased_commits",
+                SystemKind::Push,
+                Some("t"),
+                Some("blocked"),
             ),
             (
                 "2026-07-22T14:00:00+00:00 worktree-detach task=t workspace=alpha detached-from=b status=ok",
