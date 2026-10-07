@@ -11,10 +11,14 @@ use std::time::Duration;
 /// so it reads as a subtle fill rather than a coloured accent.
 pub const SELECTION_BG: Color = Color::Rgb(63, 63, 63);
 
-/// Fill for the sidebar's search box — a darker gray than [`SELECTION_BG`] so
-/// the box reads as a quiet, always-present input affordance rather than an
-/// active selection. Matches the Figma `color/search` token (#292929).
-pub const SEARCH_BG: Color = Color::Rgb(41, 41, 41);
+/// Fill for the sidebar's search box — a quieter gray than [`SELECTION_BG`] so
+/// the box reads as an always-present input affordance rather than an active
+/// selection. The Figma `color/search` token is #292929, which reads clearly
+/// on Figma's near-black sidebar but all but vanishes on a lighter terminal
+/// default background (John's Ghostty is ~#1c1c1c). We nudge it up to #333333
+/// so the box stays clearly lighter than the sidebar on real dark terminals
+/// while remaining distinctly darker than the #3f3f3f selection fill.
+pub const SEARCH_BG: Color = Color::Rgb(51, 51, 51);
 
 /// The glyph painted down the sidebar's rightmost column as the resize
 /// drag handle — a full-height light vertical rule.
