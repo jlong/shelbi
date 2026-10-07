@@ -365,9 +365,15 @@ impl Backend {
     /// Reap "alive but not listening" zombie sessions sharing `target`'s logical
     /// name when a newer live sibling (a replacement) also exists — terminating
     /// each zombie's process and removing its directory, so duplicates don't
-    /// accumulate. Local-only and best-effort; returns the reaped short ids. See
+    /// accumulate. Local-only and best-effort; returns each reaped short id paired
+    /// with the supervision action to log for it (`"reap-wedged"` for a session
+    /// that accepts but never answers, `"reap-zombie"` for a refusing one). See
     /// [`SessionProcessBackend::reap_zombies`](crate::session_process_backend::SessionProcessBackend::reap_zombies).
-    pub fn reap_zombie_duplicates(&self, host: &Host, target: &SessionTarget) -> Vec<String> {
+    pub fn reap_zombie_duplicates(
+        &self,
+        host: &Host,
+        target: &SessionTarget,
+    ) -> Vec<(String, &'static str)> {
         if host.is_ssh() {
             return Vec::new();
         }

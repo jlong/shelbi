@@ -330,6 +330,46 @@ impl Connection {
     }
 }
 
+/// Whether the session at an already-connected `stream` answers the hello
+/// handshake within `timeout` — the round-trip a supervision liveness probe
+/// needs to tell a healthy listener from a *wedged* session that accepts the
+/// connection and then never replies.
+///
+/// A bare `connect` cannot distinguish the two: a session whose per-connection
+/// handlers are all blocked still completes the TCP/Unix accept, so every connect
+/// succeeds even though no client can attach
+/// (`rt-review-session-wedges-after-repeated-attaches`). This sends a hello and
+/// waits for the reply under a bounded read, so a silent session surfaces instead
+/// of looking alive.
+///
+/// A **throwaway** probe: it borrows the stream, exchanges the hello, and returns
+/// — it does **not** start a reader thread or build a [`Connection`]. The caller
+/// drops `stream` right after, closing the probe connection so the session winds
+/// its handler down. Returns `Ok(())` when the session answered,
+/// [`ClientError::HandshakeTimeout`] when it stayed silent past the deadline, and
+/// [`ClientError::UnexpectedEof`] when it dropped the connection before replying
+/// (both of which the caller reads as "not answering").
+pub fn probe_handshake(stream: &UnixStream, timeout: Duration) -> Result<(), ClientError> {
+    stream.set_read_timeout(Some(timeout)).map_err(ClientError::Io)?;
+    stream.set_write_timeout(Some(timeout)).map_err(ClientError::Io)?;
+    let hello = Frame::Hello(Hello {
+        protocol_version: PROTOCOL_VERSION,
+        colors: None,
+        capabilities: Vec::new(),
+    })
+    .encode()?;
+    {
+        // `&UnixStream` is `Write`, so we can write without consuming the stream.
+        let mut w: &UnixStream = stream;
+        w.write_all(&hello)?;
+        w.flush()?;
+    }
+    // `&UnixStream` is `Read`; `read_session_hello` maps a timed-out read to
+    // `HandshakeTimeout` and an EOF-before-hello to `UnexpectedEof`.
+    let mut r: &UnixStream = stream;
+    read_session_hello(&mut r).map(|_| ())
+}
+
 /// Read frames from `stream` until the session's [`Hello`] arrives, returning the
 /// announced capabilities and the session's protocol version.
 ///

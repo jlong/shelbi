@@ -21,6 +21,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use shelbi_proto::{
     decode_any, AnyFrame, ExtFrame, Frame, Hello, InfoData, Resync, SnapshotData,
@@ -33,6 +34,23 @@ use crate::session::Shared;
 /// disconnected if it did not negotiate `resync`), so the PTY reader never
 /// blocks and memory stays bounded.
 const CLIENT_QUEUE_LIMIT: usize = 2048;
+
+/// How long a single socket write to a client may stall before the client is
+/// treated as dead and its connection torn down.
+///
+/// A client that keeps its socket open but stops reading (it navigated away
+/// without closing, or wedged) eventually fills the kernel send buffer, at which
+/// point a blocking `write` to it never returns. Without a bound the writer
+/// thread parks in that `write` forever, [`serve_client`]'s `writer.join()` then
+/// blocks forever too, and the pair of threads plus the connection's three file
+/// descriptors leak — one pair per abandoned attach, until the process runs out
+/// of descriptors and can serve no new connection
+/// (`rt-review-session-wedges-after-repeated-attaches`). A write that makes *no*
+/// progress for this long means the peer is gone: the writer errors out of
+/// `write_all`, winds the connection down, and releases its threads and fds. A
+/// merely *slow* client still drains a little each `write` and is never dropped
+/// here — the bounded [`Outbox`] and its [`Resync`] recovery handle backlog.
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 // Capability bits, derived from a client's hello capability list. Stored in an
 // `AtomicU16` on the channel so the broadcast path reads them lock-free.
@@ -311,7 +329,9 @@ pub fn serve_client(stream: UnixStream, shared: Arc<Shared>) {
     let writer = {
         let ch = ch.clone();
         let shared = shared.clone();
-        std::thread::spawn(move || client_writer(ch, write_half, shared, shutdown_half))
+        std::thread::spawn(move || {
+            client_writer(ch, write_half, || shared.resync_base(), shutdown_half)
+        })
     };
 
     let _ = read_loop(stream, &shared, &ch);
@@ -325,12 +345,24 @@ pub fn serve_client(stream: UnixStream, shared: Arc<Shared>) {
 
 /// The per-client writer: drain the outbox to the socket, refreshing a
 /// lagging client with a [`Resync`] replay before resuming live output.
+///
+/// `resync_base` yields the `(seq, replay)` a backpressure refresh sends (the
+/// session passes [`Shared::resync_base`](crate::session::Shared::resync_base));
+/// taking it as a closure rather than `Arc<Shared>` keeps the loop testable in
+/// isolation.
 fn client_writer(
     ch: Arc<ClientChannel>,
     mut sock: UnixStream,
-    shared: Arc<Shared>,
+    resync_base: impl Fn() -> (u64, Vec<u8>),
     shutdown_half: Option<UnixStream>,
 ) {
+    // Bound every write so a client that stopped reading can never park this
+    // thread (and the reader's `writer.join()`) forever. A stall past the
+    // timeout surfaces as a `WouldBlock`/`TimedOut` error from `write_all`,
+    // which the loop below treats like any other write failure: tear the
+    // connection down. See [`CLIENT_WRITE_TIMEOUT`].
+    let _ = sock.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
+
     loop {
         let (batch, do_resync) = {
             let mut st = ch.out.lock().unwrap();
@@ -350,7 +382,7 @@ fn client_writer(
         };
 
         if do_resync {
-            let (seq, replay) = shared.resync_base();
+            let (seq, replay) = resync_base();
             match ExtFrame::Resync(Resync { seq, replay }).encode() {
                 Ok(bytes) if sock.write_all(&bytes).is_ok() => {}
                 _ => break,
@@ -493,5 +525,113 @@ pub fn info_data(shared: &Shared) -> InfoData {
         argv: meta.argv.clone(),
         cwd: meta.cwd.to_string_lossy().into_owned(),
         child_running: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    /// Join `handle` within `timeout`, returning whether it finished. The join
+    /// runs on a helper thread so a writer that never winds down leaks that
+    /// thread instead of hanging the test forever.
+    fn join_within(handle: std::thread::JoinHandle<()>, timeout: Duration) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(timeout).is_ok()
+    }
+
+    /// Shrink a socket's send/receive buffers so a modest queue is guaranteed to
+    /// fill them — making "the write blocks" deterministic regardless of the
+    /// platform's (auto-tuned, sometimes multi-MB) default buffer size.
+    fn shrink_buffer(stream: &UnixStream, opt: libc::c_int) {
+        let size: libc::c_int = 1024;
+        unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                opt,
+                &size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    #[test]
+    fn a_writer_to_a_client_that_never_reads_winds_down_within_the_timeout() {
+        // The wedge this fixes: a client keeps its socket open but stops reading,
+        // so the kernel buffers fill and a write to it blocks. Without a bound the
+        // writer parks in that write forever (and `serve_client`'s `writer.join()`
+        // with it), leaking the pair of threads and the connection's descriptors.
+        // With the write timeout the blocked write errors out and the writer winds
+        // down (`rt-review-session-wedges-after-repeated-attaches`).
+        let (session_side, client_side) = UnixStream::pair().unwrap();
+        // Tiny buffers on both ends so the queued frames below cannot be absorbed
+        // without a reader: the write is forced to block on the silent peer.
+        shrink_buffer(&session_side, libc::SO_SNDBUF);
+        shrink_buffer(&client_side, libc::SO_RCVBUF);
+        let ch = Arc::new(ClientChannel::new(1));
+        ch.mark_attached(true);
+
+        // Queue well past the (now tiny) socket buffer, so the writer is
+        // guaranteed to block on a write to the never-reading `client_side`.
+        let big = vec![0u8; 64 * 1024];
+        for _ in 0..16 {
+            ch.enqueue_priority(&big);
+        }
+
+        let shutdown_half = session_side.try_clone().ok();
+        let writer = {
+            let ch = ch.clone();
+            std::thread::spawn(move || {
+                client_writer(ch, session_side, || (0, Vec::new()), shutdown_half)
+            })
+        };
+
+        let start = Instant::now();
+        let wound_down = join_within(writer, CLIENT_WRITE_TIMEOUT + Duration::from_secs(10));
+        assert!(
+            wound_down,
+            "the writer blocked forever on a non-reading client instead of timing out",
+        );
+        // It genuinely stalled on the write (rather than erroring instantly),
+        // then wound down — within a slack of the timeout to tolerate a timer that
+        // fires a touch early under load.
+        assert!(
+            start.elapsed() >= CLIENT_WRITE_TIMEOUT / 2,
+            "it wound down before the write could even stall ({:?})",
+            start.elapsed(),
+        );
+
+        // `client_side` is held open the whole time (the point of the test); drop
+        // it only now.
+        drop(client_side);
+    }
+
+    #[test]
+    fn a_clean_close_winds_the_writer_down_promptly() {
+        // The common path: the client closes its end. The writer, parked on the
+        // condvar with nothing to send, must wake and return as soon as the
+        // channel is closed — never wait out the write timeout.
+        let (session_side, client_side) = UnixStream::pair().unwrap();
+        let ch = Arc::new(ClientChannel::new(2));
+        let shutdown_half = session_side.try_clone().ok();
+        let writer = {
+            let ch = ch.clone();
+            std::thread::spawn(move || {
+                client_writer(ch, session_side, || (0, Vec::new()), shutdown_half)
+            })
+        };
+        drop(client_side);
+        ch.close();
+        assert!(
+            join_within(writer, Duration::from_secs(2)),
+            "a closed channel must wind the writer down at once",
+        );
     }
 }

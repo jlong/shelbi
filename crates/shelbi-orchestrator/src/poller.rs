@@ -4165,10 +4165,12 @@ fn review_slot_has_loaded_marker(
 /// status), emit a `supervision=gave-up reason=crash-loop` line when the
 /// crash-loop cap trips, or do nothing.
 /// Reap any "alive but not listening" zombie session sharing this slot's name
-/// with a newer live sibling, logging one `supervision=reap-zombie` line per
-/// reaped session. Local panes only (a remote machine reaps its own). Runs every
-/// tick but is a no-op unless a real duplicate is present
-/// (`rt-re-entering-a-review-fails-to-attach`).
+/// with a newer live sibling, logging one supervision line per reaped session —
+/// `supervision=reap-wedged` for one that accepts connections but never answers,
+/// `supervision=reap-zombie` for one whose socket refuses connects. Local panes
+/// only (a remote machine reaps its own). Runs every tick but is a no-op unless a
+/// real duplicate is present (`rt-re-entering-a-review-fails-to-attach`,
+/// `rt-review-session-wedges-after-repeated-attaches`).
 fn maybe_reap_zombie_sessions(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
@@ -4178,11 +4180,11 @@ fn maybe_reap_zombie_sessions(
     if !matches!(host, shelbi_core::Host::Local) {
         return;
     }
-    for short_id in backend().reap_zombie_duplicates(host, addr) {
+    for (short_id, action) in backend().reap_zombie_duplicates(host, addr) {
         if let Err(e) = shelbi_state::append_supervision_event(
             &project.name,
             Some(&workspace.name),
-            "reap-zombie",
+            action,
             &short_id,
         ) {
             tracing::warn!(workspace = %workspace.name, error = %e, "append_supervision_event failed");
@@ -4190,6 +4192,7 @@ fn maybe_reap_zombie_sessions(
         tracing::info!(
             workspace = %workspace.name,
             session = %short_id,
+            action,
             "reaped an alive-but-not-listening zombie session beside its live replacement",
         );
     }
