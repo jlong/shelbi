@@ -18,9 +18,11 @@ mod reachability;
 mod layout_sub;
 mod markdown;
 pub mod overlay;
+mod panel;
 mod review_panel;
 mod shell;
 mod sidebar;
+mod workspace_panel;
 pub mod theme;
 
 #[cfg(test)]

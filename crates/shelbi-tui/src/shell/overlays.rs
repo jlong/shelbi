@@ -994,7 +994,7 @@ mod tests {
             project_label: "alpha".into(),
             nav: vec![
                 NavItem {
-                    label: "Chat".into(),
+                    label: "Orchestrator".into(),
                     view: View::Session("orch".into()),
                 },
                 NavItem {

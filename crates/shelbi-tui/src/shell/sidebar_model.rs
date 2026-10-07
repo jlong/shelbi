@@ -108,7 +108,10 @@ pub(crate) fn read_sidebar_model(project: &str) -> Option<SidebarModel> {
 fn nav_items() -> Vec<NavItem> {
     vec![
         NavItem {
-            label: "Chat".into(),
+            // The first nav item is the orchestrator chat. Labelled
+            // "Orchestrator" per the Figma (the glyph stays 💬); the palette
+            // entry derives from this label, so it aligns too.
+            label: "Orchestrator".into(),
             view: View::Session("orch".into()),
         },
         NavItem {

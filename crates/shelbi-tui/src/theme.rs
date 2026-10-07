@@ -85,6 +85,11 @@ pub const FG_SECONDARY: Color = Color::Rgb(186, 186, 186);
 /// with [`PALETTE_GREEN`] (`#5acd25`) for Approve on the actions row.
 pub const ACTION_RED: Color = Color::Rgb(224, 79, 82);
 
+/// The workspace panel's "IN PROGRESS" status yellow (`#dbc300` in the Figma) —
+/// a saturated gold, distinct from the terminal's ANSI yellow, for the status
+/// label beside the back button while a workspace's agent is working.
+pub const STATUS_YELLOW: Color = Color::Rgb(0xdb, 0xc3, 0x00);
+
 /// The glyph painted down the sidebar's rightmost column as the resize
 /// drag handle and right-edge divider — a full-height left one-eighth block
 /// (`▏`, the Figma `color/divider` rule) that reads as a thin border.

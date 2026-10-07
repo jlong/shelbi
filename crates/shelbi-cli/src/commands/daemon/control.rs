@@ -32,7 +32,8 @@ use std::time::Duration;
 use shelbi_orchestrator::mutate::{self, MutateError, OutputSink};
 use shelbi_proto::control::{
     self, ChangeNote, ClientMsg, MutationError, MutationKind, MutationRequest, ReviewRole,
-    ReviewSessionOp, ReviewSessionRequest, ServerMsg, Stream, CONTROL_PROTOCOL_VERSION,
+    ReviewSessionOp, ReviewSessionRequest, ServerMsg, Stream, WorkspaceSessionOp,
+    WorkspaceSessionRequest, CONTROL_PROTOCOL_VERSION,
 };
 use shelbi_state::CLIENT_VERSION;
 
@@ -375,6 +376,12 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 let tx = tx.clone();
                 thread::spawn(move || run_review_session_job(req, tx));
             }
+            ClientMsg::WorkspaceSession(req) => {
+                // The dev-workspace twin of ReviewSession; detached for the same
+                // reason (the daemon owns the editor/diff sessions' lifetime).
+                let tx = tx.clone();
+                thread::spawn(move || run_workspace_session_job(req, tx));
+            }
         }
     }
 
@@ -509,6 +516,43 @@ fn run_review_session_job(req: ReviewSessionRequest, tx: Sender<ServerMsg>) {
                 );
             }
             loaded.map(|_| ())
+        }
+    };
+    match result {
+        Ok(()) => {
+            let _ = tx.send(ServerMsg::Done { request_id });
+        }
+        Err(e) => {
+            let _ = tx.send(ServerMsg::Failed {
+                request_id,
+                error: MutationError::Backend {
+                    message: e.to_string(),
+                },
+            });
+        }
+    }
+}
+
+/// Carry out one workspace-session request (the workspace-sidebar task):
+/// start/stop a dev workspace's editor/diff content sessions through
+/// [`shelbi_orchestrator::workspace_session`], then report the result keyed by
+/// `request_id`. The dev-workspace twin of [`run_review_session_job`]; like it,
+/// these are not issue mutations, so they skip the per-issue lock and recheck —
+/// the orchestrator calls are idempotent and best-effort.
+fn run_workspace_session_job(req: WorkspaceSessionRequest, tx: Sender<ServerMsg>) {
+    use shelbi_orchestrator::review_session::ReviewContentRole;
+    use shelbi_orchestrator::workspace_session;
+    let request_id = req.request_id;
+    let result = match req.op {
+        WorkspaceSessionOp::Ensure { role } => {
+            let role = match role {
+                ReviewRole::Editor => ReviewContentRole::Editor,
+                ReviewRole::Diff => ReviewContentRole::Diff,
+            };
+            workspace_session::ensure_content_session(&req.project, &req.workspace, role)
+        }
+        WorkspaceSessionOp::Close => {
+            workspace_session::close_content(&req.project, &req.workspace)
         }
     };
     match result {

@@ -31,7 +31,11 @@ use crate::error::ProtoError;
 /// project/Shelbi quit and reload-clients messages
 /// ([`ClientMsg::QuitProject`], [`ClientMsg::QuitShelbi`],
 /// [`ClientMsg::ReloadClients`] / [`ServerMsg::Reexec`] — `rt-tui-project-quit`).
-pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
+///
+/// v3 adds [`ClientMsg::WorkspaceSession`] (the TUI asks the daemon to
+/// start/stop a dev workspace's editor/diff content sessions for the workspace
+/// sidebar — the dev-workspace twin of `ReviewSession`).
+pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
 
 /// Upper bound on a single control frame. Generous enough for a large issue body
 /// in an `edit`/`add`, far below the session [`crate::MAX_FRAME_LEN`].
@@ -225,6 +229,32 @@ pub struct ReviewSessionRequest {
     pub op: ReviewSessionOp,
 }
 
+/// What the client wants done with a dev workspace's editor/diff content
+/// sessions (the workspace-sidebar task). The dev-workspace twin of
+/// [`ReviewSessionOp`], keyed by the workspace name rather than a review task.
+/// Reuses [`ReviewRole`] (`Editor` / `Diff`) — the roles are identical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceSessionOp {
+    /// Ensure the `role` session for this workspace is spawned and live, so the
+    /// client can attach a terminal view to it. Idempotent.
+    Ensure { role: ReviewRole },
+    /// End this workspace's editor and diff content sessions. The agent session
+    /// is left running. Idempotent.
+    Close,
+}
+
+/// Client → daemon request to manage a dev workspace's editor/diff content
+/// sessions (the workspace-sidebar task). Replies reuse [`ServerMsg::Done`] /
+/// [`ServerMsg::Failed`] keyed by `request_id`, like a mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSessionRequest {
+    pub request_id: u64,
+    pub project: String,
+    /// The dev workspace whose content sessions these are.
+    pub workspace: String,
+    pub op: WorkspaceSessionOp,
+}
+
 /// Client → daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
@@ -256,6 +286,11 @@ pub enum ClientMsg {
     /// (`rt-tui-review`). The daemon owns their lifetime so they outlive a
     /// client detach; the client only attaches terminal views.
     ReviewSession(ReviewSessionRequest),
+    /// Start or stop a dev workspace's editor/diff content sessions (the
+    /// workspace-sidebar task). The dev-workspace twin of [`Self::ReviewSession`]:
+    /// the daemon owns their lifetime so they outlive a client detach; the client
+    /// only attaches terminal views. Protocol v3.
+    WorkspaceSession(WorkspaceSessionRequest),
 }
 
 /// Why a mutation did not run (or could not be accepted). `Display` is the

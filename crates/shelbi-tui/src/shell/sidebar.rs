@@ -87,6 +87,12 @@ impl SidebarChrome {
             ),
         }
     }
+
+    /// The resolved palette-open chord (e.g. `⌃P`, `Ctrl+Space`), for callers
+    /// that show the chord outside the sidebar — the idle-workspace placeholder.
+    pub fn palette(&self) -> &str {
+        &self.palette
+    }
 }
 
 /// One laid-out sidebar row.
@@ -937,7 +943,7 @@ fn right_align(
 
 /// Uppercase the first character of a lowercase identifier (`developer` →
 /// `Developer`). Empty input is preserved.
-fn title_case(s: &str) -> String {
+pub(crate) fn title_case(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
@@ -1125,7 +1131,9 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 
 pub(crate) fn nav_glyph(label: &str) -> &'static str {
     match label {
-        "Chat" => "💬",
+        // "Orchestrator" is the orchestrator-chat nav item (was "Chat"); the
+        // glyph is unchanged.
+        "Orchestrator" => "💬",
         "Issues" => "📋",
         "Activity" => "⚡",
         "Machines" => "🖥",
@@ -1179,7 +1187,7 @@ mod tests {
     fn nav() -> Vec<NavItem> {
         vec![
             NavItem {
-                label: "Chat".into(),
+                label: "Orchestrator".into(),
                 view: View::Session("orch".into()),
             },
             NavItem {
@@ -1303,7 +1311,7 @@ mod tests {
         let chat = render_rows(&model, 0, 24, 20); // Chat
         let activity = render_rows(&model, 2, 24, 20); // Activity
 
-        for label in ["Chat", "Issues", "Activity"] {
+        for label in ["Orchestrator", "Issues", "Activity"] {
             assert_eq!(
                 row_y(&chat, label),
                 row_y(&activity, label),
@@ -1311,7 +1319,7 @@ mod tests {
             );
         }
         assert_eq!(
-            row_y(&chat, "Issues") - row_y(&chat, "Chat"),
+            row_y(&chat, "Issues") - row_y(&chat, "Orchestrator"),
             2,
             "one separator line always sits between adjacent nav items"
         );
@@ -1359,7 +1367,7 @@ mod tests {
         assert_eq!(buf[(0, above)].symbol(), " ", "the bleed gutter stays blank");
         assert_eq!(buf[(width - 1, above)].symbol(), " ", "the bleed right gutter stays blank");
         // Unselected items keep plain blank separators.
-        let chat_y = row_y(&rows, "Chat");
+        let chat_y = row_y(&rows, "Orchestrator");
         assert!(
             rows[chat_y - 1].trim().is_empty(),
             "the line above unselected Chat stays blank, got: {:?}",
@@ -1373,7 +1381,7 @@ mod tests {
             buf[(issues_x, issues_y)].modifier.contains(Modifier::BOLD),
             "selected nav label is bold"
         );
-        let chat_x = rows[chat_y].find('C').unwrap() as u16;
+        let chat_x = rows[chat_y].find('O').unwrap() as u16;
         assert_eq!(buf[(chat_x, chat_y as u16)].fg, TEXT, "unselected nav label is #bababa");
         assert_eq!(buf[(chat_x, chat_y as u16)].bg, BACKGROUND, "unselected nav label has no fill");
         assert!(
@@ -1805,7 +1813,7 @@ mod tests {
         let view = SidebarView::build(&empty_model());
         let area = Rect { x: 0, y: 0, width: 40, height: 20 };
         // Header is 6 rows (0 blank, 1 title, 2 blank, 3–5 box); the nav's
-        // leading separator is row 6, so the first nav item ("Chat") sits on
+        // leading separator is row 6, so the first nav item ("Orchestrator") sits on
         // row 7.
         assert_eq!(view.hit(area, 3, 7), Some(0), "first nav item is on row 7 and selects index 0");
         assert_eq!(view.hit(area, 3, 6), None, "the nav separator row is not selectable");
@@ -1985,7 +1993,7 @@ mod tests {
         let rows = render_rows(&model, 0, 40, 30);
 
         // Nav: item lines map to their ordinal; separators map to nothing.
-        let chat_y = row_y(&rows, "Chat") as u16;
+        let chat_y = row_y(&rows, "Orchestrator") as u16;
         assert_eq!(v.hit(area, 2, chat_y), Some(0), "Chat → ordinal 0");
         assert_eq!(v.hit(area, 2, chat_y - 1), None, "the separator above Chat is inert");
         let activity_y = row_y(&rows, "Activity") as u16;

@@ -265,7 +265,8 @@ impl SidebarModel {
             project_label: project_label.into(),
             nav: vec![
                 NavItem {
-                    label: "Chat".into(),
+                    // The orchestrator chat nav item; see the sidebar builder.
+                    label: "Orchestrator".into(),
                     view: View::Session("orch".into()),
                 },
                 NavItem {
