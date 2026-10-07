@@ -87,6 +87,21 @@ impl Selection {
         self.anchor == self.focus
     }
 
+    /// Whether the cell at grid `line`/`col` falls inside the (stream)
+    /// selection. Mirrors [`extract_stream`]'s geometry so the on-screen
+    /// highlight matches exactly what a copy would yield: the start line is
+    /// selected from `start.col` on, the end line up to `end.col`, and every
+    /// line in between is selected whole.
+    pub fn contains(&self, line: i32, col: u16) -> bool {
+        let (start, end) = self.range();
+        if line < start.line || line > end.line {
+            return false;
+        }
+        let after_start = line > start.line || col >= start.col;
+        let before_end = line < end.line || col <= end.col;
+        after_start && before_end
+    }
+
     /// Extract the selected text from `grid` as a stream selection (the whole
     /// run from start to end, not a rectangle). Lines that the emulator marked
     /// as wrapped are joined without a newline, matching `capture-pane -J`;
@@ -204,6 +219,47 @@ mod tests {
     #[test]
     fn single_click_is_empty() {
         assert!(Selection::start(Point::new(0, 0)).is_empty());
+    }
+
+    #[test]
+    fn contains_matches_stream_geometry() {
+        // A selection from (0,2) to (2,3): partial first and last lines, whole
+        // middle line.
+        let mut s = Selection::start(Point::new(0, 2));
+        s.update(Point::new(2, 3));
+        // First line: only from column 2 on.
+        assert!(!s.contains(0, 1));
+        assert!(s.contains(0, 2));
+        assert!(s.contains(0, 99));
+        // Middle line: every column.
+        assert!(s.contains(1, 0));
+        assert!(s.contains(1, 99));
+        // Last line: only up to column 3.
+        assert!(s.contains(2, 3));
+        assert!(!s.contains(2, 4));
+        // Outside the line range.
+        assert!(!s.contains(-1, 2));
+        assert!(!s.contains(3, 0));
+    }
+
+    #[test]
+    fn contains_is_direction_independent() {
+        // A drag the other way selects the same cells.
+        let mut s = Selection::start(Point::new(2, 3));
+        s.update(Point::new(0, 2));
+        assert!(s.contains(0, 2));
+        assert!(s.contains(1, 50));
+        assert!(s.contains(2, 3));
+        assert!(!s.contains(2, 4));
+    }
+
+    #[test]
+    fn single_cell_selection_contains_only_itself() {
+        let s = Selection::start(Point::new(1, 5));
+        assert!(s.contains(1, 5));
+        assert!(!s.contains(1, 4));
+        assert!(!s.contains(1, 6));
+        assert!(!s.contains(0, 5));
     }
 
     #[test]

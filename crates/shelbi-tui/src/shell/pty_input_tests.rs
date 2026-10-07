@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use shelbi_client::{Connection, SessionEvent, SessionEvents};
 use shelbi_proto::capability;
 use shelbi_session::layout::SessionPaths;
@@ -32,6 +34,7 @@ const NONE: KeyModifiers = KeyModifiers::NONE;
 const CTRL: KeyModifiers = KeyModifiers::CONTROL;
 const ALT: KeyModifiers = KeyModifiers::ALT;
 const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
+const SUPER: KeyModifiers = KeyModifiers::SUPER;
 
 /// A connector that binds the shell's main area straight to an already-running
 /// session socket (the production [`super::session::LiveConnector`] discovers by
@@ -255,6 +258,117 @@ fn every_key_but_ctrl_space_reaches_the_agent_over_a_real_pty() {
         !out.contains(&0x00),
         "Ctrl+Space must not reach the agent (no NUL in the echoed stream): {out:?}"
     );
+}
+
+#[test]
+fn a_copy_chord_with_a_selection_is_not_forwarded_to_the_agent() {
+    // With text selected in the pane, Cmd+C (SUPER) and Ctrl+Shift+C copy the
+    // selection and are consumed by the shell — no stray `c` / Ctrl+C reaches
+    // the agent. Proven against a real PTY whose `cat` echoes what it receives.
+    let _lock = crate::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("SHELBI_HOME", home.path());
+    let name = "tuicopy/orch";
+    let id = shelbi_session::layout::derive_id_now(name);
+    let paths = SessionPaths::new(&home.path().join("sessions"), &id);
+
+    let args = RunArgs {
+        id: id.clone(),
+        name: name.to_string(),
+        cwd: std::env::temp_dir(),
+        cols: 80,
+        rows: 24,
+        task: None,
+        raw_output_log: false,
+        child_argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "stty raw -echo 2>/dev/null; exec cat".into(),
+        ],
+        manage_daemon: false,
+    };
+    let _session = std::thread::spawn(move || shelbi_session::run(args));
+    let sock = paths.sock();
+    wait_for(Duration::from_secs(5), || sock.exists().then_some(()))
+        .expect("the session socket should appear");
+    let _cleanup = Cleanup { sock: sock.clone() };
+
+    let (observer, obs_events) =
+        Connection::open(&sock, None, capability::ALL).expect("observer connects");
+    observer.attach(None).expect("observer attaches");
+    wait_for(Duration::from_secs(2), || {
+        obs_events
+            .try_recv()
+            .and_then(|ev| matches!(ev, SessionEvent::Resync { .. }).then_some(()))
+    });
+    let mut out: Vec<u8> = Vec::new();
+
+    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let mut st = ShellState::new("tuicopy", Arc::new(DirectConnector { sock: sock.clone() }), caps);
+    st.show(RowTarget::Session(SessionRef::Orchestrator));
+    wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        matches!(st.sessions.state(), MainState::Live(_)).then_some(())
+    })
+    .expect("the shell's main area should bind the session live");
+
+    // Put "hello world" in the pane (cat echoes it; `pump` feeds the output into
+    // the emulator) and wait until the pane's selection machinery can see it.
+    st.sessions.send_input(b"hello world");
+    let sz = Size::new(80, 24);
+    let has_text = wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        let p = st.sessions.live_pane_mut()?;
+        // A throwaway drag select to probe the grid contents.
+        p.on_mouse(&mev(MouseEventKind::Down(MouseButton::Left), 0, 0), 0, 0, sz);
+        p.on_mouse(&mev(MouseEventKind::Drag(MouseButton::Left), 4, 0), 4, 0, sz);
+        p.on_mouse(&mev(MouseEventKind::Up(MouseButton::Left), 4, 0), 4, 0, sz);
+        (p.selection_copy().as_deref() == Some("hello")).then_some(())
+    });
+    assert!(has_text.is_some(), "the pane should hold a selectable \"hello\"");
+
+    // From here the agent must receive nothing from the copy chords.
+    let before = out.len();
+    st.handle_key(KeyEvent::new(KeyCode::Char('c'), SUPER)); // Cmd+C
+    st.handle_key(KeyEvent::new(KeyCode::Char('c'), CTRL | SHIFT)); // Ctrl+Shift+C
+    let settle = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle {
+        pump(&mut st);
+        drain(&obs_events, &mut out);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !out[before..].contains(&b'c') && !out[before..].contains(&0x03),
+        "a copy chord must not forward `c` or Ctrl+C to the agent: {:?}",
+        &out[before..],
+    );
+    // The selection survives the copy (the chord does not clear it).
+    assert_eq!(
+        st.sessions.live_pane_mut().unwrap().selection_copy().as_deref(),
+        Some("hello"),
+        "the copy chord leaves the selection in place",
+    );
+
+    // A normal key still reaches the agent and dismisses the selection.
+    st.handle_key(KeyEvent::new(KeyCode::Char('z'), NONE));
+    let saw_z = wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        drain(&obs_events, &mut out);
+        contains(&out[before..], b"z").then_some(())
+    });
+    assert!(saw_z.is_some(), "a normal key still reaches the agent: {:?}", &out[before..]);
+    assert!(
+        st.sessions.live_pane_mut().unwrap().selection_copy().is_none(),
+        "a session keypress clears the selection",
+    );
+}
+
+/// A pane-relative mouse event with no modifiers, for driving a selection.
+fn mev(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent { kind, column, row, modifiers: NONE }
 }
 
 #[test]
