@@ -84,6 +84,10 @@ struct ReviewOpenParams {
     worktree: String,
     editor_name: String,
     has_review_url: bool,
+    /// The reviewed task, for the panel's title / description preview and the
+    /// full-description popover (`None` when the store couldn't produce it).
+    /// Boxed — it's large — so [`ResolvedReview`]'s variants stay balanced.
+    task: Option<Box<shelbi_state::IssueFile>>,
 }
 
 /// How a review-open resolve landed off the UI thread (`rt-tui-review-load-queued`):
@@ -130,6 +134,7 @@ impl ReviewBackend for DaemonReviewBackend {
                 worktree: info.worktree,
                 editor_name: info.editor_name,
                 has_review_url: info.has_review_url,
+                task: info.task,
             })),
             ReviewOpenTarget::Queued { title } => {
                 // List the free review slots (the only loadable ones here — a
@@ -1597,6 +1602,7 @@ impl ShellState {
             p.worktree,
             p.editor_name,
             p.has_review_url,
+            p.task.map(|b| *b),
         ));
         self.reported_main = None; // re-report size for the content view
         self.status = None;
@@ -1781,6 +1787,19 @@ impl ShellState {
             }
             ReviewAction::Reject => {
                 self.overlay = Some(ActiveOverlay::reject_reason(task));
+            }
+            ReviewAction::ShowDescription => {
+                // Open the board's task-detail popover over the main area. The
+                // overlay owns its own copy of the task, so the review content
+                // session keeps running underneath (overlay and review are
+                // independent fields). Esc / j/k drive the popover while it's up.
+                if let Some(tf) = review.task().cloned() {
+                    self.overlay = Some(ActiveOverlay::task_description(
+                        tf,
+                        self.keymaps.clone(),
+                        self.display_style,
+                    ));
+                }
             }
             ReviewAction::OpenBrowser | ReviewAction::RevealFolder => {
                 // Openers run inline (spawn+detach); failures land on the status.
@@ -3214,6 +3233,7 @@ mod tests {
             "/wt",
             "Vim",
             true,
+            None,
         ));
         st.client.focus_main();
         // Ctrl+H targets the review panel; client focus stays on main.
@@ -3227,6 +3247,57 @@ mod tests {
         // the panel (the same guard Tab uses) but never leaves the review.
         st.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
         assert_eq!(st.client.focus(), Focus::Main);
+    }
+
+    #[test]
+    fn show_description_opens_the_task_popover_over_the_live_review() {
+        // The review panel's More / `m` yields ReviewAction::ShowDescription,
+        // which opens the board's task-detail popover over the main area with
+        // the reviewed task's body — and the review (its content session) stays
+        // loaded underneath.
+        let mut st = test_state();
+        st.main_view = MainView::Review("t-1".into());
+        let ts = chrono::Utc::now();
+        let task = shelbi_state::IssueFile {
+            task: shelbi_core::Issue {
+                id: "t-1".into(),
+                title: "Cold-start cache".into(),
+                column: shelbi_core::Column::review(),
+                priority: 2,
+                assigned_to: None,
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                launch: None,
+                created_at: ts,
+                updated_at: ts,
+                params: Default::default(),
+            },
+            body: "## Summary\n\nWarm the application cache during startup.".into(),
+            tracker_assignees: Vec::new(),
+        };
+        st.review = Some(ReviewInterface::new(
+            "proj",
+            st.connector.clone(),
+            "t-1",
+            "review-1",
+            "/wt",
+            "Vim",
+            true,
+            Some(task),
+        ));
+        assert!(st.overlay.is_none(), "no overlay before More");
+        st.apply_review_action(ReviewAction::ShowDescription);
+        match &st.overlay {
+            Some(ActiveOverlay::TaskDescription { task, .. }) => {
+                assert_eq!(task.task.title, "Cold-start cache");
+                assert!(task.body.contains("Warm the application cache"));
+            }
+            _ => panic!("ShowDescription must open the task-description overlay"),
+        }
+        assert!(st.review.is_some(), "the review stays loaded under the popover");
     }
 
     #[test]
@@ -3508,6 +3579,7 @@ mod tests {
             "/tmp/wt",
             "vim",
             false,
+            None,
         ));
         // A 120-wide window: panel [0,28), content [28,120). Divider col = 27.
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
@@ -4030,6 +4102,7 @@ mod tests {
             "/tmp/wt",
             "vim",
             false,
+            None,
         ));
         st.show(RowTarget::Session(SessionRef::Orchestrator));
         assert!(matches!(st.main_view, MainView::Session));
@@ -4372,6 +4445,7 @@ mod tests {
             worktree: "/wt".into(),
             editor_name: "Vim".into(),
             has_review_url: false,
+            task: None,
         })));
         st.apply_layout_event(shelbi_state::LayoutEvent::ReviewOpened {
             workspace: "review-1".into(),

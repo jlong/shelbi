@@ -3383,16 +3383,65 @@ fn persist_move_step(
 // ---------------------------------------------------------------------------
 // Issue detail popover
 
+/// The 80%×80% centered box the task-detail popover fills within `area`.
+/// Exposed so the review interface's description popover (which reuses
+/// [`render_task_popover_into`]) sizes its overlay identically to the board's.
+pub(crate) fn popover_rect(area: Rect) -> Rect {
+    centered_rect(80, 80, area)
+}
+
 fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
-    let popover_area = centered_rect(80, 80, area);
+    let popover_area = popover_rect(area);
 
     // Clear underneath so the kanban columns don't bleed through.
     f.render_widget(Clear, popover_area);
 
+    // Gather the popover's inputs from the app, then hand them to the shared
+    // renderer. Cloning the open task (a small struct) and the columns map
+    // sidesteps the borrow conflict between reading the task and mutably
+    // clamping the popover's scroll; both are what the per-frame draw already
+    // did (`tf.body.clone()` + `task_columns()`).
+    let tf = app
+        .popover
+        .as_ref()
+        .and_then(|p| app.tasks.iter().find(|t| t.task.id == p.task_id))
+        .cloned();
     let columns = app.task_columns();
-    let (header_lines, body_text, title) = match app.popover_task() {
+    let style = app.display_style();
+    let Some(pop) = app.popover.as_mut() else {
+        return;
+    };
+    render_task_popover_into(
+        f,
+        popover_area,
+        tf.as_ref(),
+        &columns,
+        &mut pop.scroll,
+        &app.keymaps,
+        style,
+    );
+}
+
+/// Render the task-detail popover body into an already-centered, already-cleared
+/// `popover_area` (the caller owns the [`Clear`] so this can be reused by an
+/// overlay framework that clears its own rect). Shared by the kanban board's
+/// [`render_popover`] and the review interface's description popover so both
+/// show the same cyan-bordered box, metadata header, markdown body, and footer.
+/// `tf` is the task to show (`None` renders the "issue no longer exists" stub);
+/// `columns` resolves dependency labels; `scroll` is clamped against the wrapped
+/// body height in place.
+pub(crate) fn render_task_popover_into(
+    f: &mut Frame,
+    popover_area: Rect,
+    tf: Option<&IssueFile>,
+    columns: &HashMap<String, Column>,
+    scroll: &mut u16,
+    keymaps: &Keymaps,
+    style: DisplayStyle,
+) {
+    let (header_lines, body_text, title) = match tf {
         Some(tf) => (
-            popover_header(tf, &columns),
+            popover_header(tf, columns),
             tf.body.clone(),
             tf.task.title.clone(),
         ),
@@ -3452,20 +3501,16 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     // only saturate at the top and can't know the wrapped height.
     let total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let max_scroll = total_lines.saturating_sub(chunks[2].height);
-    if let Some(p) = app.popover.as_mut() {
-        if p.scroll > max_scroll {
-            p.scroll = max_scroll;
-        }
+    if *scroll > max_scroll {
+        *scroll = max_scroll;
     }
-    let scroll = app.popover.as_ref().map(|p| p.scroll).unwrap_or(0);
-    let body = Paragraph::new(lines).scroll((scroll, 0));
+    let body = Paragraph::new(lines).scroll((*scroll, 0));
     f.render_widget(body, chunks[2]);
 
     // First-chord-only: the popover's `close` and `scroll` actions each
     // carry several bindings (esc/enter/space/q, j/k/↑/↓), but the hint
     // shows just the first — the full list lives in `config list-actions`.
-    let km = app.keymaps();
-    let style = app.display_style();
+    let km = keymaps;
     let fc = |c| format_chord_or_unbound(c, style);
     let mut hint_text = format!(
         "  {}  close      {}/{}  scroll      {}  top      {}/{}  move col",
@@ -3480,10 +3525,7 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     // when assigned; offer the jump only then, so a card with no workspace
     // simply lacks the affordance rather than pressing `o` to no visible
     // effect (the popover covers the status line).
-    if app
-        .popover_task()
-        .is_some_and(|tf| tf.task.assigned_to.is_some())
-    {
+    if tf.is_some_and(|tf| tf.task.assigned_to.is_some()) {
         hint_text.push_str(&format!(
             "      {}  workspace",
             fc(km.popover.first_chord_for(PopoverAction::OpenWorkspace)),
@@ -3496,7 +3538,7 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     f.render_widget(Paragraph::new(hint), chunks[3]);
 }
 
-fn popover_header(tf: &IssueFile, columns: &HashMap<String, Column>) -> Vec<Line<'static>> {
+pub(crate) fn popover_header(tf: &IssueFile, columns: &HashMap<String, Column>) -> Vec<Line<'static>> {
     let task = &tf.task;
     let mut lines: Vec<Line<'static>> = Vec::new();
 

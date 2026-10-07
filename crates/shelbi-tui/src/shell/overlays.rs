@@ -25,9 +25,12 @@ use shelbi_app::command::{
 use shelbi_app::exec::EditTarget;
 use shelbi_app::nav::View;
 use shelbi_app::view::SidebarModel;
-use shelbi_core::ConfigMode;
+use std::collections::HashMap;
+
+use shelbi_core::{Column, ConfigMode};
 use shelbi_palette::{Decoration, DecorationColor, Entry};
-use shelbi_state::keymap::Keymaps;
+use shelbi_state::keymap::{DisplayStyle, Keymaps, PopoverAction};
+use shelbi_state::IssueFile;
 
 use crate::overlay::palette::ProjectEntry;
 use crate::overlay::{self, centered_pct, centered_rect};
@@ -88,6 +91,21 @@ pub enum ActiveOverlay {
     },
     AddProject {
         form: overlay::add_project::Form,
+    },
+    /// The full task-description popover, opened from the review panel's `More`
+    /// link. Reuses the board's task-detail renderer
+    /// ([`crate::kanban::render_task_popover_into`]) so the board and the review
+    /// show the same box; it owns its own copy of the task so the review content
+    /// session keeps running underneath.
+    TaskDescription {
+        /// Both the task and the keymaps are large; boxing them keeps the other
+        /// `ActiveOverlay` variants from paying this variant's size. The keymaps
+        /// render the footer's chord hints (the same ones the board popover
+        /// shows); keys are dispatched through the shell's live keymaps instead.
+        task: Box<IssueFile>,
+        scroll: u16,
+        keymaps: Box<Keymaps>,
+        style: DisplayStyle,
     },
 }
 
@@ -165,6 +183,18 @@ impl ActiveOverlay {
         }
     }
 
+    /// Open the task-description popover for `task` (the review panel's `More`).
+    /// `keymaps` / `style` render the footer's chord hints the same way the
+    /// board popover does.
+    pub fn task_description(task: IssueFile, keymaps: Keymaps, style: DisplayStyle) -> Self {
+        ActiveOverlay::TaskDescription {
+            task: Box::new(task),
+            scroll: 0,
+            keymaps: Box::new(keymaps),
+            style,
+        }
+    }
+
     /// Replace the palette's entry list on a background refresh (no-op for the
     /// other overlays).
     pub fn refresh_palette(&mut self, entries: Vec<Entry>) {
@@ -237,6 +267,38 @@ impl ActiveOverlay {
                     mode: form.mode(),
                 },
             },
+            ActiveOverlay::TaskDescription { scroll, .. } => {
+                // The popover is read-only here: Esc/q close it, j/k and the page
+                // chords scroll the body. The board's move / open-workspace
+                // chords (H/L/o, shown in the shared footer) have no target in a
+                // review, so they're inert.
+                let action = crate::keymap::chord_from_event(ev)
+                    .and_then(|c| keymaps.popover.dispatch(c));
+                match action {
+                    Some(PopoverAction::Close) => OverlayEvent::Close,
+                    Some(PopoverAction::ScrollDown) => {
+                        *scroll = scroll.saturating_add(1);
+                        OverlayEvent::Stay
+                    }
+                    Some(PopoverAction::ScrollUp) => {
+                        *scroll = scroll.saturating_sub(1);
+                        OverlayEvent::Stay
+                    }
+                    Some(PopoverAction::PageDown) => {
+                        *scroll = scroll.saturating_add(10);
+                        OverlayEvent::Stay
+                    }
+                    Some(PopoverAction::PageUp) => {
+                        *scroll = scroll.saturating_sub(10);
+                        OverlayEvent::Stay
+                    }
+                    Some(PopoverAction::ScrollHome) => {
+                        *scroll = 0;
+                        OverlayEvent::Stay
+                    }
+                    _ => OverlayEvent::Stay,
+                }
+            }
         }
     }
 
@@ -280,6 +342,14 @@ impl ActiveOverlay {
                 }
                 OverlayEvent::Stay
             }
+            ActiveOverlay::TaskDescription { scroll, .. } => {
+                match m.kind {
+                    MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(1),
+                    MouseEventKind::ScrollDown => *scroll = scroll.saturating_add(1),
+                    _ => {}
+                }
+                OverlayEvent::Stay
+            }
             _ => OverlayEvent::Stay,
         }
     }
@@ -301,6 +371,9 @@ impl ActiveOverlay {
             // paths and validation messages never truncate (the tmux dialog
             // filled the whole palette window for the same reason).
             ActiveOverlay::AddProject { .. } => centered_pct(area, 70, 60, 48, 14),
+            // The same 80%×80% centered box the board's task popover uses, so
+            // the review and the board show the task at the identical size.
+            ActiveOverlay::TaskDescription { .. } => crate::kanban::popover_rect(area),
         }
     }
 
@@ -329,6 +402,28 @@ impl ActiveOverlay {
                 overlay::zen_intro::render_intro(f, rect, state)
             }
             ActiveOverlay::AddProject { form } => form.render(f, rect),
+            ActiveOverlay::TaskDescription {
+                task,
+                scroll,
+                keymaps,
+                style,
+            } => {
+                // One-entry column map (the task's own column) — enough for the
+                // header's column label/colour; a review task's deps rarely show
+                // and resolve to `[missing]` either way, exactly as the board
+                // renders a dep it hasn't loaded.
+                let columns: HashMap<String, Column> =
+                    HashMap::from([(task.task.id.clone(), task.task.column.clone())]);
+                crate::kanban::render_task_popover_into(
+                    f,
+                    rect,
+                    Some(task.as_ref()),
+                    &columns,
+                    scroll,
+                    keymaps.as_ref(),
+                    *style,
+                );
+            }
         }
     }
 }
@@ -603,7 +698,37 @@ mod tests {
                 state: overlay::zen_intro::IntroState::default(),
             },
             ActiveOverlay::add_project(Path::new("/tmp/alpha")),
+            ActiveOverlay::task_description(
+                sample_task(),
+                keymaps(),
+                shelbi_state::keymap::DisplayStyle::Linux,
+            ),
         ]
+    }
+
+    /// A minimal review task for the description-popover overlay tests.
+    fn sample_task() -> IssueFile {
+        let ts = chrono::Utc::now();
+        IssueFile {
+            task: shelbi_core::Issue {
+                id: "t-1".into(),
+                title: "Cold-start cache".into(),
+                column: shelbi_core::Column::review(),
+                priority: 2,
+                assigned_to: Some("charlie".into()),
+                workflow: None,
+                branch: Some("shelbi/cold-start-cache".into()),
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                launch: None,
+                created_at: ts,
+                updated_at: ts,
+                params: std::collections::BTreeMap::new(),
+            },
+            body: "## Summary\n\nWarm the application cache during startup.".into(),
+            tracker_assignees: Vec::new(),
+        }
     }
 
     /// Draw `ov` the way the shell does: the whole buffer is first filled with a
@@ -805,6 +930,49 @@ mod tests {
             ov.handle_key(key(KeyCode::Esc), &keymaps()),
             OverlayEvent::ReviewCancelled
         );
+    }
+
+    #[test]
+    fn task_description_popover_shows_the_body_title_and_footer() {
+        // Reuses the board's task popover, so it carries the task title, the
+        // metadata header, the markdown body, and the scroll/close footer.
+        let mut ov = ActiveOverlay::task_description(
+            sample_task(),
+            keymaps(),
+            shelbi_state::keymap::DisplayStyle::Linux,
+        );
+        let (buf, rect) = draw_over_sentinel(&mut ov);
+        let text: String = (rect.top()..rect.bottom())
+            .map(|y| {
+                (rect.left()..rect.right())
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Cold-start cache"), "title shown: {text}");
+        assert!(text.contains("Warm the application cache"), "body shown: {text}");
+        assert!(text.contains("id: t-1"), "metadata header shown: {text}");
+        assert!(text.contains("scroll"), "footer hint shown: {text}");
+    }
+
+    #[test]
+    fn task_description_popover_scrolls_with_jk_and_closes_on_esc() {
+        let mut ov = ActiveOverlay::task_description(
+            sample_task(),
+            keymaps(),
+            shelbi_state::keymap::DisplayStyle::Linux,
+        );
+        // j scrolls down (Stay), k scrolls back.
+        assert_eq!(ov.handle_key(key(KeyCode::Char('j')), &keymaps()), OverlayEvent::Stay);
+        if let ActiveOverlay::TaskDescription { scroll, .. } = &ov {
+            assert_eq!(*scroll, 1, "j scrolled the body down one line");
+        } else {
+            panic!("expected the task-description overlay");
+        }
+        assert_eq!(ov.handle_key(key(KeyCode::Char('k')), &keymaps()), OverlayEvent::Stay);
+        // Esc closes it (returning to the review panel underneath).
+        assert_eq!(ov.handle_key(key(KeyCode::Esc), &keymaps()), OverlayEvent::Close);
     }
 
     #[test]
