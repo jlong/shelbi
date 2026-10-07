@@ -3741,11 +3741,11 @@ mod tests {
         let mut st = test_state();
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_main();
-        // Sidebar geometry: rows 0-3 are the header (title, blank, search box,
-        // blank), then the nav block interleaves items with separator lines —
-        // Chat on y=5, Issues on y=7, Activity on y=9 (even rows between are
-        // inert separators). Click Issues.
-        st.handle_mouse(left_click(2, 7));
+        // Sidebar geometry: rows 0-5 are the header (title, margin, the 2-row
+        // search box across rows 2-4, margin), then the nav block interleaves
+        // items with separator lines — Chat on y=7, Issues on y=9, Activity on
+        // y=11 (even rows between are inert separators). Click Issues.
+        st.handle_mouse(left_click(2, 9));
         assert_eq!(st.selection(), 1, "selection moved to Issues");
         assert!(
             matches!(st.main_view, MainView::Native(View::Issues)),
@@ -3754,8 +3754,8 @@ mod tests {
         // A native view keeps sidebar focus, exactly as Enter does.
         assert_eq!(st.client.focus(), Focus::Sidebar);
 
-        // Clicking Activity (y=9) switches the main area again.
-        st.handle_mouse(left_click(2, 9));
+        // Clicking Activity (y=11) switches the main area again.
+        st.handle_mouse(left_click(2, 11));
         assert_eq!(st.selection(), 2, "selection moved to Activity");
         assert!(matches!(st.main_view, MainView::Native(View::Activity)));
     }
@@ -3765,10 +3765,10 @@ mod tests {
         let mut st = test_state();
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_sidebar();
-        // After the nav block (ends y=10) comes a blank (y=11), the
-        // "— Workspaces —" header (y=12), then the single flat workspace alpha
-        // on y=13 (selectable ordinal 3).
-        st.handle_mouse(left_click(2, 13));
+        // After the nav block (ends y=12) comes a blank (y=13), the
+        // "— Workspaces —" header (y=14), then the single flat workspace alpha
+        // on y=15 (selectable ordinal 3).
+        st.handle_mouse(left_click(2, 15));
         assert_eq!(st.selection(), 3, "selection moved to alpha");
         assert!(
             matches!(st.main_view, MainView::Session),
@@ -3806,8 +3806,8 @@ mod tests {
         }));
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_sidebar();
-        // The single flat workspace `alpha` sits on y=13 (see the click test).
-        st.handle_mouse(left_click(2, 13));
+        // The single flat workspace `alpha` sits on y=15 (see the click test).
+        st.handle_mouse(left_click(2, 15));
         assert!(matches!(st.main_view, MainView::Session));
         assert_eq!(
             st.sessions.current_target(),
@@ -3962,15 +3962,15 @@ mod tests {
         // Open Activity first so we can prove a header/blank click doesn't change it.
         st.show(RowTarget::Native(View::Activity));
         let before = st.selection();
-        // y=12 is the "— Workspaces —" section header (header grew to 4 rows).
-        st.handle_mouse(left_click(2, 12));
+        // y=14 is the "— Workspaces —" section header (the header block is 6 rows).
+        st.handle_mouse(left_click(2, 14));
         assert_eq!(st.selection(), before, "a header click doesn't move the selection");
         assert!(
             matches!(st.main_view, MainView::Native(View::Activity)),
             "a header click opens nothing"
         );
-        // y=15 is blank space below the last row (alpha, y=13).
-        st.handle_mouse(left_click(2, 15));
+        // y=17 is blank space below the last row (alpha, y=15).
+        st.handle_mouse(left_click(2, 17));
         assert_eq!(st.selection(), before, "a blank click doesn't move the selection");
         assert!(matches!(st.main_view, MainView::Native(View::Activity)));
     }

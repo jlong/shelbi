@@ -226,8 +226,9 @@ impl SidebarView {
             .split(area);
         let body_region = outer[0];
         let footer = outer[1];
-        // Header holds the project title (row 0), a blank (row 1), the search
-        // box (row 2), and a blank (row 3); then the body.
+        // Header holds the project title (row 0), a half-row margin (row 1),
+        // the 2-row search box across rows 2–4 (`▄` / label / `▀`), and a
+        // half-row margin (row 5); then the body.
         let header_h = HEADER_H.min(body_region.height);
         let split = Layout::default()
             .direction(Direction::Vertical)
@@ -235,10 +236,12 @@ impl SidebarView {
             .split(body_region);
         let header = split[0];
         let body = split[1];
-        let search = (header.height > 2).then(|| {
+        // The box spans the three cell rows 2–4; it needs rows 2, 3 and 4
+        // present (height ≥ 5). The trailing margin (row 5) is optional.
+        let search = (header.height >= 5).then(|| {
             Rect {
                 y: header.y + 2,
-                height: 1,
+                height: 3,
                 ..header
             }
             .inner(LIST_INDENT)
@@ -361,7 +364,8 @@ impl SidebarView {
     }
 
     /// Render the header block: the project title in the accent cyan on the
-    /// first row, and the filled search box two rows below it.
+    /// first row, and the 2-row filled search box (with its half-block bleed)
+    /// two rows below it.
     fn render_header(
         &self,
         buf: &mut Buffer,
@@ -589,9 +593,11 @@ struct SidebarGeometry {
     footer: Rect,
 }
 
-/// Height of the header block: project title (row 0), a blank (row 1), the
-/// search box (row 2), and a blank (row 3).
-const HEADER_H: u16 = 4;
+/// Height of the header block: project title (row 0), a half-row margin
+/// (row 1), the 2-row search box drawn across three cell rows with the
+/// half-block bleed (rows 2–4: `▄` top, label, `▀` bottom), and a half-row
+/// margin (row 5). The nav block's own leading separator sits below that.
+const HEADER_H: u16 = 6;
 
 /// 1-col horizontal padding shared by the title, the search box, the nav
 /// labels, and the rest-of-list rows. The nav section's full-width fill
@@ -927,15 +933,40 @@ fn truncate_ellipsis(s: &str, max: usize) -> String {
     format!("{keep}…")
 }
 
-/// Draw the search box: a full-width filled bar with a `🔍 Search` label on the
-/// left and a right-aligned palette-chord hint (e.g. `⌃P`). The whole box is
-/// painted with the search background first so the fill is solid regardless of
-/// how wide the emoji renders; the chord is dropped when there isn't room.
+/// Draw the search box: a 2-row-tall filled box carrying a `🔍 Search` label on
+/// the left and a right-aligned palette-chord hint (e.g. `⌃P`). The box is
+/// drawn across three cell rows with the same half-block bleed the nav
+/// selection bar uses — a lower-half-block row on top (fill in its bottom half,
+/// a half-row of padding above the label), the label row on a solid fill, and
+/// an upper-half-block row below (fill in its top half, a half-row of padding
+/// below). The half-block glyphs carry the fill as their *foreground* on the
+/// default background, so the eye reads the fill as half a cell tall on those
+/// rows. The chord is dropped when there isn't room for it.
 fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let width = area.width as usize;
+
+    // The box occupies rows [top, top+2]: `▄` bleed, label, `▀` bleed. When the
+    // area is shorter (a clamped header) we draw what fits, label row first.
+    let top = area.top();
+    let label_y = (top + 1).min(area.bottom().saturating_sub(1));
+    let bottom = top + 2;
+
+    // Top / bottom half-block bleed rows: the fill as the glyph's foreground on
+    // the default background, exactly like the nav selection bleed.
+    let bleed_style = Style::default().fg(SEARCH_BG);
+    if label_y > top {
+        Paragraph::new(Line::from(Span::styled(BLEED_ABOVE.repeat(width), bleed_style)))
+            .render(Rect { y: top, height: 1, ..area }, buf);
+    }
+    if bottom < area.bottom() {
+        Paragraph::new(Line::from(Span::styled(BLEED_BELOW.repeat(width), bleed_style)))
+            .render(Rect { y: bottom, height: 1, ..area }, buf);
+    }
+
+    // Label row, on the solid search fill.
     let label = " 🔍 Search";
     let label_w = label.chars().count();
     let chord_hint = if chord.is_empty() {
@@ -958,18 +989,15 @@ fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
             Style::default().fg(Color::DarkGray).bg(SEARCH_BG),
         ));
     }
-    let row = Rect {
-        height: 1,
-        ..area
-    };
-    Paragraph::new(Line::from(spans)).render(row, buf);
-    // Re-fill the background last: a double-width glyph resets its trailing
-    // continuation cell when the text is laid down, so paint over every cell to
-    // keep the box a solid bar. Setting bg leaves the symbols and fg intact.
-    for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
-            buf[(x, y)].set_bg(SEARCH_BG);
-        }
+    Paragraph::new(Line::from(spans)).render(Rect { y: label_y, height: 1, ..area }, buf);
+    // Re-fill the label row's background last: a double-width glyph resets its
+    // trailing continuation cell when the text is laid down, so paint over every
+    // cell to keep the row a solid bar. Only the label row is re-filled — the
+    // bleed rows must keep their default background so the half-block reads as
+    // half a cell of fill rather than a full one. Setting bg leaves the symbols
+    // and fg intact.
+    for x in area.left()..area.right() {
+        buf[(x, label_y)].set_bg(SEARCH_BG);
     }
 }
 
@@ -1350,7 +1378,7 @@ mod tests {
             ws("delta", "devbox", None, None, WorkspaceBadge::Idle),
         ];
         model.collapsed_machines.insert("hub".into());
-        let rows = render_rows(&model, 0, 40, 20);
+        let rows = render_rows(&model, 0, 40, 22);
         let joined = rows.join("\n");
 
         let hub_y = row_y(&rows, "▸ hub");
@@ -1369,7 +1397,7 @@ mod tests {
             ws("delta", "devbox", Some("t-2"), Some("developer"), WorkspaceBadge::Working),
         ];
         model.collapsed_machines.insert("devbox".into());
-        let rows = render_rows(&model, 0, 40, 20);
+        let rows = render_rows(&model, 0, 40, 22);
         let joined = rows.join("\n");
 
         let working_glyph = WorkspaceBadge::Working.glyph();
@@ -1407,7 +1435,7 @@ mod tests {
              (only lowercase ASCII letters, digits, `-`, and `_` are allowed)"
                 .into(),
         );
-        let rows = render_rows(&model, 0, 40, 22);
+        let rows = render_rows(&model, 0, 40, 24);
         let joined = rows.join("\n");
 
         assert!(joined.contains("Workspaces"), "header stays so the error reads in context, got:\n{joined}");
@@ -1429,7 +1457,7 @@ mod tests {
             review("nav", "Homepage nav fix", "shelbi/homepage-nav-fix", None, ReviewState::Loading),
             review("onboarding", "Rework onboarding copy", "shelbi/rework-onboarding-copy", None, ReviewState::Pending),
         ];
-        let rows = render_rows(&model, 0, 44, 24);
+        let rows = render_rows(&model, 0, 44, 26);
         let joined = rows.join("\n");
 
         assert!(joined.contains("Ready for Review"), "Ready header, got:\n{joined}");
@@ -1558,16 +1586,65 @@ mod tests {
         };
         assert!(rows[search_y].contains('🔍'), "search box shows the magnifier, got: {:?}", rows[search_y]);
         assert!(rows[search_y].contains(want_chord), "search box shows the palette chord {want_chord:?}, got: {:?}", rows[search_y]);
-        // The box is a solid fill across the row. The magnifier is double-width,
-        // so the single column after it is a wide-char continuation the
-        // TestBackend never flushes (the emoji covers it on a real terminal);
-        // assert the leading gutter cell and the whole single-width region past
-        // the emoji, which proves the bar spans the full box width.
+        // The label row is a solid fill. The magnifier is double-width, so the
+        // single column after it is a wide-char continuation the TestBackend
+        // never flushes (the emoji covers it on a real terminal); assert the
+        // leading gutter cell and the whole single-width region past the emoji,
+        // which proves the bar spans the full box width.
         let sy = search_y as u16;
         assert_eq!(buf[(1, sy)].bg, SEARCH_BG, "search box fills the leading cell");
         for x in 5..39u16 {
             assert_eq!(buf[(x, sy)].bg, SEARCH_BG, "search box fills its row, col {x}");
         }
+
+        // The box is 2 rows tall, drawn with the half-block bleed: a `▄` row of
+        // lower-half blocks above the label and a `▀` row of upper-half blocks
+        // below it, both carrying the search fill as their *foreground* (the
+        // half shows the fill; the cell background stays the terminal default).
+        let top_y = sy - 1;
+        let bottom_y = sy + 1;
+        for x in 1..39u16 {
+            assert_eq!(buf[(x, top_y)].symbol(), "▄", "top bleed row is lower-half blocks, col {x}");
+            assert_eq!(buf[(x, top_y)].fg, SEARCH_BG, "top bleed carries the fill as fg, col {x}");
+            assert_eq!(buf[(x, bottom_y)].symbol(), "▀", "bottom bleed row is upper-half blocks, col {x}");
+            assert_eq!(buf[(x, bottom_y)].fg, SEARCH_BG, "bottom bleed carries the fill as fg, col {x}");
+        }
+        // A blank half-row margin sits above (below the title) and below the box.
+        assert!(rows[(top_y - 1) as usize].trim().is_empty(), "blank margin above the box, got: {:?}", rows[(top_y - 1) as usize]);
+        assert!(rows[(bottom_y + 1) as usize].trim().is_empty(), "blank margin below the box, got: {:?}", rows[(bottom_y + 1) as usize]);
+    }
+
+    /// A click anywhere in the 2-row box — including the `▄` / `▀` half-block
+    /// rows — maps to the search box (opens the palette); the title above and
+    /// the first nav row below do not.
+    #[test]
+    fn search_box_hit_covers_all_three_cell_rows() {
+        let view = SidebarView::build(&empty_model());
+        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
+        // Rows 2, 3, 4 are the box (`▄`, label, `▀`); row 0 is the title, row 1
+        // and row 5 the margins, row 6 the nav's leading separator.
+        for y in 2..=4u16 {
+            assert!(view.search_box_hit(area, 3, y), "click on box row {y} hits the search box");
+        }
+        assert!(!view.search_box_hit(area, 3, 0), "title row is not the search box");
+        assert!(!view.search_box_hit(area, 3, 1), "top margin is not the search box");
+        assert!(!view.search_box_hit(area, 3, 5), "bottom margin is not the search box");
+        // The gutter column (0) and the divider-adjacent last column fall
+        // outside the inset box.
+        assert!(!view.search_box_hit(area, 0, 3), "left gutter is outside the inset box");
+    }
+
+    /// The nav block (and everything below it) shifts down by the taller header,
+    /// and a click on the first nav row still resolves to its selection index.
+    #[test]
+    fn taller_search_box_shifts_nav_click_targets_down() {
+        let view = SidebarView::build(&empty_model());
+        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
+        // Header is 6 rows (0 title, 1 margin, 2–4 box, 5 margin); the nav's
+        // leading separator is row 6, so the first nav item ("Chat") sits on
+        // row 7.
+        assert_eq!(view.hit(area, 3, 7), Some(0), "first nav item is on row 7 and selects index 0");
+        assert_eq!(view.hit(area, 3, 6), None, "the nav separator row is not selectable");
     }
 
     /// With no palette chord bound the search box falls back to the `<unbound>`
