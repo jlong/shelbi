@@ -295,6 +295,23 @@ pub struct CommandModel {
     pub edit_targets: Vec<EditItem>,
 }
 
+/// The one-line description shown beside a nav view in the command palette's
+/// second column. Keyed off the [`View`] so the orchestrator chat, the issues
+/// board, the activity log, and the machines view each read in the palette's
+/// voice (the Figma design fixes the first three verbatim). Workspace and other
+/// session views carry their own contextual subtitle, so they get `None` here.
+fn view_description(view: &View) -> Option<&'static str> {
+    match view {
+        View::Session(name) if name == "orch" => {
+            Some("Talk with the Orchestrator to manage Shelbi")
+        }
+        View::Issues => Some("Queue up and manage work for Shelbi"),
+        View::Activity => Some("See what's happened recently"),
+        View::Machines => Some("See the machines running your agents"),
+        View::Session(_) => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The registry.
 // ---------------------------------------------------------------------------
@@ -330,7 +347,7 @@ impl CommandRegistry {
                 kind: CommandKind::ShowView(v.view.clone()),
                 entry_kind: EntryKind::View,
                 decoration: v.decoration.clone(),
-                subtitle: None,
+                subtitle: view_description(&v.view).map(str::to_string),
                 shortcut: None,
                 hidden_until_query: false,
             });
@@ -347,7 +364,7 @@ impl CommandRegistry {
             kind: CommandKind::ToggleZen,
             entry_kind: EntryKind::Action,
             decoration: None,
-            subtitle: None,
+            subtitle: Some("Shelbi does the human parts of your workflow".to_string()),
             shortcut: model.zen_shortcut.clone(),
             hidden_until_query: false,
         });
@@ -407,7 +424,7 @@ impl CommandRegistry {
             kind: CommandKind::OpenErrorLog,
             entry_kind: EntryKind::Action,
             decoration: None,
-            subtitle: None,
+            subtitle: Some("Review recent errors and warnings".to_string()),
             shortcut: None,
             hidden_until_query: false,
         });
@@ -422,7 +439,7 @@ impl CommandRegistry {
             },
             entry_kind: EntryKind::Action,
             decoration: None,
-            subtitle: None,
+            subtitle: Some("Jump to another project".to_string()),
             shortcut: None,
             hidden_until_query: true,
         });
@@ -435,7 +452,7 @@ impl CommandRegistry {
                 },
                 entry_kind: EntryKind::Action,
                 decoration: None,
-                subtitle: None,
+                subtitle: Some(format!("Open the {} project", p.label)),
                 shortcut: None,
                 hidden_until_query: true,
             });
@@ -448,7 +465,7 @@ impl CommandRegistry {
             kind: CommandKind::AddProject,
             entry_kind: EntryKind::Action,
             decoration: None,
-            subtitle: None,
+            subtitle: Some("Register a new project with Shelbi".to_string()),
             shortcut: None,
             hidden_until_query: true,
         });
@@ -477,7 +494,7 @@ impl CommandRegistry {
                 kind: CommandKind::QuitProject,
                 entry_kind: EntryKind::Action,
                 decoration: None,
-                subtitle: None,
+                subtitle: Some("Close this project".to_string()),
                 shortcut: None,
                 hidden_until_query: false,
             });
@@ -488,7 +505,7 @@ impl CommandRegistry {
             kind: CommandKind::QuitShelbi,
             entry_kind: EntryKind::Action,
             decoration: None,
-            subtitle: None,
+            subtitle: Some("Close every Shelbi session".to_string()),
             shortcut: None,
             hidden_until_query: false,
         });
