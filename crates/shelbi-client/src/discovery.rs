@@ -18,6 +18,7 @@
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use shelbi_session::lock::is_held;
 use shelbi_session::Meta;
@@ -57,11 +58,25 @@ pub enum SocketReachability {
     /// The socket is a real socket file but a connect was **refused**: the
     /// listener is gone though the process lives. The zombie.
     Refusing,
+    /// The connect **succeeded** but the session never answered the hello
+    /// handshake within the probe deadline (or dropped the connection before
+    /// replying): the accept loop still runs but the per-connection handlers are
+    /// wedged, so every connect succeeds yet no client can attach. Detected only
+    /// by [`probe_reachable`] (the hello round-trip), never by the bare
+    /// [`probe_socket`] connect (`rt-review-session-wedges-after-repeated-attaches`).
+    Wedged,
     /// Anything else (a non-socket path, a permission or transport error we
     /// can't classify). Treated conservatively as *not* a zombie, so an
     /// ambiguous read never triggers a relaunch.
     Unknown,
 }
+
+/// How long [`probe_reachable`] waits for a session's hello reply before
+/// declaring it [`Wedged`](SocketReachability::Wedged). Short — a healthy local
+/// session answers a fresh connection's hello in well under a millisecond, and a
+/// dedicated probe connection contends with nothing — but generous enough that a
+/// momentarily busy machine is never falsely reaped.
+pub const HELLO_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Probe whether the session socket at `sock` is accepting connections, without
 /// performing the (blocking) hello handshake — a bare connect is enough to tell
@@ -91,21 +106,93 @@ pub fn probe_socket(sock: &Path) -> SocketReachability {
     }
 }
 
+/// Probe whether the session socket at `sock` is not just *accepting* connections
+/// but actually *answering* the protocol: connect, then exchange the hello
+/// handshake bounded by [`HELLO_PROBE_TIMEOUT`].
+///
+/// This is the liveness probe supervision needs. A bare [`probe_socket`] connect
+/// reports a *wedged* session — one whose accept loop runs but whose
+/// per-connection handlers are all blocked (a leaked write to a gone client that
+/// never completes, so threads and descriptors pile up until no new connection
+/// can be served) — as [`Reachable`](SocketReachability::Reachable), because the
+/// connect itself still succeeds. Only the hello round-trip tells them apart: a
+/// wedged session accepts the probe connection but never sends its hello, so it
+/// is reported [`Wedged`](SocketReachability::Wedged) and supervision relaunches
+/// and reaps it instead of stranding every client on it forever
+/// (`rt-review-session-wedges-after-repeated-attaches`).
+///
+/// Classification mirrors [`probe_socket`] for the connect itself (missing file →
+/// [`NotBound`](SocketReachability::NotBound), refused → [`Refusing`](SocketReachability::Refusing),
+/// non-socket or odd error → [`Unknown`](SocketReachability::Unknown)); the hello
+/// round-trip then refines a successful connect into
+/// [`Reachable`](SocketReachability::Reachable) or
+/// [`Wedged`](SocketReachability::Wedged).
+pub fn probe_reachable(sock: &Path) -> SocketReachability {
+    match std::fs::symlink_metadata(sock) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SocketReachability::NotBound,
+        Err(_) => return SocketReachability::Unknown,
+        Ok(m) if !m.file_type().is_socket() => return SocketReachability::Unknown,
+        Ok(_) => {}
+    }
+    let stream = match UnixStream::connect(sock) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            return SocketReachability::Refusing
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SocketReachability::NotBound,
+        Err(_) => return SocketReachability::Unknown,
+    };
+    match crate::connect::probe_handshake(&stream, HELLO_PROBE_TIMEOUT) {
+        Ok(()) => SocketReachability::Reachable,
+        // Accepted the connection but never completed the hello (timed out) or
+        // dropped it before replying (EOF): the wedged session.
+        Err(crate::ClientError::HandshakeTimeout) | Err(crate::ClientError::UnexpectedEof) => {
+            SocketReachability::Wedged
+        }
+        // Any other transport error after a successful connect is ambiguous;
+        // treat it conservatively as not-a-zombie so a flaky read never triggers
+        // a relaunch.
+        Err(_) => SocketReachability::Unknown,
+    }
+}
+
 impl DiscoveredSession {
-    /// Whether this (lock-held) session's socket is refusing connections — the
-    /// "alive but not listening" zombie. A session whose lock is **not** held is
-    /// already dead by the ordinary liveness probe, so this only ever reports
-    /// `true` for a live-by-lock session whose listener is gone.
-    pub fn socket_refusing(&self) -> bool {
-        self.alive && probe_socket(&self.sock) == SocketReachability::Refusing
+    /// This (lock-held) session's reachability over its socket, via the full
+    /// hello round-trip ([`probe_reachable`]) rather than a bare connect — so a
+    /// *wedged* session (accepts connections but never answers) is distinguished
+    /// from a healthy one. Only meaningful for a live-by-lock session; a dead
+    /// session's socket is already gone or refusing.
+    pub fn reachability(&self) -> SocketReachability {
+        probe_reachable(&self.sock)
+    }
+
+    /// Whether this (lock-held) session accepts connections but does not answer
+    /// the protocol — the "alive but not listening" zombie, in either of its two
+    /// shapes: the listener is gone so connects are **refused**
+    /// ([`Refusing`](SocketReachability::Refusing)), or the listener runs but the
+    /// per-connection handlers are **wedged** so a connect succeeds yet the hello
+    /// never comes ([`Wedged`](SocketReachability::Wedged)). Either way no client
+    /// can attach, so supervision should relaunch and reap it. A session whose
+    /// lock is **not** held is already dead by the ordinary liveness probe, so
+    /// this only ever reports `true` for a live-by-lock session.
+    pub fn not_listening(&self) -> bool {
+        self.alive
+            && matches!(
+                self.reachability(),
+                SocketReachability::Refusing | SocketReachability::Wedged
+            )
     }
 
     /// Whether this session is actually **usable**: its lock is held *and* its
-    /// socket is accepting connections. A locked-but-refusing session (a zombie)
-    /// is not usable — callers that pick a session to attach, probe, or enumerate
-    /// should treat it as gone so supervision relaunches it.
+    /// socket is answering the protocol. A locked-but-not-listening session (a
+    /// refusing *or* wedged zombie) is not usable — callers that pick a session to
+    /// attach, probe, or enumerate should treat it as gone so supervision
+    /// relaunches it. A session still binding its socket at startup
+    /// ([`NotBound`](SocketReachability::NotBound)) or giving an ambiguous read
+    /// ([`Unknown`](SocketReachability::Unknown)) is left usable, so neither a
+    /// startup race nor a flaky probe is mistaken for a dead session.
     pub fn usable(&self) -> bool {
-        self.alive && !self.socket_refusing()
+        self.alive && !self.not_listening()
     }
 }
 
@@ -180,7 +267,7 @@ pub fn reap_dead(root: &Path) -> Result<Vec<String>, crate::ClientError> {
 /// carries the name.
 ///
 /// Duplicates by name are normal — a relaunch races a not-yet-reaped predecessor,
-/// and an "alive but not listening" zombie ([`DiscoveredSession::socket_refusing`])
+/// and an "alive but not listening" zombie ([`DiscoveredSession::not_listening`])
 /// lingers beside its replacement — so a lookup must choose *deliberately* rather
 /// than take whatever [`list`] happened to return first (its order is the
 /// unsorted `read_dir` order). Picking the zombie strands the client on a connect
@@ -207,39 +294,49 @@ pub fn choose_session(sessions: &[DiscoveredSession], name: &str) -> Option<Disc
     // over a stale predecessor. `launched_at` is a fixed-format RFC3339 UTC stamp
     // from one producer, so a lexical compare orders them correctly.
     live.sort_by(|a, b| b.meta.launched_at.cmp(&a.meta.launched_at));
-    // Probe each once, newest first, and take the first socket actually accepting
-    // connections — never a zombie over a live one.
+    // Probe each once, newest first, with the full hello round-trip so a *wedged*
+    // session (accepts connections but never answers) is excluded just like a
+    // refusing one. Take the first socket actually answering the protocol — never
+    // a zombie over a live one.
     let probed: Vec<(&DiscoveredSession, SocketReachability)> =
-        live.iter().map(|s| (*s, probe_socket(&s.sock))).collect();
+        live.iter().map(|s| (*s, probe_reachable(&s.sock))).collect();
     if let Some((s, _)) = probed
         .iter()
         .find(|(_, r)| *r == SocketReachability::Reachable)
     {
         return Some((*s).clone());
     }
-    // None is accepting yet. Prefer one merely still *binding* its socket
-    // (`NotBound`, a replacement coming up) over a refusing zombie, newest first,
-    // so the attach path retries into the real session instead of the zombie.
-    // Never return a `Refusing` candidate here.
+    // None is answering yet. Prefer one merely still *binding* its socket
+    // (`NotBound`, a replacement coming up) over a refusing or wedged zombie,
+    // newest first, so the attach path retries into the real session instead of
+    // the zombie. Never return a `Refusing`/`Wedged` candidate here.
     probed
         .iter()
-        .find(|(_, r)| *r != SocketReachability::Refusing)
+        .find(|(_, r)| {
+            !matches!(r, SocketReachability::Refusing | SocketReachability::Wedged)
+        })
         .map(|(s, _)| (*s).clone())
 }
 
 /// Among `sessions`, the "alive but not listening" zombies sharing `name` that a
-/// supervisor should reap: every live candidate whose socket *refuses* connects
-/// ([`DiscoveredSession::socket_refusing`]), **except** the most recently
-/// launched live one — kept as the intended session (a replacement that exists or
-/// is still coming up). Returns an empty list unless the name has more than one
-/// live candidate, so a lone session is never reaped out from under the slot it
-/// still nominally owns (`rt-re-entering-a-review-fails-to-attach`).
+/// supervisor should reap, each paired with *why* (so the caller can log a
+/// `reap-zombie` vs `reap-wedged` event): every live candidate that is **not
+/// listening** ([`DiscoveredSession::not_listening`] — its socket refuses
+/// connects, or accepts them but never answers the hello), **except** the most
+/// recently launched live one — kept as the intended session (a replacement that
+/// exists or is still coming up). Returns an empty list unless the name has more
+/// than one live candidate, so a lone session is never reaped out from under the
+/// slot it still nominally owns (`rt-re-entering-a-review-fails-to-attach`).
 ///
-/// Pure selection: the caller does the termination and directory removal.
+/// Each returned pair carries the [`SocketReachability`] the reap decision was
+/// made on (always [`Refusing`](SocketReachability::Refusing) or
+/// [`Wedged`](SocketReachability::Wedged)), probed once here so the caller need
+/// not probe again. Pure selection: the caller does the termination and directory
+/// removal.
 pub fn zombies_to_reap<'a>(
     sessions: &'a [DiscoveredSession],
     name: &str,
-) -> Vec<&'a DiscoveredSession> {
+) -> Vec<(&'a DiscoveredSession, SocketReachability)> {
     let mut live: Vec<&DiscoveredSession> = sessions
         .iter()
         .filter(|s| s.alive && s.meta.name == name)
@@ -247,19 +344,63 @@ pub fn zombies_to_reap<'a>(
     if live.len() < 2 {
         return Vec::new();
     }
-    // Newest first; keep `live[0]` (the replacement), reap older refusing ones.
+    // Newest first; keep `live[0]` (the replacement), reap older not-listening
+    // ones (refusing or wedged).
     live.sort_by(|a, b| b.meta.launched_at.cmp(&a.meta.launched_at));
     live[1..]
         .iter()
         .copied()
-        .filter(|s| s.socket_refusing())
+        .filter_map(|s| {
+            // One probe per candidate: carry the reachability so the reason is
+            // not re-derived by a second (racy) probe at the call site.
+            let reach = s.reachability();
+            matches!(
+                reach,
+                SocketReachability::Refusing | SocketReachability::Wedged
+            )
+            .then_some((s, reach))
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shelbi_proto::{Frame, Hello};
+    use std::io::Write;
     use std::os::unix::net::UnixListener;
+
+    /// A stand-in session socket that *answers the hello* — binds `sock` and,
+    /// from a detached accept loop, replies to every connection with a [`Hello`]
+    /// frame (then closes it). This is what the hello-round-trip probe
+    /// ([`probe_reachable`]) needs to classify a listener as truly
+    /// [`Reachable`](SocketReachability::Reachable); a bare `UnixListener` that
+    /// never writes would read as [`Wedged`](SocketReachability::Wedged). The
+    /// accept loop owns the listener, so the socket stays bound for the test; the
+    /// thread is intentionally detached (the test process exits at the end).
+    fn hello_listener(sock: &Path) -> UnixListener {
+        let listener = UnixListener::bind(sock).unwrap();
+        let accept = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let reply = Frame::Hello(Hello {
+                protocol_version: shelbi_proto::PROTOCOL_VERSION,
+                colors: None,
+                capabilities: Vec::new(),
+            })
+            .encode()
+            .unwrap();
+            for stream in accept.incoming() {
+                match stream {
+                    Ok(mut s) => {
+                        let _ = s.write_all(&reply);
+                        let _ = s.flush();
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        listener
+    }
 
     #[test]
     fn probe_socket_reports_a_bound_listener_reachable() {
@@ -333,20 +474,38 @@ mod tests {
     }
 
     #[test]
-    fn a_live_session_with_a_reachable_socket_is_usable() {
+    fn a_live_session_that_answers_the_hello_is_usable() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("sock");
+        let _listener = hello_listener(&sock);
+        let s = discovered(dir.path(), sock, true);
+        assert!(s.usable(), "a live, answering session is usable");
+        assert!(!s.not_listening());
+        assert_eq!(s.reachability(), SocketReachability::Reachable);
+    }
+
+    #[test]
+    fn a_live_session_that_accepts_but_never_answers_is_wedged_and_not_usable() {
+        // Lock held (alive=true) and the socket *accepts* connections, but the
+        // session never sends its hello — the wedge this task fixes. A bare
+        // connect would call it reachable; the hello round-trip must classify it
+        // Wedged so supervision relaunches it instead of reusing the stranded
+        // slot (`rt-review-session-wedges-after-repeated-attaches`).
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sock");
+        // A bare listener accepts connections but never writes a hello.
         let _listener = UnixListener::bind(&sock).unwrap();
         let s = discovered(dir.path(), sock, true);
-        assert!(s.usable(), "a live, listening session is usable");
-        assert!(!s.socket_refusing());
+        assert_eq!(s.reachability(), SocketReachability::Wedged);
+        assert!(s.not_listening(), "an accept-but-silent session is not listening");
+        assert!(!s.usable(), "a wedged session is not usable");
     }
 
     #[test]
     fn a_live_session_whose_socket_refuses_is_a_zombie_and_not_usable() {
-        // Lock held (alive=true) but the listener is gone: the exact "alive but
-        // not listening" zombie. It must read as not usable so supervision
-        // relaunches it instead of reusing the stranded slot.
+        // Lock held (alive=true) but the listener is gone: the "alive but not
+        // listening" zombie whose connects are refused. It must read as not usable
+        // so supervision relaunches it instead of reusing the stranded slot.
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("sock");
         let listener = UnixListener::bind(&sock).unwrap();
@@ -357,20 +516,21 @@ mod tests {
             return;
         }
         let s = discovered(dir.path(), sock, true);
-        assert!(s.socket_refusing(), "a refusing live socket is a zombie");
+        assert_eq!(s.reachability(), SocketReachability::Refusing);
+        assert!(s.not_listening(), "a refusing live socket is a zombie");
         assert!(!s.usable(), "a zombie is not usable");
     }
 
     #[test]
     fn a_dead_session_is_never_reported_as_a_zombie() {
-        // alive=false is already dead by the ordinary lock probe; socket_refusing
+        // alive=false is already dead by the ordinary lock probe; not_listening
         // only ever speaks to live-by-lock sessions, so it stays false.
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("sock");
         let listener = UnixListener::bind(&sock).unwrap();
         drop(listener);
         let s = discovered(dir.path(), sock, false);
-        assert!(!s.socket_refusing());
+        assert!(!s.not_listening());
         assert!(!s.usable());
     }
 
@@ -406,7 +566,7 @@ mod tests {
         // zombie.
         let live_dir = tempfile::tempdir().unwrap();
         let live_sock = live_dir.path().join("sock");
-        let _listener = UnixListener::bind(&live_sock).unwrap();
+        let _listener = hello_listener(&live_sock);
 
         let zombie_dir = tempfile::tempdir().unwrap();
         let zombie_sock = zombie_dir.path().join("sock");
@@ -438,10 +598,10 @@ mod tests {
         // Two live listeners share a name: the most recently launched wins.
         let a_dir = tempfile::tempdir().unwrap();
         let a_sock = a_dir.path().join("sock");
-        let _la = UnixListener::bind(&a_sock).unwrap();
+        let _la = hello_listener(&a_sock);
         let b_dir = tempfile::tempdir().unwrap();
         let b_sock = b_dir.path().join("sock");
-        let _lb = UnixListener::bind(&b_sock).unwrap();
+        let _lb = hello_listener(&b_sock);
 
         let older = named_at(a_dir.path(), a_sock, true, "demo/ws/x", "2026-01-01T00:00:00Z");
         let newer = named_at(b_dir.path(), b_sock, true, "demo/ws/x", "2026-02-01T00:00:00Z");
@@ -487,7 +647,43 @@ mod tests {
         let candidates = [live, zombie.clone()];
         let reap = zombies_to_reap(&candidates, "demo/ws/x");
         assert_eq!(reap.len(), 1, "exactly the one zombie is reaped");
-        assert_eq!(reap[0].meta.launched_at, "t1", "and it is the stale one");
+        assert_eq!(reap[0].0.meta.launched_at, "t1", "and it is the stale one");
+        assert_eq!(
+            reap[0].1,
+            SocketReachability::Refusing,
+            "a refusing zombie is reaped as a refusing one"
+        );
+    }
+
+    #[test]
+    fn zombies_to_reap_drops_a_stale_wedged_one_keeping_the_replacement() {
+        // The wedge case: a live (answering) replacement and an older *wedged*
+        // sibling — one that accepts connections but never answers — share a
+        // name. The wedged one is reaped and reported as Wedged (so the caller
+        // logs `reap-wedged`), the replacement kept
+        // (`rt-review-session-wedges-after-repeated-attaches`).
+        let live_dir = tempfile::tempdir().unwrap();
+        let live_sock = live_dir.path().join("sock");
+        let _listener = hello_listener(&live_sock);
+
+        // A bare listener accepts but never answers the hello: wedged.
+        let wedged_dir = tempfile::tempdir().unwrap();
+        let wedged_sock = wedged_dir.path().join("sock");
+        let _wedged = UnixListener::bind(&wedged_sock).unwrap();
+
+        // The live one is the newer (the replacement), the wedged one older.
+        let live = named_at(live_dir.path(), live_sock, true, "demo/ws/x", "t2");
+        let wedged = named_at(wedged_dir.path(), wedged_sock, true, "demo/ws/x", "t1");
+
+        let candidates = [live, wedged];
+        let reap = zombies_to_reap(&candidates, "demo/ws/x");
+        assert_eq!(reap.len(), 1, "exactly the one wedged session is reaped");
+        assert_eq!(reap[0].0.meta.launched_at, "t1", "and it is the stale one");
+        assert_eq!(
+            reap[0].1,
+            SocketReachability::Wedged,
+            "an accept-but-silent session is reaped as wedged"
+        );
     }
 
     #[test]
@@ -511,7 +707,7 @@ mod tests {
         let candidates = [older, newer];
         let reap = zombies_to_reap(&candidates, "demo/ws/x");
         assert_eq!(reap.len(), 1);
-        assert_eq!(reap[0].meta.launched_at, "t1", "the newest is kept");
+        assert_eq!(reap[0].0.meta.launched_at, "t1", "the newest is kept");
     }
 
     #[test]

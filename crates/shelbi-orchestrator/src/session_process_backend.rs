@@ -41,7 +41,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use shelbi_client::{DiscoveredSession, SnapshotSource};
+use shelbi_client::{DiscoveredSession, SnapshotSource, SocketReachability};
 use shelbi_core::{Error, Host, Result};
 use shelbi_proto::capability;
 use shelbi_session::SpawnSpec;
@@ -507,25 +507,35 @@ impl SessionProcessBackend {
     /// launched), and remove their session directories. Returns the reaped short
     /// ids. Local-only and best-effort — a remote machine reaps its own.
     ///
-    /// A zombie's socket refuses every connect, so the usual over-the-socket
-    /// `kill` can't reach it; instead we signal its process directly by the pid
-    /// recorded in `meta.json` (SIGTERM, which drives the session's own clean
-    /// teardown — it kills its child group and releases its lock). A session from
-    /// a build predating the recorded pid can't be signaled (pid `0`); it is still
-    /// dropped from discovery so duplicates don't accumulate. We keep the newest
-    /// live sibling untouched (it is the intended session, even if it is itself
-    /// still binding its socket) and only ever reap *older* refusing ones.
-    pub(crate) fn reap_zombies(&self, name: &str) -> Vec<String> {
+    /// A zombie's socket either refuses every connect or accepts them yet never
+    /// answers (wedged), so the usual over-the-socket `kill` can't reach it;
+    /// instead we signal its process directly by the pid recorded in `meta.json`
+    /// (SIGTERM, which drives the session's own clean teardown — it kills its
+    /// child group and releases its lock). A session from a build predating the
+    /// recorded pid can't be signaled (pid `0`); it is still dropped from
+    /// discovery so duplicates don't accumulate. We keep the newest live sibling
+    /// untouched (it is the intended session, even if it is itself still binding
+    /// its socket) and only ever reap *older* not-listening ones.
+    ///
+    /// Each reaped id is paired with the supervision action to log for it —
+    /// `"reap-wedged"` for a [`SocketReachability::Wedged`] session (accepts but
+    /// never answers), `"reap-zombie"` for a refusing one — so the two failure
+    /// shapes are distinguishable on `events.log`.
+    pub(crate) fn reap_zombies(&self, name: &str) -> Vec<(String, &'static str)> {
         let all = self.discover();
         let mut reaped = Vec::new();
-        for z in shelbi_client::zombies_to_reap(&all, name) {
+        for (z, reach) in shelbi_client::zombies_to_reap(&all, name) {
             terminate_pid(z.meta.pid);
             // Drop its directory so discovery stops offering it. Unlinking the
             // files out from under a still-running process is safe on Unix (it
             // keeps its open fds); once it exits on the SIGTERM above its lock is
             // gone anyway.
             if std::fs::remove_dir_all(&z.dir).is_ok() {
-                reaped.push(z.short_id.clone());
+                let action = match reach {
+                    SocketReachability::Wedged => "reap-wedged",
+                    _ => "reap-zombie",
+                };
+                reaped.push((z.short_id.clone(), action));
             }
         }
         reaped
@@ -660,6 +670,31 @@ mod tests {
             drop(listener);
             (lock, None)
         } else {
+            // A reachable stand-in must *answer the hello*: the liveness probe is
+            // now a hello round-trip, so a bare listener that accepts and stays
+            // silent would read as wedged, not reachable. Reply to every connect
+            // with a Hello from a detached accept loop over a clone, and hand the
+            // caller the original listener to hold/drop as before.
+            use std::io::Write;
+            let accept = listener.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let reply = shelbi_proto::Frame::Hello(shelbi_proto::Hello {
+                    protocol_version: shelbi_proto::PROTOCOL_VERSION,
+                    colors: None,
+                    capabilities: Vec::new(),
+                })
+                .encode()
+                .unwrap();
+                for stream in accept.incoming() {
+                    match stream {
+                        Ok(mut s) => {
+                            let _ = s.write_all(&reply);
+                            let _ = s.flush();
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
             (lock, Some(listener))
         }
     }
@@ -745,7 +780,10 @@ mod tests {
         let zombie_dir = sessions.join("dddddddddddddddd");
         if zombie_dir.join("sock").exists() {
             let reaped = SessionProcessBackend.reap_zombies("demo/ws/alpha");
-            assert_eq!(reaped, vec!["dddddddddddddddd".to_string()]);
+            assert_eq!(
+                reaped,
+                vec![("dddddddddddddddd".to_string(), "reap-zombie")]
+            );
             assert!(!zombie_dir.exists(), "the zombie's dir is removed");
             assert!(
                 sessions.join("cccccccccccccccc").exists(),

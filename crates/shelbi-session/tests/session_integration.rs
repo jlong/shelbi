@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use shelbi_proto::{Frame, Hello, Kill};
+use shelbi_proto::{Attach, Frame, Hello, Kill};
 use shelbi_session::{layout::SessionPaths, RunArgs};
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -437,4 +437,164 @@ fn raw_output_log_is_written_only_when_enabled() {
         sess.kill_and_join().unwrap();
         assert!(!raw_exists, "raw log must not exist when the project did not enable it");
     }
+}
+
+// --- connection lifecycle: no thread/fd leak on repeated attach, and a slow or
+// dead client never wedges its handler or blocks others
+// (`rt-review-session-wedges-after-repeated-attaches`). ---
+
+/// Count the file descriptors this process currently has open. The session runs
+/// in-process (on a `run()` thread), so a leaked per-connection handler shows up
+/// here as held descriptors. Portable across the session's platforms: Linux
+/// exposes `/proc/self/fd`, macOS `/dev/fd`. Reading the directory opens one
+/// transient fd, but it is counted identically on every call so deltas cancel.
+fn open_fd_count() -> usize {
+    for dir in ["/proc/self/fd", "/dev/fd"] {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            return rd.count();
+        }
+    }
+    0
+}
+
+/// Send the client hello (negotiating every capability, so the session treats
+/// this as a full client — resync backpressure included) and read the session's
+/// hello reply.
+fn client_hello(stream: &mut UnixStream) {
+    let hello = Frame::Hello(Hello {
+        protocol_version: shelbi_proto::PROTOCOL_VERSION,
+        colors: None,
+        capabilities: shelbi_proto::capability::ALL
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    })
+    .encode()
+    .unwrap();
+    stream.write_all(&hello).unwrap();
+    stream.flush().unwrap();
+    read_frame(stream).expect("session answers the hello");
+}
+
+/// Subscribe this client to the output stream.
+fn client_attach(stream: &mut UnixStream) {
+    let frame = Frame::Attach(Attach { since_seq: None }).encode().unwrap();
+    stream.write_all(&frame).unwrap();
+    stream.flush().unwrap();
+}
+
+#[test]
+fn repeated_attach_detach_does_not_leak_descriptors() {
+    let _g = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut sess = RunningSession::start(
+        "demo/ws/cycle",
+        dir.path(),
+        80,
+        24,
+        vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()],
+    );
+
+    // One full attach/detach: connect, handshake, subscribe, read the attach
+    // replay, then drop the connection (a clean close).
+    let cycle = |sess: &RunningSession| {
+        let mut s = sess.connect();
+        client_hello(&mut s);
+        client_attach(&mut s);
+        let _ = read_frame(&mut s); // the attach Resync replay
+        drop(s);
+    };
+
+    // Warm up so first-connection lazy allocations settle, then take a baseline
+    // once the fd count stops moving.
+    for _ in 0..5 {
+        cycle(&sess);
+    }
+    let base = wait_for(Duration::from_secs(5), {
+        let mut last = 0usize;
+        let mut stable = 0u8;
+        move || {
+            let now = open_fd_count();
+            if now == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = now;
+            }
+            (stable >= 2).then_some(last)
+        }
+    })
+    .expect("fd count settles before the run");
+
+    for _ in 0..200 {
+        cycle(&sess);
+    }
+
+    // After 200 clean cycles the session must have wound every handler down, so
+    // the fd count returns to the baseline (a per-connection leak would grow it
+    // by a few descriptors each cycle — hundreds total).
+    let after = wait_for(Duration::from_secs(8), || {
+        let now = open_fd_count();
+        (now <= base + 8).then_some(now)
+    });
+    let after = after.unwrap_or_else(open_fd_count);
+    assert!(
+        after <= base + 8,
+        "descriptors leaked across 200 attach/detach cycles: base={base}, after={after}",
+    );
+
+    sess.kill_and_join().unwrap();
+}
+
+#[test]
+fn a_silent_client_does_not_block_another_clients_hello() {
+    let _g = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut sess = RunningSession::start(
+        "demo/ws/indep",
+        dir.path(),
+        80,
+        24,
+        vec!["/bin/sh".into(), "-c".into(), "exec yes".into()],
+    );
+
+    // One client attaches and then stops reading, wedging its own writer on the
+    // flood of output.
+    let mut stuck = sess.connect();
+    client_hello(&mut stuck);
+    client_attach(&mut stuck);
+    // Let output pile up against the silent client.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // A second client's hello must still complete promptly — each connection has
+    // its own handler threads and the broadcast holds no lock across a blocking
+    // write, so the stuck client cannot stall it.
+    let mut fresh = sess.connect();
+    let hello = Frame::Hello(Hello {
+        protocol_version: shelbi_proto::PROTOCOL_VERSION,
+        colors: None,
+        capabilities: shelbi_proto::capability::ALL
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    })
+    .encode()
+    .unwrap();
+    let start = Instant::now();
+    fresh.write_all(&hello).unwrap();
+    fresh.flush().unwrap();
+    let reply = read_frame(&mut fresh);
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(reply, Some(Frame::Hello(_))),
+        "the second client must get its hello reply",
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "a silent client blocked a second client's hello ({elapsed:?})",
+    );
+
+    drop(stuck);
+    drop(fresh);
+    sess.kill_and_join().unwrap();
 }

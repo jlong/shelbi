@@ -56,11 +56,11 @@ pub mod snapshot;
 pub mod spawn;
 pub mod transport;
 
-pub use connect::{Connection, SessionEvents};
+pub use connect::{probe_handshake, Connection, SessionEvents};
 pub use control::{ControlClient, Notice, Subscription};
 pub use discovery::{
-    choose_session, list, probe_socket, reap_dead, zombies_to_reap, DiscoveredSession,
-    SocketReachability,
+    choose_session, list, probe_reachable, probe_socket, reap_dead, zombies_to_reap,
+    DiscoveredSession, SocketReachability,
 };
 pub use error::ClientError;
 pub use reader::SessionEvent;
