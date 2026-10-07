@@ -961,6 +961,12 @@ impl ShellState {
     /// area. Agents in the old project keep running — switching is a view
     /// change, not a quit. Invoked from the command palette (`dispatch_effect`).
     fn switch_project(&mut self, project: &str) {
+        // Switching to the already-current project (e.g. Enter on the current
+        // row in the palette's Projects column) is a no-op; skip the session
+        // rebuild so it doesn't needlessly detach and reconnect.
+        if self.client.project() == Some(project) {
+            return;
+        }
         // `ClientState::switch_project` records the current project's view and
         // restores the new project's remembered (or default) view.
         self.client.switch_project(project);
@@ -1174,14 +1180,15 @@ impl ShellState {
 
     /// Open the command palette over the current registry entries.
     fn open_palette(&mut self) {
-        let label = self
-            .sidebar_model
-            .as_ref()
-            .map(|s| s.project_label.clone())
-            .or_else(|| self.client.project().map(str::to_string))
-            .unwrap_or_default();
         let entries = self.palette_entries_from_model();
-        self.overlay = Some(ActiveOverlay::palette(&label, entries));
+        // The Projects column lists every registered project, the current one
+        // leading with the filled disc; Enter on a row switches to it.
+        let projects = self
+            .client
+            .project()
+            .map(overlays::build_projects_column)
+            .unwrap_or_default();
+        self.overlay = Some(ActiveOverlay::palette(entries, projects));
     }
 
     /// Act on what the active overlay yielded.

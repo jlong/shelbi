@@ -20,6 +20,27 @@ pub const SELECTION_BG: Color = Color::Rgb(63, 63, 63);
 /// while remaining distinctly darker than the #3f3f3f selection fill.
 pub const SEARCH_BG: Color = Color::Rgb(51, 51, 51);
 
+/// The command palette's panel fill (`color/search` in the Figma design,
+/// `#292929`). A touch lighter than the app's near-black background so the
+/// palette reads as a raised, borderless panel floating over the view rather
+/// than a framed box. The whole overlay rect is painted with this before any
+/// text lands.
+pub const PALETTE_BG: Color = Color::Rgb(41, 41, 41);
+
+/// The palette's primary text (`color/foreground`, `#c6c6c6`): the `❯` prompt,
+/// a typed query, and an unselected command's label. The selected command's
+/// label brightens to white (see [`SELECTION_BG`]).
+pub const PALETTE_FG: Color = Color::Rgb(198, 198, 198);
+
+/// The palette's muted/secondary text (`color/muted`, `#7a7a7a`): command
+/// descriptions, the right-aligned shortcut hint, the placeholder, the
+/// Projects heading and its `·` bullets, and the footer hint line.
+pub const PALETTE_MUTED: Color = Color::Rgb(122, 122, 122);
+
+/// The palette's accent green (`color/green`, `#5acd25`): the block cursor's
+/// fill in the search line, and a loaded project's status ring.
+pub const PALETTE_GREEN: Color = Color::Rgb(90, 205, 37);
+
 /// The glyph painted down the sidebar's rightmost column as the resize
 /// drag handle — a full-height light vertical rule.
 pub const DIVIDER_GLYPH: &str = "│";
@@ -51,8 +72,10 @@ pub const WORKFLOW_BADGE_FG: Color = Color::Rgb(220, 223, 232);
 /// build on this hue so the two states read as one family; only the
 /// not-loaded ring swaps to [`PROJECT_STATUS_NEUTRAL`]. Kept as the same
 /// terminal green the rest of the palette already paints "loaded" with, so
-/// the indicator honors the existing palette color vocabulary.
-pub const PROJECT_STATUS_GREEN: Color = Color::Green;
+/// the indicator honors the existing palette color vocabulary. Shares the
+/// Figma brand green (`#5acd25`, see [`PALETTE_GREEN`]) so the project ring and
+/// the search cursor read as the one accent.
+pub const PROJECT_STATUS_GREEN: Color = PALETTE_GREEN;
 
 /// The neutral/unloaded outline token for the project-status indicator — the
 /// same dim gray the palette uses for inert affordances (the `+ Add project`

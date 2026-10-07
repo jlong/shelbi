@@ -26,9 +26,10 @@ use shelbi_app::exec::EditTarget;
 use shelbi_app::nav::View;
 use shelbi_app::view::SidebarModel;
 use shelbi_core::ConfigMode;
-use shelbi_palette::Entry;
+use shelbi_palette::{Decoration, DecorationColor, Entry};
 use shelbi_state::keymap::Keymaps;
 
+use crate::overlay::palette::ProjectEntry;
 use crate::overlay::{self, centered_pct, centered_rect};
 
 /// What the shell should do after feeding input to the active overlay.
@@ -91,9 +92,10 @@ pub enum ActiveOverlay {
 }
 
 impl ActiveOverlay {
-    /// Open the command palette over `entries` for `project_label`.
-    pub fn palette(project_label: &str, entries: Vec<Entry>) -> Self {
-        ActiveOverlay::Palette(overlay::palette::Palette::new(project_label, entries))
+    /// Open the command palette over `entries`, with `projects` listed in the
+    /// Projects column (empty hides the column).
+    pub fn palette(entries: Vec<Entry>, projects: Vec<ProjectEntry>) -> Self {
+        ActiveOverlay::Palette(overlay::palette::Palette::new(entries, projects))
     }
 
     /// Open the "Load for review" dialog for `task_id` over the given (free)
@@ -365,7 +367,7 @@ pub fn build_command_model(project: &str, sidebar: &SidebarModel) -> CommandMode
             id: format!("view:{}", n.view.as_view_id()),
             title: n.label.clone(),
             view: n.view.clone(),
-            decoration: None,
+            decoration: nav_decoration(&n.label),
         })
         .collect();
 
@@ -377,7 +379,7 @@ pub fn build_command_model(project: &str, sidebar: &SidebarModel) -> CommandMode
             id: format!("view:{}", View::Machines.as_view_id()),
             title: "Machines".to_string(),
             view: View::Machines,
-            decoration: None,
+            decoration: nav_decoration("Machines"),
         });
     }
 
@@ -423,6 +425,51 @@ pub fn build_command_model(project: &str, sidebar: &SidebarModel) -> CommandMode
         other_projects,
         edit_targets: edit_targets(project),
     }
+}
+
+/// The palette icon decoration for a nav view, from its label: the Figma's
+/// twemoji nav glyph (💬 / 📋 / ⚡ / 🖥), rendered in its natural color. A label
+/// with no mapped glyph gets `None`, so it falls back to the entry-kind icon.
+fn nav_decoration(label: &str) -> Option<Decoration> {
+    let glyph = super::sidebar::nav_glyph(label);
+    if glyph == "•" {
+        return None;
+    }
+    Some(Decoration {
+        glyph: glyph.to_string(),
+        color: DecorationColor::Default,
+    })
+}
+
+/// Build the palette's Projects column from the registered projects on disk.
+/// The current project leads (filled `●`), other open projects get the green
+/// ring (`○`), and closed ones the gray ring. Enter on a row activates its
+/// `action:switch-project:<slug>` entry; the renderer appends the trailing
+/// "+ Add project" row itself.
+pub fn build_projects_column(current: &str) -> Vec<ProjectEntry> {
+    let open: std::collections::HashSet<String> = shelbi_state::list_open_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let mut rows: Vec<ProjectEntry> = shelbi_state::list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| {
+            let is_current = p.name == current;
+            let loaded = is_current || open.contains(&p.name);
+            // The current project is the single "active" one (the filled,
+            // pulsing disc), matching the Figma.
+            ProjectEntry {
+                indicator: overlay::palette::project_indicator(loaded, is_current),
+                label: p.display_label().to_string(),
+                slug: p.name,
+            }
+        })
+        .collect();
+    // Lead with the current project, keeping the rest in list order
+    // (most-recently-launched first).
+    rows.sort_by_key(|p| p.slug != current);
+    rows
 }
 
 /// The on-disk edit targets that exist for `project`, titled to match the tmux
@@ -536,7 +583,7 @@ mod tests {
             hidden_until_query: false,
         };
         vec![
-            ActiveOverlay::palette("alpha", vec![entry]),
+            ActiveOverlay::palette(vec![entry], Vec::new()),
             ActiveOverlay::review_confirm(
                 "T-1",
                 "Fix the thing",
@@ -622,7 +669,7 @@ mod tests {
             decoration: None,
             hidden_until_query: false,
         };
-        let mut ov = ActiveOverlay::palette("alpha", vec![entry]);
+        let mut ov = ActiveOverlay::palette(vec![entry], Vec::new());
         let (buf, rect) = draw_over_sentinel(&mut ov);
 
         // Find the selected row: the one, inside the palette rect, whose cells
@@ -636,18 +683,24 @@ mod tests {
                 continue;
             }
             found_row = true;
-            // The highlight bar reaches both edges of the list: the report
-            // showed underlying error text bleeding into the right of the
-            // selected row, so the bar must run from the left edge to the last
-            // column of the rect. Any interior cell without the bar is a
-            // wide-glyph continuation cell (empty symbol), never a visible gap.
+            // The highlight bar spans the commands column edge to edge: with no
+            // Projects column the commands column is the whole content area,
+            // which the borderless panel insets by a one-cell gutter on each
+            // side. The report showed underlying error text bleeding into the
+            // right of the selected row, so the bar must run from the content's
+            // left edge to its last column. Any interior cell without the bar is
+            // a wide-glyph continuation cell (empty symbol), never a visible gap.
             let first = *selected_cells.first().unwrap();
             let last = *selected_cells.last().unwrap();
-            assert_eq!(first, rect.left(), "the selection bar must start at the left edge");
+            assert_eq!(
+                first,
+                rect.left() + 1,
+                "the selection bar must start at the content's left edge"
+            );
             assert_eq!(
                 last,
-                rect.right() - 1,
-                "the selection bar must reach the right edge, got {selected_cells:?}"
+                rect.right() - 2,
+                "the selection bar must reach the content's right edge, got {selected_cells:?}"
             );
             for x in first..=last {
                 if buf[(x, y)].bg != crate::theme::SELECTION_BG {
@@ -756,7 +809,7 @@ mod tests {
 
     #[test]
     fn palette_tab_focuses_sidebar_and_esc_closes() {
-        let mut ov = ActiveOverlay::palette("alpha", Vec::new());
+        let mut ov = ActiveOverlay::palette(Vec::new(), Vec::new());
         assert_eq!(
             ov.handle_key(key(KeyCode::Tab), &keymaps()),
             OverlayEvent::FocusSidebar

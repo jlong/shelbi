@@ -1091,7 +1091,7 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn nav_glyph(label: &str) -> &'static str {
+pub(crate) fn nav_glyph(label: &str) -> &'static str {
     match label {
         "Chat" => "💬",
         "Issues" => "📋",
