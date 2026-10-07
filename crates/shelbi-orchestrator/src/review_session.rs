@@ -94,7 +94,7 @@ fn resolve_review_slot(project_name: &str, project: &Project, task_id: &str) -> 
 /// Everything the single-process TUI needs to build its review panel for a
 /// task, resolved from durable state in one place (so the client stays thin and
 /// the slot resolution matches the spawn path).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ReviewOpenInfo {
     /// The review slot (workspace) the task is loaded on.
     pub slot: String,
@@ -104,6 +104,14 @@ pub struct ReviewOpenInfo {
     pub editor_name: String,
     /// Whether the workflow declares a review URL (gates the Browser entry).
     pub has_review_url: bool,
+    /// The reviewed task as read from the issue store, for the panel's title /
+    /// description preview and the full-description popover. `None` when the
+    /// store couldn't produce it (the panel degrades to no task info).
+    /// [`IssueFile`](shelbi_state::IssueFile) isn't `Eq`, so this struct drops
+    /// the `PartialEq`/`Eq` derives it carried while it was all scalars; it's
+    /// also large (~500 bytes), so it's boxed to keep the enclosing
+    /// [`ReviewOpenTarget`] variants balanced.
+    pub task: Option<Box<shelbi_state::IssueFile>>,
 }
 
 /// Resolve the panel inputs for `task_id`. Errors when the task is not loaded on
@@ -135,21 +143,25 @@ fn review_open_info_for_slot(
         .to_string_lossy()
         .to_string();
     let editor_name = shelbi_state::editor_display_name(&shelbi_state::resolve_editor());
-    let has_review_url = {
-        let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
-        match store.get(task_id)? {
-            Some(tf) => shelbi_state::load_task_workflow(project_name, project, &tf.task)
+    // Read the task once, for both the review-URL gate and the panel's task
+    // info (title / description preview / popover).
+    let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
+    let task = store.get(task_id)?;
+    let has_review_url = task
+        .as_ref()
+        .map(|tf| {
+            shelbi_state::load_task_workflow(project_name, project, &tf.task)
                 .ok()
                 .map(|wf| wf.review_url_for_status(tf.task.column.as_str()).is_some())
-                .unwrap_or(false),
-            None => false,
-        }
-    };
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
     Ok(ReviewOpenInfo {
         slot: slot.to_string(),
         worktree,
         editor_name,
         has_review_url,
+        task: task.map(Box::new),
     })
 }
 
@@ -157,7 +169,7 @@ fn review_open_info_for_slot(
 /// durable state in one read (`rt-tui-review-load-queued`): either it is already
 /// loaded on a review slot — open the interface straight away — or it is still
 /// queued and must be loaded onto a slot first.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ReviewOpenTarget {
     /// The task is on a review slot; open the interface with these inputs
     /// (the same the tmux runtime and [`review_open_info`] resolve).
@@ -435,19 +447,16 @@ mod tests {
             ReviewOpenTarget::Serving(info) => assert_eq!(info.slot, "review-1"),
             other => panic!("expected Serving, got {other:?}"),
         }
-        assert_eq!(
-            review_open_target(&proj, "t-dev").unwrap(),
-            ReviewOpenTarget::Queued {
-                title: "On the dev slot".into()
-            },
-            "a handoff pinned to its dev slot is queued, not serving"
-        );
-        assert_eq!(
-            review_open_target(&proj, "t-none").unwrap(),
-            ReviewOpenTarget::Queued {
-                title: "Unassigned".into()
-            }
-        );
+        // `ReviewOpenTarget` is no longer `PartialEq` (it now carries the task's
+        // `IssueFile`, which isn't), so match the variant and check its field.
+        match review_open_target(&proj, "t-dev").unwrap() {
+            ReviewOpenTarget::Queued { title } => assert_eq!(title, "On the dev slot"),
+            other => panic!("a handoff pinned to its dev slot is queued, got {other:?}"),
+        }
+        match review_open_target(&proj, "t-none").unwrap() {
+            ReviewOpenTarget::Queued { title } => assert_eq!(title, "Unassigned"),
+            other => panic!("an unassigned review task is queued, got {other:?}"),
+        }
 
         match prev_home {
             Some(h) => std::env::set_var("SHELBI_HOME", h),

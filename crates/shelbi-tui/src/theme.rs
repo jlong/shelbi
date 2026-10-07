@@ -68,6 +68,23 @@ pub const PALETTE_MUTED: Color = Color::Rgb(122, 122, 122);
 /// fill in the search line, and a loaded project's status ring.
 pub const PALETTE_GREEN: Color = Color::Rgb(90, 205, 37);
 
+/// The review panel's accent cyan (`color/accent`, `#00a6b2` in the Figma):
+/// the review status header beside the back button and the `More` link that
+/// opens the task-description popover. Deliberately the brand teal, not the
+/// terminal's ANSI cyan, so the review header reads as the same accent the
+/// design pins.
+pub const ACCENT_CYAN: Color = Color::Rgb(0, 166, 178);
+
+/// Secondary foreground (`#bababa`): the review panel's worktree line and its
+/// unselected nav labels. Sits just under [`PALETTE_FG`] (`#c6c6c6`, the
+/// task-description body) so the chrome reads as present-but-quiet without
+/// dropping to the dim [`PALETTE_MUTED`].
+pub const FG_SECONDARY: Color = Color::Rgb(186, 186, 186);
+
+/// The review panel's Reject red (`color/red`, `#e04f52` in the Figma). Paired
+/// with [`PALETTE_GREEN`] (`#5acd25`) for Approve on the actions row.
+pub const ACTION_RED: Color = Color::Rgb(224, 79, 82);
+
 /// The glyph painted down the sidebar's rightmost column as the resize
 /// drag handle and right-edge divider — a full-height left one-eighth block
 /// (`▏`, the Figma `color/divider` rule) that reads as a thin border.

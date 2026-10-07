@@ -31,6 +31,7 @@ use ratatui::layout::Rect;
 use ratatui::Frame;
 
 use shelbi_app::ReviewRole;
+use shelbi_state::IssueFile;
 use shelbi_term::Size;
 
 use crate::review_panel::{render_full, PanelEffect, ReviewPanel};
@@ -64,6 +65,10 @@ pub enum ReviewAction {
     OpenBrowser,
     /// Reveal the review worktree folder in the OS file manager.
     RevealFolder,
+    /// Open the full task-description popover over the main area (the `More`
+    /// link / `m` key). The shell opens the overlay; the content session keeps
+    /// running underneath.
+    ShowDescription,
     /// Back button: return to the orchestrator chat, leaving the review loaded.
     Back,
     /// Close the review (q / Esc): tear the interface down (the shell asks the
@@ -80,10 +85,16 @@ pub struct ReviewInterface {
     task_id: String,
     slot: String,
     focus: ReviewFocus,
+    /// The reviewed task, when resolvable — the source of the panel's title and
+    /// description preview, and the data the `More` description popover shows.
+    /// `None` only if the issue store couldn't produce it (the panel then shows
+    /// no task info and `More` is inert).
+    task: Option<IssueFile>,
 }
 
 impl ReviewInterface {
     /// Build the interface and start connecting the Chat (agent) content view.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         project: &str,
         connector: Arc<dyn Connector>,
@@ -92,10 +103,15 @@ impl ReviewInterface {
         worktree: impl Into<String>,
         editor_name: impl Into<String>,
         has_review_url: bool,
+        task: Option<IssueFile>,
     ) -> Self {
         let task_id = task_id.into();
         let slot = slot.into();
-        let panel = ReviewPanel::new(worktree, editor_name, has_review_url);
+        // The panel shows the task's title and a preview of its body; the full
+        // body opens in the description popover.
+        let title = task.as_ref().map(|t| t.task.title.clone()).unwrap_or_default();
+        let description = task.as_ref().map(|t| t.body.clone()).unwrap_or_default();
+        let panel = ReviewPanel::new(worktree, editor_name, has_review_url, title, description);
         let mut content = SessionManager::new(project, connector);
         // Chat is the default view: bind to the review agent's workspace session.
         content.show(SessionRef::Workspace(slot.clone()));
@@ -105,11 +121,17 @@ impl ReviewInterface {
             task_id,
             slot,
             focus: ReviewFocus::Panel,
+            task,
         }
     }
 
     pub fn task_id(&self) -> &str {
         &self.task_id
+    }
+
+    /// The reviewed task, for the shell to populate the description popover.
+    pub fn task(&self) -> Option<&IssueFile> {
+        self.task.as_ref()
     }
 
     /// Tighten the content view's connect-retry policy and re-arm the connect
@@ -292,6 +314,9 @@ impl ReviewInterface {
                 self.panel.nav_down();
                 ReviewAction::None
             }
+            // `m` opens the full task-description popover (the `More` link's
+            // keyboard twin). Inert when the task has no body.
+            KeyCode::Char('m') => map_effect(self.panel.request_description()),
             KeyCode::Enter | KeyCode::Char(' ') => map_effect(self.panel.activate()),
             _ => ReviewAction::None,
         }
@@ -421,6 +446,7 @@ fn map_effect(effect: PanelEffect) -> ReviewAction {
         PanelEffect::ShowVim => ReviewAction::ShowContent(Some(ReviewRole::Editor)),
         PanelEffect::OpenBrowser => ReviewAction::OpenBrowser,
         PanelEffect::RevealFolder => ReviewAction::RevealFolder,
+        PanelEffect::ShowDescription => ReviewAction::ShowDescription,
         PanelEffect::Approve => ReviewAction::Approve,
         PanelEffect::RejectPrompt => ReviewAction::Reject,
     }
@@ -494,6 +520,32 @@ mod tests {
         (dir, sock)
     }
 
+    /// A minimal task with a non-empty body so the panel shows the task-info
+    /// section and the `More` link.
+    fn sample_task() -> IssueFile {
+        let ts = chrono::Utc::now();
+        IssueFile {
+            task: shelbi_core::Issue {
+                id: "fix-login".into(),
+                title: "Fix the login".into(),
+                column: shelbi_core::Column::review(),
+                priority: 1,
+                assigned_to: Some("review-1".into()),
+                workflow: None,
+                branch: Some("jlong/fix-login".into()),
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                launch: None,
+                created_at: ts,
+                updated_at: ts,
+                params: std::collections::BTreeMap::new(),
+            },
+            body: "## Summary\n\nFix the broken login so sessions persist.".into(),
+            tracker_assignees: Vec::new(),
+        }
+    }
+
     fn iface() -> ReviewInterface {
         ReviewInterface::new(
             "proj",
@@ -503,6 +555,7 @@ mod tests {
             "/wt",
             "Vim",
             true,
+            Some(sample_task()),
         )
     }
 
@@ -546,6 +599,31 @@ mod tests {
         }
         // And it never quit.
         assert!(!it.panel.should_quit, "q/Esc cannot close during a merge");
+    }
+
+    #[test]
+    fn m_key_opens_the_description_popover() {
+        // `m` (the More link's keyboard twin) asks the shell to open the
+        // task-description popover when the task has a body.
+        let mut it = iface();
+        assert_eq!(it.handle_key(key(KeyCode::Char('m'))), ReviewAction::ShowDescription);
+        // The shell can reach the task to populate the popover.
+        assert_eq!(it.task().map(|t| t.task.title.as_str()), Some("Fix the login"));
+    }
+
+    #[test]
+    fn m_key_is_inert_for_a_bodyless_task() {
+        let mut it = ReviewInterface::new(
+            "proj",
+            Arc::new(NeverConnector),
+            "fix-login",
+            "review-1",
+            "/wt",
+            "Vim",
+            true,
+            None,
+        );
+        assert_eq!(it.handle_key(key(KeyCode::Char('m'))), ReviewAction::None);
     }
 
     #[test]
@@ -624,6 +702,7 @@ mod tests {
             "/wt",
             "Vim",
             true,
+            Some(sample_task()),
         );
         // Tighten the retry so the give-up is observable in well under a second.
         it.set_content_retry(RetryPolicy {
