@@ -851,8 +851,9 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
             ..
         } => {
             let dec = state.decoration();
-            // The ready `✓` is bold cyan; the queued `·` and loading `▶` keep
-            // their weight.
+            // Serving reads as a bold cyan ✓ (matching the review panel's bold
+            // cyan "Ready for review" header); the queued `·` and loading `▶`
+            // keep their weight so only the ready mark pops.
             let mut badge_style = Style::default().fg(badge_color(dec.color));
             if matches!(state, ReviewState::Serving) {
                 badge_style = badge_style.add_modifier(Modifier::BOLD);
@@ -1541,6 +1542,59 @@ mod tests {
             row_y(&rows, "Ready for Review") < row_y(&rows, "Queued for Review"),
             "Ready section renders above Queued, got:\n{joined}"
         );
+    }
+
+    /// The serving ✓ renders bold cyan (matching the review panel's bold-cyan
+    /// "Ready for review" header) and the loading ▶ renders in the design's
+    /// muted `#7a7a7a`, never alert-yellow. Inspects the drawn cell styles, not
+    /// just the glyphs, so a regression in either tint is caught.
+    #[test]
+    fn review_badges_render_bold_cyan_check_and_muted_loading() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut model = empty_model();
+        model.reviews = vec![
+            review("palette", "Palette fuzzy-match fix", "shelbi/pf", Some("hub:3000"), ReviewState::Serving),
+            review("nav", "Homepage nav fix", "shelbi/nav", None, ReviewState::Loading),
+        ];
+
+        let view = SidebarView::build(&model);
+        let backend = TestBackend::new(44, 26);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            view.render(f.buffer_mut(), area, 0, true, &default_chrome())
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let cell = |glyph: &str| {
+            (0..buf.area.height)
+                .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+                .map(|(x, y)| &buf[(x, y)])
+                .find(|c| c.symbol() == glyph)
+                .unwrap_or_else(|| panic!("no {glyph:?} cell drawn"))
+        };
+
+        let check = cell("✓");
+        assert_eq!(
+            check.fg,
+            crate::theme::ACCENT,
+            "serving ✓ is the Figma cyan accent",
+        );
+        assert!(
+            check.modifier.contains(Modifier::BOLD),
+            "serving ✓ is bold",
+        );
+
+        let play = cell("▶");
+        assert_eq!(
+            play.fg,
+            crate::theme::MUTED,
+            "loading ▶ renders in the muted #7a7a7a tint",
+        );
+        assert_eq!(play.fg, Color::Rgb(122, 122, 122), "muted is #7a7a7a");
+        assert_ne!(play.fg, Color::Yellow, "loading ▶ is never alert-yellow");
     }
 
     /// The branch line carries the `⎇` marker and truncates a long branch with

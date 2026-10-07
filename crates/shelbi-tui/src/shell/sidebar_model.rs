@@ -268,7 +268,13 @@ fn split_reviews(project_name: &str, queue: Vec<IssueFile>) -> Vec<ReviewRow> {
             .and_then(|name| project.workspace(name))
             .filter(|w| project.effective_tags(w).contains("review"));
         match loaded_on {
-            Some(ws) if review_workspace_is_serving(&project, ws, &tf.task.id) => {
+            Some(ws)
+                if shelbi_orchestrator::workspace::review_slot_is_serving(
+                    &project,
+                    ws,
+                    &tf.task.id,
+                ) =>
+            {
                 let location = Some(format!("{}:{}", ws.machine, ws.name));
                 out.push(entry(
                     &tf.task,
@@ -287,24 +293,6 @@ fn split_reviews(project_name: &str, queue: Vec<IssueFile>) -> Vec<ReviewRow> {
         }
     }
     out
-}
-
-/// Whether `task_id`'s review slot is confirmed serving: its
-/// `.claude/shelbi-review-loaded` marker exists and names this task. Any other
-/// outcome reads as "not serving yet" — the conservative call.
-fn review_workspace_is_serving(
-    project: &shelbi_core::Project,
-    workspace: &shelbi_core::WorkspaceSpec,
-    task_id: &str,
-) -> bool {
-    let Some(machine) = project.machine(&workspace.machine) else {
-        return false;
-    };
-    let marker = shelbi_orchestrator::workspace::workspace_review_loaded_marker(machine, workspace);
-    matches!(
-        shelbi_orchestrator::workspace::read_review_loaded_marker(&machine.host(), &marker),
-        Ok(Some(marked)) if marked == task_id
-    )
 }
 
 /// Whether a config file for `project` exists on disk in either supported
