@@ -362,6 +362,19 @@ impl Backend {
         self.0.live_session_names(host)
     }
 
+    /// Reap "alive but not listening" zombie sessions sharing `target`'s logical
+    /// name when a newer live sibling (a replacement) also exists — terminating
+    /// each zombie's process and removing its directory, so duplicates don't
+    /// accumulate. Local-only and best-effort; returns the reaped short ids. See
+    /// [`SessionProcessBackend::reap_zombies`](crate::session_process_backend::SessionProcessBackend::reap_zombies).
+    pub fn reap_zombie_duplicates(&self, host: &Host, target: &SessionTarget) -> Vec<String> {
+        if host.is_ssh() {
+            return Vec::new();
+        }
+        self.0
+            .reap_zombies(&crate::session_process_backend::session_name(target))
+    }
+
     /// Spawn the orchestrator as a detached session process — the
     /// session-backend branch of [`crate::ensure_dashboard`]
     /// ([`crate::orchestrator_session_spec`] builds the spec).

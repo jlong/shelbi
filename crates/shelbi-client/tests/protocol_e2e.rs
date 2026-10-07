@@ -769,6 +769,7 @@ fn discovery_lists_sessions_and_reaps_dead_directories() {
             task: None,
             launched_at: "2026-10-03T00:00:00Z".into(),
             protocol_version: PROTOCOL_VERSION,
+            pid: 0,
         }
         .to_json()
         .unwrap(),

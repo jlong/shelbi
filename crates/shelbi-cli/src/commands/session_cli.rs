@@ -415,6 +415,7 @@ mod tests {
                 task: None,
                 launched_at: "2026-10-04T12:00:00Z".into(),
                 protocol_version: shelbi_proto::PROTOCOL_VERSION,
+                pid: 0,
             },
             alive,
         }

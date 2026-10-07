@@ -29,6 +29,14 @@ pub struct Meta {
     /// The session protocol's frozen-core version this session speaks
     /// ([`shelbi_proto::PROTOCOL_VERSION`]).
     pub protocol_version: u16,
+    /// OS process id of the session process, recorded at startup. A supervisor
+    /// needs this to terminate an "alive but not listening" zombie *out of band*:
+    /// such a session refuses every socket connect, so the usual over-the-socket
+    /// `kill` can't reach it. `0` means "unknown" — a session written before this
+    /// field existed (an older build), which the reaper can still drop from
+    /// discovery but cannot signal (`rt-re-entering-a-review-fails-to-attach`).
+    #[serde(default)]
+    pub pid: u32,
 }
 
 impl Meta {
@@ -80,9 +88,26 @@ mod tests {
             task: Some("fix-login".into()),
             launched_at: "2026-10-03T12:00:00Z".into(),
             protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            pid: 4242,
         };
         let json = meta.to_json().unwrap();
         assert_eq!(Meta::from_json(&json).unwrap(), meta);
+    }
+
+    #[test]
+    fn meta_without_pid_defaults_to_zero() {
+        // An older build's `meta.json` has no `pid` key; it must still parse, with
+        // `pid` defaulting to 0 (unknown) so the reaper degrades gracefully.
+        let json = r#"{
+            "id": "abc",
+            "name": "demo/ws/alpha",
+            "argv": ["claude"],
+            "cwd": "/tmp",
+            "launched_at": "2026-10-03T12:00:00Z",
+            "protocol_version": 1
+        }"#;
+        let meta = Meta::from_json(json).unwrap();
+        assert_eq!(meta.pid, 0);
     }
 
     #[test]
@@ -95,6 +120,7 @@ mod tests {
             task: None,
             launched_at: "2026-10-03T12:00:00Z".into(),
             protocol_version: 1,
+            pid: 0,
         };
         let json = meta.to_json().unwrap();
         assert!(!json.contains("task"), "task should be elided when None");

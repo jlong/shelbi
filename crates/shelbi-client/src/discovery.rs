@@ -174,6 +174,88 @@ pub fn reap_dead(root: &Path) -> Result<Vec<String>, crate::ClientError> {
     Ok(reaped)
 }
 
+/// Among all discovered `sessions`, choose the one a client should attach to for
+/// logical `name`: a *usable* session (lock held **and** socket accepting),
+/// preferring the most recently launched. Returns `None` when no live session
+/// carries the name.
+///
+/// Duplicates by name are normal — a relaunch races a not-yet-reaped predecessor,
+/// and an "alive but not listening" zombie ([`DiscoveredSession::socket_refusing`])
+/// lingers beside its replacement — so a lookup must choose *deliberately* rather
+/// than take whatever [`list`] happened to return first (its order is the
+/// unsorted `read_dir` order). Picking the zombie strands the client on a connect
+/// that the socket refuses (`rt-re-entering-a-review-fails-to-attach`).
+///
+/// **Cheap by design.** With a single live candidate it is returned *without* a
+/// socket probe: the caller's real connect follows immediately and surfaces a
+/// dead socket on its own (the attach path retries a refused/not-bound socket),
+/// so a redundant probe would only double the work. The probe runs only to
+/// disambiguate two or more live candidates — the duplicate case — and there it
+/// never knowingly returns a refusing socket.
+pub fn choose_session(sessions: &[DiscoveredSession], name: &str) -> Option<DiscoveredSession> {
+    let mut live: Vec<&DiscoveredSession> = sessions
+        .iter()
+        .filter(|s| s.alive && s.meta.name == name)
+        .collect();
+    match live.len() {
+        0 => return None,
+        // Single candidate: trust the lock and skip the probe (see the doc note).
+        1 => return Some(live[0].clone()),
+        _ => {}
+    }
+    // Several share the name. Newest first, so a fresh replacement is preferred
+    // over a stale predecessor. `launched_at` is a fixed-format RFC3339 UTC stamp
+    // from one producer, so a lexical compare orders them correctly.
+    live.sort_by(|a, b| b.meta.launched_at.cmp(&a.meta.launched_at));
+    // Probe each once, newest first, and take the first socket actually accepting
+    // connections — never a zombie over a live one.
+    let probed: Vec<(&DiscoveredSession, SocketReachability)> =
+        live.iter().map(|s| (*s, probe_socket(&s.sock))).collect();
+    if let Some((s, _)) = probed
+        .iter()
+        .find(|(_, r)| *r == SocketReachability::Reachable)
+    {
+        return Some((*s).clone());
+    }
+    // None is accepting yet. Prefer one merely still *binding* its socket
+    // (`NotBound`, a replacement coming up) over a refusing zombie, newest first,
+    // so the attach path retries into the real session instead of the zombie.
+    // Never return a `Refusing` candidate here.
+    probed
+        .iter()
+        .find(|(_, r)| *r != SocketReachability::Refusing)
+        .map(|(s, _)| (*s).clone())
+}
+
+/// Among `sessions`, the "alive but not listening" zombies sharing `name` that a
+/// supervisor should reap: every live candidate whose socket *refuses* connects
+/// ([`DiscoveredSession::socket_refusing`]), **except** the most recently
+/// launched live one — kept as the intended session (a replacement that exists or
+/// is still coming up). Returns an empty list unless the name has more than one
+/// live candidate, so a lone session is never reaped out from under the slot it
+/// still nominally owns (`rt-re-entering-a-review-fails-to-attach`).
+///
+/// Pure selection: the caller does the termination and directory removal.
+pub fn zombies_to_reap<'a>(
+    sessions: &'a [DiscoveredSession],
+    name: &str,
+) -> Vec<&'a DiscoveredSession> {
+    let mut live: Vec<&DiscoveredSession> = sessions
+        .iter()
+        .filter(|s| s.alive && s.meta.name == name)
+        .collect();
+    if live.len() < 2 {
+        return Vec::new();
+    }
+    // Newest first; keep `live[0]` (the replacement), reap older refusing ones.
+    live.sort_by(|a, b| b.meta.launched_at.cmp(&a.meta.launched_at));
+    live[1..]
+        .iter()
+        .copied()
+        .filter(|s| s.socket_refusing())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,18 +302,31 @@ mod tests {
     }
 
     fn discovered(dir: &Path, sock: PathBuf, alive: bool) -> DiscoveredSession {
+        named_at(dir, sock, alive, "demo/ws/review", "1970-01-01T00:00:00Z")
+    }
+
+    /// A [`DiscoveredSession`] with an explicit name and launch time, so a test
+    /// can set up two same-named candidates and assert which one is chosen.
+    fn named_at(
+        dir: &Path,
+        sock: PathBuf,
+        alive: bool,
+        name: &str,
+        launched_at: &str,
+    ) -> DiscoveredSession {
         DiscoveredSession {
             short_id: "test".into(),
             dir: dir.to_path_buf(),
             sock,
             meta: Meta {
                 id: "test".into(),
-                name: "demo/ws/review".into(),
+                name: name.into(),
                 argv: vec!["cat".into()],
                 cwd: dir.to_path_buf(),
                 task: None,
-                launched_at: "1970-01-01T00:00:00Z".into(),
+                launched_at: launched_at.into(),
                 protocol_version: shelbi_proto::PROTOCOL_VERSION,
+                pid: 0,
             },
             alive,
         }
@@ -277,6 +372,146 @@ mod tests {
         let s = discovered(dir.path(), sock, false);
         assert!(!s.socket_refusing());
         assert!(!s.usable());
+    }
+
+    #[test]
+    fn choose_session_returns_none_when_no_live_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let dead = named_at(dir.path(), dir.path().join("sock"), false, "demo/ws/x", "t1");
+        assert!(choose_session(&[dead], "demo/ws/x").is_none());
+        assert!(choose_session(&[], "demo/ws/x").is_none());
+    }
+
+    #[test]
+    fn choose_session_returns_the_lone_live_candidate_without_probing() {
+        // A single live candidate is returned as-is (no socket probe): its path
+        // need not even be a real socket, proving nothing was connected to.
+        let dir = tempfile::tempdir().unwrap();
+        let only = named_at(
+            dir.path(),
+            dir.path().join("no-such-sock"),
+            true,
+            "demo/ws/x",
+            "t1",
+        );
+        let chosen = choose_session(&[only], "demo/ws/x").expect("the lone live candidate");
+        assert_eq!(chosen.meta.launched_at, "t1");
+    }
+
+    #[test]
+    fn choose_session_prefers_the_live_socket_over_a_refusing_zombie() {
+        // The crux (`rt-re-entering-a-review-fails-to-attach`): two sessions share
+        // a name — one a live listener, one a zombie whose socket refuses — and
+        // the pick must be the live one *regardless of list order*, never the
+        // zombie.
+        let live_dir = tempfile::tempdir().unwrap();
+        let live_sock = live_dir.path().join("sock");
+        let _listener = UnixListener::bind(&live_sock).unwrap();
+
+        let zombie_dir = tempfile::tempdir().unwrap();
+        let zombie_sock = zombie_dir.path().join("sock");
+        let z = UnixListener::bind(&zombie_sock).unwrap();
+        drop(z);
+        if !zombie_sock.exists() {
+            return; // platform removed the socket file on drop; refusing case N/A
+        }
+
+        // The zombie is the *newer* one, so a naive "prefer newest" without a
+        // probe would wrongly choose it.
+        let live = named_at(live_dir.path(), live_sock, true, "demo/ws/x", "t1");
+        let zombie = named_at(zombie_dir.path(), zombie_sock, true, "demo/ws/x", "t2");
+
+        for order in [
+            vec![live.clone(), zombie.clone()],
+            vec![zombie.clone(), live.clone()],
+        ] {
+            let chosen = choose_session(&order, "demo/ws/x").expect("a usable session");
+            assert_eq!(
+                chosen.meta.launched_at, "t1",
+                "the live listener must win over the refusing zombie, any order",
+            );
+        }
+    }
+
+    #[test]
+    fn choose_session_prefers_the_newest_reachable_of_several() {
+        // Two live listeners share a name: the most recently launched wins.
+        let a_dir = tempfile::tempdir().unwrap();
+        let a_sock = a_dir.path().join("sock");
+        let _la = UnixListener::bind(&a_sock).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b_sock = b_dir.path().join("sock");
+        let _lb = UnixListener::bind(&b_sock).unwrap();
+
+        let older = named_at(a_dir.path(), a_sock, true, "demo/ws/x", "2026-01-01T00:00:00Z");
+        let newer = named_at(b_dir.path(), b_sock, true, "demo/ws/x", "2026-02-01T00:00:00Z");
+        let chosen = choose_session(&[older, newer], "demo/ws/x").expect("a usable session");
+        assert_eq!(chosen.meta.launched_at, "2026-02-01T00:00:00Z");
+    }
+
+    #[test]
+    fn zombies_to_reap_is_empty_without_a_duplicate() {
+        // A lone live session (zombie or not) is never reaped — there is no
+        // replacement to reap it against.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sock");
+        let z = UnixListener::bind(&sock).unwrap();
+        drop(z);
+        if !sock.exists() {
+            return;
+        }
+        let lone = named_at(dir.path(), sock, true, "demo/ws/x", "t1");
+        assert!(zombies_to_reap(&[lone], "demo/ws/x").is_empty());
+    }
+
+    #[test]
+    fn zombies_to_reap_drops_the_stale_refusing_one_keeping_the_replacement() {
+        // The reap case: a live listener and an older refusing zombie share a
+        // name. The zombie is reaped; the live replacement is kept.
+        let live_dir = tempfile::tempdir().unwrap();
+        let live_sock = live_dir.path().join("sock");
+        let _listener = UnixListener::bind(&live_sock).unwrap();
+
+        let zombie_dir = tempfile::tempdir().unwrap();
+        let zombie_sock = zombie_dir.path().join("sock");
+        let z = UnixListener::bind(&zombie_sock).unwrap();
+        drop(z);
+        if !zombie_sock.exists() {
+            return;
+        }
+
+        // The live one is the newer (the replacement), the zombie older.
+        let live = named_at(live_dir.path(), live_sock, true, "demo/ws/x", "t2");
+        let zombie = named_at(zombie_dir.path(), zombie_sock, true, "demo/ws/x", "t1");
+
+        let candidates = [live, zombie.clone()];
+        let reap = zombies_to_reap(&candidates, "demo/ws/x");
+        assert_eq!(reap.len(), 1, "exactly the one zombie is reaped");
+        assert_eq!(reap[0].meta.launched_at, "t1", "and it is the stale one");
+    }
+
+    #[test]
+    fn zombies_to_reap_never_reaps_the_newest_even_if_it_is_refusing() {
+        // If the *newest* live session is itself still refusing (a replacement
+        // mid-startup) and an older one also refuses, we keep the newest and reap
+        // only the older — never leaving the slot with nothing intended.
+        let a_dir = tempfile::tempdir().unwrap();
+        let a_sock = a_dir.path().join("sock");
+        let za = UnixListener::bind(&a_sock).unwrap();
+        drop(za);
+        let b_dir = tempfile::tempdir().unwrap();
+        let b_sock = b_dir.path().join("sock");
+        let zb = UnixListener::bind(&b_sock).unwrap();
+        drop(zb);
+        if !a_sock.exists() || !b_sock.exists() {
+            return;
+        }
+        let older = named_at(a_dir.path(), a_sock, true, "demo/ws/x", "t1");
+        let newer = named_at(b_dir.path(), b_sock, true, "demo/ws/x", "t2");
+        let candidates = [older, newer];
+        let reap = zombies_to_reap(&candidates, "demo/ws/x");
+        assert_eq!(reap.len(), 1);
+        assert_eq!(reap[0].meta.launched_at, "t1", "the newest is kept");
     }
 
     #[test]

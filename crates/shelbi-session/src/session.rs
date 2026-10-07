@@ -409,6 +409,10 @@ pub fn run(args: RunArgs) -> Result<()> {
         task: args.task.clone(),
         launched_at: chrono::Utc::now().to_rfc3339(),
         protocol_version: shelbi_proto::PROTOCOL_VERSION,
+        // Our own pid, so a supervisor can terminate us out of band if we ever
+        // become an "alive but not listening" zombie (socket refusing connects,
+        // so the usual over-the-socket kill can't reach us).
+        pid: std::process::id(),
     };
     write_meta(&paths, &meta)?;
 

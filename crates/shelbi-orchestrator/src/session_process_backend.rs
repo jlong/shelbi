@@ -89,6 +89,24 @@ fn project_of(session: &str) -> &str {
     session.strip_prefix("shelbi-").unwrap_or(session)
 }
 
+/// SIGTERM the session process `pid`, which drives its own clean teardown (it
+/// kills its child's process group and releases its lifetime lock). A `pid` of 0
+/// (unknown — an older build that didn't record it) is a no-op, and so is any
+/// pid ≤ 1 (self / init), so a malformed record can never signal the wrong
+/// process. Best-effort: a process already gone is fine.
+fn terminate_pid(pid: u32) {
+    let pid = pid as libc::pid_t;
+    if pid <= 1 {
+        return;
+    }
+    // SAFETY: a bare `kill(2)` on a pid we recorded ourselves. SIGTERM lets the
+    // session shut down gracefully (reaping its child); we never SIGKILL it,
+    // which would orphan the child.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+}
+
 impl SessionProcessBackend {
     /// Whether a discovered session is actually **usable**: its lock is held
     /// *and* its socket is accepting connections. A locked session whose socket
@@ -110,34 +128,31 @@ impl SessionProcessBackend {
         s.usable()
     }
 
-    /// Find the live session with the given logical name, if any. A dead
+    /// Find the usable live session with the given logical name, if any. A dead
     /// session directory (lock not held) is skipped here — callers that want a
     /// dead session's final screen reach for it explicitly via the directory.
-    /// Lock-based (no socket probe): the callers (`send_*`, `kill`, `title`,
-    /// `resize`) open a real connection next, so a zombie surfaces there as a
-    /// connect error rather than warranting a second probe connect.
+    ///
+    /// Delegates to [`shelbi_client::choose_session`], which prefers the most
+    /// recently launched and, *only when the name has more than one live
+    /// candidate*, probes their sockets so a zombie is never chosen over a live
+    /// replacement (`rt-re-entering-a-review-fails-to-attach`). The common
+    /// one-session-per-name case still costs a single filesystem scan with no
+    /// extra connect.
     fn find_live(&self, name: &str) -> Option<DiscoveredSession> {
-        self.discover()
-            .into_iter()
-            .find(|s| s.alive && s.meta.name == name)
+        shelbi_client::choose_session(&self.discover(), name)
     }
 
     /// Find any session directory (alive or dead) with the given logical name.
-    /// Prefers a live one when both exist (a stale directory not yet reaped
-    /// alongside a fresh respawn).
+    /// Prefers a usable live one (newest, socket-accepting — via
+    /// [`find_live`](Self::find_live)) when one exists, falling back to any
+    /// directory with the name (a dead/exited session for a final-screen read, or
+    /// a lone zombie) otherwise.
     fn find_any(&self, name: &str) -> Option<DiscoveredSession> {
-        let mut found: Option<DiscoveredSession> = None;
-        for s in self.discover() {
-            let matches = s.meta.name == name;
-            if matches && (s.alive || found.is_none()) {
-                let alive = s.alive;
-                found = Some(s);
-                if alive {
-                    break;
-                }
-            }
+        let all = self.discover();
+        if let Some(s) = shelbi_client::choose_session(&all, name) {
+            return Some(s);
         }
-        found
+        all.into_iter().find(|s| s.meta.name == name)
     }
 
     /// Every session directory under the sessions root. A missing root (no
@@ -470,12 +485,50 @@ impl SessionProcessBackend {
         if host.is_ssh() {
             return remote_session::live_session_names(host);
         }
-        Ok(self
-            .discover()
-            .into_iter()
+        // Report each live name once, and a name only when a *usable* session
+        // carries it: a name whose only live candidates are refusing zombies is
+        // not really live, so an idempotency check keyed on this
+        // (`ensure_content_session`) relaunches rather than reusing a stranded
+        // slot. `choose_session` keeps this cheap — it probes a name only when it
+        // has more than one live candidate (`rt-re-entering-a-review-fails-to-attach`).
+        let all = self.discover();
+        let mut seen = std::collections::BTreeSet::new();
+        Ok(all
+            .iter()
             .filter(|s| s.alive)
-            .map(|s| s.meta.name)
+            .map(|s| s.meta.name.clone())
+            .filter(|name| seen.insert(name.clone()))
+            .filter(|name| shelbi_client::choose_session(&all, name).is_some())
             .collect())
+    }
+
+    /// Terminate any "alive but not listening" zombie sessions that share `name`
+    /// with a newer, still-live sibling (a replacement that exists or is being
+    /// launched), and remove their session directories. Returns the reaped short
+    /// ids. Local-only and best-effort — a remote machine reaps its own.
+    ///
+    /// A zombie's socket refuses every connect, so the usual over-the-socket
+    /// `kill` can't reach it; instead we signal its process directly by the pid
+    /// recorded in `meta.json` (SIGTERM, which drives the session's own clean
+    /// teardown — it kills its child group and releases its lock). A session from
+    /// a build predating the recorded pid can't be signaled (pid `0`); it is still
+    /// dropped from discovery so duplicates don't accumulate. We keep the newest
+    /// live sibling untouched (it is the intended session, even if it is itself
+    /// still binding its socket) and only ever reap *older* refusing ones.
+    pub(crate) fn reap_zombies(&self, name: &str) -> Vec<String> {
+        let all = self.discover();
+        let mut reaped = Vec::new();
+        for z in shelbi_client::zombies_to_reap(&all, name) {
+            terminate_pid(z.meta.pid);
+            // Drop its directory so discovery stops offering it. Unlinking the
+            // files out from under a still-running process is safe on Unix (it
+            // keeps its open fds); once it exits on the SIGTERM above its lock is
+            // gone anyway.
+            if std::fs::remove_dir_all(&z.dir).is_ok() {
+                reaped.push(z.short_id.clone());
+            }
+        }
+        reaped
     }
 }
 
@@ -568,5 +621,143 @@ mod tests {
         let b = SessionProcessBackend;
         let outcome = b.respawn(&SessionTarget::pane("%1"), "cmd");
         assert!(matches!(outcome, RespawnOutcome::Failed { .. }));
+    }
+
+    /// Write a session directory under `sessions` keyed by `id` with logical
+    /// `name` and `launched_at`, hold its lifetime lock, and bind its socket —
+    /// dropped again when `refusing` so every connect to it is refused (the
+    /// zombie), kept listening otherwise (a reachable live session). Returns the
+    /// held lock and the (optional) live listener, which the caller keeps in scope
+    /// for the test's duration.
+    fn write_session_dir(
+        sessions: &std::path::Path,
+        id: &str,
+        name: &str,
+        launched_at: &str,
+        refusing: bool,
+    ) -> (
+        shelbi_session::lock::SessionLock,
+        Option<std::os::unix::net::UnixListener>,
+    ) {
+        use std::os::unix::net::UnixListener;
+        let dir = sessions.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = shelbi_session::Meta {
+            id: id.into(),
+            name: name.into(),
+            argv: vec!["cat".into()],
+            cwd: dir.clone(),
+            task: None,
+            launched_at: launched_at.into(),
+            protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            pid: 0,
+        };
+        std::fs::write(dir.join("meta.json"), meta.to_json().unwrap()).unwrap();
+        let lock = shelbi_session::lock::SessionLock::acquire(&dir.join("lock")).unwrap();
+        let sock = dir.join("sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        if refusing {
+            drop(listener);
+            (lock, None)
+        } else {
+            (lock, Some(listener))
+        }
+    }
+
+    #[test]
+    fn find_live_chooses_the_reachable_session_over_a_same_named_zombie() {
+        // Two live-by-lock sessions share `demo/ws/alpha`: a reachable one and an
+        // even-newer zombie whose socket refuses. `find_live` must return the
+        // reachable one regardless of launch order — never the zombie
+        // (`rt-re-entering-a-review-fails-to-attach`).
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!("shelbi-flz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let prev = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let (_live_lock, live_listener) = write_session_dir(
+            &sessions,
+            "aaaaaaaaaaaaaaaa",
+            "demo/ws/alpha",
+            "2026-01-01T00:00:00Z",
+            false,
+        );
+        let (_zlock, _z) = write_session_dir(
+            &sessions,
+            "bbbbbbbbbbbbbbbb",
+            "demo/ws/alpha",
+            "2999-01-01T00:00:00Z", // newer, so a naive pick would land here
+            true,
+        );
+
+        let chosen = SessionProcessBackend.find_live("demo/ws/alpha");
+        // Skip only if the platform removed the dropped socket file (refusing case
+        // unreproducible); otherwise the reachable one must be chosen.
+        if sessions.join("bbbbbbbbbbbbbbbb").join("sock").exists() {
+            let chosen = chosen.expect("a usable session");
+            assert_eq!(
+                chosen.meta.launched_at, "2026-01-01T00:00:00Z",
+                "the reachable session wins over the newer refusing zombie",
+            );
+        }
+
+        drop(live_listener);
+        match prev {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn reap_zombies_removes_the_stale_one_and_keeps_the_live_replacement() {
+        // A reachable replacement and an older refusing zombie share a name. The
+        // reap drops the zombie's directory and returns its id, leaving the live
+        // replacement untouched (`rt-re-entering-a-review-fails-to-attach`).
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!("shelbi-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let prev = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let (_live_lock, live_listener) = write_session_dir(
+            &sessions,
+            "cccccccccccccccc",
+            "demo/ws/alpha",
+            "2026-02-01T00:00:00Z", // newer: the replacement
+            false,
+        );
+        let (_zlock, _z) = write_session_dir(
+            &sessions,
+            "dddddddddddddddd",
+            "demo/ws/alpha",
+            "2026-01-01T00:00:00Z", // older: the zombie
+            true,
+        );
+
+        let zombie_dir = sessions.join("dddddddddddddddd");
+        if zombie_dir.join("sock").exists() {
+            let reaped = SessionProcessBackend.reap_zombies("demo/ws/alpha");
+            assert_eq!(reaped, vec!["dddddddddddddddd".to_string()]);
+            assert!(!zombie_dir.exists(), "the zombie's dir is removed");
+            assert!(
+                sessions.join("cccccccccccccccc").exists(),
+                "the live replacement's dir is kept",
+            );
+        }
+
+        drop(live_listener);
+        match prev {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
