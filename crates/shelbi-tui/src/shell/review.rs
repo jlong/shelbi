@@ -420,8 +420,8 @@ impl ReviewInterface {
 pub fn open_browser(project: &str, task: &str) -> Result<(), String> {
     let url = crate::review_panel::review_url(project, task)
         .ok_or_else(|| "no review URL configured".to_string())?;
-    let (prog, args) = crate::review_panel::open_url_command(crate::review_panel::current_os(), &url);
-    crate::review_panel::spawn_opener(&prog, &args)
+    let (prog, args) = crate::panel::open_url_command(crate::panel::current_os(), &url);
+    crate::panel::spawn_opener(&prog, &args)
 }
 
 /// Reveal the review worktree folder in the OS file manager (off the UI thread).
@@ -431,9 +431,8 @@ pub fn reveal_folder(project: &str, task: &str) -> Result<(), String> {
     if info.worktree.is_empty() {
         return Err("no review worktree to reveal".into());
     }
-    let (prog, args) =
-        crate::review_panel::reveal_command(crate::review_panel::current_os(), &info.worktree);
-    crate::review_panel::spawn_opener(&prog, &args)
+    let (prog, args) = crate::panel::reveal_command(crate::panel::current_os(), &info.worktree);
+    crate::panel::spawn_opener(&prog, &args)
 }
 
 /// Map a panel [`PanelEffect`] to the shell-level [`ReviewAction`].

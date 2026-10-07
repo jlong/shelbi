@@ -23,6 +23,7 @@ mod refresh;
 mod review;
 mod session;
 mod sidebar;
+mod workspace;
 mod sidebar_model;
 mod terminal_view;
 
@@ -72,6 +73,7 @@ use refresh::ShellSnapshot;
 use review::{ReviewAction, ReviewInterface};
 use session::{LiveConnector, MainState, SessionManager, SessionRef};
 use sidebar::{RowTarget, SidebarView};
+use workspace::{WorkspaceAction, WorkspaceInterface};
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -373,6 +375,18 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         if state.poll_review_reconcile() {
             state.dirty = true;
         }
+        // The workspace interface's content terminal view runs its own connection.
+        if let Some(w) = state.workspace.as_mut() {
+            if w.pump_output(&mut ring) {
+                state.dirty = true;
+            }
+            if w.poll() {
+                state.dirty = true;
+            }
+        }
+        if state.poll_workspace() {
+            state.dirty = true;
+        }
         if state.poll_job() {
             state.dirty = true;
         }
@@ -503,6 +517,29 @@ enum MainView {
     Session,
     Native(View),
     Review(String),
+    /// The workspace interface (panel + content view) for the named dev
+    /// workspace (the workspace-sidebar task). Like [`MainView::Review`] it is a
+    /// transient interface, not a remembered view.
+    Workspace(String),
+}
+
+/// Resolved inputs the shell needs to build a [`WorkspaceInterface`], read off
+/// the UI thread (the workspace-sidebar task).
+struct WorkspaceOpenParams {
+    workspace: String,
+    worktree: String,
+    editor_name: String,
+    /// The in-progress task on the workspace, when resolvable.
+    task: Option<Box<shelbi_state::IssueFile>>,
+}
+
+/// A message from a workspace-open background job (all run off the UI thread).
+enum WorkspaceJobMsg {
+    /// A workspace-open resolve finished: build the interface or show the error.
+    Opened(Result<WorkspaceOpenParams, String>),
+    /// A content-session ensure finished: bind the role or fall back to the
+    /// agent view with a status note.
+    ContentReady(shelbi_app::ReviewRole, Result<(), String>),
 }
 
 /// The three ways to leave the TUI (plan, "Quit semantics"):
@@ -610,6 +647,15 @@ struct ShellState {
     /// The open review interface (panel + content terminal view), when
     /// `main_view` is [`MainView::Review`]. `rt-tui-review`.
     review: Option<ReviewInterface>,
+    /// The open workspace interface (panel + content terminal view), when
+    /// `main_view` is [`MainView::Workspace`] (the workspace-sidebar task).
+    workspace: Option<WorkspaceInterface>,
+    /// In-flight workspace background work (open resolve, content ensure).
+    /// Drained by [`ShellState::poll_workspace`].
+    workspace_rx: Option<Receiver<WorkspaceJobMsg>>,
+    /// The workspace an open-resolve is in flight for, so a resolve that lands
+    /// after the user navigated away is dropped.
+    workspace_opening: Option<String>,
     /// In-flight review background work (open resolution, content ensure,
     /// approve, reject). Drained by [`ShellState::poll_review`].
     review_rx: Option<Receiver<ReviewJobMsg>>,
@@ -777,6 +823,9 @@ impl ShellState {
             review_backend: Arc::new(DaemonReviewBackend),
             review_opening: None,
             review_open_pending: None,
+            workspace: None,
+            workspace_rx: None,
+            workspace_opening: None,
             layout_rx: None,
             layout_bus: None,
             last_review_reconcile: Instant::now(),
@@ -900,6 +949,21 @@ impl ShellState {
     /// [`switch_project`](Self::switch_project) back to this project restores it
     /// — the per-client last-view-per-project memory the plan wants.
     fn show(&mut self, target: RowTarget) {
+        // A dev workspace that has a running task opens the *workspace sidebar* (a
+        // transient interface like review, built off-thread) rather than
+        // attaching its agent session in the main area under the nav sidebar. An
+        // idle workspace keeps the nav sidebar and shows the idle placeholder (the
+        // `RowTarget::Session` path below). Diverted before the view is recorded,
+        // so a later Back restores the view that was active before the workspace
+        // opened — the interface itself is never remembered.
+        if let RowTarget::Session(SessionRef::Workspace(name)) = &target {
+            if self.workspace_has_task(name) {
+                let name = name.clone();
+                self.begin_workspace(name);
+                self.dirty = true;
+                return;
+            }
+        }
         // Record the view first (a Review target has no `View` and is transient,
         // so it is deliberately not remembered).
         if let Some(view) = row_target_to_view(&target) {
@@ -907,23 +971,27 @@ impl ShellState {
         }
         match target {
             RowTarget::Session(r) => {
-                // Leaving an open review for a session: drop the review interface
-                // so it stops rendering over the main area (it draws at the frame
-                // level regardless of `main_view`). Dropping detaches the content
-                // views; the daemon keeps the review's sessions, so reopening the
-                // review-column task reattaches (`rt-tui-idle-workspace-open`).
+                // Leaving an open review / workspace for a session: drop the
+                // interface so it stops rendering over the main area (it draws at
+                // the frame level regardless of `main_view`). Dropping detaches
+                // the content views; the daemon keeps the sessions, so reopening
+                // reattaches (`rt-tui-idle-workspace-open`).
                 self.review = None;
+                self.workspace = None;
                 self.main_view = MainView::Session;
                 self.reported_main = None; // force a resize report for the new session
                 // Record the view (orchestrator chat or a workspace session).
                 let view = match &r {
                     SessionRef::Orchestrator => View::Session("orch".into()),
                     SessionRef::Workspace(w) => View::Session(w.clone()),
-                    // Review content sessions live inside the review interface's
-                    // own manager, never the main one; this arm only keeps the
-                    // match exhaustive.
+                    // Content sessions live inside the review / workspace
+                    // interface's own manager, never the main one; these arms
+                    // only keep the match exhaustive.
                     SessionRef::Review { slot, role } => {
                         View::Session(format!("review/{slot}/{role}"))
+                    }
+                    SessionRef::WorkspaceContent { workspace, role } => {
+                        View::Session(format!("ws/{workspace}/{role}"))
                     }
                 };
                 self.client.set_view(view);
@@ -932,8 +1000,9 @@ impl ShellState {
             }
             RowTarget::Native(v) => {
                 // As above: a native view also replaces the main area, so drop
-                // any open review interface drawn over it.
+                // any open review / workspace interface drawn over it.
                 self.review = None;
+                self.workspace = None;
                 self.client.set_view(v.clone());
                 self.main_view = MainView::Native(v);
                 // Opening a native view takes main focus too, so the keyboard
@@ -1166,6 +1235,19 @@ impl ShellState {
                 match action {
                     GlobalAction::FocusSidebar => r.focus_panel(),
                     GlobalAction::FocusMain => r.focus_content(),
+                    _ => {}
+                }
+            }
+            return;
+        }
+        if matches!(self.main_view, MainView::Workspace(_)) {
+            // Same invariant as review: the workspace interface owns the main
+            // area, so the focus moves step between its panel and content view.
+            self.client.focus_main();
+            if let Some(w) = self.workspace.as_mut() {
+                match action {
+                    GlobalAction::FocusSidebar => w.focus_panel(),
+                    GlobalAction::FocusMain => w.focus_content(),
                     _ => {}
                 }
             }
@@ -2040,6 +2122,227 @@ impl ShellState {
             && self.review.as_ref().map(|r| r.task_id()) == Some(task)
     }
 
+    // -- workspace sidebar (the workspace-sidebar task) ---------------------
+
+    /// Whether the dev workspace `name` currently has a running task, per the
+    /// cached sidebar model (the same `current_task` signal the sidebar shows an
+    /// agent badge for). Decides whether opening the row swaps in the workspace
+    /// sidebar or keeps the nav sidebar with the idle placeholder.
+    fn workspace_has_task(&self, name: &str) -> bool {
+        self.sidebar_model
+            .as_ref()
+            .map(|m| {
+                m.workspaces
+                    .iter()
+                    .any(|w| w.name == name && w.current_task.is_some())
+            })
+            .unwrap_or(false)
+    }
+
+    /// Begin opening the workspace sidebar for `name`: resolve its panel inputs
+    /// (worktree, editor, in-progress task) off the UI thread, then build the
+    /// interface when the resolve lands. Mirrors [`begin_review`](Self::begin_review).
+    fn begin_workspace(&mut self, name: String) {
+        if self.workspace.as_ref().map(|w| w.workspace()) == Some(name.as_str())
+            && matches!(self.main_view, MainView::Workspace(_))
+        {
+            return;
+        }
+        let Some(project) = self.client.project().map(str::to_string) else {
+            return;
+        };
+        self.workspace_opening = Some(name.clone());
+        self.status = Some(format!("opening workspace {name}…"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.workspace_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("shelbi-workspace-open".into())
+            .spawn(move || {
+                let res = shelbi_orchestrator::workspace_session::workspace_open_info(
+                    &project, &name,
+                )
+                .map(|info| WorkspaceOpenParams {
+                    workspace: name.clone(),
+                    worktree: info.worktree,
+                    editor_name: info.editor_name,
+                    task: info.task,
+                })
+                .map_err(|e| e.to_string());
+                let _ = tx.send(WorkspaceJobMsg::Opened(res));
+            })
+            .ok();
+    }
+
+    /// Drain the workspace background channel: build the interface on a resolve,
+    /// or bind the ensured content session.
+    fn poll_workspace(&mut self) -> bool {
+        let msg = match &self.workspace_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(m) => m,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => {
+                    self.workspace_rx = None;
+                    return false;
+                }
+            },
+            None => return false,
+        };
+        self.workspace_rx = None;
+        match msg {
+            WorkspaceJobMsg::Opened(res) => self.on_workspace_opened(res),
+            WorkspaceJobMsg::ContentReady(role, Ok(())) => {
+                if let Some(w) = self.workspace.as_mut() {
+                    w.show_role(role);
+                    self.reported_main = None;
+                }
+            }
+            WorkspaceJobMsg::ContentReady(_role, Err(e)) => {
+                if let Some(w) = self.workspace.as_mut() {
+                    w.show_agent();
+                    w.set_status(format!("couldn't open view: {e}"));
+                }
+            }
+        }
+        true
+    }
+
+    /// Act on a finished workspace-open resolve. A resolve for a workspace the
+    /// user is no longer opening is dropped.
+    fn on_workspace_opened(&mut self, res: Result<WorkspaceOpenParams, String>) {
+        if self.workspace_opening.take().is_none() {
+            return; // navigated away / superseded
+        }
+        match res {
+            Ok(p) => self.build_workspace_interface(p),
+            Err(e) => self.status = Some(format!("workspace failed: {e}")),
+        }
+    }
+
+    /// Build the native workspace interface from resolved params and switch the
+    /// main area to it.
+    fn build_workspace_interface(&mut self, p: WorkspaceOpenParams) {
+        let project = self
+            .client
+            .project()
+            .map(str::to_string)
+            .unwrap_or_default();
+        let task = p.task.map(|b| *b);
+        let agent_name = task
+            .as_ref()
+            .map(agent_display_name)
+            .unwrap_or_else(|| "Agent".to_string());
+        let status = task
+            .as_ref()
+            .map(|t| status_for_column(&t.task.column))
+            .unwrap_or_else(default_ws_status);
+        self.main_view = MainView::Workspace(p.workspace.clone());
+        self.client.focus_main();
+        self.workspace = Some(WorkspaceInterface::new(
+            &project,
+            self.connector.clone(),
+            p.workspace,
+            p.worktree,
+            p.editor_name,
+            agent_name,
+            status,
+            task,
+        ));
+        self.reported_main = None;
+        self.status = None;
+        self.dirty = true;
+    }
+
+    /// Carry out one [`WorkspaceAction`] from the embedded panel. Blocking parts
+    /// run off the UI thread.
+    fn apply_workspace_action(&mut self, action: WorkspaceAction) {
+        let (Some(project), Some(ws)) = (
+            self.client.project().map(str::to_string),
+            self.workspace.as_ref(),
+        ) else {
+            return;
+        };
+        let name = ws.workspace().to_string();
+        match action {
+            WorkspaceAction::None => {}
+            WorkspaceAction::ShowContent(None) => {
+                if let Some(w) = self.workspace.as_mut() {
+                    w.show_agent();
+                    self.reported_main = None;
+                }
+            }
+            WorkspaceAction::ShowContent(Some(role)) => {
+                // Ask the daemon to ensure the editor/diff session, then bind it.
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.workspace_rx = Some(rx);
+                let name = name.clone();
+                std::thread::Builder::new()
+                    .name("shelbi-workspace-ensure".into())
+                    .spawn(move || {
+                        let op = shelbi_app::WorkspaceSessionOp::Ensure { role };
+                        let res = shelbi_app::workspace_session(&project, &name, op, &mut |_, _| {})
+                            .map_err(|e| e.to_string());
+                        let _ = tx.send(WorkspaceJobMsg::ContentReady(role, res));
+                    })
+                    .ok();
+            }
+            WorkspaceAction::RevealFolder => {
+                if let Some(w) = self.workspace.as_mut() {
+                    w.set_status("opening…");
+                }
+                self.spawn_workspace_reveal(name);
+            }
+            WorkspaceAction::ShowDescription => {
+                if let Some(tf) = ws.task().cloned() {
+                    self.overlay = Some(ActiveOverlay::task_description(
+                        tf,
+                        self.keymaps.clone(),
+                        self.display_style,
+                    ));
+                }
+            }
+            WorkspaceAction::Back => {
+                // Leave the content sessions loaded and return to the nav sidebar,
+                // restoring the view active before the workspace opened.
+                self.workspace = None;
+                let view = self.client.view().clone();
+                self.apply_restored_view(view);
+                self.client.focus_sidebar();
+                self.dirty = true;
+            }
+            WorkspaceAction::Close => self.close_workspace(&project, &name),
+        }
+    }
+
+    /// Reveal the workspace worktree folder, off the UI thread.
+    fn spawn_workspace_reveal(&mut self, workspace: String) {
+        let Some(project) = self.client.project().map(str::to_string) else {
+            return;
+        };
+        self.spawn_job(move || match workspace::reveal_folder(&project, &workspace) {
+            Ok(()) => "revealed folder".to_string(),
+            Err(e) => format!("reveal failed: {e}"),
+        });
+    }
+
+    /// Close the workspace sidebar: ask the daemon to end the editor/diff
+    /// sessions, drop the interface, and return to the nav sidebar.
+    fn close_workspace(&mut self, project: &str, workspace: &str) {
+        let project = project.to_string();
+        let workspace = workspace.to_string();
+        self.spawn_job(move || {
+            let op = shelbi_app::WorkspaceSessionOp::Close;
+            match shelbi_app::workspace_session(&project, &workspace, op, &mut |_, _| {}) {
+                Ok(()) => "workspace view closed".to_string(),
+                Err(e) => format!("workspace close failed: {e}"),
+            }
+        });
+        self.workspace = None;
+        let view = self.client.view().clone();
+        self.apply_restored_view(view);
+        self.client.focus_sidebar();
+        self.dirty = true;
+    }
+
     fn handle_sidebar_key(&mut self, k: KeyEvent) {
         let count = self
             .sidebar_view()
@@ -2072,6 +2375,16 @@ impl ShellState {
             if let Some(r) = self.review.as_mut() {
                 let action = r.handle_key(k);
                 self.apply_review_action(action);
+                self.dirty = true;
+            }
+            return;
+        }
+        // The workspace interface owns the main area when it is open (the
+        // workspace-sidebar task).
+        if matches!(self.main_view, MainView::Workspace(_)) {
+            if let Some(w) = self.workspace.as_mut() {
+                let action = w.handle_key(k);
+                self.apply_workspace_action(action);
                 self.dirty = true;
             }
             return;
@@ -2288,6 +2601,20 @@ impl ShellState {
             if let Some(r) = self.review.as_mut() {
                 let action = r.handle_mouse(m, panel_rect, main_rect);
                 self.apply_review_action(action);
+                self.dirty = true;
+            }
+            return;
+        }
+        // The workspace interface owns clicks in both columns, same as review.
+        if matches!(self.main_view, MainView::Workspace(_)) {
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.client.focus_main();
+            }
+            let panel_rect = self.sidebar_content_rect();
+            let main_rect = self.main_rect;
+            if let Some(w) = self.workspace.as_mut() {
+                let action = w.handle_mouse(m, panel_rect, main_rect);
+                self.apply_workspace_action(action);
                 self.dirty = true;
             }
             return;
@@ -2567,6 +2894,9 @@ fn draw(
         if let Some(r) = state.review.as_mut() {
             r.resize(main_rect);
         }
+        if let Some(w) = state.workspace.as_mut() {
+            w.resize(main_rect);
+        }
         state.reported_main = Some(main_size);
     }
 
@@ -2585,6 +2915,8 @@ fn draw(
     // Taken out like the overlay so the draw closure can render it with a
     // mutable borrow of the frame; put back after the draw (rt-tui-review).
     let mut review = state.review.take();
+    // Likewise for the workspace interface (the workspace-sidebar task).
+    let mut workspace = state.workspace.take();
 
     // Borrow what the closure needs. `sidebar_view` is owned and `main_view` is
     // cloned (cheap) so the closure can disjointly borrow the embedded views
@@ -2593,6 +2925,10 @@ fn draw(
     let sidebar_chrome = state.sidebar_chrome();
     let main_view = state.main_view.clone();
     let is_review = matches!(main_view, MainView::Review(_));
+    let is_workspace = matches!(main_view, MainView::Workspace(_));
+    // Either sidebar-column interface suppresses the nav sidebar and the shell's
+    // bottom status band (each carries its own column + status line).
+    let is_panel = is_review || is_workspace;
     let kanban = &mut state.kanban;
     let activity = &mut state.activity;
     let machines = &mut state.machines;
@@ -2619,11 +2955,11 @@ fn draw(
         {
             let buf = frame.buffer_mut();
 
-            // Sidebar — the nav sidebar, except while a review is open: then the
-            // review panel takes the sidebar's column (rendered at the frame
-            // level below), so there are only two columns, panel and content
-            // (`rt-review-screen-hangs-on-connecting`).
-            if !is_review {
+            // Sidebar — the nav sidebar, except while a review or workspace
+            // interface is open: then that panel takes the sidebar's column
+            // (rendered at the frame level below), so there are only two columns,
+            // panel and content (`rt-review-screen-hangs-on-connecting`).
+            if !is_panel {
                 if let Some(view) = &sidebar_view {
                     view.render(buf, content_rect, selection, !focus_main, &sidebar_chrome);
                 }
@@ -2636,7 +2972,9 @@ fn draw(
                     MainState::Connecting(r) => {
                         render_placeholder(buf, main_rect, &format!("Connecting to {}…", r.display()))
                     }
-                    MainState::Idle(info) => render_idle_workspace(buf, main_rect, info),
+                    MainState::Idle(info) => {
+                        render_idle_workspace(buf, main_rect, info, sidebar_chrome.palette())
+                    }
                     MainState::Failed(r, err) => render_placeholder(
                         buf,
                         main_rect,
@@ -2657,11 +2995,18 @@ fn draw(
                         render_placeholder(buf, main_rect, &format!("opening review {id}…"));
                     }
                 }
+                MainView::Workspace(name) => {
+                    // The interface renders at the frame level below; this is only
+                    // the "still opening" fallback before it is built.
+                    if workspace.is_none() {
+                        render_placeholder(buf, main_rect, &format!("opening workspace {name}…"));
+                    }
+                }
             }
 
-            // The review panel carries its own status line, so the shell's
-            // bottom-row status/search band is only for the other main views.
-            if !is_review {
+            // The review / workspace panel carries its own status line, so the
+            // shell's bottom-row status/search band is only for the other views.
+            if !is_panel {
                 if let Some(q) = &searching {
                     render_search_prompt(buf, main_rect, q);
                 } else if let Some(s) = &status {
@@ -2680,6 +3025,15 @@ fn draw(
         // into the main area (`main_rect`) — two columns, panel and content.
         if let Some(r) = review.as_mut() {
             let cur = r.render(frame, content_rect, main_rect, truecolor, focus_main);
+            if overlay.is_none() {
+                cursor = cur;
+            }
+        }
+
+        // The workspace interface renders the same way — panel into the sidebar
+        // column, content terminal view into the main area.
+        if let Some(w) = workspace.as_mut() {
+            let cur = w.render(frame, content_rect, main_rect, truecolor, focus_main);
             if overlay.is_none() {
                 cursor = cur;
             }
@@ -2706,6 +3060,7 @@ fn draw(
     });
     state.overlay = overlay;
     state.review = review;
+    state.workspace = workspace;
     if begin.is_ok() {
         let _ = execute!(io::stdout(), EndSynchronizedUpdate);
     }
@@ -2794,9 +3149,11 @@ fn row_target_to_view(target: &RowTarget) -> Option<View> {
         RowTarget::Session(SessionRef::Orchestrator) => Some(View::Session(ORCH_VIEW.to_string())),
         RowTarget::Session(SessionRef::Workspace(w)) => Some(View::Session(w.clone())),
         RowTarget::Native(v) => Some(v.clone()),
-        // A review content session (editor/diff) is transient and laid out from
-        // current state, never restored from a saved view. `rt-tui-review`.
-        RowTarget::Session(SessionRef::Review { .. }) | RowTarget::Review(_) => None,
+        // A review / workspace content session (editor/diff) is transient and
+        // laid out from current state, never restored from a saved view.
+        RowTarget::Session(SessionRef::Review { .. })
+        | RowTarget::Session(SessionRef::WorkspaceContent { .. })
+        | RowTarget::Review(_) => None,
         // A machine group header toggles collapse; it is not a view.
         RowTarget::Machine(_) => None,
     }
@@ -2812,10 +3169,63 @@ fn view_to_row_target(view: &View) -> RowTarget {
     }
 }
 
+/// Default agent shown when a task has no explicit `agent:` — matches the
+/// sidebar's `DEFAULT_TASK_AGENT`.
+const DEFAULT_TASK_AGENT: &str = "developer";
+
+/// The agent's display name for the workspace panel's Agent switch — the task's
+/// `agent:` param (defaulting to `developer`), title-cased like the sidebar's
+/// right-column agent label (`developer` → `Developer`).
+fn agent_display_name(task: &shelbi_state::IssueFile) -> String {
+    let key = task
+        .task
+        .param_str("agent")
+        .unwrap_or(DEFAULT_TASK_AGENT);
+    sidebar::title_case(key)
+}
+
+/// The status label + colour the workspace panel shows beside the back button,
+/// derived from the task's column. The workspace sidebar opens only for an
+/// in-progress workspace, so `IN PROGRESS` (bold yellow) is the usual case; the
+/// other arms keep it robust if the column changes under an open sidebar.
+fn status_for_column(column: &shelbi_core::Column) -> crate::workspace_panel::WsStatus {
+    use crate::theme::{ACCENT_CYAN, MUTED, PALETTE_GREEN, STATUS_YELLOW};
+    if *column == shelbi_core::Column::in_progress() {
+        crate::workspace_panel::WsStatus {
+            text: "IN PROGRESS".into(),
+            color: STATUS_YELLOW,
+        }
+    } else if *column == shelbi_core::Column::review() {
+        crate::workspace_panel::WsStatus {
+            text: "READY FOR REVIEW".into(),
+            color: ACCENT_CYAN,
+        }
+    } else if *column == shelbi_core::Column::done() {
+        crate::workspace_panel::WsStatus {
+            text: "DONE".into(),
+            color: PALETTE_GREEN,
+        }
+    } else {
+        crate::workspace_panel::WsStatus {
+            text: column.as_str().to_uppercase(),
+            color: MUTED,
+        }
+    }
+}
+
+/// The fallback status when the workspace has no resolvable task (the sidebar
+/// should not open in that case, but the panel degrades gracefully).
+fn default_ws_status() -> crate::workspace_panel::WsStatus {
+    crate::workspace_panel::WsStatus {
+        text: "IDLE".into(),
+        color: crate::theme::MUTED,
+    }
+}
+
 /// The lines of the idle-workspace placeholder: the workspace identity, then a
 /// blank, then the "idle" state and how to start work on it. Pure (no IO, no
 /// rendering) so the content is unit-testable (`rt-tui-idle-workspace-open`).
-fn idle_placeholder_lines(info: &session::IdleInfo) -> Vec<String> {
+fn idle_placeholder_lines(info: &session::IdleInfo, palette_chord: &str) -> Vec<String> {
     // Identity: "<name>" then "<machine> · <branch>" (each part dropped when
     // unknown, e.g. a remote workspace whose branch we don't resolve).
     let mut identity: Vec<String> = Vec::new();
@@ -2831,41 +3241,47 @@ fn idle_placeholder_lines(info: &session::IdleInfo) -> Vec<String> {
     }
     lines.push(String::new());
     lines.push("Idle — no running session.".to_string());
-    lines.push(
-        "Dispatch a ready task here from the Issues board, or the command palette (Ctrl+Space), \
+    // Show the user's actual palette chord, not a hard-coded one.
+    lines.push(format!(
+        "Dispatch a ready task here from the Issues board, or the command palette ({palette_chord}), \
          to start work."
-            .to_string(),
-    );
+    ));
     lines
 }
 
-/// Render the idle-workspace placeholder: the workspace's identity and how to
-/// start work on it, so opening an idle slot shows something the sidebar
-/// selection agrees with instead of a bare attach error
-/// (`rt-tui-idle-workspace-open`).
-fn render_idle_workspace(buf: &mut ratatui::buffer::Buffer, area: Rect, info: &session::IdleInfo) {
+/// Render the idle-workspace placeholder (`rt-tui-idle-workspace-open`): the
+/// workspace's identity and how to start work on it, top-left per the Figma
+/// (`workspace-idle`). The name reads bold white, the `machine · branch` line and
+/// the body read muted.
+fn render_idle_workspace(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    info: &session::IdleInfo,
+    palette_chord: &str,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let lines = idle_placeholder_lines(info);
-    // Vertically centre the block; the name reads brighter than the dim body.
+    let lines = idle_placeholder_lines(info, palette_chord);
     let n = lines.len() as u16;
-    let top = area.y + area.height.saturating_sub(n) / 2;
     let body: Vec<Line> = lines
         .into_iter()
         .enumerate()
         .map(|(i, text)| {
             let style = if i == 0 {
-                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)
+                // Name: bold white.
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                // Identity + body: muted (`#7a7a7a`).
+                Style::default().fg(crate::theme::MUTED)
             };
             Line::from(Span::styled(text, style))
         })
         .collect();
+    // Top-left, with a one-column gutter.
     let block = Rect::new(
         area.x + 1,
-        top,
+        area.y,
         area.width.saturating_sub(2),
         n.min(area.height),
     );
@@ -3083,7 +3499,7 @@ mod tests {
                 project_label: "proj".into(),
                 nav: vec![
                     NavItem {
-                        label: "Chat".into(),
+                        label: "Orchestrator".into(),
                         view: View::Session("orch".into()),
                     },
                     NavItem {
@@ -3981,30 +4397,55 @@ mod tests {
     fn idle_placeholder_lines_carry_identity_and_a_start_hint() {
         // Full identity: name, then "machine · branch", a blank, the idle line,
         // and the start hint.
-        let lines = idle_placeholder_lines(&session::IdleInfo {
-            name: "vector".into(),
-            machine: "hub".into(),
-            branch: Some("jlong/widget".into()),
-        });
+        let lines = idle_placeholder_lines(
+            &session::IdleInfo {
+                name: "vector".into(),
+                machine: "hub".into(),
+                branch: Some("jlong/widget".into()),
+            },
+            "Ctrl+Space",
+        );
         assert_eq!(lines[0], "vector");
         assert_eq!(lines[1], "hub · jlong/widget");
         assert!(lines.iter().any(|l| l.contains("Idle")));
         assert!(lines.iter().any(|l| l.contains("Issues board")));
+        // The start hint shows the actual palette chord, not a hard-coded one.
+        assert!(
+            lines.iter().any(|l| l.contains("Ctrl+Space")),
+            "the hint names the configured palette chord: {lines:?}"
+        );
+
+        // A different chord flows through verbatim.
+        let custom = idle_placeholder_lines(
+            &session::IdleInfo {
+                name: "vector".into(),
+                machine: "hub".into(),
+                branch: None,
+            },
+            "⌃P",
+        );
+        assert!(custom.iter().any(|l| l.contains("⌃P")));
 
         // A remote workspace (no resolved branch) drops the branch part.
-        let remote = idle_placeholder_lines(&session::IdleInfo {
-            name: "vector".into(),
-            machine: "gpu-box".into(),
-            branch: None,
-        });
+        let remote = idle_placeholder_lines(
+            &session::IdleInfo {
+                name: "vector".into(),
+                machine: "gpu-box".into(),
+                branch: None,
+            },
+            "Ctrl+Space",
+        );
         assert_eq!(remote[1], "gpu-box");
 
         // A workspace whose config couldn't load still shows its name.
-        let bare = idle_placeholder_lines(&session::IdleInfo {
-            name: "vector".into(),
-            machine: String::new(),
-            branch: None,
-        });
+        let bare = idle_placeholder_lines(
+            &session::IdleInfo {
+                name: "vector".into(),
+                machine: String::new(),
+                branch: None,
+            },
+            "Ctrl+Space",
+        );
         assert_eq!(bare[0], "vector");
         assert!(bare.iter().any(|l| l.contains("Idle")));
     }
@@ -4047,6 +4488,7 @@ mod tests {
                 machine: "hub".into(),
                 branch: Some("main".into()),
             },
+            "Ctrl+Space",
         );
         let painted: String = (0..area.height)
             .flat_map(|y| (0..area.width).map(move |x| (x, y)))
@@ -4055,6 +4497,50 @@ mod tests {
         assert!(painted.contains("vector"), "name painted: {painted:?}");
         assert!(painted.contains("hub"), "machine painted");
         assert!(painted.contains("Idle"), "idle line painted");
+        // The name is bold white, the body muted (the Figma `workspace-idle`).
+        let name_cell = (0..area.width)
+            .find_map(|x| buf.cell((x, 0)).filter(|c| c.symbol() == "v"))
+            .expect("name row painted");
+        assert_eq!(name_cell.fg, Color::White, "name is white");
+        assert!(name_cell.modifier.contains(Modifier::BOLD), "name is bold");
+    }
+
+    #[test]
+    fn opening_an_idle_workspace_keeps_the_regular_sidebar() {
+        // Correction (idle workspaces keep the regular sidebar): opening an idle
+        // workspace shows its agent session (→ idle placeholder) under the nav
+        // sidebar, never the workspace sidebar.
+        let mut st = test_state(); // alpha is idle (current_task None)
+        assert!(!st.workspace_has_task("alpha"), "alpha has no task");
+        st.show(RowTarget::Session(SessionRef::Workspace("alpha".into())));
+        assert!(st.workspace.is_none(), "no workspace interface for an idle slot");
+        assert!(st.workspace_opening.is_none(), "no workspace open in flight");
+        assert!(
+            matches!(st.main_view, MainView::Session),
+            "an idle workspace keeps the plain session view"
+        );
+    }
+
+    #[test]
+    fn opening_a_workspace_with_a_task_opens_the_workspace_sidebar() {
+        // A workspace with a running task opens the workspace sidebar (resolved
+        // off-thread), not the plain session view.
+        let mut st = test_state();
+        {
+            let ws = &mut st.sidebar_model.as_mut().unwrap().workspaces[0];
+            ws.current_task = Some("t-1".into());
+            ws.agent = Some("developer".into());
+            ws.badge = shelbi_app::view::WorkspaceBadge::Working;
+        }
+        assert!(st.workspace_has_task("alpha"), "alpha now has a task");
+        st.show(RowTarget::Session(SessionRef::Workspace("alpha".into())));
+        // begin_workspace resolves off-thread; synchronously it marks the open as
+        // in flight rather than falling through to the plain session path.
+        assert_eq!(
+            st.workspace_opening.as_deref(),
+            Some("alpha"),
+            "a workspace-with-task open goes through begin_workspace"
+        );
     }
 
     #[test]

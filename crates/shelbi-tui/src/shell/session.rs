@@ -35,6 +35,13 @@ pub enum SessionRef {
     /// attaches. The review slot's agent (chat) session is a
     /// [`SessionRef::Workspace`] of the slot name.
     Review { slot: String, role: String },
+    /// A dev workspace's content session: the editor or diff tool the workspace
+    /// sidebar shows in a terminal view (the workspace-sidebar task). `workspace`
+    /// is the dev workspace, `role` is `editor` / `diff`. The dev-workspace twin
+    /// of [`SessionRef::Review`]: the daemon owns their lifetime (see
+    /// [`shelbi_orchestrator::workspace_session`]); the shell only attaches. The
+    /// workspace's agent session is a [`SessionRef::Workspace`].
+    WorkspaceContent { workspace: String, role: String },
 }
 
 impl SessionRef {
@@ -44,6 +51,7 @@ impl SessionRef {
             SessionRef::Orchestrator => "orchestrator".to_string(),
             SessionRef::Workspace(w) => w.clone(),
             SessionRef::Review { slot, role } => format!("{slot} {role}"),
+            SessionRef::WorkspaceContent { workspace, role } => format!("{workspace} {role}"),
         }
     }
 }
@@ -54,6 +62,9 @@ pub fn discovery_name(project: &str, r: &SessionRef) -> String {
         SessionRef::Orchestrator => format!("{project}/orch"),
         SessionRef::Workspace(w) => format!("{project}/ws/{w}"),
         SessionRef::Review { slot, role } => format!("{project}/review/{slot}/{role}"),
+        SessionRef::WorkspaceContent { workspace, role } => {
+            format!("{project}/ws/{workspace}/{role}")
+        }
     }
 }
 

@@ -46,6 +46,7 @@ pub mod system_plugin;
 pub mod transition;
 pub mod wake;
 pub mod workspace;
+pub mod workspace_session;
 pub mod zen;
 
 #[cfg(test)]

@@ -14,7 +14,7 @@
 
 use shelbi_proto::control::{
     AddSpec, EditSpec, ExpectedState, MutationKind, MutationRequest, ReviewSessionOp,
-    ReviewSessionRequest, Stream,
+    ReviewSessionRequest, Stream, WorkspaceSessionOp, WorkspaceSessionRequest,
 };
 
 use crate::exec::{ExecError, ExecOutcome, Mutation};
@@ -54,6 +54,30 @@ pub fn review_session(
         op,
     };
     client.review_session(&req, on_line).map_err(map_client_err)
+}
+
+/// Ask the daemon to start or stop a dev workspace's editor/diff content
+/// sessions (the workspace-sidebar task) — the dev-workspace twin of
+/// [`review_session`]. The TUI calls this off its UI thread when a workspace
+/// view is switched to (`Ensure`) and when the workspace sidebar is closed
+/// (`Close`); the daemon owns the sessions so they outlive a client detach.
+pub fn workspace_session(
+    project: &str,
+    workspace: &str,
+    op: WorkspaceSessionOp,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> ExecOutcome {
+    shelbi_state::ensure_daemon_running().map_err(|e| ExecError::Backend(e.to_string()))?;
+    let sock = shelbi_state::control_socket_path().map_err(|e| ExecError::Backend(e.to_string()))?;
+    let mut client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)
+        .map_err(|e| ExecError::Backend(e.to_string()))?;
+    let req = WorkspaceSessionRequest {
+        request_id: 1,
+        project: project.to_string(),
+        workspace: workspace.to_string(),
+        op,
+    };
+    client.workspace_session(&req, on_line).map_err(map_client_err)
 }
 
 /// Map an app [`Mutation`] to `(project, issue id, wire kind)`. The two

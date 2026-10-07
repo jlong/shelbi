@@ -18,7 +18,7 @@ use std::path::Path;
 use serde::de::DeserializeOwned;
 use shelbi_proto::control::{
     self, ChangeNote, ClientMsg, MutationRequest, ReviewSessionRequest, ServerMsg,
-    Stream as OutStream, CONTROL_PROTOCOL_VERSION,
+    Stream as OutStream, WorkspaceSessionRequest, CONTROL_PROTOCOL_VERSION,
 };
 
 use crate::error::ClientError;
@@ -179,6 +179,37 @@ impl ControlClient {
     ) -> Result<(), ClientError> {
         self.write
             .write_all(&control::encode(&ClientMsg::ReviewSession(req.clone()))?)?;
+        self.write.flush()?;
+
+        loop {
+            let msg: ServerMsg = self.read.read_frame()?.ok_or(ClientError::UnexpectedEof)?;
+            match msg {
+                ServerMsg::Line {
+                    request_id,
+                    stream,
+                    text,
+                } if request_id == req.request_id => on_line(stream, &text),
+                ServerMsg::Done { request_id } if request_id == req.request_id => return Ok(()),
+                ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
+                    return Err(ClientError::Mutation(error))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Ask the daemon to start/stop a dev workspace's editor/diff content
+    /// sessions (the workspace-sidebar task) — the dev-workspace twin of
+    /// [`review_session`](Self::review_session). Blocks until the daemon replies
+    /// [`ServerMsg::Done`] (`Ok`) or [`ServerMsg::Failed`], draining streamed
+    /// lines through `on_line`.
+    pub fn workspace_session(
+        &mut self,
+        req: &WorkspaceSessionRequest,
+        on_line: &mut dyn FnMut(OutStream, &str),
+    ) -> Result<(), ClientError> {
+        self.write
+            .write_all(&control::encode(&ClientMsg::WorkspaceSession(req.clone()))?)?;
         self.write.flush()?;
 
         loop {
