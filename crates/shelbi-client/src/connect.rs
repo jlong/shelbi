@@ -88,7 +88,35 @@ pub struct Connection {
     /// The frozen-core protocol version the session speaks (detected, not
     /// enforced: an old session is always usable, per the compatibility policy).
     session_protocol_version: u16,
-    _reader: std::thread::JoinHandle<()>,
+    /// Closes the channel on [`Drop`](Connection::drop) so the reader thread
+    /// stops. `Option` only so `Drop` can take the `FnOnce` out to call it.
+    shutdown: Option<crate::transport::ShutdownHandle>,
+    /// The reader thread. `Option` so `Drop` can `join` it after the channel is
+    /// shut down; keeping the handle lets a dropped `Connection` leave no thread
+    /// behind rather than detach it.
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Connection {
+    /// Wind the connection down so it leaks nothing. Dropping the struct alone
+    /// would not: the reader thread holds a clone of the shared write half, so
+    /// the write half's teardown can't run while the reader lives, and the reader
+    /// stays parked on a `read` of a channel still held open — one abandoned
+    /// throwaway connect (a liveness probe, a `snapshot`/`info`/`title` poll) then
+    /// leaves the reader thread and the session's per-connection handler and
+    /// descriptors held forever
+    /// (`rt-find-the-5s-connection-to-the-review-session`). Firing the shutdown
+    /// handle closes the channel (the reader's `read` returns EOF and it exits,
+    /// and the session sees the close and winds its handler down); joining the
+    /// reader then guarantees the thread is gone before this returns.
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown();
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
 }
 
 impl Connection {
@@ -175,7 +203,7 @@ impl Connection {
         capabilities: &[&str],
         handshake_timeout: Option<Duration>,
     ) -> Result<(Self, SessionEvents), ClientError> {
-        let (mut read_half, mut write_half) = transport.split()?;
+        let (mut read_half, mut write_half, shutdown) = transport.split()?;
 
         // Send our hello.
         let hello = Frame::Hello(Hello {
@@ -214,7 +242,8 @@ impl Connection {
             replies: Mutex::new(reply_rx),
             announced,
             session_protocol_version,
-            _reader: reader,
+            shutdown: Some(shutdown),
+            reader: Some(reader),
         };
         Ok((conn, SessionEvents { rx: event_rx }))
     }

@@ -598,3 +598,215 @@ fn a_silent_client_does_not_block_another_clients_hello() {
     drop(fresh);
     sess.kill_and_join().unwrap();
 }
+
+/// Count this process's live threads. Linux exposes them under
+/// `/proc/self/task`; macOS has no equally portable equivalent here, so on macOS
+/// the leak signal is the fd count alone (a leaked per-connection handler holds
+/// three descriptors as well as its two threads). Returns `None` when the count
+/// can't be read, so the caller skips the thread assertion on an unsupported
+/// platform rather than failing — the fd assertion still carries the leak check,
+/// and CI (Linux) exercises the thread count.
+fn thread_count() -> Option<usize> {
+    std::fs::read_dir("/proc/self/task").ok().map(|rd| rd.count())
+}
+
+/// Wait for the live thread count to fall back to within `slack` of `base`, then
+/// return the settled count. Returns `None` only where `thread_count()` itself is
+/// unavailable (non-Linux), so callers skip the thread assertion exactly as they
+/// would with a bare `thread_count()`.
+///
+/// Why this isn't a bare sample: a handler winds down by *returning* from
+/// `serve_client` / `client_writer`, which drops its sockets — so the fd count
+/// falls back the instant the threads finish. But Linux reclaims a returned
+/// thread's `/proc/self/task` entry asynchronously, a little after the function
+/// returns and the client has already seen EOF. A sample taken the moment the
+/// last probe's fds settle can still count handler threads that have returned but
+/// whose task entries the kernel hasn't reaped yet, so the thread count lags the
+/// (already-flat) fd count on Linux. Polling it the same way the fd check does
+/// lets that lag drain without loosening the bound: a genuine thread leak never
+/// settles and still trips the assertion after `timeout`.
+fn settled_thread_count(base: usize, slack: usize, timeout: Duration) -> Option<usize> {
+    thread_count()?; // availability gate: None on platforms without /proc/self/task
+    Some(
+        wait_for(timeout, || thread_count().filter(|&n| n <= base + slack))
+            .or_else(thread_count)
+            .unwrap_or(0),
+    )
+}
+
+/// Wait for the open-fd count to stop moving, then return it — the baseline a
+/// leak check measures deltas against (lazy first-connection allocations settle
+/// first). Falls back to a bare sample if it never fully settles.
+fn settled_fd_count() -> usize {
+    wait_for(Duration::from_secs(5), {
+        let mut last = 0usize;
+        let mut stable = 0u8;
+        move || {
+            let now = open_fd_count();
+            if now == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = now;
+            }
+            (stable >= 2).then_some(last)
+        }
+    })
+    .unwrap_or_else(open_fd_count)
+}
+
+#[test]
+fn bare_connect_and_drop_probes_do_not_leak() {
+    // A peer that connects and drops at once without ever sending a hello (an
+    // aborted probe). The session sees the EOF and must wind its handler down
+    // immediately; 200 of them leave the thread and fd counts flat
+    // (`rt-find-the-5s-connection-to-the-review-session`).
+    let _g = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut sess = RunningSession::start(
+        "demo/ws/dropprobe",
+        dir.path(),
+        80,
+        24,
+        vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()],
+    );
+
+    // Run the probes in bounded batches, draining each batch's handlers back to
+    // the baseline before the next. This caps how many connections are in flight
+    // at once (a tight unpaced `connect(); drop();` loop can outrun the session's
+    // accept-and-reap and pile up handlers past the process's own fd limit — a
+    // test artifact, not the behavior under test), while still exercising 200
+    // connect-and-drops and proving none of them leaves a handler behind.
+    let drop_batch = |sess: &RunningSession, n: usize| {
+        let probes: Vec<UnixStream> = (0..n).map(|_| sess.connect()).collect();
+        drop(probes);
+    };
+
+    // Warm up so first-connection lazy allocations settle, then baseline.
+    drop_batch(&sess, 5);
+    let base_fds = settled_fd_count();
+    let base_threads = thread_count();
+
+    let (total, batch) = (200usize, 20usize);
+    let mut done = 0;
+    while done < total {
+        let n = batch.min(total - done);
+        drop_batch(&sess, n);
+        // The session must reap this batch (EOF on each dropped probe) back to the
+        // baseline before we add more, or a real leak would be masked by the cap.
+        let settled = wait_for(Duration::from_secs(8), || {
+            let now = open_fd_count();
+            (now <= base_fds + 8).then_some(now)
+        });
+        assert!(
+            settled.is_some(),
+            "a connect-and-drop batch did not wind its handlers down (base={base_fds}, now={})",
+            open_fd_count(),
+        );
+        done += n;
+    }
+
+    let after_fds = wait_for(Duration::from_secs(8), || {
+        let now = open_fd_count();
+        (now <= base_fds + 8).then_some(now)
+    })
+    .unwrap_or_else(open_fd_count);
+    assert!(
+        after_fds <= base_fds + 8,
+        "descriptors leaked across 200 connect-and-drop probes: base={base_fds}, after={after_fds}",
+    );
+    if let Some(base) = base_threads {
+        // Poll the thread count down, same as the fd check above: on Linux the
+        // reaped handler threads' task entries drain a beat after their fds do.
+        let after = settled_thread_count(base, 4, Duration::from_secs(10))
+            .expect("thread_count is available since base was Some");
+        assert!(
+            after <= base + 4,
+            "threads leaked across 200 connect-and-drop probes: base={base}, after={after}",
+        );
+    }
+
+    sess.kill_and_join().unwrap();
+}
+
+#[test]
+fn connect_and_hang_probes_do_not_leak() {
+    // A peer that connects, sends no hello, and holds its socket open past the
+    // handshake window (it wedged mid-handshake, or opened the socket and walked
+    // away). Without a server-side bound each one parks a reader thread and holds
+    // the handler and its three fds forever, until the session hits EMFILE. The
+    // session must close such a connection on its own clock. We drive that clock
+    // short (`SHELBI_HELLO_TIMEOUT_MS`) so the test doesn't wait out the 5 s
+    // default, and confirm the SESSION closes each probe — the client read
+    // returns EOF while the client still holds its end open — leaving the thread
+    // and fd counts flat across 200 (`rt-find-the-5s-connection-to-the-review-session`).
+    let _g = serial();
+    std::env::set_var("SHELBI_HELLO_TIMEOUT_MS", "300");
+    let dir = tempfile::tempdir().unwrap();
+    let mut sess = RunningSession::start(
+        "demo/ws/hangprobe",
+        dir.path(),
+        80,
+        24,
+        vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()],
+    );
+
+    // Warm up (each probe held until the session reaps it), then baseline with no
+    // probe outstanding.
+    let one_batch = |sess: &RunningSession, n: usize| {
+        let mut probes: Vec<UnixStream> = (0..n).map(|_| sess.connect()).collect();
+        for p in &mut probes {
+            // `connect` set a 3 s read timeout — far past the short handshake
+            // window — so a genuine reap returns EOF while a regression that never
+            // closes the connection surfaces as a timeout the assert rejects, not
+            // a hang. (We must not re-set the timeout here: on macOS, once the
+            // session has already closed its end with `shutdown(Both)`,
+            // `set_read_timeout` on the half-closed socket fails EINVAL — which is
+            // itself proof the session reaped it.)
+            let mut b = [0u8; 1];
+            let r = p.read(&mut b);
+            assert!(
+                matches!(r, Ok(0)),
+                "the session must close an un-handshaken probe on its own clock; got {r:?}",
+            );
+        }
+        drop(probes);
+    };
+
+    one_batch(&sess, 10);
+    let base_fds = settled_fd_count();
+    let base_threads = thread_count();
+
+    // 200 probes, batched so at most ~20 handlers are alive at once (the test
+    // process stays well under its own descriptor limit).
+    let (total, batch) = (200usize, 20usize);
+    let mut done = 0;
+    while done < total {
+        let n = batch.min(total - done);
+        one_batch(&sess, n);
+        done += n;
+    }
+
+    let after_fds = wait_for(Duration::from_secs(8), || {
+        let now = open_fd_count();
+        (now <= base_fds + 8).then_some(now)
+    })
+    .unwrap_or_else(open_fd_count);
+    assert!(
+        after_fds <= base_fds + 8,
+        "descriptors leaked across 200 connect-and-hang probes: base={base_fds}, after={after_fds}",
+    );
+    if let Some(base) = base_threads {
+        // Poll the thread count down, same as the fd check above: on Linux the
+        // reaped handler threads' task entries drain a beat after their fds do.
+        let after = settled_thread_count(base, 4, Duration::from_secs(10))
+            .expect("thread_count is available since base was Some");
+        assert!(
+            after <= base + 4,
+            "threads leaked across 200 connect-and-hang probes: base={base}, after={after}",
+        );
+    }
+
+    std::env::remove_var("SHELBI_HELLO_TIMEOUT_MS");
+    sess.kill_and_join().unwrap();
+}

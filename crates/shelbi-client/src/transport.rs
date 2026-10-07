@@ -14,6 +14,7 @@
 //! [`Read`]/[`Write`] objects, no async runtime.
 
 use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -37,10 +38,31 @@ impl ReadTimeout for UnixStream {
     }
 }
 
-/// The owned read and write halves a [`Transport`] splits into: boxed so a
-/// local socket and a relay stream are the same type. The read half carries
-/// [`ReadTimeout`] so the connect can bound the hello handshake.
-pub type TransportHalves = (Box<dyn ReadTimeout + Send>, Box<dyn Write + Send>);
+/// Closes a transport's channel so a reader thread parked on `read` returns
+/// EOF and exits — the piece [`Connection`](crate::Connection)'s `Drop` fires to
+/// release a connection it is finished with.
+///
+/// Without it a throwaway connection leaks: the reader thread holds a clone of
+/// the write half, so the write half's own teardown can't run while the reader
+/// lives, and the reader never wakes because it is blocked reading a channel
+/// that stays open. One abandoned connect leaves the reader thread parked and —
+/// for a local socket — the session's per-connection handler and its three file
+/// descriptors held open too, until the session runs out of descriptors and can
+/// serve no one (`rt-find-the-5s-connection-to-the-review-session`). Firing this
+/// on drop shuts the channel so the reader returns and both ends wind down. It is
+/// a `FnOnce` the `Drop` calls exactly once; it must be safe to call on a channel
+/// that is already gone.
+pub type ShutdownHandle = Box<dyn FnOnce() + Send>;
+
+/// The owned read and write halves a [`Transport`] splits into, plus a
+/// [`ShutdownHandle`] that closes the channel. Boxed so a local socket and a
+/// relay stream are the same type. The read half carries [`ReadTimeout`] so the
+/// connect can bound the hello handshake.
+pub type TransportHalves = (
+    Box<dyn ReadTimeout + Send>,
+    Box<dyn Write + Send>,
+    ShutdownHandle,
+);
 
 /// A bidirectional byte channel to one session, splittable into independent,
 /// owned read and write halves.
@@ -67,6 +89,14 @@ impl Transport for LocalTransport {
         // whole frames are written under the connection's write lock.
         let read = self.0;
         let write = read.try_clone()?;
-        Ok((Box::new(read), Box::new(write)))
+        // A third handle, solely so `Connection`'s `Drop` can `shutdown(Both)`
+        // the socket from outside the reader thread: that unblocks the reader's
+        // parked `read` (which returns EOF) so it exits, and closes the peer so
+        // the session's handler winds down and frees its descriptors.
+        let shutdown = read.try_clone()?;
+        let shutdown: ShutdownHandle = Box::new(move || {
+            let _ = shutdown.shutdown(Shutdown::Both);
+        });
+        Ok((Box::new(read), Box::new(write), shutdown))
     }
 }

@@ -308,7 +308,17 @@ impl Transport for RelayStream {
             inner: self.inner.clone(),
             stream: self.state.stream,
         };
-        Ok((Box::new(reader), Box::new(writer)))
+        // `Connection`'s `Drop` fires this to wind a finished stream down from
+        // outside the reader thread. Closing the stream state wakes the reader's
+        // parked `read` with EOF so it exits (it cannot wait for the writer's own
+        // `Drop`, which the reader itself keeps from running by holding a clone of
+        // the shared write half); the relay-side socket is then dropped when the
+        // last writer handle goes away. Mirrors `RelayStreamWriter::Drop`.
+        let state = self.state.clone();
+        let shutdown: crate::transport::ShutdownHandle = Box::new(move || {
+            state.close();
+        });
+        Ok((Box::new(reader), Box::new(writer), shutdown))
     }
 }
 
