@@ -25,6 +25,22 @@ fn serial() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|p| p.into_inner())
 }
 
+/// A generous upper bound for polling a one-time condition to completion:
+/// the socket binding, the child writing a file, fd/thread counts settling, the
+/// run thread joining after a kill. Sized so a loaded host — several workers and
+/// a parallel `cargo build --workspace` saturating every core — still satisfies
+/// a healthy condition far inside it, while a genuine hang or leak never
+/// satisfies it and still trips the caller's assertion at the deadline. A longer
+/// deadline never weakens a check; it only removes the false failures that come
+/// from scheduler starvation, not from the behavior under test.
+const SETTLE: Duration = Duration::from_secs(30);
+
+/// How long to wait for a protocol frame we expect to arrive (a hello reply, an
+/// attach replay). Generous for the same load reasons as [`SETTLE`]: a reply
+/// that is merely slow under load still reads cleanly, while one that never
+/// comes still fails the caller's assertion once this elapses.
+const FRAME_READ: Duration = Duration::from_secs(15);
+
 /// Set `$SHELBI_HOME` to a fresh temp dir for this test; returns the guard that
 /// cleans it up when dropped.
 fn set_home() -> tempfile::TempDir {
@@ -127,9 +143,13 @@ impl RunningSession {
             manage_daemon: false,
         };
         let handle = std::thread::spawn(move || shelbi_session::run(args));
-        // Wait for the socket to be bound.
+        // Wait for the socket to be bound. `run()` binds it only after opening
+        // the PTY, spawning the child, and starting three background threads
+        // (session.rs); on a host under parallel-build load that cold startup can
+        // take several seconds, so poll up to the generous `SETTLE` deadline
+        // rather than a tight one that races scheduler starvation.
         let sock = paths.sock();
-        wait_for(Duration::from_secs(5), || sock.exists().then_some(()))
+        wait_for(SETTLE, || sock.exists().then_some(()))
             .expect("session socket should appear");
         Self {
             paths,
@@ -139,27 +159,72 @@ impl RunningSession {
     }
 
     fn connect(&self) -> UnixStream {
-        let stream = UnixStream::connect(self.paths.sock()).expect("connect");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
+        // Retry a transient connect failure rather than panic. The leak probes
+        // fire connects in rapid bursts; on a loaded host the accept thread can be
+        // starved long enough for the listen backlog to fill, and the kernel then
+        // refuses a connect (`ECONNREFUSED` on macOS) even though the session is
+        // perfectly healthy and draining — a test artifact of the burst, not the
+        // behavior under test. A not-yet-visible socket file (`NotFound`) is the
+        // same kind of transient startup race. Poll past both up to `SETTLE`; a
+        // genuinely dead listener keeps refusing and still fails at the deadline.
+        let sock = self.paths.sock();
+        let stream = wait_for(SETTLE, || match UnixStream::connect(&sock) {
+            Ok(s) => Some(s),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                None
+            }
+            Err(e) => panic!("connect: {e:?}"),
+        })
+        .expect("session accepts a connection within the deadline");
+        // Bound reads so a never-arriving frame surfaces as a prompt error rather
+        // than a hang, but keep the bound generous (`FRAME_READ`): a reply that is
+        // merely slow under load must still read cleanly. It is far past every
+        // handshake window the session enforces, so a reaped probe still returns
+        // EOF long before this fires.
+        stream.set_read_timeout(Some(FRAME_READ)).unwrap();
         stream
     }
 
     /// Send a kill frame to end the child, then join the run thread.
     fn kill_and_join(&mut self) -> anyhow::Result<()> {
-        if let Ok(mut s) = UnixStream::connect(self.paths.sock()) {
-            let frame = Frame::Kill(Kill {
-                signal: Some(libc::SIGKILL),
-            })
-            .encode()
-            .unwrap();
-            let _ = s.write_all(&frame);
+        send_kill(&self.paths.sock());
+        join_run(self.handle.take().expect("joined once"), SETTLE)
+    }
+}
+
+/// Best-effort: connect to the session socket and send a `SIGKILL` frame. Retries
+/// a transient connection refusal (a momentarily full accept backlog under load)
+/// for a short window so the kill still reaches a healthy session; a *missing*
+/// socket means the session already exited (nothing to kill), so that returns at
+/// once rather than waiting out the window.
+fn send_kill(sock: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match UnixStream::connect(sock) {
+            Ok(mut s) => {
+                if let Ok(frame) = Frame::Kill(Kill {
+                    signal: Some(libc::SIGKILL),
+                })
+                .encode()
+                {
+                    let _ = s.write_all(&frame);
+                }
+                return;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // Socket gone (session exited) or any other error: best effort, done.
+            Err(_) => return,
         }
-        join_run(
-            self.handle.take().expect("joined once"),
-            Duration::from_secs(10),
-        )
     }
 }
 
@@ -168,17 +233,10 @@ impl Drop for RunningSession {
         // Backstop: if a test returned early, make sure the run thread is not
         // left waiting on a live child.
         if let Some(handle) = self.handle.take() {
-            if let Ok(mut s) = UnixStream::connect(self.paths.sock()) {
-                let frame = Frame::Kill(Kill {
-                    signal: Some(libc::SIGKILL),
-                })
-                .encode()
-                .unwrap();
-                let _ = s.write_all(&frame);
-            }
+            send_kill(&self.paths.sock());
             // Bounded join: never let a stuck run thread hang teardown, and
             // never panic from Drop (a double-panic would abort the process).
-            let _ = join_within(handle, Duration::from_secs(10));
+            let _ = join_within(handle, SETTLE);
         }
     }
 }
@@ -187,7 +245,7 @@ impl Drop for RunningSession {
 fn read_frame(stream: &mut UnixStream) -> Option<Frame> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + FRAME_READ;
     loop {
         match Frame::decode(&buf) {
             Ok((frame, _)) => return Some(frame),
@@ -274,7 +332,7 @@ fn child_gets_scrubbed_login_environment_with_shelbi_term_vars() {
         vec!["/bin/sh".into(), "-c".into(), script],
     );
 
-    let body = wait_for(Duration::from_secs(5), || {
+    let body = wait_for(SETTLE, || {
         std::fs::read_to_string(&out).ok().filter(|s| !s.is_empty())
     })
     .expect("child should write its environment");
@@ -312,7 +370,7 @@ fn responder_answers_queries_with_no_client_attached() {
         vec!["/bin/sh".into(), "-c".into(), script],
     );
 
-    let reply = wait_for(Duration::from_secs(5), || {
+    let reply = wait_for(SETTLE, || {
         std::fs::read(&out).ok().filter(|b| b.len() >= 15)
     });
     sess.kill_and_join().unwrap();
@@ -346,7 +404,7 @@ fn kill_reaches_the_whole_process_group() {
         vec!["/bin/sh".into(), "-c".into(), script],
     );
 
-    let gc: i32 = wait_for(Duration::from_secs(5), || {
+    let gc: i32 = wait_for(SETTLE, || {
         std::fs::read_to_string(&out)
             .ok()
             .and_then(|s| s.trim().parse().ok())
@@ -357,7 +415,7 @@ fn kill_reaches_the_whole_process_group() {
     sess.kill_and_join().unwrap();
 
     // After the session reaps the group, the grandchild is gone.
-    let reaped = wait_for(Duration::from_secs(5), || (!alive(gc)).then_some(()));
+    let reaped = wait_for(SETTLE, || (!alive(gc)).then_some(()));
     assert!(reaped.is_some(), "grandchild survived the group kill");
 }
 
@@ -383,7 +441,7 @@ fn no_descriptor_leaks_into_the_child() {
         vec!["/bin/sh".into(), "-c".into(), script],
     );
 
-    let body = wait_for(Duration::from_secs(5), || {
+    let body = wait_for(SETTLE, || {
         std::fs::read_to_string(&out).ok().filter(|s| !s.is_empty())
     })
     .expect("child should list its fds");
@@ -411,7 +469,7 @@ fn raw_output_log_is_written_only_when_enabled() {
             dir.path(),
             vec!["/bin/sh".into(), "-c".into(), "printf RAWMARKER; exec sleep 10".into()],
         );
-        let has_marker = wait_for(Duration::from_secs(5), || {
+        let has_marker = wait_for(SETTLE, || {
             std::fs::read(sess.paths.raw_log())
                 .ok()
                 .filter(|b| b.windows(9).any(|w| w == b"RAWMARKER"))
@@ -510,7 +568,7 @@ fn repeated_attach_detach_does_not_leak_descriptors() {
     for _ in 0..5 {
         cycle(&sess);
     }
-    let base = wait_for(Duration::from_secs(5), {
+    let base = wait_for(SETTLE, {
         let mut last = 0usize;
         let mut stable = 0u8;
         move || {
@@ -533,7 +591,7 @@ fn repeated_attach_detach_does_not_leak_descriptors() {
     // After 200 clean cycles the session must have wound every handler down, so
     // the fd count returns to the baseline (a per-connection leak would grow it
     // by a few descriptors each cycle — hundreds total).
-    let after = wait_for(Duration::from_secs(8), || {
+    let after = wait_for(SETTLE, || {
         let now = open_fd_count();
         (now <= base + 8).then_some(now)
     });
@@ -563,7 +621,10 @@ fn a_silent_client_does_not_block_another_clients_hello() {
     let mut stuck = sess.connect();
     client_hello(&mut stuck);
     client_attach(&mut stuck);
-    // Let output pile up against the silent client.
+    // Let output pile up against the silent client so its writer is parked on a
+    // full socket buffer before the second client arrives. `yes` fills the kernel
+    // buffer near-instantly, so this only ever under-wedges on a pathologically
+    // slow host — which would make the test trivially pass, never falsely fail.
     std::thread::sleep(Duration::from_millis(300));
 
     // A second client's hello must still complete promptly — each connection has
@@ -583,14 +644,27 @@ fn a_silent_client_does_not_block_another_clients_hello() {
     let start = Instant::now();
     fresh.write_all(&hello).unwrap();
     fresh.flush().unwrap();
+    // `read_frame` waits up to the generous `FRAME_READ` window, so a reply that
+    // is merely slow under load is still read rather than lost to a tight read
+    // timeout — we rely on the measured `elapsed`, not the read bound, to catch a
+    // regression.
     let reply = read_frame(&mut fresh);
     let elapsed = start.elapsed();
     assert!(
         matches!(reply, Some(Frame::Hello(_))),
-        "the second client must get its hello reply",
+        "the second client must get its hello reply (got {reply:?} after {elapsed:?})",
     );
+    // The discriminator. A correct session answers the fresh hello on that
+    // connection's own handler/writer threads in milliseconds. The only
+    // regression this guards — serializing the broadcast's socket writes behind a
+    // held registry lock — would stall the fresh client's registration behind the
+    // stuck client's blocked write for at least the 2 s client write timeout (and,
+    // under the continuous `yes` flood, on every broadcast cycle after). The 1.5 s
+    // bound sits with clear margin on both sides: far above the millisecond-scale
+    // healthy path even on a loaded host (two thread wake-ups), and below the 2 s
+    // regression floor.
     assert!(
-        elapsed < Duration::from_secs(1),
+        elapsed < Duration::from_millis(1500),
         "a silent client blocked a second client's hello ({elapsed:?})",
     );
 
@@ -638,7 +712,7 @@ fn settled_thread_count(base: usize, slack: usize, timeout: Duration) -> Option<
 /// leak check measures deltas against (lazy first-connection allocations settle
 /// first). Falls back to a bare sample if it never fully settles.
 fn settled_fd_count() -> usize {
-    wait_for(Duration::from_secs(5), {
+    wait_for(SETTLE, {
         let mut last = 0usize;
         let mut stable = 0u8;
         move || {
@@ -694,7 +768,7 @@ fn bare_connect_and_drop_probes_do_not_leak() {
         drop_batch(&sess, n);
         // The session must reap this batch (EOF on each dropped probe) back to the
         // baseline before we add more, or a real leak would be masked by the cap.
-        let settled = wait_for(Duration::from_secs(8), || {
+        let settled = wait_for(SETTLE, || {
             let now = open_fd_count();
             (now <= base_fds + 8).then_some(now)
         });
@@ -706,7 +780,7 @@ fn bare_connect_and_drop_probes_do_not_leak() {
         done += n;
     }
 
-    let after_fds = wait_for(Duration::from_secs(8), || {
+    let after_fds = wait_for(SETTLE, || {
         let now = open_fd_count();
         (now <= base_fds + 8).then_some(now)
     })
@@ -718,7 +792,7 @@ fn bare_connect_and_drop_probes_do_not_leak() {
     if let Some(base) = base_threads {
         // Poll the thread count down, same as the fd check above: on Linux the
         // reaped handler threads' task entries drain a beat after their fds do.
-        let after = settled_thread_count(base, 4, Duration::from_secs(10))
+        let after = settled_thread_count(base, 4, SETTLE)
             .expect("thread_count is available since base was Some");
         assert!(
             after <= base + 4,
@@ -756,10 +830,11 @@ fn connect_and_hang_probes_do_not_leak() {
     let one_batch = |sess: &RunningSession, n: usize| {
         let mut probes: Vec<UnixStream> = (0..n).map(|_| sess.connect()).collect();
         for p in &mut probes {
-            // `connect` set a 3 s read timeout — far past the short handshake
-            // window — so a genuine reap returns EOF while a regression that never
-            // closes the connection surfaces as a timeout the assert rejects, not
-            // a hang. (We must not re-set the timeout here: on macOS, once the
+            // `connect` set the generous `FRAME_READ` read timeout — far past the
+            // short handshake window — so a genuine reap returns EOF while a
+            // regression that never closes the connection surfaces as a timeout
+            // the assert rejects, not a hang. (We must not re-set the timeout
+            // here: on macOS, once the
             // session has already closed its end with `shutdown(Both)`,
             // `set_read_timeout` on the half-closed socket fails EINVAL — which is
             // itself proof the session reaped it.)
@@ -787,7 +862,7 @@ fn connect_and_hang_probes_do_not_leak() {
         done += n;
     }
 
-    let after_fds = wait_for(Duration::from_secs(8), || {
+    let after_fds = wait_for(SETTLE, || {
         let now = open_fd_count();
         (now <= base_fds + 8).then_some(now)
     })
@@ -799,7 +874,7 @@ fn connect_and_hang_probes_do_not_leak() {
     if let Some(base) = base_threads {
         // Poll the thread count down, same as the fd check above: on Linux the
         // reaped handler threads' task entries drain a beat after their fds do.
-        let after = settled_thread_count(base, 4, Duration::from_secs(10))
+        let after = settled_thread_count(base, 4, SETTLE)
             .expect("thread_count is available since base was Some");
         assert!(
             after <= base + 4,
