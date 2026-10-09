@@ -146,7 +146,12 @@ fn every_key_but_ctrl_space_reaches_the_agent_over_a_real_pty() {
     };
     let _session = std::thread::spawn(move || shelbi_session::run(args));
     let sock = paths.sock();
-    wait_for(Duration::from_secs(5), || sock.exists().then_some(()))
+    // Generous deadline: the PTY session spawns on a worker thread, and under a
+    // loaded host (several workers plus a parallel `cargo build` saturating the
+    // CPU) its socket can take several seconds to bind. A tight 5s wait flaked
+    // here; this returns the instant the socket appears, so a healthy run is
+    // unaffected.
+    wait_for(Duration::from_secs(30), || sock.exists().then_some(()))
         .expect("the session socket should appear");
     let _cleanup = Cleanup { sock: sock.clone() };
 
@@ -325,7 +330,12 @@ fn a_copy_chord_with_a_selection_is_not_forwarded_to_the_agent() {
     };
     let _session = std::thread::spawn(move || shelbi_session::run(args));
     let sock = paths.sock();
-    wait_for(Duration::from_secs(5), || sock.exists().then_some(()))
+    // Generous deadline: the PTY session spawns on a worker thread, and under a
+    // loaded host (several workers plus a parallel `cargo build` saturating the
+    // CPU) its socket can take several seconds to bind. A tight 5s wait flaked
+    // here; this returns the instant the socket appears, so a healthy run is
+    // unaffected.
+    wait_for(Duration::from_secs(30), || sock.exists().then_some(()))
         .expect("the session socket should appear");
     let _cleanup = Cleanup { sock: sock.clone() };
 
@@ -436,7 +446,12 @@ fn focus_chords_are_not_forwarded_but_backspace_is() {
     };
     let _session = std::thread::spawn(move || shelbi_session::run(args));
     let sock = paths.sock();
-    wait_for(Duration::from_secs(5), || sock.exists().then_some(()))
+    // Generous deadline: the PTY session spawns on a worker thread, and under a
+    // loaded host (several workers plus a parallel `cargo build` saturating the
+    // CPU) its socket can take several seconds to bind. A tight 5s wait flaked
+    // here; this returns the instant the socket appears, so a healthy run is
+    // unaffected.
+    wait_for(Duration::from_secs(30), || sock.exists().then_some(()))
         .expect("the session socket should appear");
     let _cleanup = Cleanup { sock: sock.clone() };
 

@@ -1316,7 +1316,10 @@ mod tests {
         };
         std::thread::spawn(move || shelbi_session::run(args));
         let sock = paths.sock();
-        for _ in 0..500 {
+        // Generous deadline (30s, not 5s): the session spawns on a worker thread,
+        // and under a loaded host its socket can take seconds to bind. The loop
+        // breaks the instant the socket appears, so a healthy run is unaffected.
+        for _ in 0..3000 {
             if sock.exists() {
                 break;
             }
@@ -1342,7 +1345,10 @@ mod tests {
     /// Poll the manager until it reaches `MainState::Live`, or the budget runs
     /// out. Returns whether it went live.
     fn poll_until_live(mgr: &mut SessionManager) -> bool {
-        for _ in 0..500 {
+        // Generous deadline (30s): attaching involves a real session spawn plus a
+        // connect handshake, both of which stretch under load. Returns the moment
+        // the pane goes live, so a healthy run doesn't pay the full budget.
+        for _ in 0..3000 {
             mgr.poll();
             if matches!(mgr.state(), MainState::Live(_)) {
                 return true;
@@ -1859,7 +1865,10 @@ mod tests {
         };
         std::thread::spawn(move || shelbi_session::run(args));
         let sock = paths.sock();
-        for _ in 0..500 {
+        // Generous deadline (30s, not 5s): the session spawns on a worker thread,
+        // and under a loaded host its socket can take seconds to bind. The loop
+        // breaks the instant the socket appears, so a healthy run is unaffected.
+        for _ in 0..3000 {
             if sock.exists() {
                 break;
             }
@@ -1872,7 +1881,10 @@ mod tests {
     /// Drive the manager until its bound pane reports it exited, pumping output.
     fn wait_until_exited(mgr: &mut SessionManager) -> bool {
         let mut ring = false;
-        for _ in 0..600 {
+        // Generous deadline (30s): the child exits on its own after a short sleep,
+        // but observing that exit depends on scheduling the poll loop, which lags
+        // under load. Returns as soon as the exit is seen.
+        for _ in 0..3000 {
             mgr.poll();
             mgr.pump_output(&mut ring);
             if let Slot::Live(live) = &mgr.slot {
@@ -1914,8 +1926,22 @@ mod tests {
             matches!(mgr.state(), MainState::Restarting(1, _)),
             "the pane shows restart attempt 1 in flight"
         );
-        // A (non-reopen) relaunch was requested.
-        let calls = relauncher.calls.lock().unwrap().clone();
+        // A (non-reopen) relaunch was requested. It runs on the connect worker
+        // thread `poll_at` spawned, so it lands a beat after `poll_at` returns —
+        // wait for it rather than reading the shared log straight away (the read
+        // used to race the worker and see `[]`). Only one restart worker was
+        // kicked (a single `poll_at`), so once a call shows up the log is final.
+        let calls = {
+            let mut calls = Vec::new();
+            for _ in 0..500 {
+                calls = relauncher.calls.lock().unwrap().clone();
+                if !calls.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            calls
+        };
         assert_eq!(calls, vec![false], "one auto (non-reopen) relaunch");
     }
 
