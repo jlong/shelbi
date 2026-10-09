@@ -57,6 +57,9 @@ enum SwitchItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PanelRow {
     Back,
+    /// The `More` link in the task-info block — opens the full task-description
+    /// popover. Present only when the task has a body.
+    More,
     Folder,
     Switch(SwitchItem),
 }
@@ -149,13 +152,19 @@ impl WorkspacePanel {
 
     /// The keyboard-navigable rows, top to bottom.
     fn rows(&self) -> Vec<PanelRow> {
-        vec![
-            PanelRow::Back,
+        let mut rows = vec![PanelRow::Back];
+        // `More` sits right under the back button, in reading order with the
+        // task-info block it belongs to, and only when there's a body to open.
+        if !self.description.trim().is_empty() {
+            rows.push(PanelRow::More);
+        }
+        rows.extend([
             PanelRow::Folder,
             PanelRow::Switch(SwitchItem::Agent),
             PanelRow::Switch(SwitchItem::Diff),
             PanelRow::Switch(SwitchItem::Editor),
-        ]
+        ]);
+        rows
     }
 
     /// Start index and count of the contiguous `Switch` run in [`rows`].
@@ -210,6 +219,7 @@ impl WorkspacePanel {
     fn activate_row(&mut self, row: PanelRow) -> WsEffect {
         match row {
             PanelRow::Back => WsEffect::Back,
+            PanelRow::More => self.request_description(),
             PanelRow::Folder => WsEffect::RevealFolder,
             PanelRow::Switch(SwitchItem::Agent) => {
                 self.active_view = WsView::Agent;
@@ -239,6 +249,11 @@ impl WorkspacePanel {
     pub fn click(&mut self, column: u16, row: u16) -> WsEffect {
         if let Some(r) = self.more_hit {
             if in_rect(r, column, row) {
+                // Move keyboard focus to `More` too, so a click and the keyboard
+                // agree on what's selected.
+                if let Some(idx) = self.rows().iter().position(|r| matches!(r, PanelRow::More)) {
+                    self.selected = idx;
+                }
                 return self.request_description();
             }
         }
@@ -308,6 +323,10 @@ pub fn render_full(f: &mut Frame, app: &mut WorkspacePanel, area: Rect) {
 
     // 2. Task info (title + description preview + More).
     if y < bottom {
+        let more_selected = app
+            .rows()
+            .get(app.selected)
+            .is_some_and(|r| matches!(r, PanelRow::More));
         let (used, more_hit) = render_task_info(
             f,
             Rect {
@@ -318,6 +337,7 @@ pub fn render_full(f: &mut Frame, app: &mut WorkspacePanel, area: Rect) {
             },
             &app.title,
             &app.description,
+            more_selected,
         );
         app.more_hit = more_hit;
         y += used;
@@ -530,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_switch_is_selected_and_full_width_by_default() {
+    fn agent_switch_is_selected_and_inset_by_default() {
         let width = 30u16;
         let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
         let mut app = panel();
@@ -538,10 +558,64 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
         let agent_y = row_y(&rows, "Developer") as u16;
-        assert_eq!(buf[(0, agent_y)].bg, SELECTION_BG, "left edge carries the selection fill");
-        for x in (width - 4)..width {
-            assert_eq!(buf[(x, agent_y)].bg, SELECTION_BG, "right edge carries the fill, col {x}");
+        // The selection fill is inset one column from each edge (matching the
+        // main sidebar); the gutters stay transparent.
+        assert_eq!(buf[(0, agent_y)].bg, Color::Reset, "left gutter is transparent");
+        assert_eq!(buf[(width - 1, agent_y)].bg, Color::Reset, "right gutter is transparent");
+        assert_eq!(buf[(1, agent_y)].bg, SELECTION_BG, "the fill starts one column in");
+        for x in (width - 4)..(width - 1) {
+            assert_eq!(buf[(x, agent_y)].bg, SELECTION_BG, "right-edge padding carries the fill, col {x}");
         }
+    }
+
+    #[test]
+    fn switch_icons_start_at_col_two() {
+        let mut app = panel();
+        let rows = render_lines(&mut app, 44, 24);
+        let agent_y = row_y(&rows, "Developer");
+        let col = rows[agent_y].chars().take_while(|c| *c == ' ').count();
+        assert_eq!(col, 2, "the switch icon starts at col 2, got row {:?}", rows[agent_y]);
+    }
+
+    #[test]
+    fn more_is_keyboard_reachable_and_activates_the_popover() {
+        let mut app = panel();
+        app.selected = app.rows().iter().position(|r| matches!(r, PanelRow::Back)).unwrap();
+        app.nav_down();
+        assert!(
+            matches!(app.rows().get(app.selected), Some(PanelRow::More)),
+            "↓ from Back reaches More first"
+        );
+        assert_eq!(app.activate(), WsEffect::ShowDescription, "Enter on More opens the popover");
+    }
+
+    #[test]
+    fn focused_more_carries_the_selection_fill() {
+        let mut app = panel();
+        app.selected = app.rows().iter().position(|r| matches!(r, PanelRow::More)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(44, 24)).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
+        let more_y = row_y(&rows, "More") as u16;
+        let more_x = rows[more_y as usize].find("More").unwrap() as u16;
+        let cell = &buf[(more_x, more_y)];
+        assert_eq!(cell.bg, SELECTION_BG, "focused More carries the selection fill");
+        assert_eq!(cell.fg, Color::White, "focused More brightens to white");
+        assert!(cell.modifier.contains(Modifier::BOLD), "focused More is bold");
+    }
+
+    #[test]
+    fn panel_text_cells_keep_the_default_background() {
+        let mut term = Terminal::new(TestBackend::new(44, 24)).unwrap();
+        let mut app = panel();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
+        let title_y = row_y(&rows, "Cold-start cache") as u16;
+        let title_x = rows[title_y as usize].find('C').unwrap() as u16;
+        assert_eq!(buf[(title_x, title_y)].bg, Color::Reset, "task title cell is transparent");
+        assert_eq!(buf[(0, title_y)].bg, Color::Reset, "left gutter is transparent");
     }
 
     #[test]

@@ -3229,17 +3229,18 @@ fn render_divider(buf: &mut ratatui::buffer::Buffer, sidebar_rect: Rect, active:
         return;
     }
     let x = sidebar_rect.right().saturating_sub(1);
-    // Keep the divider column on the sidebar's black background so the thin
-    // `▏` rule blends with the painted sidebar rather than the terminal default.
+    // The divider column keeps the terminal's default (transparent) background,
+    // like the rest of the sidebar — only the thin `▏` rule glyph is painted, so
+    // a semi-transparent terminal shows through behind it.
     let style = if active {
         Style::default()
             .fg(crate::theme::DIVIDER_ACTIVE)
-            .bg(crate::theme::BACKGROUND)
+            .bg(Color::Reset)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
             .fg(crate::theme::DIVIDER_DIM)
-            .bg(crate::theme::BACKGROUND)
+            .bg(Color::Reset)
     };
     for y in sidebar_rect.top()..sidebar_rect.bottom() {
         if let Some(cell) = buf.cell_mut((x, y)) {
@@ -4641,6 +4642,48 @@ mod tests {
             .expect("name row painted");
         assert_eq!(name_cell.fg, Color::White, "name is white");
         assert!(name_cell.modifier.contains(Modifier::BOLD), "name is bold");
+    }
+
+    #[test]
+    fn main_area_paints_no_opaque_background() {
+        // Neither the idle-workspace placeholder nor the "connecting" placeholder
+        // paints a full-area fill: unpainted cells stay on the terminal default
+        // (`Color::Reset`) so a transparent terminal shows through the main area.
+        let area = Rect::new(0, 0, 60, 12);
+
+        let mut idle = ratatui::buffer::Buffer::empty(area);
+        render_idle_workspace(
+            &mut idle,
+            area,
+            &session::IdleInfo {
+                name: "vector".into(),
+                machine: "hub".into(),
+                branch: Some("main".into()),
+            },
+            "Ctrl+Space",
+        );
+        // The last row is well below the few lines of identity text — a blank
+        // main-area cell with no fill.
+        let blank_y = area.height - 1;
+        for x in 0..area.width {
+            assert_eq!(
+                idle[(x, blank_y)].bg,
+                Color::Reset,
+                "idle placeholder leaves the main area transparent, col {x}"
+            );
+        }
+
+        let mut placeholder = ratatui::buffer::Buffer::empty(area);
+        render_placeholder(&mut placeholder, area, "Connecting to alpha…");
+        for y in 0..area.height {
+            for x in 0..area.width {
+                assert_eq!(
+                    placeholder[(x, y)].bg,
+                    Color::Reset,
+                    "placeholder leaves the main area transparent, cell ({x},{y})"
+                );
+            }
+        }
     }
 
     #[test]
