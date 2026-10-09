@@ -34,7 +34,7 @@ use shelbi_state::ZenModeState;
 use super::session::SessionRef;
 use crate::keymap::format_chord_or_unbound;
 use crate::sidebar::{decoration_to_color, nav_lines, BLEED_ABOVE, BLEED_BELOW};
-use crate::theme::{ACCENT, BACKGROUND, BUSY_GREEN, MUTED, SEARCH_BG, SELECTION_BG, TEXT, TEXT_SELECTED};
+use crate::theme::{ACCENT, BUSY_GREEN, MUTED, SEARCH_BG, SELECTION_BG, TEXT, TEXT_SELECTED};
 use shelbi_palette::DecorationColor;
 
 /// Exact one-time orientation copy shown in the sidebar footer after the first
@@ -359,12 +359,13 @@ impl SidebarView {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        // Paint the whole sidebar `color/background` (#000000) first so every
-        // later span lands on a true black: the search fill, the selection
-        // fills, and especially the half-block bleed rows, whose glyphs carry
-        // their fill as a *foreground* and rely on this background showing
-        // through their other half.
-        buf.set_style(area, Style::default().bg(BACKGROUND));
+        // The sidebar paints no full-area background: unfilled cells keep the
+        // terminal's default background (`Color::Reset`) so a semi-transparent
+        // terminal shows through. Only the components that are filled in the
+        // Figma carry a fill — the search box, the selection blocks, and the zen
+        // band. The half-block bleed rows draw their fill as the glyph's
+        // *foreground* over that default background, so they blend with whatever
+        // sits behind the sidebar rather than a painted black.
         let geo = self.geometry(area);
 
         self.render_header(buf, geo.header, geo.search, chrome);
@@ -421,7 +422,7 @@ impl SidebarView {
         // The nav item bounds — fill, half-block bleed, and label — are inset one
         // column from each side, exactly like the search box above, so the
         // selection block reads as the same width. The gutter columns stay on
-        // the painted #000000 background.
+        // the terminal's default (transparent) background.
         let inner = area.inner(LIST_INDENT);
         if inner.width == 0 {
             return;
@@ -974,8 +975,8 @@ fn truncate_ellipsis(s: &str, max: usize) -> String {
 /// a half-row of padding above the label), the label row on a solid fill, and
 /// an upper-half-block row below (fill in its top half, a half-row of padding
 /// below). The half-block glyphs carry the fill as their *foreground* on the
-/// sidebar's painted #000000 background, so the eye reads the fill as half a
-/// cell tall on those rows. The chord is dropped when there isn't room for it.
+/// terminal's default (transparent) background, so the eye reads the fill as
+/// half a cell tall on those rows. The chord is dropped when there isn't room.
 fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -989,8 +990,8 @@ fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
     let bottom = top + 2;
 
     // Top / bottom half-block bleed rows: the fill as the glyph's foreground on
-    // the sidebar's painted black background, exactly like the nav selection
-    // bleed.
+    // the terminal's default (transparent) background, exactly like the nav
+    // selection bleed.
     let bleed_style = Style::default().fg(SEARCH_BG);
     if label_y > top {
         Paragraph::new(Line::from(Span::styled(BLEED_ABOVE.repeat(width), bleed_style)))
@@ -1327,9 +1328,9 @@ mod tests {
 
     /// The selected nav item's fill and its half-block bleed (U+2584 above,
     /// U+2580 below) are inset one column from each edge — the same width as the
-    /// search box — with the gutter columns left on the #000000 background. The
-    /// selected label is white + bold; an unselected label is plain #bababa with
-    /// no fill.
+    /// search box — with the gutter columns left on the default (transparent)
+    /// background. The selected label is white + bold; an unselected label is
+    /// plain #bababa with no fill.
     #[test]
     fn selected_nav_item_renders_inset_half_block_bleed() {
         let width = 24u16;
@@ -1346,11 +1347,12 @@ mod tests {
         let rows = dump(&term);
 
         let issues_y = row_y(&rows, "Issues") as u16;
-        // Gutters stay on the painted background; the inset region carries the
-        // selection fill. (Columns 2–3 hold the double-width icon continuation,
-        // which the TestBackend leaves unflushed, so sample single-width cells.)
-        assert_eq!(buf[(0, issues_y)].bg, BACKGROUND, "left gutter stays on the background, not the fill");
-        assert_eq!(buf[(width - 1, issues_y)].bg, BACKGROUND, "right gutter stays on the background, not the fill");
+        // Gutters stay on the default (transparent) background; the inset region
+        // carries the selection fill. (Columns 2–3 hold the double-width icon
+        // continuation, which the TestBackend leaves unflushed, so sample
+        // single-width cells.)
+        assert_eq!(buf[(0, issues_y)].bg, Color::Reset, "left gutter stays transparent, not the fill");
+        assert_eq!(buf[(width - 1, issues_y)].bg, Color::Reset, "right gutter stays transparent, not the fill");
         assert_eq!(buf[(1, issues_y)].bg, SELECTION_BG, "the inset starts one column in with the selection fill");
         for x in (width - 4)..(width - 1) {
             assert_eq!(buf[(x, issues_y)].bg, SELECTION_BG, "right-edge padding carries the fill, col {x}");
@@ -1383,7 +1385,7 @@ mod tests {
         );
         let chat_x = rows[chat_y].find('O').unwrap() as u16;
         assert_eq!(buf[(chat_x, chat_y as u16)].fg, TEXT, "unselected nav label is #bababa");
-        assert_eq!(buf[(chat_x, chat_y as u16)].bg, BACKGROUND, "unselected nav label has no fill");
+        assert_eq!(buf[(chat_x, chat_y as u16)].bg, Color::Reset, "unselected nav label has no fill");
         assert!(
             !buf[(chat_x, chat_y as u16)].modifier.contains(Modifier::BOLD),
             "unselected nav label is not bold"
@@ -1669,8 +1671,9 @@ mod tests {
     }
 
     /// The selected workspace row fills with `color/selection` (#3f3f3f), inset
-    /// one column from the left edge; the gutter stays on the #000000
-    /// background. The row's text colour is unchanged (only the fill marks it).
+    /// one column from the left edge; the gutter stays on the default
+    /// (transparent) background. The row's text colour is unchanged (only the
+    /// fill marks it).
     #[test]
     fn selected_workspace_row_fills_inset_selection() {
         let mut model = empty_model();
@@ -1692,7 +1695,7 @@ mod tests {
         let rows = dump(&term);
 
         let alpha_y = row_y(&rows, "alpha") as u16;
-        assert_eq!(buf[(0, alpha_y)].bg, BACKGROUND, "the left gutter stays on the background");
+        assert_eq!(buf[(0, alpha_y)].bg, Color::Reset, "the left gutter stays transparent");
         assert_eq!(buf[(1, alpha_y)].bg, SELECTION_BG, "the fill starts one column in");
         // The fill runs to roughly one column before the divider column.
         assert_eq!(buf[(width - 2, alpha_y)].bg, SELECTION_BG, "the fill extends to the right inset");
@@ -1702,15 +1705,15 @@ mod tests {
 
         // The unselected row below has no fill.
         let charlie_y = row_y(&rows, "charlie") as u16;
-        assert_eq!(buf[(1, charlie_y)].bg, BACKGROUND, "an unselected row has no fill");
+        assert_eq!(buf[(1, charlie_y)].bg, Color::Reset, "an unselected row has no fill");
     }
 
     // --- header / search ----------------------------------------------------
 
     /// The header renders a blank row, the project name in the accent cyan on
     /// row 1, a blank row, then the filled search box (rows 3–5) carrying
-    /// `🔍 Search` and the resolved palette chord. The whole area is painted on
-    /// the #000000 background.
+    /// `🔍 Search` and the resolved palette chord. The area paints no background;
+    /// unfilled cells keep the default (transparent) background.
     #[test]
     fn header_renders_project_title_and_search_box() {
         let mut model = empty_model();
@@ -1729,7 +1732,7 @@ mod tests {
 
         // A blank row sits above the title; the title is on row 1, accent cyan.
         assert!(rows[0].trim().is_empty(), "a blank row sits above the title, got: {:?}", rows[0]);
-        assert_eq!(buf[(1, 0)].bg, BACKGROUND, "the sidebar paints the #000000 background");
+        assert_eq!(buf[(1, 0)].bg, Color::Reset, "the sidebar paints no background (transparent)");
         let title_y = row_y(&rows, "My project");
         assert_eq!(title_y, 1, "project title is on the second row, got:\n{joined}");
         let title_x = rows[title_y].find('M').unwrap() as u16;
@@ -1771,14 +1774,14 @@ mod tests {
         // The box is 2 rows tall, drawn with the half-block bleed: a `▄` row of
         // lower-half blocks above the label and a `▀` row of upper-half blocks
         // below it, both carrying the search fill as their *foreground* on the
-        // #000000 background (the half shows the fill; the cell background stays
-        // black).
+        // default (transparent) background (the half shows the fill; the cell
+        // background stays the terminal default).
         let top_y = sy - 1;
         let bottom_y = sy + 1;
         for x in 1..39u16 {
             assert_eq!(buf[(x, top_y)].symbol(), "▄", "top bleed row is lower-half blocks, col {x}");
             assert_eq!(buf[(x, top_y)].fg, SEARCH_BG, "top bleed carries the fill as fg, col {x}");
-            assert_eq!(buf[(x, top_y)].bg, BACKGROUND, "top bleed keeps the black background, col {x}");
+            assert_eq!(buf[(x, top_y)].bg, Color::Reset, "top bleed keeps the default background, col {x}");
             assert_eq!(buf[(x, bottom_y)].symbol(), "▀", "bottom bleed row is upper-half blocks, col {x}");
             assert_eq!(buf[(x, bottom_y)].fg, SEARCH_BG, "bottom bleed carries the fill as fg, col {x}");
         }

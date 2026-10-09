@@ -259,11 +259,16 @@ pub(crate) fn render_back_button(
 /// returning `(lines_used, more_hit)` so the caller can advance past it and
 /// record the `More` link's click rect. A bodyless task shows just the title and
 /// no `More` (the returned `more_hit` is `None`).
+///
+/// `more_selected` marks the `More` link as the keyboard-focused row: it then
+/// renders with the selection fill behind it (white + bold), the same focus
+/// state the nav block gives its selected item, rather than its resting cyan.
 pub(crate) fn render_task_info(
     f: &mut Frame,
     area: Rect,
     title: &str,
     description: &str,
+    more_selected: bool,
 ) -> (u16, Option<Rect>) {
     if area.width == 0 || area.height == 0 {
         return (0, None);
@@ -304,12 +309,19 @@ pub(crate) fn render_task_info(
         used += 1;
     }
 
-    // More link (cyan), only when a description was shown.
+    // More link, only when a description was shown. Resting it is cyan; focused
+    // it carries the selection fill (white + bold), matching the nav block's
+    // selected item so keyboard focus reads consistently across the panel.
     if !desc_lines.is_empty() && used < area.height {
-        lines.push(Line::from(Span::styled(
-            "More",
-            Style::default().fg(ACCENT_CYAN),
-        )));
+        let more_style = if more_selected {
+            Style::default()
+                .fg(Color::White)
+                .bg(SELECTION_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(ACCENT_CYAN)
+        };
+        lines.push(Line::from(Span::styled("More", more_style)));
         more_hit = Some(Rect {
             x: inner_x,
             y: area.y + used,
@@ -366,11 +378,13 @@ pub(crate) struct NavEntry {
     pub active: bool,
 }
 
-/// Render `entries` as a full-width nav block, mirroring the main sidebar's nav:
-/// a separator line between (and bracketing) each item, the selected item's fill
-/// spanning edge to edge with its adjacent separators carrying the half-block
-/// bleed. `selected` is the index into `entries` of the selected item, if any.
-/// Returns each item's screen rect (positionally), for the caller's click map.
+/// Render `entries` as a nav block, mirroring the main sidebar's nav exactly: a
+/// separator line between (and bracketing) each item, the selected item's fill
+/// **inset one column from each edge** with its adjacent separators carrying the
+/// half-block bleed over that same inset region. The one-column gutters stay on
+/// the terminal's default background. `selected` is the index into `entries` of
+/// the selected item, if any. Returns each item's screen rect (full width, for
+/// the caller's click map — a click anywhere on the row selects it).
 pub(crate) fn render_nav_block(
     f: &mut Frame,
     area: Rect,
@@ -381,7 +395,14 @@ pub(crate) fn render_nav_block(
     if area.width == 0 || area.height == 0 {
         return rects;
     }
-    let width = area.width as usize;
+    // Inset the fill, bleed, and label one column from each side — the same
+    // `LIST_INDENT` the main sidebar's nav uses, so the selection block reads as
+    // the same width and lines its icon up at col 2 (gutter + 1-col pad).
+    let inner = area.inner(NAV_INSET);
+    if inner.width == 0 {
+        return rects;
+    }
+    let width = inner.width as usize;
     let bleed = SELECTION_BG;
     let scount = entries.len();
 
@@ -410,17 +431,23 @@ pub(crate) fn render_nav_block(
             });
         }
     }
-    f.render_widget(Paragraph::new(lines), area);
+    f.render_widget(Paragraph::new(lines), inner);
     rects
 }
 
-/// One nav block row. Selected rows fill edge to edge with the selection
+/// 1-col horizontal inset for the nav block — matches the main sidebar's
+/// `LIST_INDENT` so the panel nav reads identically.
+const NAV_INSET: ratatui::layout::Margin = ratatui::layout::Margin {
+    horizontal: 1,
+    vertical: 0,
+};
+
+/// One nav block row. Selected rows fill the inset width with the selection
 /// background and render white/bold; the active view is cyan/bold when
-/// unselected; other rows are `#bababa`. The leading space keeps the label
-/// aligned with the sidebar nav's 1-col inset.
+/// unselected; other rows are `#bababa`. The single leading space keeps the icon
+/// aligned at col 2 (inset gutter + this 1-col pad), matching the main sidebar.
 fn nav_block_line(entry: &NavEntry, selected: bool, width: usize, bg: Color) -> Line<'static> {
-    let marker = "  ";
-    let text = format!(" {marker}{} {}", entry.glyph, entry.label);
+    let text = format!(" {} {}", entry.glyph, entry.label);
     if selected {
         let pad = width.saturating_sub(text.chars().count());
         Line::from(Span::styled(
