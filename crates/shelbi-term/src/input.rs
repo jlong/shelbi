@@ -165,6 +165,18 @@ impl KeyEncoding {
 /// Returns an empty vector for a key that has no encoding in the current mode
 /// (e.g. a lone modifier, which callers should not pass here).
 pub fn encode_key(key: Key, mods: Modifiers, encoding: KeyEncoding) -> Vec<u8> {
+    // Under the kitty keyboard protocol, the unmodified Tab *key* is the CSI-u
+    // event `ESC[9u` (9 = HT's codepoint). termwiz encodes plain Tab as a bare
+    // `\t` regardless of the protocol (its Tab arm never consults the encoding),
+    // and a program that enabled the protocol — Claude Code does, pushing
+    // `CSI > 5 u` — reads that bare `\t` as literal tab *text*, not a Tab key
+    // press, so completion (file paths, slash commands) never fires. Emitting
+    // the CSI-u form makes the Tab key register. Modified Tab is left to
+    // termwiz: Shift+Tab stays the legacy backtab `ESC[Z`, which Claude Code
+    // maps to its Shift+Tab mode cycle (the CSI-u `ESC[9;2u` does not drive it).
+    if encoding.kitty && key == Key::Tab && mods == Modifiers::NONE {
+        return b"\x1b[9u".to_vec();
+    }
     key.to_termwiz()
         .encode(mods.to_termwiz(), encoding.modes(), /* is_down */ true)
         .unwrap_or_default()
@@ -362,6 +374,33 @@ mod tests {
     }
 
     #[test]
+    fn plain_tab_without_kitty_is_ht() {
+        // A legacy program (no kitty protocol) expects a bare HT for Tab.
+        assert_eq!(encode_key(Key::Tab, Modifiers::NONE, KeyEncoding::default()), b"\t");
+    }
+
+    #[test]
+    fn plain_tab_under_kitty_is_csi_u() {
+        // The headline fix: once a program enables the kitty keyboard protocol
+        // (Claude Code pushes `CSI > 5 u`), the Tab *key* must arrive as the
+        // CSI-u event ESC[9u. A bare `\t` is read as literal tab text there, so
+        // completion never fires.
+        let enc = KeyEncoding { kitty: true, ..Default::default() };
+        assert_eq!(encode_key(Key::Tab, Modifiers::NONE, enc), b"\x1b[9u");
+    }
+
+    #[test]
+    fn shift_tab_is_legacy_backtab_in_both_modes() {
+        // Shift+Tab stays the legacy backtab ESC[Z with or without the protocol:
+        // that is what Claude Code maps to its Shift+Tab mode cycle (the CSI-u
+        // ESC[9;2u form does not drive it). The kitty carve-out above is scoped
+        // to the *unmodified* Tab so this encoding is untouched.
+        assert_eq!(encode_key(Key::Tab, Modifiers::SHIFT, KeyEncoding::default()), b"\x1b[Z");
+        let enc = KeyEncoding { kitty: true, ..Default::default() };
+        assert_eq!(encode_key(Key::Tab, Modifiers::SHIFT, enc), b"\x1b[Z");
+    }
+
+    #[test]
     fn arrows_follow_application_cursor_keys_mode() {
         let normal = KeyEncoding::default();
         assert_eq!(encode_key(Key::Up, Modifiers::NONE, normal), b"\x1b[A");
@@ -543,3 +582,4 @@ mod tests {
         );
     }
 }
+

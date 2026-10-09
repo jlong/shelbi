@@ -240,6 +240,39 @@ fn every_key_but_ctrl_space_reaches_the_agent_over_a_real_pty() {
         "Shift+Enter under the kitty protocol should reach the agent as ESC[13;2u: {out:?}"
     );
 
+    // --- Tab under the kitty protocol reaches the agent as ESC[9u --------------
+    // With the protocol on, the Tab *key* must arrive as the CSI-u event ESC[9u;
+    // a bare `\t` is read as literal tab text (completion never fires). The shell
+    // forwards Tab with the main pane focused — it is never consumed — so seeing
+    // ESC[9u in the echoed stream proves both the encoding and the forwarding.
+    let tab_before = out.len();
+    st.handle_key(KeyEvent::new(KeyCode::Tab, NONE));
+    let tab = wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        drain(&obs_events, &mut out);
+        contains(&out[tab_before..], b"\x1b[9u").then_some(())
+    });
+    assert!(
+        tab.is_some(),
+        "Tab under the kitty protocol should reach the agent as ESC[9u: {:?}",
+        &out[tab_before..]
+    );
+
+    // Shift+Tab stays the legacy backtab ESC[Z (Claude Code's mode cycle); the
+    // kitty carve-out is scoped to the unmodified Tab, so this is unchanged.
+    let backtab_before = out.len();
+    st.handle_key(KeyEvent::new(KeyCode::BackTab, SHIFT));
+    let backtab = wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        drain(&obs_events, &mut out);
+        contains(&out[backtab_before..], b"\x1b[Z").then_some(())
+    });
+    assert!(
+        backtab.is_some(),
+        "Shift+Tab under the kitty protocol should reach the agent as ESC[Z: {:?}",
+        &out[backtab_before..]
+    );
+
     // --- Ctrl+Space is reserved: it opens the palette, never reaching the agent
     st.handle_key(KeyEvent::new(KeyCode::Char(' '), CTRL));
     assert!(
