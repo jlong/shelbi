@@ -20,6 +20,7 @@ mod caps;
 mod changes;
 mod overlays;
 mod refresh;
+mod relaunch;
 mod review;
 mod session;
 mod sidebar;
@@ -71,7 +72,7 @@ use caps::Caps;
 use overlays::{ActiveOverlay, OverlayEvent};
 use refresh::ShellSnapshot;
 use review::{ReviewAction, ReviewInterface};
-use session::{LiveConnector, MainState, SessionManager, SessionRef};
+use session::{gave_up_notice, LiveConnector, MainState, SessionManager, SessionRef};
 use sidebar::{RowTarget, SidebarView};
 use workspace::{WorkspaceAction, WorkspaceInterface};
 
@@ -926,7 +927,11 @@ impl ShellState {
         };
         Self {
             client,
-            sessions: SessionManager::new(project, connector.clone()),
+            sessions: SessionManager::new(project, connector.clone()).with_relauncher(
+                std::sync::Arc::new(relaunch::PersistentRelauncher {
+                    project: project.to_string(),
+                }),
+            ),
             connector,
             lifecycle,
             bootstrap,
@@ -1171,7 +1176,11 @@ impl ShellState {
         self.client.switch_project(project);
         // Rebuild the session manager for the new project (dropping the old
         // project's connection detaches, never kills).
-        self.sessions = SessionManager::new(project, self.connector.clone());
+        self.sessions = SessionManager::new(project, self.connector.clone()).with_relauncher(
+            std::sync::Arc::new(relaunch::PersistentRelauncher {
+                project: project.to_string(),
+            }),
+        );
         self.reported_main = None;
         // Apply the restored view to the main area.
         let restored = self.client.view().clone();
@@ -2069,6 +2078,11 @@ impl ShellState {
     /// Close the review: ask the daemon to end the editor/diff/server sessions
     /// (freeing the port), drop the interface, and return to the orchestrator.
     fn close_review(&mut self, project: &str, task: &str) {
+        // The teardown is deliberate — don't let the content supervisor restart
+        // the sessions the Close op is about to end.
+        if let Some(r) = self.review.as_mut() {
+            r.note_deliberate_close();
+        }
         let project = project.to_string();
         let task = task.to_string();
         self.spawn_job(move || {
@@ -2465,6 +2479,11 @@ impl ShellState {
     /// Close the workspace sidebar: ask the daemon to end the editor/diff
     /// sessions, drop the interface, and return to the nav sidebar.
     fn close_workspace(&mut self, project: &str, workspace: &str) {
+        // Deliberate teardown — the content supervisor must not restart the
+        // sessions the Close op ends.
+        if let Some(w) = self.workspace.as_mut() {
+            w.note_deliberate_close();
+        }
         let project = project.to_string();
         let workspace = workspace.to_string();
         self.spawn_job(move || {
@@ -3118,6 +3137,14 @@ fn draw(
                         main_rect,
                         &format!("Couldn't attach to {}: {err}", r.display()),
                     ),
+                    MainState::Restarting(attempt, max) => render_placeholder(
+                        buf,
+                        main_rect,
+                        &format!("Session exited — restarting ({attempt}/{max})…"),
+                    ),
+                    MainState::GaveUp(last_line) => {
+                        render_placeholder(buf, main_rect, &gave_up_notice(last_line))
+                    }
                     MainState::Live(pane) => {
                         let cur = pane.render(buf, main_rect, truecolor);
                         if focus_main {

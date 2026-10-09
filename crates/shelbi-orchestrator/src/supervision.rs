@@ -1,12 +1,31 @@
 //! Auto-restart supervision for shelbi-managed panes.
 //!
-//! The sidebar poller (`shelbi-tui`) is the one persistent process that
-//! watches every pane shelbi owns — the workspace agent panes and the
-//! orchestrator pane. When one of them dies *unexpectedly* (a crash, not a
-//! deliberate `workspace stop` / project close / clean user exit) it
-//! relaunches it, re-dispatching the workspace's task or re-standing-up the
-//! orchestrator, so a crashed pane comes back on its own instead of sitting
-//! dead until the user notices.
+//! The daemon poller is the one persistent process that watches every
+//! *persistent* pane shelbi owns and relaunches it on an unexpected death:
+//! the workspace agent panes, the orchestrator pane, and the review agent
+//! ("Chat with Reviewer") slot. These must come back on their own even when
+//! no TUI is attached, so the daemon — not a client — owns their restart.
+//! When one dies *unexpectedly* (a crash, not a deliberate `workspace stop` /
+//! project close / clean user exit) it relaunches it, re-dispatching the
+//! workspace's task, re-standing-up the orchestrator, or resuming the review
+//! slot, so a crashed pane comes back on its own instead of sitting dead
+//! until the user notices.
+//!
+//! The *content* sessions (a review slot's or dev workspace's View-Diff /
+//! Edit-in-Vim terminal views) are only meaningful while a client is looking
+//! at them — the daemon has no signal that a content role is "wanted" — so
+//! their restart budget lives client-side in the TUI, which re-ensures the
+//! session through the daemon while it holds the view (see
+//! `shelbi_tui`'s content restart controller). That client controller reuses
+//! the same cap / backoff / window rules this module defines, so every pane
+//! kind is supervised by one set of rules even though the budget lives in two
+//! places.
+//!
+//! After the cap trips the pane is left dead with a `supervision=gave-up`
+//! line; re-opening the pane in the TUI relaunches it with a fresh budget
+//! ([`SupervisionState::request_relaunch`] / the client controller's reset),
+//! so a pane that outlasts its auto-restarts is one keystroke from coming
+//! back.
 //!
 //! This module is the pure decision core: given a fresh liveness
 //! observation plus the two discriminators the caller gathers (was the death
@@ -26,8 +45,10 @@ use std::time::{Duration, Instant};
 
 /// How many restarts inside [`CRASH_LOOP_WINDOW`] before we give up and
 /// leave the pane for the user. The would-be `MAX_RESTARTS_IN_WINDOW + 1`th
-/// restart within the window trips the give-up.
-pub const MAX_RESTARTS_IN_WINDOW: usize = 3;
+/// restart within the window trips the give-up. A pane that keeps dying is
+/// brought back this many times on its own before the give-up hands it to the
+/// user, who relaunches it (with a fresh budget) by re-opening the pane.
+pub const MAX_RESTARTS_IN_WINDOW: usize = 5;
 
 /// Sliding window for the crash-loop cap. Restarts older than this are
 /// pruned, so a slow drip (one crash every few minutes) never accumulates
@@ -36,8 +57,8 @@ pub const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// Base backoff between successive restarts. The Nth restart in the current
 /// window must wait `BASE_BACKOFF * 2^(N-1)` since the previous one, so a
-/// pane that keeps crashing is retried at 0s, then ≥5s, then ≥10s before
-/// the cap trips — exponential backoff with a hard ceiling.
+/// pane that keeps crashing is retried at 0s, then ≥5s, ≥10s, ≥20s, ≥40s
+/// before the cap trips — exponential backoff with a hard ceiling.
 pub const BASE_BACKOFF: Duration = Duration::from_secs(5);
 
 /// How long a relaunched pane must stay alive before we consider it
@@ -166,6 +187,35 @@ impl SupervisionState {
         self.restarts.clear();
         self.gave_up = false;
     }
+
+    /// Whether this pane has ever been observed alive (and so is adopted for
+    /// supervision). A pane that was never seen alive is not restarted — a
+    /// client distinguishes a first-open connect failure (never alive, leave it)
+    /// from a crash of a pane that had come up (restart it) on this.
+    pub fn ever_alive(&self) -> bool {
+        self.ever_alive
+    }
+
+    /// How many restarts are currently counted against the crash-loop cap
+    /// (the attempts still inside the window, pruned on the last `decide`).
+    /// Surfaced so the caller can render / publish the `N/MAX` progress a
+    /// restart notice shows.
+    pub fn restart_count(&self) -> usize {
+        self.restarts.len()
+    }
+
+    /// Re-arm supervision after a give-up because the user re-opened the pane:
+    /// forget the crash-loop history, un-latch give-up, and keep the pane
+    /// *adopted* (`ever_alive`) so the very next dead observation relaunches it
+    /// immediately with a fresh budget rather than being treated as a
+    /// never-seen pane. This is the "navigate away and back relaunches it"
+    /// path — distinct from [`reset`](Self::reset), which stands supervision
+    /// *down* for a deliberate stop.
+    pub fn request_relaunch(&mut self) {
+        self.restarts.clear();
+        self.gave_up = false;
+        self.ever_alive = true;
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +339,51 @@ mod tests {
             s.decide(&dead_crash(), recovered),
             SupervisionAction::Restart
         );
+    }
+
+    #[test]
+    fn the_cap_is_five_restarts_before_give_up() {
+        // The pane comes back on its own exactly MAX_RESTARTS_IN_WINDOW (5)
+        // times; the sixth crash inside the window trips give-up.
+        assert_eq!(MAX_RESTARTS_IN_WINDOW, 5);
+        let mut s = SupervisionState::default();
+        let mut t = Instant::now();
+        for n in 0..5 {
+            assert_eq!(s.decide(&alive(), t), SupervisionAction::None);
+            t += BASE_BACKOFF * (1u32 << n) + Duration::from_secs(1);
+            assert_eq!(
+                s.decide(&dead_crash(), t),
+                SupervisionAction::Restart,
+                "restart {n} (of 5) should fire"
+            );
+            assert_eq!(s.restart_count(), n + 1, "the count tracks the attempt");
+        }
+        // The 6th crash gives up.
+        assert_eq!(s.decide(&dead_crash(), t), SupervisionAction::GiveUp);
+    }
+
+    #[test]
+    fn request_relaunch_resets_the_budget_and_relaunches_at_once() {
+        // Drive a give-up, then "re-open the pane": request_relaunch re-arms it
+        // so the next dead observation restarts immediately with a clean count.
+        let mut s = SupervisionState::default();
+        let mut t = Instant::now();
+        for n in 0..MAX_RESTARTS_IN_WINDOW {
+            s.decide(&alive(), t);
+            t += BASE_BACKOFF * (1u32 << n) + Duration::from_secs(1);
+            assert_eq!(s.decide(&dead_crash(), t), SupervisionAction::Restart);
+        }
+        assert_eq!(s.decide(&dead_crash(), t), SupervisionAction::GiveUp);
+        // Gave up: a further crash does nothing on its own.
+        assert_eq!(s.decide(&dead_crash(), t), SupervisionAction::None);
+
+        // The user re-opens the pane.
+        s.request_relaunch();
+        assert_eq!(s.restart_count(), 0, "the budget is reset");
+        // The very next dead tick relaunches immediately (no backoff, not
+        // treated as an un-adopted never-seen pane), with a fresh budget.
+        assert_eq!(s.decide(&dead_crash(), t), SupervisionAction::Restart);
+        assert_eq!(s.restart_count(), 1);
     }
 
     #[test]
