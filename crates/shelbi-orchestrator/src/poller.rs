@@ -4218,6 +4218,18 @@ fn maybe_supervise_workspace(
             &shelbi_state::supervision_shutdown_key(&workspace.name),
         )
         .unwrap_or(false);
+        // A TUI reopen of a gave-up worker pane drops a relaunch marker; re-arm
+        // the budget so this tick restarts it with a fresh count. Skipped for a
+        // deliberate stop — that must stay down regardless of a stale marker.
+        if !intentional
+            && shelbi_state::supervision_relaunch::consume_supervision_relaunch(
+                &project.name,
+                &shelbi_state::supervision_relaunch::workspace_supervise_relaunch_key(&workspace.name),
+            )
+            .unwrap_or(false)
+        {
+            state.request_relaunch();
+        }
         (intentional, current_task_for(project, &workspace.name))
     };
 
@@ -4314,6 +4326,18 @@ fn redispatch_workspace(
 
 fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState) {
     let alive = crate::orchestrator_pane_alive(&project.name).unwrap_or(true);
+    // A TUI reopen of a gave-up orchestrator drops a relaunch marker; consume it
+    // (only while dead, so a healthy pane's backoff is never reset) and re-arm
+    // the budget so this tick relaunches it with a fresh count.
+    if !alive
+        && shelbi_state::supervision_relaunch::consume_supervision_relaunch(
+            &project.name,
+            &shelbi_state::supervision_relaunch::orchestrator_relaunch_key(),
+        )
+        .unwrap_or(false)
+    {
+        state.request_relaunch();
+    }
     let inputs = SupervisionInputs {
         alive,
         intentional_shutdown: false,
@@ -4574,6 +4598,15 @@ impl ReviewResumeState {
         self.restarts.pop();
     }
 
+    /// Re-arm after a give-up because the user re-opened the review slot in the
+    /// TUI: forget the crash-loop history and un-latch give-up so the next dead
+    /// tick resumes the slot immediately with a fresh budget (the client drops a
+    /// [`shelbi_state::supervision_relaunch`] marker this pass consumes).
+    fn request_relaunch(&mut self) {
+        self.restarts.clear();
+        self.gave_up = false;
+    }
+
     /// The slot's pane is dead and a review task is assigned to it. Decide
     /// whether to resume now, wait out the backoff, or give up. `now` is
     /// threaded in so the timing is unit-testable.
@@ -4696,6 +4729,18 @@ fn maybe_resume_stranded_review_slots(
         if shelbi_state::is_task_parked(&project.name, &task_id).unwrap_or(false) {
             state.remove(&ws.name);
             continue;
+        }
+
+        // A TUI reopen of a gave-up review slot ("Chat with Reviewer") drops a
+        // relaunch marker; re-arm the budget so the slot resumes with a fresh
+        // count instead of staying down behind a latched give-up.
+        if shelbi_state::supervision_relaunch::consume_supervision_relaunch(
+            &project.name,
+            &shelbi_state::supervision_relaunch::review_resume_relaunch_key(&ws.name),
+        )
+        .unwrap_or(false)
+        {
+            entry.request_relaunch();
         }
 
         match entry.decide_dead(now) {
@@ -4968,6 +5013,15 @@ impl DevResumeState {
         self.restarts.push(now);
         ReviewResumeAction::Resume
     }
+
+    /// Re-arm after a give-up because the user re-opened the dev slot in the
+    /// TUI. Keeps `ever_alive` as-is (a stranded reopen it still owns stays
+    /// unadopted-elsewhere) and just forgets the crash history + un-latches
+    /// give-up, so the next dead tick resumes it with a fresh budget.
+    fn request_relaunch(&mut self) {
+        self.restarts.clear();
+        self.gave_up = false;
+    }
 }
 
 /// How recently an active-launch dispatch line (`status=message-channel` /
@@ -5119,6 +5173,18 @@ fn maybe_resume_stranded_dev_slots(
         {
             entry.note_alive(now);
             continue;
+        }
+
+        // A TUI reopen of a gave-up dev slot drops a relaunch marker; re-arm the
+        // budget so this stranded slot resumes with a fresh count rather than
+        // staying down behind a latched give-up.
+        if shelbi_state::supervision_relaunch::consume_supervision_relaunch(
+            &project.name,
+            &shelbi_state::supervision_relaunch::workspace_resume_relaunch_key(&ws.name),
+        )
+        .unwrap_or(false)
+        {
+            entry.request_relaunch();
         }
 
         match entry.decide_dead(now) {
@@ -5806,27 +5872,28 @@ mod tests {
     #[test]
     fn review_resume_backs_off_then_caps_into_gave_up() {
         let mut s = ReviewResumeState::default();
-        let t0 = Instant::now();
+        let mut t = Instant::now();
 
-        // 1st: resume immediately.
-        assert_eq!(s.decide_dead(t0), ReviewResumeAction::Resume);
-        // Still dead a moment later — inside the backoff window → wait.
+        // The slot resumes on its own MAX_RESTARTS_IN_WINDOW times, each after
+        // its exponential backoff (0s, then 5s, 10s, 20s, 40s…) has elapsed.
+        for n in 0..MAX_RESTARTS_IN_WINDOW {
+            assert_eq!(
+                s.decide_dead(t),
+                ReviewResumeAction::Resume,
+                "resume {n} should fire"
+            );
+            // Still dead a moment later — inside the backoff window → wait.
+            // (Skipped once the count has reached the cap, where the next
+            // evaluation gives up rather than waiting.)
+            if n + 1 < MAX_RESTARTS_IN_WINDOW {
+                assert_eq!(s.decide_dead(t + Duration::from_secs(1)), ReviewResumeAction::None);
+            }
+            t += BASE_BACKOFF * (1u32 << n) + Duration::from_secs(2);
+        }
+        // The next evaluation trips the cap → give up, once, then stay quiet.
+        assert_eq!(s.decide_dead(t), ReviewResumeAction::GaveUp);
         assert_eq!(
-            s.decide_dead(t0 + Duration::from_secs(1)),
-            ReviewResumeAction::None
-        );
-        // 2nd resume after the 5s backoff elapses.
-        let t1 = t0 + BASE_BACKOFF + Duration::from_secs(1);
-        assert_eq!(s.decide_dead(t1), ReviewResumeAction::Resume);
-        // 3rd resume after the doubled (10s) backoff.
-        let t2 = t1 + BASE_BACKOFF * 2 + Duration::from_secs(1);
-        assert_eq!(s.decide_dead(t2), ReviewResumeAction::Resume);
-        // 4th evaluation trips the cap (3 restarts in the window) → give up,
-        // once, then stay quiet.
-        let t3 = t2 + BASE_BACKOFF * 4 + Duration::from_secs(1);
-        assert_eq!(s.decide_dead(t3), ReviewResumeAction::GaveUp);
-        assert_eq!(
-            s.decide_dead(t3 + Duration::from_secs(1)),
+            s.decide_dead(t + Duration::from_secs(1)),
             ReviewResumeAction::None
         );
     }
@@ -5989,24 +6056,58 @@ mod tests {
         // Same crash-loop cap + exponential backoff as the review pass, so a
         // dev slot that can't boot stops relaunching after the cap.
         let mut s = DevResumeState::default();
-        let t0 = Instant::now();
-        assert_eq!(s.decide_dead(t0), ReviewResumeAction::Resume);
+        let mut t = Instant::now();
+        for n in 0..MAX_RESTARTS_IN_WINDOW {
+            assert_eq!(s.decide_dead(t), ReviewResumeAction::Resume, "resume {n}");
+            if n + 1 < MAX_RESTARTS_IN_WINDOW {
+                assert_eq!(
+                    s.decide_dead(t + Duration::from_secs(1)),
+                    ReviewResumeAction::None,
+                    "inside the backoff window → wait"
+                );
+            }
+            t += BASE_BACKOFF * (1u32 << n) + Duration::from_secs(2);
+        }
+        assert_eq!(s.decide_dead(t), ReviewResumeAction::GaveUp);
         assert_eq!(
-            s.decide_dead(t0 + Duration::from_secs(1)),
-            ReviewResumeAction::None,
-            "inside the backoff window → wait"
-        );
-        let t1 = t0 + BASE_BACKOFF + Duration::from_secs(1);
-        assert_eq!(s.decide_dead(t1), ReviewResumeAction::Resume);
-        let t2 = t1 + BASE_BACKOFF * 2 + Duration::from_secs(1);
-        assert_eq!(s.decide_dead(t2), ReviewResumeAction::Resume);
-        let t3 = t2 + BASE_BACKOFF * 4 + Duration::from_secs(1);
-        assert_eq!(s.decide_dead(t3), ReviewResumeAction::GaveUp);
-        assert_eq!(
-            s.decide_dead(t3 + Duration::from_secs(1)),
+            s.decide_dead(t + Duration::from_secs(1)),
             ReviewResumeAction::None,
             "give-up is emitted once, then quiet"
         );
+    }
+
+    #[test]
+    fn review_resume_request_relaunch_rearms_after_give_up() {
+        // After the cap trips, a reopen marker's `request_relaunch` clears the
+        // budget so the next dead tick resumes the slot again.
+        let mut s = ReviewResumeState::default();
+        let mut t = Instant::now();
+        for n in 0..MAX_RESTARTS_IN_WINDOW {
+            assert_eq!(s.decide_dead(t), ReviewResumeAction::Resume);
+            t += BASE_BACKOFF * (1u32 << n) + Duration::from_secs(2);
+        }
+        assert_eq!(s.decide_dead(t), ReviewResumeAction::GaveUp);
+        assert_eq!(s.decide_dead(t), ReviewResumeAction::None, "stays down");
+        s.request_relaunch();
+        assert_eq!(
+            s.decide_dead(t),
+            ReviewResumeAction::Resume,
+            "reopen re-arms and resumes at once"
+        );
+    }
+
+    #[test]
+    fn dev_resume_request_relaunch_rearms_after_give_up() {
+        let mut s = DevResumeState::default();
+        let mut t = Instant::now();
+        for n in 0..MAX_RESTARTS_IN_WINDOW {
+            assert_eq!(s.decide_dead(t), ReviewResumeAction::Resume);
+            t += BASE_BACKOFF * (1u32 << n) + Duration::from_secs(2);
+        }
+        assert_eq!(s.decide_dead(t), ReviewResumeAction::GaveUp);
+        assert_eq!(s.decide_dead(t), ReviewResumeAction::None);
+        s.request_relaunch();
+        assert_eq!(s.decide_dead(t), ReviewResumeAction::Resume);
     }
 
     #[test]

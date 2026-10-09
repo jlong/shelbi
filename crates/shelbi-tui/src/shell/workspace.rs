@@ -91,7 +91,11 @@ impl WorkspaceInterface {
         let title = task.as_ref().map(|t| t.task.title.clone()).unwrap_or_default();
         let description = task.as_ref().map(|t| t.body.clone()).unwrap_or_default();
         let panel = WorkspacePanel::new(worktree, editor_name, agent_name, title, description, status);
-        let mut content = SessionManager::new(project, connector);
+        let mut content = SessionManager::new(project, connector).with_relauncher(Arc::new(
+            super::relaunch::WorkspaceContentRelauncher {
+                project: project.to_string(),
+            },
+        ));
         // Agent is the default view: bind to the workspace's agent session.
         content.show(SessionRef::Workspace(workspace.clone()));
         Self {
@@ -130,6 +134,12 @@ impl WorkspaceInterface {
     /// Put a message on the panel's status line (effect failures, notes).
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.panel.status_line = msg.into();
+    }
+
+    /// Mark the content session's teardown as deliberate, so the exit that
+    /// follows a `Close` is not auto-restarted by the content supervisor.
+    pub fn note_deliberate_close(&mut self) {
+        self.content.note_deliberate_close();
     }
 
     // -- background plumbing, delegated to the content SessionManager --------
@@ -302,6 +312,16 @@ impl WorkspaceInterface {
                 buf,
                 content_rect,
                 &format!("No live session for {}", info.name),
+            ),
+            MainState::Restarting(attempt, max) => super::render_placeholder(
+                buf,
+                content_rect,
+                &format!("Session exited — restarting ({attempt}/{max})…"),
+            ),
+            MainState::GaveUp(last_line) => super::render_placeholder(
+                buf,
+                content_rect,
+                &super::session::gave_up_notice(last_line),
             ),
             MainState::Live(pane) => {
                 let cur = pane.render(buf, content_rect, truecolor);

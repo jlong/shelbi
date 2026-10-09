@@ -54,6 +54,7 @@ mod project_paths;
 mod resolve;
 mod root;
 mod ssh_control;
+pub mod supervision_relaunch;
 mod user_config;
 mod workflows;
 mod workspace_status;

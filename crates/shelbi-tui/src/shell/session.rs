@@ -10,14 +10,49 @@
 //! viewed").
 
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use shelbi_client::{ClientError, Connection, SessionEvents};
+use shelbi_orchestrator::supervision::{
+    SupervisionAction, SupervisionInputs, SupervisionState, MAX_RESTARTS_IN_WINDOW,
+};
 use shelbi_proto::capability;
 use shelbi_term::Size;
 
 use super::terminal_view::TerminalPane;
+
+/// How a dead pane is brought back before the manager re-attaches, abstracted so
+/// the manager's restart loop is one code path for every pane kind and so it is
+/// testable without a daemon.
+///
+/// The step runs on the connect worker thread (it may block on the daemon
+/// socket) and differs by pane kind: a *content* session (View-Diff / Edit) is
+/// re-`Ensure`d through the daemon, which won't resurrect it on its own; a
+/// *persistent* pane (orchestrator / agent / review slot) is the daemon
+/// supervisor's to relaunch, so an auto-restart here is a no-op (the manager
+/// just re-attaches once the daemon brings it back) and only a `reopen` drops a
+/// [`shelbi_state::supervision_relaunch`] marker to reset that daemon budget.
+pub trait Relauncher: Send + Sync {
+    /// (Re)launch the session for `target`. `reopen` is true when the user
+    /// re-selected a pane the budget had given up on (reset + relaunch), false
+    /// for an automatic in-view restart. `Ok` means the request was placed, not
+    /// that the session is live — the following connect proves that.
+    fn relaunch(&self, target: &SessionRef, reopen: bool) -> Result<(), String>;
+}
+
+/// A relauncher that does nothing. The default for a manager whose pane kind the
+/// daemon fully owns and which never needs a reopen marker (and the seam tests
+/// inject their own), so [`SessionManager::new`] stays a two-argument
+/// constructor.
+pub struct NoopRelauncher;
+
+impl Relauncher for NoopRelauncher {
+    fn relaunch(&self, _target: &SessionRef, _reopen: bool) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 /// Which session a sidebar row refers to. The concrete session *name* used for
 /// discovery is derived from the project (sessions are named `<project>/orch`
@@ -309,6 +344,45 @@ fn starting_error(want: &str) -> String {
     format!("session `{want}` is starting (socket not up yet)")
 }
 
+/// The notice shown when the restart budget is spent: names the cap and how to
+/// bring the pane back ("select it again to relaunch"), and appends the last
+/// output line when there is one so a stuck pane shows *why* it stopped. Shared
+/// by every main-area / content render site so the wording stays identical.
+pub fn gave_up_notice(last_line: &str) -> String {
+    let base = format!(
+        "Stopped after {} restarts — select it again to relaunch.",
+        MAX_RESTARTS_IN_WINDOW
+    );
+    if last_line.trim().is_empty() {
+        base
+    } else {
+        format!("{base} Last output: {}", last_line.trim())
+    }
+}
+
+/// A one-line summary of why a live session's child exited, for the restart /
+/// give-up notice. Prefers the session's own reason, then the exit status or
+/// signal. Pure, so it's unit-testable without a session.
+fn exit_line(exited: Option<&shelbi_proto::Exited>) -> String {
+    match exited {
+        Some(e) => {
+            if let Some(r) = e.reason.as_deref() {
+                if !r.trim().is_empty() {
+                    return r.trim().to_string();
+                }
+            }
+            if let Some(code) = e.code {
+                return format!("exited with status {code}");
+            }
+            if let Some(sig) = e.signal {
+                return format!("killed by signal {sig}");
+            }
+            "session exited".to_string()
+        }
+        None => "session exited".to_string(),
+    }
+}
+
 /// The last non-empty line of a dead session's `<dir>/final.txt`, trimmed, or
 /// `None` when the file is absent or blank. This is the exited session's final
 /// screen line (e.g. `zsh:1: command not found: claude`).
@@ -337,6 +411,10 @@ enum Slot {
         target: SessionRef,
         rx: Receiver<Result<Connected, ConnectFailure>>,
         _join: JoinHandle<()>,
+        /// The restart attempt this connect is serving, when it was kicked by
+        /// the supervisor (1-based). `None` for an ordinary first connect, so
+        /// the view shows "Connecting…" rather than "restarting (N/…)".
+        restart_attempt: Option<u32>,
     },
     Live(Box<LiveSlot>),
     /// A declared workspace with no live session — the main area shows the
@@ -348,6 +426,22 @@ enum Slot {
     Failed {
         target: SessionRef,
         error: String,
+    },
+    /// A pane that exited unexpectedly and is waiting out its restart backoff
+    /// before the next attempt. Rendered as "restarting" so the user sees the
+    /// pane is coming back, not that it is gone.
+    AwaitingRestart {
+        target: SessionRef,
+        /// The last output / exit line, carried so a later give-up can show it.
+        last_line: String,
+        /// The attempt that will next be made (1-based), for the notice.
+        next_attempt: u32,
+    },
+    /// The restart budget is spent — the pane is left dead until the user
+    /// re-opens it (which resets the budget and relaunches).
+    GaveUp {
+        target: SessionRef,
+        last_line: String,
     },
 }
 
@@ -367,6 +461,19 @@ pub struct SessionManager {
     /// keeps the pane filling its area instead of letterboxing the default grid
     /// (`rt-review-content-session-edit-in-vi-doesn-t-fill-the-content-area`).
     last_size: Option<Size>,
+    /// How to bring the current pane back before re-attaching (content re-ensure
+    /// / persistent reopen marker). Shared, so the connect worker can run it.
+    relauncher: Arc<dyn Relauncher>,
+    /// The crash-loop budget for the pane currently bound, reusing the daemon's
+    /// decision core so the client supervises content sessions (and reflects a
+    /// persistent pane's restarts) under the exact same cap / backoff / window.
+    /// Reset when a different target is shown or the user re-opens a given-up
+    /// pane (`request_relaunch`).
+    supervision: SupervisionState,
+    /// Set when the shell is deliberately tearing the pane down (`q` / Close /
+    /// quit), so the resulting exit is read as intentional and not restarted.
+    /// Cleared whenever a new target is shown.
+    deliberate_close: bool,
 }
 
 /// What the main area should draw right now.
@@ -377,6 +484,13 @@ pub enum MainState<'a> {
     /// An idle workspace: render its placeholder (`rt-tui-idle-workspace-open`).
     Idle(&'a IdleInfo),
     Failed(&'a SessionRef, &'a str),
+    /// The pane exited and is being auto-restarted: `(attempt, max)`. The view
+    /// shows "Session exited — restarting (attempt/max)…".
+    Restarting(u32, u32),
+    /// The restart budget is spent; the field is the last output line. The view
+    /// shows "Stopped after N restarts — select it again to relaunch" plus that
+    /// line.
+    GaveUp(&'a str),
 }
 
 impl SessionManager {
@@ -387,7 +501,19 @@ impl SessionManager {
             slot: Slot::Empty,
             retry: RetryPolicy::default(),
             last_size: None,
+            relauncher: Arc::new(NoopRelauncher),
+            supervision: SupervisionState::default(),
+            deliberate_close: false,
         }
+    }
+
+    /// Install the relauncher that brings this manager's panes back
+    /// (content re-ensure / persistent reopen marker). Chained after
+    /// [`new`](Self::new) so the two-argument constructor and the many existing
+    /// call sites (and seam tests) stay unchanged.
+    pub fn with_relauncher(mut self, relauncher: Arc<dyn Relauncher>) -> Self {
+        self.relauncher = relauncher;
+        self
     }
 
     /// Begin showing `target`. The blocking connect runs on a worker thread;
@@ -404,18 +530,49 @@ impl SessionManager {
         {
             return;
         }
-        let project = self.project.clone();
+        // Re-opening the *same* target that had failed / given up / is mid-restart
+        // is the "navigate away and back relaunches it" gesture: reset the
+        // crash-loop budget and run a reopen relaunch (content re-ensure, or a
+        // persistent pane's daemon-budget reset marker). Any other `show` is a
+        // fresh binding with a clean budget and no relaunch step — the caller
+        // already ensured a content session before switching to it.
+        let reopen = self.current_target() == Some(&target)
+            && matches!(
+                self.slot,
+                Slot::Failed { .. } | Slot::GaveUp { .. } | Slot::AwaitingRestart { .. }
+            );
+        if reopen {
+            self.supervision.request_relaunch();
+        } else {
+            self.supervision = SupervisionState::default();
+        }
+        self.deliberate_close = false;
+        self.start_connect(target, if reopen { Some(true) } else { None }, None);
+    }
+
+    /// Spawn a connect worker for `target`. `relaunch` is `Some(reopen)` to run a
+    /// relaunch step first (`reopen` distinguishes an auto-restart from a
+    /// user-driven reopen); `None` for a plain first connect. `restart_attempt`
+    /// tags a supervisor-kicked restart so the view shows its progress.
+    fn start_connect(
+        &mut self,
+        target: SessionRef,
+        relaunch: Option<bool>,
+        restart_attempt: Option<u32>,
+    ) {
         let (tx, rx) = mpsc::channel();
-        // The connector is shared, so hand the worker a raw pointer-free clone
-        // of what it needs by moving a boxed job. We keep the connector on the
-        // manager and run it through a trait object the worker borrows via an
-        // Arc.
+        // The connector and relauncher are shared, so hand the worker Arc clones
+        // it borrows; the manager keeps its own.
         let job = ConnectJob {
             connector: self.connector.clone(),
-            project,
+            project: self.project.clone(),
             target: target.clone(),
             tx,
             retry: self.retry,
+            relaunch: relaunch.map(|reopen| RelaunchStep {
+                relauncher: self.relauncher.clone(),
+                reopen,
+            }),
         };
         let join = std::thread::Builder::new()
             .name("shelbi-shell-connect".into())
@@ -425,12 +582,35 @@ impl SessionManager {
             target,
             rx,
             _join: join,
+            restart_attempt,
         };
     }
 
-    /// Poll the in-flight connect without blocking. Returns `true` when the
-    /// slot changed (a connect finished or failed) so the caller redraws.
+    /// Mark the pane as being torn down deliberately (the shell's `q` / Close /
+    /// quit), so the exit that follows is read as intentional and the supervisor
+    /// stands down instead of restarting it. Cleared on the next [`show`].
+    pub fn note_deliberate_close(&mut self) {
+        self.deliberate_close = true;
+    }
+
+    /// Poll the in-flight connect without blocking and advance the restart
+    /// supervisor. Returns `true` when the slot changed (a connect finished or
+    /// failed, a pane exited, or a restart fired) so the caller redraws.
     pub fn poll(&mut self) -> bool {
+        self.poll_at(Instant::now())
+    }
+
+    /// [`poll`](Self::poll) with the clock injected, so a test can advance past
+    /// the restart backoff without sleeping.
+    fn poll_at(&mut self, now: Instant) -> bool {
+        let mut changed = self.poll_connect();
+        changed |= self.drive_supervision(now);
+        changed
+    }
+
+    /// Resolve a finished connect worker (a plain connect or a restart attempt).
+    /// A no-op unless the slot is `Connecting`.
+    fn poll_connect(&mut self) -> bool {
         let result = match &self.slot {
             Slot::Connecting { rx, .. } => match rx.try_recv() {
                 Ok(r) => r,
@@ -485,6 +665,138 @@ impl SessionManager {
         true
     }
 
+    /// Emit a `supervision=` line for a *content* session's restart / give-up,
+    /// identifying the pane as `<slot-or-workspace>/<role>`. Persistent panes
+    /// (orchestrator / agents / review slot) are the daemon supervisor's to log,
+    /// so they are skipped here to avoid double-logging; this covers the content
+    /// sessions the client supervises itself. Best-effort — a failed append is a
+    /// missed log line, not a broken restart.
+    fn emit_content_supervision(&self, target: &SessionRef, action: &str, reason: &str) {
+        let label = match target {
+            SessionRef::Review { slot, role } => format!("{slot}/{role}"),
+            SessionRef::WorkspaceContent { workspace, role } => format!("{workspace}/{role}"),
+            SessionRef::Orchestrator | SessionRef::Workspace(_) => return,
+        };
+        let _ = shelbi_state::append_supervision_event(&self.project, Some(&label), action, reason);
+    }
+
+    /// Advance the crash-loop supervisor for the current pane. Feeds the pure
+    /// decision core one observation per call (reusing the daemon's cap /
+    /// backoff / window), turning an unexpected exit — or a reconnect that found
+    /// no live session — into a restart, a backoff wait, or a give-up. Returns
+    /// whether the slot changed.
+    fn drive_supervision(&mut self, now: Instant) -> bool {
+        // Gather the observation without holding a borrow across the mutation.
+        enum Observed {
+            /// The bound pane is up — feed an alive tick (recovery reset).
+            Alive,
+            /// The pane is dead / failed and may need restarting.
+            Dead { target: SessionRef, last_line: String },
+            /// Nothing to supervise this tick (connecting, idle, empty, given up).
+            Nothing,
+        }
+        let observed = match &self.slot {
+            Slot::Live(live) if live.pane.exited.is_none() => Observed::Alive,
+            Slot::Live(live) => Observed::Dead {
+                target: live.target.clone(),
+                last_line: exit_line(live.pane.exited.as_ref()),
+            },
+            Slot::Failed { target, error } => Observed::Dead {
+                target: target.clone(),
+                last_line: error.clone(),
+            },
+            Slot::AwaitingRestart {
+                target, last_line, ..
+            } => Observed::Dead {
+                target: target.clone(),
+                last_line: last_line.clone(),
+            },
+            Slot::Connecting { .. } | Slot::Idle { .. } | Slot::GaveUp { .. } | Slot::Empty => {
+                Observed::Nothing
+            }
+        };
+
+        match observed {
+            Observed::Nothing => false,
+            Observed::Alive => {
+                // A pane that stays up past the recovery window forgets its
+                // crash history; a brief flap-back keeps it so the cap still
+                // trips. No slot change.
+                self.supervision.decide(
+                    &SupervisionInputs {
+                        alive: true,
+                        intentional_shutdown: false,
+                        has_work: false,
+                    },
+                    now,
+                );
+                false
+            }
+            Observed::Dead { target, last_line } => self.act_on_death(target, last_line, now),
+        }
+    }
+
+    /// Decide what to do about a dead/failed pane and apply it. The pane the user
+    /// is viewing is always "work" (we want it up); a deliberate teardown is the
+    /// one case we don't restart.
+    fn act_on_death(&mut self, target: SessionRef, last_line: String, now: Instant) -> bool {
+        let action = self.supervision.decide(
+            &SupervisionInputs {
+                alive: false,
+                intentional_shutdown: self.deliberate_close,
+                has_work: true,
+            },
+            now,
+        );
+        match action {
+            SupervisionAction::Restart => {
+                // `restart_count` is post-increment here, so it is the 1-based
+                // attempt number. Content re-ensures (the daemon won't on its
+                // own); a persistent pane relaunches via the daemon, so this is
+                // an auto (non-reopen) relaunch step.
+                let attempt = self.supervision.restart_count() as u32;
+                self.emit_content_supervision(&target, "restart", "crash");
+                self.start_connect(target, Some(false), Some(attempt));
+                true
+            }
+            SupervisionAction::GiveUp => {
+                self.emit_content_supervision(&target, "gave-up", "crash-loop");
+                self.slot = Slot::GaveUp { target, last_line };
+                true
+            }
+            SupervisionAction::None => {
+                if self.deliberate_close || !self.supervision.ever_alive() {
+                    // Deliberate teardown, or a pane that never came up at all
+                    // (a first-open connect failure): stand down. Leave a
+                    // never-live failure showing as `Failed`; clear a
+                    // deliberately-closed pane so we stop supervising it.
+                    if self.deliberate_close && !matches!(self.slot, Slot::Empty) {
+                        self.slot = Slot::Empty;
+                        return true;
+                    }
+                    return false;
+                }
+                // Inside the backoff between attempts: reflect it as "restarting"
+                // so the user sees the pane is coming back. Only rewrite the slot
+                // when the shown attempt changes, to avoid redraw churn.
+                let next_attempt = self.supervision.restart_count() as u32 + 1;
+                let already = matches!(
+                    &self.slot,
+                    Slot::AwaitingRestart { next_attempt: n, .. } if *n == next_attempt
+                );
+                if already {
+                    return false;
+                }
+                self.slot = Slot::AwaitingRestart {
+                    target,
+                    last_line,
+                    next_attempt,
+                };
+                true
+            }
+        }
+    }
+
     /// Retry the current binding when it settled on a non-live outcome (idle or
     /// failed). Used when a board/workspace change arrives while the main area
     /// shows an idle/failed workspace, so a session that just started attaches
@@ -523,7 +835,9 @@ impl SessionManager {
             Slot::Empty => None,
             Slot::Connecting { target, .. }
             | Slot::Idle { target, .. }
-            | Slot::Failed { target, .. } => Some(target),
+            | Slot::Failed { target, .. }
+            | Slot::AwaitingRestart { target, .. }
+            | Slot::GaveUp { target, .. } => Some(target),
             Slot::Live(live) => Some(&live.target),
         }
     }
@@ -543,12 +857,23 @@ impl SessionManager {
     }
 
     pub fn state(&self) -> MainState<'_> {
+        let max = MAX_RESTARTS_IN_WINDOW as u32;
         match &self.slot {
             Slot::Empty => MainState::Empty,
+            // A supervisor-kicked restart still connecting shows its progress;
+            // an ordinary first connect shows plain "Connecting…".
+            Slot::Connecting {
+                restart_attempt: Some(a),
+                ..
+            } => MainState::Restarting(*a, max),
             Slot::Connecting { target, .. } => MainState::Connecting(target),
             Slot::Live(live) => MainState::Live(&live.pane),
             Slot::Idle { info, .. } => MainState::Idle(info),
             Slot::Failed { target, error } => MainState::Failed(target, error),
+            Slot::AwaitingRestart { next_attempt, .. } => {
+                MainState::Restarting(*next_attempt, max)
+            }
+            Slot::GaveUp { last_line, .. } => MainState::GaveUp(last_line),
         }
     }
 
@@ -595,6 +920,12 @@ impl SessionManager {
     }
 }
 
+/// A relaunch to run on the worker thread before connecting.
+struct RelaunchStep {
+    relauncher: Arc<dyn Relauncher>,
+    reopen: bool,
+}
+
 /// A connect job run on a worker thread.
 struct ConnectJob {
     connector: std::sync::Arc<dyn Connector>,
@@ -602,10 +933,26 @@ struct ConnectJob {
     target: SessionRef,
     tx: mpsc::Sender<Result<Connected, ConnectFailure>>,
     retry: RetryPolicy,
+    /// A relaunch to perform before the connect (content re-ensure / persistent
+    /// reopen marker). `None` for a plain first connect.
+    relaunch: Option<RelaunchStep>,
 }
 
 impl ConnectJob {
     fn run(self) {
+        // Bring the pane back first, when asked. A relaunch failure is terminal
+        // and surfaced as the connect error, so the view shows a clear message
+        // (with the carried reason) rather than retrying a relaunch that can't
+        // happen.
+        if let Some(step) = &self.relaunch {
+            if let Err(e) = step.relauncher.relaunch(&self.target, step.reopen) {
+                let _ = self.tx.send(Err(ConnectFailure::Message(format!(
+                    "couldn't relaunch {}: {e}",
+                    self.target.display()
+                ))));
+                return;
+            }
+        }
         // Retry a session whose socket isn't up yet. A just-launched session has
         // its dir (with `meta.json`) on disk a beat before its `sock` is bound,
         // so a connect in that window returns `Starting` — we back off and try
@@ -1404,6 +1751,248 @@ mod tests {
             Ok(connected) => assert!(connected.size.cols >= 1),
             Err(_) => panic!("the connector must attach to the live session, not the zombie"),
         }
+    }
+
+    // -- restart supervision (rt-auto-restart-killed-panes) ------------------
+
+    /// A relauncher that records every call, so a test can prove the manager
+    /// asked for a relaunch (and whether it was a reopen) without a daemon.
+    #[derive(Default)]
+    struct CountingRelauncher {
+        calls: std::sync::Mutex<Vec<bool>>, // each entry = the `reopen` flag
+    }
+    impl Relauncher for CountingRelauncher {
+        fn relaunch(&self, _target: &SessionRef, reopen: bool) -> Result<(), String> {
+            self.calls.lock().unwrap().push(reopen);
+            Ok(())
+        }
+    }
+
+    /// Build a `SupervisionState` that has already given up, using only its
+    /// public API (the fields are private to the orchestrator crate): a live
+    /// sighting then MAX_RESTARTS_IN_WINDOW crashes, each past its backoff, then
+    /// one more crash to trip give-up.
+    fn gave_up_state() -> SupervisionState {
+        let mut s = SupervisionState::default();
+        let mut t = Instant::now();
+        let alive = SupervisionInputs {
+            alive: true,
+            intentional_shutdown: false,
+            has_work: false,
+        };
+        let dead = SupervisionInputs {
+            alive: false,
+            intentional_shutdown: false,
+            has_work: true,
+        };
+        for n in 0..MAX_RESTARTS_IN_WINDOW {
+            s.decide(&alive, t);
+            t += shelbi_orchestrator::supervision::BASE_BACKOFF * (1u32 << n)
+                + Duration::from_secs(1);
+            assert_eq!(s.decide(&dead, t), SupervisionAction::Restart);
+        }
+        assert_eq!(s.decide(&dead, t), SupervisionAction::GiveUp);
+        s
+    }
+
+    #[test]
+    fn reopening_a_given_up_pane_resets_the_budget_and_relaunches() {
+        // The user navigates away and back to a pane whose restarts were spent:
+        // the budget resets and a reopen relaunch runs (reopen=true), rather than
+        // the view sitting on the dead state.
+        let relauncher = std::sync::Arc::new(CountingRelauncher::default());
+        let (_tx, rx): (Sender<()>, Receiver<()>) = mpsc::channel();
+        let connector = BlockingConnector {
+            release: std::sync::Mutex::new(Some(rx)),
+        };
+        let mut mgr = SessionManager::new("demo", std::sync::Arc::new(connector))
+            .with_relauncher(relauncher.clone());
+        let target = SessionRef::Orchestrator;
+        // Put it in the given-up state the daemon/client would reach.
+        mgr.supervision = gave_up_state();
+        assert_eq!(mgr.supervision.restart_count(), MAX_RESTARTS_IN_WINDOW);
+        mgr.slot = Slot::GaveUp {
+            target: target.clone(),
+            last_line: "boom".into(),
+        };
+        assert!(matches!(mgr.state(), MainState::GaveUp("boom")));
+
+        // Re-open the same target.
+        mgr.show(target.clone());
+        // Budget reset and a connect kicked.
+        assert_eq!(mgr.supervision.restart_count(), 0, "the budget is reset");
+        assert!(matches!(mgr.slot, Slot::Connecting { .. }));
+        // The worker ran a reopen relaunch; wait briefly for it.
+        let mut saw_reopen = false;
+        for _ in 0..200 {
+            if relauncher.calls.lock().unwrap().iter().any(|&reopen| reopen) {
+                saw_reopen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_reopen, "a reopen relaunch (reopen=true) should run");
+    }
+
+    /// Spawn a real session that stays up briefly then exits, so a connected
+    /// client observes a genuine `Exited`. Returns a cleanup guard.
+    fn spawn_exiting_session(home: &std::path::Path, name: &str) -> CatCleanup {
+        use shelbi_session::layout::SessionPaths;
+        use shelbi_session::RunArgs;
+        std::env::set_var("SHELBI_HOME", home);
+        let id = shelbi_session::layout::derive_id_now(name);
+        let paths = SessionPaths::new(&home.join("sessions"), &id);
+        let args = RunArgs {
+            id,
+            name: name.to_string(),
+            cwd: std::env::temp_dir(),
+            cols: 80,
+            rows: 24,
+            task: None,
+            raw_output_log: false,
+            child_argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "stty raw -echo 2>/dev/null; sleep 0.4; exit 7".into(),
+            ],
+            manage_daemon: false,
+        };
+        std::thread::spawn(move || shelbi_session::run(args));
+        let sock = paths.sock();
+        for _ in 0..500 {
+            if sock.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(sock.exists(), "the session socket should appear");
+        CatCleanup { sock }
+    }
+
+    /// Drive the manager until its bound pane reports it exited, pumping output.
+    fn wait_until_exited(mgr: &mut SessionManager) -> bool {
+        let mut ring = false;
+        for _ in 0..600 {
+            mgr.poll();
+            mgr.pump_output(&mut ring);
+            if let Slot::Live(live) = &mgr.slot {
+                if live.pane.exited.is_some() {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_live_pane_that_exits_is_auto_restarted() {
+        // A pane that was alive and then its child exits is brought back: the
+        // manager leaves Live, asks the relauncher for a (non-reopen) relaunch,
+        // and shows the restart in flight.
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let _cleanup = spawn_exiting_session(home.path(), "demo/ws/worker");
+
+        let relauncher = std::sync::Arc::new(CountingRelauncher::default());
+        let mut mgr = SessionManager::new("demo", std::sync::Arc::new(LiveConnector))
+            .with_relauncher(relauncher.clone());
+        mgr.retry = RetryPolicy {
+            deadline: Duration::from_millis(200),
+            backoff: Duration::from_millis(10),
+        };
+        mgr.show(SessionRef::Workspace("worker".into()));
+        assert!(poll_until_live(&mut mgr), "the session attaches live first");
+        assert!(wait_until_exited(&mut mgr), "its child then exits");
+
+        // The next poll acts on the exit: first restart fires immediately.
+        let base = Instant::now();
+        mgr.poll_at(base);
+        assert!(
+            matches!(mgr.state(), MainState::Restarting(1, _)),
+            "the pane shows restart attempt 1 in flight"
+        );
+        // A (non-reopen) relaunch was requested.
+        let calls = relauncher.calls.lock().unwrap().clone();
+        assert_eq!(calls, vec![false], "one auto (non-reopen) relaunch");
+    }
+
+    #[test]
+    fn a_deliberately_closed_pane_is_not_restarted() {
+        // When the shell marks a deliberate teardown, the exit that follows is
+        // not restarted — it stands down instead.
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let _cleanup = spawn_exiting_session(home.path(), "demo/ws/stopme");
+
+        let relauncher = std::sync::Arc::new(CountingRelauncher::default());
+        let mut mgr = SessionManager::new("demo", std::sync::Arc::new(LiveConnector))
+            .with_relauncher(relauncher.clone());
+        mgr.show(SessionRef::Workspace("stopme".into()));
+        assert!(poll_until_live(&mut mgr));
+        assert!(wait_until_exited(&mut mgr));
+
+        // The teardown was deliberate.
+        mgr.note_deliberate_close();
+        mgr.poll_at(Instant::now());
+        assert!(
+            !matches!(mgr.state(), MainState::Restarting(..)),
+            "a deliberate close is not restarted"
+        );
+        assert!(
+            relauncher.calls.lock().unwrap().is_empty(),
+            "no relaunch is requested for a deliberate close"
+        );
+    }
+
+    #[test]
+    fn gave_up_notice_names_the_cap_and_last_line() {
+        let n = MAX_RESTARTS_IN_WINDOW;
+        assert_eq!(
+            gave_up_notice("command not found: vim"),
+            format!(
+                "Stopped after {n} restarts — select it again to relaunch. \
+                 Last output: command not found: vim"
+            )
+        );
+        assert_eq!(
+            gave_up_notice("   "),
+            format!("Stopped after {n} restarts — select it again to relaunch.")
+        );
+    }
+
+    #[test]
+    fn exit_line_prefers_reason_then_status_then_signal() {
+        use shelbi_proto::Exited;
+        assert_eq!(
+            exit_line(Some(&Exited {
+                code: Some(1),
+                signal: None,
+                reason: Some("usage limit reached".into()),
+            })),
+            "usage limit reached"
+        );
+        assert_eq!(
+            exit_line(Some(&Exited {
+                code: Some(2),
+                signal: None,
+                reason: None,
+            })),
+            "exited with status 2"
+        );
+        assert_eq!(
+            exit_line(Some(&Exited {
+                code: None,
+                signal: Some(9),
+                reason: None,
+            })),
+            "killed by signal 9"
+        );
+        assert_eq!(exit_line(None), "session exited");
     }
 
     #[test]

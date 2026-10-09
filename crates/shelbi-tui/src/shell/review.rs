@@ -112,7 +112,12 @@ impl ReviewInterface {
         let title = task.as_ref().map(|t| t.task.title.clone()).unwrap_or_default();
         let description = task.as_ref().map(|t| t.body.clone()).unwrap_or_default();
         let panel = ReviewPanel::new(worktree, editor_name, has_review_url, title, description);
-        let mut content = SessionManager::new(project, connector);
+        let mut content = SessionManager::new(project, connector).with_relauncher(Arc::new(
+            super::relaunch::ReviewRelauncher {
+                project: project.to_string(),
+                task: task_id.clone(),
+            },
+        ));
         // Chat is the default view: bind to the review agent's workspace session.
         content.show(SessionRef::Workspace(slot.clone()));
         Self {
@@ -190,6 +195,12 @@ impl ReviewInterface {
     /// Put a message on the panel's status line (effect failures, notes).
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.panel.status_line = msg.into();
+    }
+
+    /// Mark the content session's teardown as deliberate, so the exit that
+    /// follows a `Close` is not auto-restarted by the content supervisor.
+    pub fn note_deliberate_close(&mut self) {
+        self.content.note_deliberate_close();
     }
 
     // -- background plumbing, delegated to the content SessionManager --------
@@ -403,6 +414,16 @@ impl ReviewInterface {
                 buf,
                 content_rect,
                 &format!("No live session for {}", info.name),
+            ),
+            MainState::Restarting(attempt, max) => super::render_placeholder(
+                buf,
+                content_rect,
+                &format!("Session exited — restarting ({attempt}/{max})…"),
+            ),
+            MainState::GaveUp(last_line) => super::render_placeholder(
+                buf,
+                content_rect,
+                &super::session::gave_up_notice(last_line),
             ),
             MainState::Live(pane) => {
                 let cur = pane.render(buf, content_rect, truecolor);
@@ -747,6 +768,8 @@ mod tests {
             MainState::Live(_) => "Live",
             MainState::Idle(_) => "Idle",
             MainState::Failed(_, _) => "Failed",
+            MainState::Restarting(..) => "Restarting",
+            MainState::GaveUp(..) => "GaveUp",
         }
     }
 }
