@@ -37,6 +37,13 @@ pub enum Effect {
     /// Begin the add-project flow (the host collects the form, then calls
     /// [`Mutation::AddProject`]).
     AddProject,
+    /// Detach this client: stop rendering and drop its connections, leaving
+    /// every session and agent running (the palette's "Detach"; the same
+    /// client-local stop `q` performs).
+    Detach,
+    /// Detach every *other* client attached to this session, leaving this one
+    /// running (the palette's "Detach Other Clients"). A daemon round-trip.
+    DetachOtherClients,
     /// Quit a project: end its sessions and mark it closed. The host
     /// confirms first.
     QuitProject { project: String },

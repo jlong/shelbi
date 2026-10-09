@@ -31,8 +31,8 @@ mod terminal_view;
 mod pty_input_tests;
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -257,12 +257,30 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
     // the periodic request below is the fallback for a hubless project.
     let (_changes, change_rx) = changes::spawn(project);
 
-    // Re-exec listener (Phase 4f): a background subscription to the daemon that
-    // flips this flag when the daemon pushes a re-exec (this client is out of
-    // date after an upgrade, or a `shelbi reload` signalled a re-exec). The loop
-    // observes the flag and exits into the re-exec path below.
+    // Daemon-push listener: a background subscription — registered as this
+    // attached client — that flips `reexec` on a re-exec push (this client is out
+    // of date after an upgrade, or `shelbi reload` signalled a re-exec) and the
+    // detach signal on a detach push (`shelbi detach` / another window's "Detach
+    // Other Clients"). The loop observes both flags and exits accordingly.
     let reexec = Arc::new(AtomicBool::new(false));
-    spawn_reexec_listener(reexec.clone());
+    let detach_signal = state.detach_signal.clone();
+    let client_info = shelbi_proto::control::ClientInfo {
+        client_id: state.client_id.clone(),
+        kind: shelbi_proto::control::ClientKind::Tui,
+        host: shelbi_client::hostname(),
+        pid: Some(std::process::id()),
+        project: Some(project.to_string()),
+    };
+    spawn_reexec_listener(reexec.clone(), detach_signal, client_info);
+
+    // Attached-client count poller: keeps the "other clients attached" flag the
+    // palette gates "Detach Other Clients" on fresh. Stopped on loop exit.
+    let count_stop = Arc::new(AtomicBool::new(false));
+    spawn_client_count_poller(
+        state.other_clients.clone(),
+        state.client_id.clone(),
+        count_stop.clone(),
+    );
 
     // Start on the restored view (set by a prior re-exec) or the orchestrator
     // chat, focused.
@@ -292,6 +310,13 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         // A pushed re-exec ends the loop and re-execs on the way out.
         if reexec.load(Ordering::SeqCst) && !state.should_reexec {
             state.should_reexec = true;
+            state.should_quit = true;
+            continue;
+        }
+        // A pushed detach ends the loop cleanly (CloseUi semantics): sessions and
+        // agents keep running, and the reason is printed after the terminal is
+        // restored (below).
+        if state.detach_signal.is_requested() && !state.should_quit {
             state.should_quit = true;
             continue;
         }
@@ -411,17 +436,35 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         }
     }
 
-    // Re-exec on the way out, if the daemon asked us to. Restore the terminal
-    // first (the RAII guard would do it on drop, but `exec` replaces the process
-    // so Drop never runs), carry the current view forward so the fresh TUI lands
-    // where this one was, then replace this process with the installed binary.
-    if state.should_reexec {
-        let view = state.client.view().clone();
+    // Stop the background client-count poller (its thread exits on the next tick).
+    count_stop.store(true, Ordering::SeqCst);
+
+    // Decide the on-exit action(s) before touching the terminal: a daemon-asked
+    // re-exec (carry the view forward and replace the process) and/or a daemon
+    // detach (print why the TUI closed on the normal screen). They are mutually
+    // exclusive in practice, but computing both keeps the one terminal teardown
+    // below unconditional for the borrow checker.
+    let reexec_view = state.should_reexec.then(|| state.client.view().clone());
+    let detach_reason = state.detach_signal.take_reason();
+
+    // Restore the terminal once if either path needs the normal screen. (The RAII
+    // guard restores on drop anyway, but `exec` replaces the process so Drop never
+    // runs, and a detach message must print after the restore.)
+    if reexec_view.is_some() || detach_reason.is_some() {
         drop(term);
-        drop(_guard); // restores the terminal
+        drop(_guard);
+    }
+
+    if let Some(view) = reexec_view {
         reexec_into_current_binary(&view);
-        // `reexec_into_current_binary` only returns if exec failed; fall through
-        // to a clean exit so the shell doesn't hang in a broken terminal.
+        // Only returns if exec failed; fall through to a clean exit so the shell
+        // doesn't hang in a broken terminal.
+    }
+
+    // The daemon detached this client: sessions and agents keep running, and a
+    // plain `shelbi` reattaches.
+    if let Some(reason) = detach_reason {
+        println!("{reason}");
     }
 
     Ok(())
@@ -464,22 +507,53 @@ fn reexec_into_current_binary(view: &View) {
     }
 }
 
-/// Spawn the background re-exec listener: subscribe to the daemon's control
-/// socket and flip `reexec` on a [`Notice::Reexec`] push. If the subscription
+/// A daemon-pushed request for this client to detach (`shelbi detach` / the
+/// palette's "Detach Other Clients" from another window). The background listener
+/// sets `requested` and records the one-line `reason` the shell prints on exit.
+#[derive(Default)]
+struct DetachSignal {
+    requested: AtomicBool,
+    reason: Mutex<Option<String>>,
+}
+
+impl DetachSignal {
+    fn request(&self, reason: String) {
+        *self.reason.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
+        self.requested.store(true, Ordering::SeqCst);
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    /// Take the recorded reason (consumed once, for the on-exit message).
+    fn take_reason(&self) -> Option<String> {
+        self.reason.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+}
+
+/// Spawn the background daemon-push listener: subscribe to the daemon's control
+/// socket **as this attached client** (so `shelbi detach` can list and target
+/// it) and react to the pushes — flip `reexec` on a [`Notice::Reexec`], flip
+/// `detach` on a [`Notice::Detach`] (recording its reason). If the subscription
 /// drops (the daemon restarted), re-probe the daemon version: a mismatch means
-/// this client is now out of date, so flip the flag; otherwise reconnect. All
-/// best-effort — a daemon that is simply absent leaves the flag clear, and the
-/// shell keeps running (read-only session viewing is unaffected).
-fn spawn_reexec_listener(reexec: Arc<AtomicBool>) {
+/// this client is now out of date, so flip the re-exec flag; otherwise reconnect
+/// (re-registering under the same `client_id`). All best-effort — a daemon that
+/// is simply absent leaves both flags clear, and the shell keeps running.
+fn spawn_reexec_listener(
+    reexec: Arc<AtomicBool>,
+    detach: Arc<DetachSignal>,
+    info: shelbi_proto::control::ClientInfo,
+) {
     std::thread::Builder::new()
-        .name("shelbi-shell-reexec".into())
+        .name("shelbi-shell-daemon-push".into())
         .spawn(move || loop {
-            if reexec.load(Ordering::SeqCst) {
+            if reexec.load(Ordering::SeqCst) || detach.is_requested() {
                 return;
             }
             match connect_control() {
                 Some(client) => {
-                    let Ok(mut sub) = client.subscribe() else {
+                    let Ok(mut sub) = client.subscribe_as(info.clone()) else {
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
                     };
@@ -487,6 +561,10 @@ fn spawn_reexec_listener(reexec: Arc<AtomicBool>) {
                         match sub.recv() {
                             Ok(Some(shelbi_client::Notice::Reexec { .. })) => {
                                 reexec.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                            Ok(Some(shelbi_client::Notice::Detach { reason })) => {
+                                detach.request(reason);
                                 return;
                             }
                             Ok(Some(_)) => {} // a change note — ignored here
@@ -507,6 +585,30 @@ fn spawn_reexec_listener(reexec: Arc<AtomicBool>) {
                     std::thread::sleep(Duration::from_secs(2));
                 }
             }
+        })
+        .ok();
+}
+
+/// Spawn the background attached-client poller: every couple of seconds, list the
+/// attached clients and store how many are *other* than this one in `others`, so
+/// the palette can offer "Detach Other Clients" only when there is one. Purely
+/// best-effort — an unreachable daemon leaves the count at zero.
+fn spawn_client_count_poller(others: Arc<AtomicUsize>, my_id: String, stop: Arc<AtomicBool>) {
+    std::thread::Builder::new()
+        .name("shelbi-shell-client-count".into())
+        .spawn(move || loop {
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let count = match connect_control() {
+                Some(mut client) => client
+                    .list_clients()
+                    .map(|clients| clients.iter().filter(|c| c.client_id != my_id).count())
+                    .unwrap_or(0),
+                None => 0,
+            };
+            others.store(count, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_secs(2));
         })
         .ok();
 }
@@ -723,6 +825,17 @@ struct ShellState {
     /// is out of date, or a `shelbi reload` signalled a re-exec). Checked by
     /// [`run_with`] after the event loop ends.
     should_reexec: bool,
+    /// This client's stable id for the attached-clients registry (generated once
+    /// per process). The daemon-push listener registers under it, and "Detach
+    /// Other Clients" detaches everyone *but* this id.
+    client_id: String,
+    /// How many *other* clients are attached right now (maintained by the
+    /// background poller). Gates the "Detach Other Clients" palette command.
+    other_clients: Arc<AtomicUsize>,
+    /// Set (with a reason) when the daemon pushes a detach for this client
+    /// (`shelbi detach` / another window's "Detach Other Clients"). The run loop
+    /// observes it, quits, and prints the reason on exit.
+    detach_signal: Arc<DetachSignal>,
     /// The one-time keyboard-protocol notice: shown from startup until its
     /// deadline, then cleared and never re-armed (see [`ShellState::notice_text`]).
     notice: Option<Notice>,
@@ -846,6 +959,9 @@ impl ShellState {
             reported_main: None,
             search_input: None,
             should_reexec: false,
+            client_id: shelbi_client::fresh_client_id(),
+            other_clients: Arc::new(AtomicUsize::new(0)),
+            detach_signal: Arc::new(DetachSignal::default()),
             notice,
             overlay: None,
             palette_chord,
@@ -916,7 +1032,8 @@ impl ShellState {
         else {
             return Vec::new();
         };
-        let model = overlays::build_command_model(project, sidebar);
+        let other_clients_attached = self.other_clients.load(Ordering::SeqCst) > 0;
+        let model = overlays::build_command_model(project, sidebar, other_clients_attached);
         CommandRegistry::new().entries(&model)
     }
 
@@ -1100,6 +1217,25 @@ impl ShellState {
             }
         }
         self.should_quit = true;
+    }
+
+    /// Detach every *other* client attached to this session, leaving this window
+    /// running (the palette's "Detach Other Clients"). A best-effort control-socket
+    /// round-trip; the outcome lands in the status line.
+    fn detach_other_clients(&mut self) {
+        let reason = format!("Detached by another window on {}.", shelbi_client::hostname());
+        let selector = shelbi_proto::control::DetachSelector::AllExcept {
+            client_id: self.client_id.clone(),
+        };
+        self.status = Some(match connect_control() {
+            Some(mut client) => match client.detach_clients(selector, &reason) {
+                Ok(0) => "No other windows are attached.".to_string(),
+                Ok(n) => format!("Detached {n} other window{}.", if n == 1 { "" } else { "s" }),
+                Err(e) => format!("Could not detach other windows: {e}"),
+            },
+            None => "Could not reach the daemon to detach other windows.".to_string(),
+        });
+        self.dirty = true;
     }
 
     fn activate_selection(&mut self) {
@@ -1527,6 +1663,8 @@ impl ShellState {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.overlay = Some(ActiveOverlay::add_project(&cwd));
             }
+            Effect::Detach => self.quit(QuitAction::CloseUi),
+            Effect::DetachOtherClients => self.detach_other_clients(),
             Effect::QuitProject { .. } => self.quit(QuitAction::QuitProject),
             Effect::QuitShelbi => self.quit(QuitAction::QuitShelbi),
             Effect::Mutate(Mutation::ToggleZen { project }) => self.toggle_zen(project),

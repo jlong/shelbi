@@ -31,9 +31,9 @@ use std::time::Duration;
 
 use shelbi_orchestrator::mutate::{self, MutateError, OutputSink};
 use shelbi_proto::control::{
-    self, ChangeNote, ClientMsg, MutationError, MutationKind, MutationRequest, ReviewRole,
-    ReviewSessionOp, ReviewSessionRequest, ServerMsg, Stream, WorkspaceSessionOp,
-    WorkspaceSessionRequest, CONTROL_PROTOCOL_VERSION,
+    self, AttachedClient, ChangeNote, ClientInfo, ClientMsg, DetachSelector, MutationError,
+    MutationKind, MutationRequest, ReviewRole, ReviewSessionOp, ReviewSessionRequest, ServerMsg,
+    Stream, WorkspaceSessionOp, WorkspaceSessionRequest, CONTROL_PROTOCOL_VERSION,
 };
 use shelbi_state::CLIENT_VERSION;
 
@@ -138,13 +138,30 @@ struct Inner {
     /// are distinct issues touched in a daemon's lifetime.
     issue_locks: Mutex<HashMap<IssueKey, Arc<Mutex<()>>>>,
     /// Connected subscriber connections, keyed by connection id, each with the
-    /// sender feeding its writer thread.
+    /// sender feeding its writer thread. Every subscriber (including an info-less
+    /// internal watcher) is here, for `Changed`/`Reexec` broadcasts.
     subscribers: Mutex<HashMap<u64, Sender<ServerMsg>>>,
+    /// The **attached UI clients** registry: the subset of subscribers that
+    /// announced a [`ClientInfo`], keyed by connection id, each with its info,
+    /// attach time, and writer sender. This is what `shelbi detach` lists and
+    /// targets; an entry is removed when its connection closes (detected by the
+    /// handler's read loop ending, so a client that dies without a goodbye is
+    /// still reaped).
+    clients: Mutex<HashMap<u64, RegisteredClient>>,
     next_conn_id: AtomicU64,
     /// The mutation executor (see [`ApplyFn`]).
     apply: Box<ApplyFn>,
     /// The quit/stop operations behind the lifecycle commands.
     lifecycle: Arc<dyn LifecycleOps>,
+}
+
+/// One attached UI client in the registry: its announced identity, the time it
+/// attached (daemon-stamped RFC3339), and the sender feeding its writer thread
+/// (so the daemon can push it a [`ServerMsg::Detach`]).
+struct RegisteredClient {
+    info: ClientInfo,
+    attached_at: String,
+    tx: Sender<ServerMsg>,
 }
 
 impl ControlState {
@@ -179,6 +196,7 @@ impl ControlState {
             inner: Arc::new(Inner {
                 issue_locks: Mutex::new(HashMap::new()),
                 subscribers: Mutex::new(HashMap::new()),
+                clients: Mutex::new(HashMap::new()),
                 next_conn_id: AtomicU64::new(1),
                 apply,
                 lifecycle,
@@ -200,6 +218,68 @@ impl ControlState {
 
     fn unregister(&self, conn_id: u64) {
         self.inner.subscribers.lock().unwrap().remove(&conn_id);
+        self.inner.clients.lock().unwrap().remove(&conn_id);
+    }
+
+    /// Register (or refresh, on a reconnect) an attached UI client. Stamps the
+    /// attach time daemon-side so a client can't spoof it.
+    fn register_client(&self, conn_id: u64, info: ClientInfo, tx: Sender<ServerMsg>) {
+        let attached_at = now_rfc3339();
+        self.inner.clients.lock().unwrap().insert(
+            conn_id,
+            RegisteredClient {
+                info,
+                attached_at,
+                tx,
+            },
+        );
+    }
+
+    /// A snapshot of the attached UI clients, newest first by attach time, for
+    /// [`ServerMsg::ClientList`].
+    fn list_clients(&self) -> Vec<AttachedClient> {
+        let clients = self.inner.clients.lock().unwrap();
+        let mut out: Vec<AttachedClient> = clients
+            .values()
+            .map(|c| AttachedClient {
+                client_id: c.info.client_id.clone(),
+                kind: c.info.kind,
+                host: c.info.host.clone(),
+                pid: c.info.pid,
+                project: c.info.project.clone(),
+                attached_at: c.attached_at.clone(),
+            })
+            .collect();
+        // Stable, readable order: oldest attach first (then by id to break ties).
+        out.sort_by(|a, b| {
+            a.attached_at
+                .cmp(&b.attached_at)
+                .then_with(|| a.client_id.cmp(&b.client_id))
+        });
+        out
+    }
+
+    /// Push a [`ServerMsg::Detach`] to every attached client matching `selector`,
+    /// returning how many were signalled. The entries are *not* removed here —
+    /// each client disconnects in response and the handler's read loop reaps it,
+    /// which also handles a client that never acts on the push.
+    fn detach_clients(&self, selector: &DetachSelector, reason: &str) -> u32 {
+        let clients = self.inner.clients.lock().unwrap();
+        let mut count = 0u32;
+        for c in clients.values() {
+            let matches = match selector {
+                DetachSelector::All => true,
+                DetachSelector::AllExcept { client_id } => c.info.client_id != *client_id,
+                DetachSelector::One { client_id } => c.info.client_id == *client_id,
+            };
+            if matches {
+                let _ = c.tx.send(ServerMsg::Detach {
+                    reason: reason.to_string(),
+                });
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Announce `note` to every subscriber except `origin` (which gets the
@@ -224,6 +304,12 @@ impl ControlState {
             let _ = tx.send(msg.clone());
         }
     }
+}
+
+/// The current time as an RFC3339 string (seconds precision, UTC), for a
+/// client's daemon-stamped attach time.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// Bind the control socket (0600, like the hub socket). Returns the listener for
@@ -320,8 +406,13 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                     daemon_version: state.inner.lifecycle.daemon_version(),
                 });
             }
-            ClientMsg::Subscribe => {
+            ClientMsg::Subscribe { info } => {
                 state.register(conn_id, tx.clone());
+                // When the subscriber announced its identity, track it as an
+                // attached UI client so `shelbi detach` can list and target it.
+                if let Some(info) = info {
+                    state.register_client(conn_id, info, tx.clone());
+                }
                 // If this subscriber announced a different version than ours it
                 // is out of date: tell it to re-exec (a TUI) / prompt for
                 // relaunch (the desktop app) right away, so it stops sending
@@ -381,6 +472,24 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 // reason (the daemon owns the editor/diff sessions' lifetime).
                 let tx = tx.clone();
                 thread::spawn(move || run_workspace_session_job(req, tx));
+            }
+            ClientMsg::ListClients { request_id } => {
+                let clients = state.list_clients();
+                let _ = tx.send(ServerMsg::ClientList {
+                    request_id,
+                    clients,
+                });
+            }
+            ClientMsg::DetachClients {
+                request_id,
+                selector,
+                reason,
+            } => {
+                // Push a Detach to every matching attached client, then ack with
+                // the count. Each client leaves on its own; the registry entries
+                // are reaped as their connections close.
+                let count = state.detach_clients(&selector, &reason);
+                let _ = tx.send(ServerMsg::Detached { request_id, count });
             }
         }
     }
@@ -1172,6 +1281,143 @@ mod tests {
                 assert!(reason.contains("out of date"), "reason: {reason}")
             }
             other => panic!("an out-of-date subscriber must be told to re-exec, got {other:?}"),
+        }
+    }
+
+    // --- attached-client registry + detach (v4) ------------------------------
+
+    use shelbi_proto::control::{ClientInfo, ClientKind, DetachSelector};
+
+    fn info(id: &str) -> ClientInfo {
+        ClientInfo {
+            client_id: id.into(),
+            kind: ClientKind::Tui,
+            host: "studio".into(),
+            pid: Some(42),
+            project: Some("p".into()),
+        }
+    }
+
+    #[test]
+    fn client_registry_lists_and_detaches_by_selector() {
+        // The registry lists attached clients and the three selectors target the
+        // right ones: All (everyone), AllExcept (everyone but the named id — the
+        // "detach other clients" case), and One (just that id).
+        let state = ControlState::new();
+        let (tx1, rx1) = std::sync::mpsc::channel();
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        state.register_client(1, info("aaa"), tx1);
+        state.register_client(2, info("bbb"), tx2);
+
+        let listed = state.list_clients();
+        let ids: Vec<String> = listed.iter().map(|c| c.client_id.clone()).collect();
+        assert_eq!(listed.len(), 2);
+        assert!(ids.contains(&"aaa".to_string()) && ids.contains(&"bbb".to_string()));
+
+        // AllExcept aaa → only bbb is told to detach.
+        let n = state.detach_clients(
+            &DetachSelector::AllExcept {
+                client_id: "aaa".into(),
+            },
+            "bye",
+        );
+        assert_eq!(n, 1);
+        assert!(rx1.try_recv().is_err(), "the excepted client gets no push");
+        match rx2.try_recv() {
+            Ok(ServerMsg::Detach { reason }) => assert_eq!(reason, "bye"),
+            other => panic!("bbb should receive a Detach push, got {other:?}"),
+        }
+
+        // One aaa → just aaa.
+        let n = state.detach_clients(&DetachSelector::One { client_id: "aaa".into() }, "x");
+        assert_eq!(n, 1);
+        assert!(matches!(rx1.try_recv(), Ok(ServerMsg::Detach { .. })));
+
+        // All → both remaining registered clients.
+        let n = state.detach_clients(&DetachSelector::All, "all");
+        assert_eq!(n, 2);
+
+        // One with an unknown id detaches nobody.
+        let n = state.detach_clients(&DetachSelector::One { client_id: "zzz".into() }, "x");
+        assert_eq!(n, 0);
+
+        // Unregister drops the entry from the registry (and the subscriber set).
+        state.unregister(1);
+        let listed = state.list_clients();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].client_id, "bbb");
+    }
+
+    #[test]
+    fn an_info_less_subscriber_is_not_a_listable_client() {
+        // A plain Subscribe (an internal watcher) still gets pushes but must not
+        // appear in the attached-clients registry.
+        let state = ControlState::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        state.register(9, tx);
+        assert!(state.list_clients().is_empty());
+    }
+
+    #[test]
+    fn a_subscribed_client_that_dies_without_goodbye_is_reaped() {
+        // A client registers by subscribing with its info; when it dies WITHOUT a
+        // goodbye (socket closed) the daemon's read loop hits EOF and reaps it, so
+        // the registry does not leak dead clients.
+        let life = RecordingLifecycle::new("v1");
+        let served = serve_lifecycle(life, "reap");
+
+        let a = ControlClient::connect(&served.sock, "v1").unwrap();
+        let sub = a.subscribe_as(info("ghost")).unwrap();
+
+        // A separate lister connection observes the registry.
+        let count = || {
+            let mut c = ControlClient::connect(&served.sock, "v1").unwrap();
+            c.list_clients().unwrap().len()
+        };
+        assert!(
+            wait_until(Duration::from_secs(5), || count() == 1),
+            "the subscribed client registers"
+        );
+
+        // It dies without a goodbye: dropping the subscription closes the socket.
+        drop(sub);
+
+        assert!(
+            wait_until(Duration::from_secs(5), || count() == 0),
+            "the dead client is reaped from the registry"
+        );
+    }
+
+    #[test]
+    fn detach_push_reaches_a_subscribed_client_over_the_socket() {
+        // End to end over a real socket: one client subscribes with its info,
+        // another sends DetachClients(All); the subscriber receives a Detach push
+        // and the requester gets the count back.
+        let life = RecordingLifecycle::new("v1");
+        let served = serve_lifecycle(life, "detach-push");
+
+        let a = ControlClient::connect(&served.sock, "v1").unwrap();
+        let mut sub = a.subscribe_as(info("one")).unwrap();
+        // Let the daemon register A before B detaches.
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                let mut c = ControlClient::connect(&served.sock, "v1").unwrap();
+                !c.list_clients().unwrap().is_empty()
+            }),
+            "A registered"
+        );
+
+        let mut b = ControlClient::connect(&served.sock, "v1").unwrap();
+        let n = b
+            .detach_clients(DetachSelector::All, "Detached by 'shelbi detach' from studio.")
+            .unwrap();
+        assert_eq!(n, 1, "one client was detached");
+
+        match sub.recv() {
+            Ok(Some(Notice::Detach { reason })) => {
+                assert!(reason.contains("shelbi detach"), "reason: {reason}")
+            }
+            other => panic!("the subscriber should receive a Detach push, got {other:?}"),
         }
     }
 }

@@ -201,6 +201,25 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<commands::daemon::DaemonCmd>,
     },
+    /// Detach clients from the one running session, leaving every session and
+    /// agent running in the background.
+    ///
+    /// Shelbi runs a single long-lived session that multiple clients (terminal
+    /// windows today) can attach to at once. `shelbi detach` detaches every
+    /// attached client and prints how many; `shelbi detach <client-id>` detaches
+    /// just one; `shelbi detach --list` lists the attached clients without
+    /// detaching. There is no `shelbi attach` — plain `shelbi` reattaches to the
+    /// running session (or starts one). Exits 0 whether or not any client was
+    /// attached.
+    Detach {
+        /// Detach only the client with this id (from `shelbi detach --list`).
+        /// Omit to detach every attached client.
+        #[arg(value_name = "CLIENT_ID")]
+        client_id: Option<String>,
+        /// List the attached clients without detaching any.
+        #[arg(long)]
+        list: bool,
+    },
     /// Attach this terminal to a workspace's session, rendered full-screen.
     /// Detach with the configured key (default Ctrl+]).
     Attach {
@@ -469,6 +488,7 @@ fn main() -> Result<()> {
         Some(Cmd::MsrvCheck) => commands::msrv_check::run(),
         Some(Cmd::Guard { cmd }) => commands::guard::run(cli.project, cmd),
         Some(Cmd::Action { cmd }) => commands::action::run(cli.project, cmd),
+        Some(Cmd::Detach { client_id, list }) => commands::detach::run(list, client_id),
         Some(Cmd::Attach {
             workspace,
             detach_key,

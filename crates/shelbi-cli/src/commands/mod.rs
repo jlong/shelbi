@@ -6,6 +6,7 @@ mod config_surfaces;
 mod config_upgrade;
 mod config_upgrade_apply;
 pub mod daemon;
+pub mod detach;
 pub mod events;
 pub mod guard;
 pub mod hub_version;

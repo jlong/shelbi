@@ -17,8 +17,9 @@ use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use shelbi_proto::control::{
-    self, ChangeNote, ClientMsg, MutationRequest, ReviewSessionRequest, ServerMsg,
-    Stream as OutStream, WorkspaceSessionRequest, CONTROL_PROTOCOL_VERSION,
+    self, AttachedClient, ChangeNote, ClientInfo, ClientMsg, DetachSelector, MutationRequest,
+    ReviewSessionRequest, ServerMsg, Stream as OutStream, WorkspaceSessionRequest,
+    CONTROL_PROTOCOL_VERSION,
 };
 
 use crate::error::ClientError;
@@ -31,6 +32,11 @@ pub enum Notice {
     /// The daemon asked this client to re-exec (a TUI) or prompt for relaunch
     /// (the desktop app) and stop sending commands. `reason` is operator-facing.
     Reexec { reason: String },
+    /// The daemon asked this client to detach — stop rendering and drop its
+    /// connections, leaving every session and agent running. `reason` is the
+    /// one-line message to print on exit (`shelbi detach` / "Detach Other
+    /// Clients").
+    Detach { reason: String },
 }
 
 /// A connection to the daemon's mutation control socket, past the hello
@@ -229,14 +235,70 @@ impl ControlClient {
         }
     }
 
-    /// Subscribe this connection to change / re-exec notifications and return a
-    /// blocking iterator of [`Notice`]s. The iterator ends when the daemon closes
-    /// the connection.
-    pub fn subscribe(mut self) -> Result<Subscription, ClientError> {
+    /// Subscribe this connection to change / re-exec / detach notifications and
+    /// return a blocking iterator of [`Notice`]s, without registering as a
+    /// listable attached client (an internal watcher). The iterator ends when the
+    /// daemon closes the connection.
+    pub fn subscribe(self) -> Result<Subscription, ClientError> {
+        self.subscribe_inner(None)
+    }
+
+    /// Subscribe and register this connection as an **attached UI client**
+    /// ([`ClientInfo`]), so `shelbi detach` can list and detach it. Otherwise
+    /// identical to [`subscribe`](Self::subscribe).
+    pub fn subscribe_as(self, info: ClientInfo) -> Result<Subscription, ClientError> {
+        self.subscribe_inner(Some(info))
+    }
+
+    fn subscribe_inner(mut self, info: Option<ClientInfo>) -> Result<Subscription, ClientError> {
         self.write
-            .write_all(&control::encode(&ClientMsg::Subscribe)?)?;
+            .write_all(&control::encode(&ClientMsg::Subscribe { info })?)?;
         self.write.flush()?;
         Ok(Subscription { read: self.read })
+    }
+
+    /// List the attached UI clients (`shelbi detach --list`). Blocks until the
+    /// daemon's [`ServerMsg::ClientList`] reply.
+    pub fn list_clients(&mut self) -> Result<Vec<AttachedClient>, ClientError> {
+        let request_id = 1;
+        self.write
+            .write_all(&control::encode(&ClientMsg::ListClients { request_id })?)?;
+        self.write.flush()?;
+        loop {
+            match self.read.read_frame::<ServerMsg>()? {
+                Some(ServerMsg::ClientList { request_id: id, clients }) if id == request_id => {
+                    return Ok(clients)
+                }
+                Some(_) => {} // stray broadcast — keep reading
+                None => return Err(ClientError::UnexpectedEof),
+            }
+        }
+    }
+
+    /// Detach the attached clients matching `selector`, carrying the one-line
+    /// `reason` each detached client prints on exit. Blocks until the daemon's
+    /// [`ServerMsg::Detached`] reply and returns how many clients were detached.
+    pub fn detach_clients(
+        &mut self,
+        selector: DetachSelector,
+        reason: &str,
+    ) -> Result<u32, ClientError> {
+        let request_id = 1;
+        self.write.write_all(&control::encode(&ClientMsg::DetachClients {
+            request_id,
+            selector,
+            reason: reason.to_string(),
+        })?)?;
+        self.write.flush()?;
+        loop {
+            match self.read.read_frame::<ServerMsg>()? {
+                Some(ServerMsg::Detached { request_id: id, count }) if id == request_id => {
+                    return Ok(count)
+                }
+                Some(_) => {}
+                None => return Err(ClientError::UnexpectedEof),
+            }
+        }
     }
 
     /// Whether the daemon this client connected to runs a different version than
@@ -260,11 +322,60 @@ impl Subscription {
             match self.read.read_frame::<ServerMsg>()? {
                 Some(ServerMsg::Changed(note)) => return Ok(Some(Notice::Changed(note))),
                 Some(ServerMsg::Reexec { reason }) => return Ok(Some(Notice::Reexec { reason })),
+                Some(ServerMsg::Detach { reason }) => return Ok(Some(Notice::Detach { reason })),
                 Some(_) => continue, // ignore mutation-stream traffic
                 None => return Ok(None),
             }
         }
     }
+}
+
+/// This host's name, for a [`ClientInfo::host`] / a detach reason. Best-effort:
+/// falls back to `"localhost"` if the lookup fails. Trimmed of a trailing dot
+/// and kept whole (not split on `.`), so a fully-qualified name is preserved.
+pub fn hostname() -> String {
+    // `gethostname` into a buffer; POSIX guarantees HOST_NAME_MAX fits well
+    // under 256. Not NUL-guaranteed on truncation, so we cap at the first NUL.
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return "localhost".to_string();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]);
+    let name = name.trim().trim_end_matches('.');
+    if name.is_empty() {
+        "localhost".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// A fresh, opaque, short client id for a [`ClientInfo::client_id`], stable for
+/// the caller's process lifetime (generate it once and reuse it across
+/// reconnects). Short enough to type for `shelbi detach <client-id>`; derived
+/// from the pid and a high-resolution timestamp, so two concurrently attached
+/// clients never collide.
+pub fn fresh_client_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Mix the pid in so two clients that start in the same nanosecond on one host
+    // still differ, then fold to 32 bits of base-36 (≤7 chars, lowercase+digits).
+    let mix = (nanos as u64) ^ ((std::process::id() as u64) << 40);
+    let mut n = (mix as u32) as u64;
+    if n == 0 {
+        n = 1;
+    }
+    let digits = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(digits[(n % 36) as usize]);
+        n /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_else(|_| "client".to_string())
 }
 
 /// Reads length-prefixed control frames off a blocking reader, buffering partial

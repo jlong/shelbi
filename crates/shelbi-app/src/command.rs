@@ -50,6 +50,10 @@ pub enum CommandKind {
     SwitchProject { project: String },
     /// Begin the add-project flow.
     AddProject,
+    /// Detach this client (leave Shelbi running in the background).
+    Detach,
+    /// Detach every other client attached to this session.
+    DetachOtherClients,
     /// Quit the current project.
     QuitProject,
     /// Quit Shelbi entirely.
@@ -158,6 +162,8 @@ impl CommandKind {
                 project: project.clone(),
             },
             CommandKind::AddProject => Effect::AddProject,
+            CommandKind::Detach => Effect::Detach,
+            CommandKind::DetachOtherClients => Effect::DetachOtherClients,
             CommandKind::QuitProject => Effect::QuitProject { project: p() },
             CommandKind::QuitShelbi => Effect::QuitShelbi,
             CommandKind::OpenEditor { target } => Effect::OpenEditor {
@@ -293,6 +299,9 @@ pub struct CommandModel {
     /// project.
     pub other_projects: Vec<ProjectItem>,
     pub edit_targets: Vec<EditItem>,
+    /// Whether any *other* client is attached to this session right now. Gates
+    /// the "Detach Other Clients" command (hidden when this is the only client).
+    pub other_clients_attached: bool,
 }
 
 /// The one-line description shown beside a nav view in the command palette's
@@ -486,7 +495,37 @@ impl CommandRegistry {
             });
         }
 
-        // Quit actions, structurally last — only when a project is open.
+        // Detach / quit actions, structurally last. The three subtitles draw the
+        // line the user needs: detach keeps everything running; quit stops it.
+
+        // Detach this client — the same client-local stop `q` performs.
+        out.push(Command {
+            id: "action:detach".to_string(),
+            title: "Detach".to_string(),
+            kind: CommandKind::Detach,
+            entry_kind: EntryKind::Action,
+            decoration: None,
+            subtitle: Some("Leave Shelbi running in the background".to_string()),
+            shortcut: None,
+            hidden_until_query: false,
+        });
+        // Detach every other attached client — only when there is one.
+        if model.other_clients_attached {
+            out.push(Command {
+                id: "action:detach-others".to_string(),
+                title: "Detach Other Clients".to_string(),
+                kind: CommandKind::DetachOtherClients,
+                entry_kind: EntryKind::Action,
+                decoration: None,
+                subtitle: Some(
+                    "Disconnect every other window attached to this session".to_string(),
+                ),
+                shortcut: None,
+                hidden_until_query: false,
+            });
+        }
+
+        // Quit actions — only when a project is open for the project-scoped one.
         if model.project.is_some() {
             out.push(Command {
                 id: "action:quit-project".to_string(),
@@ -494,7 +533,7 @@ impl CommandRegistry {
                 kind: CommandKind::QuitProject,
                 entry_kind: EntryKind::Action,
                 decoration: None,
-                subtitle: Some("Close this project".to_string()),
+                subtitle: Some("Stop this project's agents and close it".to_string()),
                 shortcut: None,
                 hidden_until_query: false,
             });
@@ -505,7 +544,7 @@ impl CommandRegistry {
             kind: CommandKind::QuitShelbi,
             entry_kind: EntryKind::Action,
             decoration: None,
-            subtitle: Some("Close every Shelbi session".to_string()),
+            subtitle: Some("Stop every agent and shut Shelbi down".to_string()),
             shortcut: None,
             hidden_until_query: false,
         });
@@ -574,6 +613,8 @@ impl CommandKind {
                 project: String::new(),
             }),
             "action:add-project" => Some(CommandKind::AddProject),
+            "action:detach" => Some(CommandKind::Detach),
+            "action:detach-others" => Some(CommandKind::DetachOtherClients),
             "action:quit-project" => Some(CommandKind::QuitProject),
             "action:quit-shelbi" => Some(CommandKind::QuitShelbi),
             "edit:project" => Some(CommandKind::OpenEditor {
@@ -660,6 +701,10 @@ mod tests {
                     title: "Edit developer Settings".into(),
                 },
             ],
+            // Default the fixture to "another client attached" so both detach
+            // commands are present (and covered by the round-trip test); the
+            // gating is exercised separately below.
+            other_clients_attached: true,
         }
     }
 
@@ -681,11 +726,45 @@ mod tests {
             "action:add-project",
             "edit:project",
             "edit:agent:developer",
+            "action:detach",
+            "action:detach-others",
             "action:quit-project",
             "action:quit-shelbi",
         ] {
             assert!(ids.contains(&want.to_string()), "missing command id {want}");
         }
+    }
+
+    #[test]
+    fn detach_is_always_offered_and_detach_others_only_when_others_are_attached() {
+        // Detach (keep running) is a sibling of Quit Shelbi — always available.
+        // Detach Other Clients is shown only when another client is attached.
+        let reg = CommandRegistry::new();
+        let mut m = model();
+
+        m.other_clients_attached = true;
+        let ids: Vec<String> = reg.commands(&m).iter().map(|c| c.id().into()).collect();
+        assert!(ids.contains(&"action:detach".to_string()));
+        assert!(ids.contains(&"action:detach-others".to_string()));
+
+        m.other_clients_attached = false;
+        let ids: Vec<String> = reg.commands(&m).iter().map(|c| c.id().into()).collect();
+        assert!(ids.contains(&"action:detach".to_string()), "detach stays");
+        assert!(
+            !ids.contains(&"action:detach-others".to_string()),
+            "detach-others hidden when this is the only client"
+        );
+    }
+
+    #[test]
+    fn detach_effects_are_client_local_and_daemon_detach() {
+        let reg = CommandRegistry::new();
+        let m = model();
+        assert_eq!(reg.resolve("action:detach", &m).unwrap().effect("alpha"), Effect::Detach);
+        assert_eq!(
+            reg.resolve("action:detach-others", &m).unwrap().effect("alpha"),
+            Effect::DetachOtherClients
+        );
     }
 
     #[test]
