@@ -1839,6 +1839,22 @@ pub fn append_project_event(project: &str, action: &str, reason: &str) -> Result
     append_event_line(&format!("{ts} project={project} {action} reason={reason}"))
 }
 
+/// Append `<rfc3339> daemon <action> reason=<reason>` to `~/.shelbi/events.log`.
+///
+/// A hub-global disclosure line (no `project=` — it describes the daemon
+/// process itself, not one project's board). Used by the macOS login-session
+/// health monitor: `session-lost`, `session-recovered`,
+/// `session-recovery-attempting`, `session-recovery-failed`,
+/// `session-recovery-gave-up`. Both fields fold to single tokens so the line
+/// stays parseable. Written directly (not via the socket) because the caller is
+/// the daemon itself.
+pub fn append_daemon_event(action: &str, reason: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let action = sanitize_reason(action);
+    let reason = sanitize_reason(reason);
+    append_event_line(&format!("{ts} daemon {action} reason={reason}"))
+}
+
 /// Append `<rfc3339> project=<project> migration workspace=<ws> outcome=<outcome> detail=<detail>`
 /// to `~/.shelbi/events.log`. Emitted for every step of the Phase 6 tmux →
 /// session-backend migration (`rt-cutover-migration`): a workspace marked

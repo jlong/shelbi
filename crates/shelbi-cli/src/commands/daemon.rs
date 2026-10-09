@@ -29,6 +29,7 @@ mod control;
 mod lifecycle;
 mod poller;
 mod serve;
+mod session_health;
 
 use anyhow::Result;
 

@@ -67,6 +67,11 @@ pub struct SidebarModel {
     /// hotkey hint (Off / Paused).
     pub zen_mode: ZenModeState,
     pub unread_errors: usize,
+    /// Set when the hub daemon has recorded that it lost its macOS GUI login
+    /// session (the user logged out/in while it kept running). Carries the
+    /// user-facing banner text; the shell paints it as a persistent top banner
+    /// in every view. `None` on a healthy session.
+    pub session_lost: Option<String>,
 }
 
 /// A fixed nav builtin (Chat / Issues / Activity).
@@ -293,6 +298,10 @@ impl SidebarModel {
                 ZenModeState::Off
             },
             unread_errors,
+            // The structural builder is fed pre-read board data and does no disk
+            // IO of its own; the richer disk builder reads the hub-global marker
+            // and sets this (`sidebar_model::read_sidebar_model`).
+            session_lost: None,
         }
     }
 }

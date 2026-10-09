@@ -5,6 +5,7 @@ pub mod login_env;
 pub mod model;
 pub mod placeholders;
 pub mod scaffold;
+pub mod session_health;
 pub mod shell;
 pub mod statuses;
 pub mod system_memory;
@@ -43,6 +44,10 @@ pub use model::{
     MAX_TASK_ID_LEN, SHARED_PROJECT_FIELDS, SUBTASK_WORKFLOW_NAME, TASK_WORKFLOW_NAME,
 };
 pub use placeholders::{extract_placeholders, substitute_placeholders};
+pub use session_health::{
+    classify as classify_session, HealthTransition, RealSessionProbe, SessionHealthTracker,
+    SessionProbe, SessionReading, TickVerdict, DEFAULT_LOST_THRESHOLD,
+};
 pub use shell::shell_escape;
 pub use statuses::{default_project_statuses, ProjectStatus, ProjectStatuses};
 pub use system_memory::{format_bytes_short, recommended_workspace_count, total_memory_bytes};

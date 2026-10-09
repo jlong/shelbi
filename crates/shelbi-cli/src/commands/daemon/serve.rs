@@ -303,6 +303,11 @@ pub(super) fn run_foreground() -> Result<()> {
     // just-started daemon alive long enough for the opener to record its open
     // flag and for a restart to verify, and avoids thrash on project switches.
     spawn_idle_monitor(stop.clone(), sock.clone());
+    // macOS only: detect a lost GUI login session (user logged out/in while the
+    // daemon kept running) and recover by re-execing into the live session, or
+    // warn. A hermetic no-op on non-macOS, when disabled, and under a non-default
+    // root (every test). See `super::session_health`.
+    super::session_health::spawn_session_health_monitor(stop.clone(), sock.clone());
 
     // The mutation control socket, bound and accepting BEFORE the hub serve loop
     // below starts answering hellos — so a client that waits on hub.sock and

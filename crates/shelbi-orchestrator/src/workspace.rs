@@ -2703,6 +2703,23 @@ const NON_CLAUDE_PASTE_STARTUP_SETTLE: std::time::Duration = std::time::Duration
 /// dispatch event and returns `Err`, so the caller can leave the task put
 /// for a retry.
 fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
+    // 1. Refuse to launch a new agent when the daemon has lost its macOS login
+    //    session: every session spawned from that dead bootstrap context
+    //    inherits broken DNS, user lookups, and a stale SSH agent, so starting
+    //    one does more harm than leaving the task put for a retry. The daemon's
+    //    session-health monitor flips this gate and discloses the condition on
+    //    `events.log` + the TUI banner; the task stays where it is until the
+    //    session recovers (or the operator reopens). See
+    //    `shelbi_orchestrator::session_guard`.
+    if crate::session_guard::spawning_blocked() {
+        return Err(Error::Other(format!(
+            "refusing to spawn `{}` for task `{}`: the daemon has lost its macOS login session \
+             (DNS/SSH/user lookups are broken for anything it starts). \
+             Run `shelbi quit` and reopen, or wait for automatic recovery.",
+            a.workspace.name, a.task_id,
+        )));
+    }
+
     // 2. Self-heal Shelbi's hook wiring in `.claude/settings.local.json` —
     //    Claude Code's local, gitignored scope, which merges *additively* with
     //    any committed `.claude/settings.json` so the user's hooks and Shelbi's
