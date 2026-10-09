@@ -354,11 +354,14 @@ impl ActiveOverlay {
         }
     }
 
-    /// The rect this overlay occupies within `area` (the main area). Centered;
-    /// sizes mirror the tmux popups' dimensions so the layout matches.
+    /// The rect this overlay occupies within `area` (the main area). Most are
+    /// centered with sizes mirroring the tmux popups' dimensions; the palette is
+    /// the exception — it is top-aligned and sized to its content.
     fn rect(&self, area: Rect) -> Rect {
         match self {
-            ActiveOverlay::Palette(_) => centered_pct(area, 70, 60, 40, 10),
+            // Top-aligned and sized to its content: the palette owns its own
+            // geometry so the panel grows and shrinks as the query filters.
+            ActiveOverlay::Palette(p) => p.overlay_rect(area),
             ActiveOverlay::ErrorLog { .. } => centered_pct(area, 80, 60, 40, 8),
             ActiveOverlay::RejectReason { .. } => centered_rect(area, 70, 18),
             ActiveOverlay::ReviewConfirm { dialog, .. } => {
@@ -815,21 +818,22 @@ mod tests {
             found_row = true;
             // The highlight bar spans the commands column edge to edge: with no
             // Projects column the commands column is the whole content area,
-            // which the borderless panel insets by a one-cell gutter on each
-            // side. The report showed underlying error text bleeding into the
-            // right of the selected row, so the bar must run from the content's
-            // left edge to its last column. Any interior cell without the bar is
-            // a wide-glyph continuation cell (empty symbol), never a visible gap.
+            // which is inset one cell for the border plus one column of padding
+            // on each side (so content starts at rect.left()+2 and ends at
+            // rect.right()-3). The report showed underlying error text bleeding
+            // into the right of the selected row, so the bar must run the full
+            // content width. Any interior cell without the bar is a wide-glyph
+            // continuation cell (empty symbol), never a visible gap.
             let first = *selected_cells.first().unwrap();
             let last = *selected_cells.last().unwrap();
             assert_eq!(
                 first,
-                rect.left() + 1,
+                rect.left() + 2,
                 "the selection bar must start at the content's left edge"
             );
             assert_eq!(
                 last,
-                rect.right() - 2,
+                rect.right() - 3,
                 "the selection bar must reach the content's right edge, got {selected_cells:?}"
             );
             for x in first..=last {

@@ -1,12 +1,18 @@
 //! The command palette — shared overlay rendering + the in-process state.
 //!
 //! The palette lists and runs commands fuzzy-matched from
-//! [`shelbi_palette::Entry`] values. [`render`] paints a borderless, filled
-//! panel (no box, no title) matching the Figma design: a `❯` search line with a
-//! block cursor and placeholder, a two-column results list (icon + bold label,
-//! a dim description, and a right-aligned shortcut hint), a full-width highlight
-//! bar on the selected row, a Projects column on the right separated by
-//! whitespace, and a dim footer hint line.
+//! [`shelbi_palette::Entry`] values. [`render`] paints a filled panel wrapped in
+//! a muted single-line border (the Figma "Terminal border") matching the design:
+//! a `❯` search line with a block cursor and placeholder, a two-column results
+//! list (icon + bold label, a dim description, and a right-aligned shortcut
+//! hint), a full-width highlight bar on the selected row, a Projects column on
+//! the right separated by whitespace, and a dim footer hint line.
+//!
+//! [`palette_rect`] sizes the overlay to its content: top-aligned a small fixed
+//! offset below the top of the window, horizontally centered at the prior width,
+//! and exactly as tall as the current results need — so the panel grows and
+//! shrinks on every keystroke as the list filters, capped to the window (a long
+//! list then scrolls inside the panel).
 //!
 //! The in-process TUI overlay uses [`Palette`] — a small state machine over the
 //! registry's entries. Its focus model: typing filters and runs any command,
@@ -23,7 +29,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
 use shelbi_palette::{Entry, EntryKind};
@@ -51,6 +57,14 @@ const PROJECTS_MAX_W: u16 = 30;
 /// Below this commands-column width, the Projects column is dropped so nothing
 /// overlaps on a narrow terminal (the column collapses, per the design note).
 const COMMANDS_MIN_W: u16 = 30;
+
+/// Minimum panel width (display cols). Mirrors the prior 70%/min-40 rule so the
+/// panel stays usable on a small terminal.
+const PALETTE_MIN_W: u16 = 40;
+/// Chrome rows framing the results band: the top and bottom border (2), the
+/// search line (1), one blank row above and below the band (2), and the footer
+/// (1). Added to the band height to size the whole panel.
+const CHROME_ROWS: u16 = 6;
 
 // ---------------------------------------------------------------------------
 // Project indicators (Projects column status glyphs)
@@ -137,23 +151,28 @@ pub struct PaletteView<'a> {
     pub footer: &'a str,
 }
 
-/// Paint the palette into `area` (a centered overlay rect in the TUI). The whole
-/// rect becomes the panel: a solid [`theme::PALETTE_BG`] fill with no border and
-/// no title, content inset by a one-cell gutter.
+/// Paint the palette into `area` (the content-sized overlay rect [`palette_rect`]
+/// computes). The rect is the panel: a solid [`theme::PALETTE_BG`] fill wrapped
+/// in a muted single-line border, content inset one column inside the border.
 pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
-    // Borderless filled panel: paint the whole rect with the panel background
-    // first, so every gap (between columns, around rows) reads as one surface.
-    f.render_widget(
-        Block::default().style(Style::default().bg(theme::PALETTE_BG)),
-        area,
-    );
+    // A filled panel wrapped in the muted single-line border (the Figma
+    // "Terminal border"): the `Block` paints the PALETTE_BG fill — so every gap
+    // reads as one surface — and draws the border in the same pass.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::PALETTE_MUTED))
+        .style(Style::default().bg(theme::PALETTE_BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    // Inset the content by a one-cell gutter on every side.
+    // One column of padding inside the border on each side. Vertically the
+    // search line sits just under the top border and the footer just above the
+    // bottom one (the blank rows inside the layout do the breathing).
     let content = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
+        x: inner.x.saturating_add(1),
+        y: inner.y,
+        width: inner.width.saturating_sub(2),
+        height: inner.height,
     };
     if content.width == 0 || content.height == 0 {
         return;
@@ -164,7 +183,7 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
         .constraints([
             Constraint::Length(1), // search line
             Constraint::Length(1), // blank
-            Constraint::Min(1),    // results
+            Constraint::Min(1),    // results band
             Constraint::Length(1), // blank
             Constraint::Length(1), // footer
         ])
@@ -176,30 +195,39 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
     // right separated by whitespace.
     let (commands_area, projects_area) = split_results(rows[2], view.projects.is_some());
 
-    let commands_focused = projects_area.is_none() || view.commands_focused;
-    let selected = if view.results.is_empty() {
-        None
+    if view.results.is_empty() {
+        // A query that matches no command shows one dim row rather than
+        // collapsing the band to nothing, so the panel keeps a legible shape.
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No matching commands",
+                Style::default().fg(theme::PALETTE_MUTED),
+            ))),
+            commands_area,
+        );
     } else {
-        Some(view.selected.min(view.results.len().saturating_sub(1)))
-    };
-    let items = build_result_items(
-        view.results,
-        commands_area.width as usize,
-        commands_focused.then_some(selected).flatten(),
-    );
-    let mut list = List::new(items);
-    if commands_focused {
-        // Patch the selected row's background only; the label span already
-        // carries its white/bold foreground, and leaving the foreground alone
-        // keeps the description dim on the highlighted row (matching the
-        // design).
-        list = list.highlight_style(Style::default().bg(theme::SELECTION_BG));
+        let commands_focused = projects_area.is_none() || view.commands_focused;
+        let selected = view.selected.min(view.results.len().saturating_sub(1));
+        let items = build_result_items(
+            view.results,
+            commands_area.width as usize,
+            commands_focused.then_some(selected),
+        );
+        let mut list = List::new(items);
+        if commands_focused {
+            // Patch the selected row's background only; the label span already
+            // carries its white/bold foreground, and leaving the foreground
+            // alone keeps the description dim on the highlighted row (matching
+            // the design).
+            list = list.highlight_style(Style::default().bg(theme::SELECTION_BG));
+        }
+        // `ListState` scrolls to keep the selected row visible when the band is
+        // capped shorter than the result list, so the selection never leaves
+        // the panel.
+        let mut s = ListState::default();
+        s.select(Some(selected));
+        f.render_stateful_widget(list, commands_area, &mut s);
     }
-    let mut s = ListState::default();
-    if let Some(i) = selected {
-        s.select(Some(i));
-    }
-    f.render_stateful_widget(list, commands_area, &mut s);
 
     if let (Some(area), Some(projects)) = (projects_area, view.projects.as_ref()) {
         render_projects_column(f, area, projects);
@@ -212,6 +240,37 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
         ))),
         rows[4],
     );
+}
+
+/// Rows the results band needs: the larger of the command result count (at
+/// least one, for the "No matching commands" row) and the Projects column's
+/// rows — its heading, one row per project, and the trailing "Add project".
+fn results_band_rows(result_count: usize, project_count: Option<usize>) -> u16 {
+    let commands = result_count.max(1).min(u16::MAX as usize) as u16;
+    let projects = project_count
+        .map(|n| (n.min(u16::MAX as usize - 2) as u16) + 2)
+        .unwrap_or(0);
+    commands.max(projects)
+}
+
+/// The palette's overlay rect within `area` (the main area). Horizontally
+/// centered at the prior width (70%, min 40), top-aligned a small fixed offset
+/// below the top of the window (about 2 rows, or 10% of the height, whichever is
+/// smaller), and tall enough for exactly its current content — so the panel
+/// grows and shrinks as the list filters. Capped to the window, with a matching
+/// top and bottom margin, so a longer list scrolls inside the panel instead of
+/// overflowing.
+pub fn palette_rect(area: Rect, result_count: usize, project_count: Option<usize>) -> Rect {
+    let offset_y = (area.height / 10).min(2);
+    let width = (area.width.saturating_mul(70) / 100)
+        .max(PALETTE_MIN_W)
+        .min(area.width);
+    let desired_h = results_band_rows(result_count, project_count).saturating_add(CHROME_ROWS);
+    let max_h = area.height.saturating_sub(offset_y.saturating_mul(2));
+    let height = desired_h.min(max_h);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + offset_y;
+    Rect::new(x, y, width, height)
 }
 
 /// The search line: a `❯` prompt, then a green block cursor and the dim
@@ -529,6 +588,15 @@ impl Palette {
         shelbi_palette::search(&self.entries, &self.query)
     }
 
+    /// The overlay rect for the current content within `area`, via
+    /// [`palette_rect`]. Recomputed every frame so the panel resizes as the
+    /// query filters the list.
+    pub fn overlay_rect(&self, area: Rect) -> Rect {
+        let result_count = self.results().len();
+        let project_count = (!self.projects.is_empty()).then_some(self.projects.len());
+        palette_rect(area, result_count, project_count)
+    }
+
     /// The highest selectable index in the Projects column: one past the last
     /// project (the trailing "Add project" row).
     fn projects_max(&self) -> usize {
@@ -786,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_query_renders_the_borderless_panel_layout() {
+    fn empty_query_renders_the_bordered_panel_layout() {
         use ratatui::{backend::TestBackend, Terminal};
         let p = Palette::new(
             vec![
@@ -821,8 +889,17 @@ mod tests {
         assert!(text.contains("→ projects"), "footer: {text}");
         assert!(text.contains("Ctrl+P close"), "footer: {text}");
         assert!(!text.contains("shelbi ·"), "no title row: {text}");
-        // No border glyphs.
-        assert!(!text.contains('│') && !text.contains('─'), "no border: {text}");
+        // The muted single-line border wraps the panel: corners, edges, and the
+        // border color on a corner cell.
+        assert!(text.contains('┌') && text.contains('┐'), "top corners: {text}");
+        assert!(text.contains('└') && text.contains('┘'), "bottom corners: {text}");
+        assert!(text.contains('│') && text.contains('─'), "border edges: {text}");
+        assert_eq!(
+            buf[(0, 0)].fg,
+            theme::PALETTE_MUTED,
+            "the border renders in the muted color"
+        );
+        assert_eq!(buf[(0, 0)].symbol(), "┌", "top-left corner glyph");
     }
 
     #[test]
@@ -1126,5 +1203,104 @@ mod tests {
             }
         }
     }
+
+    // -- Sizing: top-aligned, content-height, cap/scroll ------------------
+
+    #[test]
+    fn results_band_rows_is_the_larger_of_commands_and_projects() {
+        assert_eq!(results_band_rows(6, None), 6);
+        // An empty list still reserves one row (the "No matching commands" row).
+        assert_eq!(results_band_rows(0, None), 1);
+        // Projects column: heading + one row per project + the Add row (n + 2).
+        assert_eq!(results_band_rows(1, Some(3)), 5);
+        assert_eq!(results_band_rows(10, Some(3)), 10);
+    }
+
+    #[test]
+    fn palette_rect_is_top_aligned_centered_and_content_sized() {
+        let area = Rect::new(0, 0, 100, 40);
+        // Six results, no projects: band 6 + 6 chrome rows = 12 tall.
+        let r = palette_rect(area, 6, None);
+        assert_eq!(r.height, 12, "height fits the content");
+        // Width is the prior 70%/min-40 rule, horizontally centered.
+        assert_eq!(r.width, 70);
+        assert_eq!(r.x, 15);
+        // Top-aligned a small offset below the top: min(2, 10% of height).
+        assert_eq!(r.y, 2);
+    }
+
+    #[test]
+    fn palette_rect_shrinks_and_grows_with_the_result_count() {
+        let area = Rect::new(0, 0, 100, 40);
+        let full = palette_rect(area, 8, None);
+        let one = palette_rect(area, 1, None);
+        let none = palette_rect(area, 0, None);
+        assert!(one.height < full.height, "one result is a shorter panel");
+        assert_eq!(one.height, 7, "one result: 1 band row + 6 chrome");
+        assert_eq!(none.height, 7, "no matches still reserves the one row");
+    }
+
+    #[test]
+    fn palette_rect_caps_tall_lists_to_the_window() {
+        let area = Rect::new(0, 0, 100, 20);
+        // 100 results would want 106 rows; cap to the window minus the top and
+        // bottom margin (offset 2 each, from 10% of 20).
+        let r = palette_rect(area, 100, None);
+        assert_eq!(r.y, 2);
+        assert_eq!(r.height, 16, "capped to area.height - 2*offset");
+        assert!(r.y + r.height <= area.height, "stays within the window");
+    }
+
+    #[test]
+    fn palette_rect_offset_is_the_smaller_of_two_rows_and_ten_percent() {
+        // Short window: 10% of 15 = 1 row, smaller than 2.
+        let short = palette_rect(Rect::new(0, 0, 80, 15), 3, None);
+        assert_eq!(short.y, 1);
+        // Tall window: the offset caps at 2 rows.
+        let tall = palette_rect(Rect::new(0, 0, 80, 60), 3, None);
+        assert_eq!(tall.y, 2);
+    }
+
+    #[test]
+    fn no_match_shows_a_single_dim_row() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut p = Palette::new(vec![entry("view:tasks", "Issues")], Vec::new());
+        for c in "zzzzz".chars() {
+            p.handle_key(key(KeyCode::Char(c)), None);
+        }
+        assert!(p.results().is_empty(), "the query matches nothing");
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        term.draw(|f| p.render(f, f.area())).unwrap();
+        let text = dump(&term.backend().buffer().clone());
+        assert!(
+            text.contains("No matching commands"),
+            "the empty state renders one dim row: {text}"
+        );
+    }
+
+    #[test]
+    fn capped_band_scrolls_to_keep_the_selection_visible() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let results: Vec<(Entry, u16)> = (0..12)
+            .map(|i| (entry(&format!("view:v{i}"), &format!("Command{i:02}")), 0u16))
+            .collect();
+        let view = PaletteView {
+            query: "",
+            results: &results,
+            selected: 11,
+            commands_focused: true,
+            projects: None,
+            footer: "footer",
+        };
+        // Height 11: 6 chrome rows leave a 5-row band for 12 items, so the band
+        // must scroll. The selected last row must stay visible; the top ones
+        // scroll out of view.
+        let mut term = Terminal::new(TestBackend::new(60, 11)).unwrap();
+        term.draw(|f| render(f, f.area(), &view)).unwrap();
+        let text = dump(&term.backend().buffer().clone());
+        assert!(text.contains("Command11"), "the selected row stays visible: {text}");
+        assert!(!text.contains("Command00"), "the top rows scrolled out: {text}");
+    }
+
 }
 
