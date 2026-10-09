@@ -1,0 +1,79 @@
+---
+title: shelbi detach
+order: 30.5
+summary: Detach clients from the one running session, leaving everything running in the background.
+---
+
+```text
+shelbi detach [OPTIONS] [CLIENT_ID]
+```
+
+Shelbi runs a single long-lived session that the daemon owns, and more than one
+client can attach to it at once: two terminal windows today, and later the
+desktop app attaching to a running CLI session or a client attaching to a remote
+one. `shelbi detach` disconnects clients from that session without stopping any
+work. Each detached client stops rendering and drops its connections, while every
+session and agent keeps running in the background.
+
+Detaching is not quitting. [`shelbi quit`](/docs/cli/open) ends a project's
+sessions (and `shelbi quit --all` stops the whole hub); detach leaves all of it
+running so you can come back to it. Inside the dashboard the same actions live in
+the command palette as **Detach** (leave Shelbi running in the background),
+**Detach Other Clients** (disconnect every other window attached to this
+session), **Quit Project**, and **Quit Shelbi**.
+
+## Reattaching
+
+There is no `shelbi attach` for this. Plain `shelbi` reattaches to the running
+session (and starts one if none is running), so after a detach you simply run
+`shelbi` again to pick up where you left off.
+
+## Arguments
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `[CLIENT_ID]` | string | all clients | Detach only the client with this id (from `shelbi detach --list`). Omit to detach every attached client. |
+
+## Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--list` | bool | `false` | List the attached clients (id, kind, host, project, attach time) without detaching any. |
+| `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
+
+`shelbi detach` always exits `0`, whether or not any client was attached (with
+no running session it reports `No clients attached.`).
+
+## Examples
+
+Detach every attached client:
+
+```bash
+shelbi detach
+# Detached 2 clients.
+```
+
+List the attached clients without detaching:
+
+```bash
+shelbi detach --list
+# ID          KIND     HOST              PROJECT       ATTACHED
+# k3f9a2      tui      studio            alpha         2026-10-07T18:04:11Z (pid 40321)
+# q8d1c7      tui      laptop            alpha         2026-10-07T18:05:52Z (pid 9981)
+```
+
+Detach just one client by id:
+
+```bash
+shelbi detach q8d1c7
+# Detached 1 client.
+```
+
+## See also
+
+- [`shelbi attach`](/docs/cli/attach) — attach your terminal to a single
+  workspace's session full-screen (a different concept: that is a per-workspace
+  view, not session-level detach).
+- [`shelbi reload`](/docs/cli/reload) — reload the dashboard and orchestrator in
+  place after installing a new binary.

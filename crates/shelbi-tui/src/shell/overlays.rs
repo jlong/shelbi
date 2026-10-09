@@ -454,7 +454,11 @@ fn confirm_event(task_id: &str, outcome: overlay::review_confirm::Outcome) -> Ov
 /// a few light on-disk reads (the other projects and the edit targets). The
 /// registry enumerates the palette's commands from this, so populating it is
 /// what makes every command reachable.
-pub fn build_command_model(project: &str, sidebar: &SidebarModel) -> CommandModel {
+pub fn build_command_model(
+    project: &str,
+    sidebar: &SidebarModel,
+    other_clients_attached: bool,
+) -> CommandModel {
     let mut views: Vec<ViewItem> = sidebar
         .nav
         .iter()
@@ -519,6 +523,7 @@ pub fn build_command_model(project: &str, sidebar: &SidebarModel) -> CommandMode
         legacy_agents: Vec::new(),
         other_projects,
         edit_targets: edit_targets(project),
+        other_clients_attached,
     }
 }
 
@@ -1028,7 +1033,7 @@ mod tests {
             zen_mode: shelbi_state::ZenModeState::On,
             unread_errors: 0,
         };
-        let m = build_command_model("alpha", &sidebar);
+        let m = build_command_model("alpha", &sidebar, false);
         assert_eq!(m.project.as_deref(), Some("alpha"));
         assert!(m.zen_on);
         let view_ids: Vec<&str> = m.views.iter().map(|v| v.id.as_str()).collect();
@@ -1079,8 +1084,57 @@ mod tests {
             zen_mode: shelbi_state::ZenModeState::Off,
             unread_errors: 0,
         };
-        let m = build_command_model("alpha", &sidebar);
+        let m = build_command_model("alpha", &sidebar, false);
         let machines = m.views.iter().filter(|v| v.id == "view:machines").count();
         assert_eq!(machines, 1, "exactly one Machines command");
+    }
+
+    /// The "other clients attached" flag is threaded into the command model, so
+    /// the registry offers "Detach Other Clients" only when another client is
+    /// attached (and "Detach" always).
+    #[test]
+    fn command_model_threads_other_clients_flag_to_the_detach_commands() {
+        use shelbi_app::command::CommandRegistry;
+        let sidebar = SidebarModel {
+            project_label: "alpha".into(),
+            nav: vec![NavItem {
+                label: "Issues".into(),
+                view: View::Issues,
+            }],
+            workspaces: Vec::new(),
+            reviews: Vec::new(),
+            config_error: None,
+            board_loading: false,
+            collapsed_machines: Default::default(),
+            board_banner: None,
+            daemon_version_line: None,
+            daemon_version_mismatch: false,
+            status_line: String::new(),
+            zen_mode: shelbi_state::ZenModeState::Off,
+            unread_errors: 0,
+        };
+
+        let ids = |others: bool| -> Vec<String> {
+            let m = build_command_model("alpha", &sidebar, others);
+            CommandRegistry::new()
+                .entries(&m)
+                .into_iter()
+                .map(|e| e.id)
+                .collect()
+        };
+
+        let solo = ids(false);
+        assert!(solo.contains(&"action:detach".to_string()), "Detach always offered");
+        assert!(
+            !solo.contains(&"action:detach-others".to_string()),
+            "Detach Other Clients hidden when this is the only client"
+        );
+
+        let shared = ids(true);
+        assert!(shared.contains(&"action:detach".to_string()));
+        assert!(
+            shared.contains(&"action:detach-others".to_string()),
+            "Detach Other Clients shown when another client is attached"
+        );
     }
 }

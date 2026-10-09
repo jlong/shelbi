@@ -35,7 +35,16 @@ use crate::error::ProtoError;
 /// v3 adds [`ClientMsg::WorkspaceSession`] (the TUI asks the daemon to
 /// start/stop a dev workspace's editor/diff content sessions for the workspace
 /// sidebar — the dev-workspace twin of `ReviewSession`).
-pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
+///
+/// v4 makes **attached clients** first-class, so multiple clients can attach to
+/// one running session and be listed / detached individually (the detach task):
+/// [`ClientMsg::Subscribe`] carries an optional [`ClientInfo`] that registers the
+/// connection as an attached UI client; [`ClientMsg::ListClients`] and
+/// [`ClientMsg::DetachClients`] let a `shelbi detach` CLI (or the palette) list
+/// and detach them; and [`ServerMsg::ClientList`] / [`ServerMsg::Detached`] /
+/// [`ServerMsg::Detach`] carry the replies and the push that tells a client to
+/// leave (agents keep running).
+pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
 
 /// Upper bound on a single control frame. Generous enough for a large issue body
 /// in an `edit`/`add`, far below the session [`crate::MAX_FRAME_LEN`].
@@ -255,6 +264,75 @@ pub struct WorkspaceSessionRequest {
     pub op: WorkspaceSessionOp,
 }
 
+/// What kind of UI client is attached to a session. Room is left for the
+/// Desktop app attaching to a running CLI session and a client attaching to a
+/// remote session (the detach task's motivating cases); only [`ClientKind::Tui`]
+/// is produced today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientKind {
+    /// The terminal dashboard (`shelbi`).
+    Tui,
+    /// The desktop app (future).
+    Desktop,
+    /// A client attached to a remote session (future).
+    Remote,
+}
+
+impl ClientKind {
+    /// A short lowercase label for `shelbi detach --list`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ClientKind::Tui => "tui",
+            ClientKind::Desktop => "desktop",
+            ClientKind::Remote => "remote",
+        }
+    }
+}
+
+/// The identity a UI client announces when it subscribes, so the daemon can
+/// register it in the attached-clients registry and a `shelbi detach` can list
+/// and target it. The `client_id` is client-generated and stable for the
+/// client's lifetime, so a client that reconnects (the daemon bounced) keeps the
+/// same registry identity and knows its own id for "detach every client but me".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientInfo {
+    /// Stable, client-generated id (opaque, short enough to type).
+    pub client_id: String,
+    pub kind: ClientKind,
+    /// The host the client runs on (its own hostname).
+    pub host: String,
+    /// The client's process id where it is local; `None` for a remote client.
+    pub pid: Option<u32>,
+    /// The project the client is currently showing, if any.
+    pub project: Option<String>,
+}
+
+/// Which attached clients a [`ClientMsg::DetachClients`] targets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetachSelector {
+    /// Every attached client.
+    All,
+    /// Every attached client except the one with this id (the "detach other
+    /// clients" case: the requester keeps its own window).
+    AllExcept { client_id: String },
+    /// Just the one client with this id.
+    One { client_id: String },
+}
+
+/// A snapshot of one attached client, for [`ServerMsg::ClientList`] /
+/// `shelbi detach --list`. [`ClientInfo`] plus the daemon-stamped attach time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachedClient {
+    pub client_id: String,
+    pub kind: ClientKind,
+    pub host: String,
+    pub pid: Option<u32>,
+    pub project: Option<String>,
+    /// When the client attached, RFC3339 (daemon-stamped).
+    pub attached_at: String,
+}
+
 /// Client → daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
@@ -263,9 +341,12 @@ pub enum ClientMsg {
         protocol: u32,
         client_version: String,
     },
-    /// Subscribe this connection to [`ServerMsg::Changed`] (and
-    /// [`ServerMsg::Reexec`]) notifications.
-    Subscribe,
+    /// Subscribe this connection to [`ServerMsg::Changed`] /
+    /// [`ServerMsg::Reexec`] / [`ServerMsg::Detach`] notifications. When `info`
+    /// is `Some`, the connection is also registered as an **attached UI client**
+    /// (listable and detachable); an info-less subscribe (an internal watcher)
+    /// still receives the pushes but is not tracked in the client registry.
+    Subscribe { info: Option<ClientInfo> },
     /// Run a mutation.
     Mutate(MutationRequest),
     /// Quit a project (removing-tmux Phase 4f): end that project's sessions,
@@ -291,6 +372,18 @@ pub enum ClientMsg {
     /// the daemon owns their lifetime so they outlive a client detach; the client
     /// only attaches terminal views. Protocol v3.
     WorkspaceSession(WorkspaceSessionRequest),
+    /// List the attached UI clients (protocol v4). The daemon replies
+    /// [`ServerMsg::ClientList`]. Used by `shelbi detach --list`.
+    ListClients { request_id: u64 },
+    /// Detach the attached clients matching `selector` (protocol v4): the daemon
+    /// pushes [`ServerMsg::Detach`] to each so it leaves cleanly (sessions and
+    /// agents keep running), and replies [`ServerMsg::Detached`] with the count.
+    /// `reason` is the one-line message the detached client prints on exit.
+    DetachClients {
+        request_id: u64,
+        selector: DetachSelector,
+        reason: String,
+    },
 }
 
 /// Why a mutation did not run (or could not be accepted). `Display` is the
@@ -375,6 +468,20 @@ pub enum ServerMsg {
     /// date). `reason` is a short operator-facing phrase. Broadcast; no
     /// `request_id`.
     Reexec { reason: String },
+    /// Reply to [`ClientMsg::ListClients`]: the attached UI clients (protocol v4).
+    ClientList {
+        request_id: u64,
+        clients: Vec<AttachedClient>,
+    },
+    /// Reply to [`ClientMsg::DetachClients`]: how many attached clients were told
+    /// to detach (protocol v4).
+    Detached { request_id: u64, count: u32 },
+    /// The client should detach now — stop rendering and drop its connections,
+    /// leaving every session and agent running (protocol v4). Pushed to a
+    /// subscribed client the daemon was asked to detach. `reason` is the one-line
+    /// message the client prints on exit. Broadcast to the targets; no
+    /// `request_id`.
+    Detach { reason: String },
 }
 
 /// Encode a message to its full wire bytes (`[len: u32 BE][json]`).
@@ -478,6 +585,78 @@ mod tests {
         let (back, n): (ServerMsg, usize) = decode(&bytes).unwrap();
         assert_eq!(n, bytes.len());
         assert_eq!(back, reexec);
+    }
+
+    #[test]
+    fn round_trips_the_attached_client_messages() {
+        // The v4 detach additions must survive a wire round-trip like every
+        // other control message.
+        let info = ClientInfo {
+            client_id: "ab12cd".into(),
+            kind: ClientKind::Tui,
+            host: "studio".into(),
+            pid: Some(4242),
+            project: Some("alpha".into()),
+        };
+        let client_msgs = [
+            ClientMsg::Subscribe {
+                info: Some(info.clone()),
+            },
+            ClientMsg::Subscribe { info: None },
+            ClientMsg::ListClients { request_id: 7 },
+            ClientMsg::DetachClients {
+                request_id: 8,
+                selector: DetachSelector::All,
+                reason: "Detached by 'shelbi detach' from studio.".into(),
+            },
+            ClientMsg::DetachClients {
+                request_id: 9,
+                selector: DetachSelector::AllExcept {
+                    client_id: "ab12cd".into(),
+                },
+                reason: "r".into(),
+            },
+            ClientMsg::DetachClients {
+                request_id: 10,
+                selector: DetachSelector::One {
+                    client_id: "ab12cd".into(),
+                },
+                reason: "r".into(),
+            },
+        ];
+        for msg in client_msgs {
+            let bytes = encode(&msg).unwrap();
+            let (back, n): (ClientMsg, usize) = decode(&bytes).unwrap();
+            assert_eq!(n, bytes.len());
+            assert_eq!(back, msg);
+        }
+
+        let server_msgs = [
+            ServerMsg::ClientList {
+                request_id: 7,
+                clients: vec![AttachedClient {
+                    client_id: info.client_id.clone(),
+                    kind: info.kind,
+                    host: info.host.clone(),
+                    pid: info.pid,
+                    project: info.project.clone(),
+                    attached_at: "2026-10-07T00:00:00Z".into(),
+                }],
+            },
+            ServerMsg::Detached {
+                request_id: 8,
+                count: 2,
+            },
+            ServerMsg::Detach {
+                reason: "Detached by 'shelbi detach' from studio.".into(),
+            },
+        ];
+        for msg in server_msgs {
+            let bytes = encode(&msg).unwrap();
+            let (back, n): (ServerMsg, usize) = decode(&bytes).unwrap();
+            assert_eq!(n, bytes.len());
+            assert_eq!(back, msg);
+        }
     }
 
     #[test]

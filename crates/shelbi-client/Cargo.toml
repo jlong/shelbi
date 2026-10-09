@@ -17,9 +17,10 @@ shelbi-session = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# `gethostname` for a client's self-reported host (ClientInfo / detach reason).
+libc = { workspace = true }
 
 [dev-dependencies]
 shelbi-session = { workspace = true }
 tempfile = "3"
-libc = { workspace = true }
 anyhow = { workspace = true }
