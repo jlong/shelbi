@@ -1286,6 +1286,26 @@ pub fn parse_event_line(line: &str) -> Event {
         return parse_supervision(ts, project, None, rest, raw);
     }
 
+    // Hub-global daemon lines with no project scope, e.g.
+    // `daemon session-lost reason=…` from the macOS session-health monitor.
+    if let Some(tail) = rest.strip_prefix("daemon ") {
+        let kv = parse_kv(tail);
+        let action = tail.split(' ').next().unwrap_or("event");
+        let detail = match kv.get("reason") {
+            Some(r) => format!("{} ({})", humanize_token(action), humanize_token(r)),
+            None => humanize_token(action),
+        };
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Other,
+            project: None,
+            target: Some("daemon".to_string()),
+            status: None,
+            detail: Some(detail),
+            raw,
+        });
+    }
+
     // Any remaining project-scoped line: keep it human (verb + humanized
     // tail) rather than dumping raw wire syntax. Non-project lines with no
     // recognized shape are the genuine last resort → cleaned Unknown.

@@ -45,6 +45,12 @@ pub(crate) fn read_sidebar_model(project: &str) -> Option<SidebarModel> {
             .map(|s| s.zen_mode)
             .unwrap_or(ZenModeState::Off),
         unread_errors: unread_error_count(project).unwrap_or(0),
+        // Hub-global: present when the daemon recorded a lost macOS login
+        // session. Read once per refresh (not per frame) and painted as a
+        // persistent top banner by the shell's `draw`.
+        session_lost: shelbi_state::read_session_lost().map(|_| {
+            shelbi_state::SESSION_LOST_BANNER.to_string()
+        }),
     };
 
     // A human-readable label when the project config carries one.

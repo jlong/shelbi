@@ -1217,6 +1217,7 @@ mod tests {
             status_line: String::new(),
             zen_mode: ZenModeState::Off,
             unread_errors: 0,
+            session_lost: None,
         }
     }
 

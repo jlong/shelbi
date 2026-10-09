@@ -53,6 +53,7 @@ mod pr_template;
 mod project_paths;
 mod resolve;
 mod root;
+pub mod session_lost;
 mod ssh_control;
 pub mod supervision_relaunch;
 mod user_config;
@@ -100,6 +101,10 @@ pub use issue_store::{
     IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
 };
 pub use project_paths::ProjectPaths;
+pub use session_lost::{
+    clear_session_lost, read_session_lost, session_lost_active, session_lost_path,
+    write_session_lost, RecoveryState, SessionLostRecord, SESSION_LOST_BANNER,
+};
 pub use root::{
     ensure_root_subdirs, expand_tilde_path, expand_tilde_str, resolve as resolve_root, root,
     set_root_override, RootSource, STANDARD_SUBDIRS,
@@ -165,6 +170,7 @@ pub use workflows::{
 pub use event_log::{
     append_board_rate_limited_event,
     append_board_unreachable_event,
+    append_daemon_event,
     append_ci_event, append_clarification_event, append_dispatch_event, append_external_event,
     append_handoff_action_failed_event, append_handoff_refused_event,
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,

@@ -156,6 +156,9 @@ fn print_summary(project: &str) -> Result<()> {
     );
 
     println!("daemon: {}", super::hub_version::status_line());
+    if let Some(line) = session_lost_line() {
+        println!("{line}");
+    }
     if let Some(line) = github_summary_line(project) {
         println!("github: {line}");
     }
@@ -177,6 +180,13 @@ fn print_summary(project: &str) -> Result<()> {
 /// the check rather than the whole `status` output. The hub machine's
 /// `work_dir` is the volume that fills with build output, so it is the one
 /// probed.
+/// A one-line session-lost warning when the daemon has recorded that it lost its
+/// macOS GUI login session. `None` in the healthy (marker-absent) case.
+fn session_lost_line() -> Option<String> {
+    shelbi_state::read_session_lost()
+        .map(|_| format!("session: ⚠ {}", shelbi_state::SESSION_LOST_BANNER))
+}
+
 fn disk_warning_line(project: &str) -> Option<String> {
     let p = shelbi_state::load_project(project).ok()?;
     let work_dir = p
@@ -301,6 +311,9 @@ fn print_full(project: &str) -> Result<()> {
     println!("## Daemon");
     println!();
     println!("daemon: {}", super::hub_version::status_line());
+    if let Some(line) = session_lost_line() {
+        println!("{line}");
+    }
 
     if let Some(line) = disk_warning_line(project) {
         println!();

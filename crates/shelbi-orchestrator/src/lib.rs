@@ -39,6 +39,7 @@ pub mod remote_session;
 pub mod review_session;
 pub mod review_ui;
 pub mod session_backend;
+pub mod session_guard;
 pub mod session_process_backend;
 pub mod submit;
 pub mod supervision;

@@ -3022,11 +3022,36 @@ fn draw(
 ) -> Result<()> {
     // Compute layout up front so we can report the main-area size to the live
     // session before painting.
-    let area = Rect {
+    let full = Rect {
         x: 0,
         y: 0,
         width: term.size()?.width,
         height: term.size()?.height,
+    };
+    // A persistent, full-width banner when the daemon has lost its macOS login
+    // session — shown in every view (the sidebar footer is too narrow and is
+    // suppressed under a review/workspace panel). Carve one row off the top and
+    // lay the rest of the shell out below it.
+    let session_lost_banner = state
+        .sidebar_model
+        .as_ref()
+        .and_then(|m| m.session_lost.clone());
+    let (banner_rect, area) = match &session_lost_banner {
+        Some(_) if full.height > 1 => (
+            Some(Rect {
+                x: 0,
+                y: 0,
+                width: full.width,
+                height: 1,
+            }),
+            Rect {
+                x: 0,
+                y: 1,
+                width: full.width,
+                height: full.height - 1,
+            },
+        ),
+        _ => (None, full),
     };
     // Clamp the saved width to the live window for display only (at least 24,
     // at most half the window). A narrow window shrinks the sidebar on screen
@@ -3111,6 +3136,12 @@ fn draw(
         // borrow ends before the review interface / overlay re-borrow the frame.
         {
             let buf = frame.buffer_mut();
+
+            // The lost-login-session banner, above everything (its row was
+            // carved off the top of the layout).
+            if let (Some(rect), Some(msg)) = (banner_rect, session_lost_banner.as_deref()) {
+                render_session_lost_banner(buf, rect, msg);
+            }
 
             // Sidebar — the nav sidebar, except while a review or workspace
             // interface is open: then that panel takes the sidebar's column
@@ -3286,6 +3317,27 @@ fn render_status(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
         .bg(Color::Rgb(40, 40, 50))
         .fg(Color::Gray);
     let label = format!(" {text} ");
+    for (x, ch) in (area.left()..area.right()).zip(label.chars().chain(std::iter::repeat(' '))) {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_char(ch);
+            cell.set_style(style);
+        }
+    }
+}
+
+/// Paint the lost-login-session banner across `area` (a single full-width row):
+/// a red band with bold white text, truncated to the row width. Loud on purpose
+/// — it means every agent the daemon starts has broken DNS/SSH/user lookups.
+fn render_session_lost_banner(buf: &mut ratatui::buffer::Buffer, area: Rect, msg: &str) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let style = Style::default()
+        .bg(Color::Red)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let label = format!(" {msg} ");
+    let y = area.top();
     for (x, ch) in (area.left()..area.right()).zip(label.chars().chain(std::iter::repeat(' '))) {
         if let Some(cell) = buf.cell_mut((x, y)) {
             cell.set_char(ch);
@@ -3695,6 +3747,7 @@ mod tests {
                 status_line: String::new(),
                 zen_mode: shelbi_state::ZenModeState::Off,
                 unread_errors: 0,
+                session_lost: None,
             }),
             board: None,
             activity: None,

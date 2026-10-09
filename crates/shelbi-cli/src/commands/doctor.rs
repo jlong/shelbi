@@ -42,6 +42,13 @@ const OBSERVATION_WINDOW: Duration = Duration::from_secs(3_600);
 /// free; always exits 0 (it is a report, not a gate) — the warning is the signal.
 pub fn run(project: Option<String>) -> Result<()> {
     let project = require_project(project)?;
+
+    // macOS login-session health is independent of the issue backend, so report
+    // it first — before the local-backend early return below. A lost session is
+    // the most actionable thing `doctor` can surface (it's why agents silently
+    // lost DNS/SSH/user lookups).
+    report_session_health();
+
     let cfg = shelbi_state::load_project(&project)
         .map_err(|e| anyhow!(e))?
         .issue_tracker;
@@ -84,6 +91,23 @@ pub fn run(project: Option<String>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Report the daemon's macOS login-session health: a loud, actionable warning
+/// when the marker is present, a one-line OK otherwise. Always a report, never a
+/// gate (doctor exits 0).
+fn report_session_health() {
+    match shelbi_state::read_session_lost() {
+        Some(rec) => {
+            println!("macOS login session: LOST");
+            println!("  ⚠ {}", shelbi_state::SESSION_LOST_BANNER);
+            println!("  detected: {}  (reason: {})", rec.detected_at, rec.reason);
+        }
+        None => {
+            println!("macOS login session: ok");
+        }
+    }
+    println!();
 }
 
 /// Print one budget's line plus, when the projected exhaustion is under the
