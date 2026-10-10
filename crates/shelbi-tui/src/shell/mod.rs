@@ -1306,12 +1306,7 @@ impl ShellState {
         match ev {
             Event::Key(k) => self.handle_key(k),
             Event::Mouse(m) => self.handle_mouse(m),
-            Event::Paste(s) => {
-                if self.focus_is_main() {
-                    self.sessions.send_paste(&s);
-                    self.dirty = true;
-                }
-            }
+            Event::Paste(s) => self.deliver_paste(&s),
             Event::FocusGained => self.forward_focus(true),
             Event::FocusLost => self.forward_focus(false),
             Event::Resize(_, _) => self.dirty = true,
@@ -1320,6 +1315,44 @@ impl ShellState {
 
     fn focus_is_main(&self) -> bool {
         self.client.focus() == Focus::Main
+    }
+
+    /// Deliver a bracketed paste to whatever session the main area currently
+    /// shows — the orchestrator / workspace agent for a plain session, or the
+    /// content session (review agent, workspace agent, diff, editor) owned by an
+    /// open review or workspace interface — routing through that session's own
+    /// manager so the inner program's bracketed-paste encoding is preserved.
+    ///
+    /// A terminal reports a drag-and-drop of a file as a bracketed paste of the
+    /// dropped path, and Claude Code attaches an image from such a path. A drop
+    /// targets the window, not whatever list holds keyboard focus, so it must
+    /// reach the main-area session even when the nav sidebar or an interface
+    /// panel is focused; focus follows the paste to the main area so the user
+    /// can keep typing there afterward. Native board/activity/machines views
+    /// have no terminal session, so a drop over one is a no-op.
+    fn deliver_paste(&mut self, text: &str) {
+        match self.main_view {
+            MainView::Session => {
+                self.client.focus_main();
+                self.sessions.send_paste(text);
+                self.dirty = true;
+            }
+            MainView::Review(_) => {
+                self.client.focus_main();
+                if let Some(r) = self.review.as_mut() {
+                    r.paste_into_content(text);
+                }
+                self.dirty = true;
+            }
+            MainView::Workspace(_) => {
+                self.client.focus_main();
+                if let Some(w) = self.workspace.as_mut() {
+                    w.paste_into_content(text);
+                }
+                self.dirty = true;
+            }
+            MainView::Native(_) => {}
+        }
     }
 
     fn handle_key(&mut self, k: KeyEvent) {

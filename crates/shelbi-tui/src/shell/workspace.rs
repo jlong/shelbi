@@ -152,6 +152,12 @@ impl WorkspaceInterface {
         self.content.pump_output(ring)
     }
 
+    /// The content view's current [`MainState`] (test accessor).
+    #[cfg(test)]
+    pub(crate) fn content_state(&self) -> MainState<'_> {
+        self.content.state()
+    }
+
     /// Report the content `area` so the content view reflows to fill it (the
     /// panel occupies the sidebar column, so the content view fills the whole
     /// main area).
@@ -185,6 +191,15 @@ impl WorkspaceInterface {
     #[cfg(test)]
     pub fn content_focused(&self) -> bool {
         matches!(self.focus, WsFocus::Content)
+    }
+
+    /// Deliver a bracketed paste (a drag-and-drop lands as a paste of the
+    /// dropped path) to the content session. Focus moves to the content view
+    /// when it is live so the user can keep typing in the agent/editor after
+    /// the drop; the paste is best-effort and reaches only a live session.
+    pub fn paste_into_content(&mut self, text: &str) {
+        self.focus_content();
+        self.content.send_paste(text);
     }
 
     fn handle_content_key(&mut self, k: KeyEvent) -> WorkspaceAction {
