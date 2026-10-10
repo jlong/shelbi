@@ -71,7 +71,7 @@ can `tail` or `grep`: an append-only events log at
 `~/.shelbi/events.log` with one line per state change, and a
 per-workspace review-ready marker the hub poller watches. The workspace
 never runs a `shelbi` command —
-`printf '%s\n' <task-id> > .claude/shelbi-review-ready` is the entire
+`printf '%s\n' <task-id> > .shelbi/shelbi-ready` is the entire
 on-workspace protocol. That is how a remote workspace can ship with
 nothing installed but `tmux`, `git`, and an agent CLI. (See
 [The events log](/docs/concepts/events-log) and
