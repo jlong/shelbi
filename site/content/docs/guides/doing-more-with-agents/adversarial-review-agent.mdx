@@ -132,7 +132,7 @@ change is not ready for a human. Write up your findings, then send the issue
 back to the developer by writing the transition marker:
 
     printf '%s\n%s\n' "$TASK_ID" bounce \
-      > .claude/shelbi-transition.tmp && mv .claude/shelbi-transition.tmp .claude/shelbi-transition
+      > .shelbi/shelbi-transition.tmp && mv .shelbi/shelbi-transition.tmp .shelbi/shelbi-transition
 
 The first line is your issue id (`$TASK_ID` in your environment); the second
 is `bounce`, which sends the issue back to the active status the developer
@@ -151,7 +151,7 @@ first and earns its sign-off.
 ## How send-back works
 
 A gate agent bounces an issue by writing one file: the **transition marker**
-at `<worktree>/.claude/shelbi-transition`. It's the same kind of plain-file
+at `<worktree>/.shelbi/shelbi-transition`. It's the same kind of plain-file
 signal as the review-ready marker a finishing agent writes. Workspaces have
 no `shelbi` binary, so the agent just writes the file and the hub poller
 acts on it.
@@ -176,10 +176,10 @@ half-written marker:
 
 ```sh
 printf '%s\n%s\n' "$TASK_ID" bounce \
-  > .claude/shelbi-transition.tmp && mv .claude/shelbi-transition.tmp .claude/shelbi-transition
+  > .shelbi/shelbi-transition.tmp && mv .shelbi/shelbi-transition.tmp .shelbi/shelbi-transition
 ```
 
-It lives under `.claude/` because that directory is Shelbi's gitignored
+It lives under `.shelbi/` because that directory is Shelbi's gitignored
 deploy footprint, so the marker never dirties the worktree or trips a
 clean-branch check between issues.
 
