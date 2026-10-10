@@ -264,6 +264,20 @@ impl ReviewInterface {
         matches!(self.focus, ReviewFocus::Content)
     }
 
+    /// Deliver a bracketed paste (a drag-and-drop lands as a paste of the
+    /// dropped path) to the content session. Focus moves to the content view
+    /// when it is live so the reviewer can keep typing in the agent/editor
+    /// after the drop; the paste is best-effort and reaches only a live session.
+    /// Inert while a gated merge runs — the review takes no competing input then
+    /// (AC #4 parity with the focus-move methods).
+    pub fn paste_into_content(&mut self, text: &str) {
+        if self.panel.merging {
+            return;
+        }
+        self.focus_content();
+        self.content.send_paste(text);
+    }
+
     fn handle_content_key(&mut self, k: KeyEvent) -> ReviewAction {
         // Tab returns focus to the panel; everything else goes to the agent.
         if k.code == KeyCode::Tab && k.modifiers.is_empty() {

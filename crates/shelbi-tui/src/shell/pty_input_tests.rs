@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use shelbi_client::{Connection, SessionEvent, SessionEvents};
 use shelbi_proto::capability;
@@ -518,4 +518,275 @@ fn focus_chords_are_not_forwarded_but_backspace_is() {
     // --- Ctrl+L moves focus back to the main pane -----------------------------
     st.handle_key(KeyEvent::new(KeyCode::Char('l'), CTRL));
     assert!(st.focus_is_main(), "Ctrl+L moves focus back to the main pane");
+}
+
+// --- drag-and-drop paste routing (rt-drag-and-drop-paste-into-a-review-or-
+// workspace-panel-and-with-sidebar-focus-is-dropped) -------------------------
+//
+// A terminal reports a file drag-and-drop as a bracketed paste of the dropped
+// path, which the shell delivers as a `crossterm` `Event::Paste`. These tests
+// prove the paste reaches whatever session the main area shows — even with the
+// nav sidebar or an interface panel focused — against a real PTY whose `cat`
+// echoes exactly the bytes it receives, so an observer sees what the agent got.
+
+/// Spawn a raw, no-echo `cat` session named `name` under `home` and return its
+/// socket path once it is bound. The PTY echoes exactly the bytes it receives.
+fn spawn_cat(home: &std::path::Path, name: &str) -> PathBuf {
+    let id = shelbi_session::layout::derive_id_now(name);
+    let paths = SessionPaths::new(&home.join("sessions"), &id);
+    let args = RunArgs {
+        id,
+        name: name.to_string(),
+        cwd: std::env::temp_dir(),
+        cols: 80,
+        rows: 24,
+        task: None,
+        raw_output_log: false,
+        child_argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "stty raw -echo 2>/dev/null; exec cat".into(),
+        ],
+        manage_daemon: false,
+    };
+    let _session = std::thread::spawn(move || shelbi_session::run(args));
+    let sock = paths.sock();
+    wait_for(Duration::from_secs(30), || sock.exists().then_some(()))
+        .expect("the session socket should appear");
+    sock
+}
+
+/// Open an observer client on `sock` and drain its attach resync, so only live
+/// output lands in later `drain` calls. Returns the kept-alive connection and
+/// its event stream.
+fn attach_observer(sock: &std::path::Path) -> (Connection, SessionEvents) {
+    let (observer, obs_events) =
+        Connection::open(sock, None, capability::ALL).expect("observer connects");
+    observer.attach(None).expect("observer attaches");
+    wait_for(Duration::from_secs(2), || {
+        obs_events
+            .try_recv()
+            .and_then(|ev| matches!(ev, SessionEvent::Resync { .. }).then_some(()))
+    });
+    (observer, obs_events)
+}
+
+#[test]
+fn a_dropped_file_pastes_into_the_main_session_even_with_the_sidebar_focused() {
+    let _lock = crate::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("SHELBI_HOME", home.path());
+    let sock = spawn_cat(home.path(), "tuipaste/orch");
+    let _cleanup = Cleanup { sock: sock.clone() };
+    let (_observer, obs_events) = attach_observer(&sock);
+    let mut out: Vec<u8> = Vec::new();
+
+    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let mut st = ShellState::new("tuipaste", Arc::new(DirectConnector { sock: sock.clone() }), caps);
+    st.show(RowTarget::Session(SessionRef::Orchestrator));
+    wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        matches!(st.sessions.state(), MainState::Live(_)).then_some(())
+    })
+    .expect("the shell's main area should bind the session live");
+
+    // Focus the nav sidebar: a drop targets the window, not the focused list.
+    st.client.focus_sidebar();
+    assert!(!st.focus_is_main(), "the sidebar holds focus before the drop");
+
+    // A path with a space must arrive exactly as sent (no re-quoting / truncation).
+    let path = "/tmp/holiday pic.png";
+    st.handle_event(Event::Paste(path.to_string()));
+
+    let saw = wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        drain(&obs_events, &mut out);
+        contains(&out, path.as_bytes()).then_some(())
+    });
+    assert!(
+        saw.is_some(),
+        "the dropped path should reach the main session intact; expected {path:?} within {out:?}",
+    );
+    assert!(st.focus_is_main(), "a drop moves focus to the main area");
+}
+
+#[test]
+fn a_paste_is_bracketed_when_the_program_enabled_bracketed_paste() {
+    let _lock = crate::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("SHELBI_HOME", home.path());
+    let sock = spawn_cat(home.path(), "tuipastebr/orch");
+    let _cleanup = Cleanup { sock: sock.clone() };
+    let (_observer, obs_events) = attach_observer(&sock);
+    let mut out: Vec<u8> = Vec::new();
+
+    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let mut st =
+        ShellState::new("tuipastebr", Arc::new(DirectConnector { sock: sock.clone() }), caps);
+    st.show(RowTarget::Session(SessionRef::Orchestrator));
+    wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        matches!(st.sessions.state(), MainState::Live(_)).then_some(())
+    })
+    .expect("the shell's main area should bind the session live");
+
+    // Turn on bracketed-paste mode (DECSET 2004) the way a program does: `cat`
+    // echoes the sequence, and the session's emulator picks the mode up as it
+    // processes that output (before broadcasting it), so seeing it on the
+    // observer means the mode is already live for the next paste.
+    st.sessions.send_input(b"\x1b[?2004h");
+    let on = wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        drain(&obs_events, &mut out);
+        contains(&out, b"\x1b[?2004h").then_some(())
+    });
+    assert!(on.is_some(), "the session should enable bracketed-paste mode: {out:?}");
+
+    let before = out.len();
+    st.handle_event(Event::Paste("hi".to_string()));
+    let bracketed = wait_for(Duration::from_secs(5), || {
+        pump(&mut st);
+        drain(&obs_events, &mut out);
+        contains(&out[before..], b"\x1b[200~hi\x1b[201~").then_some(())
+    });
+    assert!(
+        bracketed.is_some(),
+        "an enabled program should receive the paste wrapped in bracketed markers: {:?}",
+        &out[before..],
+    );
+}
+
+#[test]
+fn a_dropped_file_pastes_into_the_open_review_content_session() {
+    let _lock = crate::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("SHELBI_HOME", home.path());
+    // The review content view binds to the slot's workspace session.
+    let sock = spawn_cat(home.path(), "tuipasterev/review-1");
+    let _cleanup = Cleanup { sock: sock.clone() };
+    let (_observer, obs_events) = attach_observer(&sock);
+    let mut out: Vec<u8> = Vec::new();
+
+    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let mut st =
+        ShellState::new("tuipasterev", Arc::new(DirectConnector { sock: sock.clone() }), caps);
+
+    // Build a review interface whose content session is live (DirectConnector
+    // binds whatever target to the one `cat` socket), then install it the way an
+    // open review leaves the shell.
+    let mut review = super::review::ReviewInterface::new(
+        "tuipasterev",
+        Arc::new(DirectConnector { sock: sock.clone() }),
+        "fix-login",
+        "review-1",
+        "/wt",
+        "Vim",
+        true,
+        None,
+    );
+    wait_for(Duration::from_secs(5), || {
+        review.poll();
+        let mut ring = false;
+        review.pump_output(&mut ring);
+        matches!(review.content_state(), MainState::Live(_)).then_some(())
+    })
+    .expect("the review content session should go live");
+    st.review = Some(review);
+    st.main_view = super::MainView::Review("fix-login".into());
+    // The panel (not the content view) holds focus, and the shell focus is on
+    // the sidebar — a drop must still reach the content session.
+    st.client.focus_sidebar();
+
+    let path = "/tmp/review shot.png";
+    st.handle_event(Event::Paste(path.to_string()));
+
+    let saw = wait_for(Duration::from_secs(5), || {
+        if let Some(r) = st.review.as_mut() {
+            r.poll();
+            let mut ring = false;
+            r.pump_output(&mut ring);
+        }
+        drain(&obs_events, &mut out);
+        contains(&out, path.as_bytes()).then_some(())
+    });
+    assert!(
+        saw.is_some(),
+        "the dropped path should reach the review agent intact; expected {path:?} within {out:?}",
+    );
+    assert!(st.focus_is_main(), "a drop moves focus to the main area");
+    assert!(
+        st.review.as_ref().unwrap().content_focused(),
+        "focus follows the drop to the review content view",
+    );
+}
+
+#[test]
+fn a_dropped_file_pastes_into_the_open_workspace_content_session() {
+    let _lock = crate::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("SHELBI_HOME", home.path());
+    // The workspace content view binds to the workspace's agent session.
+    let sock = spawn_cat(home.path(), "tuipastews/ws-1");
+    let _cleanup = Cleanup { sock: sock.clone() };
+    let (_observer, obs_events) = attach_observer(&sock);
+    let mut out: Vec<u8> = Vec::new();
+
+    let caps = Caps { kitty: true, truecolor: true, nested: None };
+    let mut st =
+        ShellState::new("tuipastews", Arc::new(DirectConnector { sock: sock.clone() }), caps);
+
+    let mut workspace = super::workspace::WorkspaceInterface::new(
+        "tuipastews",
+        Arc::new(DirectConnector { sock: sock.clone() }),
+        "ws-1",
+        "/wt",
+        "Vim",
+        "Developer",
+        super::default_ws_status(),
+        None,
+    );
+    wait_for(Duration::from_secs(5), || {
+        workspace.poll();
+        let mut ring = false;
+        workspace.pump_output(&mut ring);
+        matches!(workspace.content_state(), MainState::Live(_)).then_some(())
+    })
+    .expect("the workspace content session should go live");
+    st.workspace = Some(workspace);
+    st.main_view = super::MainView::Workspace("ws-1".into());
+    st.client.focus_sidebar();
+
+    let path = "/tmp/ws shot.png";
+    st.handle_event(Event::Paste(path.to_string()));
+
+    let saw = wait_for(Duration::from_secs(5), || {
+        if let Some(w) = st.workspace.as_mut() {
+            w.poll();
+            let mut ring = false;
+            w.pump_output(&mut ring);
+        }
+        drain(&obs_events, &mut out);
+        contains(&out, path.as_bytes()).then_some(())
+    });
+    assert!(
+        saw.is_some(),
+        "the dropped path should reach the workspace agent intact; expected {path:?} within {out:?}",
+    );
+    assert!(st.focus_is_main(), "a drop moves focus to the main area");
+    assert!(
+        st.workspace.as_ref().unwrap().content_focused(),
+        "focus follows the drop to the workspace content view",
+    );
 }
