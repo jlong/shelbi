@@ -275,9 +275,9 @@ fn expand_tilde(p: &std::path::Path) -> PathBuf {
 }
 
 /// Add shelbi's footprint to the repo's `.gitignore` if it isn't already
-/// covered: `.shelbi/` (metadata) plus the fixed `.claude/` files shelbi
-/// deploys into the worktree on every dispatch (settings.json,
-/// agent-instructions.md, the ready marker). Shelbi's *skill* mounts are
+/// covered: `.shelbi/` (metadata — now including the per-worktree handoff
+/// markers) plus the fixed `.claude/` files shelbi deploys into the worktree on
+/// every dispatch (settings.json, agent-instructions.md). Shelbi's *skill* mounts are
 /// intentionally NOT claimed here — they're excluded per-name in the
 /// worktree's git exclude at mount time, so a user's own `.claude/skills/`
 /// stays under their git control (see `refresh_agent_skills`). Writes to the
@@ -294,8 +294,11 @@ fn ensure_gitignored(host: &Host, machine: &Machine) -> Result<()> {
             "\n# shelbi worktrees + metadata (https://github.com/jlong/shelbi)\n.shelbi/\n",
         );
     }
-    // Representative probe: if the ready marker isn't ignored, none of the
-    // shelbi-written `.claude/` files are, so append the whole block.
+    // Representative probe: if `.claude/settings.json` isn't ignored, none of
+    // the shelbi-written `.claude/` deploy files are, so append the whole block.
+    // (The per-worktree handoff markers moved out of `.claude/` into `.shelbi/`,
+    // which the block above already ignores wholesale, so they need no entry
+    // here.)
     //
     // NB: we deliberately do NOT blanket-claim `.claude/skills/` here — that
     // would hide (and, historically, let Shelbi destroy) user-authored skills.
@@ -303,12 +306,11 @@ fn ensure_gitignored(host: &Host, machine: &Machine) -> Result<()> {
     // exclude at mount time (see `refresh_agent_skills` /
     // `deploy_orchestrator_system_skill`), so a user's `.claude/skills/` stays
     // fully under their own git control.
-    if !check_ignored(host, &repo, ".claude/shelbi-ready")? {
+    if !check_ignored(host, &repo, ".claude/settings.json")? {
         snippet.push_str(
             "\n# shelbi deploy footprint written into the worktree on dispatch\n\
              .claude/settings.json\n\
-             .claude/agent-instructions.md\n\
-             .claude/shelbi-ready\n",
+             .claude/agent-instructions.md\n",
         );
     }
     if snippet.is_empty() {

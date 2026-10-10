@@ -2688,7 +2688,7 @@ pub fn append_marker_deferred_event(
 }
 
 /// Append a **ready-marker skipped** line to `~/.shelbi/events.log`. Emitted by
-/// the poller's ready-marker handoff when it reads a `.claude/shelbi-ready`
+/// the poller's ready-marker handoff when it reads a `.shelbi/shelbi-ready`
 /// marker it will NOT advance and instead clears — the task loaded fine but is
 /// no longer `in_progress`-and-assigned-to-this-workspace (an out-of-band board
 /// move / relabel / reassignment raced the worker's marker write), the task is

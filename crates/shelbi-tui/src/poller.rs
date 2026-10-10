@@ -15,7 +15,7 @@
 //! machines via shelbi-ssh — which sets up ControlMaster so the marginal
 //! cost per poll is a socket write, not a TCP handshake) and parses the
 //! trailing `shelbi:<state>` marker. The marker file at
-//! `<worktree>/.claude/shelbi-ready` is checked first, before any
+//! `<worktree>/.shelbi/shelbi-ready` is checked first, before any
 //! pane operation, so the review handoff isn't gated on a working pane
 //! title (Claude's own OSC writes often clobber the marker before the
 //! poller sees it).
@@ -2621,7 +2621,7 @@ fn limit_resume_eligible_now(project_name: &str, workspace_name: &str, task_id: 
 /// Check the workspace's ready-handoff file marker and, if present, advance
 /// its in-progress task to the workflow's handoff status. The marker is the
 /// workspace's "I'm done" signal — it writes its task id into
-/// `<worktree>/.claude/shelbi-ready` when done (see
+/// `<worktree>/.shelbi/shelbi-ready` when done (see
 /// `shelbi_orchestrator::workspace::workspace_ready_marker`).
 ///
 /// The forward target is resolved generically from the task's workflow: the
@@ -2656,12 +2656,29 @@ fn maybe_apply_ready_handoff(
     host: &shelbi_core::Host,
     addr: &shelbi_core::TmuxAddr,
 ) {
-    let marker = shelbi_orchestrator::workspace::workspace_ready_marker(machine, workspace);
+    let mut marker = shelbi_orchestrator::workspace::workspace_ready_marker(machine, workspace);
+    let legacy_marker =
+        shelbi_orchestrator::workspace::legacy_workspace_ready_marker(machine, workspace);
     let deferred_marker =
         shelbi_orchestrator::workspace::workspace_ready_deferred_marker(machine, workspace);
     let task_id = match shelbi_orchestrator::workspace::read_ready_marker(host, &marker) {
         Ok(Some(id)) => id,
-        Ok(None) => return,
+        // Transition fallback: a worker dispatched before the markers moved from
+        // `.claude/` to `.shelbi/` still writes the legacy path, so read it when
+        // the new marker is absent and point `marker` at it so the consume-time
+        // clears below target the file that actually held the signal. Remove
+        // this arm (and `legacy_workspace_ready_marker`) in a later release.
+        Ok(None) => match shelbi_orchestrator::workspace::read_ready_marker(host, &legacy_marker) {
+            Ok(Some(id)) => {
+                marker = legacy_marker;
+                id
+            }
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(workspace = %workspace.name, error = %e, "read_ready_marker (legacy path) failed");
+                return;
+            }
+        },
         Err(e) => {
             tracing::warn!(workspace = %workspace.name, error = %e, "read_ready_marker failed");
             return;
@@ -3292,10 +3309,29 @@ fn maybe_apply_transition(
     host: &shelbi_core::Host,
     addr: &shelbi_core::TmuxAddr,
 ) {
-    let marker = shelbi_orchestrator::workspace::workspace_transition_marker(machine, workspace);
+    let mut marker =
+        shelbi_orchestrator::workspace::workspace_transition_marker(machine, workspace);
+    let legacy_marker =
+        shelbi_orchestrator::workspace::legacy_workspace_transition_marker(machine, workspace);
     let req = match shelbi_orchestrator::workspace::read_transition_marker(host, &marker) {
         Ok(Some(r)) => r,
-        Ok(None) => return,
+        // Transition fallback (see `maybe_apply_ready_handoff`): a gate worker
+        // dispatched before the markers moved from `.claude/` to `.shelbi/`
+        // still writes the legacy path. Read it when the new marker is absent
+        // and point `marker` at it so the clears below target the right file.
+        // Remove this arm in a later release.
+        Ok(None) => match shelbi_orchestrator::workspace::read_transition_marker(host, &legacy_marker)
+        {
+            Ok(Some(r)) => {
+                marker = legacy_marker;
+                r
+            }
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(workspace = %workspace.name, error = %e, "read_transition_marker (legacy path) failed");
+                return;
+            }
+        },
         Err(e) => {
             // Torn / hostile body — leave the marker (read didn't clear it) so a
             // half-flushed write survives to the next tick.
@@ -4196,7 +4232,7 @@ fn debounce_idle_edge(
 /// [`WorkspaceState::Serving`].
 ///
 /// A `review`-tagged slot the poller already confirmed serving (its
-/// `.claude/shelbi-review-loaded` marker is present — see
+/// `.shelbi/shelbi-review-loaded` marker is present — see
 /// [`ensure_review_marker_and_serving_state`]) sits idle at its ready prompt
 /// between the human's questions. Claude's ready input box — and the
 /// suggested-prompt ghost text it draws under the ready summary (`❯ open it in
@@ -5295,7 +5331,7 @@ fn resume_dev_workspace(
 /// Review agent pane normally (loading / blocked / paused / dialogs).
 ///
 /// - **Issue assigned + `ready:` probe passes** → the branch is serving: write
-///   the `.claude/shelbi-review-loaded` marker (so the sidebar promotes it to
+///   the `.shelbi/shelbi-review-loaded` marker (so the sidebar promotes it to
 ///   **Ready for Review**, deterministically) and record the `serving`
 ///   sub-state (so `shelbi workspace status` no longer reads "hasn't been
 ///   polled"). Authoritative.
@@ -5490,7 +5526,7 @@ fn emit_review_ready(
 
 /// Reap a review slot whose task is resolved — no review-column task points at
 /// it, the state a review → done accept (or a bounce / hand move / eviction)
-/// leaves behind. Clears any lingering `.claude/shelbi-review-loaded` marker (so
+/// leaves behind. Clears any lingering `.shelbi/shelbi-review-loaded` marker (so
 /// the sidebar drops the phantom **Ready for Review** row) and, on a live
 /// non-user-shell pane, kills it (stopping the server it parented) and drops the
 /// slot's stale `status.yaml` so it returns to a clean idle. Returns `true` when
@@ -6238,9 +6274,9 @@ Intro prose.
         let ws = project.workspaces[0].clone();
 
         // Plant a stale review-loaded marker naming a (now-resolved) task.
-        let marker_dir = work_dir.join(".claude");
+        let marker_dir = work_dir.join(".shelbi");
         std::fs::create_dir_all(&marker_dir).unwrap();
-        let marker = work_dir.join(".claude").join("shelbi-review-loaded");
+        let marker = work_dir.join(".shelbi").join("shelbi-review-loaded");
         std::fs::write(&marker, "gone-task http://localhost:4310\n").unwrap();
 
         let host = Host::Local;
@@ -8487,6 +8523,71 @@ while :; do sleep 60; done
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[test]
+    fn legacy_claude_ready_marker_still_promotes_and_clears() {
+        // Transition fallback: a worker dispatched before the markers moved from
+        // `.claude/` to `.shelbi/` wrote the legacy path. With no new marker
+        // present, the poller must still read the legacy one, promote the task,
+        // and clear the legacy file (so it can't re-fire every tick).
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-legacy-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+
+        // Plant ONLY the legacy `.claude/shelbi-ready` marker; the new
+        // `.shelbi/` marker is absent.
+        let legacy = shelbi_orchestrator::workspace::legacy_workspace_ready_marker(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "fix-login\n").unwrap();
+        let new_marker = shelbi_orchestrator::workspace::workspace_ready_marker(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        assert!(!new_marker.exists(), "no new-path marker in this scenario");
+
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
+        );
+
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login")
+                .unwrap()
+                .task
+                .column,
+            Column::review(),
+            "task should be promoted via the legacy marker fallback"
+        );
+        assert!(
+            !legacy.exists(),
+            "the legacy marker must be cleared so it can't re-fire"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// The documented [add-to-workflow] gated topology, end to end: a ready
     /// marker must route the finished work through the agent-owned active
     /// `adversarial-review` gate (running the declared edge's side-effects and
@@ -8859,7 +8960,7 @@ transitions:
 
     #[test]
     fn ready_marker_promotes_even_with_an_issue_reconcile_in_flight_for_the_task() {
-        // Additional acceptance: a `.claude/shelbi-ready` marker must move its
+        // Additional acceptance: a `.shelbi/shelbi-ready` marker must move its
         // task to the handoff category even when a `poller:issue-reconcile` pass
         // for that same task has just run. The marker scan (`maybe_apply_ready_handoff`,
         // a per-workspace thread) and the reconcile passes (the supervisor thread)
