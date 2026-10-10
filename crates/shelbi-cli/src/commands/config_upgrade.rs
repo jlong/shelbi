@@ -482,6 +482,17 @@ pub(crate) const REVIEW_TWEAK_SECTION_HEADING: &str =
 const HUMAN_AUTHORIZED_REBASE_MARKERS: &[&str] =
     &["human-authorized rebase", "rebase unless the"];
 
+/// The pre-move location of the review-serving marker. Shelbi moved its
+/// per-worktree markers out of `.claude/` (runner-specific agent config, not
+/// Shelbi state) into `.shelbi/`; the review template now names
+/// `.shelbi/shelbi-review-loaded`. A forked review-instructions copy still
+/// naming the old `.claude/` path tells the Review agent to write a marker the
+/// hub no longer reads there, so a diff-only review (one with no serve recipe,
+/// where the poller never writes the marker itself) would silently never
+/// promote to **Ready for Review**. Kept in sync with the shipped default
+/// template by the drift guard in this module's tests.
+const LEGACY_REVIEW_LOADED_MARKER_PATH: &str = ".claude/shelbi-review-loaded";
+
 /// Detect three deprecations in the review agent's instructions (or, for the
 /// server-centric wording, its bundled load-run skill). Every fix is a prose
 /// refresh a user may have forked and customized — never a mechanical,
@@ -489,6 +500,28 @@ const HUMAN_AUTHORIZED_REBASE_MARKERS: &[&str] =
 /// the orchestrator to repair its own copy rather than silently clobbering
 /// local edits.
 fn sniff_review_instructions(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    // Marker location move (`.claude/` -> `.shelbi/`). A forked copy still
+    // naming the old review-loaded path points the agent at a file the hub no
+    // longer watches there. The fix is a precise path swap, but these are
+    // user-forkable prose instructions, so it routes to NeedsJudgment for the
+    // orchestrator to apply with judgment rather than a mechanical clobber.
+    if text.contains(LEGACY_REVIEW_LOADED_MARKER_PATH) {
+        out.push(finding(
+            entry,
+            Classification::NeedsJudgment,
+            "REVIEW_INSTRUCTIONS_MARKER_PATH_CLAUDE",
+            "the review agent's instructions name the pre-move review-loaded marker path \
+             (`.claude/shelbi-review-loaded`) — Shelbi's per-worktree markers moved to \
+             `.shelbi/`, so a diff-only review would write a marker the hub no longer reads \
+             and never promote to Ready for Review",
+            "Update the review-loaded marker path from `.claude/shelbi-review-loaded` to \
+             `.shelbi/shelbi-review-loaded` (markers now live under the worktree's `.shelbi/` \
+             runtime scratch, not the `.claude/` deploy footprint) — mirror the shipped default \
+             template.",
+            locate_line(text, LEGACY_REVIEW_LOADED_MARKER_PATH),
+        ));
+    }
+
     if let Some(marker) = LEGACY_REVIEW_WORDING.iter().find(|m| text.contains(**m)) {
         out.push(finding(
             entry,
@@ -2388,6 +2421,11 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              the medium-agnostic wording can't be merged in mechanically without risking \
              local edits — the orchestrator refreshes its own copy instead."
         }
+        "REVIEW_INSTRUCTIONS_MARKER_PATH_CLAUDE" => {
+            "These are prose instructions a project may have forked and customized, so the \
+             review-loaded marker path can't be swapped mechanically without risking local \
+             edits — the orchestrator updates its own copy instead."
+        }
         "REVIEW_INSTRUCTIONS_TWEAK_NO_PUSH" => {
             "These are prose instructions a project may have forked and customized, so the \
              commit-and-push guidance can't be merged in mechanically without risking local \
@@ -3189,6 +3227,49 @@ mod tests {
             find(&out, "REVIEW_INSTRUCTIONS_TWEAK_NO_PUSH").is_none(),
             "a section that commits and pushes should not be flagged: {:?}",
             codes(&out)
+        );
+    }
+
+    #[test]
+    fn review_instructions_naming_legacy_marker_path_is_needs_judgment() {
+        // A forked copy still naming the pre-move `.claude/` review-loaded path
+        // points the agent at a marker the hub no longer reads there.
+        let text = "# Review\n\nWrite the loaded marker. Your dispatch prompt gives you \
+             the exact path (`.claude/shelbi-review-loaded`) and the atomic write.\n";
+        let mut out = Vec::new();
+        sniff_review_instructions(&review_instr_entry(), text, &mut out);
+        let f = find(&out, "REVIEW_INSTRUCTIONS_MARKER_PATH_CLAUDE").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+    }
+
+    #[test]
+    fn review_instructions_with_new_marker_path_are_clean() {
+        let text = "# Review\n\nWrite the loaded marker. Your dispatch prompt gives you \
+             the exact path (`.shelbi/shelbi-review-loaded`) and the atomic write.\n";
+        let mut out = Vec::new();
+        sniff_review_instructions(&review_instr_entry(), text, &mut out);
+        assert!(
+            find(&out, "REVIEW_INSTRUCTIONS_MARKER_PATH_CLAUDE").is_none(),
+            "the new `.shelbi/` marker path must not be flagged: {:?}",
+            codes(&out)
+        );
+    }
+
+    /// Drift guard: the shipped default review template must name the marker at
+    /// its new `.shelbi/` location and never the pre-move `.claude/` one — so a
+    /// fresh install is correct and never trips the path-move sniffer.
+    #[test]
+    fn shipped_default_review_template_names_new_marker_path() {
+        assert!(
+            shelbi_state::DEFAULT_REVIEW_INSTRUCTIONS.contains(".shelbi/shelbi-review-loaded"),
+            "shipped default review template no longer names the `.shelbi/shelbi-review-loaded` \
+             marker path — the sniffer's fix text and the template have drifted apart"
+        );
+        assert!(
+            !shelbi_state::DEFAULT_REVIEW_INSTRUCTIONS.contains(LEGACY_REVIEW_LOADED_MARKER_PATH),
+            "shipped default review template still names the pre-move \
+             `.claude/shelbi-review-loaded` marker path"
         );
     }
 

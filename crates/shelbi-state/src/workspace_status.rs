@@ -53,7 +53,7 @@ pub enum WorkspaceState {
     /// title, never a `shelbi:<state>` marker, so without this the slot would
     /// never be polled at all ("hasn't been polled"). It is the serving
     /// sub-state the sidebar's **Ready for Review** section keys off (via the
-    /// poller-written `.claude/shelbi-review-loaded` marker).
+    /// poller-written `.shelbi/shelbi-review-loaded` marker).
     Serving,
 }
 

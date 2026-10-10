@@ -1673,7 +1673,7 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 /// "this slot is a review surface". If the project can't be loaded we can't
 /// classify, so everything falls back to Queued/Pending (no location).
 ///
-/// The serving signal is the review workspace's `.claude/shelbi-review-loaded`
+/// The serving signal is the review workspace's `.shelbi/shelbi-review-loaded`
 /// marker (see [`shelbi_orchestrator::workspace::read_review_loaded_marker`]):
 /// the hub poller writes it once the serve recipe's `ready:` health check passes
 /// (the deterministic, agent-independent path — see
@@ -1770,7 +1770,7 @@ fn split_review_sections(
 }
 
 /// Whether `task_id`'s review slot is confirmed serving: its
-/// `.claude/shelbi-review-loaded` marker exists and names this task. A missing
+/// `.shelbi/shelbi-review-loaded` marker exists and names this task. A missing
 /// marker, a marker naming a different task (slot reused before the new server
 /// came up), a mis-configured machine, or a read error all read as "not serving
 /// yet" — the conservative call, since under-claiming ready (task shows Loading)
@@ -2953,7 +2953,7 @@ mod tests {
         p
     }
 
-    /// Write the `.claude/shelbi-review-loaded` serving marker for `workspace`
+    /// Write the `.shelbi/shelbi-review-loaded` serving marker for `workspace`
     /// under `work_dir`, standing in for the Review agent's write once its dev
     /// server is confirmed up. Body mirrors the real marker: `<task-id> <url>`.
     fn write_review_loaded_marker(work_dir: &std::path::Path, workspace: &str, task_id: &str) {
@@ -2961,7 +2961,7 @@ mod tests {
             .join(".shelbi")
             .join("wt")
             .join(workspace)
-            .join(".claude");
+            .join(".shelbi");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("shelbi-review-loaded"),

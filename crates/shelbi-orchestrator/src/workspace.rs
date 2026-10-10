@@ -38,14 +38,15 @@ fn current_exe_string() -> Result<String> {
 /// Two families of paths are shelbi's, not the user's, and must never block a
 /// dispatch or rebase:
 ///
-/// - `.claude/` — shelbi's deploy footprint (`settings.json`, the
-///   `shelbi-ready` marker). Normally gitignored, but a repo that
-///   hasn't ignored it yet still shouldn't wedge on it.
+/// - `.claude/` — shelbi's deploy footprint (`settings.json`,
+///   `agent-instructions.md`, the system-plugin mount). Normally gitignored,
+///   but a repo that hasn't ignored it yet still shouldn't wedge on it.
 /// - `.shelbi/` — shelbi's own runtime scratch (`.shelbi/messages/` inter-agent
-///   mail, the worker-authored `.shelbi/pr-body.md` PR description, and other
-///   daemon state) written into the worktree root. It is never user work, so an
-///   otherwise-idle worktree whose only untracked entry is `.shelbi/` must read
-///   as clean and dispatchable.
+///   mail, the worker-authored `.shelbi/pr-body.md` PR description, the
+///   per-worktree handoff markers — `shelbi-ready`, `shelbi-transition`, and
+///   their sidecars — and other daemon state) written into the worktree root.
+///   It is never user work, so an otherwise-idle worktree whose only untracked
+///   entry is `.shelbi/` must read as clean and dispatchable.
 ///
 /// Callers pass `git status --porcelain -z` (NUL-delimited) output. The `-z`
 /// form is load-bearing: plain porcelain quotes paths with unusual bytes
@@ -123,7 +124,7 @@ pub fn workspace_worktree(machine: &Machine, workspace: &WorkspaceSpec) -> PathB
 }
 
 /// The ready-handoff file marker for a workspace:
-/// `<worktree>/.claude/shelbi-ready`.
+/// `<worktree>/.shelbi/shelbi-ready`.
 ///
 /// The workspace writes its current task id here to signal "I'm done, advance
 /// me"; the hub poller reads it (`stat`/`cat`, local or over SSH), moves the
@@ -132,13 +133,33 @@ pub fn workspace_worktree(machine: &Machine, workspace: &WorkspaceSpec) -> PathB
 /// raced Claude's own OSC title writes and the Stop hook. A file survives
 /// both: nothing the agent's UI does can clobber it.
 ///
-/// It lives under `.claude/` (not the worktree root) on purpose — `.claude/`
-/// is where shelbi already deploys `settings.json`, and shelbi relies on it
-/// being gitignored so deployed files don't dirty the worktree between
-/// tasks. Keeping the marker there means it never shows up in
-/// `git status --porcelain` and so never trips [`sync_worktree`]'s
-/// clean-worktree check.
+/// It lives under `.shelbi/` (not the worktree root) on purpose — `.shelbi/`
+/// is shelbi's own per-worktree runtime scratch (inter-agent `messages/`, the
+/// worker-authored `pr-body.md`, and these markers), already treated as
+/// shelbi's by [`is_shelbi_scratch_path`] and ignored wholesale by the
+/// worktree's `.gitignore`. Keeping the marker there means it never shows up
+/// as user work in `git status --porcelain` and so never trips
+/// [`sync_worktree`]'s clean-worktree check. (Markers used to live under
+/// `.claude/`, shelbi's deploy footprint; they moved out because `.claude/` is
+/// runner-specific agent config, not shelbi state — see
+/// [`legacy_workspace_ready_marker`] for the transition fallback.)
 pub fn workspace_ready_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
+    workspace_worktree(machine, workspace)
+        .join(".shelbi")
+        .join("shelbi-ready")
+}
+
+/// The pre-move location of the ready marker,
+/// `<worktree>/.shelbi/shelbi-ready`.
+///
+/// Before the per-worktree markers moved from `.claude/` to `.shelbi/`, the
+/// dispatch prompt told workers to write the ready signal here. A worker
+/// dispatched *before* the move is still running against a prompt that names
+/// this path, so during the transition the poller reads it as a fallback when
+/// the new [`workspace_ready_marker`] is absent, and dispatch clears it
+/// alongside the new one. Remove in a later release once no pre-move worker can
+/// still be in flight.
+pub fn legacy_workspace_ready_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
     workspace_worktree(machine, workspace)
         .join(".claude")
         .join("shelbi-ready")
@@ -178,7 +199,7 @@ pub fn read_ready_marker(host: &Host, marker: &Path) -> Result<Option<String>> {
 }
 
 /// The review-serving file marker for a review workspace:
-/// `<worktree>/.claude/shelbi-review-loaded`.
+/// `<worktree>/.shelbi/shelbi-review-loaded`.
 ///
 /// The hub poller writes this once the serve recipe's `ready:` probe passes
 /// (the deterministic path — see [`probe_review_slot_serving`] /
@@ -192,12 +213,12 @@ pub fn read_ready_marker(host: &Host, marker: &Path) -> Result<Option<String>> {
 ///
 /// Body is the task id, optionally followed by the serving URL
 /// (`<task-id> http://host:port`); a diff-only review writes the id alone.
-/// It lives under `.claude/` for the same reason as the other markers: that
-/// directory is shelbi's gitignored deploy footprint, so the marker never
-/// dirties the worktree between tasks.
+/// It lives under `.shelbi/` for the same reason as the other markers: that
+/// directory is shelbi's gitignored per-worktree runtime scratch, so the
+/// marker never dirties the worktree between tasks.
 pub fn workspace_review_loaded_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
     workspace_worktree(machine, workspace)
-        .join(".claude")
+        .join(".shelbi")
         .join("shelbi-review-loaded")
 }
 
@@ -253,7 +274,7 @@ pub fn clear_ready_marker(host: &Host, marker: &Path) -> Result<()> {
 }
 
 /// The ready-handoff **deferral** sidecar for a workspace:
-/// `<worktree>/.claude/shelbi-ready-deferred`.
+/// `<worktree>/.shelbi/shelbi-ready-deferred`.
 ///
 /// When the poller reads a [`workspace_ready_marker`] but the task load fails
 /// with a *transient* backend error (network blip, GitHub 403/rate-limit,
@@ -263,16 +284,16 @@ pub fn clear_ready_marker(host: &Host, marker: &Path) -> Result<()> {
 /// next tick. This sidecar records the error class of the current outage so the
 /// deferral is logged (and recorded on `events.log`) once per outage rather than
 /// every tick; a later *successful* read clears it, arming the next outage to
-/// log afresh. Lives under `.claude/` for the same gitignore reason as the
+/// log afresh. Lives under `.shelbi/` for the same gitignore reason as the
 /// ready marker itself.
 pub fn workspace_ready_deferred_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
     workspace_worktree(machine, workspace)
-        .join(".claude")
+        .join(".shelbi")
         .join("shelbi-ready-deferred")
 }
 
 /// The ready-handoff **refusal** sidecar for a workspace:
-/// `<worktree>/.claude/shelbi-ready-refused`.
+/// `<worktree>/.shelbi/shelbi-ready-refused`.
 ///
 /// When the poller's pre-push worktree check (see
 /// [`verify_worktree_ready_for_handoff`]) refuses a ready marker — the worker
@@ -283,17 +304,17 @@ pub fn workspace_ready_deferred_marker(machine: &Machine, workspace: &WorkspaceS
 /// current refusal token (e.g. `uncommitted-changes` / `no-commits-ahead`) so the
 /// refusal is logged and the worker messaged **once per distinct reason** rather
 /// than every poll; the handoff proceeding (a passing check) clears it, arming the
-/// next refusal to surface afresh. Lives under `.claude/` for the same gitignore
+/// next refusal to surface afresh. Lives under `.shelbi/` for the same gitignore
 /// reason as the ready marker itself, and reuses the [`read_deferred_marker`] /
 /// [`write_deferred_marker`] / [`clear_deferred_marker`] trio (all path-generic).
 pub fn workspace_ready_refused_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
     workspace_worktree(machine, workspace)
-        .join(".claude")
+        .join(".shelbi")
         .join("shelbi-ready-refused")
 }
 
 /// The handoff-**push** retry ledger for a workspace:
-/// `<worktree>/.claude/shelbi-push-blocked`.
+/// `<worktree>/.shelbi/shelbi-push-blocked`.
 ///
 /// The ready handoff pushes the workspace branch to origin before advancing the
 /// card (see `poller::push_workspace_branch_before_handoff`). When that push is
@@ -305,12 +326,12 @@ pub fn workspace_ready_refused_marker(machine: &Machine, workspace: &WorkspaceSp
 /// the poller skips re-attempting the push entirely (no tight loop) and re-emits
 /// nothing; a *new* local tip (the worker committed a fix) resets the ledger so
 /// the next tip gets a fresh budget. A successful push clears it. Lives under
-/// `.claude/` for the same gitignore reason as the ready marker itself, and uses
+/// `.shelbi/` for the same gitignore reason as the ready marker itself, and uses
 /// the [`read_deferred_marker`] / [`write_deferred_marker`] / [`clear_deferred_marker`]
 /// trio.
 pub fn workspace_push_blocked_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
     workspace_worktree(machine, workspace)
-        .join(".claude")
+        .join(".shelbi")
         .join("shelbi-push-blocked")
 }
 
@@ -385,7 +406,7 @@ pub fn clear_deferred_marker(host: &Host, marker: &Path) -> Result<()> {
 
 /// A review slot confirmed serving by the poller's own `ready:` probe.
 /// Carries the reviewable URL (if the recipe declared one) so the poller can
-/// write it into the `.claude/shelbi-review-loaded` marker body.
+/// write it into the `.shelbi/shelbi-review-loaded` marker body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewServing {
     /// The resolved reviewable URL, or `None` when the recipe declared none.
@@ -593,7 +614,7 @@ fn first_prose_paragraph(body: &str) -> String {
     para.join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Write the review-serving marker (`<worktree>/.claude/shelbi-review-loaded`)
+/// Write the review-serving marker (`<worktree>/.shelbi/shelbi-review-loaded`)
 /// naming `task_id`, optionally followed by the reviewable `url`. Atomic — a
 /// sibling `.tmp` is written and renamed into place so the sidebar never reads
 /// a half-written body (which would fail [`read_review_loaded_marker`]'s task-id
@@ -628,8 +649,8 @@ pub fn write_review_loaded_marker(
         std::fs::rename(&tmp_path, marker).map_err(Error::Io)?;
         return Ok(());
     }
-    // Remote slot: mkdir -p the .claude dir, then atomically write via a temp
-    // file + mv, all through one `sh -c` so it's a single round-trip.
+    // Remote slot: mkdir -p the marker's `.shelbi/` dir, then atomically write
+    // via a temp file + mv, all through one `sh -c` so it's a single round-trip.
     let esc = shelbi_core::shell_escape;
     let dir_esc = dir
         .map(|d| esc(&d.to_string_lossy()))
@@ -661,7 +682,7 @@ pub fn clear_review_loaded_marker(host: &Host, marker: &Path) -> Result<()> {
 }
 
 /// The agent-written **transition** marker for a workspace:
-/// `<worktree>/.claude/shelbi-transition`.
+/// `<worktree>/.shelbi/shelbi-transition`.
 ///
 /// Where [`workspace_ready_marker`] is the forward-only "I'm done, move me to
 /// review" handoff, this marker lets an agent request an *arbitrary* status
@@ -698,13 +719,28 @@ pub fn clear_review_loaded_marker(host: &Host, marker: &Path) -> Result<()> {
 ///
 /// ```sh
 /// printf '%s\n%s\n' <task-id> <target-status> \
-///   > .claude/shelbi-transition.tmp && mv .claude/shelbi-transition.tmp .claude/shelbi-transition
+///   > .shelbi/shelbi-transition.tmp && mv .shelbi/shelbi-transition.tmp .shelbi/shelbi-transition
 /// ```
 ///
-/// It lives under `.claude/` for the same reason as the other markers: that
-/// directory is shelbi's gitignored deploy footprint, so the marker never
-/// dirties the worktree between tasks and never trips a clean-worktree check.
+/// It lives under `.shelbi/` for the same reason as the other markers: that
+/// directory is shelbi's gitignored per-worktree runtime scratch, so the marker
+/// never dirties the worktree between tasks and never trips a clean-worktree
+/// check.
 pub fn workspace_transition_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
+    workspace_worktree(machine, workspace)
+        .join(".shelbi")
+        .join("shelbi-transition")
+}
+
+/// The pre-move location of the transition marker,
+/// `<worktree>/.shelbi/shelbi-transition`. See [`legacy_workspace_ready_marker`]:
+/// a gate worker dispatched before the markers moved to `.shelbi/` still writes
+/// here, so the poller reads it as a fallback and dispatch clears it alongside
+/// the new one during the transition. Remove in a later release.
+pub fn legacy_workspace_transition_marker(
+    machine: &Machine,
+    workspace: &WorkspaceSpec,
+) -> PathBuf {
     workspace_worktree(machine, workspace)
         .join(".claude")
         .join("shelbi-transition")
@@ -2533,11 +2569,20 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //     block standing up the workspace.
     let marker = workspace_ready_marker(&machine, spec.workspace);
     let _ = clear_ready_marker(&host, &marker);
+    // Also clear the pre-move `.claude/` location: a worktree last used before
+    // the markers moved to `.shelbi/` may still carry a stale legacy marker the
+    // poller's transition fallback would otherwise misread. Remove with the
+    // fallback in a later release.
+    let _ = clear_ready_marker(&host, &legacy_workspace_ready_marker(&machine, spec.workspace));
     // Same for any stale agent-transition marker — a fresh dispatch must not
     // inherit a bounce request left behind by the previous task on this worktree.
     let _ = clear_transition_marker(
         &host,
         &workspace_transition_marker(&machine, spec.workspace),
+    );
+    let _ = clear_transition_marker(
+        &host,
+        &legacy_workspace_transition_marker(&machine, spec.workspace),
     );
 
     // 1. Make sure the worktree exists + is on the right branch, clean.
@@ -2702,11 +2747,17 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // any marker present is stale. Best-effort.
     let marker = workspace_ready_marker(&machine, spec.workspace);
     let _ = clear_ready_marker(&host, &marker);
+    // Also clear the pre-move `.claude/` location (see the dispatch path).
+    let _ = clear_ready_marker(&host, &legacy_workspace_ready_marker(&machine, spec.workspace));
     // Same for any stale agent-transition marker — a resumed task is still
     // in-progress, so any transition request present is stale. Best-effort.
     let _ = clear_transition_marker(
         &host,
         &workspace_transition_marker(&machine, spec.workspace),
+    );
+    let _ = clear_transition_marker(
+        &host,
+        &legacy_workspace_transition_marker(&machine, spec.workspace),
     );
 
     // Preserve the worktree: don't reset the branch, don't bail on a dirty
@@ -5416,7 +5467,7 @@ fn scp_text_to_remote(
 /// and then mark itself done.
 ///
 /// The handoff is a file marker, not a pane title or a `shelbi` CLI call.
-/// The workspace writes its task id into `<worktree>/.claude/shelbi-ready`
+/// The workspace writes its task id into `<worktree>/.shelbi/shelbi-ready`
 /// (see [`workspace_ready_marker`]); the hub poller picks it up and moves the
 /// task to the review column. This survives Claude's own OSC pane-title
 /// writes and the Stop hook, both of which used to clobber a `shelbi:review`
@@ -5616,6 +5667,13 @@ fn compose_prompt(
         );
     }
     let marker_esc = shelbi_agent::shell_escape(&marker.to_string_lossy());
+    // The marker lives under the worktree's `.shelbi/` scratch dir, which is
+    // created lazily (not guaranteed present on a fresh dev dispatch), so the
+    // write `mkdir -p`s its parent first — harmless when it already exists.
+    let marker_dir_esc = marker
+        .parent()
+        .map(|d| shelbi_agent::shell_escape(&d.to_string_lossy()))
+        .unwrap_or_else(|| shelbi_agent::shell_escape("."));
     // Write to a sibling temp file and `mv` it into place so the poller
     // never `cat`s a half-written marker (a torn body would fail
     // `validate_task_id` in `read_ready_marker` and stall the handoff).
@@ -5647,7 +5705,7 @@ fn compose_prompt(
          2. Signal that it's ready for handoff by writing the task id to the \
          ready marker file:\n\
          \n\
-         printf '%s\\n' {id_esc} > {marker_tmp_esc} && mv {marker_tmp_esc} {marker_esc}\n\
+         mkdir -p {marker_dir_esc} && printf '%s\\n' {id_esc} > {marker_tmp_esc} && mv {marker_tmp_esc} {marker_esc}\n\
          \n\
          The hub watches for this file and moves your task to the review \
          column on its next poll. Write the marker once; you can keep \
@@ -5659,7 +5717,7 @@ fn compose_prompt(
 /// The completion section for an agent-owned active **gate** (e.g.
 /// `adversarial-review`) — see [`HandoffPlan::Gate`]. The gate records a pass /
 /// reject verdict with the **transition marker**
-/// (`<worktree>/.claude/shelbi-transition`, derived here as the ready marker's
+/// (`<worktree>/.shelbi/shelbi-transition`, derived here as the ready marker's
 /// sibling): a pass advances to the configured next status, a rejection returns
 /// to the configured previous status.
 ///
@@ -5686,9 +5744,15 @@ fn compose_gate_prompt(
     reject_name: &str,
     polling_section: &str,
 ) -> String {
-    // The transition marker is the ready marker's sibling under `.claude/`.
+    // The transition marker is the ready marker's sibling under `.shelbi/`.
     let trans = marker.with_file_name("shelbi-transition");
     let trans_esc = shelbi_agent::shell_escape(&trans.to_string_lossy());
+    // `.shelbi/` is created lazily, so each write `mkdir -p`s the marker's
+    // parent first (harmless when it already exists).
+    let trans_dir_esc = trans
+        .parent()
+        .map(|d| shelbi_agent::shell_escape(&d.to_string_lossy()))
+        .unwrap_or_else(|| shelbi_agent::shell_escape("."));
     let trans_tmp = {
         let mut s = trans.as_os_str().to_owned();
         s.push(".tmp");
@@ -5715,11 +5779,11 @@ fn compose_gate_prompt(
          \n\
          1. **Pass** — advance the task to `{pass_name}`:\n\
          \n\
-         printf '%s\\n%s\\n' {id_esc} {pass_esc} > {trans_tmp_esc} && mv {trans_tmp_esc} {trans_esc}\n\
+         mkdir -p {trans_dir_esc} && printf '%s\\n%s\\n' {id_esc} {pass_esc} > {trans_tmp_esc} && mv {trans_tmp_esc} {trans_esc}\n\
          \n\
          2. **Reject** — send the task back to `{reject_name}`:\n\
          \n\
-         printf '%s\\n%s\\n' {id_esc} {reject_esc} > {trans_tmp_esc} && mv {trans_tmp_esc} {trans_esc}\n\
+         mkdir -p {trans_dir_esc} && printf '%s\\n%s\\n' {id_esc} {reject_esc} > {trans_tmp_esc} && mv {trans_tmp_esc} {trans_esc}\n\
          \n\
          The hub watches for this file and moves your task on its next poll. \
          Write exactly one marker, once — do not write both, and do not write a \
@@ -7219,7 +7283,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_task_id_branch_and_ready_marker_instruction() {
-        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-ready");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready");
         let prompt = compose_prompt(
             "fix-login",
             "shelbi/fix-login",
@@ -7234,7 +7298,7 @@ mod tests {
         assert!(prompt.contains("fix-login"));
         assert!(prompt.contains("shelbi/fix-login"));
         // Hands off via the file marker, not the old pane-title / CLI path.
-        assert!(prompt.contains(".claude/shelbi-ready"));
+        assert!(prompt.contains(".shelbi/shelbi-ready"));
         assert!(prompt.contains("printf"));
         assert!(!prompt.contains("shelbi task move"));
         assert!(prompt.contains("\n---\n"));
@@ -7245,7 +7309,7 @@ mod tests {
 
     #[test]
     fn prompt_falls_back_to_task_id_heading_when_body_empty() {
-        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-ready");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready");
         let prompt = compose_prompt(
             "fix-login",
             "shelbi/fix-login",
@@ -7257,12 +7321,12 @@ mod tests {
             &HandoffPlan::Developer,
         );
         assert!(prompt.contains("# Task fix-login"));
-        assert!(prompt.contains(".claude/shelbi-ready"));
+        assert!(prompt.contains(".shelbi/shelbi-ready"));
     }
 
     #[test]
     fn polling_runner_prompt_includes_message_log_instructions() {
-        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-ready");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready");
         let prompt = compose_prompt(
             "fix-login",
             "shelbi/fix-login",
@@ -7274,7 +7338,7 @@ mod tests {
             &HandoffPlan::Developer,
         );
         // Still hands off the same way, and still rebases first.
-        assert!(prompt.contains(".claude/shelbi-ready"));
+        assert!(prompt.contains(".shelbi/shelbi-ready"));
         assert!(prompt.contains("git rebase origin/main"));
         // Concrete poll cadence + the per-task log/cursor paths.
         assert!(prompt.contains("After every shell command"));
@@ -7307,7 +7371,7 @@ mod tests {
         // ordering (rebase → marker) and the exact command so a future
         // prompt rewording can't quietly drop the rebase or invert the
         // sequence.
-        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-ready");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready");
         let prompt = compose_prompt(
             "fix-login",
             "shelbi/fix-login",
@@ -7343,7 +7407,7 @@ mod tests {
         // marker, bouncing the card back to review and re-triggering the
         // stranded-review-slot resume. The task body still rides along (it's
         // what's being reviewed).
-        let marker = PathBuf::from("/work/myapp/.shelbi/wt/review-1/.claude/shelbi-ready");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/review-1/.shelbi/shelbi-ready");
         let prompt = compose_prompt(
             "fix-login",
             "shelbi/fix-login",
@@ -7384,7 +7448,7 @@ mod tests {
         // transition marker. It must NOT be handed the developer's rebase +
         // ready-marker handoff — that is exactly what made a gate agent resume
         // implementation work (#1311).
-        let marker = PathBuf::from("/work/myapp/.shelbi/wt/adv-1/.claude/shelbi-ready");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/adv-1/.shelbi/shelbi-ready");
         let prompt = compose_prompt(
             "fix-login",
             "shelbi/fix-login",
@@ -7417,10 +7481,10 @@ mod tests {
             !prompt.contains("shelbi-ready"),
             "gate must not write the developer ready marker: {prompt}"
         );
-        // Both verdicts go through the transition marker (its `.claude/`
-        // sibling), targeting the derived pass/reject status ids.
+        // Both verdicts go through the transition marker (the ready marker's
+        // `.shelbi/` sibling), targeting the derived pass/reject status ids.
         assert!(
-            prompt.contains("/work/myapp/.shelbi/wt/adv-1/.claude/shelbi-transition"),
+            prompt.contains("/work/myapp/.shelbi/wt/adv-1/.shelbi/shelbi-transition"),
             "gate must write the transition marker: {prompt}"
         );
         assert!(
@@ -7455,7 +7519,7 @@ transitions:
   - { from: review-app,         to: in-progress,        actions: [] }
 "#;
         let wf = shelbi_core::Workflow::from_yaml_str(yaml).unwrap();
-        let marker = PathBuf::from("/work/myapp/.shelbi/wt/adv-1/.claude/shelbi-ready");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/adv-1/.shelbi/shelbi-ready");
 
         // Build the gate plan exactly as `classify_handoff` does, from the
         // resolved statuses, for whichever gate the task is sitting in.
@@ -7527,7 +7591,7 @@ transitions:
         // safety language and the dynamic pass/reject transitions, with no
         // developer-role wording. Exercise the full prompt a worker would
         // receive: composed agent instructions + the gate body (`compose_prompt`).
-        let marker = PathBuf::from("/work/myapp/.shelbi/wt/adv-1/.claude/shelbi-ready");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/adv-1/.shelbi/shelbi-ready");
         let body = compose_prompt(
             "fix-login",
             "shelbi/fix-login",
@@ -7584,7 +7648,7 @@ transitions:
     fn prompt_uses_projects_default_branch_for_rebase_target() {
         // Not every project's main branch is named `main` — verify the
         // command picks up `default_branch` rather than hard-coding it.
-        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-ready");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready");
         let prompt = compose_prompt(
             "fix-login",
             "shelbi/fix-login",
@@ -7669,7 +7733,7 @@ transitions:
         );
 
         // And the composed prompt threads it into the actual rebase command.
-        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-ready");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready");
         let prompt = compose_prompt(
             "rust-ui-app-name",
             "shelbi/rust-ui-app-name",
@@ -7724,7 +7788,7 @@ transitions:
         // and (c) keep the identical rebase + review-marker handoff so the
         // resume path can't drift from the dev-start path on the load-bearing
         // bits.
-        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-ready");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready");
         let prompt = compose_resume_prompt(
             "fix-login",
             "shelbi/fix-login",
@@ -7749,7 +7813,7 @@ transitions:
             "handoff rebase missing: {prompt}"
         );
         assert!(
-            prompt.contains(".claude/shelbi-ready"),
+            prompt.contains(".shelbi/shelbi-ready"),
             "marker missing: {prompt}"
         );
         // The banner is a preamble — it precedes the body + handoff.
@@ -7763,7 +7827,7 @@ transitions:
 
     #[test]
     fn resume_prompt_banner_wording_depends_on_conversation_resume() {
-        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-ready");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready");
         // conversation_resumed = true (claude --continue): point at the
         // conversation above.
         let resumed = compose_resume_prompt(
@@ -7974,12 +8038,12 @@ transitions:
     }
 
     #[test]
-    fn ready_marker_lives_under_gitignored_claude_dir() {
+    fn ready_marker_lives_under_gitignored_shelbi_dir() {
         let p = fixture_project();
         let marker = workspace_ready_marker(&p.machines[0], &p.workspaces[0]);
         assert_eq!(
             marker,
-            PathBuf::from("/tmp/myapp/.shelbi/wt/alice/.claude/shelbi-ready")
+            PathBuf::from("/tmp/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready")
         );
     }
 
@@ -8095,8 +8159,8 @@ transitions:
                 .unwrap()
                 .as_nanos()
         ));
-        // Marker lives under a `.claude` subdir that write_ must create.
-        let marker = dir.join(".claude").join("shelbi-review-loaded");
+        // Marker lives under a `.shelbi` subdir that write_ must create.
+        let marker = dir.join(".shelbi").join("shelbi-review-loaded");
 
         // With a URL.
         write_review_loaded_marker(
@@ -8179,12 +8243,12 @@ transitions:
     }
 
     #[test]
-    fn workspace_review_loaded_marker_path_is_under_the_claude_dir() {
+    fn workspace_review_loaded_marker_path_is_under_the_shelbi_dir() {
         let p = fixture_with_tagged_workspaces();
         let review = p.workspaces.iter().find(|w| w.name == "review-1").unwrap();
         assert_eq!(
             workspace_review_loaded_marker(&p.machines[0], review),
-            PathBuf::from("/tmp/myapp/.shelbi/wt/review-1/.claude/shelbi-review-loaded")
+            PathBuf::from("/tmp/myapp/.shelbi/wt/review-1/.shelbi/shelbi-review-loaded")
         );
     }
 
@@ -8216,13 +8280,50 @@ transitions:
     }
 
     #[test]
-    fn transition_marker_lives_under_gitignored_claude_dir() {
+    fn transition_marker_lives_under_gitignored_shelbi_dir() {
         let p = fixture_with_tagged_workspaces();
         let r1 = p.workspaces.iter().find(|w| w.name == "review-1").unwrap();
         let marker = workspace_transition_marker(&p.machines[0], r1);
         assert_eq!(
             marker,
-            PathBuf::from("/tmp/myapp/.shelbi/wt/review-1/.claude/shelbi-transition")
+            PathBuf::from("/tmp/myapp/.shelbi/wt/review-1/.shelbi/shelbi-transition")
+        );
+    }
+
+    #[test]
+    fn all_sidecar_markers_live_under_the_shelbi_dir() {
+        // The deferral / refusal / push-blocked sidecars share the ready
+        // marker's `.shelbi/` home so none of them dirty the worktree.
+        let p = fixture_project();
+        let ws = &p.workspaces[0];
+        let base = PathBuf::from("/tmp/myapp/.shelbi/wt/alice/.shelbi");
+        assert_eq!(
+            workspace_ready_deferred_marker(&p.machines[0], ws),
+            base.join("shelbi-ready-deferred")
+        );
+        assert_eq!(
+            workspace_ready_refused_marker(&p.machines[0], ws),
+            base.join("shelbi-ready-refused")
+        );
+        assert_eq!(
+            workspace_push_blocked_marker(&p.machines[0], ws),
+            base.join("shelbi-push-blocked")
+        );
+    }
+
+    #[test]
+    fn legacy_marker_builders_point_at_the_pre_move_claude_dir() {
+        // The transition fallback reads (and dispatch clears) the pre-move
+        // `.claude/` location for workers dispatched before the markers moved.
+        let p = fixture_project();
+        let ws = &p.workspaces[0];
+        assert_eq!(
+            legacy_workspace_ready_marker(&p.machines[0], ws),
+            PathBuf::from("/tmp/myapp/.shelbi/wt/alice/.claude/shelbi-ready")
+        );
+        assert_eq!(
+            legacy_workspace_transition_marker(&p.machines[0], ws),
+            PathBuf::from("/tmp/myapp/.shelbi/wt/alice/.claude/shelbi-transition")
         );
     }
 
@@ -8304,7 +8405,7 @@ transitions:
         // it into place — a rename within one directory is atomic, so the
         // poller never `cat`s a half-written body (which would fail
         // `validate_task_id` and stall the handoff).
-        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-ready");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready");
         let prompt = compose_prompt(
             "fix-login",
             "shelbi/fix-login",
@@ -8318,11 +8419,18 @@ transitions:
         assert!(
             prompt.contains(
                 "printf '%s\\n' fix-login > \
-                 /work/myapp/.shelbi/wt/alice/.claude/shelbi-ready.tmp && \
-                 mv /work/myapp/.shelbi/wt/alice/.claude/shelbi-ready.tmp \
-                 /work/myapp/.shelbi/wt/alice/.claude/shelbi-ready"
+                 /work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready.tmp && \
+                 mv /work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready.tmp \
+                 /work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready"
             ),
             "marker write is not atomic (tmp + mv): {prompt}"
+        );
+        // The `.shelbi/` scratch dir is created lazily, so the write `mkdir -p`s
+        // the marker's parent first (it is not guaranteed to exist on a fresh
+        // dev dispatch, unlike the old `.claude/` deploy footprint).
+        assert!(
+            prompt.contains("mkdir -p /work/myapp/.shelbi/wt/alice/.shelbi && printf"),
+            "marker write must mkdir -p its .shelbi/ parent first: {prompt}"
         );
     }
 
@@ -11097,7 +11205,7 @@ mod rebase_git_tests {
     #[test]
     fn dirty_only_in_dot_claude_is_ignored() {
         // shelbi's own deploy footprint lives under `.claude/` (settings,
-        // review marker). It's gitignored in normal use, but if a user
+        // agent-instructions). It's gitignored in normal use, but if a user
         // hasn't ignored it yet we still don't want it blocking a rebase
         // — same carve-out the review preflight applies.
         if !git_available() {
@@ -11112,10 +11220,10 @@ mod rebase_git_tests {
         commit_file(&repo, "prereq.txt", "prereq\n", "prereq");
         run_git_in(&repo, &["checkout", "-q", "feature"]);
 
-        // Drop a marker-style file under .claude/. It's untracked, but
+        // Drop a shelbi deploy file under .claude/. It's untracked, but
         // the carve-out skips it from the dirty check.
         std::fs::create_dir_all(repo.join(".claude")).unwrap();
-        std::fs::write(repo.join(".claude/shelbi-ready"), "task-id\n").unwrap();
+        std::fs::write(repo.join(".claude/settings.json"), "{}\n").unwrap();
 
         let outcome = rebase_workspace_branch_onto_default(&Host::Local, &repo, "main");
         assert!(
@@ -13429,11 +13537,14 @@ mod handoff_readiness_git_tests {
         run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
         commit_file(&repo, "feature.txt", "hi\n", "feature work");
 
-        // shelbi's own footprint alone must NOT count as uncommitted work.
+        // shelbi's own footprint alone must NOT count as uncommitted work:
+        // the `.claude/` deploy files plus everything in the `.shelbi/` runtime
+        // scratch, which now includes the per-worktree handoff markers.
         std::fs::create_dir_all(repo.join(".claude")).unwrap();
-        std::fs::write(repo.join(".claude").join("shelbi-ready"), "feature\n").unwrap();
+        std::fs::write(repo.join(".claude").join("settings.json"), "{}\n").unwrap();
         std::fs::create_dir_all(repo.join(".shelbi").join("messages")).unwrap();
         std::fs::write(repo.join(".shelbi").join("pr-body.md"), "pr\n").unwrap();
+        std::fs::write(repo.join(".shelbi").join("shelbi-ready"), "feature\n").unwrap();
         assert_eq!(
             verify_worktree_ready_for_handoff(&Host::Local, &repo, "feature", "main"),
             HandoffReadiness::Ready,
