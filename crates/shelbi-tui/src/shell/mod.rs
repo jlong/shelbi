@@ -1291,7 +1291,10 @@ impl ShellState {
                     self.dirty = true;
                 }
                 Event::Mouse(m) => {
-                    let area = self.main_rect;
+                    // Overlays center on the full window (sidebar + main), so
+                    // hit-test against that same rect — clicks land on the right
+                    // row even where the overlay covers the sidebar.
+                    let area = self.full_area();
                     let outcome = self.overlay.as_mut().unwrap().handle_mouse(m, area);
                     self.apply_overlay_event(outcome);
                     self.dirty = true;
@@ -2834,6 +2837,20 @@ impl ShellState {
         }
     }
 
+    /// The full shell area: the sidebar and the main pane combined (below the
+    /// lost-login banner, if any). Overlays center on this so a popover sits in
+    /// the middle of the whole window rather than off to the right in the main
+    /// area. The two rects share a top and height, so the union is the sidebar's
+    /// origin spanning both widths.
+    fn full_area(&self) -> Rect {
+        Rect {
+            x: self.sidebar_rect.x,
+            y: self.sidebar_rect.y,
+            width: self.sidebar_rect.width + self.main_rect.width,
+            height: self.main_rect.height.max(self.sidebar_rect.height),
+        }
+    }
+
     /// Whether `(col, row)` lands on the draggable divider between the sidebar
     /// and the main pane.
     fn on_divider(&self, col: u16, row: u16) -> bool {
@@ -3281,8 +3298,11 @@ fn draw(
         }
 
         // An open overlay draws over the dimmed main area and owns the cursor.
+        // It centers on the full window (sidebar + main), so it is handed `area`
+        // (both columns) rather than just `main_rect`; the sidebar was drawn
+        // above and the overlay's own `Clear` covers it where they overlap.
         if let Some(ov) = overlay.as_mut() {
-            ov.render(frame, main_rect);
+            ov.render(frame, area);
         } else if let Some((x, y)) = cursor {
             frame.set_cursor_position(Position::new(x, y));
         }
@@ -4170,6 +4190,25 @@ mod tests {
         ));
         std::fs::create_dir_all(&home).unwrap();
         home
+    }
+
+    #[test]
+    fn full_area_spans_the_sidebar_and_main_pane() {
+        // The overlay-centering rect is the union of the two columns, so a
+        // popover centers across the whole window rather than only the main
+        // area. Sidebar [0,28), main [28,120): the union is the full 120-wide
+        // window, and its center is well left of the main area's center.
+        let mut st = test_state();
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        st.main_rect = Rect::new(28, 0, 92, 20);
+        let full = st.full_area();
+        assert_eq!(full, Rect::new(0, 0, 120, 20));
+        let full_center = full.x + full.width / 2;
+        let main_center = st.main_rect.x + st.main_rect.width / 2;
+        assert!(
+            full_center < main_center,
+            "the full-window center ({full_center}) must sit left of the main-area center ({main_center})"
+        );
     }
 
     #[test]

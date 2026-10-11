@@ -1,8 +1,9 @@
 //! The single-process TUI's in-process overlays (removing-tmux Phase 4d).
 //!
 //! The shell holds one [`ActiveOverlay`] at a time, feeds it keys/mouse from the
-//! one event loop, draws it over the main area, and acts on the [`OverlayEvent`]
-//! it yields. Each variant wraps a shared overlay type from [`crate::overlay`],
+//! one event loop, draws it centered over the full window (sidebar + main area),
+//! and acts on the [`OverlayEvent`] it yields. Each variant wraps a shared
+//! overlay type from [`crate::overlay`],
 //! so the in-process overlays and the legacy tmux popups run the exact same
 //! rendering and decision logic.
 //!
@@ -354,9 +355,12 @@ impl ActiveOverlay {
         }
     }
 
-    /// The rect this overlay occupies within `area` (the main area). Most are
-    /// centered with sizes mirroring the tmux popups' dimensions; the palette is
-    /// the exception — it is top-aligned and sized to its content.
+    /// The rect this overlay occupies within `area` — the full shell window
+    /// (sidebar + main area), so a popover is centered across the whole window
+    /// rather than off to the right in the main area. Most are centered with
+    /// sizes mirroring the tmux popups' dimensions; the palette is the exception
+    /// — it is top-aligned and sized to its content (still centered on the full
+    /// width).
     fn rect(&self, area: Rect) -> Rect {
         match self {
             // Top-aligned and sized to its content: the palette owns its own
@@ -765,6 +769,44 @@ mod tests {
         })
         .unwrap();
         (term.backend().buffer().clone(), rect)
+    }
+
+    /// Every overlay centers on the full frame area it is handed (sidebar +
+    /// main), not on just the main area — so a popover sits in the middle of the
+    /// whole window. Horizontal centering holds for all of them; the centered
+    /// (non-top-aligned) ones are vertically centered too, while the palette
+    /// stays top-aligned.
+    #[test]
+    fn overlay_rects_center_on_the_full_frame_area() {
+        // A wide frame where a main-area-only center would land well to the
+        // right of the window center, so centering on the full area is the only
+        // way this passes.
+        let area = Rect::new(0, 0, 120, 40);
+        let hcenter = area.x as i32 + area.width as i32 / 2;
+        let vcenter = area.y as i32 + area.height as i32 / 2;
+        for ov in every_overlay() {
+            let is_palette = matches!(ov, ActiveOverlay::Palette(_));
+            let r = ov.rect(area);
+            let r_hcenter = r.x as i32 + r.width as i32 / 2;
+            assert!(
+                (r_hcenter - hcenter).abs() <= 1,
+                "overlay not horizontally centered on the full area: rect={r:?}, area={area:?}"
+            );
+            if !is_palette {
+                let r_vcenter = r.y as i32 + r.height as i32 / 2;
+                assert!(
+                    (r_vcenter - vcenter).abs() <= 1,
+                    "overlay not vertically centered on the full area: rect={r:?}, area={area:?}"
+                );
+            } else {
+                // The palette is top-aligned: it starts near the top, not the
+                // vertical middle.
+                assert!(
+                    r.y < vcenter as u16,
+                    "the palette should stay top-aligned: rect={r:?}"
+                );
+            }
+        }
     }
 
     #[test]
