@@ -36,6 +36,27 @@ const ALT: KeyModifiers = KeyModifiers::ALT;
 const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
 const SUPER: KeyModifiers = KeyModifiers::SUPER;
 
+/// The readiness marker the raw-`cat` child prints to its PTY *after*
+/// `stty raw -echo` has taken effect. Seeing it on an observer proves the line
+/// discipline is already raw/no-echo, so keys sent afterward echo back verbatim
+/// instead of being cooked into caret notation (`^C`, `^[`) or swallowed by the
+/// canonical line buffer. Chosen from uppercase ASCII + `-` only, so it can
+/// never collide with any key byte the tests send and assert on.
+const READY_MARKER: &[u8] = b"SHELBI-READY";
+
+/// The child argv for a raw, no-echo `cat` that announces when it is ready. The
+/// PTY passes control bytes through untouched (no ISIG, no canonical mode) and
+/// echoes exactly what it reads; the `printf` runs only once `stty raw -echo`
+/// has switched the line discipline, so [`READY_MARKER`] on the stream means the
+/// race window — keys landing before `stty` runs — is closed.
+fn raw_cat_argv() -> Vec<String> {
+    vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "stty raw -echo 2>/dev/null; printf 'SHELBI-READY\\n'; exec cat".into(),
+    ]
+}
+
 /// A connector that binds the shell's main area straight to an already-running
 /// session socket (the production [`super::session::LiveConnector`] discovers by
 /// name; here the test knows the exact socket).
@@ -122,49 +143,16 @@ fn every_key_but_ctrl_space_reaches_the_agent_over_a_real_pty() {
 
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("SHELBI_HOME", home.path());
-    let name = "tuikeys/orch";
-    let id = shelbi_session::layout::derive_id_now(name);
-    let paths = SessionPaths::new(&home.path().join("sessions"), &id);
-
     // A raw, no-echo `cat`: the PTY passes control bytes through untouched (no
-    // ISIG, no canonical mode) and echoes exactly what it reads.
-    let args = RunArgs {
-        id: id.clone(),
-        name: name.to_string(),
-        cwd: std::env::temp_dir(),
-        cols: 80,
-        rows: 24,
-        task: None,
-        raw_output_log: false,
-        child_argv: vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "stty raw -echo 2>/dev/null; exec cat".into(),
-        ],
-        // In-process: no daemon watchdog racing our per-test `SHELBI_HOME`.
-        manage_daemon: false,
-    };
-    let _session = std::thread::spawn(move || shelbi_session::run(args));
-    let sock = paths.sock();
-    // Generous deadline: the PTY session spawns on a worker thread, and under a
-    // loaded host (several workers plus a parallel `cargo build` saturating the
-    // CPU) its socket can take several seconds to bind. A tight 5s wait flaked
-    // here; this returns the instant the socket appears, so a healthy run is
-    // unaffected.
-    wait_for(Duration::from_secs(30), || sock.exists().then_some(()))
-        .expect("the session socket should appear");
+    // ISIG, no canonical mode) and echoes exactly what it reads. `spawn_cat` +
+    // `attach_observer` block until the child has reached raw mode, so no key is
+    // sent while the line discipline is still cooking input.
+    let sock = spawn_cat(home.path(), "tuikeys/orch");
     let _cleanup = Cleanup { sock: sock.clone() };
 
-    // An independent observer that watches the echoed PTY output.
-    let (observer, obs_events) =
-        Connection::open(&sock, None, capability::ALL).expect("observer connects");
-    observer.attach(None).expect("observer attaches");
-    // Drain the attach resync so only live output lands in `out`.
-    wait_for(Duration::from_secs(2), || {
-        obs_events
-            .try_recv()
-            .and_then(|ev| matches!(ev, SessionEvent::Resync { .. }).then_some(()))
-    });
+    // An independent observer that watches the echoed PTY output. It returns
+    // past the readiness marker, so only live output lands in `out`.
+    let (_observer, obs_events) = attach_observer(&sock);
     let mut out: Vec<u8> = Vec::new();
 
     // Drive the shell's real input path against this session.
@@ -309,44 +297,9 @@ fn a_copy_chord_with_a_selection_is_not_forwarded_to_the_agent() {
 
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("SHELBI_HOME", home.path());
-    let name = "tuicopy/orch";
-    let id = shelbi_session::layout::derive_id_now(name);
-    let paths = SessionPaths::new(&home.path().join("sessions"), &id);
-
-    let args = RunArgs {
-        id: id.clone(),
-        name: name.to_string(),
-        cwd: std::env::temp_dir(),
-        cols: 80,
-        rows: 24,
-        task: None,
-        raw_output_log: false,
-        child_argv: vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "stty raw -echo 2>/dev/null; exec cat".into(),
-        ],
-        manage_daemon: false,
-    };
-    let _session = std::thread::spawn(move || shelbi_session::run(args));
-    let sock = paths.sock();
-    // Generous deadline: the PTY session spawns on a worker thread, and under a
-    // loaded host (several workers plus a parallel `cargo build` saturating the
-    // CPU) its socket can take several seconds to bind. A tight 5s wait flaked
-    // here; this returns the instant the socket appears, so a healthy run is
-    // unaffected.
-    wait_for(Duration::from_secs(30), || sock.exists().then_some(()))
-        .expect("the session socket should appear");
+    let sock = spawn_cat(home.path(), "tuicopy/orch");
     let _cleanup = Cleanup { sock: sock.clone() };
-
-    let (observer, obs_events) =
-        Connection::open(&sock, None, capability::ALL).expect("observer connects");
-    observer.attach(None).expect("observer attaches");
-    wait_for(Duration::from_secs(2), || {
-        obs_events
-            .try_recv()
-            .and_then(|ev| matches!(ev, SessionEvent::Resync { .. }).then_some(()))
-    });
+    let (_observer, obs_events) = attach_observer(&sock);
     let mut out: Vec<u8> = Vec::new();
 
     let caps = Caps { kitty: true, truecolor: true, nested: None };
@@ -360,7 +313,10 @@ fn a_copy_chord_with_a_selection_is_not_forwarded_to_the_agent() {
 
     // Put "hello world" in the pane (cat echoes it; `pump` feeds the output into
     // the emulator) and wait until the pane's selection machinery can see it.
-    st.sessions.send_input(b"hello world");
+    // Clear + home first so the readiness marker the child left on row 0 does not
+    // sit under the cells this test selects by coordinate — `cat` echoes the
+    // sequence and the emulator applies it, landing "hello world" at row 0, col 0.
+    st.sessions.send_input(b"\x1b[2J\x1b[Hhello world");
     let sz = Size::new(80, 24);
     let has_text = wait_for(Duration::from_secs(5), || {
         pump(&mut st);
@@ -425,44 +381,9 @@ fn focus_chords_are_not_forwarded_but_backspace_is() {
 
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("SHELBI_HOME", home.path());
-    let name = "tuifocus/orch";
-    let id = shelbi_session::layout::derive_id_now(name);
-    let paths = SessionPaths::new(&home.path().join("sessions"), &id);
-
-    let args = RunArgs {
-        id: id.clone(),
-        name: name.to_string(),
-        cwd: std::env::temp_dir(),
-        cols: 80,
-        rows: 24,
-        task: None,
-        raw_output_log: false,
-        child_argv: vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "stty raw -echo 2>/dev/null; exec cat".into(),
-        ],
-        manage_daemon: false,
-    };
-    let _session = std::thread::spawn(move || shelbi_session::run(args));
-    let sock = paths.sock();
-    // Generous deadline: the PTY session spawns on a worker thread, and under a
-    // loaded host (several workers plus a parallel `cargo build` saturating the
-    // CPU) its socket can take several seconds to bind. A tight 5s wait flaked
-    // here; this returns the instant the socket appears, so a healthy run is
-    // unaffected.
-    wait_for(Duration::from_secs(30), || sock.exists().then_some(()))
-        .expect("the session socket should appear");
+    let sock = spawn_cat(home.path(), "tuifocus/orch");
     let _cleanup = Cleanup { sock: sock.clone() };
-
-    let (observer, obs_events) =
-        Connection::open(&sock, None, capability::ALL).expect("observer connects");
-    observer.attach(None).expect("observer attaches");
-    wait_for(Duration::from_secs(2), || {
-        obs_events
-            .try_recv()
-            .and_then(|ev| matches!(ev, SessionEvent::Resync { .. }).then_some(()))
-    });
+    let (_observer, obs_events) = attach_observer(&sock);
     let mut out: Vec<u8> = Vec::new();
 
     let caps = Caps { kitty: true, truecolor: true, nested: None };
@@ -530,7 +451,9 @@ fn focus_chords_are_not_forwarded_but_backspace_is() {
 // echoes exactly the bytes it receives, so an observer sees what the agent got.
 
 /// Spawn a raw, no-echo `cat` session named `name` under `home` and return its
-/// socket path once it is bound. The PTY echoes exactly the bytes it receives.
+/// socket path once it is bound. The PTY echoes exactly the bytes it receives;
+/// the child announces [`READY_MARKER`] after switching to raw mode (see
+/// [`raw_cat_argv`]), which [`attach_observer`] waits for.
 fn spawn_cat(home: &std::path::Path, name: &str) -> PathBuf {
     let id = shelbi_session::layout::derive_id_now(name);
     let paths = SessionPaths::new(&home.join("sessions"), &id);
@@ -542,32 +465,57 @@ fn spawn_cat(home: &std::path::Path, name: &str) -> PathBuf {
         rows: 24,
         task: None,
         raw_output_log: false,
-        child_argv: vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "stty raw -echo 2>/dev/null; exec cat".into(),
-        ],
+        child_argv: raw_cat_argv(),
+        // In-process: no daemon watchdog racing our per-test `SHELBI_HOME`.
         manage_daemon: false,
     };
     let _session = std::thread::spawn(move || shelbi_session::run(args));
     let sock = paths.sock();
+    // Generous deadline: the PTY session spawns on a worker thread, and under a
+    // loaded host (several workers plus a parallel `cargo build` saturating the
+    // CPU) its socket can take several seconds to bind. A tight 5s wait flaked
+    // here; this returns the instant the socket appears, so a healthy run is
+    // unaffected.
     wait_for(Duration::from_secs(30), || sock.exists().then_some(()))
         .expect("the session socket should appear");
     sock
 }
 
-/// Open an observer client on `sock` and drain its attach resync, so only live
-/// output lands in later `drain` calls. Returns the kept-alive connection and
-/// its event stream.
+/// Open an observer client on `sock`, then block until the raw-`cat` child's
+/// [`READY_MARKER`] has appeared — proving `stty raw -echo` has taken effect so
+/// keys sent afterward echo back verbatim. Returns the kept-alive connection and
+/// its event stream, positioned past the marker: only output produced *after*
+/// readiness lands in later [`drain`] calls.
+///
+/// The marker can arrive two ways and this handles both: the child may print it
+/// *before* this observer attaches (so it is already on screen and arrives
+/// inside the attach [`SessionEvent::Resync`] replay — which paints live cell
+/// text, so the marker's bytes appear there verbatim), or *after* the attach (so
+/// it arrives as [`SessionEvent::Output`]). Bytes from both are accumulated and
+/// checked together, so a marker split across the attach boundary still matches.
 fn attach_observer(sock: &std::path::Path) -> (Connection, SessionEvents) {
     let (observer, obs_events) =
         Connection::open(sock, None, capability::ALL).expect("observer connects");
     observer.attach(None).expect("observer attaches");
-    wait_for(Duration::from_secs(2), || {
-        obs_events
-            .try_recv()
-            .and_then(|ev| matches!(ev, SessionEvent::Resync { .. }).then_some(()))
+    let mut seen: Vec<u8> = Vec::new();
+    // Not an input-byte timeout: this gates on the child reaching raw mode. It
+    // tracks the socket-bind deadline above (the child spawn is the slow part
+    // under load); the marker follows `stty` within milliseconds of a healthy
+    // boot, so this returns the instant readiness is observed.
+    let ready = wait_for(Duration::from_secs(30), || {
+        while let Some(ev) = obs_events.try_recv() {
+            match ev {
+                SessionEvent::Resync { replay, .. } => seen.extend_from_slice(&replay),
+                SessionEvent::Output { data, .. } => seen.extend_from_slice(&data),
+                _ => {}
+            }
+        }
+        contains(&seen, READY_MARKER).then_some(())
     });
+    assert!(
+        ready.is_some(),
+        "the raw-cat child should announce readiness ({READY_MARKER:?}) after `stty raw -echo`; saw {seen:?}",
+    );
     (observer, obs_events)
 }
 
