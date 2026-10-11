@@ -417,33 +417,22 @@ pub(crate) fn render_nav_block(
     }
     let width = inner.width as usize;
     let bleed = SELECTION_BG;
-    let scount = entries.len();
 
-    let mut lines: Vec<Line> = Vec::with_capacity(crate::sidebar::nav_lines(scount));
     // The item line for entry `p` sits at nav-area offset `2p + 1`.
-    for p in 0..=scount {
-        let glyph = if selected == Some(p) {
-            Some(crate::sidebar::BLEED_ABOVE)
-        } else if p > 0 && selected == Some(p - 1) {
-            Some(crate::sidebar::BLEED_BELOW)
-        } else {
-            None
-        };
-        lines.push(match glyph {
-            Some(g) => Line::from(Span::styled(g.repeat(width), Style::default().fg(bleed))),
-            None => Line::raw(""),
+    let content: Vec<Line> = entries
+        .iter()
+        .enumerate()
+        .map(|(p, entry)| nav_block_line(entry, selected == Some(p), width, bleed))
+        .collect();
+    for p in 0..entries.len() {
+        rects.push(Rect {
+            x: area.x,
+            y: area.y + (2 * p as u16 + 1),
+            width: area.width,
+            height: 1,
         });
-        if let Some(entry) = entries.get(p) {
-            lines.push(nav_block_line(entry, selected == Some(p), width, bleed));
-            let item_y = area.y + (2 * p as u16 + 1);
-            rects.push(Rect {
-                x: area.x,
-                y: item_y,
-                width: area.width,
-                height: 1,
-            });
-        }
     }
+    let lines = crate::sidebar::bleed_block_lines(content, selected, width, bleed);
     f.render_widget(Paragraph::new(lines), inner);
     rects
 }

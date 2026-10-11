@@ -309,6 +309,18 @@ impl ActiveOverlay {
     pub fn handle_mouse(&mut self, m: MouseEvent, area: Rect) -> OverlayEvent {
         let rect = self.rect(area);
         match self {
+            ActiveOverlay::Palette(p) => {
+                if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                    match p.handle_click(rect, m.column, m.row) {
+                        overlay::palette::PaletteStep::Continue => OverlayEvent::Stay,
+                        overlay::palette::PaletteStep::Close => OverlayEvent::Close,
+                        overlay::palette::PaletteStep::FocusSidebar => OverlayEvent::FocusSidebar,
+                        overlay::palette::PaletteStep::Activate(e) => OverlayEvent::RunEntry(e),
+                    }
+                } else {
+                    OverlayEvent::Stay
+                }
+            }
             ActiveOverlay::ReviewConfirm { task_id, dialog } => {
                 if m.kind == MouseEventKind::Down(MouseButton::Left) {
                     match dialog.handle_click(rect, m.column, m.row) {
