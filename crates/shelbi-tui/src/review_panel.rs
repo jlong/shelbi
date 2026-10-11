@@ -1063,6 +1063,56 @@ mod tests {
         assert_eq!(buf[(0, title_y)].bg, Color::Reset, "left gutter is transparent");
     }
 
+    #[test]
+    fn task_info_and_folder_keep_a_two_column_right_gutter() {
+        // Title, wrapped description, and the worktree path all stay two columns
+        // clear of the right border (matching the left gutter): no text glyph
+        // lands in the two right-most columns, and the folder path never clips at
+        // the border.
+        let width = 40u16;
+        let mut app = ReviewPanel::new(
+            "/Users/jlong/Workspaces/32pixels/ContextStore/.shelbi/wt/review",
+            "Vim".to_string(),
+            true,
+            "A very long task title that would otherwise run right up against the sidebar border",
+            BODY,
+        );
+        let mut term = Terminal::new(TestBackend::new(width, 28)).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
+
+        // The title must actually reach near the border (otherwise the gutter is
+        // trivially satisfied by short text) and ellipsize within the reduced
+        // width.
+        let title_y = row_y(&rows, "A very long task title");
+        assert!(rows[title_y].contains('…'), "the long title ellipsizes: {:?}", rows[title_y]);
+        // The description was clipped, so its last visible line ends in `...`.
+        let more_y = row_y(&rows, "More");
+        assert!(
+            rows[more_y - 1].trim_end().ends_with("..."),
+            "the clipped description ends in ...: {:?}",
+            rows[more_y - 1]
+        );
+        let folder_y = row_y(&rows, "wt/review");
+        assert!(rows[folder_y].contains("..."), "the path is left-truncated: {:?}", rows[folder_y]);
+
+        // Every text-content row (title, each description line, the folder path)
+        // leaves the two right-most columns blank.
+        let mut text_rows = vec![title_y, folder_y];
+        text_rows.extend((title_y + 1)..more_y);
+        for y in text_rows {
+            for x in (width - 2)..width {
+                assert_eq!(
+                    buf[(x, y as u16)].symbol(),
+                    " ",
+                    "col {x} of row {y} ({:?}) must be blank — two-column right gutter",
+                    rows[y]
+                );
+            }
+        }
+    }
+
     // -- folder / actions --------------------------------------------------
 
     #[test]

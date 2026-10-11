@@ -619,6 +619,50 @@ mod tests {
     }
 
     #[test]
+    fn task_info_and_folder_keep_a_two_column_right_gutter() {
+        // The workspace panel shares the review panel's task-info block, so it
+        // gets the same two-column right gutter: title, wrapped description, and
+        // the worktree path all stay clear of the right border.
+        let width = 40u16;
+        let mut app = WorkspacePanel::new(
+            "/Users/jlong/Workspaces/32pixels/ContextStore/.shelbi/wt/alpha",
+            "Vim".to_string(),
+            "Developer".to_string(),
+            "A very long task title that would otherwise run right up against the sidebar border",
+            BODY,
+            in_progress(),
+        );
+        let mut term = Terminal::new(TestBackend::new(width, 28)).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
+
+        let title_y = row_y(&rows, "A very long task title");
+        assert!(rows[title_y].contains('…'), "the long title ellipsizes: {:?}", rows[title_y]);
+        let more_y = row_y(&rows, "More");
+        assert!(
+            rows[more_y - 1].trim_end().ends_with("..."),
+            "the clipped description ends in ...: {:?}",
+            rows[more_y - 1]
+        );
+        let folder_y = row_y(&rows, "wt/alpha");
+        assert!(rows[folder_y].contains("..."), "the path is left-truncated: {:?}", rows[folder_y]);
+
+        let mut text_rows = vec![title_y, folder_y];
+        text_rows.extend((title_y + 1)..more_y);
+        for y in text_rows {
+            for x in (width - 2)..width {
+                assert_eq!(
+                    buf[(x, y as u16)].symbol(),
+                    " ",
+                    "col {x} of row {y} ({:?}) must be blank — two-column right gutter",
+                    rows[y]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn diff_renders_directly_below_the_agent_switch() {
         let mut app = panel();
         let rows = render_lines(&mut app, 44, 24);

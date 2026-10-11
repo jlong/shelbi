@@ -35,6 +35,14 @@ use crate::theme::{ACCENT_CYAN, FG_SECONDARY, PALETTE_FG, SELECTION_BG};
 /// narrower 1-col inset instead (see [`nav_block_line`]).
 pub(crate) const PAD: u16 = 2;
 
+/// Right gutter (in columns) kept clear between flowing text content and the
+/// sidebar's right border, matching the left [`PAD`]. The task title, wrapped
+/// description, `More` link, and the worktree path all wrap and ellipsize
+/// within the content area **minus** this gutter, so no glyph lands against the
+/// border. Only text content observes it — the nav switches keep their
+/// edge-to-edge (1-col-inset) selection fill (see [`render_nav_block`]).
+pub(crate) const PAD_RIGHT: u16 = PAD;
+
 /// The square back button occupies three rendered lines: a lower-half-block
 /// bleed row, the button (arrow) row, and an upper-half-block bleed row.
 pub(crate) const BACK_BLOCK_H: u16 = 3;
@@ -274,7 +282,10 @@ pub(crate) fn render_task_info(
         return (0, None);
     }
     let inner_x = area.x + PAD;
-    let width = area.width.saturating_sub(PAD) as usize;
+    // Wrap and ellipsize against the content area minus both gutters so the text
+    // never lands against the right border; the render rect below is this same
+    // reduced width, keeping the two right-most columns blank.
+    let width = area.width.saturating_sub(PAD + PAD_RIGHT) as usize;
     if width == 0 {
         return (0, None);
     }
@@ -349,7 +360,9 @@ pub(crate) fn render_folder(f: &mut Frame, area: Rect, worktree: &str, selected:
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let width = area.width.saturating_sub(PAD) as usize;
+    // Left-truncate the path against the content area minus both gutters so the
+    // tail ends two columns before the border (never clipped at it).
+    let width = area.width.saturating_sub(PAD + PAD_RIGHT) as usize;
     let style = if selected {
         Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
     } else {
