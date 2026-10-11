@@ -1071,6 +1071,21 @@ impl ShellState {
     /// [`switch_project`](Self::switch_project) back to this project restores it
     /// — the per-client last-view-per-project memory the plan wants.
     fn show(&mut self, target: RowTarget) {
+        // Opening any row — a session, a native view, a review, or a workspace
+        // interface — moves keyboard focus to the main area immediately, up
+        // front, before any off-thread open work. Owning the focus move here —
+        // the one function every open path routes through (click, Enter/Space,
+        // the palette) — rather than in each match arm or only when an async
+        // open finally completes keeps focus and the focused-pane styling
+        // uniform: a review / workspace open that is slow, fails to resolve, or
+        // is already open never strands focus on the sidebar while the user
+        // waits (the async builders below re-assert it on success, but the
+        // failure and already-open paths never reach them). A machine group
+        // header only toggles its collapse state — it is not an open — so it
+        // leaves focus where it is.
+        if !matches!(target, RowTarget::Machine(_)) {
+            self.client.focus_main();
+        }
         // A dev workspace that has a running task opens the *workspace sidebar* (a
         // transient interface like review, built off-thread) rather than
         // attaching its agent session in the main area under the nav sidebar. An
@@ -1118,7 +1133,7 @@ impl ShellState {
                 };
                 self.client.set_view(view);
                 self.sessions.show(r);
-                self.client.focus_main();
+                // Focus moved to the main area up front, in `show`.
             }
             RowTarget::Native(v) => {
                 // As above: a native view also replaces the main area, so drop
@@ -1127,10 +1142,9 @@ impl ShellState {
                 self.workspace = None;
                 self.client.set_view(v.clone());
                 self.main_view = MainView::Native(v);
-                // Opening a native view takes main focus too, so the keyboard
-                // drives the board / feed / machines list immediately — the same
-                // as opening a session.
-                self.client.focus_main();
+                // Focus moved to the main area up front, in `show` — so the
+                // keyboard drives the board / feed / machines list immediately,
+                // the same as opening a session.
             }
             RowTarget::Review(id) => {
                 // Review has no `View` variant (it is a transient interface, not a
@@ -2927,9 +2941,10 @@ impl ShellState {
                         while self.client.sidebar_selection() > sel {
                             self.client.select_up();
                         }
-                        // Open it, exactly as Enter would: native views swap the
-                        // main area (focus stays on the sidebar), a session or a
-                        // review-column task attaches/opens and takes main focus.
+                        // Open it, exactly as Enter would: `show` opens the row
+                        // and moves focus to the main area for every row type —
+                        // native view, session, review, or workspace — so the
+                        // next keystroke drives what was opened.
                         if let Some(target) = view.target_at(sel) {
                             self.show(target);
                         }
@@ -4143,6 +4158,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clicking_a_nav_item_opens_it_and_moves_focus_to_main() {
+        // The live regression: a mouse click on a nav row opened the view but
+        // left keyboard focus on the sidebar, so the next keystroke kept driving
+        // the sidebar instead of the opened view. Drive the real mouse event path
+        // (`handle_event` → `handle_mouse` → `handle_sidebar_mouse`) at the row's
+        // rendered coordinates, then confirm a following key reaches the main
+        // view — the exact sequence unit tests calling `handle_key` never
+        // exercised.
+        let mut st = test_state();
+        // Lay the shell out as a draw would: a 28-col sidebar beside a 92-col
+        // main area, 40 rows tall (`handle_mouse` routes on these rects, and the
+        // sidebar hit map is derived from the sidebar rect).
+        st.sidebar_rect = Rect::new(0, 0, 28, 40);
+        st.main_rect = Rect::new(28, 0, 92, 40);
+        // The user has tabbed into the nav, so focus starts on the sidebar.
+        st.client.focus_sidebar();
+
+        // The nav block renders two-row bleed pills below the 6-row header: the
+        // label for nav item `k` sits on row `6 + 2k + 1`. Rows are Orchestrator
+        // (k=0 → row 7), Issues (k=1 → row 9), Activity (k=2 → row 11). Click the
+        // Issues label.
+        st.handle_event(Event::Mouse(left_click(5, 9)));
+        assert!(
+            matches!(st.main_view, MainView::Native(View::Issues)),
+            "the click opened the Issues view",
+        );
+        assert_eq!(
+            st.client.focus(),
+            Focus::Main,
+            "the click moved keyboard focus to the main area",
+        );
+
+        // The next keystroke must drive the main view, not the sidebar: a
+        // sidebar-nav key (Down) must leave the sidebar selection untouched.
+        let sel_before = st.selection();
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(
+            st.selection(),
+            sel_before,
+            "with focus on main, a nav key no longer moves the sidebar selection",
+        );
+    }
+
     /// A synthetic left-click at `(col, row)` in absolute terminal coordinates.
     fn left_click(col: u16, row: u16) -> crossterm::event::MouseEvent {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -5161,6 +5220,42 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("review job never completed");
+    }
+
+    #[test]
+    fn opening_a_review_focuses_main_up_front_not_only_when_the_async_open_completes() {
+        // Opening a review resolves off the UI thread. Focus must move to the
+        // main area the instant the row is activated — not wait for the async
+        // resolve, which may be slow, fail, or find the review already open.
+        // Before the fix `show`'s Review arm called only `begin_review` (async)
+        // and relied on `build_review_interface` to focus main on success, so a
+        // slow or failed resolve stranded focus on the sidebar — the live
+        // regression for review rows.
+        let stub = Arc::new(StubReviewBackend::default());
+        // A failing resolve: the async path never reaches the builder that would
+        // focus main, so only an up-front focus move keeps focus off the sidebar.
+        stub.stage_resolve(Err("resolve failed".into()));
+        let mut st = test_state();
+        st.review_backend = stub.clone();
+        st.client.focus_sidebar();
+
+        // Activate the review row exactly as a click / Enter would (`show`).
+        st.show(RowTarget::Review("T-1".into()));
+        assert_eq!(
+            st.client.focus(),
+            Focus::Main,
+            "activating a review row moves focus to the main area synchronously",
+        );
+
+        // Even after the failing async resolve lands, focus stays on main — the
+        // failure path never yanks it back to the sidebar.
+        pump_review(&mut st);
+        assert_eq!(
+            st.client.focus(),
+            Focus::Main,
+            "a failed async resolve leaves focus on the main area",
+        );
+        assert!(st.review.is_none(), "the failed resolve opened no interface");
     }
 
     #[test]
