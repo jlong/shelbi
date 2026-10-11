@@ -431,32 +431,16 @@ impl SidebarView {
         let width = inner.width as usize;
         let selected = sel_row.filter(|&r| r < nav_n);
 
-        let mut lines: Vec<Line> = Vec::with_capacity(nav_lines(nav_n));
-        for p in 0..=nav_n {
-            let glyph = if selected == Some(p) {
-                Some(BLEED_ABOVE)
-            } else if p > 0 && selected == Some(p - 1) {
-                Some(BLEED_BELOW)
-            } else {
-                None
-            };
-            lines.push(match glyph {
-                Some(g) => Line::from(Span::styled(
-                    g.repeat(width),
-                    Style::default().fg(SELECTION_BG),
-                )),
-                None => Line::raw(""),
-            });
-            if let Some(Row::Nav { glyph, label, .. }) = self.rows.get(p) {
-                lines.push(nav_item_line(
-                    glyph,
-                    label,
-                    selected == Some(p),
-                    focused,
-                    width,
-                ));
-            }
-        }
+        let content: Vec<Line> = (0..nav_n)
+            .filter_map(|p| {
+                if let Some(Row::Nav { glyph, label, .. }) = self.rows.get(p) {
+                    Some(nav_item_line(glyph, label, selected == Some(p), focused, width))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let lines = crate::sidebar::bleed_block_lines(content, selected, width, SELECTION_BG);
         Paragraph::new(lines).render(inner, buf);
     }
 

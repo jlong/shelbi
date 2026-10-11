@@ -37,6 +37,7 @@ use shelbi_state::keymap::PaletteAction;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::decoration_to_color;
+use crate::sidebar::{bleed_block_lines, nav_lines};
 use crate::theme;
 
 // ---------------------------------------------------------------------------
@@ -162,32 +163,12 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::PALETTE_MUTED))
         .style(Style::default().bg(theme::PALETTE_BG));
-    let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // One column of padding inside the border on each side. Vertically the
-    // search line sits just under the top border and the footer just above the
-    // bottom one (the blank rows inside the layout do the breathing).
-    let content = Rect {
-        x: inner.x.saturating_add(1),
-        y: inner.y,
-        width: inner.width.saturating_sub(2),
-        height: inner.height,
-    };
-    if content.width == 0 || content.height == 0 {
+    let rows = panel_rows(area);
+    if rows.is_empty() || rows[2].width == 0 || rows[2].height == 0 {
         return;
     }
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // search line
-            Constraint::Length(1), // blank
-            Constraint::Min(1),    // results band
-            Constraint::Length(1), // blank
-            Constraint::Length(1), // footer
-        ])
-        .split(content);
 
     f.render_widget(Paragraph::new(search_line(view.query)), rows[0]);
 
@@ -208,25 +189,28 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
     } else {
         let commands_focused = projects_area.is_none() || view.commands_focused;
         let selected = view.selected.min(view.results.len().saturating_sub(1));
-        let items = build_result_items(
+        // Each command row gets a half-row of space above and below (the sidebar
+        // nav's half-block bleed): the selected row's fill bleeds into those
+        // half-rows via the `▄`/`▀` glyphs so the highlight reads as a taller
+        // pill. The content lines carry the solid fill on the selected row; the
+        // shared `bleed_block_lines` interleaves the bleed separators.
+        let content = build_result_lines(
             view.results,
             commands_area.width as usize,
             commands_focused.then_some(selected),
         );
-        let mut list = List::new(items);
-        if commands_focused {
-            // Patch the selected row's background only; the label span already
-            // carries its white/bold foreground, and leaving the foreground
-            // alone keeps the description dim on the highlighted row (matching
-            // the design).
-            list = list.highlight_style(Style::default().bg(theme::SELECTION_BG));
-        }
-        // `ListState` scrolls to keep the selected row visible when the band is
-        // capped shorter than the result list, so the selection never leaves
-        // the panel.
-        let mut s = ListState::default();
-        s.select(Some(selected));
-        f.render_stateful_widget(list, commands_area, &mut s);
+        let lines = bleed_block_lines(
+            content,
+            commands_focused.then_some(selected),
+            commands_area.width as usize,
+            theme::SELECTION_BG,
+        );
+        // Scroll the band to keep the selected pill visible when the list is
+        // taller than the band (the half-block pitch doubles the row count).
+        let band_h = commands_area.height as usize;
+        let off = command_scroll_offset(view.results.len(), selected, band_h);
+        let visible: Vec<Line> = lines.into_iter().skip(off).take(band_h).collect();
+        f.render_widget(Paragraph::new(visible), commands_area);
     }
 
     if let (Some(area), Some(projects)) = (projects_area, view.projects.as_ref()) {
@@ -242,15 +226,66 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
     );
 }
 
-/// Rows the results band needs: the larger of the command result count (at
-/// least one, for the "No matching commands" row) and the Projects column's
-/// rows — its heading, one row per project, and the trailing "Add project".
+/// The palette panel's content rows within its overlay `area`: the search line,
+/// a blank, the results band, a blank, and the footer. One source of truth so
+/// [`render`] and the mouse hit-test agree on where the band sits. The content
+/// is inset one column inside the border on each side (so `rows[_].x == area.x
+/// + 2`), matching the Figma's padding.
+fn panel_rows(area: Rect) -> std::rc::Rc<[Rect]> {
+    // The block's border inset (Borders::ALL), then one more column of padding
+    // inside it on each side. Vertically the search line sits just under the top
+    // border and the footer just above the bottom one.
+    let content = Rect {
+        x: area.x.saturating_add(2),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(2),
+    };
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // search line
+            Constraint::Length(1), // blank
+            Constraint::Min(1),    // results band
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // footer
+        ])
+        .split(content)
+}
+
+/// Rows the results band needs: the larger of the command list height and the
+/// Projects column's rows. The command list uses the half-block bleed pitch —
+/// `nav_lines(n)` (`2n + 1`) rows, a half-row band above and below every item
+/// so the selected row's fill bleeds into a taller pill — except the empty
+/// "No matching commands" state, which is a single plain row. The Projects
+/// column keeps its compact one-row-per-project list: a heading, one row per
+/// project, and the trailing "Add project".
 fn results_band_rows(result_count: usize, project_count: Option<usize>) -> u16 {
-    let commands = result_count.max(1).min(u16::MAX as usize) as u16;
+    let commands = if result_count == 0 {
+        1
+    } else {
+        nav_lines(result_count).min(u16::MAX as usize) as u16
+    };
     let projects = project_count
         .map(|n| (n.min(u16::MAX as usize - 2) as u16) + 2)
         .unwrap_or(0);
     commands.max(projects)
+}
+
+/// The vertical scroll offset (in band rows) that keeps the selected command's
+/// pill — its content row at `2*sel + 1` and the half-block bleed rows at
+/// `2*sel` and `2*sel + 2` — fully inside a band `band_h` rows tall. The full
+/// bleed block is `nav_lines(n)` rows; when it fits, no scrolling is needed.
+fn command_scroll_offset(n: usize, sel: usize, band_h: usize) -> usize {
+    let total = nav_lines(n);
+    if band_h == 0 || total <= band_h {
+        return 0;
+    }
+    // Keep the selected item's bleed-below row (`2*sel + 2`) as the last visible
+    // row when we must scroll; its content and bleed-above then sit just above
+    // it, so the whole pill stays on screen.
+    let bot = 2 * sel + 2;
+    (bot + 1).saturating_sub(band_h).min(total - band_h)
 }
 
 /// The palette's overlay rect within `area` (the main area). Horizontally
@@ -338,17 +373,20 @@ fn icon_for(e: &Entry) -> (String, Color) {
     }
 }
 
-/// Build the command-list rows: a fixed-width icon slot, a fixed-width label
-/// (bold white on the selected row, else foreground), a dim description aligned
-/// to a fixed x and truncated with `…` when it won't fit, and a right-aligned
-/// dim shortcut hint. Each row is padded to `row_width` so the selection bar
-/// spans the whole commands column. `selected` is the highlighted index when
-/// the commands column holds focus.
-fn build_result_items(
+/// Build the command-list content lines: a fixed-width icon slot, a fixed-width
+/// label (bold white on the selected row, else foreground), a dim description
+/// aligned to a fixed x and truncated with `…` when it won't fit, and a
+/// right-aligned dim shortcut hint. Each row is padded to `row_width` so the
+/// selection fill spans the whole commands column; on the selected row the
+/// solid [`theme::SELECTION_BG`] fill is baked into every span (the shared
+/// [`bleed_block_lines`] then bleeds that fill into the half-rows above and
+/// below). `selected` is the highlighted index when the commands column holds
+/// focus.
+fn build_result_lines(
     results: &[(Entry, u16)],
     row_width: usize,
     selected: Option<usize>,
-) -> Vec<ListItem<'static>> {
+) -> Vec<Line<'static>> {
     results
         .iter()
         .enumerate()
@@ -408,7 +446,16 @@ fn build_result_items(
                 spans.push(Span::raw(" ".repeat(filler)));
             }
 
-            ListItem::new(Line::from(spans))
+            // Bake the solid fill into every span on the selected row so it
+            // reads as one continuous bar (and the bleed half-rows match). The
+            // label keeps its white/bold foreground; the description stays dim.
+            if is_selected {
+                for s in &mut spans {
+                    s.style = s.style.bg(theme::SELECTION_BG);
+                }
+            }
+
+            Line::from(spans)
         })
         .collect()
 }
@@ -703,6 +750,48 @@ impl Palette {
         }
     }
 
+    /// Feed a left-click at terminal cell (`col`, `row`) over the palette panel
+    /// `rect` (the overlay rect [`overlay_rect`] returned). A click anywhere on a
+    /// command item's band — its label row or either half-block bleed row —
+    /// selects that item and activates it. A click outside the commands column
+    /// (the Projects column, the search line, the footer, or the blank area
+    /// below a short list) leaves the palette open unchanged.
+    pub fn handle_click(&mut self, rect: Rect, col: u16, row: u16) -> PaletteStep {
+        let results = self.results();
+        let n = results.len();
+        if n == 0 {
+            return PaletteStep::Continue;
+        }
+        let rows = panel_rows(rect);
+        if rows.len() < 3 {
+            return PaletteStep::Continue;
+        }
+        let (commands_area, _) = split_results(rows[2], !self.projects.is_empty());
+        // Horizontal + vertical bounds of the commands band.
+        if col < commands_area.x
+            || col >= commands_area.x.saturating_add(commands_area.width)
+            || row < commands_area.y
+            || row >= commands_area.y.saturating_add(commands_area.height)
+        {
+            return PaletteStep::Continue;
+        }
+        // Map the clicked row back through the scroll offset to a line in the
+        // full `2n + 1`-row bleed block. Each item owns a 2-row band (its
+        // bleed-above and its label row), so `line / 2` resolves the item; the
+        // final trailing bleed row clamps to the last item.
+        let selected = self.selected.min(n - 1);
+        let band_h = commands_area.height as usize;
+        let off = command_scroll_offset(n, selected, band_h);
+        let line = (row - commands_area.y) as usize + off;
+        if line >= nav_lines(n) {
+            return PaletteStep::Continue;
+        }
+        let item = (line / 2).min(n - 1);
+        self.selected = item;
+        self.focus = Focus::Commands;
+        PaletteStep::Activate(results[item].0.clone())
+    }
+
     /// Type a character into the query, resetting the command selection and
     /// pulling focus back to the commands column (typing filters commands).
     fn type_char(&mut self, c: char) {
@@ -799,6 +888,29 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The `y` of the first buffer row whose text contains `needle`.
+    fn find_row_with(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<u16> {
+        (0..buf.area.height).find(|&y| {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            row.contains(needle)
+        })
+    }
+
+    /// The (col, row) of the first cell where `needle` starts (ASCII needles).
+    fn find_cell(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(byte_idx) = row.find(needle) {
+                return Some((row[..byte_idx].chars().count() as u16, y));
+            }
+        }
+        None
     }
 
     #[test]
@@ -1208,20 +1320,23 @@ mod tests {
 
     #[test]
     fn results_band_rows_is_the_larger_of_commands_and_projects() {
-        assert_eq!(results_band_rows(6, None), 6);
+        // Commands use the half-block pitch: nav_lines(n) == 2n + 1.
+        assert_eq!(results_band_rows(6, None), 13);
         // An empty list still reserves one row (the "No matching commands" row).
         assert_eq!(results_band_rows(0, None), 1);
         // Projects column: heading + one row per project + the Add row (n + 2).
+        // One command (3 rows) is shorter than three projects (5 rows).
         assert_eq!(results_band_rows(1, Some(3)), 5);
-        assert_eq!(results_band_rows(10, Some(3)), 10);
+        // Ten commands (21 rows) dwarf the Projects column (5 rows).
+        assert_eq!(results_band_rows(10, Some(3)), 21);
     }
 
     #[test]
     fn palette_rect_is_top_aligned_centered_and_content_sized() {
         let area = Rect::new(0, 0, 100, 40);
-        // Six results, no projects: band 6 + 6 chrome rows = 12 tall.
+        // Six results, no projects: band nav_lines(6)=13 + 6 chrome rows = 19.
         let r = palette_rect(area, 6, None);
-        assert_eq!(r.height, 12, "height fits the content");
+        assert_eq!(r.height, 19, "height fits the content");
         // Width is the prior 70%/min-40 rule, horizontally centered.
         assert_eq!(r.width, 70);
         assert_eq!(r.x, 15);
@@ -1236,7 +1351,7 @@ mod tests {
         let one = palette_rect(area, 1, None);
         let none = palette_rect(area, 0, None);
         assert!(one.height < full.height, "one result is a shorter panel");
-        assert_eq!(one.height, 7, "one result: 1 band row + 6 chrome");
+        assert_eq!(one.height, 9, "one result: 3 band rows (2*1+1) + 6 chrome");
         assert_eq!(none.height, 7, "no matches still reserves the one row");
     }
 
@@ -1300,6 +1415,160 @@ mod tests {
         let text = dump(&term.backend().buffer().clone());
         assert!(text.contains("Command11"), "the selected row stays visible: {text}");
         assert!(!text.contains("Command00"), "the top rows scrolled out: {text}");
+    }
+
+    // -- Half-block selection bleed on the command list --------------------
+
+    #[test]
+    fn selected_command_row_renders_the_half_block_bleed() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let p = Palette::new(
+            vec![
+                entry_full("view:orch", "Chat", "Talk with the Orchestrator", None),
+                entry_full("view:tasks", "Issues", "Queue up and manage work", None),
+            ],
+            vec![project("website", "Website", ProjectIndicator::Active)],
+        );
+        // Selection defaults to index 0 (Chat) with the commands column focused.
+        let mut term = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        term.draw(|f| p.render(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let chat_y = find_row_with(&buf, "Chat").expect("the selected label renders");
+        let (website_x, _) = find_cell(&buf, "Website").expect("a Projects row renders");
+
+        // Solid fill: the selected content row carries the selection background.
+        assert!(
+            (0..buf.area.width).any(|x| buf[(x, chat_y)].bg == theme::SELECTION_BG),
+            "the selected row has the solid fill"
+        );
+        // Lower-half-block (`▄`) bleed row directly above the selection, drawn
+        // with its foreground set to the selection background.
+        let above = chat_y - 1;
+        assert!(
+            (0..buf.area.width).any(|x| {
+                buf[(x, above)].symbol() == "▄" && buf[(x, above)].fg == theme::SELECTION_BG
+            }),
+            "a ▄ bleed row sits above the selection: {}",
+            dump(&buf)
+        );
+        // Upper-half-block (`▀`) bleed row directly below.
+        let below = chat_y + 1;
+        assert!(
+            (0..buf.area.width).any(|x| {
+                buf[(x, below)].symbol() == "▀" && buf[(x, below)].fg == theme::SELECTION_BG
+            }),
+            "a ▀ bleed row sits below the selection: {}",
+            dump(&buf)
+        );
+
+        // The Projects column is untouched: no bleed glyph reaches into or past
+        // it, and no Projects row carries the command fill.
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let c = &buf[(x, y)];
+                if (c.symbol() == "▄" || c.symbol() == "▀") && c.fg == theme::SELECTION_BG {
+                    assert!(
+                        x < website_x,
+                        "bleed stays in the commands column (x={x}, website_x={website_x})"
+                    );
+                }
+            }
+        }
+        let web_y = find_row_with(&buf, "Website").unwrap();
+        for x in website_x..buf.area.width {
+            assert_ne!(
+                buf[(x, web_y)].bg,
+                theme::SELECTION_BG,
+                "a Projects row must carry no command selection fill"
+            );
+        }
+    }
+
+    #[test]
+    fn moving_the_selection_leaves_no_leftover_fill_on_the_old_row() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut p = Palette::new(
+            vec![
+                entry_full("view:orch", "Chat", "Talk with the Orchestrator", None),
+                entry_full("view:tasks", "Issues", "Queue up and manage work", None),
+            ],
+            Vec::new(),
+        );
+        // Move the selection off Chat onto Issues.
+        p.handle_key(key(KeyCode::Down), Some(PaletteAction::NavDown));
+        assert_eq!(p.selected(), 1);
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| p.render(f, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let chat_y = find_row_with(&buf, "Chat").unwrap();
+        let issues_y = find_row_with(&buf, "Issues").unwrap();
+
+        // The now-unselected Chat row keeps no fill. (The row below it is the
+        // selected Issues row's own bleed-above — a shared separator — so the
+        // clean-separator check is the row *above* Chat, which belongs to no
+        // selection now.)
+        assert!(
+            (0..buf.area.width).all(|x| buf[(x, chat_y)].bg != theme::SELECTION_BG),
+            "the deselected row has no leftover fill: {}",
+            dump(&buf)
+        );
+        assert!(
+            (0..buf.area.width)
+                .all(|x| buf[(x, chat_y - 1)].symbol() != "▄" && buf[(x, chat_y - 1)].symbol() != "▀"),
+            "no bleed glyph lingers above the deselected row: {}",
+            dump(&buf)
+        );
+        // The newly selected Issues row carries the fill and its bleed rows.
+        assert!(
+            (0..buf.area.width).any(|x| buf[(x, issues_y)].bg == theme::SELECTION_BG),
+            "the new selection is filled: {}",
+            dump(&buf)
+        );
+        assert!(
+            (0..buf.area.width).any(|x| buf[(x, issues_y - 1)].symbol() == "▄"),
+            "the new selection has a ▄ above it: {}",
+            dump(&buf)
+        );
+    }
+
+    #[test]
+    fn clicking_a_command_label_or_its_bleed_row_activates_that_item() {
+        let mut p = Palette::new(
+            vec![
+                entry("view:a", "Alpha"),
+                entry("view:b", "Bravo"),
+                entry("view:c", "Charlie"),
+            ],
+            Vec::new(),
+        );
+        let area = Rect::new(0, 0, 80, 24);
+        let rect = p.overlay_rect(area);
+        let rows = panel_rows(rect);
+        let (band, _) = split_results(rows[2], false);
+        let col = band.x + 1;
+
+        // Item 1's label row sits at band offset 2*1 + 1 = 3.
+        match p.handle_click(rect, col, band.y + 3) {
+            PaletteStep::Activate(e) => assert_eq!(e.id, "view:b"),
+            other => panic!("label-row click should activate Bravo, got {other:?}"),
+        }
+        assert_eq!(p.selected(), 1, "the clicked item becomes selected");
+
+        // Item 2's bleed-above row (band offset 2*2 = 4) also activates it — a
+        // click anywhere on the item's band resolves to that item.
+        match p.handle_click(rect, col, band.y + 4) {
+            PaletteStep::Activate(e) => assert_eq!(e.id, "view:c"),
+            other => panic!("bleed-row click should activate Charlie, got {other:?}"),
+        }
+
+        // A click on the search line (above the band) leaves the palette open.
+        assert_eq!(
+            p.handle_click(rect, col, rows[0].y),
+            PaletteStep::Continue,
+            "a click outside the commands band is a no-op"
+        );
     }
 
 }
