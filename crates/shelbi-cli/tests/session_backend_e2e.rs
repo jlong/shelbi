@@ -71,12 +71,17 @@ fn local_dispatch_to_handoff_cycle_on_the_session_backend() {
     // worker hooks would, then blocks for a line. On receiving the delivered
     // message it flips its title to `shelbi:review` and writes the review-ready
     // marker — the handoff signal — before idling on `cat` so it stays live.
+    //
+    // The marker is written tmp+rename (the same atomic pattern real workers use
+    // for Shelbi markers): a bare `> {marker}` creates and truncates the file
+    // before `printf` writes, so a reader can catch it empty in that window. The
+    // rename makes the marker appear only once its full contents are there.
     let stub = format!(
         "printf '? for shortcuts\\n'; \
          printf '\\033]2;shelbi:idle\\007'; \
          IFS= read -r line; \
          printf '\\033]2;shelbi:review\\007'; \
-         printf '%s\\n' \"$line\" > {marker}; \
+         printf '%s\\n' \"$line\" > {marker}.tmp && mv {marker}.tmp {marker}; \
          printf 'REVIEW-READY\\n'; \
          exec cat",
         marker = marker.display(),
@@ -145,8 +150,12 @@ fn local_dispatch_to_handoff_cycle_on_the_session_backend() {
     // The handoff: the agent wrote its review-ready marker, and its title now
     // reads `shelbi:review`. Observing the marker is the dispatch-to-handoff
     // cycle completing on the session backend.
+    // Accept the marker only once its full contents are present: a partial or
+    // empty read keeps polling instead of ending the wait (a belt-and-braces
+    // guard alongside the stub's atomic write).
     let delivered = wait_for(Duration::from_secs(10), || {
-        std::fs::read_to_string(&marker).ok()
+        let got = std::fs::read_to_string(&marker).ok()?;
+        (!got.trim().is_empty()).then_some(got)
     });
     assert_eq!(
         delivered.as_deref().map(str::trim),
@@ -198,7 +207,7 @@ fn orchestrator_runs_as_a_session_without_tmux_pane_and_delivers_input_once() {
         &stub,
         format!(
             "#!/bin/sh\n\
-             printf '%s\\n' \"${{TMUX_PANE:-unset}}\" > {pane}\n\
+             printf '%s\\n' \"${{TMUX_PANE:-unset}}\" > {pane}.tmp && mv {pane}.tmp {pane}\n\
              printf '? for shortcuts\\n'\n\
              printf '\\033]2;shelbi:idle\\007'\n\
              while IFS= read -r line; do printf '%s\\n' \"$line\" >> {deliv}; done\n",
@@ -249,9 +258,12 @@ fn orchestrator_runs_as_a_session_without_tmux_pane_and_delivers_input_once() {
     });
     assert!(alive.is_some(), "the orchestrator session should come up Alive");
 
-    // No `$TMUX_PANE` in the orchestrator's environment.
+    // No `$TMUX_PANE` in the orchestrator's environment. Accept the file only
+    // once its contents are present so an empty read in the create/write window
+    // keeps polling instead of ending the wait.
     let pane = wait_for(Duration::from_secs(10), || {
-        std::fs::read_to_string(&tmux_pane_file).ok()
+        let got = std::fs::read_to_string(&tmux_pane_file).ok()?;
+        (!got.trim().is_empty()).then_some(got)
     });
     assert_eq!(
         pane.as_deref().map(str::trim),
@@ -270,10 +282,17 @@ fn orchestrator_runs_as_a_session_without_tmux_pane_and_delivers_input_once() {
         "the orchestrator session should paint a ready input box"
     );
 
-    // Deliver one line through the backend. It must reach the orchestrator
-    // exactly once: a single PTY stdin, no teed / duplicated pane input.
-    backend()
-        .send_line(&Host::Local, &target, "steer-once")
+    // Deliver one line through the production submit path. It must reach the
+    // orchestrator exactly once: a single PTY stdin, no teed / duplicated pane
+    // input. `deliver_text` is how Shelbi actually steers a session (paste →
+    // settle → Enter under the injection lock); the settle is load-bearing here
+    // too — the backend's raw `send_line` sends the text and the Enter as two
+    // separate connections with no settle between them, so under load the `\r`
+    // can overtake the pasted bytes and terminate an empty line, leaving
+    // `steer-once` sitting un-newlined in the tty buffer where `read` never
+    // completes it. The settled path keeps the delivery deterministic without
+    // changing what this asserts (exactly-once over the one PTY stdin).
+    shelbi_orchestrator::submit::deliver_text(&Host::Local, &target, "steer-once")
         .expect("deliver a line through the session backend");
 
     let delivered = wait_for(Duration::from_secs(10), || {

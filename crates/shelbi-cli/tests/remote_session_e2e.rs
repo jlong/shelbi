@@ -132,12 +132,18 @@ fn remote_dispatch_to_handoff_reconnect_and_unreachable() {
 
     // A stub agent: draws a ready input box + `shelbi:idle` title, blocks for a
     // line, then flips to `shelbi:review` and writes the review-ready marker.
+    //
+    // The marker is written tmp+rename (the atomic pattern real workers use): a
+    // bare `> {marker}` creates and truncates the file before `printf` writes, so
+    // the `marker.exists()` handoff gate below can fire before the contents land
+    // and the following `read_to_string` reads it empty. The rename makes the
+    // marker appear only once its full contents are there.
     let stub = format!(
         "printf '? for shortcuts\\n'; \
          printf '\\033]2;shelbi:idle\\007'; \
          IFS= read -r line; \
          printf '\\033]2;shelbi:review\\007'; \
-         printf '%s\\n' \"$line\" > {marker}; \
+         printf '%s\\n' \"$line\" > {marker}.tmp && mv {marker}.tmp {marker}; \
          printf 'REVIEW-READY\\n'; \
          exec cat",
         marker = marker.display(),
