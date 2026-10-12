@@ -335,9 +335,11 @@ fn attach(project: Option<&str>, selector: &str, detach_key: &str) -> Result<()>
 ///
 /// Tried in order, each stage short-circuiting on a unique hit: exact short-id,
 /// exact name, workspace (the last `/`-segment of a name), unique short-id
-/// prefix, unique name substring. When a stage finds several candidates and a
-/// `project` is set, ties are broken toward names under `"<project>/"`; a tie
-/// that still has several candidates is an error that lists them.
+/// prefix, unique name substring. When a stage finds several candidates, ties
+/// are broken first toward names under `"<project>/"` (when a `project` is set
+/// and owns any hit), then toward the single *live* session among what remains
+/// (dead predecessor dirs outlive a relaunch); a tie that still has several
+/// candidates is an error that lists them.
 pub(crate) fn resolve_index(
     sessions: &[DiscoveredSession],
     project: Option<&str>,
@@ -359,18 +361,34 @@ pub(crate) fn resolve_index(
             0 => continue,
             1 => return Ok(hits[0]),
             _ => {
+                // Narrow by project first (if one is set and it owns any hit),
+                // then break any remaining tie toward a *live* session. Dead
+                // session dirs linger after a relaunch (the prune keeps a couple
+                // per name for their `final.txt`), so a workspace selector that
+                // matches one live session plus its exited predecessors should
+                // land on the live one rather than erroring
+                // (`rt-review-slot-relaunch-loop`).
+                let mut candidates = hits.clone();
                 if let Some(proj) = project {
                     let prefix = format!("{proj}/");
-                    let narrowed: Vec<usize> = hits
+                    let narrowed: Vec<usize> = candidates
                         .iter()
                         .copied()
                         .filter(|&i| sessions[i].meta.name.starts_with(&prefix))
                         .collect();
-                    if narrowed.len() == 1 {
-                        return Ok(narrowed[0]);
+                    if !narrowed.is_empty() {
+                        candidates = narrowed;
                     }
                 }
-                let names: Vec<String> = hits
+                if candidates.len() == 1 {
+                    return Ok(candidates[0]);
+                }
+                let live: Vec<usize> =
+                    candidates.iter().copied().filter(|&i| sessions[i].alive).collect();
+                if live.len() == 1 {
+                    return Ok(live[0]);
+                }
+                let names: Vec<String> = candidates
                     .iter()
                     .map(|&i| format!("{} ({})", sessions[i].short_id, sessions[i].meta.name))
                     .collect();
@@ -462,6 +480,37 @@ mod tests {
         // the demo session.
         assert_eq!(resolve_index(&sessions, Some("demo"), "shared").unwrap(), 0);
         assert_eq!(resolve_index(&sessions, Some("other"), "shared").unwrap(), 1);
+    }
+
+    #[test]
+    fn live_session_wins_over_same_named_dead_predecessors() {
+        // After a relaunch the sessions dir holds the live session plus a couple
+        // of its exited predecessors (the prune keeps them for `final.txt`). A
+        // workspace selector that matches all three must resolve to the live one
+        // rather than erroring ambiguously (`rt-review-slot-relaunch-loop`).
+        let sessions = vec![
+            session("dead1111", "demo/ws/review", false),
+            session("live2222", "demo/ws/review", true),
+            session("dead3333", "demo/ws/review", false),
+        ];
+        assert_eq!(resolve_index(&sessions, None, "review").unwrap(), 1);
+        // The project tie-break and the live tie-break compose: `--project demo`
+        // narrows nothing here (all are demo) and the live pick still lands.
+        assert_eq!(resolve_index(&sessions, Some("demo"), "review").unwrap(), 1);
+    }
+
+    #[test]
+    fn several_live_matches_are_still_ambiguous() {
+        // The live tie-break only resolves a *unique* live session; two live ones
+        // under the same selector remain an error listing both.
+        let sessions = vec![
+            session("aaaa1111", "demo/ws/shared", true),
+            session("bbbb2222", "other/ws/shared", true),
+            session("cccc3333", "gone/ws/shared", false),
+        ];
+        let err = resolve_index(&sessions, None, "shared").unwrap_err().to_string();
+        assert!(err.contains("matches several"), "{err}");
+        assert!(err.contains("demo/ws/shared") && err.contains("other/ws/shared"), "{err}");
     }
 
     #[test]

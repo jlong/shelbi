@@ -391,6 +391,20 @@ fn request_resize(st: &mut Sizing, cv: &Condvar, size: (u16, u16)) {
 /// Run the session to completion. Returns when the child has exited (or a
 /// terminating signal was received) and `exit.json` / `final.txt` are written.
 pub fn run(args: RunArgs) -> Result<()> {
+    // Give this session the descriptor headroom launchd's 256 soft limit denies
+    // it: a session fans out a descriptor per client connection, per serving
+    // thread, and per throwaway probe, and hitting the cap turns `accept` into a
+    // stream of `EMFILE` that strands the listener as a zombie supervision then
+    // relaunches in a loop (`rt-review-slot-relaunch-loop`). Best-effort — a
+    // too-low limit only degrades gracefully (the accept loop backs off).
+    match shelbi_core::raise_file_limit() {
+        Ok((prev, new)) if new > prev => {
+            eprintln!("shelbi session: raised open-file soft limit {prev} -> {new}");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("shelbi session: could not raise open-file limit: {e}"),
+    }
+
     let paths = SessionPaths::resolve(&args.id)?;
     paths.check_socket_fits()?;
     std::fs::create_dir_all(&paths.dir)
@@ -725,8 +739,17 @@ fn spawn_accept_thread(shared: Arc<Shared>, listener: UnixListener) {
                 }
                 Err(e) if is_transient_accept_error(&e) => {
                     // The listener is still valid; keep serving. Back off only on
-                    // resource exhaustion so the loop doesn't spin while fds free.
+                    // resource exhaustion so the loop doesn't spin while fds free
+                    // — and log it, rather than spinning silently, so a session
+                    // walking into its descriptor cap is visible in the record
+                    // instead of only showing up as the relaunch loop it causes
+                    // (`rt-review-slot-relaunch-loop`).
                     if is_resource_exhaustion(&e) {
+                        eprintln!(
+                            "shelbi session: accept() hit the open-file limit ({e}); \
+                             backing off {}ms (raise RLIMIT_NOFILE if this persists)",
+                            ACCEPT_RETRY_BACKOFF.as_millis(),
+                        );
                         thread::sleep(ACCEPT_RETRY_BACKOFF);
                     }
                     continue;

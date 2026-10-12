@@ -335,6 +335,13 @@ pub fn backend() -> Backend {
     Backend(crate::session_process_backend::SessionProcessBackend)
 }
 
+/// How many consecutive polls a session must read as a not-listening zombie
+/// before [`Backend::reap_zombie_duplicates`] SIGTERMs it. Two consecutive
+/// wedged observations (a 10s window at the 5s poll cadence) rules out a
+/// one-tick hiccup so a healthy-but-briefly-slow session's agent is never
+/// killed out from under it (`rt-review-slot-relaunch-loop`).
+const REAP_WEDGED_THRESHOLD: u32 = 2;
+
 /// The runtime backend: a session process per worker terminal. A thin newtype
 /// over [`SessionProcessBackend`](crate::session_process_backend::SessionProcessBackend)
 /// that implements [`SessionBackend`] by delegation and carries a few inherent
@@ -373,12 +380,29 @@ impl Backend {
         &self,
         host: &Host,
         target: &SessionTarget,
+        wedged_streak: &mut HashMap<String, u32>,
     ) -> Vec<(String, &'static str)> {
         if host.is_ssh() {
             return Vec::new();
         }
+        self.0.reap_zombies_with_hysteresis(
+            &crate::session_process_backend::session_name(target),
+            wedged_streak,
+            REAP_WEDGED_THRESHOLD,
+        )
+    }
+
+    /// Whether a session for `target`'s slot is **wedged** — its process is
+    /// still up but its socket does not answer the protocol — as opposed to
+    /// genuinely gone (process exited). Local-only (a remote slot's wedge can't
+    /// be told apart from an SSH blip); false for a remote host. Used to label a
+    /// resume's reason `wedged` vs `restart/crash` (`rt-review-slot-relaunch-loop`).
+    pub fn slot_wedged(&self, host: &Host, target: &SessionTarget) -> bool {
+        if host.is_ssh() {
+            return false;
+        }
         self.0
-            .reap_zombies(&crate::session_process_backend::session_name(target))
+            .name_wedged(&crate::session_process_backend::session_name(target))
     }
 
     /// Spawn the orchestrator as a detached session process — the

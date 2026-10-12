@@ -224,6 +224,19 @@ impl Daemon {
 /// individual clients are swallowed (logged to stderr) so the daemon
 /// keeps serving the rest of the fleet.
 pub(super) fn run_foreground() -> Result<()> {
+    // Give the hub the descriptor headroom launchd's 256 soft limit denies it:
+    // the daemon holds a descriptor per open client connection plus every
+    // throwaway session probe its pollers make, and hitting the cap wedges the
+    // hub the same way it wedges a session (`rt-review-slot-relaunch-loop`).
+    // Best-effort; a failure is logged, never fatal.
+    match shelbi_core::raise_file_limit() {
+        Ok((prev, new)) if new > prev => {
+            eprintln!("shelbi daemon: raised open-file soft limit {prev} -> {new}");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("shelbi daemon: could not raise open-file limit: {e}"),
+    }
+
     let sock = shelbi_state::hub_socket_path().map_err(|e| anyhow!(e))?;
     ensure_socket_dir(&sock)?;
     // Exclusive advisory lock held for the daemon's whole lifetime. Two

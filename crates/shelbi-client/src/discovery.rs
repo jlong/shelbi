@@ -230,32 +230,93 @@ pub fn list(root: &Path) -> Result<Vec<DiscoveredSession>, crate::ClientError> {
     Ok(out)
 }
 
-/// Remove every session directory under `root` whose lock is **not held** (the
-/// session is dead), returning the short ids reaped. A caller that still wants a
-/// dead session's `exit.json` / `final.txt` reads them before calling this.
+/// Remove **every** session directory under `root` whose lock is not held (the
+/// session is dead), returning the short ids reaped. Equivalent to
+/// [`reap_dead_keeping_recent`] with `keep_per_name = 0`. A caller that still
+/// wants a dead session's `exit.json` / `final.txt` reads them before calling
+/// this.
 ///
 /// A directory that cannot be removed is skipped (best-effort cleanup), not an
 /// error; a missing `root` reaps nothing.
 pub fn reap_dead(root: &Path) -> Result<Vec<String>, crate::ClientError> {
-    let mut reaped = Vec::new();
+    reap_dead_keeping_recent(root, 0)
+}
+
+/// Remove dead session directories under `root`, but keep the `keep_per_name`
+/// most recently launched dead directories for each logical session name — so a
+/// just-relaunched session's predecessor stays around for a `final.txt` /
+/// crash-record read while *older* duplicates of the same name are pruned.
+///
+/// Returns the short ids reaped. A **live** session (lock held) is never
+/// removed and never counts against `keep_per_name` (the kept-dead budget is for
+/// post-exit screens, which a live session doesn't need). "Most recent" is by
+/// `meta.launched_at` (a fixed-format RFC3339 UTC stamp from one producer, so a
+/// lexical compare orders it); a dead directory with no readable `meta.json` is
+/// treated as the oldest (reaped first). A directory that cannot be removed is
+/// skipped (best-effort), not an error; a missing `root` reaps nothing.
+///
+/// This is the automatic prune that keeps `~/.shelbi/sessions` from filling with
+/// the exited predecessors every relaunch leaves behind — the pile-up that made
+/// `shelbi session snapshot <workspace>` ambiguous ("matches several sessions")
+/// and the directory grow without bound (`rt-review-slot-relaunch-loop`).
+pub fn reap_dead_keeping_recent(
+    root: &Path,
+    keep_per_name: usize,
+) -> Result<Vec<String>, crate::ClientError> {
+    use std::collections::HashMap;
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(reaped),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
+
+    // A dead session directory and the sort key we prune by.
+    struct Dead {
+        dir: PathBuf,
+        short_id: String,
+        // `launched_at` from meta.json, or "" when unreadable (sorts oldest).
+        launched_at: String,
+    }
+    let mut by_name: HashMap<String, Vec<Dead>> = HashMap::new();
+
     for entry in entries.flatten() {
         let dir = entry.path();
         if !dir.is_dir() {
             continue;
         }
-        // Only reap things that look like session directories (have a lock file),
-        // so an unrelated directory under the root is never deleted.
+        // Only consider things that look like session directories (have a lock
+        // file), so an unrelated directory under the root is never deleted.
         let lock = dir.join("lock");
         if !lock.exists() {
             continue;
         }
-        if !is_held(&lock) && std::fs::remove_dir_all(&dir).is_ok() {
-            reaped.push(entry.file_name().to_string_lossy().into_owned());
+        // A live session is off-limits — never removed, never counted.
+        if is_held(&lock) {
+            continue;
+        }
+        let short_id = entry.file_name().to_string_lossy().into_owned();
+        // The name keys the per-name budget; an unreadable meta sorts oldest and
+        // is grouped under its own short id so it is still eligible for pruning.
+        let (name, launched_at) = std::fs::read_to_string(dir.join("meta.json"))
+            .ok()
+            .and_then(|s| Meta::from_json(&s).ok())
+            .map(|m| (m.name, m.launched_at))
+            .unwrap_or_else(|| (format!("<unknown>/{short_id}"), String::new()));
+        by_name.entry(name).or_default().push(Dead {
+            dir,
+            short_id,
+            launched_at,
+        });
+    }
+
+    let mut reaped = Vec::new();
+    for (_name, mut deads) in by_name {
+        // Newest first, so the first `keep_per_name` are the ones to keep.
+        deads.sort_by(|a, b| b.launched_at.cmp(&a.launched_at));
+        for d in deads.into_iter().skip(keep_per_name) {
+            if std::fs::remove_dir_all(&d.dir).is_ok() {
+                reaped.push(d.short_id);
+            }
         }
     }
     Ok(reaped)
@@ -760,6 +821,77 @@ mod tests {
         let reap = zombies_to_reap(&candidates, "demo/ws/x");
         assert_eq!(reap.len(), 1);
         assert_eq!(reap[0].0.meta.launched_at, "t1", "the newest is kept");
+    }
+
+    /// Write a dead session directory (an unheld `lock`, so `is_held` is false)
+    /// under `root` keyed by `short_id`, with the given logical `name` and
+    /// `launched_at` in its `meta.json`.
+    fn write_dead_dir(root: &Path, short_id: &str, name: &str, launched_at: &str) {
+        let dir = root.join(short_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = Meta {
+            id: short_id.into(),
+            name: name.into(),
+            argv: vec!["cat".into()],
+            cwd: dir.clone(),
+            task: None,
+            launched_at: launched_at.into(),
+            protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            pid: 0,
+        };
+        std::fs::write(dir.join("meta.json"), meta.to_json().unwrap()).unwrap();
+        // A lock file nobody holds: `is_held` reads it as dead.
+        std::fs::write(dir.join("lock"), b"").unwrap();
+    }
+
+    #[test]
+    fn reap_dead_keeping_recent_prunes_older_duplicates_per_name() {
+        // Three dead directories share one name and a fourth carries another.
+        // Keeping the single most recent per name must prune the two older
+        // same-named ones and leave the other name's lone dead dir untouched.
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        write_dead_dir(root, "a1", "demo/ws/alpha", "2026-01-01T00:00:00Z");
+        write_dead_dir(root, "a2", "demo/ws/alpha", "2026-02-01T00:00:00Z");
+        write_dead_dir(root, "a3", "demo/ws/alpha", "2026-03-01T00:00:00Z"); // newest
+        write_dead_dir(root, "b1", "demo/ws/beta", "2026-01-15T00:00:00Z");
+
+        let mut reaped = reap_dead_keeping_recent(root, 1).unwrap();
+        reaped.sort();
+        assert_eq!(reaped, vec!["a1".to_string(), "a2".to_string()]);
+        assert!(!root.join("a1").exists());
+        assert!(!root.join("a2").exists());
+        assert!(root.join("a3").exists(), "the newest same-named dead dir is kept");
+        assert!(root.join("b1").exists(), "the other name's lone dead dir is kept");
+    }
+
+    #[test]
+    fn reap_dead_keeping_recent_never_removes_a_live_session() {
+        // A held lock (live) is never pruned, and never counts against the
+        // kept-dead budget — so an older *dead* sibling of a *live* session is
+        // still reaped when keep_per_name is 0.
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let live_dir = root.join("live");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        let meta = Meta {
+            id: "live".into(),
+            name: "demo/ws/alpha".into(),
+            argv: vec!["cat".into()],
+            cwd: live_dir.clone(),
+            task: None,
+            launched_at: "2026-04-01T00:00:00Z".into(),
+            protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            pid: 0,
+        };
+        std::fs::write(live_dir.join("meta.json"), meta.to_json().unwrap()).unwrap();
+        let _live_lock = shelbi_session::lock::SessionLock::acquire(&live_dir.join("lock")).unwrap();
+        write_dead_dir(root, "old", "demo/ws/alpha", "2026-01-01T00:00:00Z");
+
+        let reaped = reap_dead_keeping_recent(root, 0).unwrap();
+        assert_eq!(reaped, vec!["old".to_string()]);
+        assert!(live_dir.exists(), "the live session survives");
+        assert!(!root.join("old").exists(), "the dead sibling is reaped");
     }
 
     #[test]
