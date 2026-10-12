@@ -1,5 +1,6 @@
 pub mod agent_manifest;
 pub mod error;
+pub mod file_limit;
 pub mod integration;
 pub mod login_env;
 pub mod model;
@@ -17,6 +18,7 @@ pub use agent_manifest::{
     ResolvedAgentLaunch, RunnerManifestConfig,
 };
 pub use error::{Error, GhTokenProbeFailure, Result};
+pub use file_limit::raise_file_limit;
 pub use integration::{CapabilityLadder, IntegrationMode};
 pub use login_env::{
     build_session_env, capture_env_bounded, current_shelbi_exe, login_shell_env,

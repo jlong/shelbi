@@ -478,6 +478,20 @@ impl SessionProcessBackend {
         Ok(())
     }
 
+    /// Whether some session carrying `name` is **wedged** — its process is still
+    /// up (lifetime lock held) but its socket does not answer the protocol
+    /// (refusing connects, or accepting them yet never sending the hello). This
+    /// is the "alive but not listening" zombie, distinct from a session whose
+    /// process genuinely exited (no lock held at all). Used only to label a
+    /// resume's `events.log` reason `wedged` vs `restart/crash`
+    /// (`rt-review-slot-relaunch-loop`); a bare filesystem scan plus a cheap
+    /// probe, so it stays off the hot paths.
+    pub(crate) fn name_wedged(&self, name: &str) -> bool {
+        self.discover()
+            .iter()
+            .any(|s| s.meta.name == name && s.not_listening())
+    }
+
     /// The logical names of every live session. Stands in for the tmux backend's
     /// `live_pane_ids` (there are no panes): a caller confirming a specific
     /// handle still gets a definitive membership answer.
@@ -504,8 +518,10 @@ impl SessionProcessBackend {
 
     /// Terminate any "alive but not listening" zombie sessions that share `name`
     /// with a newer, still-live sibling (a replacement that exists or is being
-    /// launched), and remove their session directories. Returns the reaped short
-    /// ids. Local-only and best-effort — a remote machine reaps its own.
+    /// launched), and remove their session directories — but only after
+    /// `threshold` **consecutive** observations of the same session as a
+    /// not-listening zombie. Returns the reaped short ids. Local-only and
+    /// best-effort — a remote machine reaps its own.
     ///
     /// A zombie's socket either refuses every connect or accepts them yet never
     /// answers (wedged), so the usual over-the-socket `kill` can't reach it;
@@ -517,14 +533,44 @@ impl SessionProcessBackend {
     /// untouched (it is the intended session, even if it is itself still binding
     /// its socket) and only ever reap *older* not-listening ones.
     ///
+    /// The hysteresis a single-probe reap lacks: a single wedged probe is not
+    /// proof a session is dead — one momentarily slow to answer the hello (a GC
+    /// pause, a scheduler hiccup, or the very fd-pressure that precedes a real
+    /// wedge) reads `Wedged` for one tick and healthy the next, and reaping on
+    /// that one read SIGTERMs a session whose agent is perfectly alive, the kill
+    /// half of the relaunch loop (`rt-review-slot-relaunch-loop`). So each
+    /// candidate's consecutive-wedged count is tracked in `streak` (keyed by
+    /// short id, scoped to this slot by the caller); a session is reaped only
+    /// once its streak reaches `threshold`. A session no longer offered as a
+    /// zombie this tick (it recovered, or was already reaped) is dropped from
+    /// `streak`, so the count only ever reflects an unbroken run.
+    ///
     /// Each reaped id is paired with the supervision action to log for it —
     /// `"reap-wedged"` for a [`SocketReachability::Wedged`] session (accepts but
     /// never answers), `"reap-zombie"` for a refusing one — so the two failure
     /// shapes are distinguishable on `events.log`.
-    pub(crate) fn reap_zombies(&self, name: &str) -> Vec<(String, &'static str)> {
+    pub(crate) fn reap_zombies_with_hysteresis(
+        &self,
+        name: &str,
+        streak: &mut std::collections::HashMap<String, u32>,
+        threshold: u32,
+    ) -> Vec<(String, &'static str)> {
         let all = self.discover();
+        let candidates = shelbi_client::zombies_to_reap(&all, name);
+        // Forget any session whose consecutive-wedged run this tick broke (it is
+        // not a candidate now), so a later wedge starts counting from zero.
+        let current: std::collections::HashSet<&str> =
+            candidates.iter().map(|(z, _)| z.short_id.as_str()).collect();
+        streak.retain(|id, _| current.contains(id.as_str()));
+
         let mut reaped = Vec::new();
-        for (z, reach) in shelbi_client::zombies_to_reap(&all, name) {
+        for (z, reach) in candidates {
+            let count = streak.entry(z.short_id.clone()).or_insert(0);
+            *count += 1;
+            if *count < threshold {
+                // Not yet proven dead — give it another tick to answer.
+                continue;
+            }
             terminate_pid(z.meta.pid);
             // Drop its directory so discovery stops offering it. Unlinking the
             // files out from under a still-running process is safe on Unix (it
@@ -536,6 +582,9 @@ impl SessionProcessBackend {
                     _ => "reap-zombie",
                 };
                 reaped.push((z.short_id.clone(), action));
+                // Reaped: stop tracking it (its dir is gone; a same-id
+                // reincarnation is impossible — short ids are unique per spawn).
+                streak.remove(&z.short_id);
             }
         }
         reaped
@@ -779,7 +828,10 @@ mod tests {
 
         let zombie_dir = sessions.join("dddddddddddddddd");
         if zombie_dir.join("sock").exists() {
-            let reaped = SessionProcessBackend.reap_zombies("demo/ws/alpha");
+            // Threshold 1 (no hysteresis): reaps on the first observation.
+            let mut streak = std::collections::HashMap::new();
+            let reaped =
+                SessionProcessBackend.reap_zombies_with_hysteresis("demo/ws/alpha", &mut streak, 1);
             assert_eq!(
                 reaped,
                 vec![("dddddddddddddddd".to_string(), "reap-zombie")]
@@ -792,6 +844,207 @@ mod tests {
         }
 
         drop(live_listener);
+        match prev {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn reap_hysteresis_waits_for_two_consecutive_wedged_observations() {
+        // With threshold 2, a wedged zombie beside a live replacement is NOT
+        // reaped on the first observation — only on the second, after the streak
+        // confirms it. This is the kill-side guard against a one-tick hiccup
+        // SIGTERMing a healthy session (`rt-review-slot-relaunch-loop`).
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!("shelbi-reap-hyst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let prev = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // A reachable replacement (newer) and an older *wedged* sibling (a bare
+        // listener that accepts but never answers the hello).
+        let (_live_lock, live_listener) = write_session_dir(
+            &sessions,
+            "eeeeeeeeeeeeeeee",
+            "demo/ws/alpha",
+            "2026-02-01T00:00:00Z",
+            false,
+        );
+        let wedged_dir = sessions.join("ffffffffffffffff");
+        std::fs::create_dir_all(&wedged_dir).unwrap();
+        let wmeta = shelbi_session::Meta {
+            id: "ffffffffffffffff".into(),
+            name: "demo/ws/alpha".into(),
+            argv: vec!["cat".into()],
+            cwd: wedged_dir.clone(),
+            task: None,
+            launched_at: "2026-01-01T00:00:00Z".into(),
+            protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            pid: 0,
+        };
+        std::fs::write(wedged_dir.join("meta.json"), wmeta.to_json().unwrap()).unwrap();
+        let _wlock =
+            shelbi_session::lock::SessionLock::acquire(&wedged_dir.join("lock")).unwrap();
+        // A bare listener: accepts connections, never sends a hello → Wedged.
+        let _wlistener =
+            std::os::unix::net::UnixListener::bind(wedged_dir.join("sock")).unwrap();
+
+        let mut streak = std::collections::HashMap::new();
+        // First observation: streak = 1 < 2 → no reap yet.
+        let first = SessionProcessBackend.reap_zombies_with_hysteresis("demo/ws/alpha", &mut streak, 2);
+        assert!(first.is_empty(), "a single wedged observation must not reap");
+        assert!(wedged_dir.exists(), "the wedged session's dir survives the first tick");
+        // Second consecutive observation: streak = 2 → reaped as wedged.
+        let second = SessionProcessBackend.reap_zombies_with_hysteresis("demo/ws/alpha", &mut streak, 2);
+        assert_eq!(second, vec![("ffffffffffffffff".to_string(), "reap-wedged")]);
+        assert!(!wedged_dir.exists(), "the confirmed wedged session is reaped");
+
+        drop(live_listener);
+        match prev {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The file descriptors this process has open right now. The session under
+    /// test runs in-process (on a `run()` thread), so a `title()` call that left
+    /// its `Connection` — and thus the session's per-connection handler — alive
+    /// would show up here as held descriptors. Linux exposes `/proc/self/fd`,
+    /// macOS `/dev/fd`; the read opens one transient fd, counted identically
+    /// every call so deltas cancel.
+    fn open_fd_count() -> usize {
+        for dir in ["/proc/self/fd", "/dev/fd"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                return rd.count();
+            }
+        }
+        0
+    }
+
+    #[test]
+    fn repeated_title_polls_leave_the_fd_count_flat() {
+        // Criterion 6: the backend's per-tick `title()` poll (~every 5 s against a
+        // serving slot) opens a short-lived `Connection`, requests `Info`, and
+        // drops it — the second fd-leaker called out in the task. #1575's
+        // `Connection::drop` must wind both ends down so nothing accumulates. This
+        // drives the *real* `SessionProcessBackend::title()` against a genuine
+        // in-process session (not a stubbed listener) and asserts the process fd
+        // count stays flat across 50 polls (`rt-review-slot-relaunch-loop`).
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!("shelbi-title-fd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let prev = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A real detached-style session, run in-process on a thread (the same
+        // recipe `shelbi-client`'s protocol e2e harness uses). Its logical name is
+        // what `session_name(slot("shelbi-demo", "alpha"))` derives.
+        let name = "demo/ws/alpha";
+        let id = shelbi_session::layout::derive_id_now(name);
+        let paths = shelbi_session::SessionPaths::new(&home.join("sessions"), &id);
+        let args = shelbi_session::RunArgs {
+            id: id.clone(),
+            name: name.to_string(),
+            cwd: std::env::temp_dir(),
+            cols: 80,
+            rows: 24,
+            task: None,
+            raw_output_log: false,
+            // No daemon watchdog: it loops reading the global `$SHELBI_HOME` this
+            // test mutates, which would be a data race (see `RunArgs::manage_daemon`).
+            manage_daemon: false,
+            child_argv: vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()],
+        };
+        let handle = std::thread::spawn(move || shelbi_session::run(args));
+
+        // Wait until the socket actually accepts (bind precedes listen, so an
+        // earlier connect is refused).
+        let sock = paths.sock();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::os::unix::net::UnixStream::connect(&sock).is_err() {
+            assert!(std::time::Instant::now() < deadline, "session socket never accepted");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let backend = SessionProcessBackend;
+        let target = SessionTarget::slot("shelbi-demo", "alpha");
+        assert_eq!(session_name(&target), name);
+        // Sanity: the title path resolves the live session and returns cleanly (a
+        // bare `/bin/sh` emits no OSC title marker, so the string is empty — we are
+        // testing the fd lifecycle, not the value).
+        let poll = || {
+            let _ = backend.title(&Host::Local, &target).expect("title poll");
+        };
+
+        // Warm up so first-connection lazy allocations settle, then baseline once
+        // the fd count stops moving.
+        for _ in 0..5 {
+            poll();
+        }
+        let base = {
+            let mut last = 0usize;
+            let mut stable = 0u8;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let now = open_fd_count();
+                if now == last {
+                    stable += 1;
+                } else {
+                    stable = 0;
+                    last = now;
+                }
+                if stable >= 2 {
+                    break last;
+                }
+                assert!(std::time::Instant::now() < deadline, "fd count never settled");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        for _ in 0..50 {
+            poll();
+        }
+
+        // Every handler must have wound down, so the count returns to the
+        // baseline. A per-poll leak would grow it by a few descriptors each cycle.
+        let after = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let now = open_fd_count();
+                if now <= base + 8 {
+                    break now;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break now;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert!(
+            after <= base + 8,
+            "descriptors leaked across 50 title() polls: base={base}, after={after}",
+        );
+
+        // Teardown: kill the session and join its thread.
+        if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) {
+            use std::io::Write;
+            let _ = s.write_all(
+                &shelbi_proto::Frame::Kill(shelbi_proto::Kill {
+                    signal: Some(libc::SIGKILL),
+                })
+                .encode()
+                .unwrap(),
+            );
+        }
+        let _ = handle.join();
+
         match prev {
             Some(h) => std::env::set_var("SHELBI_HOME", h),
             None => std::env::remove_var("SHELBI_HOME"),

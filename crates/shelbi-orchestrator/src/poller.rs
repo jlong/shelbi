@@ -260,6 +260,12 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     // a restart reconciles any PR merged on GitHub while the hub was down.
     let mut last_github_reconcile: Option<Instant> = None;
 
+    // Dead-session-directory prune clock. Project-wide (it sweeps the one global
+    // sessions dir), so it lives on the supervisor tick. `None` means "due now",
+    // so the first tick after start reclaims whatever piled up while the hub was
+    // down. Its own slow cadence keeps the filesystem scan off the 5s tick.
+    let mut last_session_prune: Option<Instant> = None;
+
     // External-issue reconcile state. Project-wide (one tracker per project), so
     // it lives on the supervisor tick. Holds the poll watermark + last-seen
     // column per issue (ephemeral in-memory sync state — NOT a disk content
@@ -383,6 +389,19 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
                 // down the moment the pane is alive so it never races the pane
                 // supervisor's fresh-restart path.
                 maybe_resume_stranded_dev_slots(&project, &mut dev_resume);
+
+                // Prune dead session directories that piled up as sessions
+                // relaunched, keeping the most recent few per name for a
+                // post-exit `final.txt` read. Without this, every relaunch left
+                // its exited predecessor behind until the sessions dir filled
+                // and `shelbi session snapshot <ws>` went ambiguous ("matches
+                // several sessions") — `rt-review-slot-relaunch-loop`. Its own
+                // slow cadence keeps the filesystem scan off the 5s tick; a
+                // no-op for a backend with no session dirs.
+                if last_session_prune.is_none_or(|t| Instant::now() >= t) {
+                    prune_dead_session_dirs();
+                    last_session_prune = Some(Instant::now() + SESSION_PRUNE_CADENCE);
+                }
 
                 // Scoped CI poll: for every in-review PR, sample its checks and
                 // emit a `ci` state-change on a pass/fail transition so CI flows
@@ -508,6 +527,14 @@ fn run_workspace_poll_loop(
     // reset passed hours while the hub was down.
     let mut limit_resume = LimitResumeState::default();
 
+    // Consecutive-wedged counts for the zombie reaper's hysteresis, keyed by
+    // session short id. Per-thread and in-memory like the rest: a zombie is only
+    // SIGTERMed after it reads as a not-listening zombie on two consecutive polls
+    // (`REAP_WEDGED_THRESHOLD`), so a one-tick hiccup never kills a healthy
+    // session. A poller restart re-seeds it to empty, at worst re-arming one
+    // extra confirming tick for a genuinely wedged session.
+    let mut reap_wedged_streak: HashMap<String, u32> = HashMap::new();
+
     // When this slot first read as orphaned-by-board (no active task points at
     // it). `None` = not currently orphaned. The reaper debounces off this so a
     // dispatch racing a stale remote-board snapshot is never reaped mid-flight;
@@ -575,6 +602,7 @@ fn run_workspace_poll_loop(
             &mut supervision,
             &mut limit_resume,
             &mut orphan_since,
+            &mut reap_wedged_streak,
         );
 
         sleep_interruptible(
@@ -1523,6 +1551,7 @@ fn poll_one(
     supervision: &mut SupervisionState,
     limit_resume: &mut LimitResumeState,
     orphan_since: &mut Option<Instant>,
+    reap_wedged_streak: &mut HashMap<String, u32>,
 ) {
     // Gate the whole tick before reading/consuming ready or transition
     // markers. Under a mismatch those durable markers stay in place, and the
@@ -1553,7 +1582,7 @@ fn poll_one(
     // review-slot short-circuit below, so it covers review agent slots too (the
     // exact case in the bug); it only fires when a newer live sibling exists, so
     // it never reaps the slot's one good session.
-    maybe_reap_zombie_sessions(project, workspace, &host, &addr);
+    maybe_reap_zombie_sessions(project, workspace, &host, &addr, reap_wedged_streak);
 
     // Ready handoff is a file marker the workspace writes when it's done, read
     // independently of the pane title. We check it *before* the pane-title
@@ -4171,16 +4200,46 @@ fn review_slot_has_loaded_marker(
 /// only (a remote machine reaps its own). Runs every tick but is a no-op unless a
 /// real duplicate is present (`rt-re-entering-a-review-fails-to-attach`,
 /// `rt-review-session-wedges-after-repeated-attaches`).
+/// How often the project-wide supervisor tick prunes dead session directories.
+/// Slow — the pile-up is gradual (one dir per relaunch) and the scan touches the
+/// filesystem, so there is no need to run it on the 5s tick.
+const SESSION_PRUNE_CADENCE: Duration = Duration::from_secs(60);
+
+/// How many *dead* session directories to keep per logical name when pruning, so
+/// a just-relaunched session's immediate predecessor stays around for a
+/// `final.txt` / crash-record read while older duplicates are reclaimed. Two
+/// covers the common "current exited + one before it" without letting the
+/// directory grow without bound.
+const KEEP_DEAD_SESSION_DIRS_PER_NAME: usize = 2;
+
+/// Prune dead session directories under the global sessions root, keeping the
+/// most recent [`KEEP_DEAD_SESSION_DIRS_PER_NAME`] per name. Best-effort: a
+/// missing root (no session ever started, or a backend with no session dirs)
+/// reaps nothing, and any removal error is swallowed by the client helper.
+fn prune_dead_session_dirs() {
+    let Ok(root) = shelbi_state::sessions_dir() else {
+        return;
+    };
+    match shelbi_client::reap_dead_keeping_recent(&root, KEEP_DEAD_SESSION_DIRS_PER_NAME) {
+        Ok(reaped) if !reaped.is_empty() => {
+            tracing::debug!(count = reaped.len(), "pruned dead session directories");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::debug!(error = %e, "pruning dead session directories failed"),
+    }
+}
+
 fn maybe_reap_zombie_sessions(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     host: &shelbi_core::Host,
     addr: &crate::session_backend::SessionTarget,
+    wedged_streak: &mut HashMap<String, u32>,
 ) {
     if !matches!(host, shelbi_core::Host::Local) {
         return;
     }
-    for (short_id, action) in backend().reap_zombie_duplicates(host, addr) {
+    for (short_id, action) in backend().reap_zombie_duplicates(host, addr, wedged_streak) {
         if let Err(e) = shelbi_state::append_supervision_event(
             &project.name,
             Some(&workspace.name),
@@ -4541,6 +4600,16 @@ fn gate_task_is_served(project: &Project, task: &shelbi_core::Issue) -> bool {
     crate::workspace::workspace_pane_alive(&host, &addr).unwrap_or(true)
 }
 
+/// How many consecutive **confirmed-dead** polls a stranded slot must show
+/// before a resume relaunches it. The hysteresis both resume passes share: a
+/// single wedged / "not listening" read (a one-tick hiccup, or the fd-pressure
+/// moment just before a real wedge) is not proof the agent is gone, so acting on
+/// it relaunches a live slot — the resume half of the loop
+/// (`rt-review-slot-relaunch-loop`). Two consecutive confirming polls (a 10s
+/// window at the 5s poll cadence) rule that out while still resuming a genuine
+/// crash promptly.
+const CONSECUTIVE_DEAD_BEFORE_RESUME: u32 = 2;
+
 /// What the resume pass should do for one stranded review slot this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewResumeAction {
@@ -4574,13 +4643,21 @@ struct ReviewResumeState {
     /// resumes while the slot stays down. Cleared when the slot recovers
     /// (stays alive past [`STABLE_RECOVERY`]) or its task leaves the slot.
     gave_up: bool,
+    /// Consecutive polls the slot's pane has read **confirmed dead** (not alive,
+    /// not masked by an in-flight dispatch). The hysteresis counter: a resume
+    /// fires only once this reaches [`CONSECUTIVE_DEAD_BEFORE_RESUME`], so one
+    /// transient wedged/"not listening" read never relaunches a slot whose agent
+    /// is actually alive (`rt-review-slot-relaunch-loop`).
+    dead_streak: u32,
 }
 
 impl ReviewResumeState {
-    /// The slot's pane is alive (serving or still booting). Once it has stayed
-    /// up past [`STABLE_RECOVERY`] since our last resume, forget the crash
-    /// history so an unrelated crash much later starts counting from zero.
+    /// The slot's pane is alive (serving or still booting). Breaks the
+    /// confirmed-dead streak, and — once it has stayed up past
+    /// [`STABLE_RECOVERY`] since our last resume — forgets the crash history so
+    /// an unrelated crash much later starts counting from zero.
     fn note_alive(&mut self, now: Instant) {
+        self.dead_streak = 0;
         match self.restarts.last() {
             Some(&last) if now.duration_since(last) >= STABLE_RECOVERY => {
                 self.restarts.clear();
@@ -4589,6 +4666,26 @@ impl ReviewResumeState {
             Some(_) => {}
             None => self.gave_up = false,
         }
+    }
+
+    /// The pane probed dead but the observation is **not** trustworthy as a
+    /// crash: a dispatch is in flight onto the slot (its window is still
+    /// spawning). Stand down for the tick without resetting the crash history —
+    /// a resume we just issued must still count toward the cap, so the
+    /// dispatch-grace latch no longer launders it away
+    /// (`rt-review-slot-relaunch-loop`) — but break the confirmed-dead streak,
+    /// since this tick did not confirm the slot dead.
+    fn note_dispatch_in_flight(&mut self) {
+        self.dead_streak = 0;
+    }
+
+    /// Record one **confirmed-dead** poll and report whether the hysteresis
+    /// threshold ([`CONSECUTIVE_DEAD_BEFORE_RESUME`]) is now met — i.e. whether
+    /// the caller should proceed to [`decide_dead`](Self::decide_dead) this tick
+    /// rather than wait for another confirming poll.
+    fn observe_dead(&mut self) -> bool {
+        self.dead_streak = self.dead_streak.saturating_add(1);
+        self.dead_streak >= CONSECUTIVE_DEAD_BEFORE_RESUME
     }
 
     /// Drop the resume [`Self::decide_dead`] just recorded, when the resume
@@ -4699,9 +4796,14 @@ fn maybe_resume_stranded_review_slots(
         // grace window keeps a stale pre-`quit` signal from masking a genuinely
         // stranded slot. Checked before the stash-recovery probe below: a slot
         // the dispatcher only just seeded has no parked View-Diff agent to
-        // recover.
+        // recover. Stand down WITHOUT `note_alive`: a resume we just issued
+        // writes these very dispatch lines, so letting the grace latch it alive
+        // would launder that resume out of the crash history and the cap would
+        // never trip — the relaunch-loop bug (`rt-review-slot-relaunch-loop`).
+        // We only break the confirmed-dead streak (this tick did not confirm the
+        // slot dead).
         if shelbi_state::recent_dispatch_active(&project.name, &ws.name, DISPATCH_CONFIRM_GRACE) {
-            entry.note_alive(now);
+            entry.note_dispatch_in_flight();
             continue;
         }
 
@@ -4743,9 +4845,28 @@ fn maybe_resume_stranded_review_slots(
             entry.request_relaunch();
         }
 
+        // Hysteresis: a stranded slot must read confirmed-dead on two
+        // consecutive polls before we resume it, so a single transient wedged
+        // read never relaunches a slot whose agent is actually alive
+        // (`rt-review-slot-relaunch-loop`). Below the threshold we stand down and
+        // wait for the next confirming poll.
+        if !entry.observe_dead() {
+            continue;
+        }
+
         match entry.decide_dead(now) {
             ReviewResumeAction::None => {}
             ReviewResumeAction::Resume => {
+                // Why was the slot stranded? A session whose process is still up
+                // but whose socket no longer answers is `wedged`; one whose
+                // process is gone is a `restart/crash`. Capture it BEFORE the
+                // resume kills+respawns the session, so the distinction survives
+                // into the log line (`rt-review-slot-relaunch-loop`).
+                let reason = if backend().slot_wedged(&host, &addr) {
+                    "wedged"
+                } else {
+                    "restart/crash"
+                };
                 // Reuse the manual/auto load path: it forces the Review agent,
                 // appends the serve recipe, and permits a same-slot resume. The
                 // resume variant re-checks liveness under the review-load lock,
@@ -4768,7 +4889,7 @@ fn maybe_resume_stranded_review_slots(
                             &task_id,
                             &ws.name,
                             "review-resume",
-                            "resuming stranded review slot after restart/crash",
+                            &format!("resuming stranded review slot reason={reason}"),
                         );
                         tracing::info!(
                             project = %project.name,
@@ -4972,15 +5093,21 @@ struct DevResumeState {
     /// Latched once the gave-up line is emitted, so it neither spams nor resumes
     /// while the slot stays down. Cleared when the slot recovers.
     gave_up: bool,
+    /// Consecutive confirmed-dead polls — the hysteresis counter, matching
+    /// [`ReviewResumeState::dead_streak`]. A resume fires only once it reaches
+    /// [`CONSECUTIVE_DEAD_BEFORE_RESUME`] (`rt-review-slot-relaunch-loop`).
+    dead_streak: u32,
 }
 
 impl DevResumeState {
     /// The slot's pane is alive (booting, or resumed and serving). Latch
-    /// `ever_alive` so future crashes belong to the pane supervisor, and — once
-    /// it has stayed up past [`STABLE_RECOVERY`] since our last resume — forget
-    /// the crash history so an unrelated crash much later starts from zero.
+    /// `ever_alive` so future crashes belong to the pane supervisor, break the
+    /// confirmed-dead streak, and — once it has stayed up past
+    /// [`STABLE_RECOVERY`] since our last resume — forget the crash history so
+    /// an unrelated crash much later starts from zero.
     fn note_alive(&mut self, now: Instant) {
         self.ever_alive = true;
+        self.dead_streak = 0;
         match self.restarts.last() {
             Some(&last) if now.duration_since(last) >= STABLE_RECOVERY => {
                 self.restarts.clear();
@@ -4989,6 +5116,14 @@ impl DevResumeState {
             Some(_) => {}
             None => self.gave_up = false,
         }
+    }
+
+    /// Record one confirmed-dead poll and report whether the hysteresis
+    /// threshold ([`CONSECUTIVE_DEAD_BEFORE_RESUME`]) is now met — the dev
+    /// analogue of [`ReviewResumeState::observe_dead`].
+    fn observe_dead(&mut self) -> bool {
+        self.dead_streak = self.dead_streak.saturating_add(1);
+        self.dead_streak >= CONSECUTIVE_DEAD_BEFORE_RESUME
     }
 
     /// The slot's pane is dead and never seen alive by this pass (the stranded
@@ -5187,6 +5322,21 @@ fn maybe_resume_stranded_dev_slots(
             entry.request_relaunch();
         }
 
+        // Hysteresis: require two consecutive confirmed-dead polls before a
+        // resume, matching the review pass, so a single transient wedged read
+        // never relaunches a live slot (`rt-review-slot-relaunch-loop`).
+        if !entry.observe_dead() {
+            continue;
+        }
+
+        // Label the reason `wedged` (process up, socket silent) vs
+        // `restart/crash` (process gone), captured before the resume respawns it.
+        let reason = if backend().slot_wedged(&host, &addr) {
+            "wedged"
+        } else {
+            "restart/crash"
+        };
+
         match entry.decide_dead(now) {
             ReviewResumeAction::None => {}
             ReviewResumeAction::Resume => match resume_dev_workspace(project, ws, &task_id) {
@@ -5196,7 +5346,7 @@ fn maybe_resume_stranded_dev_slots(
                         &task_id,
                         &ws.name,
                         "dev-resume",
-                        "resuming stranded dev slot after restart/crash",
+                        &format!("resuming stranded dev slot reason={reason}"),
                     );
                     tracing::info!(
                         project = %project.name,
@@ -5916,6 +6066,60 @@ mod tests {
             s.decide_dead(t0 + STABLE_RECOVERY + Duration::from_secs(2)),
             ReviewResumeAction::Resume
         );
+    }
+
+    #[test]
+    fn review_resume_requires_two_consecutive_dead_observations() {
+        // Hysteresis: one confirmed-dead poll is not enough to resume — the
+        // streak must reach CONSECUTIVE_DEAD_BEFORE_RESUME. A single transient
+        // wedged read therefore never relaunches a live slot.
+        let mut s = ReviewResumeState::default();
+        assert_eq!(CONSECUTIVE_DEAD_BEFORE_RESUME, 2);
+        assert!(!s.observe_dead(), "first dead poll: stand down");
+        assert!(s.observe_dead(), "second consecutive dead poll: proceed");
+        // An alive reading breaks the streak, so the next dead poll starts over.
+        s.note_alive(Instant::now());
+        assert!(!s.observe_dead(), "streak reset by a live reading");
+    }
+
+    #[test]
+    fn review_dispatch_in_flight_keeps_the_crash_history() {
+        // The crash-loop-cap fix: the dispatch-grace latch stands the tick down
+        // and breaks the dead streak, but must NOT clear the restart history —
+        // otherwise a resume (whose own dispatch lines trigger the grace) would
+        // launder itself out of the cap and loop forever.
+        let mut s = ReviewResumeState::default();
+        let t = Instant::now();
+        assert_eq!(s.decide_dead(t), ReviewResumeAction::Resume);
+        assert_eq!(s.restarts.len(), 1);
+        s.observe_dead();
+        assert_eq!(s.dead_streak, 1);
+        s.note_dispatch_in_flight();
+        assert_eq!(s.dead_streak, 0, "in-flight breaks the confirmed-dead streak");
+        assert_eq!(s.restarts.len(), 1, "but the crash history survives the grace");
+    }
+
+    #[test]
+    fn review_resume_caps_without_a_full_recovery_between_resumes() {
+        // A fast resume loop that never recovers past STABLE_RECOVERY still trips
+        // the cap: brief in-flight ticks (as every resume produces) break the
+        // dead streak but leave the crash history intact, so the resumes
+        // accumulate to supervision=gave-up.
+        let mut s = ReviewResumeState::default();
+        let mut t = Instant::now();
+        for n in 0..MAX_RESTARTS_IN_WINDOW {
+            // Two confirming dead polls, then the resume fires.
+            assert!(!s.observe_dead());
+            assert!(s.observe_dead());
+            assert_eq!(s.decide_dead(t), ReviewResumeAction::Resume, "resume {n}");
+            // The relaunch's dispatch lines land: an in-flight tick, not a real
+            // recovery. It must not clear the history.
+            s.note_dispatch_in_flight();
+            t += BASE_BACKOFF * (1u32 << n) + Duration::from_secs(2);
+        }
+        assert!(!s.observe_dead());
+        assert!(s.observe_dead());
+        assert_eq!(s.decide_dead(t), ReviewResumeAction::GaveUp);
     }
 
     #[test]
@@ -7778,6 +7982,11 @@ Auto mode works better when it knows your environment. Takes about a minute.
         // board, so the attempt surfaces as a single `dev-resume-failed` — the
         // point is that the pass ACTS rather than standing down, proving the
         // in-flight guard is scoped to a fresh launch, not a blanket mute.
+        //
+        // The resume now takes TWO consecutive confirmed-dead ticks (the
+        // hysteresis that stops a one-tick wedge from relaunching a live slot —
+        // `rt-review-slot-relaunch-loop`): the first tick stands down recording
+        // no restart, the second fires the resume.
         let _g = crate::test_lock::acquire();
         let home = gh_guard_home("dev-strand-resumes");
         std::env::set_var("SHELBI_HOME", &home);
@@ -7792,18 +8001,32 @@ Auto mode works better when it knows your environment. Takes about a minute.
         // gone, so the slot is genuinely stranded.
 
         let mut state: HashMap<String, DevResumeState> = HashMap::new();
+        // First tick: the hysteresis gate stands the pass down (no resume yet).
         maybe_resume_stranded_dev_slots(&project, &mut state);
+        let after_first =
+            std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
+        assert!(
+            !after_first.contains("status=dev-resume"),
+            "one confirmed-dead tick must not resume yet; log:\n{after_first}"
+        );
+        assert_eq!(
+            state.get("alpha").map(|s| s.dead_streak).unwrap_or(0),
+            1,
+            "the first dead tick arms the hysteresis streak",
+        );
 
+        // Second consecutive dead tick: now the resume fires exactly once.
+        maybe_resume_stranded_dev_slots(&project, &mut state);
         let log =
             std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
         assert!(
             log.contains("status=dev-resume"),
-            "a genuinely stranded slot must still be resumed exactly once; log:\n{log}"
+            "a genuinely stranded slot must be resumed on the second confirming tick; log:\n{log}"
         );
         assert_eq!(
             state.get("alpha").map(|s| s.restarts.len()).unwrap_or(0),
             1,
-            "a genuine strand resumes exactly once this tick",
+            "a genuine strand resumes exactly once",
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -8042,6 +8265,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
             &mut supervision,
             &mut limit_resume,
             &mut orphan_since,
+            &mut HashMap::new(),
         );
         daemon.join().unwrap();
 
