@@ -1444,7 +1444,7 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 /// "this slot is a review surface". If the project can't be loaded we can't
 /// classify, so everything falls back to Queued/Pending (no location).
 ///
-/// The serving signal is the review workspace's `.claude/shelbi-review-loaded`
+/// The serving signal is the review workspace's `.shelbi/shelbi-review-loaded`
 /// marker (see [`shelbi_orchestrator::workspace::read_review_loaded_marker`]):
 /// the hub poller writes it once the serve recipe's `ready:` health check passes
 /// (the deterministic, agent-independent path — see
@@ -1543,7 +1543,7 @@ fn split_review_sections(
 /// Whether `task_id`'s review slot is confirmed serving. Delegates to the shared
 /// [`shelbi_orchestrator::workspace::review_slot_is_serving`] so this legacy
 /// sidebar and the shell's `SidebarModel` can't drift on the rule: the
-/// `.claude/shelbi-review-loaded` marker names this task, **or** the workflow
+/// `.shelbi/shelbi-review-loaded` marker names this task, **or** the workflow
 /// declares no health-checkable server and the review-agent session is live (a
 /// URL-less review has no server to probe). A missing/stale marker, a
 /// mis-configured machine, or a read error all read as "not serving yet" — the
@@ -2639,7 +2639,7 @@ mod tests {
         p
     }
 
-    /// Write the `.claude/shelbi-review-loaded` serving marker for `workspace`
+    /// Write the `.shelbi/shelbi-review-loaded` serving marker for `workspace`
     /// under `work_dir`, standing in for the Review agent's write once its dev
     /// server is confirmed up. Body mirrors the real marker: `<task-id> <url>`.
     fn write_review_loaded_marker(work_dir: &std::path::Path, workspace: &str, task_id: &str) {
@@ -2647,7 +2647,7 @@ mod tests {
             .join(".shelbi")
             .join("wt")
             .join(workspace)
-            .join(".claude");
+            .join(".shelbi");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("shelbi-review-loaded"),

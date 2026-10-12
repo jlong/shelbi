@@ -210,7 +210,7 @@ serving.
 **Loaded marker.** In addition to the socket event, write a file marker the
 hub watches for — the durable, UI-proof handoff signal (the socket event can
 be missed; a file can't be clobbered by an OSC title write). Your dispatch
-prompt gives you the exact path (`.claude/shelbi-review-loaded`) and the
+prompt gives you the exact path (`.shelbi/shelbi-review-loaded`) and the
 atomic `printf … > …tmp && mv …tmp …` write to use. Its body is the task id
 followed by the reviewable URL (omit the URL when no recipe ran). Write it
 once, when you're up (or have determined there's nothing to bring up).

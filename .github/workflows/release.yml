@@ -426,6 +426,25 @@ jobs:
       APT_BASE_URL: ${{ vars.APT_BASE_URL || 'https://apt.shelbi.dev' }}
       APT_SUITE: stable
     steps:
+      - name: Checkout Shelbi
+        uses: actions/checkout@v4
+
+      - name: Wait for the hosted APT repository to settle
+        # apt-publish pushes InRelease and Packages.gz together, but the Vercel
+        # edge serving apt.shelbi.dev can briefly serve a new InRelease with a
+        # stale Packages.gz (or the reverse) while the deploy propagates. apt
+        # reports that as "File has unexpected size ... Mirror sync in
+        # progress?" and the old 5x15s apt-get update loop gave up before the
+        # edge converged. Poll (up to ~5 minutes) until InRelease and the index
+        # files it signs agree; a mismatch that persists past the deadline still
+        # fails the job, logging the observed vs. expected sizes.
+        run: |
+          scripts/release/wait-for-apt-consistency.sh \
+            --base-url "$APT_BASE_URL" \
+            --suite "$APT_SUITE" \
+            --timeout 300 \
+            --interval 15
+
       - name: Install Shelbi from hosted APT repository
         run: |
           sudo install -d -m 0755 /etc/apt/keyrings
@@ -434,6 +453,8 @@ jobs:
           echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/shelbi-archive-keyring.gpg] $APT_BASE_URL $APT_SUITE main" \
             | sudo tee /etc/apt/sources.list.d/shelbi.list >/dev/null
 
+          # Belt-and-suspenders retry in case the edge still flips a cached POP
+          # between the consistency check above and this update.
           for attempt in 1 2 3 4 5; do
             if sudo apt-get update; then
               break

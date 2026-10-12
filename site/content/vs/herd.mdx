@@ -62,7 +62,7 @@ serial trigger, not a scheduler. The human stays the dispatcher.
 ### Explicit review handoff via file marker
 
 When a worker finishes a task, it writes its task id to
-`<worktree>/.claude/shelbi-review-ready`. The hub poller picks it up and
+`<worktree>/.shelbi/shelbi-ready`. The hub poller picks it up and
 moves the card to `review`. The handoff survives machine sleep, network
 blips, and SSH drops — the marker is the *entire* on-worker protocol,
 which is what lets a remote worker run with nothing installed but `git`,
