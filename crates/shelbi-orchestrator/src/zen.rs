@@ -55,8 +55,9 @@ use crate::git::{
     commit_subject, compose_pr_body, gh_pr_merge, locate_hub_workdir, locate_workspace_worktree,
     login_shell_prefix, lookup_merged_pr, lookup_open_pr_in_repository, lookup_origin_repository,
     lookup_origin_repository_selector, lookup_origin_repository_with_push_target,
-    lookup_pr_identity, parse_pr_number_from_url, pr_title, run_in_dir,
-    run_login_shell_script_with_deadline, squash_merge_subject, MergedPr, RepositoryIdentity,
+    lookup_pr_identity, parse_pr_number_from_url, pr_head_contains_tip, pr_title,
+    resolve_branch_tip, run_in_dir, run_login_shell_script_with_deadline, squash_merge_subject,
+    MergedPr, RepositoryIdentity,
 };
 use crate::workspace::{rebase_workspace_branch_onto_default, workspace_worktree, RebaseOutcome};
 
@@ -1182,9 +1183,43 @@ pub fn github_merge_reconcile(project: &Project) -> Result<Vec<GithubMergeReconc
     }
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
-    reconcile_candidates_with(project, candidates, |branch| {
-        lookup_merged_pr(&host, &wt, branch)
+    reconcile_candidates_with(project, candidates, |cand| {
+        let Some(merged) = lookup_merged_pr(&host, &wt, &cand.branch)? else {
+            return Ok(None);
+        };
+        // Resolve the branch's CURRENT tip and whether the merged PR actually
+        // integrated it. A reopened issue re-dispatched on the same branch has
+        // a fresh, un-merged tip that the old PR's head does not contain; a
+        // branch that was merged and deleted has no tip left to protect.
+        let branch_tip = resolve_branch_tip(&host, &wt, &cand.branch)?;
+        let tip_in_pr_head = match &branch_tip {
+            Some(tip) => pr_head_contains_tip(&host, &wt, tip, &merged.head)?,
+            None => true,
+        };
+        Ok(Some(MergeEvidence {
+            merged,
+            branch_tip,
+            tip_in_pr_head,
+        }))
     })
+}
+
+/// What one reconcile candidate's branch looks like against the merged PR
+/// GitHub reports for it — the evidence [`reconcile_candidates_with`] decides
+/// on. Resolved by the real caller via `gh` + `git` in the hub worktree, and
+/// injected directly by tests so the finalize / leave-in-review decision is
+/// exercised without a live repository.
+struct MergeEvidence {
+    /// The merged PR GitHub reports for the candidate's branch head.
+    merged: MergedPr,
+    /// The branch's current tip (local, else remote-tracking). `None` when the
+    /// branch ref is gone everywhere — the merged-and-deleted finished state,
+    /// where there is no un-integrated work to protect.
+    branch_tip: Option<String>,
+    /// Whether [`Self::branch_tip`] is contained in the merged PR's recorded
+    /// head. Conventionally `true` when `branch_tip` is `None` (nothing left to
+    /// protect), so the only blocking case is a *present* tip the PR omits.
+    tip_in_pr_head: bool,
 }
 
 /// Drive the reconcile over an already-selected candidate set with the
@@ -1196,10 +1231,10 @@ pub fn github_merge_reconcile(project: &Project) -> Result<Vec<GithubMergeReconc
 fn reconcile_candidates_with<F>(
     project: &Project,
     candidates: Vec<GithubReconcileCandidate>,
-    lookup_merged: F,
+    resolve_evidence: F,
 ) -> Result<Vec<GithubMergeReconcile>>
 where
-    F: Fn(&str) -> Result<Option<MergedPr>>,
+    F: Fn(&GithubReconcileCandidate) -> Result<Option<MergeEvidence>>,
 {
     let mut reconciled = Vec::new();
     for (i, cand) in candidates.into_iter().enumerate() {
@@ -1211,8 +1246,8 @@ where
             );
             break;
         }
-        let merged = match lookup_merged(&cand.branch) {
-            Ok(Some(m)) => m,
+        let evidence = match resolve_evidence(&cand) {
+            Ok(Some(e)) => e,
             // No merged PR (open / closed-unmerged / none) — leave it in review.
             Ok(None) => continue,
             Err(e) => {
@@ -1223,6 +1258,51 @@ where
                 continue;
             }
         };
+        let MergeEvidence {
+            merged,
+            branch_tip,
+            tip_in_pr_head,
+        } = evidence;
+        // Stale-PR guard #1 — reused branch. If the branch still points at a
+        // tip the merged PR does NOT contain, the PR belongs to an earlier
+        // cycle of this branch (the issue was reopened and re-dispatched) and
+        // the new work was never merged. Finalizing here is the bug that
+        // stranded `rt-merge-main-into-umbrella` in a worktree while the board
+        // said done — so leave the task in review. A branch with no tip left
+        // (merged and deleted) sets `tip_in_pr_head = true` and falls through,
+        // preserving the finished-case finalize the pass exists for.
+        if branch_tip.is_some() && !tip_in_pr_head {
+            tracing::info!(
+                task = %cand.task.id, branch = %cand.branch,
+                tip = branch_tip.as_deref().unwrap_or("-"),
+                pr = merged.pr, pr_head = %merged.head,
+                "github-merge reconcile: branch tip is not contained in the merged PR head (stale PR on a reused branch); leaving in review"
+            );
+            continue;
+        }
+        // Stale-PR guard #2 — merge predates this cycle. A PR that merged
+        // before the task's most recent handoff into review (`updated_at`, a
+        // time at or after the current cycle's dispatch/reopen) belongs to a
+        // previous cycle. Only meaningful while the branch is still present:
+        // in the merged-and-deleted finished state there is no later cycle to
+        // be stale against, and skipping it there avoids over-blocking the
+        // out-of-band-merge finalize the pass was built for. A missing
+        // `merged_at` (the brief pre-materialize window) is not proof the PR
+        // is stale, so it does not block — guard #1 already covers the reused
+        // branch, and the next tick re-checks with a materialized timestamp.
+        if branch_tip.is_some() {
+            if let Some(merged_at) = merged.merged_at {
+                if merged_at < cand.task.updated_at {
+                    tracing::info!(
+                        task = %cand.task.id, branch = %cand.branch,
+                        pr = merged.pr,
+                        merged_at = %merged_at, handoff_at = %cand.task.updated_at,
+                        "github-merge reconcile: PR merged before the task's latest handoff (stale PR from a previous cycle); leaving in review"
+                    );
+                    continue;
+                }
+            }
+        }
         match apply_github_merge_reconcile(project, &cand, &merged) {
             Ok(true) => {
                 tracing::info!(
@@ -5873,12 +5953,16 @@ esac
             .collect()
     }
 
-    /// A merged PR the injected lookup can hand back.
+    /// A merged PR the injected evidence resolver can hand back. `head` is a
+    /// placeholder; containment / time-guard tests set `head`, `merged_at`, and
+    /// the evidence's `branch_tip` / `tip_in_pr_head` explicitly.
     fn merged_pr(pr: u64, sha: Option<&str>) -> MergedPr {
         MergedPr {
             pr,
             sha: sha.map(str::to_string),
             base: "main".into(),
+            head: "mergedhead0000".into(),
+            merged_at: None,
         }
     }
 
@@ -5901,10 +5985,16 @@ esac
                 1,
                 "the in-review task must be the single reconcile candidate"
             );
-            // Inject a merged PR — no gh / GitHub touched.
-            let reconciled = reconcile_candidates_with(&project, candidates, |branch| {
-                assert_eq!(branch, TASK_BRANCH, "lookup must key off the task branch");
-                Ok(Some(merged_pr(236, Some("abc1234def"))))
+            // Inject a merged PR — no gh / GitHub touched. The branch is gone
+            // (merged and deleted), so there is no un-integrated tip to protect
+            // and the pass finalizes exactly as before.
+            let reconciled = reconcile_candidates_with(&project, candidates, |cand| {
+                assert_eq!(cand.branch, TASK_BRANCH, "lookup must key off the task branch");
+                Ok(Some(MergeEvidence {
+                    merged: merged_pr(236, Some("abc1234def")),
+                    branch_tip: None,
+                    tip_in_pr_head: true,
+                }))
             })
             .unwrap();
 
@@ -5951,9 +6041,9 @@ esac
             let _env = EnvGuard::install(home.path());
             shelbi_state::save_task(PROJECT_NAME, &task(), "").unwrap();
             let candidates = github_merge_reconcile_candidates(&project).unwrap();
-            // No merged PR (open / closed-unmerged / none) → the lookup yields None.
+            // No merged PR (open / closed-unmerged / none) → the resolver yields None.
             let reconciled =
-                reconcile_candidates_with(&project, candidates, |_branch| Ok(None)).unwrap();
+                reconcile_candidates_with(&project, candidates, |_cand| Ok(None)).unwrap();
             let column_after = shelbi_state::load_task(PROJECT_NAME, &task().id)
                 .unwrap()
                 .task
@@ -6000,6 +6090,151 @@ esac
             gh.is_empty(),
             "the no-candidate early return must precede any gh call: {gh}"
         );
+    }
+
+    #[test]
+    fn github_merge_reconcile_leaves_reused_branch_with_stale_pr_in_review() {
+        // The motivating bug: an issue reopened and re-dispatched on the SAME
+        // branch. The branch's old, already-merged PR is still on GitHub, but
+        // the branch now points at a fresh tip the old PR head does not contain
+        // — the new work was never merged. The card must stay in review rather
+        // than be moved to done against the stale PR.
+        let _lock = crate::test_lock::acquire();
+        let home = tempfile::tempdir().unwrap();
+        let project = project(home.path());
+
+        let (column_after, events, reconciled) = {
+            let _env = EnvGuard::install(home.path());
+            shelbi_state::save_task(PROJECT_NAME, &task(), "").unwrap();
+            let candidates = github_merge_reconcile_candidates(&project).unwrap();
+            // Old merged PR head != the branch's current (fresh, un-merged) tip,
+            // and that tip is NOT contained in the old head.
+            let reconciled = reconcile_candidates_with(&project, candidates, |_cand| {
+                Ok(Some(MergeEvidence {
+                    merged: merged_pr(1515, Some("f670320acafe")),
+                    branch_tip: Some("28baf5b2new0".into()),
+                    tip_in_pr_head: false,
+                }))
+            })
+            .unwrap();
+            let column_after = shelbi_state::load_task(PROJECT_NAME, &task().id)
+                .unwrap()
+                .task
+                .column;
+            (column_after, reconcile_event_lines(), reconciled)
+        };
+
+        assert!(
+            reconciled.is_empty(),
+            "a stale PR on a reused branch must not reconcile: {reconciled:?}"
+        );
+        assert_eq!(
+            column_after,
+            Column::review(),
+            "the re-dispatched task must stay in review"
+        );
+        assert!(
+            events.is_empty(),
+            "no reconcile transition may be emitted for a stale PR: {events:?}"
+        );
+    }
+
+    #[test]
+    fn github_merge_reconcile_leaves_pr_merged_before_handoff_in_review() {
+        // Even when the branch tip IS contained in the merged PR head (a reused
+        // branch not yet re-committed, say), a PR that merged BEFORE the task's
+        // latest handoff into review belongs to a previous cycle and must not
+        // finalize the new one — the time guard, independent of containment.
+        let _lock = crate::test_lock::acquire();
+        let home = tempfile::tempdir().unwrap();
+        let project = project(home.path());
+        let now = chrono::Utc::now();
+
+        let (column_after, events, reconciled) = {
+            let _env = EnvGuard::install(home.path());
+            // Hand the task off "now"; the PR merged a day earlier.
+            let mut t = task();
+            t.updated_at = now;
+            shelbi_state::save_task(PROJECT_NAME, &t, "").unwrap();
+            let candidates = github_merge_reconcile_candidates(&project).unwrap();
+
+            let reconciled = reconcile_candidates_with(&project, candidates, |_cand| {
+                let mut merged = merged_pr(1515, Some("f670320acafe"));
+                merged.head = "oldtip000000".into();
+                merged.merged_at = Some(now - chrono::Duration::days(1));
+                Ok(Some(MergeEvidence {
+                    merged,
+                    // Present and contained — only the time guard can block it.
+                    branch_tip: Some("oldtip000000".into()),
+                    tip_in_pr_head: true,
+                }))
+            })
+            .unwrap();
+            let column_after = shelbi_state::load_task(PROJECT_NAME, &task().id)
+                .unwrap()
+                .task
+                .column;
+            (column_after, reconcile_event_lines(), reconciled)
+        };
+
+        assert!(
+            reconciled.is_empty(),
+            "a PR merged before the handoff must not reconcile: {reconciled:?}"
+        );
+        assert_eq!(
+            column_after,
+            Column::review(),
+            "a task whose merged PR predates the handoff must stay in review"
+        );
+        assert!(
+            events.is_empty(),
+            "no reconcile transition may be emitted: {events:?}"
+        );
+    }
+
+    #[test]
+    fn github_merge_reconcile_advances_when_present_tip_is_in_a_fresh_merge() {
+        // The out-of-band merge the pass exists for, with the branch NOT
+        // deleted: the current tip equals the merged PR head and the merge is
+        // newer than the handoff. Both stale-PR guards pass → finalize. Guards
+        // the time guard against over-blocking the legitimate finalize.
+        let _lock = crate::test_lock::acquire();
+        let home = tempfile::tempdir().unwrap();
+        let project = project(home.path());
+        let now = chrono::Utc::now();
+
+        let (column_after, reconciled) = {
+            let _env = EnvGuard::install(home.path());
+            let mut t = task();
+            t.updated_at = now;
+            shelbi_state::save_task(PROJECT_NAME, &t, "").unwrap();
+            let candidates = github_merge_reconcile_candidates(&project).unwrap();
+
+            let reconciled = reconcile_candidates_with(&project, candidates, |_cand| {
+                let mut merged = merged_pr(236, Some("abc1234def0"));
+                merged.head = "livehead0000".into();
+                merged.merged_at = Some(now + chrono::Duration::hours(1));
+                Ok(Some(MergeEvidence {
+                    merged,
+                    branch_tip: Some("livehead0000".into()),
+                    tip_in_pr_head: true,
+                }))
+            })
+            .unwrap();
+            let column_after = shelbi_state::load_task(PROJECT_NAME, &task().id)
+                .unwrap()
+                .task
+                .column;
+            (column_after, reconciled)
+        };
+
+        assert_eq!(
+            column_after.as_str(),
+            "done",
+            "a fresh out-of-band merge containing the current tip must finalize"
+        );
+        assert_eq!(reconciled.len(), 1, "one task must be reported reconciled");
+        assert_eq!(reconciled[0].pr, 236);
     }
 
     fn umbrella_workflow() -> Workflow {

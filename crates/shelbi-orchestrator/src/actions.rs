@@ -4440,13 +4440,15 @@ transitions:
             .to_string();
 
         // No open PR for the branch; a MERGED PR #564 whose merge commit is
-        // `abc123def` and whose base was `main`. The branch itself is *not*
-        // on origin (never created) — the already-merged path must not depend
-        // on it, exactly the deleted-branch case.
+        // `abc123def`, whose head was `deadbeefhead`, merged at a fixed time,
+        // and whose base was `main`. The branch itself is *not* on origin
+        // (never created) — the already-merged path must not depend on it,
+        // exactly the deleted-branch case. The line mirrors `lookup_merged_pr`'s
+        // 5-field `--jq` output: `<number> <mergeOid> <headOid> <mergedAt> <base>`.
         let (_stub, prev_shell, prev_home) = install_gh_stub(
             r#"#!/bin/sh
 case "$*" in
-  *"--state merged"*) echo "564 abc123def main" ;;
+  *"--state merged"*) echo "564 abc123def deadbeefhead 2026-10-05T12:00:00Z main" ;;
   *"pr list"*) : ;;
 esac
 exit 0
