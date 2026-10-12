@@ -1,0 +1,412 @@
+//! First-enable Zen Mode intro popover — shared overlay logic + rendering.
+//!
+//! Shown the first time the user picks "Turn Zen Mode on" while
+//! `~/.shelbi/state.json::zen_intro_seen` is unset. Explains what Zen does
+//! (auto-promote, auto-merge), the safety mechanism (per-project checks), and
+//! the escape hatches (pause, off, CLAUDE.md). On dismissal with "Don't show
+//! this again" checked the caller persists the flag so the popover never
+//! re-fires.
+//!
+//! This module is the single implementation shared by the in-process TUI
+//! overlay (removing-tmux Phase 4d) and the legacy tmux palette's in-alt-screen
+//! popover (`shelbi-cli`): the state machine + step function are pure data, and
+//! [`render_intro`] paints into any caller-supplied [`Rect`]. The caller owns
+//! the event loop and the one-shot flag.
+
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Clear, Paragraph, Wrap},
+    Frame,
+};
+
+/// Which control has keyboard focus inside the intro popover.
+/// Tab cycles forward through these three in the order written; BackTab
+/// cycles backwards. Enter / Space activates the focused control —
+/// toggling the checkbox or firing the corresponding button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntroFocus {
+    Checkbox,
+    Cancel,
+    Enable,
+}
+
+/// Mutable state the popover renderer reads each frame. Constructed via
+/// [`IntroState::default`] — spec calls for the Enable Zen button to
+/// own initial focus (the user just clicked Enable, are you sure?) and
+/// the checkbox starts unchecked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntroState {
+    pub focus: IntroFocus,
+    pub dont_show_again: bool,
+}
+
+impl Default for IntroState {
+    fn default() -> Self {
+        Self {
+            focus: IntroFocus::Enable,
+            dont_show_again: false,
+        }
+    }
+}
+
+/// Result of feeding a key into the popover state machine. The caller
+/// drives the loop: `Continue` keeps redrawing, `Cancelled` /
+/// `Confirmed` exit and the caller looks at `state.dont_show_again` to
+/// decide whether to persist the global flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntroOutcome {
+    Continue,
+    Cancelled,
+    Confirmed,
+}
+
+/// Step the popover state machine. Pure function — no IO, no terminal,
+/// so every key path is covered by the unit tests below.
+///
+/// Bindings (spec):
+/// - `Tab` cycles Checkbox → Cancel → Enable → Checkbox; `BackTab`
+///   walks backwards. Left/Right alias to BackTab/Tab so users who
+///   reach for arrow keys land on the next control.
+/// - `Enter` / `Space` activates focus: toggles the checkbox, fires
+///   the Cancel button, or fires Enable.
+/// - `Esc` is equivalent to Cancel regardless of focus.
+pub fn step_intro(state: &mut IntroState, key: KeyEvent) -> IntroOutcome {
+    match key.code {
+        KeyCode::Esc => IntroOutcome::Cancelled,
+        KeyCode::Tab | KeyCode::Right => {
+            state.focus = match state.focus {
+                IntroFocus::Checkbox => IntroFocus::Cancel,
+                IntroFocus::Cancel => IntroFocus::Enable,
+                IntroFocus::Enable => IntroFocus::Checkbox,
+            };
+            IntroOutcome::Continue
+        }
+        KeyCode::BackTab | KeyCode::Left => {
+            state.focus = match state.focus {
+                IntroFocus::Checkbox => IntroFocus::Enable,
+                IntroFocus::Cancel => IntroFocus::Checkbox,
+                IntroFocus::Enable => IntroFocus::Cancel,
+            };
+            IntroOutcome::Continue
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => match state.focus {
+            IntroFocus::Checkbox => {
+                state.dont_show_again = !state.dont_show_again;
+                IntroOutcome::Continue
+            }
+            IntroFocus::Cancel => IntroOutcome::Cancelled,
+            IntroFocus::Enable => IntroOutcome::Confirmed,
+        },
+        _ => IntroOutcome::Continue,
+    }
+}
+
+/// Paint the intro dialog. It fills the whole pane it's given — in the tmux
+/// runtime that pane is the palette's `tmux display-popup`, which already draws
+/// its own border; in the single-process TUI the caller gives it a centered
+/// overlay [`Rect`] over the dimmed main area. Either way the widget
+/// deliberately draws *no* border of its own (a second one would double up; see
+/// the task "zen-intro-double-border"). The " Enable Zen Mode? " title is a
+/// plain in-content heading instead of a border title. Buttons render at the
+/// bottom in the same Cancel-left / primary-right order the existing Quit
+/// popovers use.
+pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
+    // Clear the whole pane so whatever is behind us doesn't bleed through around
+    // the copy, then inset the content (2 cols / 1 row) so the text isn't
+    // jammed against the frame.
+    f.render_widget(Clear, area);
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .horizontal_margin(2)
+        .vertical_margin(1)
+        .constraints([
+            Constraint::Length(1), // heading (in-content title)
+            Constraint::Length(1), // blank
+            Constraint::Min(8),    // body copy
+            Constraint::Length(1), // checkbox
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // buttons
+        ])
+        .split(area);
+
+    let heading = Paragraph::new(Line::from(Span::styled(
+        "Enable Zen Mode?",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(heading, layout[0]);
+
+    let body = Paragraph::new(
+        "Zen Mode lets the orchestrator act autonomously:\n\
+         \n  \
+         • Auto-promotes ready tasks to dispatch\n  \
+         • Auto-merges completed tasks that pass your project's checks \
+         (build/test + diff size + danger paths)\n\
+         \n\
+         You can pause it (palette → Pause Zen) or turn it off any time. \
+         Edit CLAUDE.md to tune what qualifies as in-scope or what gates merges.",
+    )
+    .style(Style::default().fg(Color::Gray))
+    .wrap(Wrap { trim: true });
+    f.render_widget(body, layout[2]);
+
+    let checkbox_glyph = if state.dont_show_again { "[x]" } else { "[ ]" };
+    let checkbox_style = if state.focus == IntroFocus::Checkbox {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{checkbox_glyph} Don't show this again"),
+            checkbox_style,
+        ))),
+        layout[3],
+    );
+
+    let cancel_style = if state.focus == IntroFocus::Cancel {
+        Style::default()
+            .bg(crate::theme::SELECTION_BG)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let enable_style = if state.focus == IntroFocus::Enable {
+        Style::default()
+            .bg(Color::Green)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let buttons = Paragraph::new(Line::from(vec![
+        Span::styled("  [ Cancel ]  ", cancel_style),
+        Span::raw("  "),
+        Span::styled("  [ Enable Zen ]  ", enable_style),
+    ]));
+    f.render_widget(buttons, layout[5]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn default_focus_is_enable_and_checkbox_unchecked() {
+        let s = IntroState::default();
+        assert_eq!(s.focus, IntroFocus::Enable);
+        assert!(
+            !s.dont_show_again,
+            "spec: checkbox starts unchecked so the user opts in explicitly",
+        );
+    }
+
+    #[test]
+    fn tab_cycles_focus_checkbox_cancel_enable_in_order() {
+        let mut s = IntroState::default();
+        assert_eq!(step_intro(&mut s, key(KeyCode::Tab)), IntroOutcome::Continue);
+        assert_eq!(s.focus, IntroFocus::Checkbox);
+        assert_eq!(step_intro(&mut s, key(KeyCode::Tab)), IntroOutcome::Continue);
+        assert_eq!(s.focus, IntroFocus::Cancel);
+        assert_eq!(step_intro(&mut s, key(KeyCode::Tab)), IntroOutcome::Continue);
+        assert_eq!(s.focus, IntroFocus::Enable);
+    }
+
+    #[test]
+    fn back_tab_walks_focus_in_reverse() {
+        let mut s = IntroState::default();
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::BackTab)),
+            IntroOutcome::Continue
+        );
+        assert_eq!(s.focus, IntroFocus::Cancel);
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::BackTab)),
+            IntroOutcome::Continue
+        );
+        assert_eq!(s.focus, IntroFocus::Checkbox);
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::BackTab)),
+            IntroOutcome::Continue
+        );
+        assert_eq!(s.focus, IntroFocus::Enable);
+    }
+
+    #[test]
+    fn esc_cancels_regardless_of_focus() {
+        for focus in [IntroFocus::Checkbox, IntroFocus::Cancel, IntroFocus::Enable] {
+            let mut s = IntroState {
+                focus,
+                dont_show_again: false,
+            };
+            assert_eq!(step_intro(&mut s, key(KeyCode::Esc)), IntroOutcome::Cancelled);
+        }
+    }
+
+    #[test]
+    fn enter_on_enable_button_confirms() {
+        let mut s = IntroState::default(); // focus = Enable
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::Enter)),
+            IntroOutcome::Confirmed
+        );
+    }
+
+    #[test]
+    fn enter_on_cancel_button_cancels() {
+        let mut s = IntroState {
+            focus: IntroFocus::Cancel,
+            dont_show_again: false,
+        };
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::Enter)),
+            IntroOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn enter_on_checkbox_toggles_without_dismissing() {
+        let mut s = IntroState {
+            focus: IntroFocus::Checkbox,
+            dont_show_again: false,
+        };
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::Enter)),
+            IntroOutcome::Continue
+        );
+        assert!(s.dont_show_again);
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::Enter)),
+            IntroOutcome::Continue
+        );
+        assert!(!s.dont_show_again);
+    }
+
+    #[test]
+    fn space_activates_focused_control_just_like_enter() {
+        let mut s = IntroState {
+            focus: IntroFocus::Checkbox,
+            dont_show_again: false,
+        };
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::Char(' '))),
+            IntroOutcome::Continue,
+        );
+        assert!(s.dont_show_again);
+        let mut s = IntroState {
+            focus: IntroFocus::Enable,
+            dont_show_again: false,
+        };
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::Char(' '))),
+            IntroOutcome::Confirmed,
+        );
+    }
+
+    #[test]
+    fn left_right_arrows_alias_to_backtab_tab() {
+        let mut s = IntroState::default();
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::Right)),
+            IntroOutcome::Continue
+        );
+        assert_eq!(s.focus, IntroFocus::Checkbox);
+        assert_eq!(step_intro(&mut s, key(KeyCode::Left)), IntroOutcome::Continue);
+        assert_eq!(s.focus, IntroFocus::Enable);
+    }
+
+    #[test]
+    fn unbound_key_is_a_no_op() {
+        let mut before = IntroState::default();
+        let outcome = step_intro(&mut before, key(KeyCode::Char('x')));
+        assert_eq!(outcome, IntroOutcome::Continue);
+        assert_eq!(before, IntroState::default());
+    }
+
+    #[test]
+    fn render_paints_title_body_checkbox_and_buttons() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let state = IntroState::default();
+        term.draw(|f| render_intro(f, f.area(), &state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let dumped: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for needle in [
+            "Enable Zen Mode?",
+            "Auto-promotes",
+            "Auto-merges",
+            "CLAUDE.md",
+            "Don't show this again",
+            "[ Cancel ]",
+            "[ Enable Zen ]",
+        ] {
+            assert!(
+                dumped.contains(needle),
+                "missing {needle:?} in rendered popover:\n{dumped}",
+            );
+        }
+        assert!(
+            dumped.contains("[ ] Don't show this again"),
+            "default state must render unchecked checkbox:\n{dumped}",
+        );
+        for glyph in ['┌', '┐', '└', '┘', '│', '─'] {
+            assert!(
+                !dumped.contains(glyph),
+                "widget drew its own border glyph {glyph:?}; only the surrounding \
+                 popup/overlay frame should frame the dialog:\n{dumped}",
+            );
+        }
+    }
+
+    #[test]
+    fn render_paints_checked_checkbox_after_toggle() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let state = IntroState {
+            focus: IntroFocus::Checkbox,
+            dont_show_again: true,
+        };
+        term.draw(|f| render_intro(f, f.area(), &state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let dumped: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            dumped.contains("[x] Don't show this again"),
+            "checked state must render `[x]` glyph:\n{dumped}",
+        );
+    }
+}

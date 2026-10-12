@@ -65,9 +65,9 @@ plugins/update-shelbi-configuration/
 ```
 
 The generated formula installs `shelbi` and its system plugin assets, declares
-the MIT license, depends on `tmux`, points at the GitHub release tarballs,
-verifies SHA256, selects arm64 vs x86_64 only when both artifacts exist, and
-tests `shelbi --version`.
+the MIT license, has no runtime dependencies, points at the GitHub release
+tarballs, verifies SHA256, selects arm64 vs x86_64 only when both artifacts
+exist, and tests `shelbi --version`.
 
 It deliberately omits a `version` stanza. Homebrew scans the version out of the
 `.../releases/download/vX.Y.Z/...` URL, and `brew audit --strict` (which tap CI

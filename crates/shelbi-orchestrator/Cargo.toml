@@ -11,11 +11,23 @@ description = "Orchestrator pane bootstrap and system prompt for shelbi"
 [dependencies]
 shelbi-core = { workspace = true }
 shelbi-state = { workspace = true }
-shelbi-tmux = { workspace = true }
 shelbi-ssh = { workspace = true }
 shelbi-agent = { workspace = true }
+shelbi-proto = { workspace = true }
+# The session-process backend (`session_process_backend`) drives detached
+# `shelbi __session` processes through the shared client; `shelbi-session`
+# supplies the spawn spec, on-disk layout, and liveness lock.
+shelbi-client = { workspace = true }
+shelbi-session = { workspace = true }
 serde = { workspace = true }
+regex = { workspace = true }
 serde_json = { workspace = true }
+# `project_create` renders the starter project YAML through serde, expands `~`
+# in a repo path, and reports scaffold failures as context-tagged `anyhow`
+# errors to match the CLI's existing init surface.
+anyhow = { workspace = true }
+serde_yaml = { workspace = true }
+dirs = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 signal-hook = "0.3"
@@ -28,6 +40,10 @@ libc = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 serde_yaml = { workspace = true }
+# `shelbi-session` is a normal dependency (the session backend). The detector
+# round-trip test (`detector_snapshot_parity`) also feeds the ready.rs /
+# submit.rs screen fixtures through the session emulator and asserts the
+# detectors read the rendered snapshot identically to the raw fixture.
 # The review-autoload freshness-guard test drives `autoload_review_queue` against
 # a `github` board via the injectable fake `gh` runner (behind this feature).
 shelbi-state = { workspace = true, features = ["test-support"] }

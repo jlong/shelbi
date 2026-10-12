@@ -102,7 +102,6 @@ pub(crate) struct DetectedSetupPlan {
     pub(crate) selected_runner: Runner,
     pub(crate) orchestrator_runner: Runner,
     pub(crate) detected_runners: Vec<DetectedRunner>,
-    pub(crate) tmux_version: String,
     pub(crate) cpu_count: usize,
     /// Which board backend the project's issues live in. Defaults to
     /// `file_system`; the interactive issue-tracker step (or the
@@ -216,7 +215,7 @@ impl DetectedSetupPlan {
             })
             .collect::<BTreeMap<_, _>>();
 
-        let project = Project {
+        let project = Project { session: Default::default(),
             // `name` is the machine id (the registration filename); the
             // free-form human label (present only when the entered name was
             // slugified) is serialized under the YAML `name:` key via `label`.
@@ -804,7 +803,6 @@ trait SetupProbe {
     fn git_defaults(&mut self, root: &Path) -> GitDefaults;
     fn init_git(&mut self, root: &Path, default_branch: &str) -> Result<()>;
     fn runner_version(&mut self, runner: Runner) -> Option<String>;
-    fn tmux_version(&mut self) -> Option<String>;
     fn cpu_count(&mut self) -> usize;
 }
 
@@ -831,10 +829,6 @@ impl SetupProbe for RealSetupProbe {
     fn runner_version(&mut self, runner: Runner) -> Option<String> {
         command_version(runner.id(), &["--version"])
             .map(|line| normalize_version(runner.id(), &line))
-    }
-
-    fn tmux_version(&mut self) -> Option<String> {
-        command_version("tmux", &["-V"]).map(|line| normalize_version("tmux", &line))
     }
 
     fn cpu_count(&mut self) -> usize {
@@ -878,7 +872,6 @@ fn normalize_version(command: &str, line: &str) -> String {
     let prefixes: &[&str] = match command {
         "claude" => &["claude code ", "claude "],
         "codex" => &["codex-cli ", "codex "],
-        "tmux" => &["tmux "],
         _ => &[],
     };
     let lower = trimmed.to_ascii_lowercase();
@@ -894,7 +887,6 @@ fn normalize_version(command: &str, line: &str) -> String {
 struct DetectionSnapshot {
     git: GitDefaults,
     runners: Vec<DetectedRunner>,
-    tmux_version: String,
     cpu_count: usize,
 }
 
@@ -948,12 +940,6 @@ where
         sink.emit(PreflightItem::ok("agent", value))?;
     }
 
-    let tmux_version = probe.tmux_version();
-    match tmux_version.as_deref() {
-        Some(version) => sink.emit(PreflightItem::ok("tmux", version))?,
-        None => sink.emit(PreflightItem::failed("tmux", "not found on PATH"))?,
-    }
-
     let cpu_count = probe.cpu_count().max(1);
     sink.emit(PreflightItem::ok(
         "machine",
@@ -961,16 +947,8 @@ where
     ))?;
 
     if runners.is_empty() {
-        let mut guidance = missing_runner_guidance();
-        if tmux_version.is_none() {
-            guidance.push_str("\n\n");
-            guidance.push_str(&missing_tmux_guidance(current_platform()));
-        }
-        bail!("{guidance}");
+        bail!("{}", missing_runner_guidance());
     }
-    let Some(tmux_version) = tmux_version else {
-        bail!("{}", missing_tmux_guidance(current_platform()));
-    };
 
     Ok(DetectionSnapshot {
         git: GitDefaults {
@@ -978,7 +956,6 @@ where
             ..git
         },
         runners,
-        tmux_version,
         cpu_count,
     })
 }
@@ -1007,7 +984,6 @@ fn assemble_plan(
         selected_runner,
         orchestrator_runner: selected_runner,
         detected_runners: snapshot.runners,
-        tmux_version: snapshot.tmux_version,
         cpu_count: snapshot.cpu_count,
         // Detection is write-free and never shells out to `gh`; the board
         // defaults to file_system and the interactive step (or a scripted
@@ -1041,34 +1017,6 @@ fn resolve_runner(runners: &[DetectedRunner], explicit_runner: Option<Runner>) -
             bail!("both claude and codex are on PATH; rerun with --runner claude or --runner codex")
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Platform {
-    MacOs,
-    DebianLike,
-    Other,
-}
-
-fn current_platform() -> Platform {
-    if cfg!(target_os = "macos") {
-        Platform::MacOs
-    } else if cfg!(target_os = "linux") {
-        Platform::DebianLike
-    } else {
-        Platform::Other
-    }
-}
-
-fn missing_tmux_guidance(platform: Platform) -> String {
-    let install = match platform {
-        Platform::MacOs => "brew install tmux",
-        Platform::DebianLike => {
-            "sudo apt install tmux (Debian/Ubuntu) or sudo dnf install tmux (Fedora)"
-        }
-        Platform::Other => "install tmux 3.2 or later with your package manager",
-    };
-    format!("tmux was not found on PATH. Run {install}, then start Shelbi again.")
 }
 
 fn missing_runner_guidance() -> String {
@@ -1360,7 +1308,6 @@ fn customize_from(plan: &DetectedSetupPlan) -> Result<DetectedSetupPlan> {
         selected_runner,
         orchestrator_runner,
         detected_runners: plan.detected_runners.clone(),
-        tmux_version: plan.tmux_version.clone(),
         cpu_count: plan.cpu_count,
         issue_tracker,
         git_init_root: plan.git_init_root.clone(),
@@ -1795,7 +1742,6 @@ mod tests {
             selected_runner: runner,
             orchestrator_runner: runner,
             detected_runners: vec![fixture_runner(runner)],
-            tmux_version: "3.5a".to_string(),
             cpu_count: 10,
             issue_tracker: issue_tracker_setup::file_system_config(),
             git_init_root: None,
@@ -1806,7 +1752,6 @@ mod tests {
         git_before_init: GitDefaults,
         git_after_init: Option<GitDefaults>,
         runners: Vec<DetectedRunner>,
-        tmux_version: Option<String>,
         cpu_count: usize,
         init_calls: usize,
         init_error: Option<String>,
@@ -1818,7 +1763,6 @@ mod tests {
                 git_before_init: fixture_git(root),
                 git_after_init: None,
                 runners,
-                tmux_version: Some("3.5a".to_string()),
                 cpu_count: 10,
                 init_calls: 0,
                 init_error: None,
@@ -1850,10 +1794,6 @@ mod tests {
                 .iter()
                 .find(|candidate| candidate.runner == runner)
                 .map(|candidate| candidate.version.clone())
-        }
-
-        fn tmux_version(&mut self) -> Option<String> {
-            self.tmux_version.clone()
         }
 
         fn cpu_count(&mut self) -> usize {
@@ -2115,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn neither_runner_and_missing_tmux_stop_before_selector_or_card() {
+    fn missing_runner_stops_before_selector_or_card() {
         let root = TempDir::new().unwrap();
 
         let mut no_runner_probe = FakeProbe::ready(root.path(), Vec::new());
@@ -2125,26 +2065,6 @@ mod tests {
         assert!(error.to_string().contains("No supported agent runner"));
         assert_eq!(no_runner_ui.select_calls, 0);
         assert_eq!(no_runner_ui.action_calls, 0);
-
-        let mut no_tmux_probe = FakeProbe::ready(root.path(), vec![fixture_runner(Runner::Claude)]);
-        no_tmux_probe.tmux_version = None;
-        let mut no_tmux_ui = MockUi::new(PlanAction::Launch);
-        let error =
-            setup_one_project_with(root.path(), &mut no_tmux_probe, &mut no_tmux_ui).unwrap_err();
-        assert!(error.to_string().contains("tmux was not found"));
-        assert_eq!(no_tmux_ui.select_calls, 0);
-        assert_eq!(no_tmux_ui.action_calls, 0);
-
-        let mut neither_probe = FakeProbe::ready(root.path(), Vec::new());
-        neither_probe.tmux_version = None;
-        let mut neither_ui = MockUi::new(PlanAction::Launch);
-        let error =
-            setup_one_project_with(root.path(), &mut neither_probe, &mut neither_ui).unwrap_err();
-        let guidance = error.to_string();
-        assert!(guidance.contains("No supported agent runner"));
-        assert!(guidance.contains("tmux was not found"));
-        assert_eq!(neither_ui.select_calls, 0);
-        assert_eq!(neither_ui.action_calls, 0);
     }
 
     #[test]
@@ -2167,19 +2087,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             labels,
-            vec![
-                "git repo",
-                "default branch",
-                "remote",
-                "agent",
-                "tmux",
-                "machine"
-            ]
+            vec!["git repo", "default branch", "remote", "agent", "machine"]
         );
         assert!(ui.preflight.iter().all(|item| item.success));
         assert!(ui.preflight[3].value.contains("claude 2.1.0"));
         assert!(ui.preflight[3].value.contains("codex 0.101.0"));
-        assert_eq!(ui.preflight[5].value, "10 cores");
+        assert_eq!(ui.preflight[4].value, "10 cores");
     }
 
     #[test]
@@ -2404,13 +2317,13 @@ mod tests {
         .unwrap();
         render_preflight_item(
             &mut writer,
-            &PreflightItem::failed("tmux", "not found on PATH"),
+            &PreflightItem::failed("agent", "not found on PATH"),
         )
         .unwrap();
         assert_eq!(writer.flushes, 2);
         let text = writer.text();
         assert!(text.contains("✓ git repo"));
-        assert!(text.contains("✗ tmux"));
+        assert!(text.contains("✗ agent"));
     }
 
     #[test]
@@ -2506,7 +2419,6 @@ mod tests {
 
     #[test]
     fn version_normalization_is_non_panicking_and_strips_terminal_controls() {
-        assert_eq!(normalize_version("tmux", "tmux 3.5a"), "3.5a");
         assert_eq!(normalize_version("claude", "Claude Code 2.1.0"), "2.1.0");
         assert_eq!(normalize_version("codex", "codex-cli 0.101.0"), "0.101.0");
         assert_eq!(normalize_version("claude", "2.1\u{1b}[31m"), "2.1[31m");
@@ -2887,7 +2799,6 @@ mod tests {
         assert_eq!(detected.selected_runner, Runner::Claude);
         assert_eq!(detected.orchestrator_runner, Runner::Claude);
         assert_eq!(detected.detected_runners.len(), 2);
-        assert_eq!(detected.tmux_version, "3.5a");
         assert_eq!(detected.cpu_count, 10);
 
         let saved = shelbi_state::load_project("custom-shaft").unwrap();
@@ -2963,11 +2874,6 @@ mod tests {
 
     #[test]
     fn failure_guidance_is_platform_appropriate() {
-        assert!(missing_tmux_guidance(Platform::MacOs).contains("brew install tmux"));
-        let linux = missing_tmux_guidance(Platform::DebianLike);
-        assert!(linux.contains("apt install tmux"));
-        assert!(linux.contains("dnf install tmux"));
-        assert!(missing_tmux_guidance(Platform::Other).contains("package manager"));
         let runners = missing_runner_guidance();
         assert!(runners.contains("Claude Code"));
         assert!(runners.contains("@openai/codex"));

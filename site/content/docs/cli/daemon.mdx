@@ -1,7 +1,7 @@
 ---
 title: shelbi daemon
 order: 35
-summary: Run the hub-side daemon that ingests worker messages and appends them to the events log — or manage its platform supervisor.
+summary: Run the hub-side daemon that ingests worker messages and appends them to the events log.
 ---
 
 ```text
@@ -11,24 +11,24 @@ shelbi daemon [OPTIONS] [COMMAND]
 `shelbi daemon` runs the hub-side daemon that listens on `~/.shelbi/hub.sock`
 (overridable via `$SHELBI_HUB_SOCK`) for worker messages and appends
 `event`-verb payloads to [`~/.shelbi/events.log`](/docs/concepts/events-log).
-Bare `shelbi daemon` (no subcommand) is the foreground entry point that
-launchd/systemd call into; the `install` / `uninstall` / `status` / `restart`
-subcommands manage that platform supervisor on your behalf.
+
+The daemon is **started on demand**: the first time you open a project it is
+launched if it isn't already running, and it exits once no project is open.
+There is no service to install. If a daemon crashes while no UI is attached, a
+session process restarts it. You rarely run any of these subcommands by hand.
 
 ## Subcommands
 
 | Subcommand | Description |
 | --- | --- |
-| `run` | *(default — also the form launchd/systemd invoke)* Bind the hub socket and accept worker messages in the foreground until killed. |
-| `install` | Install the platform supervisor unit (launchd plist on macOS, systemd user service on Linux) so the daemon auto-starts at login and is restarted on crash. Idempotent — re-running just refreshes the unit file and reloads it. |
-| `uninstall` | Stop the daemon and remove the platform supervisor unit. |
-| `status` | Print a short human-readable status by wrapping `launchctl print` or `systemctl --user status`. |
-| `restart` | Stop the daemon so the supervisor relaunches it — picks up a freshly installed binary without losing the auto-restart guarantee. |
+| `run` | *(default)* Bind the hub socket and accept worker messages in the foreground until killed or until no project is open. |
+| `status` | Print a short human-readable status from the single-instance lock and the socket (no supervisor involved). |
+| `restart` | Stop the running daemon and start a fresh one on the current binary, directly. Picks up a freshly installed binary and is the path the version-mismatch flow uses. |
 
 Running `shelbi daemon` with no subcommand is equivalent to `shelbi daemon run`:
 it binds the hub socket and stays in the foreground, ingesting worker messages
-until killed. That's the form the platform supervisor invokes. You rarely run
-it by hand except to debug ingestion.
+until killed or until no project is open. That's the form the on-demand start
+launches. You rarely run it by hand except to debug ingestion.
 
 ## Flags
 
@@ -70,29 +70,17 @@ apply):
 
 ## Examples
 
-Install the supervisor unit so the daemon auto-starts at login and restarts on
-crash:
-
-```bash
-shelbi daemon install
-```
-
 Check whether the daemon is running:
 
 ```bash
 shelbi daemon status
 ```
 
-Pick up a freshly installed binary without losing the auto-restart guarantee:
+Pick up a freshly installed binary (stop the running daemon and start a fresh
+one on the current binary):
 
 ```bash
 shelbi daemon restart
-```
-
-Remove the supervisor unit and stop the daemon:
-
-```bash
-shelbi daemon uninstall
 ```
 
 ## See also

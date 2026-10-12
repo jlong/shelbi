@@ -17,10 +17,12 @@
 You talk to one agent, the orchestrator. It writes your work up as tasks,
 dispatches them to worker agents (Claude Code, Codex, aider, anything with a
 CLI) running in parallel across your machines, locally or over SSH, and brings
-finished work back for you to review. Each workspace is a persistent tmux slot
-with its own git worktree; Shelbi switches that worktree to each task's branch
-so tasks can be reviewed and merged independently. A workspace machine needs
-`tmux`, `git`, and its configured agent CLI.
+finished work back for you to review. Each workspace is a persistent Shelbi
+session with its own git worktree; Shelbi switches that worktree to each task's
+branch so tasks can be reviewed and merged independently. Attach to any session
+from any terminal with `shelbi attach <workspace>`. A workspace machine needs
+`git` and its configured agent CLI, and nothing else: Shelbi runs its own
+sessions, so there is no dependency beyond the binary.
 
 ## Install
 
@@ -60,8 +62,9 @@ setup wizard, then launches the TUI. See
 
 ## Requirements
 
-`tmux` (≥ 3.2), `git`, and an agent CLI such as `claude` or `codex` on the
-hub and every remote workspace machine.
+`git` and an agent CLI such as `claude` or `codex` on the hub and every remote
+workspace machine. Shelbi runs its own sessions, so no terminal multiplexer is
+required; it also runs fine inside tmux or Screen if you prefer one.
 
 ## Documentation
 

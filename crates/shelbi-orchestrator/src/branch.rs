@@ -153,7 +153,7 @@ mod tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "p".into(),
             label: None,
             display_name: None,

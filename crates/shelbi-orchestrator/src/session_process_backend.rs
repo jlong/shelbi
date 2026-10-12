@@ -1,0 +1,1054 @@
+//! [`SessionBackend`] over detached `shelbi __session` processes.
+//!
+//! This is the second implementation of the Phase 2 seam (the first,
+//! [`TmuxBackend`](crate::session_backend::TmuxBackend), reproduces tmux byte
+//! for byte). It drives the shared [`shelbi_client`] / [`shelbi_session`] stack:
+//! every workspace is its own small session process owning one PTY and one
+//! headless emulator, discovered by scanning `~/.shelbi/sessions/` rather than
+//! through any central registry. It is selected only when the hidden dev flag
+//! is on (see [`crate::session_backend::backend`]); tmux stays the default.
+//!
+//! **Addressing.** A caller names a target with a backend-neutral
+//! [`SessionTarget`]; this backend maps it to a session *directory keyed by its
+//! logical name* ([`Meta::name`](shelbi_session::Meta)). Because the targets
+//! orchestrator call sites build still carry tmux-shaped names (a local project
+//! session is `shelbi-<project>`, a workspace is a window named `<workspace>`),
+//! [`session_name`] derives the plan's readable name from them deterministically
+//! — a local workspace slot becomes `<project>/ws/<workspace>`. The derivation
+//! is a pure function of the target, so spawn and every later lookup agree on
+//! the name without a side channel. Native plan-shaped targets land when the
+//! callers are rewritten at cutover.
+//!
+//! **Remote workspaces (Phase 5, `rt-remote-spawn`).** A `Host::Ssh` target is
+//! a session process on another machine, started over SSH and reached through
+//! one relay per machine ([`crate::remote_session`]). Every remote operation
+//! below delegates there: spawn runs `shelbi session new` on the remote, and
+//! probe / send / snapshot / title / kill / resize / enumerate ride the relay. A
+//! machine that cannot be reached reports [`Liveness::Unreachable`] (never
+//! `Dead`), so an SSH blip never makes a live remote agent look absent.
+//!
+//! **Scope (Phase 2+, behind the dev flag).**
+//!
+//! - **Metadata / session env are not persisted.** tmux user options
+//!   (`@shelbi-user-shell`) and the session environment (`SHELBI_PANE_orch`,
+//!   the review `SHELBI_REVIEW_*` keys) have no session-process analogue yet;
+//!   `get_metadata` / `get_env` return `Ok(None)` and `set_metadata` is a no-op.
+//!   Every caller already treats the absent value as a safe default (no pinned
+//!   orchestrator pane, no user-shell mark, no parked review interface), so this
+//!   degrades to "rebuild from scratch" rather than misbehaving. Persisting
+//!   these moves with the daemon/TUI in Phases 3–4.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use shelbi_client::{DiscoveredSession, SnapshotSource, SocketReachability};
+use shelbi_core::{Error, Host, Result};
+use shelbi_proto::capability;
+use shelbi_session::SpawnSpec;
+
+use crate::remote_session;
+use crate::session_backend::{
+    injection_guard, InjectionGuard, Liveness, RespawnOutcome, SessionBackend, SessionTarget,
+    SlotInfo, TargetParts,
+};
+
+/// Default PTY size for a freshly spawned session. A client reports its real
+/// viewport on attach and the PTY reflows; until then the agent renders against
+/// this, which is a comfortable default for the detectors.
+const DEFAULT_COLS: u16 = 120;
+const DEFAULT_ROWS: u16 = 40;
+
+/// [`SessionBackend`] backed by `shelbi __session` processes. Unit struct: all
+/// state (the sessions directory, the injection-lock registry) is process-global.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionProcessBackend;
+
+/// Derive the logical session name (the `meta.json` name a session is keyed by)
+/// from a backend-neutral target. Pure, so spawn and every later lookup agree.
+///
+/// - A **slot** (`session`=`shelbi-<project>`, `window`=`<workspace>`) →
+///   `<project>/ws/<workspace>`.
+/// - A **session** (the project session `shelbi-<project>`) → `<project>/orch`,
+///   the orchestrator session — the stand-in for "does the project session
+///   exist?" that `local_session_exists` and the create-new-session probe ask.
+/// - A **pane** handle → `pane/<id>` (panes have no session-process analogue;
+///   present only so the derivation is total).
+pub(crate) fn session_name(target: &SessionTarget) -> String {
+    match target.name_parts() {
+        TargetParts::Slot { session, window } => {
+            format!("{}/ws/{}", project_of(&session), window)
+        }
+        TargetParts::Session { session } => format!("{}/orch", project_of(&session)),
+        TargetParts::Pane { id } => format!("pane/{id}"),
+    }
+}
+
+/// The project slug a `shelbi-<project>` session name carries. Local sessions
+/// are `shelbi-<project>`; strip the prefix, leaving anything else untouched.
+fn project_of(session: &str) -> &str {
+    session.strip_prefix("shelbi-").unwrap_or(session)
+}
+
+/// SIGTERM the session process `pid`, which drives its own clean teardown (it
+/// kills its child's process group and releases its lifetime lock). A `pid` of 0
+/// (unknown — an older build that didn't record it) is a no-op, and so is any
+/// pid ≤ 1 (self / init), so a malformed record can never signal the wrong
+/// process. Best-effort: a process already gone is fine.
+fn terminate_pid(pid: u32) {
+    let pid = pid as libc::pid_t;
+    if pid <= 1 {
+        return;
+    }
+    // SAFETY: a bare `kill(2)` on a pid we recorded ourselves. SIGTERM lets the
+    // session shut down gracefully (reaping its child); we never SIGKILL it,
+    // which would orphan the child.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+}
+
+impl SessionProcessBackend {
+    /// Whether a discovered session is actually **usable**: its lock is held
+    /// *and* its socket is accepting connections. A locked session whose socket
+    /// refuses connections is the "alive but not listening" zombie — its process
+    /// is up (lock held) but its listener is gone, so no client can ever attach.
+    /// Treating it as not usable in the supervision probes
+    /// ([`probe`](SessionBackend::probe) /
+    /// [`enumerate_slots`](SessionBackend::enumerate_slots)) is what makes the
+    /// resume passes see the slot as gone and relaunch a fresh, working session
+    /// rather than reuse the stranded one
+    /// (`rt-review-session-alive-but-not-listening`).
+    ///
+    /// Scoped to those liveness probes (which already run on the poller cadence):
+    /// it opens a bare connect to the session, so applying it on the per-keystroke
+    /// `send_*` / per-tick `title` paths — which connect for real right after —
+    /// would just double the work, and a zombie there surfaces as a connect error
+    /// the caller already tolerates.
+    fn usable(&self, s: &DiscoveredSession) -> bool {
+        s.usable()
+    }
+
+    /// Find the usable live session with the given logical name, if any. A dead
+    /// session directory (lock not held) is skipped here — callers that want a
+    /// dead session's final screen reach for it explicitly via the directory.
+    ///
+    /// Delegates to [`shelbi_client::choose_session`], which prefers the most
+    /// recently launched and, *only when the name has more than one live
+    /// candidate*, probes their sockets so a zombie is never chosen over a live
+    /// replacement (`rt-re-entering-a-review-fails-to-attach`). The common
+    /// one-session-per-name case still costs a single filesystem scan with no
+    /// extra connect.
+    fn find_live(&self, name: &str) -> Option<DiscoveredSession> {
+        shelbi_client::choose_session(&self.discover(), name)
+    }
+
+    /// Find any session directory (alive or dead) with the given logical name.
+    /// Prefers a usable live one (newest, socket-accepting — via
+    /// [`find_live`](Self::find_live)) when one exists, falling back to any
+    /// directory with the name (a dead/exited session for a final-screen read, or
+    /// a lone zombie) otherwise.
+    fn find_any(&self, name: &str) -> Option<DiscoveredSession> {
+        let all = self.discover();
+        if let Some(s) = shelbi_client::choose_session(&all, name) {
+            return Some(s);
+        }
+        all.into_iter().find(|s| s.meta.name == name)
+    }
+
+    /// Every session directory under the sessions root. A missing root (no
+    /// session ever started) or a scan error yields an empty list — callers
+    /// read that as "nothing is bound", matching the tmux backend's
+    /// no-server branch.
+    fn discover(&self) -> Vec<DiscoveredSession> {
+        match shelbi_state::sessions_dir() {
+            Ok(root) => shelbi_client::list(&root).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Open a short-lived connection to a session's socket, understanding the
+    /// request capabilities this backend uses (`paste`, `info`). The session's
+    /// own hello decides which it actually honors; unknown ones fall back to the
+    /// frozen core.
+    fn connect(&self, session: &DiscoveredSession) -> Result<shelbi_client::Connection> {
+        let (conn, _events) =
+            shelbi_client::Connection::open(&session.sock, None, &[capability::PASTE, capability::INFO])
+                .map_err(|e| Error::Other(format!("connecting to session `{}`: {e}", session.meta.name)))?;
+        Ok(conn)
+    }
+
+}
+
+impl SessionBackend for SessionProcessBackend {
+    fn spawn(&self, host: &Host, target: &SessionTarget, command: Option<&str>) -> Result<()> {
+        // `spawn` is the trait's *remote* workspace path (the local dispatch
+        // uses the inherent `Backend::spawn_local_pane`). A remote session runs
+        // the given launch command under a login shell; the dispatch path
+        // (`deploy_and_spawn`) builds the full `cd … && … exec <runner>` line and
+        // passes it here, having already resolved+gated the remote binary.
+        if !host.is_ssh() {
+            return Err(Error::Other(
+                "local workspace spawn uses spawn_local_pane, not the neutral spawn".into(),
+            ));
+        }
+        let cmd = command.ok_or_else(|| {
+            Error::Other("remote session spawn needs a launch command".into())
+        })?;
+        let worktree = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let spec = remote_session::remote_launch_spec(
+            session_name(target),
+            worktree,
+            None,
+            cmd.to_string(),
+        );
+        let bin = remote_session::relay_bin_for_host(host);
+        remote_session::spawn_remote_session(host, &bin, &spec)
+    }
+
+    fn kill(&self, host: &Host, target: &SessionTarget) -> Result<()> {
+        let name = session_name(target);
+        if host.is_ssh() {
+            return remote_session::kill(host, &name);
+        }
+        // Best-effort: an already-dead session is fine. Signal the child's
+        // process group over the socket; the session writes its exit record and
+        // exits once the child is gone.
+        if let Some(session) = self.find_live(&name) {
+            let conn = self.connect(&session)?;
+            conn.kill(None)
+                .map_err(|e| Error::Other(format!("killing session `{name}`: {e}")))?;
+        }
+        Ok(())
+    }
+
+    fn probe(&self, host: &Host, target: &SessionTarget, _deadline: Option<Duration>) -> Liveness {
+        let name = session_name(target);
+        if host.is_ssh() {
+            // Over the relay: Alive/Dead when the machine answers, Unreachable
+            // when it cannot be reached (never collapsed to Dead).
+            return remote_session::probe(host, &name);
+        }
+        // A local scan is a filesystem read plus (for a live-by-lock session) a
+        // cheap connect probe: it always produces a definitive answer, so the
+        // deadline is irrelevant and the probe is never Unreachable. A name no
+        // *usable* session carries is Dead — including a zombie whose process is
+        // up but whose socket refuses connections, so supervision relaunches it
+        // instead of treating the stranded slot as alive.
+        match self.find_any(&name) {
+            Some(s) if self.usable(&s) => Liveness::Alive,
+            _ => Liveness::Dead,
+        }
+    }
+
+    fn send_text(&self, host: &Host, target: &SessionTarget, text: &str) -> Result<()> {
+        let name = session_name(target);
+        if host.is_ssh() {
+            return remote_session::send_text(host, &name, text);
+        }
+        let session = self
+            .find_live(&name)
+            .ok_or_else(|| Error::Other(format!("no live session `{name}` to send to")))?;
+        let conn = self.connect(&session)?;
+        // Paste delivers the text WITHOUT a trailing Enter, with bracketed-paste
+        // framing when the program enabled it (the frozen-core fallback is raw
+        // input). The submit layer sequences the separate Enter after a settle.
+        conn.paste(text)
+            .map_err(|e| Error::Other(format!("pasting into session `{name}`: {e}")))
+    }
+
+    fn send_enter(&self, host: &Host, target: &SessionTarget) -> Result<()> {
+        let name = session_name(target);
+        if host.is_ssh() {
+            return remote_session::send_enter(host, &name);
+        }
+        let session = self
+            .find_live(&name)
+            .ok_or_else(|| Error::Other(format!("no live session `{name}` to send Enter to")))?;
+        let conn = self.connect(&session)?;
+        conn.input(b"\r")
+            .map_err(|e| Error::Other(format!("sending Enter to session `{name}`: {e}")))
+    }
+
+    fn send_line(&self, host: &Host, target: &SessionTarget, text: &str) -> Result<()> {
+        // Text then Enter, over one connection (the injection lock the submit
+        // layer holds keeps concurrent callers from interleaving).
+        self.send_text(host, target, text)?;
+        self.send_enter(host, target)
+    }
+
+    fn snapshot(&self, host: &Host, target: &SessionTarget) -> Result<String> {
+        self.history(host, target, 0)
+    }
+
+    fn history(&self, host: &Host, target: &SessionTarget, lines: usize) -> Result<String> {
+        let name = session_name(target);
+        if host.is_ssh() {
+            return remote_session::snapshot(host, &name, lines);
+        }
+        let session = self
+            .find_any(&name)
+            .ok_or_else(|| Error::Other(format!("no session `{name}` to snapshot")))?;
+        let history = if lines == 0 {
+            None
+        } else {
+            Some(lines as u32)
+        };
+        // One call that reads a live session over its socket or a dead one from
+        // `final.txt`, both in `capture-pane -p -J` shape (so the ready.rs /
+        // submit.rs detectors read it identically to a tmux capture).
+        let snap = shelbi_client::snapshot(&session, history)
+            .map_err(|e| Error::Other(format!("snapshotting session `{name}`: {e}")))?;
+        Ok(snap.text)
+    }
+
+    fn final_screen(&self, host: &Host, target: &SessionTarget) -> Result<String> {
+        let name = session_name(target);
+        if host.is_ssh() {
+            // A relay bridges live sockets only — a dead remote session's
+            // `final.txt` is not reachable this way. Return the live screen when
+            // it is still up; otherwise this surfaces an error the crash-record
+            // caller already tolerates.
+            return remote_session::snapshot(host, &name, 0);
+        }
+        let session = self
+            .find_any(&name)
+            .ok_or_else(|| Error::Other(format!("no session `{name}` for a final screen")))?;
+        // A true post-exit snapshot: a dead session's `final.txt`, or the live
+        // screen if it is somehow still up (strictly better than tmux, which
+        // keeps no post-exit buffer).
+        let snap = shelbi_client::snapshot(&session, None)
+            .map_err(|e| Error::Other(format!("reading final screen for `{name}`: {e}")))?;
+        let _ = SnapshotSource::Final; // documents the dead-session source
+        Ok(snap.text)
+    }
+
+    fn title(&self, host: &Host, target: &SessionTarget) -> Result<String> {
+        let name = session_name(target);
+        if host.is_ssh() {
+            return remote_session::title(host, &name);
+        }
+        // A dead session carries no live title (it is read from the title
+        // event, which only a running emulator emits); report empty, which
+        // `parse_pane_title_marker` reads as "no marker".
+        let Some(session) = self.find_live(&name) else {
+            return Ok(String::new());
+        };
+        let conn = self.connect(&session)?;
+        // The OSC 2 `shelbi:<state>` marker the worker hooks write rides the
+        // session title event unchanged into `InfoData.title`.
+        let info = conn
+            .info()
+            .map_err(|e| Error::Other(format!("reading title for session `{name}`: {e}")))?;
+        Ok(info.title.unwrap_or_default().trim_end().to_string())
+    }
+
+    fn get_metadata(
+        &self,
+        _host: &Host,
+        _target: &SessionTarget,
+        _key: &str,
+        _deadline: Option<Duration>,
+    ) -> Result<Option<String>> {
+        // No session-process metadata store yet (Phase 3/4). An unset value is
+        // the safe default every caller already handles (e.g. "not a user
+        // shell"). Never an error, so a probe can't read it as a transport
+        // failure.
+        Ok(None)
+    }
+
+    fn set_metadata(
+        &self,
+        _host: &Host,
+        _target: &SessionTarget,
+        _key: &str,
+        _value: &str,
+    ) -> Result<()> {
+        // No-op: see `get_metadata`. Stamping a mark that nothing reads back is
+        // harmless, and the value would die with the session regardless.
+        Ok(())
+    }
+
+    fn get_env(&self, _host: &Host, _target: &SessionTarget, _var: &str) -> Result<Option<String>> {
+        // No queryable per-session environment store (tmux `show-environment`
+        // has no analogue). Callers (`SHELBI_PANE_orch`, the review keys) treat
+        // `None` as "nothing pinned" and rebuild, which is correct here.
+        Ok(None)
+    }
+
+    fn enumerate_slots(
+        &self,
+        host: &Host,
+        target: &SessionTarget,
+        _deadline: Option<Duration>,
+    ) -> std::io::Result<Option<Vec<SlotInfo>>> {
+        let project = project_of(target.session_name()).to_string();
+        if host.is_ssh() {
+            // Over the relay: Some(slots) when the machine answered, None when it
+            // could not be asked (distinct from "no sessions").
+            return Ok(remote_session::enumerate(host, &project));
+        }
+        // tmux lists the windows inside the shared project session; here each
+        // workspace is its own `<project>/ws/<workspace>` session. Enumerate the
+        // live ones under this project, keyed so teardown can act on them:
+        // `name` is the workspace (what `slot_ids_named` filters on) and `id` is
+        // the full logical name `kill_window` kills.
+        let prefix = format!("{project}/ws/");
+        let slots = self
+            .discover()
+            .into_iter()
+            .filter(|s| self.usable(s))
+            .filter_map(|s| {
+                s.meta
+                    .name
+                    .strip_prefix(&prefix)
+                    .map(|workspace| SlotInfo {
+                        id: s.meta.name.clone(),
+                        name: workspace.to_string(),
+                    })
+            })
+            .collect();
+        Ok(Some(slots))
+    }
+
+    fn respawn(&self, target: &SessionTarget, _cmd: &str) -> RespawnOutcome {
+        // A session keeps the binary it started with; there is no respawn in
+        // place. The orchestrator restart path (the only caller) already treats
+        // a `Failed` outcome as "let a fresh rebuild happen", which is exactly
+        // the session model (a crashed session is replaced by a new one, owned
+        // by the daemon/supervision in Phase 3).
+        RespawnOutcome::Failed {
+            target: session_name(target),
+            reason: "respawn-in-place has no session-process analogue; a session is replaced by a fresh spawn (Phase 3 supervision)".into(),
+        }
+    }
+
+    fn resize(&self, host: &Host, target: &SessionTarget, cols: u16, rows: u16) -> Result<()> {
+        let name = session_name(target);
+        if host.is_ssh() {
+            return remote_session::resize(host, &name, cols, rows);
+        }
+        let Some(session) = self.find_live(&name) else {
+            return Ok(());
+        };
+        let conn = self.connect(&session)?;
+        conn.resize(cols, rows)
+            .map_err(|e| Error::Other(format!("resizing session `{name}`: {e}")))
+    }
+
+    fn injection_lock(&self, target: &SessionTarget) -> InjectionGuard {
+        // The same process-global registry the tmux backend uses, keyed on the
+        // target label, so a paste can never interleave regardless of which
+        // backend is active.
+        injection_guard(&target.label())
+    }
+}
+
+impl SessionProcessBackend {
+    /// Spawn a detached session running `spec`. The local dispatch path maps a
+    /// [`LocalPaneTmuxArgs`](crate::workspace::LocalPaneTmuxArgs) to a
+    /// [`SpawnSpec`] and calls this; a stand-alone spawn (tests) builds the
+    /// spec directly. Errors carry the readable session name for diagnostics.
+    pub(crate) fn spawn_session(&self, spec: SpawnSpec) -> Result<shelbi_session::SpawnedSession> {
+        let name = spec.name.clone();
+        shelbi_client::spawn(&spec)
+            .map_err(|e| Error::Other(format!("spawning session `{name}`: {e}")))
+    }
+
+    /// Default initial size for a dispatched session (see [`DEFAULT_COLS`]).
+    pub(crate) fn default_size() -> (u16, u16) {
+        (DEFAULT_COLS, DEFAULT_ROWS)
+    }
+
+    /// Kill a session addressed directly by its logical name (not through a
+    /// [`SessionTarget`]). Used by the enum's `kill_window` / `kill_pane`
+    /// inherent methods, whose `id` is the logical name
+    /// [`enumerate_slots`](SessionBackend::enumerate_slots) handed back.
+    /// Best-effort: an already-gone session is fine.
+    pub(crate) fn kill_by_name(&self, host: &Host, name: &str) -> Result<()> {
+        if host.is_ssh() {
+            return remote_session::kill(host, name);
+        }
+        if let Some(session) = self.find_live(name) {
+            let conn = self.connect(&session)?;
+            conn.kill(None)
+                .map_err(|e| Error::Other(format!("killing session `{name}`: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Whether some session carrying `name` is **wedged** — its process is still
+    /// up (lifetime lock held) but its socket does not answer the protocol
+    /// (refusing connects, or accepting them yet never sending the hello). This
+    /// is the "alive but not listening" zombie, distinct from a session whose
+    /// process genuinely exited (no lock held at all). Used only to label a
+    /// resume's `events.log` reason `wedged` vs `restart/crash`
+    /// (`rt-review-slot-relaunch-loop`); a bare filesystem scan plus a cheap
+    /// probe, so it stays off the hot paths.
+    pub(crate) fn name_wedged(&self, name: &str) -> bool {
+        self.discover()
+            .iter()
+            .any(|s| s.meta.name == name && s.not_listening())
+    }
+
+    /// The logical names of every live session. Stands in for the tmux backend's
+    /// `live_pane_ids` (there are no panes): a caller confirming a specific
+    /// handle still gets a definitive membership answer.
+    pub(crate) fn live_session_names(&self, host: &Host) -> Result<Vec<String>> {
+        if host.is_ssh() {
+            return remote_session::live_session_names(host);
+        }
+        // Report each live name once, and a name only when a *usable* session
+        // carries it: a name whose only live candidates are refusing zombies is
+        // not really live, so an idempotency check keyed on this
+        // (`ensure_content_session`) relaunches rather than reusing a stranded
+        // slot. `choose_session` keeps this cheap — it probes a name only when it
+        // has more than one live candidate (`rt-re-entering-a-review-fails-to-attach`).
+        let all = self.discover();
+        let mut seen = std::collections::BTreeSet::new();
+        Ok(all
+            .iter()
+            .filter(|s| s.alive)
+            .map(|s| s.meta.name.clone())
+            .filter(|name| seen.insert(name.clone()))
+            .filter(|name| shelbi_client::choose_session(&all, name).is_some())
+            .collect())
+    }
+
+    /// Terminate any "alive but not listening" zombie sessions that share `name`
+    /// with a newer, still-live sibling (a replacement that exists or is being
+    /// launched), and remove their session directories — but only after
+    /// `threshold` **consecutive** observations of the same session as a
+    /// not-listening zombie. Returns the reaped short ids. Local-only and
+    /// best-effort — a remote machine reaps its own.
+    ///
+    /// A zombie's socket either refuses every connect or accepts them yet never
+    /// answers (wedged), so the usual over-the-socket `kill` can't reach it;
+    /// instead we signal its process directly by the pid recorded in `meta.json`
+    /// (SIGTERM, which drives the session's own clean teardown — it kills its
+    /// child group and releases its lock). A session from a build predating the
+    /// recorded pid can't be signaled (pid `0`); it is still dropped from
+    /// discovery so duplicates don't accumulate. We keep the newest live sibling
+    /// untouched (it is the intended session, even if it is itself still binding
+    /// its socket) and only ever reap *older* not-listening ones.
+    ///
+    /// The hysteresis a single-probe reap lacks: a single wedged probe is not
+    /// proof a session is dead — one momentarily slow to answer the hello (a GC
+    /// pause, a scheduler hiccup, or the very fd-pressure that precedes a real
+    /// wedge) reads `Wedged` for one tick and healthy the next, and reaping on
+    /// that one read SIGTERMs a session whose agent is perfectly alive, the kill
+    /// half of the relaunch loop (`rt-review-slot-relaunch-loop`). So each
+    /// candidate's consecutive-wedged count is tracked in `streak` (keyed by
+    /// short id, scoped to this slot by the caller); a session is reaped only
+    /// once its streak reaches `threshold`. A session no longer offered as a
+    /// zombie this tick (it recovered, or was already reaped) is dropped from
+    /// `streak`, so the count only ever reflects an unbroken run.
+    ///
+    /// Each reaped id is paired with the supervision action to log for it —
+    /// `"reap-wedged"` for a [`SocketReachability::Wedged`] session (accepts but
+    /// never answers), `"reap-zombie"` for a refusing one — so the two failure
+    /// shapes are distinguishable on `events.log`.
+    pub(crate) fn reap_zombies_with_hysteresis(
+        &self,
+        name: &str,
+        streak: &mut std::collections::HashMap<String, u32>,
+        threshold: u32,
+    ) -> Vec<(String, &'static str)> {
+        let all = self.discover();
+        let candidates = shelbi_client::zombies_to_reap(&all, name);
+        // Forget any session whose consecutive-wedged run this tick broke (it is
+        // not a candidate now), so a later wedge starts counting from zero.
+        let current: std::collections::HashSet<&str> =
+            candidates.iter().map(|(z, _)| z.short_id.as_str()).collect();
+        streak.retain(|id, _| current.contains(id.as_str()));
+
+        let mut reaped = Vec::new();
+        for (z, reach) in candidates {
+            let count = streak.entry(z.short_id.clone()).or_insert(0);
+            *count += 1;
+            if *count < threshold {
+                // Not yet proven dead — give it another tick to answer.
+                continue;
+            }
+            terminate_pid(z.meta.pid);
+            // Drop its directory so discovery stops offering it. Unlinking the
+            // files out from under a still-running process is safe on Unix (it
+            // keeps its open fds); once it exits on the SIGTERM above its lock is
+            // gone anyway.
+            if std::fs::remove_dir_all(&z.dir).is_ok() {
+                let action = match reach {
+                    SocketReachability::Wedged => "reap-wedged",
+                    _ => "reap-zombie",
+                };
+                reaped.push((z.short_id.clone(), action));
+                // Reaped: stop tracking it (its dir is gone; a same-id
+                // reincarnation is impossible — short ids are unique per spawn).
+                streak.remove(&z.short_id);
+            }
+        }
+        reaped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_target_maps_to_the_plan_workspace_name() {
+        let t = SessionTarget::slot("shelbi-demo", "alice");
+        assert_eq!(session_name(&t), "demo/ws/alice");
+    }
+
+    #[test]
+    fn session_target_maps_to_the_orchestrator_name() {
+        let t = SessionTarget::session("shelbi-demo");
+        assert_eq!(session_name(&t), "demo/orch");
+    }
+
+    #[test]
+    fn a_non_prefixed_session_keeps_its_name() {
+        // A session name without the `shelbi-` prefix is left intact (so the
+        // derivation is total and never panics on an unexpected shape).
+        let t = SessionTarget::session("standalone");
+        assert_eq!(session_name(&t), "standalone/orch");
+    }
+
+    #[test]
+    fn pane_target_maps_to_a_pane_pseudo_name() {
+        let t = SessionTarget::pane("%7");
+        assert_eq!(session_name(&t), "pane/%7");
+    }
+
+    /// An SSH seam that can never reach its machine: every relay open and launch
+    /// fails. Stands in for an unreachable remote so the three-state behavior is
+    /// deterministic (and no real `ssh` is spawned in a unit test).
+    struct UnreachableSeam;
+    impl remote_session::RemoteSsh for UnreachableSeam {
+        fn launch(&self, _host: &Host, _bin: &str, _spec: &SpawnSpec) -> Result<()> {
+            Err(Error::Other("unreachable (test)".into()))
+        }
+        fn open_relay(
+            &self,
+            _host: &Host,
+            _bin: &str,
+        ) -> Result<remote_session::RelayHandle> {
+            Err(Error::Other("unreachable (test)".into()))
+        }
+    }
+
+    #[test]
+    fn remote_operations_against_an_unreachable_machine() {
+        let _g = crate::test_lock::acquire();
+        remote_session::set_test_seam(Some(std::sync::Arc::new(UnreachableSeam)));
+
+        let b = SessionProcessBackend;
+        let host = Host::Ssh { host: "box".into() };
+        let t = SessionTarget::slot("shelbi-demo", "alice");
+
+        // `spawn` with no command can't build a launch line at all.
+        assert!(b.spawn(&host, &t, None).is_err());
+        // With a command, the launch is attempted through the seam and fails.
+        assert!(b.spawn(&host, &t, Some("exec claude")).is_err());
+        // A relay we can't open surfaces as an error on ops, and crucially as
+        // Unreachable (never Dead) on probe, so supervision won't redispatch.
+        assert!(b.kill(&host, &t).is_err());
+        assert!(b.send_text(&host, &t, "x").is_err());
+        assert!(matches!(
+            b.probe(&host, &t, None),
+            Liveness::Unreachable { .. }
+        ));
+        // Enumerate reports "couldn't ask" (None), never an empty list that
+        // would read as "no sessions".
+        assert_eq!(b.enumerate_slots(&host, &t, None).unwrap(), None);
+
+        remote_session::set_test_seam(None);
+    }
+
+    #[test]
+    fn metadata_and_env_default_to_absent_without_erroring() {
+        let b = SessionProcessBackend;
+        let t = SessionTarget::slot("shelbi-demo", "alice");
+        assert_eq!(b.get_metadata(&Host::Local, &t, "k", None).unwrap(), None);
+        assert!(b.set_metadata(&Host::Local, &t, "k", "v").is_ok());
+        assert_eq!(b.get_env(&Host::Local, &t, "SHELBI_PANE_orch").unwrap(), None);
+    }
+
+    #[test]
+    fn respawn_reports_failed_so_the_caller_rebuilds() {
+        let b = SessionProcessBackend;
+        let outcome = b.respawn(&SessionTarget::pane("%1"), "cmd");
+        assert!(matches!(outcome, RespawnOutcome::Failed { .. }));
+    }
+
+    /// Write a session directory under `sessions` keyed by `id` with logical
+    /// `name` and `launched_at`, hold its lifetime lock, and bind its socket —
+    /// dropped again when `refusing` so every connect to it is refused (the
+    /// zombie), kept listening otherwise (a reachable live session). Returns the
+    /// held lock and the (optional) live listener, which the caller keeps in scope
+    /// for the test's duration.
+    fn write_session_dir(
+        sessions: &std::path::Path,
+        id: &str,
+        name: &str,
+        launched_at: &str,
+        refusing: bool,
+    ) -> (
+        shelbi_session::lock::SessionLock,
+        Option<std::os::unix::net::UnixListener>,
+    ) {
+        use std::os::unix::net::UnixListener;
+        let dir = sessions.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = shelbi_session::Meta {
+            id: id.into(),
+            name: name.into(),
+            argv: vec!["cat".into()],
+            cwd: dir.clone(),
+            task: None,
+            launched_at: launched_at.into(),
+            protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            pid: 0,
+        };
+        std::fs::write(dir.join("meta.json"), meta.to_json().unwrap()).unwrap();
+        let lock = shelbi_session::lock::SessionLock::acquire(&dir.join("lock")).unwrap();
+        let sock = dir.join("sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        if refusing {
+            drop(listener);
+            (lock, None)
+        } else {
+            // A reachable stand-in must *answer the hello*: the liveness probe is
+            // now a hello round-trip, so a bare listener that accepts and stays
+            // silent would read as wedged, not reachable. Reply to every connect
+            // with a Hello from a detached accept loop over a clone, and hand the
+            // caller the original listener to hold/drop as before.
+            use std::io::Write;
+            let accept = listener.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let reply = shelbi_proto::Frame::Hello(shelbi_proto::Hello {
+                    protocol_version: shelbi_proto::PROTOCOL_VERSION,
+                    colors: None,
+                    capabilities: Vec::new(),
+                })
+                .encode()
+                .unwrap();
+                for stream in accept.incoming() {
+                    match stream {
+                        Ok(mut s) => {
+                            let _ = s.write_all(&reply);
+                            let _ = s.flush();
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            (lock, Some(listener))
+        }
+    }
+
+    #[test]
+    fn find_live_chooses_the_reachable_session_over_a_same_named_zombie() {
+        // Two live-by-lock sessions share `demo/ws/alpha`: a reachable one and an
+        // even-newer zombie whose socket refuses. `find_live` must return the
+        // reachable one regardless of launch order — never the zombie
+        // (`rt-re-entering-a-review-fails-to-attach`).
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!("shelbi-flz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let prev = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let (_live_lock, live_listener) = write_session_dir(
+            &sessions,
+            "aaaaaaaaaaaaaaaa",
+            "demo/ws/alpha",
+            "2026-01-01T00:00:00Z",
+            false,
+        );
+        let (_zlock, _z) = write_session_dir(
+            &sessions,
+            "bbbbbbbbbbbbbbbb",
+            "demo/ws/alpha",
+            "2999-01-01T00:00:00Z", // newer, so a naive pick would land here
+            true,
+        );
+
+        let chosen = SessionProcessBackend.find_live("demo/ws/alpha");
+        // Skip only if the platform removed the dropped socket file (refusing case
+        // unreproducible); otherwise the reachable one must be chosen.
+        if sessions.join("bbbbbbbbbbbbbbbb").join("sock").exists() {
+            let chosen = chosen.expect("a usable session");
+            assert_eq!(
+                chosen.meta.launched_at, "2026-01-01T00:00:00Z",
+                "the reachable session wins over the newer refusing zombie",
+            );
+        }
+
+        drop(live_listener);
+        match prev {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn reap_zombies_removes_the_stale_one_and_keeps_the_live_replacement() {
+        // A reachable replacement and an older refusing zombie share a name. The
+        // reap drops the zombie's directory and returns its id, leaving the live
+        // replacement untouched (`rt-re-entering-a-review-fails-to-attach`).
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!("shelbi-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let prev = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let (_live_lock, live_listener) = write_session_dir(
+            &sessions,
+            "cccccccccccccccc",
+            "demo/ws/alpha",
+            "2026-02-01T00:00:00Z", // newer: the replacement
+            false,
+        );
+        let (_zlock, _z) = write_session_dir(
+            &sessions,
+            "dddddddddddddddd",
+            "demo/ws/alpha",
+            "2026-01-01T00:00:00Z", // older: the zombie
+            true,
+        );
+
+        let zombie_dir = sessions.join("dddddddddddddddd");
+        if zombie_dir.join("sock").exists() {
+            // Threshold 1 (no hysteresis): reaps on the first observation.
+            let mut streak = std::collections::HashMap::new();
+            let reaped =
+                SessionProcessBackend.reap_zombies_with_hysteresis("demo/ws/alpha", &mut streak, 1);
+            assert_eq!(
+                reaped,
+                vec![("dddddddddddddddd".to_string(), "reap-zombie")]
+            );
+            assert!(!zombie_dir.exists(), "the zombie's dir is removed");
+            assert!(
+                sessions.join("cccccccccccccccc").exists(),
+                "the live replacement's dir is kept",
+            );
+        }
+
+        drop(live_listener);
+        match prev {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn reap_hysteresis_waits_for_two_consecutive_wedged_observations() {
+        // With threshold 2, a wedged zombie beside a live replacement is NOT
+        // reaped on the first observation — only on the second, after the streak
+        // confirms it. This is the kill-side guard against a one-tick hiccup
+        // SIGTERMing a healthy session (`rt-review-slot-relaunch-loop`).
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!("shelbi-reap-hyst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let prev = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // A reachable replacement (newer) and an older *wedged* sibling (a bare
+        // listener that accepts but never answers the hello).
+        let (_live_lock, live_listener) = write_session_dir(
+            &sessions,
+            "eeeeeeeeeeeeeeee",
+            "demo/ws/alpha",
+            "2026-02-01T00:00:00Z",
+            false,
+        );
+        let wedged_dir = sessions.join("ffffffffffffffff");
+        std::fs::create_dir_all(&wedged_dir).unwrap();
+        let wmeta = shelbi_session::Meta {
+            id: "ffffffffffffffff".into(),
+            name: "demo/ws/alpha".into(),
+            argv: vec!["cat".into()],
+            cwd: wedged_dir.clone(),
+            task: None,
+            launched_at: "2026-01-01T00:00:00Z".into(),
+            protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            pid: 0,
+        };
+        std::fs::write(wedged_dir.join("meta.json"), wmeta.to_json().unwrap()).unwrap();
+        let _wlock =
+            shelbi_session::lock::SessionLock::acquire(&wedged_dir.join("lock")).unwrap();
+        // A bare listener: accepts connections, never sends a hello → Wedged.
+        let _wlistener =
+            std::os::unix::net::UnixListener::bind(wedged_dir.join("sock")).unwrap();
+
+        let mut streak = std::collections::HashMap::new();
+        // First observation: streak = 1 < 2 → no reap yet.
+        let first = SessionProcessBackend.reap_zombies_with_hysteresis("demo/ws/alpha", &mut streak, 2);
+        assert!(first.is_empty(), "a single wedged observation must not reap");
+        assert!(wedged_dir.exists(), "the wedged session's dir survives the first tick");
+        // Second consecutive observation: streak = 2 → reaped as wedged.
+        let second = SessionProcessBackend.reap_zombies_with_hysteresis("demo/ws/alpha", &mut streak, 2);
+        assert_eq!(second, vec![("ffffffffffffffff".to_string(), "reap-wedged")]);
+        assert!(!wedged_dir.exists(), "the confirmed wedged session is reaped");
+
+        drop(live_listener);
+        match prev {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The file descriptors this process has open right now. The session under
+    /// test runs in-process (on a `run()` thread), so a `title()` call that left
+    /// its `Connection` — and thus the session's per-connection handler — alive
+    /// would show up here as held descriptors. Linux exposes `/proc/self/fd`,
+    /// macOS `/dev/fd`; the read opens one transient fd, counted identically
+    /// every call so deltas cancel.
+    fn open_fd_count() -> usize {
+        for dir in ["/proc/self/fd", "/dev/fd"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                return rd.count();
+            }
+        }
+        0
+    }
+
+    #[test]
+    fn repeated_title_polls_leave_the_fd_count_flat() {
+        // Criterion 6: the backend's per-tick `title()` poll (~every 5 s against a
+        // serving slot) opens a short-lived `Connection`, requests `Info`, and
+        // drops it — the second fd-leaker called out in the task. #1575's
+        // `Connection::drop` must wind both ends down so nothing accumulates. This
+        // drives the *real* `SessionProcessBackend::title()` against a genuine
+        // in-process session (not a stubbed listener) and asserts the process fd
+        // count stays flat across 50 polls (`rt-review-slot-relaunch-loop`).
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!("shelbi-title-fd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let prev = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A real detached-style session, run in-process on a thread (the same
+        // recipe `shelbi-client`'s protocol e2e harness uses). Its logical name is
+        // what `session_name(slot("shelbi-demo", "alpha"))` derives.
+        let name = "demo/ws/alpha";
+        let id = shelbi_session::layout::derive_id_now(name);
+        let paths = shelbi_session::SessionPaths::new(&home.join("sessions"), &id);
+        let args = shelbi_session::RunArgs {
+            id: id.clone(),
+            name: name.to_string(),
+            cwd: std::env::temp_dir(),
+            cols: 80,
+            rows: 24,
+            task: None,
+            raw_output_log: false,
+            // No daemon watchdog: it loops reading the global `$SHELBI_HOME` this
+            // test mutates, which would be a data race (see `RunArgs::manage_daemon`).
+            manage_daemon: false,
+            child_argv: vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()],
+        };
+        let handle = std::thread::spawn(move || shelbi_session::run(args));
+
+        // Wait until the socket actually accepts (bind precedes listen, so an
+        // earlier connect is refused).
+        let sock = paths.sock();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::os::unix::net::UnixStream::connect(&sock).is_err() {
+            assert!(std::time::Instant::now() < deadline, "session socket never accepted");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let backend = SessionProcessBackend;
+        let target = SessionTarget::slot("shelbi-demo", "alpha");
+        assert_eq!(session_name(&target), name);
+        // Sanity: the title path resolves the live session and returns cleanly (a
+        // bare `/bin/sh` emits no OSC title marker, so the string is empty — we are
+        // testing the fd lifecycle, not the value).
+        let poll = || {
+            let _ = backend.title(&Host::Local, &target).expect("title poll");
+        };
+
+        // Warm up so first-connection lazy allocations settle, then baseline once
+        // the fd count stops moving.
+        for _ in 0..5 {
+            poll();
+        }
+        let base = {
+            let mut last = 0usize;
+            let mut stable = 0u8;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let now = open_fd_count();
+                if now == last {
+                    stable += 1;
+                } else {
+                    stable = 0;
+                    last = now;
+                }
+                if stable >= 2 {
+                    break last;
+                }
+                assert!(std::time::Instant::now() < deadline, "fd count never settled");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        for _ in 0..50 {
+            poll();
+        }
+
+        // Every handler must have wound down, so the count returns to the
+        // baseline. A per-poll leak would grow it by a few descriptors each cycle.
+        let after = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let now = open_fd_count();
+                if now <= base + 8 {
+                    break now;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break now;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert!(
+            after <= base + 8,
+            "descriptors leaked across 50 title() polls: base={base}, after={after}",
+        );
+
+        // Teardown: kill the session and join its thread.
+        if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) {
+            use std::io::Write;
+            let _ = s.write_all(
+                &shelbi_proto::Frame::Kill(shelbi_proto::Kill {
+                    signal: Some(libc::SIGKILL),
+                })
+                .encode()
+                .unwrap(),
+            );
+        }
+        let _ = handle.join();
+
+        match prev {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}

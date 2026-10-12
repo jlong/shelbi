@@ -32,14 +32,14 @@ shelbi -p myapp
 
 The TUI is two panes. A borderless sidebar on the left lists the project
 name, the nav (Chat, Issues, Activity), your declared workspaces, and any
-issues waiting on review. The right pane is a real tmux pane: the
+issues waiting on review. The right pane shows a live session: the
 orchestrator agent by default, or one of the built-in views (Chat /
 Issues / Activity) when you switch.
 
-`Ctrl+P` opens a fuzzy command palette as a tmux popup. Use it to
-switch projects, jump to a workspace pane, or swap the right pane to
-another view. `Enter` on a sidebar row activates it: focus a workspace,
-open a review, switch to the Issues board.
+`Ctrl+P` opens a fuzzy command palette. Use it to switch projects, jump
+to a workspace, or swap the right pane to another view. `Enter` on a
+sidebar row activates it: focus a workspace, open a review, switch to the
+Issues board.
 
 ## Add an issue
 
@@ -228,11 +228,11 @@ just ask:
 you: merge it.
 ```
 
-Under the hood that's `shelbi merge fix-login-bug-on-safari`. If the review
-flow already opened a PR for the branch, the CLI squash-merges that PR through
-the GitHub CLI (so a PR-protected `default_branch` still accepts it); otherwise
-it squash-merges locally into `default_branch`. Either way it prints the
-resulting commit hash. Add `--pr` to open a fresh PR instead of merging.
+Under the hood the orchestrator runs the task's merge action. If the review
+flow already opened a PR for the branch, it squash-merges that PR through the
+GitHub CLI (so a PR-protected `default_branch` still accepts it); otherwise it
+squash-merges locally into `default_branch`. Either way it reports the resulting
+commit.
 
 **Move the card to Done.** The orchestrator never auto-completes
 review. You confirm the merge landed and move the card yourself, with `L`

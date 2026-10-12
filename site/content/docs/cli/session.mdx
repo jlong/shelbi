@@ -1,0 +1,111 @@
+---
+title: shelbi session
+order: 36
+summary: Inspect and drive the session backend directly, a debug surface over Shelbi's sessions.
+---
+
+```text
+shelbi session <COMMAND> [OPTIONS]
+```
+
+`shelbi session` is a low-level debug surface over the sessions that run every
+Shelbi agent. A session is a small detached process that owns one PTY and one
+headless terminal emulator, and outlives whatever launched it. In normal use the
+orchestrator and the TUI drive sessions for you, and
+[`shelbi attach`](/docs/cli/attach) is the rendered client you use by hand.
+These subcommands are for inspecting and poking a session directly.
+
+## Subcommands
+
+| Subcommand | Description |
+| --- | --- |
+| `ls` | List sessions: name, short-id, state, size, task, launch time. |
+| `new` | Spawn a detached session running a command (everything after `--`). |
+| `kill` | Kill a session by signalling its child's process group. |
+| `send` | Send text to a session's PTY, delivered as a bracketed paste. |
+| `snapshot` | Print a session's visible screen as text, optionally with scrollback. |
+
+Most subcommands take a `<SESSION>` selector: a short-id, name, workspace, or
+unambiguous prefix.
+
+### `ls`
+
+```text
+shelbi session ls
+```
+
+### `new`
+
+```text
+shelbi session new --name <NAME> [--cwd <CWD>] [--cols <COLS>] [--rows <ROWS>] [--task <TASK>] [--raw-log] -- <COMMAND>...
+```
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--name <NAME>` | string | — | Readable session name recorded in `meta.json` (required). |
+| `--cwd <CWD>` | string | current directory | Working directory for the child. |
+| `--cols <COLS>` | number | `80` | Initial screen width in columns. |
+| `--rows <ROWS>` | number | `24` | Initial screen height in rows. |
+| `--task <TASK>` | string | — | Task id this session serves, if any. |
+| `--raw-log` | flag | off | Keep the full raw output log. |
+| `<COMMAND>...` | string | — | The child program and its arguments, everything after `--`. |
+
+### `kill`
+
+```text
+shelbi session kill [--signal <SIGNAL>] <SESSION>
+```
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--signal <SIGNAL>` | number | session's graceful default | Signal number to send. |
+
+### `send`
+
+```text
+shelbi session send [--enter] <SESSION> <TEXT>
+```
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--enter` | flag | off | Also send a carriage return after the text (submit the line). |
+
+### `snapshot`
+
+```text
+shelbi session snapshot [--history <HISTORY>] <SESSION>
+```
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--history <HISTORY>` | number | visible screen only | Include this many lines of scrollback above the visible screen. |
+
+## Flags
+
+Every subcommand accepts the same options:
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
+
+## Examples
+
+List the sessions this project is running:
+
+```bash
+shelbi session ls
+```
+
+Dump a stuck workspace's screen for inspection:
+
+```bash
+shelbi session snapshot alpha --history 200
+```
+
+## See also
+
+- [`shelbi attach`](/docs/cli/attach) — the rendered, full-screen client for a
+  session.
+- [Workspaces](/docs/concepts/workspaces) — what a workspace session is and how
+  it is owned.

@@ -609,7 +609,7 @@ mod tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "fixture".into(),
             label: None,
             display_name: None,

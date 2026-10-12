@@ -18,10 +18,10 @@ there is a runtime error.
 `<worktree>/.shelbi/messages/<task-id>.log`. Each call appends one durable JSON
 record. The workspace tails that log and folds the message into what it's doing.
 
-`shelbi message` does not type text or Enter into the tmux pane, so the pane's
+`shelbi message` does not type text or Enter into the session, so the session's
 verified-submit mechanism intentionally does not apply. Runner hooks consume
 the file record. Keeping this path file-based avoids duplicate delivery and lets
-the message survive a pane restart.
+the message survive a session restart.
 
 ### Queued is not delivered
 
@@ -56,9 +56,9 @@ workspace, but through different channels:
 
 | | `shelbi send` | `shelbi message` |
 | --- | --- | --- |
-| Channel | Keystrokes into the tmux pane | JSON record in the message log file |
+| Channel | Keystrokes into the live session | JSON record in the message log file |
 | Durability | Message text is ephemeral; delivery verdict is recorded in `events.log` | Durable record in `<worktree>/.shelbi/messages/<task-id>.log` |
-| Delivery proof | Pane submission is verified; no worker semantic ack | Worker acks the `msg_id` at its next turn; query with `status` or block with `--wait` |
+| Delivery proof | Session submission is verified; no worker semantic ack | Worker acks the `msg_id` at its next turn; query with `status` or block with `--wait` |
 | Typed / classified | Free text | `reply` / `directive` / `context` |
 | Reach for it when | A quick, live nudge to a pane | A message that must survive, be logged, and be confirmed |
 

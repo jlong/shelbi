@@ -1592,7 +1592,7 @@ workspaces: []\n";
             prompt.contains("send project=<you> workspace=<name> status=<status> detail=<reason>")
         );
         assert!(prompt.contains("For `status=stuck`, do not assume the worker received the text"));
-        assert!(prompt.contains("never fall back to raw\n  `tmux send-keys`"));
+        assert!(prompt.contains("never fall back to raw\n  `shelbi session send`"));
         assert!(prompt.contains("shelbi message <task-id> directive"));
     }
 
@@ -1771,7 +1771,7 @@ workspaces: []\n";
             task_id: "fix-login",
             title: "Fix the login redirect loop",
             workspace: "review",
-            pane: "shelbi-demo:review",
+            session: "demo/ws/review",
             worktree: "/repo/.shelbi/wt/review",
             port: Some(4310),
             url: Some("http://localhost:4310"),
@@ -1790,11 +1790,11 @@ workspaces: []\n";
         assert_eq!(ev.workspace.as_deref(), Some("review"));
 
         // The structured location payload the orchestrator keys on to jump
-        // straight to the pane + worktree without discovery.
+        // straight to the slot's session + worktree without discovery.
         assert_eq!(ev.metadata.get("state").map(String::as_str), Some("serving"));
         assert_eq!(
-            ev.metadata.get("pane").map(String::as_str),
-            Some("shelbi-demo:review")
+            ev.metadata.get("session").map(String::as_str),
+            Some("demo/ws/review")
         );
         assert_eq!(
             ev.metadata.get("worktree").map(String::as_str),

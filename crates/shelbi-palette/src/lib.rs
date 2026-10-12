@@ -53,6 +53,10 @@ pub enum DecorationColor {
     Default,
     Gray,
     DarkGray,
+    /// The design's muted/secondary tint (`#7a7a7a`) — a true RGB gray, distinct
+    /// from the terminal's indexed `DarkGray`. Used for a review slot's loading
+    /// glyph so a still-starting review reads as muted chrome, not an alert.
+    Muted,
     Green,
     Yellow,
     Red,

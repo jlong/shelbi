@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Open-source agent orchestrator built on tmux"
+description = "Open-source agent orchestrator for parallel coding agents"
 
 [[bin]]
 name = "shelbi"
@@ -16,11 +16,18 @@ path = "src/main.rs"
 shelbi-core = { workspace = true }
 shelbi-state = { workspace = true }
 shelbi-ssh = { workspace = true }
-shelbi-tmux = { workspace = true }
 shelbi-agent = { workspace = true }
 shelbi-orchestrator = { workspace = true }
 shelbi-tui = { workspace = true }
 shelbi-palette = { workspace = true }
+shelbi-app = { workspace = true }
+shelbi-proto = { workspace = true }
+shelbi-client = { workspace = true }
+shelbi-session = { workspace = true }
+# `shelbi session attach` renders a session through the toolkit-neutral client
+# emulator (`shelbi-term`) and reads its alacritty grid/mode to paint cells.
+shelbi-term = { workspace = true }
+alacritty_terminal = { workspace = true }
 
 # clap derive needs to be visible in the orchestrate args struct
 
@@ -40,12 +47,17 @@ nucleo-matcher = { workspace = true }
 inquire = { workspace = true }
 unicode-width = { workspace = true }
 regex = { workspace = true }
-which = { workspace = true }
 signal-hook = "0.3"
 libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# The control-socket integration test (`tests/control_socket.rs`) drives a real
+# daemon over the mutation control protocol via the typed client; the
+# session-survival test (`tests/session_survival.rs`) speaks the session
+# protocol directly over `shelbi-proto`.
+shelbi-proto = { workspace = true }
+shelbi-client = { workspace = true }
 # The GitHub-backend command tests resolve a store from project config and need
 # to inject a canned `gh` runner (no network / real repo); this feature exposes
 # `shelbi_state::set_test_gh_runner` for that. Dev-only — never in the shipped bin.

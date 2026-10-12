@@ -28,7 +28,7 @@ impl Drop for HomeGuard {
 }
 
 fn test_project() -> Project {
-    Project {
+    Project { session: Default::default(),
         name: PROJECT.into(),
         label: None,
         display_name: None,

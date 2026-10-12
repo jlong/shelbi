@@ -1,0 +1,25 @@
+[package]
+name = "shelbi-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared application model (navigation, command registry, view models, background refresh) rendered by the TUI and the desktop app"
+
+[dependencies]
+# IMPORTANT: this crate is the toolkit-independent app model. It must NOT
+# depend on any UI toolkit (ratatui, crossterm, gpui) directly or
+# transitively — the TUI and the desktop app are renderers *over* it. The
+# `no_ui_deps` integration test enforces this against the resolved tree.
+shelbi-core = { workspace = true }
+shelbi-state = { workspace = true }
+shelbi-palette = { workspace = true }
+# The mutation control protocol + its blocking client. Both are UI-toolkit-free
+# (serde/std only), so the `no_ui_deps` guard still holds.
+shelbi-proto = { workspace = true }
+shelbi-client = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }

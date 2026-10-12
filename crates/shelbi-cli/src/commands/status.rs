@@ -156,6 +156,9 @@ fn print_summary(project: &str) -> Result<()> {
     );
 
     println!("daemon: {}", super::hub_version::status_line());
+    if let Some(line) = session_lost_line() {
+        println!("{line}");
+    }
     if let Some(line) = github_summary_line(project) {
         println!("github: {line}");
     }
@@ -177,6 +180,13 @@ fn print_summary(project: &str) -> Result<()> {
 /// the check rather than the whole `status` output. The hub machine's
 /// `work_dir` is the volume that fills with build output, so it is the one
 /// probed.
+/// A one-line session-lost warning when the daemon has recorded that it lost its
+/// macOS GUI login session. `None` in the healthy (marker-absent) case.
+fn session_lost_line() -> Option<String> {
+    shelbi_state::read_session_lost()
+        .map(|_| format!("session: ⚠ {}", shelbi_state::SESSION_LOST_BANNER))
+}
+
 fn disk_warning_line(project: &str) -> Option<String> {
     let p = shelbi_state::load_project(project).ok()?;
     let work_dir = p
@@ -301,6 +311,9 @@ fn print_full(project: &str) -> Result<()> {
     println!("## Daemon");
     println!();
     println!("daemon: {}", super::hub_version::status_line());
+    if let Some(line) = session_lost_line() {
+        println!("{line}");
+    }
 
     if let Some(line) = disk_warning_line(project) {
         println!();
@@ -1136,7 +1149,7 @@ issue_tracker:\n\
 
     #[test]
     fn list_succeeds_against_default_statuses() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         // No statuses.yaml on disk — loader falls back to the built-in
@@ -1150,7 +1163,7 @@ issue_tracker:\n\
         // Sanity-check that the printed order matches the on-disk
         // declared order — the column-ordering contract everything
         // downstream relies on.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let custom = ProjectStatuses {
@@ -1179,7 +1192,7 @@ issue_tracker:\n\
 
     #[test]
     fn category_counts_bucket_default_columns() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -1276,7 +1289,7 @@ issue_tracker:\n\
 
     #[test]
     fn consume_handoff_writes_then_deletes() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
@@ -1296,7 +1309,7 @@ issue_tracker:\n\
 
     #[test]
     fn consume_handoff_is_noop_when_absent() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let _work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
@@ -1312,7 +1325,7 @@ issue_tracker:\n\
         // The `--full` flag is meant to be safe to re-run: a HANDOFF.md
         // that exists on disk must stay put after `--full` returns.
         // Consumption only happens under `--handoff`.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
@@ -1338,7 +1351,7 @@ issue_tracker:\n\
         // `--full --handoff` on a project with no HANDOFF.md should print
         // both sections in one call and NOT error just because the note
         // isn't there — that's the orchestrator's every-bootstrap shape.
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let _work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
@@ -1349,7 +1362,7 @@ issue_tracker:\n\
 
     #[test]
     fn zen_snapshot_flags_recent_crash_recovery_event() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let _work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
@@ -1371,7 +1384,7 @@ issue_tracker:\n\
 
     #[test]
     fn stale_crash_recovery_event_is_not_flagged() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -1404,7 +1417,7 @@ issue_tracker:\n\
 
     #[test]
     fn crash_scan_reads_only_the_tail_not_the_whole_log() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 

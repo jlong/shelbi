@@ -596,7 +596,7 @@ mod tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: name.into(),
             label: None,
             display_name: None,

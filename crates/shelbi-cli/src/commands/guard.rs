@@ -66,11 +66,12 @@ pub fn install(project: &Project, work_dir: &Path) -> Result<HookInstall> {
         .map_err(|e| anyhow!(e))
 }
 
-/// Install the guard from an `init`/scaffold path: disclose on a fresh
-/// install, warn (stderr) when a foreign hook blocks it, and stay silent on
-/// the "already there" refresh and on best-effort failures (e.g. the project
-/// root isn't a git repo yet — `shelbi guard install` can add it later). Never
-/// fails init: a hook is a convenience, not a precondition.
+/// Install the guard from the `-y` wizard's consented setup path: disclose on a
+/// fresh install, warn (stderr) when a foreign hook blocks it, and stay silent
+/// on the "already there" refresh and on best-effort failures. Never fails
+/// setup: a hook is a convenience, not a precondition. (The shared
+/// `project_create` scaffold engine installs the guard the same way for the
+/// `shelbi init` / palette / TUI add-project paths.)
 pub fn install_at_init(project: &Project, work_dir: &Path) {
     match install(project, work_dir) {
         Ok(HookInstall::Installed) => disclose_on_first_install(work_dir),
@@ -86,18 +87,13 @@ pub fn install_at_init(project: &Project, work_dir: &Path) {
     }
 }
 
-/// One-time disclosure printed when `shelbi init` actually writes the hook,
-/// so the user learns it exists, what it does, and how to remove it — the
-/// exact transparency the silent-install trust incident demanded.
+/// One-time disclosure printed when `shelbi guard install` (or the shared
+/// `project_create` scaffold engine, which installs the guard at `shelbi init`
+/// time) actually writes the hook, so the user learns it exists, what it does,
+/// and how to remove it — the exact transparency the silent-install trust
+/// incident demanded.
 pub fn disclose_on_first_install(work_dir: &Path) {
-    eprintln!(
-        "shelbi: installed a git pre-commit hook at {}/.git/hooks/pre-commit.\n\
-         shelbi:   It blocks commits to a protected branch ONLY inside Shelbi-managed\n\
-         shelbi:   agent panes (marked with SHELBI_MANAGED_CONTEXT); your own commits from\n\
-         shelbi:   a normal shell are never affected. Remove it anytime with\n\
-         shelbi:   `shelbi guard uninstall`.",
-        work_dir.display(),
-    );
+    eprintln!("{}", githook::hub_branch_guard_disclosure(work_dir));
 }
 
 fn report_install(outcome: &HookInstall, work_dir: &Path) {

@@ -1,12 +1,14 @@
-//! Project-root prompt + validators shared by `shelbi init` and the
-//! first-run path from `shelbi` (no subcommand).
+//! Project-root prompt for `shelbi init` and the first-run path from
+//! `shelbi` (no subcommand).
 //!
-//! The validator ([`validate_root`]) is a pure function — no prompting,
-//! no global state, no `inquire` calls — so it's straightforward to
-//! unit-test. The prompt loop ([`resolve_root_for_init`]) is the only
-//! part that needs a real terminal; it composes the validator with
-//! `inquire` widgets and surfaces the wireframe messaging from the
-//! task brief.
+//! The pure validators ([`validate_root`], [`validate_project_name`],
+//! [`absolutize`], [`project_name_collides`], the [`ResolvedProjectRoot`]
+//! struct) now live in [`shelbi_orchestrator::project_create`] so the
+//! single-process TUI's Add-project overlay creates projects through the same
+//! path. They're re-exported here so the CLI's callers (and tests) keep their
+//! existing `crate::project_root::…` imports. This module keeps only the parts
+//! that need a real terminal: the `inquire` prompt loop ([`resolve_root_for_init`])
+//! and the name-normalization notice ([`normalize_project_name_announced`]).
 //!
 //! TTY gating: when stdin is not a terminal we refuse to prompt and
 //! ask the caller to supply `--root` instead. The error message is
@@ -15,90 +17,14 @@
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 use inquire::{Confirm, Text};
 
-/// Outcome of validating a candidate project-root path. Non-OK variants
-/// carry only the discriminant; the caller renders the user-facing
-/// message because the message differs slightly between the prompt
-/// loop (re-prompt with `✗`) and the non-interactive `--root` path
-/// (error out with `anyhow!`).
-#[derive(Debug, PartialEq, Eq)]
-pub enum RootValidation {
-    Ok,
-    NotExists,
-    NotDirectory,
-    /// Directory exists but doesn't look like a git repo. Treated as a
-    /// warning, not an error — shelbi's workflow assumes git, but
-    /// nothing in the scaffold actively rejects a non-git dir.
-    NotGitRepo,
-}
-
-/// Pure validator: no prompting, no global state. Checks (in order):
-/// 1. path exists
-/// 2. path is a directory
-/// 3. path is a git repo (has `.git`, OR `git rev-parse --git-dir`
-///    succeeds inside it — the latter catches working trees whose
-///    `.git` is a regular file pointing at the gitdir).
-pub fn validate_root(path: &Path) -> RootValidation {
-    if !path.exists() {
-        return RootValidation::NotExists;
-    }
-    let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
-    if !is_dir {
-        return RootValidation::NotDirectory;
-    }
-    if !is_git_repo(path) {
-        return RootValidation::NotGitRepo;
-    }
-    RootValidation::Ok
-}
-
-fn is_git_repo(path: &Path) -> bool {
-    if path.join(".git").exists() {
-        return true;
-    }
-    Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["rev-parse", "--git-dir"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Validate a project name before it's used as a filesystem path
-/// component (`~/.shelbi/projects/<name>.yaml`, `~/.shelbi/projects/<name>/`)
-/// and interpolated into on-disk config.
-///
-/// The name reaches this function from three untrusted-ish sources: a
-/// `--project` override, the basename of a chosen root, and — most
-/// importantly — the `name:` key of a teammate's *committed*
-/// `<repo>/.shelbi/project.yaml` read by `--pick-up`. That last one is
-/// attacker-influenced by design (pick-up runs on someone else's repo),
-/// so an unvalidated `name: ../../.config/foo` would have `PathBuf::join`
-/// traverse out of the projects dir, and an embedded newline would inject
-/// keys into the local registry.
-///
-/// Delegates to [`shelbi_core::validate_project_name`] — the storage-layer
-/// chokepoint — so the CLI pre-check and the on-disk invariant enforce one
-/// charset and can't drift apart. That means a name must be a single path
-/// component of lowercase `[a-z0-9_-]` starting with a letter or digit; the
-/// charset also guarantees the name round-trips through YAML unquoted.
-/// Onboarding-captured names are normalized into this charset first (see
-/// [`normalize_project_name_announced`]); this guard is for the paths that
-/// pass a raw name straight through (chiefly the pick-up committed name).
-pub fn validate_project_name(name: &str) -> Result<()> {
-    shelbi_core::validate_project_name(name).map_err(|_| {
-        anyhow!(
-            "project name `{name}` is invalid — it must be a single path component of \
-             lowercase `[a-z0-9_-]` starting with a letter or digit (no `/`, `..`, spaces, \
-             uppercase, or leading `.`). Pass --project NAME with a name like `my-app`."
-        )
-    })
-}
+pub use shelbi_orchestrator::project_create::{
+    absolutize, project_name_collides, project_name_from_root, validate_project_name,
+    validate_root, ResolvedProjectRoot, RootValidation,
+};
 
 /// Normalize a captured project name into the agent-id charset, printing a
 /// one-line notice when the result differs from the input so the change is
@@ -135,37 +61,6 @@ pub(crate) fn slug_and_display(raw: &str) -> Result<(String, Option<String>)> {
     let slug = normalize_project_name_announced(&raw)?;
     let display_name = (slug != raw).then(|| raw.clone());
     Ok((slug, display_name))
-}
-
-/// Project name derived from a chosen root: the basename of the path,
-/// unchanged. Returns `None` if the path has no usable file component
-/// (e.g. `/`).
-pub fn project_name_from_root(path: &Path) -> Option<String> {
-    path.file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
-/// Whether either supported local registration for `name` already exists.
-/// The init scaffolder uses this to refuse to silently overwrite or shadow a
-/// pre-existing flat or split project registration.
-pub fn project_name_collides(name: &str) -> Result<bool> {
-    shelbi_state::has_project_registration(name).map_err(|e| anyhow!(e))
-}
-
-/// Resolved + validated project root, plus the derived project name.
-#[derive(Debug, Clone)]
-pub struct ResolvedProjectRoot {
-    pub path: PathBuf,
-    /// The slug/id — a valid `[a-z0-9_-]` path component. Keys the on-disk
-    /// folder, settings file, tmux session, and every state entry.
-    pub name: String,
-    /// The human-readable label the name was derived from, recorded only when
-    /// slugifying actually changed it (e.g. `ContextStore` → `contextstore`).
-    /// `None` when the entered name already equalled its slug, so a project
-    /// whose name needs no massaging stays free of a redundant `display_name`.
-    pub display_name: Option<String>,
 }
 
 /// End-to-end resolver used by `shelbi init`. Picks `force_root` if
@@ -326,31 +221,6 @@ fn pick_name(path: &Path, force_name: Option<&str>) -> Result<(String, Option<St
     // like `Shaft` becomes project `shaft` instead of erroring at launch, and
     // the original is preserved as the display label.
     slug_and_display(&raw)
-}
-
-/// Expand `~` / `~/...` against `$HOME` and resolve relative paths
-/// against `cwd`. Stops short of `canonicalize` because that fails on
-/// non-existent paths — we want validation to report the user's typed
-/// path verbatim ("`/tmp/nope` doesn't exist"), not a canonicalized
-/// form they didn't type.
-pub(crate) fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
-    let raw = path.to_string_lossy();
-    let expanded: PathBuf = if raw == "~" {
-        dirs::home_dir().unwrap_or_else(|| path.to_path_buf())
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        match dirs::home_dir() {
-            Some(h) => h.join(rest),
-            None => path.to_path_buf(),
-        }
-    } else {
-        path.to_path_buf()
-    };
-
-    if expanded.is_absolute() {
-        expanded
-    } else {
-        cwd.join(expanded)
-    }
 }
 
 #[cfg(test)]

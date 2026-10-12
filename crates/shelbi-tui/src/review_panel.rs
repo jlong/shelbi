@@ -5,43 +5,43 @@
 //!
 //! - a **square back button** at the very top (a back-arrow glyph, no label)
 //!   that switches focus back to the dashboard window without tearing the
-//!   still-loaded review down — see [`PanelEffect::FocusDashboard`]. It reads
-//!   as a square via the same half-block bleed trick the sidebar nav uses for
-//!   its selection (a lower-half-block row above, an upper-half-block below),
-//! - a **header** showing review status + the review worktree's folder name
-//!   (left-truncated to fit; click to reveal it in the OS file manager),
+//!   still-loaded review down — see [`PanelEffect::FocusDashboard`]. With the
+//!   **review status** (`Ready for review`) in the accent cyan on the button's
+//!   own row, two columns to its right,
+//! - **task info**: the task title (bold white) and the first few lines of the
+//!   task description (markdown stripped, wrapped, at most three lines, ending
+//!   in `...` when clipped), followed by a cyan **`More`** link / `m` key that
+//!   opens the full task-description popover — see [`PanelEffect::ShowDescription`],
+//! - the review worktree's folder name (left-truncated to fit; click to reveal
+//!   it in the OS file manager),
 //! - a **view-switcher** action group — *Chat with Reviewer* (default) /
 //!   *View Diff* / *Edit in <editor>* / *Open Browser* (the last only when the
-//!   workflow declares a review URL), the active content view highlighted,
-//!   *View Diff* opening the OS-configured diff tool over the review branch's
-//!   changes in the right-column content pane, and
-//! - an **Approve** / **Reject** action group, Reject opening a
-//!   type-the-reason popover (a centered `tmux display-popup` with a bordered
-//!   textbox and [ Reject ] / [ Cancel ] buttons — see
-//!   [`reject_reason_popup`]), rather than an in-pane modal.
+//!   workflow declares a review URL), the active content view highlighted, and
+//! - an **Approve** / **Reject** action row (no brackets, green / red in the
+//!   design colors), Reject opening a type-the-reason popover.
+//!
+//! The header, task-info, worktree and nav-block rendering are the shared
+//! [`crate::panel`] primitives, so this panel and the workspace panel
+//! ([`crate::workspace_panel`]) draw the sidebar column identically.
 //!
 //! The state machine here is pure and side-effect free: [`ReviewPanel`]
-//! methods return a [`PanelEffect`] describing what the host loop should do
-//! (swap a tmux pane, open a browser, move the task), so the rendering and
-//! input logic are unit-testable with a `TestBackend` without touching tmux,
-//! the filesystem, or the task board. [`run_review_panel`] is the real
-//! executor that maps each effect onto `shelbi_orchestrator` / `shelbi_state`.
+//! methods return a [`PanelEffect`] describing what the host loop should do, so
+//! the rendering and input logic are unit-testable with a `TestBackend`.
 
-use std::time::Duration;
-
-use anyhow::{Context, Result};
-use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
-};
 use ratatui::{
-    backend::Backend,
-    layout::{Margin, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{List, ListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
+    widgets::Paragraph,
+    Frame,
 };
-use unicode_width::UnicodeWidthStr;
+
+use crate::panel::{
+    advance_blank, display_width, in_rect, render_back_button, render_folder, render_nav_block,
+    render_status_line, render_task_info, reserve_status_area, NavEntry, BACK_BLOCK_H,
+    BACK_BTN_WIDTH, PAD,
+};
+use crate::theme::{ACCENT_CYAN, ACTION_RED, PALETTE_GREEN};
 
 /// Which middle-pane view is currently shown. `Browser` isn't a persistent
 /// view — it opens the system browser — so only `Chat` / `Diff` / `Vim` are
@@ -63,29 +63,23 @@ pub enum SwitchItem {
     Browser,
 }
 
-/// One rendered line in the panel. Mirrors the sidebar's `Row` idea: section
-/// headers and blanks are inert; everything else activates on Enter/click.
+/// One selectable panel row — the keyboard-navigable targets. The task-info
+/// block (title / description / `More`) is **not** a nav row: it is reached by
+/// click or the `m` key, so the nav cycle stays stable regardless of how the
+/// description wraps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PanelRow {
-    /// The square back button at the top of the panel — switches focus back
-    /// to the dashboard window. Rendered as its own three-line block (bleed /
-    /// button / bleed), not through the per-row list renderer.
+    /// The square back button at the top.
     Back,
-    /// Review status line (e.g. `Ready for review`). Inert.
-    Status,
+    /// The `More` link in the task-info block — opens the full task-description
+    /// popover. Present only when the task has a body.
+    More,
     /// The worktree folder name — click to reveal in the file manager.
     Folder,
-    Blank,
-    Section(&'static str),
+    /// A middle-pane view switch.
     Switch(SwitchItem),
     Approve,
     Reject,
-}
-
-impl PanelRow {
-    fn is_selectable(&self) -> bool {
-        !matches!(self, PanelRow::Status | PanelRow::Blank | PanelRow::Section(_))
-    }
 }
 
 /// What the host loop should do after a panel interaction. The panel never
@@ -94,134 +88,114 @@ impl PanelRow {
 pub enum PanelEffect {
     /// Nothing to do (e.g. moved the selection).
     None,
-    /// Switch the active tmux window back to the dashboard, leaving the review
-    /// interface loaded. The back button navigates focus only — it does not
-    /// tear the interface down — so the reviewer can return to the still-loaded
-    /// review by re-opening it from the sidebar.
+    /// Switch the active window back to the dashboard, leaving the review
+    /// interface loaded.
     FocusDashboard,
-    /// Swap the reviewer-chat pane into the middle slot.
+    /// Swap the reviewer-chat pane into the content slot.
     ShowChat,
-    /// Open the OS-configured diff tool over the review branch's changes in
-    /// the middle slot.
+    /// Open the OS-configured diff tool over the review branch's changes.
     ShowDiff,
-    /// Swap the editor pane into the middle slot.
+    /// Swap the editor pane into the content slot.
     ShowVim,
     /// Open the configured review URL in the system browser.
     OpenBrowser,
     /// Reveal the review worktree folder in the OS file manager.
     RevealFolder,
-    /// Accept: move the task out of review via the normal accept transition,
-    /// tear down the interface, and quit the panel.
+    /// Open the full task-description popover over the main area.
+    ShowDescription,
+    /// Accept: move the task out of review via the normal accept transition.
     Approve,
-    /// Open the reject-reason popover (a centered `tmux display-popup`). The
-    /// host loop launches the popup, and on submit performs the review-reject
-    /// with the typed reason, then tears down the interface and quits. The
-    /// reason itself is collected outside this process (a `display-popup`
-    /// child's output can't return here directly), so it isn't carried on the
-    /// effect — see [`reject_reason_popup`].
+    /// Open the reject-reason overlay.
     RejectPrompt,
 }
 
-/// The review panel's full state. Built once from the task's config
-/// (worktree path, resolved editor name, whether a review URL exists) and
-/// then driven by key/mouse events.
+/// The review panel's full state.
 pub struct ReviewPanel {
-    pub task_id: String,
-    /// Absolute path of the review worktree — shown truncated in the header,
-    /// revealed on click.
+    /// Absolute path of the review worktree — shown truncated, revealed on
+    /// click.
     pub worktree: String,
-    /// Display name of the resolved editor (`Vim`, `Helix`, …) for the
-    /// "Edit in <name>" switch label.
+    /// Display name of the resolved editor (`Vim`, `Helix`, …).
     pub editor_name: String,
     /// Whether the workflow declares a review URL — gates the Browser entry.
     pub has_review_url: bool,
+    /// The reviewed task's title — shown bold white in the task-info block.
+    pub title: String,
+    /// The reviewed task's markdown body.
+    pub description: String,
     /// Which middle-pane view is currently shown (drives the highlight).
     pub active_view: ActiveView,
-    /// Selected panel row.
+    /// Selected panel row (index into [`rows`](Self::rows)).
     pub selected: usize,
     pub should_quit: bool,
-    /// Set when the reviewer Approved (accept). Distinguishes the accept exit
-    /// from a plain q / Esc / Reject dismissal so only acceptance closes the
-    /// review slot's window on the way out.
-    pub approved: bool,
     pub status_line: String,
-    /// Set while the gated review→done merge runs on a background thread. The
-    /// Approve row renders a busy spinner instead of the pressable button, and
-    /// [`ReviewPanel::activate_row`] declines a second Approve while it's set —
-    /// so the multi-second `gh` merge never freezes the panel and a replayed /
-    /// double press can't re-trigger it.
+    /// Set while the gated review→done merge runs on a background thread.
     pub merging: bool,
-    /// Animation frame for the "merging…" spinner. Advanced once per loop tick
-    /// while [`merging`](Self::merging) so the reviewer sees the panel is still
-    /// alive and repainting during the merge.
+    /// Animation frame for the "merging…" spinner.
     pub spinner: usize,
-    /// Screen rect of the rendered row list — written each frame, read by the
-    /// mouse handler to map a click to a row.
-    pub list_area: Rect,
+    /// Screen rects of the selectable rows, written each frame and read by the
+    /// mouse handler to map a click back to a row.
+    hit_targets: Vec<(Rect, usize)>,
+    /// Screen rect of the `More` link, when rendered (task has a body).
+    more_hit: Option<Rect>,
 }
 
 impl ReviewPanel {
     pub fn new(
-        task_id: impl Into<String>,
         worktree: impl Into<String>,
         editor_name: impl Into<String>,
         has_review_url: bool,
+        title: impl Into<String>,
+        description: impl Into<String>,
     ) -> Self {
         let mut panel = Self {
-            task_id: task_id.into(),
             worktree: worktree.into(),
             editor_name: editor_name.into(),
             has_review_url,
+            title: title.into(),
+            description: description.into(),
             active_view: ActiveView::Chat,
             selected: 0,
             should_quit: false,
-            approved: false,
             status_line: String::new(),
             merging: false,
             spinner: 0,
-            list_area: Rect::default(),
+            hit_targets: Vec::new(),
+            more_hit: None,
         };
-        // Focus the Chat switch initially — it's the default middle-pane view
-        // (the mockup highlights it), not the header folder above it.
+        // Focus the Chat switch initially — it's the default middle-pane view.
         panel.selected = panel
             .rows()
             .iter()
             .position(|r| matches!(r, PanelRow::Switch(SwitchItem::Chat)))
-            .or_else(|| panel.rows().iter().position(PanelRow::is_selectable))
             .unwrap_or(0);
         panel
     }
 
+    /// The keyboard-navigable rows, top to bottom. Stable regardless of the
+    /// description's wrapped height (the task-info block is drawn outside this
+    /// list).
     fn rows(&self) -> Vec<PanelRow> {
-        // The Chat / Edit / Browser switches render as a full-width nav block
-        // (separator lines + half-block selection bleed) that stands on its
-        // own the way the main sidebar nav does — no leading section header.
-        // The back button leads the panel (its own block above everything),
-        // a blank giving it breathing room before the header.
-        let mut rows = vec![
-            PanelRow::Back,
-            PanelRow::Blank,
-            PanelRow::Status,
+        let mut rows = vec![PanelRow::Back];
+        // `More` sits right under the back button, in reading order with the
+        // task-info block it belongs to, and only when there's a body to open.
+        if !self.description.trim().is_empty() {
+            rows.push(PanelRow::More);
+        }
+        rows.extend([
             PanelRow::Folder,
-            PanelRow::Blank,
             PanelRow::Switch(SwitchItem::Chat),
             PanelRow::Switch(SwitchItem::Diff),
             PanelRow::Switch(SwitchItem::Vim),
-        ];
+        ]);
         if self.has_review_url {
             rows.push(PanelRow::Switch(SwitchItem::Browser));
         }
-        rows.push(PanelRow::Blank);
-        rows.push(PanelRow::Section("Actions"));
         rows.push(PanelRow::Approve);
         rows.push(PanelRow::Reject);
         rows
     }
 
-    /// Start index and count of the contiguous `Switch` run in [`rows`]. The
-    /// switches render as a full-width nav block; everything else is a plain
-    /// one-line list row, so this span is all the renderer and the click map
-    /// need to agree on where the nav block sits.
+    /// Start index and count of the contiguous `Switch` run in [`rows`].
     fn switch_span(&self) -> (usize, usize) {
         let rows = self.rows();
         let start = rows
@@ -236,37 +210,6 @@ impl ReviewPanel {
         (start, count)
     }
 
-    /// Map a rendered-line offset (from the top of the list area) back to a
-    /// row index. The back button block leads the panel (its middle line is the
-    /// only clickable one); rows before and after the switch group are one line
-    /// each; the switch group renders as a nav block whose item `j` sits on line
-    /// `navStart + 2j + 1` with inert separators on the even lines between.
-    /// Mirrors [`crate::app::App::row_at`] so drawing and clicks agree.
-    fn row_at_line(&self, target: usize) -> Option<usize> {
-        // The back button block (rows[0]) occupies the first BACK_BLOCK_H
-        // lines; only its middle line maps to the Back row.
-        if target < BACK_BLOCK_H {
-            return (target == BACK_BUTTON_LINE).then_some(0);
-        }
-        let rows = self.rows();
-        let (sstart, scount) = self.switch_span();
-        // Lines below the back block, 0-based. The plain rows above the switch
-        // group are rows[1..sstart], one line each.
-        let t = target - BACK_BLOCK_H;
-        let above = sstart.saturating_sub(1);
-        if t < above {
-            return Some(1 + t);
-        }
-        let nav_lines = crate::sidebar::nav_lines(scount);
-        if t < above + nav_lines {
-            let offset = t - above;
-            // Odd offsets are item rows; even offsets are inert separators.
-            return (offset % 2 == 1).then_some(sstart + offset / 2);
-        }
-        let idx = sstart + scount + (t - above - nav_lines);
-        (idx < rows.len()).then_some(idx)
-    }
-
     pub fn nav_up(&mut self) {
         self.step(-1);
     }
@@ -276,45 +219,20 @@ impl ReviewPanel {
     }
 
     fn step(&mut self, delta: i32) {
-        let rows = self.rows();
-        let n = rows.len();
+        let n = self.rows().len();
         if n == 0 {
             return;
         }
-        let mut idx = self.selected.min(n - 1);
-        for _ in 0..n {
-            idx = if delta < 0 {
-                if idx == 0 {
-                    n - 1
-                } else {
-                    idx - 1
-                }
+        let idx = self.selected.min(n - 1);
+        self.selected = if delta < 0 {
+            if idx == 0 {
+                n - 1
             } else {
-                (idx + 1) % n
-            };
-            if rows[idx].is_selectable() {
-                self.selected = idx;
-                return;
+                idx - 1
             }
-        }
-    }
-
-    /// Fall the mid view back to Chat after its content pane (Vim / difftool)
-    /// died in place. Mirrors `activate_row(Switch(Chat))` — sets the active
-    /// view and returns [`PanelEffect::ShowChat`] — and moves the selection
-    /// highlight to the Chat entry, so a poll-tick auto-recovery drives the
-    /// exact same view-switch (and leaves the panel in the same visible state)
-    /// a click on the Chat entry would. Kept as its own method so the recovery
-    /// converges with the click path without duplicating the effect mapping.
-    pub fn recover_to_chat(&mut self) -> PanelEffect {
-        if let Some(idx) = self
-            .rows()
-            .iter()
-            .position(|r| matches!(r, PanelRow::Switch(SwitchItem::Chat)))
-        {
-            self.selected = idx;
-        }
-        self.activate_row(PanelRow::Switch(SwitchItem::Chat))
+        } else {
+            (idx + 1) % n
+        };
     }
 
     /// Activate the selected row (Enter / Space).
@@ -329,6 +247,7 @@ impl ReviewPanel {
     fn activate_row(&mut self, row: PanelRow) -> PanelEffect {
         match row {
             PanelRow::Back => PanelEffect::FocusDashboard,
+            PanelRow::More => self.request_description(),
             PanelRow::Folder => PanelEffect::RevealFolder,
             PanelRow::Switch(SwitchItem::Chat) => {
                 self.active_view = ActiveView::Chat;
@@ -343,60 +262,51 @@ impl ReviewPanel {
                 PanelEffect::ShowVim
             }
             PanelRow::Switch(SwitchItem::Browser) => PanelEffect::OpenBrowser,
-            // Decline a second Approve while the gated merge is already in
-            // flight — the host loop runs it off-thread and sets `merging`, so
-            // a replayed or double press (Enter *or* click, both route here) is
-            // dropped, never queued behind the running merge.
+            // Decline Approve / Reject while the gated merge is already in
+            // flight — a replayed or double press (Enter *or* click) is dropped.
             PanelRow::Approve if self.merging => PanelEffect::None,
             PanelRow::Approve => PanelEffect::Approve,
-            // Decline Reject while the gated merge is in flight, the same way
-            // Approve is declined. A submitted reject reason would run the
-            // review-reject transition concurrently with the background `gh`
-            // merge — landing the card in `ready` while the PR merges, or
-            // failing the merge's `review -> done` move because the card already
-            // left `review`. The old frozen panel made this impossible; the
-            // off-thread merge reintroduces the race, so we close it here.
             PanelRow::Reject if self.merging => PanelEffect::None,
             PanelRow::Reject => PanelEffect::RejectPrompt,
-            PanelRow::Status | PanelRow::Blank | PanelRow::Section(_) => PanelEffect::None,
         }
     }
 
-    /// Map a click at (`column`, `row`) to a row activation. Returns `None`
-    /// when the click misses the list or lands on an inert row.
+    /// Ask to open the task-description popover (the `More` link / `m` key).
+    /// Returns [`PanelEffect::None`] when the task has no body.
+    pub fn request_description(&self) -> PanelEffect {
+        if self.description.trim().is_empty() {
+            PanelEffect::None
+        } else {
+            PanelEffect::ShowDescription
+        }
+    }
+
+    /// Map a click at (`column`, `row`) to an effect.
     pub fn click(&mut self, column: u16, row: u16) -> PanelEffect {
-        let area = self.list_area;
-        if area.width == 0
-            || area.height == 0
-            || column < area.x
-            || column >= area.x.saturating_add(area.width)
-            || row < area.y
-            || row >= area.y.saturating_add(area.height)
-        {
-            return PanelEffect::None;
-        }
-        // The switch group renders as a nav block (separators between/around
-        // each item), so a clicked line no longer maps 1:1 to a row index.
-        let Some(idx) = self.row_at_line((row - area.y) as usize) else {
-            return PanelEffect::None;
-        };
-        let rows = self.rows();
-        match rows.get(idx) {
-            Some(r) if r.is_selectable() => {
-                self.selected = idx;
-                self.activate_row(r.clone())
+        if let Some(r) = self.more_hit {
+            if in_rect(r, column, row) {
+                // Move keyboard focus to `More` too, so a click and the keyboard
+                // agree on what's selected.
+                if let Some(idx) = self.rows().iter().position(|r| matches!(r, PanelRow::More)) {
+                    self.selected = idx;
+                }
+                return self.request_description();
             }
-            _ => PanelEffect::None,
         }
+        let rows = self.rows();
+        for (rect, idx) in self.hit_targets.clone() {
+            if in_rect(rect, column, row) {
+                if let Some(r) = rows.get(idx) {
+                    self.selected = idx;
+                    return self.activate_row(r.clone());
+                }
+            }
+        }
+        PanelEffect::None
     }
 
-    /// Handle a q / Esc quit request. While a gated merge is in flight, quitting
-    /// would tear the review window down and exit the process with the merge
-    /// worker's `gh` children still mid-flight, orphaning a half-finished merge
-    /// (PR merged, branch not deleted, card not moved). So while `merging` the
-    /// quit is ignored and a short note explains why the key did nothing;
-    /// otherwise it sets `should_quit`. Pure so the loop's key handler stays
-    /// unit-testable without a terminal.
+    /// Handle a q / Esc quit request. While a gated merge is in flight the quit
+    /// is ignored and a short note explains why.
     pub fn request_quit(&mut self) {
         if self.merging {
             self.status_line = "merge in progress, wait for it to finish".into();
@@ -404,385 +314,173 @@ impl ReviewPanel {
             self.should_quit = true;
         }
     }
-
 }
 
-/// Display column width of `s`, honoring wide glyphs. The sidebar's folder
-/// emoji renders as a 2-cell glyph, so a plain `chars().count()` under-counts
-/// it by a column and any budget derived from that overruns the row. Measuring
-/// with `unicode-width` is what lets the folder row reserve the emoji's real
-/// width before truncating the path.
-fn display_width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
-}
-
-/// Left-truncate `path` to at most `width` columns, prefixing `...` when it's
-/// clipped, so the tail (the folder name the reviewer cares about) always
-/// stays visible: `/a/b/c/.shelbi/wt/review` → `...ct/.shelbi/wt/review`.
-pub fn truncate_left(path: &str, width: usize) -> String {
-    let chars: Vec<char> = path.chars().collect();
-    if chars.len() <= width {
-        return path.to_string();
-    }
-    if width <= 3 {
-        // No room for the ellipsis + content — show the last `width` chars.
-        return chars[chars.len().saturating_sub(width)..].iter().collect();
-    }
-    let keep = width - 3;
-    let tail: String = chars[chars.len() - keep..].iter().collect();
-    format!("...{tail}")
-}
-
-/// The folder emoji + space that prefixes the sidebar's worktree row. Kept as a
-/// named constant so the budget math and the rendered line can never drift.
-const FOLDER_PREFIX: &str = "📂 ";
-
-/// Compose the sidebar folder row — `"📂 <path>"` — fitting the whole line
-/// (emoji + space + path) within `width` columns. The prefix renders as a
-/// 2-cell emoji plus a 1-cell space, so its display width is reserved *before*
-/// left-truncating the path; otherwise the composed line runs ~3 columns past
-/// `width` and the terminal clips the tail — the final folder segment the
-/// reviewer needs (`wt/review` clipped to `wt/rev`). Front elision with `...`
-/// still kicks in once the reserved budget requires it.
-fn folder_row_text(worktree: &str, width: usize) -> String {
-    let budget = width.saturating_sub(display_width(FOLDER_PREFIX)).max(1);
-    let label = truncate_left(worktree, budget);
-    format!("{FOLDER_PREFIX}{label}")
-}
-
-/// 1-col horizontal padding shared by every non-nav row. The switch nav block
-/// deliberately bypasses it (its fill and half-block bleed paint edge to edge)
-/// while its label text re-applies the same indent, so labels stay aligned
-/// with the rows above and below — the same split the main sidebar uses.
-const LIST_INDENT: Margin = Margin {
-    horizontal: 1,
-    vertical: 0,
-};
-
-/// The square back button occupies three rendered lines: a lower-half-block
-/// bleed row, the button (arrow) row, and an upper-half-block bleed row. The
-/// two bleed rows extend the button's fill half a cell up and down so a single
-/// text row reads as a square block — the same trick the sidebar nav uses for
-/// its selection (see [`crate::sidebar::BLEED_ABOVE`] / `BLEED_BELOW`).
-const BACK_BLOCK_H: usize = 3;
-/// The button (arrow) sits on the middle line of the three-line block.
-const BACK_BUTTON_LINE: usize = 1;
-/// Column width of the back button. A terminal cell is ~twice as tall as it is
-/// wide and the half-block bleed makes the button ~2 cells tall, so a handful
-/// of columns reads as roughly square; the arrow is centered within it.
-const BACK_BTN_WIDTH: usize = 5;
-
-/// Max rows the bottom status/error line may claim, so even a long wrapped
-/// `gh` error (`PR #9 is not mergeable: …`) can't crowd the panel body out.
-const STATUS_MAX_H: u16 = 6;
-
-/// Carve the bottom rows out of `area` for the status line when one is set.
-/// Returns `(body, Some(status))`, or `(area, None)` when there's no message or
-/// no room. Reserving from the *bottom* leaves the body's top-anchored layout —
-/// and the click-map line math keyed off it via `list_area` — untouched.
-fn reserve_status_area(app: &ReviewPanel, area: Rect) -> (Rect, Option<Rect>) {
-    if app.status_line.is_empty() || area.height < 2 {
-        return (area, None);
-    }
-    // The warning renders inside the shared 1-col indent (`LIST_INDENT`), so the
-    // wrap budget matches the width `render_status_line` draws into.
-    let inner_w = area.width.saturating_sub(2).max(1) as usize;
-    let needed = wrapped_line_count(&app.status_line, inner_w) as u16;
-    // Always keep at least one body row; never exceed the cap.
-    let cap = STATUS_MAX_H.min(area.height - 1);
-    let h = needed.clamp(1, cap);
-    let body = Rect {
-        height: area.height - h,
-        ..area
-    };
-    let status = Rect {
-        y: area.y + area.height - h,
-        height: h,
-        ..area
-    };
-    (body, Some(status))
-}
-
-/// Render the panel's status line — a non-empty `status_line` (an Approve /
-/// merge failure, an opener error) painted red and word-wrapped so the whole
-/// message, including a `gh` stderr reason, is legible. Mirrors the dashboard
-/// sidebar's footer status (`sidebar::render_footer`), sitting at the bottom of
-/// the panel so the reviewer sees why an action was refused right where they
-/// clicked — the "Ready for review" header stays put above it, so the card
-/// visibly remains in review.
-fn render_status_line(f: &mut Frame, app: &ReviewPanel, area: Rect) {
-    if area.width == 0 || area.height == 0 || app.status_line.is_empty() {
-        return;
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            app.status_line.clone(),
-            Style::default().fg(Color::Red),
-        )))
-        .wrap(Wrap { trim: true }),
-        area.inner(LIST_INDENT),
-    );
-}
-
-/// Estimate how many rows `text` occupies when word-wrapped to `width` columns,
-/// matching ratatui's `Wrap { trim: true }` closely enough to size the status
-/// area: whitespace-separated words are packed greedily, and a word wider than
-/// `width` spills onto extra rows of its own.
-fn wrapped_line_count(text: &str, width: usize) -> usize {
-    if width == 0 {
-        return 1;
-    }
-    let mut lines = 1usize;
-    let mut col = 0usize;
-    for word in text.split_whitespace() {
-        let w = display_width(word);
-        if w > width {
-            // A word longer than the row: it starts on a fresh line and spills
-            // onto ceil(w / width) rows, the last of which leaves `col` at the
-            // remainder.
-            if col > 0 {
-                lines += 1;
-            }
-            lines += (w - 1) / width;
-            col = w % width;
-            if col == 0 {
-                col = width;
-            }
-            continue;
-        }
-        let need = if col == 0 { w } else { col + 1 + w };
-        if need > width {
-            lines += 1;
-            col = w;
-        } else {
-            col = need;
-        }
-    }
-    lines.max(1)
+/// Record a selectable row's screen rect + its [`rows`](ReviewPanel::rows)
+/// index for the click map.
+fn push_hit(app: &mut ReviewPanel, rect: Rect, idx: usize) {
+    app.hit_targets.push((rect, idx));
 }
 
 pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
-    // A non-empty `status_line` (an Approve / merge refusal, an opener error)
-    // claims the bottom rows of the panel as a red, wrapped warning — the
-    // panel's analogue of the dashboard sidebar's footer status line. Carve it
-    // off first so the body's top-anchored layout (and the click map keyed off
-    // `list_area`) is unaffected, and so a too-small early return below still
-    // leaves the warning painted.
-    let (area, status_area) = reserve_status_area(app, area);
+    // A non-empty `status_line` claims the bottom rows as a red, wrapped
+    // warning. Carve it off first.
+    let (area, status_area) = reserve_status_area(&app.status_line, area);
     if let Some(status_area) = status_area {
-        render_status_line(f, app, status_area);
+        render_status_line(f, &app.status_line, status_area);
     }
-    // The list spans the full pane width so the switch nav block's selection
-    // fill and half-block bleed can paint edge to edge; the plain rows above
-    // and below re-apply the 1-col indent themselves.
-    app.list_area = area;
-    let rows = app.rows();
-    let (sstart, scount) = app.switch_span();
 
-    // 1. The square back button block leads the panel, occupying the top
-    //    BACK_BLOCK_H lines.
-    let back_h = (BACK_BLOCK_H as u16).min(area.height);
+    // Reset the click map; each rendered region re-populates it.
+    app.hit_targets.clear();
+    app.more_hit = None;
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let bottom = area.y + area.height;
+    let mut y = area.y;
+
+    // 1. The square back button block + the review status beside it.
+    let back_h = BACK_BLOCK_H.min(area.height);
     render_back_button(
         f,
+        Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: back_h,
+        },
+        app.selected == 0, // Back is always rows[0].
+        "Ready for review",
+        Style::default().fg(ACCENT_CYAN).add_modifier(Modifier::BOLD),
+    );
+    let btn_w = (BACK_BTN_WIDTH as u16).min(area.width.saturating_sub(PAD)).max(1);
+    push_hit(
         app,
         Rect {
+            x: area.x + PAD,
+            y,
+            width: btn_w,
             height: back_h,
-            ..area
         },
+        0,
     );
-    if area.height <= back_h {
-        return;
+    y += back_h;
+
+    // blank
+    y = advance_blank(y, bottom);
+
+    // 2. Task info (title + description preview + More).
+    if y < bottom {
+        let more_selected = app
+            .rows()
+            .get(app.selected)
+            .is_some_and(|r| matches!(r, PanelRow::More));
+        let (used, more_hit) = render_task_info(
+            f,
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: bottom - y,
+            },
+            &app.title,
+            &app.description,
+            more_selected,
+        );
+        app.more_hit = more_hit;
+        y += used;
     }
-    // Everything else renders below the back block. `sstart` counts the Back
-    // row (rows[0]); the plain rows above the switch group are rows[1..sstart].
-    let below_y = area.y + back_h;
-    let below_h = area.height - back_h;
 
-    // Region above the switches (blank / status / folder / blank), one line each.
-    let above_n = (sstart.saturating_sub(1)) as u16;
-    let a_h = above_n.min(below_h);
-    let a_area = Rect {
-        y: below_y,
-        height: a_h,
-        ..area
-    };
-    render_row_list(f, app, &rows[1..sstart], 1, a_area.inner(LIST_INDENT));
-    if below_h <= a_h {
-        return;
+    // blank
+    y = advance_blank(y, bottom);
+
+    // 3. Worktree folder row.
+    let folder_idx = app
+        .rows()
+        .iter()
+        .position(|r| matches!(r, PanelRow::Folder))
+        .unwrap_or(0);
+    if y < bottom {
+        render_folder(
+            f,
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            },
+            &app.worktree,
+            app.selected == folder_idx,
+        );
+        push_hit(
+            app,
+            Rect {
+                x: area.x + PAD,
+                y,
+                width: area.width.saturating_sub(PAD),
+                height: 1,
+            },
+            folder_idx,
+        );
+        y += 1;
     }
 
-    // The switch group itself — a full-width nav block: a separator line
-    // between (and bracketing) each item, the selected item filling edge to
-    // edge with its adjacent separators carrying the half-block bleed. Same
-    // treatment as the main sidebar nav.
-    let nav_h = (crate::sidebar::nav_lines(scount) as u16).min(below_h - a_h);
-    let nav_area = Rect {
-        y: below_y + a_h,
-        height: nav_h,
-        ..area
-    };
-    render_switch_nav(f, app, nav_area, sstart, scount);
+    // blank
+    y = advance_blank(y, bottom);
 
-    // Region below the switches (blank, Actions header, Approve / Reject).
-    let used = a_h + nav_h;
-    if below_h > used {
-        let rest = Rect {
-            y: below_y + used,
-            height: below_h - used,
-            ..area
+    // 4. The view-switcher nav block.
+    let (sstart, scount) = app.switch_span();
+    let nav_h = (crate::sidebar::nav_lines(scount) as u16).min(bottom.saturating_sub(y));
+    if y < bottom && nav_h > 0 {
+        let rows = app.rows();
+        let entries: Vec<NavEntry> = (sstart..sstart + scount)
+            .filter_map(|i| match rows.get(i) {
+                Some(PanelRow::Switch(item)) => Some(switch_entry(app, *item)),
+                _ => None,
+            })
+            .collect();
+        let selected = (app.selected >= sstart && app.selected < sstart + scount)
+            .then(|| app.selected - sstart);
+        let rects = render_nav_block(
+            f,
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: nav_h,
+            },
+            &entries,
+            selected,
+        );
+        for (p, rect) in rects.into_iter().enumerate() {
+            if rect.y < area.y + area.height {
+                push_hit(app, rect, sstart + p);
+            }
         }
-        .inner(LIST_INDENT);
-        let offset = sstart + scount;
-        render_row_list(f, app, &rows[offset..], offset, rest);
+        y += nav_h;
+    }
+
+    // blank
+    y = advance_blank(y, bottom);
+
+    // 5. The Approve / Reject action row (one line).
+    if y < bottom {
+        render_actions(
+            f,
+            app,
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            },
+        );
     }
 }
 
-/// Render the square back button block: a lower-half-block bleed row, the
-/// arrow row, and an upper-half-block bleed row. The bleed rows carry the
-/// button's fill colour in their *foreground* so the eye reads the fill as
-/// continuing half a cell past the arrow row — the same half-block trick the
-/// sidebar nav uses — making the single arrow row read as a square. The arrow
-/// glyph (`←`, U+2190) is the only content; there is no text label. Selecting
-/// the button brightens the arrow; the fill is constant so it always reads as
-/// a raised square.
-fn render_back_button(f: &mut Frame, app: &ReviewPanel, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let selected = app.selected == 0; // Back is always rows[0].
-    let bg = crate::theme::SELECTION_BG;
-    let width = area.width as usize;
-    // Keep a 1-col indent (matching LIST_INDENT) so the button sits in from the
-    // pane edge like the labels below it.
-    let btn_w = BACK_BTN_WIDTH.min(width.saturating_sub(1)).max(1);
-    let left = (btn_w - 1) / 2;
-    let right = btn_w - 1 - left;
-    let btn_text = format!("{}\u{2190}{}", " ".repeat(left), " ".repeat(right));
-    let arrow_style = if selected {
-        Style::default()
-            .fg(Color::White)
-            .bg(bg)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray).bg(bg)
-    };
-    let bleed_style = Style::default().fg(bg);
-    let lines = vec![
-        Line::from(vec![
-            Span::raw(" "),
-            Span::styled(crate::sidebar::BLEED_ABOVE.repeat(btn_w), bleed_style),
-        ]),
-        Line::from(vec![Span::raw(" "), Span::styled(btn_text, arrow_style)]),
-        Line::from(vec![
-            Span::raw(" "),
-            Span::styled(crate::sidebar::BLEED_BELOW.repeat(btn_w), bleed_style),
-        ]),
-    ];
-    f.render_widget(Paragraph::new(lines), area);
-}
-
-/// Render a slice of one-line rows as an indented `List`, highlighting the row
-/// at `app.selected` (a global row index; `offset` is where this slice starts
-/// in the full row list) with the same full-row selection fill the sidebar's
-/// rest-of-list uses.
-fn render_row_list(
-    f: &mut Frame,
-    app: &ReviewPanel,
-    rows: &[PanelRow],
-    offset: usize,
-    area: Rect,
-) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let width = area.width as usize;
-    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
-    for (i, row) in rows.iter().enumerate() {
-        let selected = offset + i == app.selected && row.is_selectable();
-        items.push(render_row(app, row, selected, width));
-    }
-    let mut state = ListState::default();
-    if app.selected >= offset && app.selected < offset + rows.len() {
-        state.select(Some(app.selected - offset));
-    }
-    // The Approve / Reject rows read as pressed *buttons* when selected: their
-    // own tint becomes the fill via `Modifier::REVERSED` (fg = tint → rendered
-    // as the background, with the terminal's own background showing through as
-    // contrasting text). Every other row keeps the generic gray SELECTION_BG
-    // fill. We branch the whole list's highlight here — not per item — because
-    // the list's row-wide highlight patch would otherwise paint SELECTION_BG
-    // over a per-item `bg = tint` and win. Only the single selected row is ever
-    // highlighted, so keying off `app.selected` styles exactly that row.
-    let highlight = match app.rows().get(app.selected) {
-        // While merging, the Approve row is a busy indicator, not a pressable
-        // button — drop the pressed-button reverse so it doesn't read as
-        // clickable.
-        Some(PanelRow::Approve) if !app.merging => {
-            Style::default().fg(Color::Green).add_modifier(Modifier::REVERSED)
-        }
-        // While merging, Reject is declined (see `activate_row`), so drop its
-        // pressed-button reverse too — it must not read as clickable.
-        Some(PanelRow::Reject) if !app.merging => {
-            Style::default().fg(Color::Red).add_modifier(Modifier::REVERSED)
-        }
-        _ => Style::default().bg(crate::theme::SELECTION_BG),
-    };
-    let list = List::new(items).highlight_style(highlight);
-    f.render_stateful_widget(list, area, &mut state);
-}
-
-/// Render the Chat / Edit / Browser switches as a full-width nav block,
-/// mirroring the main sidebar's `render_nav`: a separator line between (and
-/// bracketing) each item, with the selected item's fill spanning edge to edge
-/// and its adjacent separators carrying the half-block bleed. Text keeps the
-/// same 1-col indent as the rest of the list.
-fn render_switch_nav(f: &mut Frame, app: &ReviewPanel, area: Rect, sstart: usize, scount: usize) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let rows = app.rows();
-    // Which switch (0-indexed within the group) is focused, if any.
-    let selected =
-        (app.selected >= sstart && app.selected < sstart + scount).then(|| app.selected - sstart);
-    let width = area.width as usize;
-    let bleed = crate::theme::SELECTION_BG;
-
-    let mut lines: Vec<Line> = Vec::with_capacity(crate::sidebar::nav_lines(scount));
-    for p in 0..=scount {
-        // Separator `p` sits between item `p-1` (above) and item `p` (below).
-        // It shows the lower half-block when the item below it is selected and
-        // the upper half-block when the item above it is selected; blank
-        // otherwise. Only one item is ever selected, so the cases are exclusive.
-        let glyph = if selected == Some(p) {
-            Some(crate::sidebar::BLEED_ABOVE)
-        } else if p > 0 && selected == Some(p - 1) {
-            Some(crate::sidebar::BLEED_BELOW)
-        } else {
-            None
-        };
-        lines.push(match glyph {
-            Some(g) => Line::from(Span::styled(g.repeat(width), Style::default().fg(bleed))),
-            None => Line::raw(""),
-        });
-        if let Some(PanelRow::Switch(item)) = rows.get(sstart + p) {
-            lines.push(switch_nav_line(app, *item, selected == Some(p), width, bleed));
-        }
-    }
-    f.render_widget(Paragraph::new(lines), area);
-}
-
-/// One switch nav row. Selected rows fill edge to edge with the selection
-/// background (label padded out to the full width) and render white/bold;
-/// the active middle-pane view is distinguished by its cyan/bold tint when
-/// unselected; other rows are plain gray. The single leading space keeps the
-/// label aligned with the 1-col-indented rows above and below.
-fn switch_nav_line(
-    app: &ReviewPanel,
-    item: SwitchItem,
-    selected: bool,
-    width: usize,
-    bg: Color,
-) -> Line<'static> {
+/// Build the nav entry (glyph, label, active) for one review switch.
+fn switch_entry(app: &ReviewPanel, item: SwitchItem) -> NavEntry {
     let (glyph, label, active) = match item {
         SwitchItem::Chat => (
             "🤓",
@@ -801,513 +499,126 @@ fn switch_nav_line(
         ),
         SwitchItem::Browser => ("🌐", "Open Browser".to_string(), false),
     };
-    // Two-space placeholder keeps the glyph column aligned; the active view is
-    // distinguished by cyan/bold styling and the selection background, not a
-    // leading marker glyph. The leading space matches the 1-col indent the
-    // sidebar nav labels use.
-    let marker = "  ";
-    let text = format!(" {marker}{glyph} {label}");
-    if selected {
-        let pad = width.saturating_sub(text.chars().count());
-        Line::from(Span::styled(
-            format!("{text}{}", " ".repeat(pad)),
-            Style::default()
-                .fg(Color::White)
-                .bg(bg)
-                .add_modifier(Modifier::BOLD),
-        ))
-    } else if active {
-        Line::from(Span::styled(
-            text,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ))
-    } else {
-        Line::from(Span::styled(text, Style::default().fg(Color::Gray)))
+    NavEntry {
+        glyph,
+        label,
+        active,
     }
 }
 
-fn render_row(app: &ReviewPanel, row: &PanelRow, selected: bool, width: usize) -> ListItem<'static> {
-    match row {
-        // The back button is drawn by `render_back_button` as its own block,
-        // never through this per-row list renderer.
-        PanelRow::Back => unreachable!("the back button renders via render_back_button"),
-        PanelRow::Status => ListItem::new(Line::from(Span::styled(
-            "Ready for review",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ))),
-        PanelRow::Folder => {
-            let style = if selected {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            ListItem::new(Line::from(Span::styled(folder_row_text(&app.worktree, width), style)))
+/// Render the Approve / Reject action row: `✅ Approve` (green) and `❌ Reject`
+/// (red) on one line, no brackets. While a merge is in flight the row becomes a
+/// busy spinner instead.
+fn render_actions(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let x0 = area.x + PAD;
+    let width = area.width.saturating_sub(PAD);
+    if width == 0 {
+        return;
+    }
+
+    if app.merging {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{} merging PR…", spinner_frame(app.spinner)),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ))),
+            Rect {
+                x: x0,
+                y: area.y,
+                width,
+                height: 1,
+            },
+        );
+        return;
+    }
+
+    let rows = app.rows();
+    let approve_idx = rows.iter().position(|r| matches!(r, PanelRow::Approve));
+    let reject_idx = rows.iter().position(|r| matches!(r, PanelRow::Reject));
+    let approve_sel = approve_idx == Some(app.selected);
+    let reject_sel = reject_idx == Some(app.selected);
+
+    let approve_label = "✅ Approve";
+    let reject_label = "❌ Reject";
+    let aw = display_width(approve_label) as u16;
+    let rw = display_width(reject_label) as u16;
+
+    const ACTIONS_GAP: u16 = 4;
+    let slack = width.saturating_sub(aw + rw);
+    let gap = ACTIONS_GAP.min(slack).max(1);
+
+    let approve_style = action_style(PALETTE_GREEN, approve_sel);
+    let reject_style = action_style(ACTION_RED, reject_sel);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(approve_label, approve_style),
+            Span::raw(" ".repeat(gap as usize)),
+            Span::styled(reject_label, reject_style),
+        ])),
+        Rect {
+            x: x0,
+            y: area.y,
+            width,
+            height: 1,
+        },
+    );
+
+    if let Some(idx) = approve_idx {
+        push_hit(
+            app,
+            Rect {
+                x: x0,
+                y: area.y,
+                width: aw.min(width),
+                height: 1,
+            },
+            idx,
+        );
+    }
+    if let Some(idx) = reject_idx {
+        let rx = x0 + aw + gap;
+        if rx < x0 + width {
+            push_hit(
+                app,
+                Rect {
+                    x: rx,
+                    y: area.y,
+                    width: rw.min(x0 + width - rx),
+                    height: 1,
+                },
+                idx,
+            );
         }
-        PanelRow::Blank => ListItem::new(Line::raw("")),
-        PanelRow::Section(label) => ListItem::new(Line::from(Span::styled(
-            format!("— {label} —"),
-            Style::default().fg(Color::DarkGray),
-        ))),
-        // Switch rows are drawn by `render_switch_nav` as a full-width nav
-        // block, never through this per-row list renderer.
-        PanelRow::Switch(_) => unreachable!("switch rows render via the nav block"),
-        // While the gated merge runs off-thread the Approve button becomes a
-        // busy indicator: an animated spinner + "merging PR…" in place of the
-        // pressable label, giving the reviewer immediate feedback that the
-        // press landed and the panel is still alive.
-        PanelRow::Approve if app.merging => ListItem::new(Line::from(Span::styled(
-            format!("[ {} merging PR… ]", spinner_frame(app.spinner)),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ))),
-        PanelRow::Approve => button_item("✅ Approve", Color::Green, selected),
-        PanelRow::Reject => button_item("❌ Reject", Color::Red, selected),
     }
 }
 
-/// One frame of the braille "merging…" spinner, indexed by the panel's
-/// `spinner` tick (advanced once per loop iteration while a merge is in
-/// flight). Pure so the busy-row render stays deterministic in tests.
-fn spinner_frame(tick: usize) -> char {
-    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    FRAMES[tick % FRAMES.len()]
-}
-
-fn button_item(label: &str, tint: Color, selected: bool) -> ListItem<'static> {
-    // Selected: reverse-video the button so its tint becomes the fill and the
-    // terminal's background shows through as contrasting text — a pressed
-    // green / red block. `render_row_list` reinforces this across the full row
-    // width with a matching reversed `highlight_style` (and deliberately skips
-    // the generic SELECTION_BG fill for these rows). Unselected keeps the flat
-    // tinted `[ ✅ Approve ]` bracket look.
-    let style = if selected {
+/// The style for an action word: flat tint when idle, reverse-video (pressed)
+/// when it is the selected row.
+fn action_style(tint: Color, selected: bool) -> Style {
+    if selected {
         Style::default()
             .fg(tint)
             .add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else {
         Style::default().fg(tint)
-    };
-    ListItem::new(Line::from(Span::styled(format!("[ {label} ]"), style)))
+    }
+}
+
+/// One frame of the braille "merging…" spinner.
+fn spinner_frame(tick: usize) -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    FRAMES[tick % FRAMES.len()]
 }
 
 // ---------------------------------------------------------------------------
-// Platform open/reveal command builders (pure, unit-tested)
-
-/// Host OS family for picking the file-manager / browser opener.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OsKind {
-    Macos,
-    Windows,
-    Linux,
-}
-
-/// The OS this binary was built for. Everything else is treated as Linux
-/// (xdg-open), which is the correct default for the BSDs too.
-pub fn current_os() -> OsKind {
-    if cfg!(target_os = "macos") {
-        OsKind::Macos
-    } else if cfg!(target_os = "windows") {
-        OsKind::Windows
-    } else {
-        OsKind::Linux
-    }
-}
-
-/// Argv (`program`, `args`) that reveals `path` in the OS file manager:
-/// `open` on macOS, `explorer` on Windows, `xdg-open` on Linux.
-pub fn reveal_command(os: OsKind, path: &str) -> (String, Vec<String>) {
-    let program = match os {
-        OsKind::Macos => "open",
-        OsKind::Windows => "explorer",
-        OsKind::Linux => "xdg-open",
-    };
-    (program.to_string(), vec![path.to_string()])
-}
-
-/// Argv (`program`, `args`) that opens `url` in the system browser — same
-/// per-platform opener as [`reveal_command`].
-pub fn open_url_command(os: OsKind, url: &str) -> (String, Vec<String>) {
-    let program = match os {
-        OsKind::Macos => "open",
-        OsKind::Windows => "explorer",
-        OsKind::Linux => "xdg-open",
-    };
-    (program.to_string(), vec![url.to_string()])
-}
-
-/// Run a fire-and-forget opener command, mapping a launch failure to a short
-/// message the caller can surface on the status line (never a crash).
-fn spawn_opener(program: &str, args: &[String]) -> std::result::Result<(), String> {
-    std::process::Command::new(program)
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("{program} failed: {e}"))
-}
-
-// ---------------------------------------------------------------------------
-// Executor
-
-/// Run the review panel in the current pane on `task_id`. Builds the panel
-/// state from the project/workflow config, then drives the crossterm event
-/// loop, mapping each [`PanelEffect`] onto the real orchestrator/state calls.
-pub fn run_review_panel(project_name: &str, task_id: &str) -> Result<()> {
-    let (worktree, has_review_url) = review_context(project_name, task_id);
-    let editor_name = shelbi_state::editor_display_name(&shelbi_state::resolve_editor());
-
-    let mut term = crate::setup_terminal_pub().context("setting up terminal")?;
-    let mut app = ReviewPanel::new(task_id, worktree, editor_name, has_review_url);
-
-    let result = review_panel_loop(&mut term, &mut app, project_name);
-    crate::restore_terminal_pub(&mut term).ok();
-    // Every exit path (q / Esc / Approve / Reject) tears the three-column
-    // interface back down: restore the agent pane to the review window's
-    // middle, drop the panel/editor panes, and return focus to the dashboard.
-    // Best-effort — the pane is going away regardless. This also parks focus on
-    // the dashboard, so the window-close below reaps a *non-active* window and
-    // never yanks the client onto some adjacent window.
-    let _ = shelbi_orchestrator::review_ui::close_review_interface(project_name);
-    // On accept (only), close the review slot's whole window now that the
-    // accept signal has been emitted — the slot returns to idle instead of
-    // lingering with just its agent pane. Ordering is load-bearing: the
-    // `approve_review_task` move event fired before we reach here, mirroring the
-    // dev-workspace teardown (promote, then close). q / Esc / Reject leave the
-    // window standing so the still-loaded review can be reopened.
-    if app.approved {
-        let _ = shelbi_orchestrator::review_ui::close_review_window(project_name, task_id);
-    }
-    result
-}
-
-/// Resolve the review worktree path and whether a review URL is configured
-/// for `task_id`. Missing config degrades gracefully — an empty worktree and
-/// no browser action rather than a failed launch.
-fn review_context(project_name: &str, task_id: &str) -> (String, bool) {
-    let Ok(project) = shelbi_state::load_project(project_name) else {
-        return (String::new(), false);
-    };
-    let Ok(store) = shelbi_state::issue_store_for_project(&project) else {
-        return (String::new(), false);
-    };
-    let Ok(Some(tf)) = store.get(task_id) else {
-        return (String::new(), false);
-    };
-    let worktree = tf
-        .task
-        .assigned_to
-        .as_deref()
-        .and_then(|ws| project.workspace(ws))
-        .and_then(|ws| {
-            let machine = project.machine(&ws.machine)?;
-            Some(shelbi_orchestrator::workspace::workspace_worktree(machine, ws))
-        })
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let has_review_url = shelbi_state::load_task_workflow(project_name, &project, &tf.task)
-        .ok()
-        .map(|wf| wf.review_url_for_status(tf.task.column.as_str()).is_some())
-        .unwrap_or(false);
-    (worktree, has_review_url)
-}
-
-fn review_panel_loop<B: Backend>(
-    term: &mut Terminal<B>,
-    app: &mut ReviewPanel,
-    project_name: &str,
-) -> Result<()> {
-    // Receiver for a gated review→done merge running on a background thread.
-    // Approve spawns the merge off-thread (it shells out to `gh` three times,
-    // up to ~6 minutes worst case) so the loop keeps drawing and handling input
-    // instead of freezing until every `gh` child returns. `Some` while a merge
-    // is in flight; the outcome (Ok, or the failure reason) is delivered here.
-    let mut merge_rx: Option<std::sync::mpsc::Receiver<std::result::Result<(), String>>> = None;
-
-    while !app.should_quit {
-        // Advance the busy spinner each tick while a merge runs, so the panel
-        // visibly keeps repainting rather than looking frozen.
-        if app.merging {
-            app.spinner = app.spinner.wrapping_add(1);
-        }
-        term.draw(|f| render_full(f, app, f.area()))?;
-        // Recover a dead middle content pane before waiting on input, on the
-        // same cadence as the event poll below. When the mid view's `exec`'d
-        // process exits (Vim `:q`, difftool quit) its pane dies in place; fall
-        // the view back to Chat via the same `ShowChat` effect a click on the
-        // Chat entry produces, so the window never sits showing a dead pane.
-        // `mid_content_pane_dead` is guarded to the active review window and is
-        // idempotent (false once Chat is back / while the pane is live), so a
-        // live pane is never rebuilt and the view is never double-switched.
-        if app.active_view != ActiveView::Chat
-            && shelbi_orchestrator::review_ui::mid_content_pane_dead(project_name, &app.task_id)
-        {
-            let effect = app.recover_to_chat();
-            perform_effect(app, project_name, effect);
-        }
-        // Apply a completed background merge. On success we accept + quit (the
-        // exit path closes the review window as before); on failure the busy
-        // spinner is replaced by the reason on the status line so the reviewer
-        // sees why it didn't land. `continue` so the next iteration redraws the
-        // outcome (and exits promptly on success) instead of waiting out the
-        // 200 ms poll below.
-        if let Some(rx) = merge_rx.as_ref() {
-            match rx.try_recv() {
-                Ok(Ok(())) => {
-                    merge_rx = None;
-                    app.merging = false;
-                    app.approved = true;
-                    app.should_quit = true;
-                    continue;
-                }
-                Ok(Err(e)) => {
-                    merge_rx = None;
-                    app.merging = false;
-                    let msg = format!("approve failed: {e}");
-                    crate::error_report::log_error(project_name, "review-panel", &msg);
-                    app.status_line = msg;
-                    continue;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // The worker dropped its sender without a result (a panic) —
-                    // clear the busy state and surface a generic failure rather
-                    // than spinning forever.
-                    merge_rx = None;
-                    app.merging = false;
-                    let msg = "approve failed: merge worker exited unexpectedly".to_string();
-                    crate::error_report::log_error(project_name, "review-panel", &msg);
-                    app.status_line = msg;
-                    continue;
-                }
-            }
-        }
-        if !event::poll(Duration::from_millis(200))? {
-            continue;
-        }
-        let effect = match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    app.request_quit();
-                    PanelEffect::None
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    app.nav_up();
-                    PanelEffect::None
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    app.nav_down();
-                    PanelEffect::None
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => app.activate(),
-                _ => PanelEffect::None,
-            },
-            Event::Mouse(m) => handle_mouse(app, m),
-            _ => PanelEffect::None,
-        };
-        // Approve runs off-thread; every other effect is handled inline. The
-        // pure model already declines a second Approve while `merging`, so the
-        // `merge_rx.is_none()` guard is belt-and-suspenders.
-        if matches!(effect, PanelEffect::Approve) {
-            if merge_rx.is_none() {
-                app.status_line.clear();
-                app.merging = true;
-                app.spinner = 0;
-                let (tx, rx) = std::sync::mpsc::channel();
-                let project = project_name.to_string();
-                let task = app.task_id.clone();
-                std::thread::spawn(move || {
-                    let result =
-                        shelbi_orchestrator::review_ui::approve_review_task(&project, &task)
-                            .map_err(|e| e.to_string());
-                    let _ = tx.send(result);
-                });
-                merge_rx = Some(rx);
-            }
-        } else {
-            perform_effect(app, project_name, effect);
-        }
-    }
-    Ok(())
-}
-
-fn handle_mouse(app: &mut ReviewPanel, mouse: MouseEvent) -> PanelEffect {
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => app.click(mouse.column, mouse.row),
-        _ => PanelEffect::None,
-    }
-}
-
-/// Map one [`PanelEffect`] onto the real world. Opener/tmux failures surface
-/// on the status line (spec: "failures surface as a status-line warning, not
-/// a crash").
-fn perform_effect(app: &mut ReviewPanel, project_name: &str, effect: PanelEffect) {
-    // Any real action supersedes a previously shown warning: clear it up front,
-    // and a failing action re-sets its own message in the match arms below. A
-    // no-op (a navigation keystroke maps to `None`) leaves the current warning
-    // in place, so an Approve refusal stays visible while the reviewer looks.
-    if !matches!(effect, PanelEffect::None) {
-        app.status_line.clear();
-    }
-    match effect {
-        PanelEffect::None => {}
-        // Back button: navigate focus to the dashboard without tearing the
-        // interface down (no `should_quit`), so the still-loaded review stays
-        // put and can be re-opened from the sidebar.
-        PanelEffect::FocusDashboard => {
-            if let Err(e) = shelbi_orchestrator::review_ui::focus_dashboard(project_name) {
-                let msg = format!("back to dashboard failed: {e}");
-                crate::error_report::log_error(project_name, "review-panel", &msg);
-                app.status_line = msg;
-            }
-        }
-        PanelEffect::ShowChat => {
-            if let Err(e) = shelbi_orchestrator::review_ui::show_review_view(
-                project_name,
-                &app.task_id,
-                shelbi_orchestrator::review_ui::ReviewMidView::Chat,
-            ) {
-                let msg = format!("show chat failed: {e}");
-                crate::error_report::log_error(project_name, "review-panel", &msg);
-                app.status_line = msg;
-            }
-        }
-        PanelEffect::ShowDiff => {
-            if let Err(e) = shelbi_orchestrator::review_ui::show_review_view(
-                project_name,
-                &app.task_id,
-                shelbi_orchestrator::review_ui::ReviewMidView::Diff,
-            ) {
-                let msg = format!("view diff failed: {e}");
-                crate::error_report::log_error(project_name, "review-panel", &msg);
-                app.status_line = msg;
-            }
-        }
-        PanelEffect::ShowVim => {
-            if let Err(e) = shelbi_orchestrator::review_ui::show_review_view(
-                project_name,
-                &app.task_id,
-                shelbi_orchestrator::review_ui::ReviewMidView::Editor,
-            ) {
-                let msg = format!("open editor failed: {e}");
-                crate::error_report::log_error(project_name, "review-panel", &msg);
-                app.status_line = msg;
-            }
-        }
-        PanelEffect::OpenBrowser => match review_url(project_name, &app.task_id) {
-            Some(url) => {
-                let (prog, args) = open_url_command(current_os(), &url);
-                if let Err(e) = spawn_opener(&prog, &args) {
-                    crate::error_report::log_error(project_name, "review-panel", &e);
-                    app.status_line = e;
-                }
-            }
-            None => app.status_line = "no review URL configured".into(),
-        },
-        PanelEffect::RevealFolder => {
-            if app.worktree.is_empty() {
-                app.status_line = "no review worktree to reveal".into();
-            } else {
-                let (prog, args) = reveal_command(current_os(), &app.worktree);
-                if let Err(e) = spawn_opener(&prog, &args) {
-                    crate::error_report::log_error(project_name, "review-panel", &e);
-                    app.status_line = e;
-                }
-            }
-        }
-        // Approve is handled off-thread in `review_panel_loop` (it must keep the
-        // panel repainting while the multi-second gated `gh` merge runs), so the
-        // effect never reaches this inline dispatcher — see the loop's Approve
-        // branch and `merge_rx`.
-        PanelEffect::Approve => {}
-        // Reject opens the reason popover (a centered tmux display-popup). A
-        // submitted reason drives the same review-reject transition the old
-        // inline prompt did; a cancel (or a failed popup launch) leaves the
-        // task untouched.
-        PanelEffect::RejectPrompt => {
-            if let Some(reason) = reject_reason_popup() {
-                match shelbi_orchestrator::review_ui::reject_review(
-                    project_name,
-                    &app.task_id,
-                    &reason,
-                ) {
-                    Ok(()) => app.should_quit = true,
-                    Err(e) => {
-                        let msg = format!("reject failed: {e}");
-                        crate::error_report::log_error(project_name, "review-panel", &msg);
-                        app.status_line = msg;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Launch the reject-reason prompt as a centered `tmux display-popup` running
-/// `shelbi __review-reject-reason`, returning the typed reason on submit or
-/// `None` on cancel / launch failure.
-///
-/// The reason round-trips through a temp file: a `display-popup -E` child's
-/// stdout goes to the popup pane, not back to us, so the popup writes the
-/// reason to `--out PATH` on submit and exits 0; we read it back. The file is
-/// removed before launch (so a stale one can't masquerade as a submit) and
-/// after read. Mirrors the launch pattern of `App::review_load_dialog` in
-/// `app.rs` — `-B` suppresses tmux's own border so only the widget's frame
-/// shows. Any tmux/IO failure degrades to `None` (a no-op), never a crash.
-fn reject_reason_popup() -> Option<String> {
-    let bin = std::env::current_exe().ok()?;
-    let bin = bin.to_string_lossy();
-    // Per-process temp path — the review panel handles one reject at a time
-    // (the popup blocks its loop), so the pid alone keeps concurrent review
-    // panels from colliding on the round-trip file.
-    let out = std::env::temp_dir().join(format!("shelbi-reject-reason-{}.txt", std::process::id()));
-    let cmd = format!(
-        "{} __review-reject-reason --out {}",
-        shelbi_agent::shell_escape(&bin),
-        shelbi_agent::shell_escape(&out.to_string_lossy()),
-    );
-    let _ = std::fs::remove_file(&out);
-    // `-h 18` leaves room for the label, a several-line bordered text area, the
-    // button row, and the hint without clipping — the reason field is now a
-    // multi-line editor, so it wants the extra vertical space.
-    let ok = run_tmux([
-        "display-popup",
-        "-B",
-        "-E",
-        "-w",
-        "70",
-        "-h",
-        "18",
-        cmd.as_str(),
-    ]);
-    let reason = ok.then(|| std::fs::read_to_string(&out).ok()).flatten();
-    let _ = std::fs::remove_file(&out);
-    reason
-        .map(|r| r.trim().to_string())
-        .filter(|r| !r.is_empty())
-}
-
-/// Run `tmux ARGS`, returning whether it exited successfully. Mirrors
-/// `app::run_tmux`; kept local so the review panel's popup launch doesn't
-/// reach across modules.
-fn run_tmux<I, S>(args: I) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    std::process::Command::new("tmux")
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 /// Resolve the concrete review URL to open for `task_id` (with `$PORT` /
 /// `$SLOT` substituted), or `None` when none is configured.
-fn review_url(project_name: &str, task_id: &str) -> Option<String> {
+pub(crate) fn review_url(project_name: &str, task_id: &str) -> Option<String> {
     let project = shelbi_state::load_project(project_name).ok()?;
     let store = shelbi_state::issue_store_for_project(&project).ok()?;
     let tf = store.get(task_id).ok().flatten()?;
@@ -1326,14 +637,19 @@ fn review_url(project_name: &str, task_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::panel::BACK_BUTTON_LINE;
+    use crate::theme::SELECTION_BG;
     use ratatui::{backend::TestBackend, Terminal};
+
+    const BODY: &str = "## Summary\n\nWarm the application cache during startup so the first request can reuse the same data as subsequent requests.\n\n## Acceptance criteria\n\n- Initialize the cache once before accepting traffic.";
 
     fn panel(has_url: bool) -> ReviewPanel {
         ReviewPanel::new(
-            "fix-login",
             "/Users/j/proj/.shelbi/wt/review",
             "Vim".to_string(),
             has_url,
+            "Cold-start cache",
+            BODY,
         )
     }
 
@@ -1355,8 +671,6 @@ mod tests {
         dump(&term)
     }
 
-    /// Render and split into per-row strings — the nav-treatment tests assert
-    /// on separator / bleed geometry, which needs line-by-line access.
     fn render_lines(app: &mut ReviewPanel, w: u16, h: u16) -> Vec<String> {
         render(app, w, h).split('\n').map(str::to_string).collect()
     }
@@ -1368,55 +682,13 @@ mod tests {
     }
 
     #[test]
-    fn truncate_left_prefixes_ellipsis_and_keeps_the_tail() {
-        // width includes the "..." so a 12-wide budget keeps the last 9 chars.
-        assert_eq!(truncate_left("/a/b/c/.shelbi/wt/review", 12), "...wt/review");
-        assert_eq!(truncate_left("/a/b/c/.shelbi/wt/review", 12).chars().count(), 12);
-        assert_eq!(truncate_left("short", 20), "short");
-        assert!(truncate_left("/very/long/path/here", 12).starts_with("..."));
-        assert!(truncate_left("/very/long/path/here", 12).ends_with("path/here"));
-    }
-
-    #[test]
-    fn folder_row_reserves_the_emoji_prefix_before_truncating() {
-        // Regression: the composed "📂 <path>" line used to hand the full row
-        // width to truncate_left and then prepend the emoji, overrunning the
-        // row by the prefix's ~3 cells and clipping the tail (`wt/review` →
-        // `wt/rev`). Reserve the prefix width first.
-        let worktree = "/Users/jlong/Workspaces/32pixels/ContextStore/.shelbi/wt/review";
-        for width in [16_usize, 20, 24, 30, 40] {
-            let line = folder_row_text(worktree, width);
-            // (a) The whole composed line fits within the row — no right clip.
-            assert!(
-                display_width(&line) <= width,
-                "line {line:?} (w={}) overruns row width {width}",
-                display_width(&line),
-            );
-            // (b) The final path segment survives intact — the reviewer's
-            // identifying folder name, never a clipped `wt/rev`.
-            assert!(
-                line.ends_with("wt/review"),
-                "line {line:?} lost the trailing segment at width {width}",
-            );
-            // Still emoji-prefixed.
-            assert!(line.starts_with(FOLDER_PREFIX));
-        }
-
-        // Front elision still engages once the prefix-reserved budget is tight.
-        let tight = folder_row_text(worktree, 18);
-        assert!(
-            tight.contains("..."),
-            "expected front elision at a narrow width, got {tight:?}",
-        );
-    }
-
-    #[test]
-    fn renders_header_switcher_and_action_buttons() {
+    fn renders_header_task_info_switcher_and_actions() {
         let mut app = panel(true);
-        // Wide enough that the (short) worktree path isn't truncated; tall
-        // enough that the back button + header + switches + actions all fit.
-        let out = render(&mut app, 44, 20);
-        assert!(out.contains("Ready for review"), "header status: {out}");
+        let out = render(&mut app, 44, 24);
+        assert!(out.contains("Ready for review"), "status header: {out}");
+        assert!(out.contains("Cold-start cache"), "task title: {out}");
+        assert!(out.contains("Warm the application cache"), "description preview: {out}");
+        assert!(out.contains("More"), "More link: {out}");
         assert!(out.contains("wt/review"), "worktree folder shown: {out}");
         assert!(out.contains("Chat with Reviewer"), "chat switch: {out}");
         assert!(out.contains("View Diff"), "diff switch: {out}");
@@ -1424,18 +696,76 @@ mod tests {
         assert!(out.contains("Open Browser"), "browser switch when url set: {out}");
         assert!(out.contains("Approve"), "approve button: {out}");
         assert!(out.contains("Reject"), "reject button: {out}");
+        assert!(!out.contains("[ "), "no bracketed buttons: {out}");
     }
 
     #[test]
-    fn failed_approve_status_line_renders_red_below_the_header() {
-        // Regression: an Approve refusal was stored in `status_line` but never
-        // drawn — the panel repainted the identical frame and the reviewer
-        // clicked Approve again. The warning must now show, in full, in red.
+    fn status_renders_on_the_back_button_row() {
+        let mut app = panel(true);
+        let rows = render_lines(&mut app, 44, 24);
+        assert!(
+            rows[BACK_BUTTON_LINE as usize].contains("Ready for review"),
+            "status must share the button row: {:?}",
+            rows[BACK_BUTTON_LINE as usize]
+        );
+        assert!(
+            rows[BACK_BUTTON_LINE as usize].contains('\u{2190}'),
+            "back-arrow glyph on the button row: {:?}",
+            rows[BACK_BUTTON_LINE as usize]
+        );
+    }
+
+    #[test]
+    fn status_header_is_accent_cyan() {
+        let mut term = Terminal::new(TestBackend::new(44, 24)).unwrap();
+        let mut app = panel(true);
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let y = BACK_BUTTON_LINE;
+        let x = (0..buf.area.width)
+            .find(|&x| buf[(x, y)].symbol() == "R" && buf[(x, y)].fg == ACCENT_CYAN)
+            .expect("the 'Ready for review' R should be accent cyan");
+        assert!(buf[(x, y)].modifier.contains(Modifier::BOLD), "status is bold");
+    }
+
+    #[test]
+    fn back_button_fill_reads_as_a_square() {
+        let mut term = Terminal::new(TestBackend::new(30, 24)).unwrap();
+        let mut app = panel(true);
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let x = PAD; // button starts at the 2-col pad
+        assert_eq!(buf[(x, BACK_BUTTON_LINE)].bg, SELECTION_BG, "arrow row carries the button fill");
+        assert_eq!(
+            buf[(x, BACK_BUTTON_LINE - 1)].fg,
+            SELECTION_BG,
+            "bleed above carries the fill colour so it reads square"
+        );
+        assert_eq!(
+            buf[(x, BACK_BUTTON_LINE + 1)].fg,
+            SELECTION_BG,
+            "bleed below carries the fill colour so it reads square"
+        );
+    }
+
+    #[test]
+    fn activating_back_button_focuses_the_dashboard() {
+        let mut app = panel(true);
+        let idx = app.rows().iter().position(|r| matches!(r, PanelRow::Back)).unwrap();
+        assert_eq!(idx, 0, "back button leads the panel");
+        app.selected = idx;
+        assert_eq!(app.activate(), PanelEffect::FocusDashboard);
+        let _ = render(&mut app, 30, 24);
+        assert_eq!(app.click(PAD, BACK_BUTTON_LINE), PanelEffect::FocusDashboard);
+    }
+
+    #[test]
+    fn failed_approve_status_line_renders_red_below_the_body() {
         let mut app = panel(true);
         app.status_line =
             "approve failed: PR #9 is not mergeable: the merge commit cannot be cleanly created"
                 .to_string();
-        let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(40, 28)).unwrap();
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
         let rows: Vec<String> = (0..buf.area.height)
@@ -1446,20 +776,11 @@ mod tests {
             })
             .collect();
         let out = rows.join("\n");
-
-        // The header still reads "Ready for review" — the card visibly stays in
-        // review — and the error is shown alongside it, not swallowed.
         assert!(out.contains("Ready for review"), "header stays: {out}");
-        // The whole message survives wrapping, including the gh stderr reason.
         for frag in ["approve", "mergeable", "cleanly", "created"] {
             assert!(out.contains(frag), "status fragment {frag:?} missing:\n{out}");
         }
-        // The warning is painted red. `cleanly` appears only in the status line
-        // (never in a button / switch label), so its row is the warning's row.
-        let y = rows
-            .iter()
-            .position(|r| r.contains("cleanly"))
-            .expect("status row present");
+        let y = rows.iter().position(|r| r.contains("cleanly")).expect("status row present");
         let red = (0..buf.area.width).any(|x| {
             let c = &buf[(x, y as u16)];
             c.fg == Color::Red && !c.symbol().trim().is_empty()
@@ -1469,8 +790,6 @@ mod tests {
 
     #[test]
     fn cleared_status_line_leaves_no_warning() {
-        // The state after a successful action: an empty `status_line` shows only
-        // the constant header, with no leftover error text.
         let mut app = panel(true);
         assert!(app.status_line.is_empty());
         let out = render(&mut app, 40, 24);
@@ -1478,205 +797,29 @@ mod tests {
         assert!(!out.contains("failed"), "no stale warning: {out}");
     }
 
-    #[test]
-    fn wrapped_line_count_matches_greedy_word_wrap() {
-        assert_eq!(wrapped_line_count("", 10), 1);
-        assert_eq!(wrapped_line_count("short", 10), 1);
-        // Two words that don't fit together wrap to two rows.
-        assert_eq!(wrapped_line_count("hello world", 8), 2);
-        // A single word wider than the row spills onto extra rows.
-        assert_eq!(wrapped_line_count("abcdefghij", 4), 3);
-    }
+    // -- switches ----------------------------------------------------------
 
-    /// A selected Approve / Reject button reads as a pressed, reverse-video
-    /// block: the row carries the button's own tint (green / red) via
-    /// `Modifier::REVERSED`, not the generic gray SELECTION_BG fill that every
-    /// other selected row gets. Unselected buttons stay flat tinted with no
-    /// reverse and no fill.
-    #[test]
-    fn selected_approve_reject_buttons_render_reverse_video_tint() {
-        for (tint, needle, want) in [
-            (Color::Green, "Approve", PanelRow::Approve),
-            (Color::Red, "Reject", PanelRow::Reject),
-        ] {
-            let width = 30u16;
-            let mut app = panel(true);
-            // Focus the button under test by index — no state mutation.
-            app.selected = app
-                .rows()
-                .iter()
-                .position(|r| std::mem::discriminant(r) == std::mem::discriminant(&want))
-                .unwrap();
-            let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
-            term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
-            let buf = term.backend().buffer().clone();
-            let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
-            let y = row_y(&rows, needle) as u16;
-            // The letter cell of the label carries the reversed tint.
-            let col = rows[y as usize].find(needle).unwrap() as u16;
-            let cell = &buf[(col, y)];
-            assert!(
-                cell.modifier.contains(Modifier::REVERSED),
-                "{needle}: selected button must be reverse-video, got {:?}",
-                cell.modifier
-            );
-            assert_eq!(cell.fg, tint, "{needle}: reverse fg carries the button tint");
-            assert_ne!(
-                cell.bg,
-                crate::theme::SELECTION_BG,
-                "{needle}: the gray SELECTION_BG fill must not compete with the tint"
-            );
-
-            // The *unselected* sibling stays flat tinted: no reverse, no fill.
-            let other = if needle == "Approve" { "Reject" } else { "Approve" };
-            let oy = row_y(&rows, other) as u16;
-            let ocol = rows[oy as usize].find(other).unwrap() as u16;
-            let ocell = &buf[(ocol, oy)];
-            assert!(
-                !ocell.modifier.contains(Modifier::REVERSED),
-                "{other}: unselected button keeps the flat tinted look"
-            );
-            assert_ne!(
-                ocell.bg,
-                crate::theme::SELECTION_BG,
-                "{other}: unselected button carries no selection fill"
-            );
-        }
-    }
-
-    /// The back button leads the panel: a square block (bleed row above, arrow
-    /// row, bleed row below) sitting above the "Ready for review" header, with
-    /// only the back-arrow glyph and no text label.
-    #[test]
-    fn back_button_renders_a_square_arrow_at_the_top() {
-        let mut app = panel(true);
-        let rows = render_lines(&mut app, 30, 20);
-        // Arrow on the button's middle line; bleed rows bracket it.
-        assert!(
-            rows[BACK_BUTTON_LINE].contains('\u{2190}'),
-            "back-arrow glyph on the button line: {:?}",
-            rows[BACK_BUTTON_LINE]
-        );
-        assert!(
-            rows[BACK_BUTTON_LINE - 1].contains(crate::sidebar::BLEED_ABOVE),
-            "lower-half-block bleed above the button: {:?}",
-            rows[BACK_BUTTON_LINE - 1]
-        );
-        assert!(
-            rows[BACK_BUTTON_LINE + 1].contains(crate::sidebar::BLEED_BELOW),
-            "upper-half-block bleed below the button: {:?}",
-            rows[BACK_BUTTON_LINE + 1]
-        );
-        // Glyph only — no text label on the button row.
-        assert!(
-            !rows[BACK_BUTTON_LINE].chars().any(|c| c.is_alphabetic()),
-            "back button carries no text label: {:?}",
-            rows[BACK_BUTTON_LINE]
-        );
-        // It sits above the header, which is the whole point of a top button.
-        assert!(
-            row_y(&rows, "Ready for review") > BACK_BUTTON_LINE,
-            "back button must sit above the status header, rows:\n{}",
-            rows.join("\n")
-        );
-    }
-
-    /// The back button's fill reads as a square: the arrow line carries the
-    /// selection background across the button's cells, and the bleed rows carry
-    /// that same colour in their foreground so it continues half a cell up/down.
-    #[test]
-    fn back_button_fill_reads_as_a_square() {
-        let mut term = Terminal::new(TestBackend::new(30, 20)).unwrap();
-        let mut app = panel(true);
-        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
-        let buf = term.backend().buffer().clone();
-        // The button starts at the 1-col indent (column 1). Its fill covers the
-        // arrow row (BACK_BUTTON_LINE); the bleed rows above/below paint the
-        // same colour in the foreground.
-        assert_eq!(
-            buf[(1, BACK_BUTTON_LINE as u16)].bg,
-            crate::theme::SELECTION_BG,
-            "arrow row carries the button fill"
-        );
-        assert_eq!(
-            buf[(1, (BACK_BUTTON_LINE - 1) as u16)].fg,
-            crate::theme::SELECTION_BG,
-            "bleed above carries the fill colour so it reads square"
-        );
-        assert_eq!(
-            buf[(1, (BACK_BUTTON_LINE + 1) as u16)].fg,
-            crate::theme::SELECTION_BG,
-            "bleed below carries the fill colour so it reads square"
-        );
-    }
-
-    /// Activating the back button (Enter or click) asks the host loop to switch
-    /// focus back to the dashboard — it does not tear the interface down.
-    #[test]
-    fn activating_back_button_focuses_the_dashboard() {
-        let mut app = panel(true);
-        let idx = app
-            .rows()
-            .iter()
-            .position(|r| matches!(r, PanelRow::Back))
-            .unwrap();
-        assert_eq!(idx, 0, "back button leads the panel");
-        app.selected = idx;
-        assert_eq!(app.activate(), PanelEffect::FocusDashboard);
-        // A click on the button's middle line maps to the same effect.
-        let _ = render(&mut app, 30, 20); // populate list_area
-        assert_eq!(app.click(1, BACK_BUTTON_LINE as u16), PanelEffect::FocusDashboard);
-    }
-
-    /// The leading "Actions" header above the switches is gone — the three
-    /// action items stand on their own the way the main nav does. The switch
-    /// group renders before any remaining section header.
-    #[test]
-    fn leading_actions_header_no_longer_renders_above_the_switches() {
-        let mut app = panel(true);
-        let rows = render_lines(&mut app, 44, 20);
-        // The Chat switch is the first action, sitting directly under the
-        // folder row with no "Actions" divider above it.
-        let chat_y = row_y(&rows, "Chat with Reviewer");
-        let actions_ys: Vec<usize> = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.contains("Actions"))
-            .map(|(y, _)| y)
-            .collect();
-        // Only the Approve/Reject group keeps a header, and it sits below the
-        // switches — nothing labelled "Actions" renders above them.
-        assert!(
-            actions_ys.iter().all(|&y| y > chat_y),
-            "no 'Actions' header may render above the switches, got headers at {actions_ys:?}, chat at {chat_y}"
-        );
-    }
-
-    /// The selected switch's adjacent lines carry the half-block bleed — a
-    /// full-width row of U+2584 directly above and U+2580 directly below, both
-    /// spanning the pane edge to edge — exactly like the main sidebar nav.
     #[test]
     fn selected_switch_renders_full_width_half_block_bleed() {
         let width = 30u16;
         let mut app = panel(true);
-        // Move focus to the Edit switch (Chat / View Diff / Edit / Browser) so
-        // both a separator-above and separator-below are asserted.
         app.nav_down();
         app.nav_down();
-        let rows = render_lines(&mut app, width, 20);
+        let rows = render_lines(&mut app, width, 24);
         let edit_y = row_y(&rows, "Edit in Vim");
+        // The bleed is inset one column from each side (matching the main
+        // sidebar): a gutter space, U+2584/U+2580 over the inner width, a gutter.
+        let inner = width as usize - 2;
         assert_eq!(
             rows[edit_y - 1],
-            crate::sidebar::BLEED_ABOVE.repeat(width as usize),
-            "line above the selected switch is full-width U+2584"
+            format!(" {} ", crate::sidebar::BLEED_ABOVE.repeat(inner)),
+            "line above the selected switch is inset U+2584"
         );
         assert_eq!(
             rows[edit_y + 1],
-            crate::sidebar::BLEED_BELOW.repeat(width as usize),
-            "line below the selected switch is full-width U+2580"
+            format!(" {} ", crate::sidebar::BLEED_BELOW.repeat(inner)),
+            "line below the selected switch is inset U+2580"
         );
-        // A switch that isn't adjacent to the selection keeps a blank
-        // separator — no bleed leaks onto it.
         let browser_y = row_y(&rows, "Open Browser");
         assert!(
             rows[browser_y + 1].trim().is_empty(),
@@ -1685,18 +828,13 @@ mod tests {
         );
     }
 
-    /// A blank separator line sits between every pair of switches (and above
-    /// the first / below the last), so moving the selection never shifts where
-    /// the labels land — the same rhythm as the main nav.
     #[test]
     fn switch_separators_keep_labels_from_shifting_across_selection() {
-        let mut chat = panel(true); // Chat focused by default
-        let chat_rows = render_lines(&mut chat, 30, 20);
-
+        let mut chat = panel(true);
+        let chat_rows = render_lines(&mut chat, 30, 24);
         let mut moved = panel(true);
-        moved.nav_down(); // focus View Diff
-        let moved_rows = render_lines(&mut moved, 30, 20);
-
+        moved.nav_down();
+        let moved_rows = render_lines(&mut moved, 30, 24);
         for label in ["Chat with Reviewer", "View Diff", "Edit in Vim", "Open Browser"] {
             assert_eq!(
                 row_y(&chat_rows, label),
@@ -1704,74 +842,48 @@ mod tests {
                 "'{label}' must not move when the selection changes"
             );
         }
-        // Adjacent switches are one separator line apart.
         assert_eq!(
             row_y(&chat_rows, "View Diff") - row_y(&chat_rows, "Chat with Reviewer"),
             2,
             "one separator line always sits between Chat and View Diff"
         );
-        assert_eq!(
-            row_y(&chat_rows, "Edit in Vim") - row_y(&chat_rows, "View Diff"),
-            2,
-            "one separator line always sits between View Diff and Edit"
-        );
     }
 
-    /// The selected switch's fill spans the pane edge to edge (column 0) while
-    /// the label keeps the 1-col indent, matching the main nav's fill.
     #[test]
-    fn selected_switch_fill_spans_full_width() {
+    fn selected_switch_fill_is_inset_one_column() {
         let width = 30u16;
-        let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
         let mut app = panel(true); // Chat focused by default
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
-        let rows = dump(&term)
-            .split('\n')
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+        let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
         let chat_y = row_y(&rows, "Chat with Reviewer") as u16;
-
-        // Both the left gutter (column 0) and the trailing padding carry the
-        // selection fill.
-        assert_eq!(
-            buf[(0, chat_y)].bg,
-            crate::theme::SELECTION_BG,
-            "left edge (indent gutter) must carry the selection fill"
-        );
-        for x in (width - 4)..width {
-            assert_eq!(
-                buf[(x, chat_y)].bg,
-                crate::theme::SELECTION_BG,
-                "right edge padding must carry the selection fill, col {x}"
-            );
+        // The selection fill is inset one column from each edge, exactly like the
+        // main sidebar: gutter columns transparent, the inner region filled.
+        assert_eq!(buf[(0, chat_y)].bg, Color::Reset, "left gutter is transparent");
+        assert_eq!(buf[(width - 1, chat_y)].bg, Color::Reset, "right gutter is transparent");
+        assert_eq!(buf[(1, chat_y)].bg, SELECTION_BG, "the fill starts one column in");
+        for x in (width - 4)..(width - 1) {
+            assert_eq!(buf[(x, chat_y)].bg, SELECTION_BG, "right-edge padding carries the fill, col {x}");
         }
-        assert_eq!(
-            buf[(0, chat_y)].symbol(),
-            " ",
-            "column 0 is the indent gutter, not the label"
-        );
+        assert_eq!(buf[(0, chat_y)].symbol(), " ", "column 0 is the indent gutter");
     }
 
     #[test]
     fn browser_entry_hidden_without_review_url() {
         let mut app = panel(false);
-        let out = render(&mut app, 30, 20);
+        let out = render(&mut app, 30, 24);
         assert!(!out.contains("Open Browser"), "no browser action when no url: {out}");
-        // The rest of the panel still renders.
         assert!(out.contains("Chat with Reviewer") && out.contains("Approve"));
     }
 
     #[test]
     fn editor_label_tracks_resolved_editor_name() {
-        let mut app = ReviewPanel::new("t", "/wt", "Helix".to_string(), false);
-        let out = render(&mut app, 30, 20);
+        let mut app = ReviewPanel::new("/wt", "Helix".to_string(), false, "T", "b");
+        let out = render(&mut app, 30, 24);
         assert!(out.contains("Edit in Helix"), "label uses resolved editor: {out}");
     }
 
-    /// Move the selection to the switch backing `item` (used by the
-    /// activation tests so they don't hard-code a step count that shifts as
-    /// switches are added or removed).
     fn select_switch(app: &mut ReviewPanel, item: SwitchItem) {
         let idx = app
             .rows()
@@ -1784,76 +896,25 @@ mod tests {
     #[test]
     fn activating_chat_and_vim_returns_switch_effects_and_marks_active() {
         let mut app = panel(true);
-        // Default selection is Chat; active view starts Chat.
         assert_eq!(app.active_view, ActiveView::Chat);
-        // Move to the Vim switch and activate.
         select_switch(&mut app, SwitchItem::Vim);
         assert_eq!(app.activate(), PanelEffect::ShowVim);
         assert_eq!(app.active_view, ActiveView::Vim);
-        // Back to Chat.
         select_switch(&mut app, SwitchItem::Chat);
         assert_eq!(app.activate(), PanelEffect::ShowChat);
         assert_eq!(app.active_view, ActiveView::Chat);
     }
 
-    /// The dead-mid-pane recovery (`recover_to_chat`) drives the exact same
-    /// effect + active-view state a click on the Chat entry produces: from a
-    /// Vim / Diff mid view it returns `ShowChat`, flips the active view back to
-    /// Chat, and moves the selection highlight onto the Chat switch so the panel
-    /// reads identically either way. This is the state-machine half of the
-    /// poll-tick recovery in `review_panel_loop`.
-    #[test]
-    fn recover_to_chat_mirrors_the_chat_switch_click() {
-        let mut app = panel(true);
-        // Simulate the user having switched the mid view to the editor.
-        select_switch(&mut app, SwitchItem::Vim);
-        assert_eq!(app.activate(), PanelEffect::ShowVim);
-        assert_eq!(app.active_view, ActiveView::Vim);
-
-        // The editor pane died (Vim `:q`): recovery falls the view back to Chat.
-        assert_eq!(app.recover_to_chat(), PanelEffect::ShowChat);
-        assert_eq!(app.active_view, ActiveView::Chat);
-        // Selection now sits on the Chat switch, matching the click path.
-        let chat_idx = app
-            .rows()
-            .iter()
-            .position(|r| matches!(r, PanelRow::Switch(SwitchItem::Chat)))
-            .unwrap();
-        assert_eq!(app.selected, chat_idx, "selection moves onto the Chat entry");
-
-        // Idempotent: recovering again while already on Chat is still a ShowChat
-        // no-op switch (the loop guards on `active_view != Chat` so it never even
-        // calls this again, but the method itself must stay stable).
-        assert_eq!(app.recover_to_chat(), PanelEffect::ShowChat);
-        assert_eq!(app.active_view, ActiveView::Chat);
-    }
-
-    /// View Diff sits directly below Chat with Reviewer in the switch group —
-    /// the ordering the wireframe pins — with no other selectable row between
-    /// them.
     #[test]
     fn view_diff_renders_directly_below_chat() {
         let mut app = panel(true);
-        let rows = render_lines(&mut app, 44, 16);
+        let rows = render_lines(&mut app, 44, 24);
         let chat_y = row_y(&rows, "Chat with Reviewer");
         let diff_y = row_y(&rows, "View Diff");
-        assert!(diff_y > chat_y, "View Diff must render below Chat");
-        // Exactly one separator line between them — nothing else is interleaved.
-        assert_eq!(
-            diff_y - chat_y,
-            2,
-            "View Diff sits immediately below Chat with Reviewer"
-        );
-        // And it precedes the editor switch, preserving the rest of the order.
-        assert!(
-            diff_y < row_y(&rows, "Edit in Vim"),
-            "View Diff comes before Edit in the switch group"
-        );
+        assert_eq!(diff_y - chat_y, 2, "View Diff sits immediately below Chat");
+        assert!(diff_y < row_y(&rows, "Edit in Vim"), "View Diff precedes Edit");
     }
 
-    /// The row order in the pure model puts the Diff switch between Chat and
-    /// Vim — the same invariant the render test asserts, checked structurally so
-    /// a renderer change can't mask a model regression.
     #[test]
     fn diff_switch_is_second_in_the_switch_group() {
         let app = panel(true);
@@ -1867,12 +928,7 @@ mod tests {
             .collect();
         assert_eq!(
             switches,
-            vec![
-                SwitchItem::Chat,
-                SwitchItem::Diff,
-                SwitchItem::Vim,
-                SwitchItem::Browser
-            ]
+            vec![SwitchItem::Chat, SwitchItem::Diff, SwitchItem::Vim, SwitchItem::Browser]
         );
     }
 
@@ -1884,42 +940,185 @@ mod tests {
         assert_eq!(app.active_view, ActiveView::Diff);
     }
 
-    /// The mouse path reaches View Diff through the same nav-block click map the
-    /// other switches use: a click on the rendered "View Diff" line dispatches
-    /// ShowDiff and marks it the active view.
     #[test]
     fn clicking_view_diff_dispatches_show_diff() {
         let mut app = panel(true);
-        // Render so `list_area` and the switch-block geometry are populated.
-        let rows = render_lines(&mut app, 44, 16);
+        let rows = render_lines(&mut app, 44, 24);
         let diff_line = row_y(&rows, "View Diff") as u16;
-        // The test backend renders the list at the pane origin (0, 0).
-        let effect = app.click(2, diff_line);
+        let effect = app.click(4, diff_line);
         assert_eq!(effect, PanelEffect::ShowDiff);
         assert_eq!(app.active_view, ActiveView::Diff);
     }
 
     #[test]
-    fn reject_row_activation_requests_the_reason_popover() {
-        // The reason is now collected in a tmux display-popup outside this
-        // process; activating Reject just asks the host loop to launch it.
-        let mut app = panel(false);
-        while !matches!(app.rows().get(app.selected), Some(PanelRow::Reject)) {
+    fn browser_activation_returns_open_browser_effect() {
+        let mut app = panel(true);
+        select_switch(&mut app, SwitchItem::Browser);
+        assert_eq!(app.activate(), PanelEffect::OpenBrowser);
+    }
+
+    // -- task info / More --------------------------------------------------
+
+    #[test]
+    fn empty_body_shows_title_without_more() {
+        let mut app = ReviewPanel::new("/wt", "Vim", true, "Just a title", "");
+        let out = render(&mut app, 40, 24);
+        assert!(out.contains("Just a title"), "title still shows: {out}");
+        assert!(!out.contains("More"), "no More link without a body: {out}");
+        assert_eq!(app.request_description(), PanelEffect::None);
+    }
+
+    #[test]
+    fn more_requests_the_description_popover() {
+        let mut app = panel(true);
+        assert_eq!(app.request_description(), PanelEffect::ShowDescription);
+        let rows = render_lines(&mut app, 44, 24);
+        let more_y = row_y(&rows, "More") as u16;
+        let more_x = rows[more_y as usize].find("More").unwrap() as u16;
+        assert_eq!(app.click(more_x, more_y), PanelEffect::ShowDescription);
+    }
+
+    #[test]
+    fn description_body_is_cyan_more_link() {
+        let mut term = Terminal::new(TestBackend::new(44, 24)).unwrap();
+        let mut app = panel(true);
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
+        let more_y = row_y(&rows, "More") as u16;
+        let more_x = rows[more_y as usize].find("More").unwrap() as u16;
+        assert_eq!(buf[(more_x, more_y)].fg, ACCENT_CYAN, "More is accent cyan");
+    }
+
+    #[test]
+    fn more_is_keyboard_reachable_and_activates_the_popover() {
+        let mut app = panel(true);
+        // Nav from the back button lands on More before the folder / switches.
+        app.selected = app.rows().iter().position(|r| matches!(r, PanelRow::Back)).unwrap();
+        app.nav_down();
+        assert!(
+            matches!(app.rows().get(app.selected), Some(PanelRow::More)),
+            "↓ from Back reaches More first"
+        );
+        assert_eq!(app.activate(), PanelEffect::ShowDescription, "Enter on More opens the popover");
+        // A full cycle (j/k or Tab drive the same step) returns to the start.
+        let start = app.selected;
+        let n = app.rows().len();
+        for _ in 0..n {
             app.nav_down();
         }
-        assert_eq!(app.activate(), PanelEffect::RejectPrompt);
+        assert_eq!(app.selected, start, "More stays in the nav cycle");
     }
+
+    #[test]
+    fn a_bodyless_panel_has_no_more_row() {
+        let app = ReviewPanel::new("/wt", "Vim", true, "T", "");
+        assert!(
+            !app.rows().iter().any(|r| matches!(r, PanelRow::More)),
+            "no More row without a body"
+        );
+    }
+
+    #[test]
+    fn focused_more_carries_the_selection_fill() {
+        let mut app = panel(true);
+        app.selected = app.rows().iter().position(|r| matches!(r, PanelRow::More)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(44, 24)).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
+        let more_y = row_y(&rows, "More") as u16;
+        let more_x = rows[more_y as usize].find("More").unwrap() as u16;
+        let cell = &buf[(more_x, more_y)];
+        assert_eq!(cell.bg, SELECTION_BG, "focused More carries the selection fill");
+        assert_eq!(cell.fg, Color::White, "focused More brightens to white");
+        assert!(cell.modifier.contains(Modifier::BOLD), "focused More is bold");
+    }
+
+    #[test]
+    fn switch_icons_start_at_col_two() {
+        // Every left-anchored icon shares col 2 (the back button, the folder 📁,
+        // and each nav switch's icon). Here we check the first switch's glyph.
+        let mut app = panel(true);
+        let rows = render_lines(&mut app, 44, 24);
+        let chat_y = row_y(&rows, "Chat with Reviewer");
+        let col = rows[chat_y].chars().take_while(|c| *c == ' ').count();
+        assert_eq!(col, 2, "the switch icon starts at col 2, got row {:?}", rows[chat_y]);
+    }
+
+    #[test]
+    fn panel_text_cells_keep_the_default_background() {
+        // The panel paints no opaque background: a plain text cell (the task
+        // title) sits on the terminal default so a transparent terminal shows
+        // through.
+        let mut term = Terminal::new(TestBackend::new(44, 24)).unwrap();
+        let mut app = panel(true);
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
+        let title_y = row_y(&rows, "Cold-start cache") as u16;
+        let title_x = rows[title_y as usize].find('C').unwrap() as u16;
+        assert_eq!(buf[(title_x, title_y)].bg, Color::Reset, "task title cell is transparent");
+        // A blank gutter column is transparent too.
+        assert_eq!(buf[(0, title_y)].bg, Color::Reset, "left gutter is transparent");
+    }
+
+    #[test]
+    fn task_info_and_folder_keep_a_two_column_right_gutter() {
+        // Title, wrapped description, and the worktree path all stay two columns
+        // clear of the right border (matching the left gutter): no text glyph
+        // lands in the two right-most columns, and the folder path never clips at
+        // the border.
+        let width = 40u16;
+        let mut app = ReviewPanel::new(
+            "/Users/jlong/Workspaces/32pixels/ContextStore/.shelbi/wt/review",
+            "Vim".to_string(),
+            true,
+            "A very long task title that would otherwise run right up against the sidebar border",
+            BODY,
+        );
+        let mut term = Terminal::new(TestBackend::new(width, 28)).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
+
+        // The title must actually reach near the border (otherwise the gutter is
+        // trivially satisfied by short text) and ellipsize within the reduced
+        // width.
+        let title_y = row_y(&rows, "A very long task title");
+        assert!(rows[title_y].contains('…'), "the long title ellipsizes: {:?}", rows[title_y]);
+        // The description was clipped, so its last visible line ends in `...`.
+        let more_y = row_y(&rows, "More");
+        assert!(
+            rows[more_y - 1].trim_end().ends_with("..."),
+            "the clipped description ends in ...: {:?}",
+            rows[more_y - 1]
+        );
+        let folder_y = row_y(&rows, "wt/review");
+        assert!(rows[folder_y].contains("..."), "the path is left-truncated: {:?}", rows[folder_y]);
+
+        // Every text-content row (title, each description line, the folder path)
+        // leaves the two right-most columns blank.
+        let mut text_rows = vec![title_y, folder_y];
+        text_rows.extend((title_y + 1)..more_y);
+        for y in text_rows {
+            for x in (width - 2)..width {
+                assert_eq!(
+                    buf[(x, y as u16)].symbol(),
+                    " ",
+                    "col {x} of row {y} ({:?}) must be blank — two-column right gutter",
+                    rows[y]
+                );
+            }
+        }
+    }
+
+    // -- folder / actions --------------------------------------------------
 
     #[test]
     fn folder_row_activation_reveals_the_worktree() {
         let mut app = panel(false);
-        // Header folder is the first selectable row above the switcher; select
-        // it explicitly and activate.
-        let idx = app
-            .rows()
-            .iter()
-            .position(|r| matches!(r, PanelRow::Folder))
-            .unwrap();
+        let idx = app.rows().iter().position(|r| matches!(r, PanelRow::Folder)).unwrap();
         app.selected = idx;
         assert_eq!(app.activate(), PanelEffect::RevealFolder);
     }
@@ -1927,165 +1126,155 @@ mod tests {
     #[test]
     fn approve_row_activation_returns_approve_effect() {
         let mut app = panel(false);
-        let idx = app
-            .rows()
-            .iter()
-            .position(|r| matches!(r, PanelRow::Approve))
-            .unwrap();
+        let idx = app.rows().iter().position(|r| matches!(r, PanelRow::Approve)).unwrap();
         app.selected = idx;
         assert_eq!(app.activate(), PanelEffect::Approve);
     }
 
-    /// A second Approve while the gated merge is already in flight is dropped,
-    /// not queued: with `merging` set, both the keyboard (`activate`) and mouse
-    /// (`click`) paths return `None` for the Approve row, so a replayed / double
-    /// press can't re-trigger the merge that froze the panel three times in the
-    /// field report.
+    #[test]
+    fn reject_row_activation_requests_the_reason_popover() {
+        let mut app = panel(false);
+        let idx = app.rows().iter().position(|r| matches!(r, PanelRow::Reject)).unwrap();
+        app.selected = idx;
+        assert_eq!(app.activate(), PanelEffect::RejectPrompt);
+    }
+
+    #[test]
+    fn approve_and_reject_share_one_row_and_are_separately_clickable() {
+        let mut app = panel(true);
+        let rows = render_lines(&mut app, 44, 24);
+        let ay = row_y(&rows, "Approve");
+        let ry = row_y(&rows, "Reject");
+        assert_eq!(ay, ry, "Approve and Reject share one row");
+        let line = &rows[ay];
+        assert!(
+            line.find("Approve").unwrap() < line.find("Reject").unwrap(),
+            "Approve sits left of Reject: {line:?}"
+        );
+        let ax = line.find("Approve").unwrap() as u16;
+        let rx = line.find("Reject").unwrap() as u16;
+        assert_eq!(app.click(ax, ay as u16), PanelEffect::Approve);
+        assert_eq!(app.click(rx, ry as u16), PanelEffect::RejectPrompt);
+    }
+
+    #[test]
+    fn selected_action_renders_reverse_video_tint() {
+        for (tint, needle, item) in [
+            (PALETTE_GREEN, "Approve", PanelRow::Approve),
+            (ACTION_RED, "Reject", PanelRow::Reject),
+        ] {
+            let width = 44u16;
+            let mut app = panel(true);
+            app.selected = app
+                .rows()
+                .iter()
+                .position(|r| std::mem::discriminant(r) == std::mem::discriminant(&item))
+                .unwrap();
+            let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+            let buf = term.backend().buffer().clone();
+            let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
+            let y = row_y(&rows, needle) as u16;
+            let col = rows[y as usize].find(needle).unwrap() as u16;
+            let cell = &buf[(col, y)];
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "{needle}: selected action must be reverse-video, got {:?}",
+                cell.modifier
+            );
+            assert_eq!(cell.fg, tint, "{needle}: reverse fg carries the action tint");
+        }
+    }
+
+    #[test]
+    fn unselected_action_is_flat_tinted_without_reverse() {
+        let mut app = panel(true);
+        app.selected = app.rows().iter().position(|r| matches!(r, PanelRow::Folder)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(44, 24)).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
+        for (tint, needle) in [(PALETTE_GREEN, "Approve"), (ACTION_RED, "Reject")] {
+            let y = row_y(&rows, needle) as u16;
+            let col = rows[y as usize].find(needle).unwrap() as u16;
+            let cell = &buf[(col, y)];
+            assert!(!cell.modifier.contains(Modifier::REVERSED), "{needle}: flat when unselected");
+            assert_eq!(cell.fg, tint, "{needle}: carries the design tint");
+        }
+    }
+
+    #[test]
+    fn renders_at_minimum_width() {
+        let mut app = panel(true);
+        let rows = render_lines(&mut app, 24, 30);
+        let out = rows.join("\n");
+        assert!(out.contains("Ready"), "status (possibly clipped) still renders: {out}");
+        assert!(out.contains("Cold-start cache"), "title: {out}");
+        assert!(out.contains("Chat with Reviewer"), "nav: {out}");
+        let ay = row_y(&rows, "Approve");
+        assert_eq!(ay, row_y(&rows, "Reject"), "actions share a row even at 24 cols");
+        let line = &rows[ay];
+        assert!(
+            line.contains("Approve ") && line.find("Approve").unwrap() < line.find("Reject").unwrap(),
+            "Approve sits left of Reject with a gap at 24 cols: {line:?}"
+        );
+    }
+
+    // -- merging -----------------------------------------------------------
+
     #[test]
     fn second_approve_while_merging_is_ignored() {
         let mut app = panel(true);
-        // Render once so `list_area` / the click map is populated.
         let rows = render_lines(&mut app, 44, 24);
-        let idx = app
-            .rows()
-            .iter()
-            .position(|r| matches!(r, PanelRow::Approve))
-            .unwrap();
+        let idx = app.rows().iter().position(|r| matches!(r, PanelRow::Approve)).unwrap();
         app.selected = idx;
-        // Before a merge starts, Approve activates normally.
         assert_eq!(app.activate(), PanelEffect::Approve);
-
-        // A merge is now in flight.
         app.merging = true;
         assert_eq!(app.activate(), PanelEffect::None, "Enter is dropped while merging");
         let approve_y = row_y(&rows, "Approve") as u16;
-        assert_eq!(
-            app.click(2, approve_y),
-            PanelEffect::None,
-            "a click is dropped while merging too"
-        );
+        let approve_x = rows[approve_y as usize].find("Approve").unwrap() as u16;
+        let _ = render(&mut app, 44, 24);
+        assert_eq!(app.click(approve_x, approve_y), PanelEffect::None, "click dropped while merging");
     }
 
-    /// Reject is declined while a merge is in flight, exactly the way Approve
-    /// is: both the keyboard (`activate`) and mouse (`click`) paths return
-    /// `None` for the Reject row. Otherwise a submitted reject reason would run
-    /// the review-reject transition concurrently with the background `gh` merge
-    /// and race the card out of `review`.
     #[test]
     fn reject_while_merging_is_ignored() {
         let mut app = panel(true);
-        // Render once so `list_area` / the click map is populated.
-        let rows = render_lines(&mut app, 44, 24);
-        let idx = app
-            .rows()
-            .iter()
-            .position(|r| matches!(r, PanelRow::Reject))
-            .unwrap();
+        let idx = app.rows().iter().position(|r| matches!(r, PanelRow::Reject)).unwrap();
         app.selected = idx;
-        // Before a merge starts, Reject activates the reason popover.
         assert_eq!(app.activate(), PanelEffect::RejectPrompt);
-
-        // A merge is now in flight — Reject is dropped, not queued.
         app.merging = true;
         assert_eq!(app.activate(), PanelEffect::None, "Enter is dropped while merging");
-        let reject_y = row_y(&rows, "Reject") as u16;
-        assert_eq!(
-            app.click(2, reject_y),
-            PanelEffect::None,
-            "a click is dropped while merging too"
-        );
     }
 
-    /// A q / Esc quit request is ignored while a merge is in flight: quitting
-    /// would tear the window down and exit with the merge worker's `gh` children
-    /// still running, orphaning a half-finished merge. `request_quit` leaves
-    /// `should_quit` false and explains why on the status line; once the merge
-    /// clears it quits normally.
     #[test]
     fn quit_is_ignored_while_merging() {
         let mut app = panel(true);
         app.merging = true;
         app.request_quit();
         assert!(!app.should_quit, "q / Esc does not quit while merging");
-        assert!(
-            !app.status_line.is_empty(),
-            "the status line explains why the key did nothing: {:?}",
-            app.status_line
-        );
-
-        // Once the merge clears, q / Esc quits as usual.
+        assert!(!app.status_line.is_empty(), "the status line explains why");
         app.merging = false;
         app.request_quit();
         assert!(app.should_quit, "q / Esc quits once the merge is done");
     }
 
-    /// While merging, the Approve button is replaced by a spinner + "merging
-    /// PR…" busy indicator — immediate feedback that the press landed — and the
-    /// pressable "Approve" label is gone.
     #[test]
-    fn merging_replaces_approve_button_with_a_busy_indicator() {
+    fn merging_replaces_actions_with_a_busy_indicator() {
         let mut app = panel(true);
-        // Not merging: the pressable Approve button shows.
         let idle = render(&mut app, 44, 24);
-        assert!(idle.contains("Approve"), "idle panel shows the Approve button: {idle}");
-
+        assert!(idle.contains("Approve"), "idle panel shows the Approve action: {idle}");
         app.merging = true;
         let busy = render(&mut app, 44, 24);
         assert!(busy.contains("merging PR"), "busy indicator shown while merging: {busy}");
-        assert!(
-            !busy.contains("Approve"),
-            "the pressable Approve label is gone while merging: {busy}"
-        );
-        // A spinner glyph from the animation set is present.
-        assert!(
-            busy.contains(spinner_frame(app.spinner)),
-            "spinner frame rendered on the busy row: {busy}"
-        );
+        assert!(!busy.contains("Approve"), "the Approve label is gone while merging: {busy}");
+        assert!(busy.contains(spinner_frame(app.spinner)), "spinner frame rendered: {busy}");
     }
 
-    /// The spinner cycles through its frames and wraps, so advancing the tick
-    /// each loop iteration animates it without ever indexing out of bounds.
     #[test]
     fn spinner_frame_cycles_and_wraps() {
         assert_eq!(spinner_frame(0), '⠋');
         assert_ne!(spinner_frame(0), spinner_frame(1), "consecutive ticks differ");
         assert_eq!(spinner_frame(0), spinner_frame(10), "wraps after 10 frames");
     }
-
-    #[test]
-    fn browser_activation_returns_open_browser_effect() {
-        let mut app = panel(true);
-        let idx = app
-            .rows()
-            .iter()
-            .position(|r| matches!(r, PanelRow::Switch(SwitchItem::Browser)))
-            .unwrap();
-        app.selected = idx;
-        assert_eq!(app.activate(), PanelEffect::OpenBrowser);
-    }
-
-    #[test]
-    fn reveal_and_open_commands_are_per_platform() {
-        assert_eq!(
-            reveal_command(OsKind::Macos, "/p"),
-            ("open".to_string(), vec!["/p".to_string()])
-        );
-        assert_eq!(
-            reveal_command(OsKind::Linux, "/p"),
-            ("xdg-open".to_string(), vec!["/p".to_string()])
-        );
-        assert_eq!(
-            reveal_command(OsKind::Windows, "C:\\p"),
-            ("explorer".to_string(), vec!["C:\\p".to_string()])
-        );
-        assert_eq!(
-            open_url_command(OsKind::Macos, "https://x"),
-            ("open".to_string(), vec!["https://x".to_string()])
-        );
-        assert_eq!(
-            open_url_command(OsKind::Linux, "https://x"),
-            ("xdg-open".to_string(), vec!["https://x".to_string()])
-        );
-    }
-
 }

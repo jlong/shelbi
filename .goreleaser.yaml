@@ -41,7 +41,7 @@ nfpms:
     vendor: Shelbi
     homepage: https://github.com/jlong/shelbi
     maintainer: John W. Long <john@johnwlong.com>
-    description: Open-source agent orchestrator built on tmux.
+    description: Open-source agent orchestrator for parallel coding agents.
     license: MIT
     section: devel
     priority: optional
@@ -49,7 +49,6 @@ nfpms:
       - deb
     bindir: /usr/bin
     dependencies:
-      - tmux (>= 3.2)
       - git
       - openssh-client
     contents:

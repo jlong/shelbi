@@ -15,29 +15,25 @@ pub struct Args {
 pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
     let project_name = require_project(project_opt)?;
     let addr = shelbi_orchestrator::dashboard_addr(&project_name);
+    // Opening a project starts the on-demand hub daemon if needed. Best-effort:
+    // a daemon that won't start shouldn't block the orchestrator bootstrap.
+    if let Err(e) = shelbi_state::ensure_daemon_running() {
+        eprintln!("shelbi: warning: could not start the hub daemon: {e}");
+    }
     let status = shelbi_orchestrator::ensure_dashboard(&project_name).map_err(|e| anyhow!(e))?;
 
     match status {
         BootstrapStatus::Started => {
-            println!("✓ orchestrator started in {}", addr.target());
+            println!("✓ orchestrator started ({})", addr.label());
         }
         BootstrapStatus::AlreadyRunning => {
             // `args.status` is reserved for future status-only output; for
             // now both branches print the same line.
             let _ = args.status;
-            println!("orchestrator already running in {}", addr.target());
+            println!("orchestrator already running ({})", addr.label());
         }
     }
-    print_attach(&addr.session, &addr.window);
-    Ok(())
-}
-
-fn print_attach(session: &str, window: &str) {
     println!();
-    println!("attach with:");
-    if std::env::var("TMUX").is_ok() {
-        println!("  tmux select-window -t {session}:{window}");
-    } else {
-        println!("  tmux attach -t {session} \\; select-window -t {window}");
-    }
+    println!("open the project with `shelbi` to see the orchestrator.");
+    Ok(())
 }

@@ -168,20 +168,15 @@ fn record_if_crash(project: &str, reason: &str, pane: Option<&str>) -> Result<()
     Ok(())
 }
 
-/// Snapshot the last [`CRASH_OUTPUT_TAIL_LINES`] lines of the orchestrator
-/// pane's output. Runs on the hub (the orchestrator pane is always local), so
-/// it shells out to `tmux capture-pane` directly. Best-effort: a gone pane, a
-/// wedged tmux, or a non-UTF-8 blob all degrade to an empty tail rather than
-/// failing the record.
-fn capture_pane_tail(pane: &str) -> String {
-    let start = format!("-{CRASH_OUTPUT_TAIL_LINES}");
-    let out = std::process::Command::new("tmux")
-        .args(["capture-pane", "-p", "-t", pane, "-S", &start])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        _ => String::new(),
-    }
+/// Snapshot the last lines of the orchestrator's output for the crash record.
+///
+/// The orchestrator now runs as a session process rather than a tmux pane, so
+/// there is no pane to capture here; the session itself persists its final
+/// screen (`final.txt`) on exit. This degrades to an empty tail — the crash
+/// record still captures the reason and timing.
+fn capture_pane_tail(_pane: &str) -> String {
+    let _ = CRASH_OUTPUT_TAIL_LINES;
+    String::new()
 }
 
 /// Did a config self-heal / validate-and-upgrade pass run recently enough to

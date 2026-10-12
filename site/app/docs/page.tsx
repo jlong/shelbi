@@ -51,7 +51,7 @@ const concepts = [
   {
     title: "Workspaces",
     href: "/docs/concepts/workspaces",
-    body: "Capacity: a tmux pane plus a git worktree the orchestrator loads with work.",
+    body: "Capacity: a Shelbi session plus a git worktree the orchestrator loads with work.",
   },
   {
     title: "Agents",
@@ -74,7 +74,7 @@ const cli = [
   {
     title: "shelbi workspace",
     href: "/docs/cli/workspace",
-    body: "Inspect the workspace pool and stop a pane to free a stuck task.",
+    body: "Inspect the workspace pool and stop a session to free a stuck task.",
   },
   {
     title: "shelbi workflow",
@@ -82,9 +82,9 @@ const cli = [
     body: "List, show, scaffold, and edit the per-project workflow YAML.",
   },
   {
-    title: "shelbi merge",
-    href: "/docs/cli/merge",
-    body: "Merge a workspace branch into the default branch, locally or via PR.",
+    title: "shelbi attach",
+    href: "/docs/cli/attach",
+    body: "Attach your terminal to a workspace's session to watch or drive the agent.",
   },
 ]
 

@@ -2962,7 +2962,7 @@ mod pr_create_tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: PROJECT_NAME.into(),
             label: None,
             display_name: None,
@@ -10369,7 +10369,7 @@ mod probe_tests {
                 integration: None,
             },
         );
-        Project {
+        Project { session: Default::default(),
             name: "probe-test".into(),
             label: None,
             display_name: None,

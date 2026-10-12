@@ -1,7 +1,7 @@
 ---
 title: shelbi send
 order: 32
-summary: Inject a follow-up message as keystrokes into a running workspace's tmux pane.
+summary: Inject a follow-up message into a running workspace's session.
 ---
 
 ```text
@@ -9,14 +9,14 @@ shelbi send [OPTIONS] <ID> <MESSAGE>
 ```
 
 `shelbi send` injects a follow-up message into a running
-[workspace](/docs/concepts/workspaces). The text is typed into the
-workspace's live tmux pane as keystrokes, exactly as if you'd typed it there
+[workspace](/docs/concepts/workspaces). The text is delivered into the
+workspace's live session, exactly as if you'd typed it there
 yourself. Use it to nudge, correct, or add a note to an agent that's already
-working, without interrupting or restarting the pane.
+working, without interrupting or restarting the session.
 
 Shelbi delivers the text first, sends Enter as a separate key event, and then
-waits for evidence that the pane accepted the submission. If the text remains
-in the input box, Shelbi retries Enter once. A busy Claude pane may keep the
+waits for evidence that the session accepted the submission. If the text remains
+in the input box, Shelbi retries Enter once. A busy Claude session may keep the
 accepted text visible as queued input until its current turn ends. Every result
 is recorded in `~/.shelbi/events.log` as `status=submitted`, `status=queued`,
 or `status=stuck`; a stuck result also makes the command fail instead of
@@ -28,7 +28,7 @@ without claiming runner-specific proof.
 `ID` is resolved against the project YAML's `workspaces:` block first, then
 falls back to the legacy spawn agent registry.
 
-Because `send` writes keystrokes into a pane, the message content is
+Because `send` writes input into a live session, the message content is
 **ephemeral**. Shelbi records and verifies the delivery result, but the worker
 does not semantically acknowledge or persist the message body. When you need a
 message that survives, is logged, and is acked by the workspace, reach for

@@ -9,7 +9,7 @@
 //! The rendering is lossy by design — it's for humans, not round-tripping.
 //! For the canonical, parseable form use [`KeyChord::canonical`].
 
-use crossterm::event::{KeyCode, KeyModifiers};
+use super::key::{Key, Mods};
 
 use super::chord::KeyChord;
 
@@ -53,25 +53,25 @@ impl DisplayStyle {
 pub fn format_chord(chord: &KeyChord, style: DisplayStyle) -> String {
     let mut out = String::new();
     let m = chord.mods;
-    if m.contains(KeyModifiers::CONTROL) {
+    if m.contains(Mods::CONTROL) {
         out.push_str(match style {
             DisplayStyle::Mac => "⌃",
             DisplayStyle::Linux => "Ctrl+",
         });
     }
-    if m.contains(KeyModifiers::ALT) {
+    if m.contains(Mods::ALT) {
         out.push_str(match style {
             DisplayStyle::Mac => "⌥",
             DisplayStyle::Linux => "Alt+",
         });
     }
-    if m.contains(KeyModifiers::SHIFT) {
+    if m.contains(Mods::SHIFT) {
         out.push_str(match style {
             DisplayStyle::Mac => "⇧",
             DisplayStyle::Linux => "Shift+",
         });
     }
-    if m.contains(KeyModifiers::SUPER) {
+    if m.contains(Mods::SUPER) {
         out.push_str(match style {
             DisplayStyle::Mac => "⌘",
             DisplayStyle::Linux => "Super+",
@@ -83,40 +83,37 @@ pub fn format_chord(chord: &KeyChord, style: DisplayStyle) -> String {
 
 /// Render just the keyname portion (no modifiers). Char keys apply the
 /// case rule; named keys use the platform's glyph/word from the table.
-fn format_key(code: KeyCode, mods: KeyModifiers, style: DisplayStyle) -> String {
+fn format_key(code: Key, mods: Mods, style: DisplayStyle) -> String {
     match code {
-        KeyCode::Char(' ') => "Space".to_string(),
-        KeyCode::Char(c) => format_char(c, mods),
-        KeyCode::Up => sym(style, "↑", "Up"),
-        KeyCode::Down => sym(style, "↓", "Down"),
-        KeyCode::Left => sym(style, "←", "Left"),
-        KeyCode::Right => sym(style, "→", "Right"),
-        KeyCode::Enter => sym(style, "⏎", "Enter"),
-        KeyCode::Esc => "Esc".to_string(),
-        KeyCode::Backspace => sym(style, "⌫", "Backspace"),
-        KeyCode::Delete => sym(style, "⌦", "Delete"),
-        KeyCode::Tab => sym(style, "⇥", "Tab"),
-        KeyCode::BackTab => sym(style, "⇤", "BackTab"),
-        KeyCode::Insert => "Insert".to_string(),
-        KeyCode::Home => sym(style, "↖", "Home"),
-        KeyCode::End => sym(style, "↘", "End"),
-        KeyCode::PageUp => sym(style, "⇞", "PageUp"),
-        KeyCode::PageDown => sym(style, "⇟", "PageDown"),
-        KeyCode::F(n) => format!("F{n}"),
-        // Anything outside our chord vocabulary (media keys etc.) falls
-        // back to crossterm's debug form rather than panicking.
-        other => format!("{other:?}"),
+        Key::Char(' ') => "Space".to_string(),
+        Key::Char(c) => format_char(c, mods),
+        Key::Up => sym(style, "↑", "Up"),
+        Key::Down => sym(style, "↓", "Down"),
+        Key::Left => sym(style, "←", "Left"),
+        Key::Right => sym(style, "→", "Right"),
+        Key::Enter => sym(style, "⏎", "Enter"),
+        Key::Esc => "Esc".to_string(),
+        Key::Backspace => sym(style, "⌫", "Backspace"),
+        Key::Delete => sym(style, "⌦", "Delete"),
+        Key::Tab => sym(style, "⇥", "Tab"),
+        Key::BackTab => sym(style, "⇤", "BackTab"),
+        Key::Insert => "Insert".to_string(),
+        Key::Home => sym(style, "↖", "Home"),
+        Key::End => sym(style, "↘", "End"),
+        Key::PageUp => sym(style, "⇞", "PageUp"),
+        Key::PageDown => sym(style, "⇟", "PageDown"),
+        Key::F(n) => format!("F{n}"),
     }
 }
 
 /// Apply the letter-case rule for a single `Char` key. See
 /// [`format_chord`] for the rationale.
-fn format_char(c: char, mods: KeyModifiers) -> String {
+fn format_char(c: char, mods: Mods) -> String {
     if c.is_ascii_alphabetic() {
-        if mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) {
+        if mods.intersects(Mods::CONTROL | Mods::ALT | Mods::SUPER) {
             // Menu-shortcut convention: ⌃P, ⌥Z, Ctrl+C, ⌃⌥⇧Z.
             c.to_ascii_uppercase().to_string()
-        } else if mods.contains(KeyModifiers::SHIFT) {
+        } else if mods.contains(Mods::SHIFT) {
             // Shift glyph already carries the case — don't double up.
             c.to_ascii_lowercase().to_string()
         } else {

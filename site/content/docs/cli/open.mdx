@@ -1,29 +1,26 @@
 ---
 title: shelbi open
 order: 29
-summary: Focus a workspace's tmux pane, creating it (with the agent running) if it doesn't exist yet.
+summary: Ensure a workspace's session is up so the TUI can show it.
 ---
 
 ```text
 shelbi open [OPTIONS] <NAME>
 ```
 
-`shelbi open` focuses a [workspace](/docs/concepts/workspaces)'s tmux pane,
-creating it (with the agent already running inside) if it doesn't exist yet.
-It's the single entry point behind both the sidebar's click-to-focus and the
-dispatch path: the "does this pane exist?" check lives here, so callers never
-have to branch on it themselves.
+`shelbi open` ensures a [workspace](/docs/concepts/workspaces)'s session is up
+so the TUI can show it. For a workspace mid-task it is a no-op: dispatch already
+owns the agent's session. For an idle workspace it starts a plain interactive
+login shell in the worktree, so there is something to focus.
 
-For a **local** workspace, an empty pane is created by re-entering this same
-command under `--as-pane`, the wrapper that owns the agent subprocess and
-emits a `pane_alive=false` event when it exits. For a **remote** workspace, the
-pane is a proxy window that `ssh -t … tmux attach`es into the workspace's own
-remote tmux session, since the lifecycle wrapper isn't deployed to remote
-machines.
+It's the single entry point behind the sidebar's click-to-focus: the "is this
+workspace's session up?" check lives here, so callers never have to branch on it
+themselves. It works the same for local and remote workspaces; a remote session
+runs on its own machine and is reached over SSH.
 
-`open` focuses (or creates) the pane inside the Shelbi tmux session. It's how
-you jump to a workspace from the sidebar. To connect your own terminal directly
-to a workspace's pane instead, use [`shelbi attach`](/docs/cli/attach).
+`open` only ensures the session exists for the dashboard. To connect your own
+terminal directly to a workspace's session instead, use
+[`shelbi attach`](/docs/cli/attach).
 
 ## Arguments
 
@@ -40,7 +37,7 @@ to a workspace's pane instead, use [`shelbi attach`](/docs/cli/attach).
 
 ## Examples
 
-Focus (or create) the `alpha` workspace's pane:
+Ensure the `alpha` workspace's session is up:
 
 ```bash
 shelbi open alpha
@@ -48,7 +45,7 @@ shelbi open alpha
 
 ## See also
 
-- [Workspaces](/docs/concepts/workspaces) — what a workspace is, its pane
+- [Workspaces](/docs/concepts/workspaces) — what a workspace is, its session
   lifecycle, and the local vs. remote distinction.
 - [`shelbi attach`](/docs/cli/attach) — connect your terminal directly to a
-  workspace's pane instead of focusing it inside the Shelbi session.
+  workspace's session rather than only ensuring it is up for the dashboard.

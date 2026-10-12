@@ -32,9 +32,9 @@ use super::actions::{
     SidebarAction, MODE_NAMES,
 };
 use super::chord::KeyChord;
+use super::key::{Key, Mods};
 use crate::user_config::{load_user_config, save_user_config, user_config_path, ZenToggleChord};
 use crate::{atomic_write, shelbi_home};
-use crossterm::event::KeyEvent;
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
@@ -100,18 +100,21 @@ impl<A: Copy + Eq + Hash> ModeKeymap<A> {
     /// in the implicit-Shift fallback some terminals produce for
     /// uppercase characters (a `Char('A')` with no SHIFT mod is treated
     /// as `Char('a') + SHIFT`).
-    pub fn dispatch(&self, key: KeyEvent) -> Option<A> {
-        let chord = KeyChord::from_event(key);
+    ///
+    /// Takes a Shelbi [`KeyChord`] — the edge crates (`shelbi-tui`,
+    /// `shelbi-cli`) translate a crossterm `KeyEvent` into one before
+    /// dispatching.
+    pub fn dispatch(&self, chord: KeyChord) -> Option<A> {
         if let Some(a) = self.bindings.get(&chord) {
             return Some(*a);
         }
         // Some terminals deliver `Char('A')` without setting SHIFT.
         // Normalize that to the `shift-a` form before giving up.
-        if let crossterm::event::KeyCode::Char(c) = chord.code {
+        if let Key::Char(c) = chord.code {
             if c.is_ascii_uppercase() {
                 let alt = KeyChord {
-                    code: crossterm::event::KeyCode::Char(c.to_ascii_lowercase()),
-                    mods: chord.mods | crossterm::event::KeyModifiers::SHIFT,
+                    code: Key::Char(c.to_ascii_lowercase()),
+                    mods: chord.mods | Mods::SHIFT,
                 };
                 if let Some(a) = self.bindings.get(&alt) {
                     return Some(*a);
@@ -1243,7 +1246,7 @@ mod tests {
     use crate::test_lock::LOCK;
     use crate::user_config::UserConfig;
     use crate::{ensure_dir, save_user_config};
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use super::super::key::{Key, Mods};
 
     fn fresh_home() -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -1277,52 +1280,52 @@ mod tests {
         // hardcoded mappings in shelbi-tui/src/lib.rs and palette.rs.
         assert_eq!(
             km.global
-                .dispatch(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                .dispatch(KeyChord::new(Key::Char('c'), Mods::CONTROL)),
             Some(GlobalAction::Quit)
         );
         assert_eq!(
             km.global
-                .dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
+                .dispatch(KeyChord::new(Key::Char('z'), Mods::ALT)),
             Some(GlobalAction::ZenToggle)
         );
         assert_eq!(
             km.global
-                .dispatch(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+                .dispatch(KeyChord::new(Key::Char('p'), Mods::CONTROL)),
             Some(GlobalAction::OpenPalette)
         );
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('j'), Mods::NONE)),
             Some(SidebarAction::NavDown)
         );
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Up, Mods::NONE)),
             Some(SidebarAction::NavUp)
         );
         assert_eq!(
             km.kanban
-                .dispatch(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+                .dispatch(KeyChord::new(Key::Char('H'), Mods::SHIFT)),
             Some(KanbanAction::MoveCardLeft)
         );
         assert_eq!(
             km.kanban
-                .dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)),
+                .dispatch(KeyChord::new(Key::Up, Mods::SHIFT)),
             Some(KanbanAction::ReorderUp)
         );
         assert_eq!(
             km.popover
-                .dispatch(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Esc, Mods::NONE)),
             Some(PopoverAction::Close)
         );
         assert_eq!(
             km.activity
-                .dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('z'), Mods::NONE)),
             Some(ActivityAction::ToggleZenFilter)
         );
         assert_eq!(
             km.palette
-                .dispatch(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+                .dispatch(KeyChord::new(Key::Char('p'), Mods::CONTROL)),
             Some(PaletteAction::Close)
         );
 
@@ -1346,24 +1349,24 @@ mod tests {
         // nav_up is now `w` (replaces — not unions — the default).
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('w'), Mods::NONE)),
             Some(SidebarAction::NavUp)
         );
         // The old defaults are gone.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('k'), Mods::NONE)),
             None
         );
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Up, Mods::NONE)),
             None
         );
         // Other actions still have their defaults.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('j'), Mods::NONE)),
             Some(SidebarAction::NavDown)
         );
 
@@ -1399,7 +1402,7 @@ mod tests {
         // ...and its override took effect on this very load.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('w'), Mods::NONE)),
             Some(SidebarAction::NavUp)
         );
 
@@ -1438,7 +1441,7 @@ mod tests {
         // `.yml` — was the file that got read.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('w'), Mods::NONE)),
             Some(SidebarAction::NavUp),
             "the canonical .yaml must be authoritative, not the stale .yml"
         );
@@ -1470,18 +1473,18 @@ projects:
         // defaults layer's override survives where projects didn't touch.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('w'), Mods::NONE)),
             Some(SidebarAction::NavUp)
         );
         // project's override replaces the default.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('s'), Mods::NONE)),
             Some(SidebarAction::NavDown)
         );
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('j'), Mods::NONE)),
             None
         );
 
@@ -1490,13 +1493,13 @@ projects:
         assert_eq!(
             km_other
                 .sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('s'), Mods::NONE)),
             None
         );
         assert_eq!(
             km_other
                 .sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('j'), Mods::NONE)),
             Some(SidebarAction::NavDown)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -1515,13 +1518,13 @@ projects:
         // Migrated chord wins on the very first load.
         assert_eq!(
             km.global
-                .dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+                .dispatch(KeyChord::new(Key::Char('g'), Mods::CONTROL)),
             Some(GlobalAction::ZenToggle)
         );
         // Alt+Z is no longer the binding.
         assert_eq!(
             km.global
-                .dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
+                .dispatch(KeyChord::new(Key::Char('z'), Mods::ALT)),
             None
         );
         // One-time migration notice fires.
@@ -1565,7 +1568,7 @@ projects:
         );
         assert_eq!(
             km2.global
-                .dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+                .dispatch(KeyChord::new(Key::Char('g'), Mods::CONTROL)),
             Some(GlobalAction::ZenToggle)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -1594,13 +1597,13 @@ projects:
         // The pre-existing nav_up override survives the migration.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('w'), Mods::NONE)),
             Some(SidebarAction::NavUp)
         );
         // And the migrated zen_toggle is in effect.
         assert_eq!(
             km.global
-                .dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+                .dispatch(KeyChord::new(Key::Char('g'), Mods::CONTROL)),
             Some(GlobalAction::ZenToggle)
         );
 
@@ -1649,12 +1652,12 @@ projects:
         // refuse to clobber the keys.yaml value.
         assert_eq!(
             km.global
-                .dispatch(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL)),
+                .dispatch(KeyChord::new(Key::Char('\\'), Mods::CONTROL)),
             Some(GlobalAction::ZenToggle)
         );
         assert_eq!(
             km.global
-                .dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+                .dispatch(KeyChord::new(Key::Char('g'), Mods::CONTROL)),
             None
         );
         // Warning fires telling the user to remove the legacy field.
@@ -1840,18 +1843,18 @@ defaults:
         // Both colliding actions revert to defaults.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('k'), Mods::NONE)),
             Some(SidebarAction::NavUp)
         );
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('j'), Mods::NONE)),
             Some(SidebarAction::NavDown)
         );
         // The colliding chord itself is no longer bound.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('x'), Mods::NONE)),
             None
         );
         std::env::remove_var("SHELBI_HOME");
@@ -1872,7 +1875,7 @@ defaults:
         // Default bindings still loaded.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('j'), Mods::NONE)),
             Some(SidebarAction::NavDown)
         );
         assert!(diags.iter().any(|d| matches!(
@@ -1899,7 +1902,7 @@ defaults:
         let (km, diags) = load_keymaps(None);
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('j'), Mods::NONE)),
             Some(SidebarAction::NavDown)
         );
         assert!(diags.iter().any(|d| matches!(
@@ -1936,7 +1939,7 @@ projects:
         // null in project falls back to defaults' `w`.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('w'), Mods::NONE)),
             Some(SidebarAction::NavUp)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -1975,7 +1978,7 @@ projects:
 
     #[test]
     fn dispatch_handles_uppercase_letter_without_shift_modifier() {
-        // Some terminals report `KeyCode::Char('J')` with NONE mods. The
+        // Some terminals report `Key::Char('J')` with NONE mods. The
         // dispatcher must still hit a `shift-j` binding.
         let _g = LOCK.lock().unwrap();
         let home = fresh_home();
@@ -1983,7 +1986,7 @@ projects:
         let (km, _) = load_keymaps(None);
         assert_eq!(
             km.kanban
-                .dispatch(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('J'), Mods::NONE)),
             Some(KanbanAction::ReorderDown)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -2000,12 +2003,12 @@ projects:
         let (km, _) = load_keymaps(None);
         assert_eq!(
             km.kanban
-                .dispatch(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('o'), Mods::NONE)),
             Some(KanbanAction::OpenWorkspace)
         );
         assert_eq!(
             km.popover
-                .dispatch(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('o'), Mods::NONE)),
             Some(PopoverAction::OpenWorkspace)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -2031,19 +2034,19 @@ projects:
         // Both former defaults are gone — nav_up is unbound.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('k'), Mods::NONE)),
             None
         );
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Up, Mods::NONE)),
             None
         );
         assert!(km.sidebar.first_chord_for(SidebarAction::NavUp).is_none());
         // A sibling action still keeps its default.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('j'), Mods::NONE)),
             Some(SidebarAction::NavDown)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -2078,12 +2081,12 @@ projects:
         // Fell back to the built-in `k` / `up`.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('k'), Mods::NONE)),
             Some(SidebarAction::NavUp)
         );
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Up, Mods::NONE)),
             Some(SidebarAction::NavUp)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -2117,12 +2120,12 @@ projects:
         );
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('k'), Mods::NONE)),
             Some(SidebarAction::NavUp)
         );
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Up, Mods::NONE)),
             Some(SidebarAction::NavUp)
         );
         // The reverse index is deduped too.
@@ -2173,18 +2176,18 @@ defaults:
         // …the bad entries revert to their defaults…
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('k'), Mods::NONE)),
             Some(SidebarAction::NavUp)
         );
         assert_eq!(
             km.global
-                .dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
+                .dispatch(KeyChord::new(Key::Char('z'), Mods::ALT)),
             Some(GlobalAction::ZenToggle)
         );
         // …and the sibling override on the same file still took effect.
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('s'), Mods::NONE)),
             Some(SidebarAction::NavDown)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -2216,7 +2219,7 @@ defaults:
         // Whole entry skipped → reverts to default (not partially applied).
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('k'), Mods::NONE)),
             Some(SidebarAction::NavUp)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -2254,7 +2257,7 @@ defaults:
             let (km, _diags) = load_keymaps(None);
             let j = km
                 .sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+                .dispatch(KeyChord::new(Key::Char('j'), Mods::NONE));
             match seen {
                 None => seen = Some(j),
                 Some(prev) => assert_eq!(prev, j, "binding for `j` is nondeterministic"),
@@ -2266,18 +2269,18 @@ defaults:
         let (km, diags) = load_keymaps(None);
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('j'), Mods::NONE)),
             Some(SidebarAction::NavDown)
         );
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Enter, Mods::NONE)),
             Some(SidebarAction::Activate)
         );
         // `x` is unbound (both original colliders reverted away from it).
         assert_eq!(
             km.sidebar
-                .dispatch(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+                .dispatch(KeyChord::new(Key::Char('x'), Mods::NONE)),
             None
         );
         // Two distinct collisions were reported (x, and j).
@@ -2424,7 +2427,7 @@ defaults:
         let (km, _diags) = load_keymaps(None);
         assert_eq!(
             km.global
-                .dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+                .dispatch(KeyChord::new(Key::Char('g'), Mods::CONTROL)),
             Some(GlobalAction::ZenToggle)
         );
         // config.yaml no longer carries the legacy field.
@@ -2488,7 +2491,7 @@ editor: hx
         let (km, _diags) = load_keymaps(None);
         assert_eq!(
             km.global
-                .dispatch(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL)),
+                .dispatch(KeyChord::new(Key::Char('\\'), Mods::CONTROL)),
             Some(GlobalAction::ZenToggle)
         );
         let cfg_text = std::fs::read_to_string(home.join("config.yaml")).unwrap();
@@ -2528,7 +2531,7 @@ editor: hx
         let (km, _diags) = load_keymaps(None);
         assert_eq!(
             km.global
-                .dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
+                .dispatch(KeyChord::new(Key::Char('z'), Mods::ALT)),
             None,
             "disabled hotkey must stay disabled after heal"
         );

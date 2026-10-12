@@ -1,0 +1,37 @@
+---
+title: shelbi relay
+order: 37
+summary: The internal, hub-started bridge that carries remote sessions over one SSH channel.
+---
+
+```text
+shelbi relay [OPTIONS]
+```
+
+`shelbi relay` is an internal command. You do not run it by hand; it is listed
+here so you recognize it when it appears in a process list or an SSH command.
+
+When the hub works with a remote machine, it starts one relay there over SSH
+(`ssh <host> shelbi relay`). The relay bridges a single stdio channel to every
+Shelbi session on that machine, so all of a host's sessions share one SSH
+connection rather than opening one per session. The relay holds no session
+state: if it or the connection dies, the hub starts another and each client
+reconnects by sequence number. The protocol carries keepalives so a dead
+connection is noticed quickly.
+
+One relay runs per machine. Finding and installing the `shelbi` binary the relay
+runs from is handled by [`shelbi machine`](/docs/cli/machine).
+
+## Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
+
+## See also
+
+- [`shelbi machine`](/docs/cli/machine) — find or install the `shelbi` binary on
+  the remote machines a relay runs on.
+- [Workspaces](/docs/concepts/workspaces) — how remote workspaces run their
+  agents in sessions.

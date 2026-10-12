@@ -1,7 +1,7 @@
 ---
 title: Workspaces
 order: 12
-summary: A workspace is capacity — a persistent slot pinned to a machine, made of one tmux pane and one git worktree. The orchestrator dispatches issues to it; whichever agent the issue calls for runs inside it.
+summary: A workspace is capacity, a persistent slot pinned to a machine, made of one Shelbi session and one git worktree. The orchestrator dispatches issues to it; whichever agent the issue calls for runs inside it.
 ---
 
 A **workspace** is the unit Shelbi dispatches issues to. It is capacity, not
@@ -11,8 +11,9 @@ issue.
 
 Each workspace is two pinned resources on one machine:
 
-- **One tmux pane**, where the agent runs. A window for hub workspaces, a
-  whole session for remote ones (so they survive SSH drops).
+- **One Shelbi session**, where the agent runs: a small detached process that
+  owns the agent's PTY and outlives the connection, so the agent survives a
+  dropped SSH link or a closed terminal.
 - **One git worktree**, its own checkout at
   `<machine.work_dir>/.shelbi/wt/<workspace-name>`. The path is fixed; not
   configurable.
@@ -190,7 +191,7 @@ and is surfaced on the kanban card.
 
 ## Workspace states
 
-The hub polls each workspace's tmux pane title every few seconds (see
+The hub polls each workspace's session every few seconds (see
 `workspace_poll_interval_secs`, default 5) and writes the observed state to
 `~/.shelbi/workspaces/<name>/status.yaml`. The sidebar reads from there.
 
@@ -283,9 +284,9 @@ it finds a non-empty value:
 4. Appends the issue transition to the events log, e.g.
    `project=<name> task=<id> workflow=<name> in_progress -> review reason=workspace:ready-marker from_category=active to_category=handoff`.
 
-The workspace never runs `shelbi` itself. The marker file is the *entire*
-on-workspace protocol. This is what makes a remote workspace possible with
-nothing installed but `tmux`, `git`, and the agent CLI.
+The agent never runs `shelbi` itself. The marker file is the *entire*
+on-workspace protocol. A remote workspace needs only a compatible `shelbi`
+binary, `git`, and the agent CLI on its machine.
 
 Once the issue is safely promoted, the finishing dev workspace **closes its
 own session** and frees its slot for the next issue. No lingering "done"
@@ -295,23 +296,25 @@ the change, not just read the diff.
 
 ## Local vs. remote workspaces
 
-A workspace's pane lives in different places depending on its machine:
+A workspace's session runs on its machine, local or remote:
 
 ```text
-                 ┌─ shelbi-myapp ─────────────────────┐
-hub workspaces → │  dashboard | alpha | bravo | …     │   one tmux session
-                 └────────────────────────────────────┘   on the hub
+                 ┌─ alpha ──────────┐  ┌─ bravo ──────────┐
+hub workspaces → │  agent (session) │  │  agent (session) │   sessions on the hub
+                 └──────────────────┘  └──────────────────┘
 
-                 ┌─ shelbi-w-charlie ─────────────────┐   one tmux session
-remote         → │  agent                             │   per workspace, on
-workspaces       └────────────────────────────────────┘   the remote machine
+                 ┌─ charlie ────────┐
+remote         → │  agent (session) │   one session per workspace,
+workspaces       └──────────────────┘   on the remote machine
 ```
 
-Hub workspaces share the project session (one window each). Remote
-workspaces each get their own session on their machine so they survive SSH
-drops. `shelbi` reattaches with `ssh -t host tmux attach -t
-shelbi-w-<name>` whenever you focus them. The session naming is hard-coded;
-you can `tmux ls` on the remote to inspect.
+Every workspace, hub or remote, runs its agent in its own Shelbi session: a
+small detached process that owns the agent's PTY, so it survives a dropped SSH
+connection or a closed terminal. Attach to any of them with
+[`shelbi attach <workspace>`](/docs/cli/attach). For a remote machine the hub
+bridges every session over a single SSH channel (see
+[`shelbi relay`](/docs/cli/relay)), and [`shelbi machine`](/docs/cli/machine)
+makes sure a compatible `shelbi` binary is there to run them.
 
 ## See also
 

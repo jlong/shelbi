@@ -1,0 +1,19 @@
+[package]
+name = "shelbi-term"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "UI-toolkit-agnostic terminal view for shelbi sessions (emulator, scrollback, selection, search, input encoding)"
+
+[dependencies]
+shelbi-proto = { workspace = true }
+# The client-side emulator crate chosen in `rt-spike-emulator-replay` (vendored
+# fork under `vendor/alacritty_terminal`). `shelbi-term` drives it headless as
+# the client-side emulator and reads its grid/mode for rendering.
+alacritty_terminal = { workspace = true }
+# Key-input encoder (MIT). Used only for its `input` encode tables; wrapped
+# behind this crate's neutral key types so no termwiz type is in the public API.
+termwiz = { workspace = true }

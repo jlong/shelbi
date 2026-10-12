@@ -25,12 +25,11 @@ of you. A typical preflight looks like this:
   ✓ default branch      main
   ✓ remote              github.com:you/myapp.git
   ✓ agent               codex 0.27.0 on PATH
-  ✓ tmux                3.5a
   ✓ machine             10 cores, recommending 4 workspaces
 ```
 
 Shelbi detects the repository root, default branch, origin, supported agent
-runners, tmux, and a workspace count suited to the machine. The values appear
+runners, and a workspace count suited to the machine. The values appear
 as each check completes.
 
 <Callout type="note" title="If both runners are installed">
@@ -174,9 +173,10 @@ Failed checks are shown with `✗`, and setup stops with a concrete next step.
 For example:
 
 ```text
-  ✗ tmux                not found on PATH
+  ✗ agent               claude and codex not found on PATH
 
-tmux was not found on PATH. Run brew install tmux, then start Shelbi again.
+No supported agent runner was found on PATH. Install and authenticate Claude
+Code or Codex, then start Shelbi again.
 ```
 
 If no supported runner is found, Shelbi points to Claude Code and Codex install

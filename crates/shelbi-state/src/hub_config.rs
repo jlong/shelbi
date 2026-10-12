@@ -242,4 +242,8 @@ mod tests {
         assert!(cfg.projects.is_empty());
         std::env::remove_var("SHELBI_HOME");
     }
+
+
+
+
 }

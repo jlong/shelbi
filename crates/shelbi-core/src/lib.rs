@@ -1,9 +1,12 @@
 pub mod agent_manifest;
 pub mod error;
+pub mod file_limit;
 pub mod integration;
+pub mod login_env;
 pub mod model;
 pub mod placeholders;
 pub mod scaffold;
+pub mod session_health;
 pub mod shell;
 pub mod statuses;
 pub mod system_memory;
@@ -15,7 +18,12 @@ pub use agent_manifest::{
     ResolvedAgentLaunch, RunnerManifestConfig,
 };
 pub use error::{Error, GhTokenProbeFailure, Result};
+pub use file_limit::raise_file_limit;
 pub use integration::{CapabilityLadder, IntegrationMode};
+pub use login_env::{
+    build_session_env, capture_env_bounded, current_shelbi_exe, login_shell_env,
+    pin_shelbi_binary, session_child_env, SCRUBBED_TERMINAL_VARS, SHELBI_BIN_VAR,
+};
 pub use model::{
     checks_for_task, checks_for_task_in_workflow, ci_timeout_for_workflow,
     danger_paths_for_project, danger_paths_for_workflow, default_dialog_signatures,
@@ -27,9 +35,9 @@ pub use model::{
     HeartbeatConfig, GithubConnection, Host, IssueTrackerBackend, IssueTrackerConfig, JiraConnection,
     LinearConnection, Machine, MachineKind, MergeStrategy, OrchestratorSpec, ParamDiagnostic,
     Project, ProjectAgentConfig, ProjectRunnerConfig, ProjectShape,
-    PromptInjectionKind, PromptInjectionSpec, ReviewConfig, RunnerKind, Session, SessionProject, Status, Issue,
+    PromptInjectionKind, PromptInjectionSpec, ReviewConfig, RunnerKind, Session, SessionConfig, SessionProject, Status, Issue,
     IssueLaunchConfig, IssueZenConfig,
-    TmuxAddr, WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS,
+    WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS,
     DEFAULT_BUDGET_GRAPHQL_HIGH, DEFAULT_BUDGET_GRAPHQL_LOW, DEFAULT_BUDGET_GRAPHQL_MEDIUM,
     DEFAULT_BUDGET_REST_RESERVE, DEFAULT_BUDGET_SLOW_REFRESH_SECS,
     DEFAULT_DISK_LOW_FREE_GIB, DEFAULT_DISK_TARGET_CAP_GIB,
@@ -38,6 +46,10 @@ pub use model::{
     MAX_TASK_ID_LEN, SHARED_PROJECT_FIELDS, SUBTASK_WORKFLOW_NAME, TASK_WORKFLOW_NAME,
 };
 pub use placeholders::{extract_placeholders, substitute_placeholders};
+pub use session_health::{
+    classify as classify_session, HealthTransition, RealSessionProbe, SessionHealthTracker,
+    SessionProbe, SessionReading, TickVerdict, DEFAULT_LOST_THRESHOLD,
+};
 pub use shell::shell_escape;
 pub use statuses::{default_project_statuses, ProjectStatus, ProjectStatuses};
 pub use system_memory::{format_bytes_short, recommended_workspace_count, total_memory_bytes};

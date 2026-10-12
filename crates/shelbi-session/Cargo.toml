@@ -1,0 +1,37 @@
+[package]
+name = "shelbi-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The `shelbi __session` process: one PTY + one headless terminal emulator per session, detached and self-owning (remove-tmux Phase 1)"
+
+[dependencies]
+shelbi-proto = { workspace = true }
+shelbi-core = { workspace = true }
+shelbi-state = { workspace = true }
+# PTY ownership (controlling terminal, group kill, no descriptor leak — all
+# proven against this version in the Phase 0 runtime spike).
+portable-pty = { workspace = true }
+# The headless terminal emulator chosen in `rt-spike-emulator-replay` (vendored
+# fork). The session process owns one per session, answers terminal queries
+# from it, and renders `final.txt` out of it.
+alacritty_terminal = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+# Replay round-trip tests build terminals directly and drive a real PTY; these
+# are regular deps of the crate but integration tests are separate crates, so
+# they must be named again here.
+alacritty_terminal = { workspace = true }
+portable-pty = { workspace = true }
+libc = { workspace = true }

@@ -1,4 +1,4 @@
-//! Chord parsing — strings ↔ ([`KeyCode`], [`KeyModifiers`]) pairs.
+//! Chord parsing — strings ↔ ([`Key`], [`Mods`]) pairs.
 //!
 //! Grammar (single chord only — multi-key sequences like `gg` or
 //! `ctrl-x-ctrl-c` are deliberately rejected as out of scope):
@@ -21,15 +21,19 @@
 
 use std::fmt;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use super::key::{Key, Mods};
 
-/// A single key chord — a `KeyCode` plus the modifier set that was held
-/// when it fired. Equality/hashing is straight off the two fields so a
-/// chord can be used as the key in a binding map.
+/// A single key chord — a [`Key`] plus the modifier set that was held when
+/// it fired. Equality/hashing is straight off the two fields so a chord can
+/// be used as the key in a binding map.
+///
+/// The code/mods are Shelbi's own toolkit-independent types; crossterm (or
+/// any other input source) is converted to a chord at the edges, in
+/// `shelbi-tui` and `shelbi-cli`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyChord {
-    pub code: KeyCode,
-    pub mods: KeyModifiers,
+    pub code: Key,
+    pub mods: Mods,
 }
 
 /// Reasons the parser rejects an input string.
@@ -67,13 +71,13 @@ impl KeyChord {
             return Ok(if ch.is_ascii_uppercase() {
                 let lower = ch.to_ascii_lowercase();
                 KeyChord {
-                    code: KeyCode::Char(lower),
-                    mods: KeyModifiers::SHIFT,
+                    code: Key::Char(lower),
+                    mods: Mods::SHIFT,
                 }
             } else {
                 KeyChord {
-                    code: KeyCode::Char(ch),
-                    mods: KeyModifiers::NONE,
+                    code: Key::Char(ch),
+                    mods: Mods::NONE,
                 }
             });
         }
@@ -88,7 +92,7 @@ impl KeyChord {
         // Collect modifiers left-to-right until the first non-modifier
         // segment; the rest is the keyname (which may be a compound like
         // `page-up` spanning two segments).
-        let mut mods = KeyModifiers::NONE;
+        let mut mods = Mods::NONE;
         let mut idx = 0usize;
         while idx < parts.len() {
             match parse_modifier_opt(parts[idx]) {
@@ -146,49 +150,18 @@ impl KeyChord {
         })
     }
 
-    /// Build a chord from a crossterm `KeyEvent` so the runtime can look
-    /// it up in a [`super::ModeKeymap`]. Drops the `KIND` etc.; just the
-    /// code + mods are relevant for dispatch. The event's `code`/`mods` are
-    /// carried verbatim — no case-folding or implied-Shift normalization
-    /// happens here. Terminals that report an uppercase `Char('A')` with no
-    /// SHIFT bit are reconciled at lookup time by
-    /// [`super::ModeKeymap::dispatch`], which retries the `shift-a` form
-    /// before giving up.
-    pub fn from_event(ev: KeyEvent) -> Self {
-        KeyChord {
-            code: ev.code,
-            mods: ev.modifiers,
-        }
+    /// Build a chord from a raw ([`Key`], [`Mods`]) pair — what the edge
+    /// crates (`shelbi-tui`, `shelbi-cli`) hand over after translating a
+    /// crossterm `KeyEvent`. The code + mods are carried verbatim: no
+    /// case-folding or implied-Shift normalization happens here. Terminals
+    /// that report an uppercase `Char('A')` with no SHIFT bit are reconciled
+    /// at lookup time by [`super::ModeKeymap::dispatch`], which retries the
+    /// `shift-a` form before giving up.
+    pub fn new(code: Key, mods: Mods) -> Self {
+        KeyChord { code, mods }
     }
 
-    /// Render this chord in tmux's `bind-key` syntax (e.g. `C-p`, `M-z`,
-    /// `C-S-Space`, `F1`, `Up`, `BSpace`). Returns `None` for chords tmux
-    /// can't express as a global key — currently anything that carries
-    /// the `super` modifier, since tmux has no representation for it and
-    /// terminal multiplexers typically don't see the Super key at all.
-    ///
-    /// Modifier order mirrors tmux: `C-` (ctrl), `M-` (alt), `S-` (shift).
-    /// Letter keynames are emitted lowercase since tmux folds case there;
-    /// named keys use tmux's canonical TitleCase / abbreviated form
-    /// (`BSpace`, `PageUp`, `F12`).
-    pub fn to_tmux_key(&self) -> Option<String> {
-        if self.mods.contains(KeyModifiers::SUPER) {
-            return None;
-        }
-        let keyname = tmux_keyname(self.code)?;
-        let mut out = String::new();
-        if self.mods.contains(KeyModifiers::CONTROL) {
-            out.push_str("C-");
-        }
-        if self.mods.contains(KeyModifiers::ALT) {
-            out.push_str("M-");
-        }
-        if self.mods.contains(KeyModifiers::SHIFT) {
-            out.push_str("S-");
-        }
-        out.push_str(&keyname);
-        Some(out)
-    }
+
 
     /// Render this chord in the canonical, lossless string form. Round-
     /// trips through [`KeyChord::parse`]:
@@ -207,22 +180,22 @@ impl KeyChord {
         // documented `shift-j` form: lowercase the letter and treat the
         // uppercase as an implied Shift.
         let (code, implied_shift) = match self.code {
-            KeyCode::Char(c) if c.is_ascii_uppercase() => {
-                (KeyCode::Char(c.to_ascii_lowercase()), true)
+            Key::Char(c) if c.is_ascii_uppercase() => {
+                (Key::Char(c.to_ascii_lowercase()), true)
             }
             other => (other, false),
         };
         let mut out = String::new();
-        if self.mods.contains(KeyModifiers::CONTROL) {
+        if self.mods.contains(Mods::CONTROL) {
             out.push_str("ctrl-");
         }
-        if self.mods.contains(KeyModifiers::ALT) {
+        if self.mods.contains(Mods::ALT) {
             out.push_str("alt-");
         }
-        if implied_shift || self.mods.contains(KeyModifiers::SHIFT) {
+        if implied_shift || self.mods.contains(Mods::SHIFT) {
             out.push_str("shift-");
         }
-        if self.mods.contains(KeyModifiers::SUPER) {
+        if self.mods.contains(Mods::SUPER) {
             out.push_str("super-");
         }
         out.push_str(&keyname(code));
@@ -255,27 +228,27 @@ fn split_chord(s: &str) -> Vec<&str> {
     s.split('-').collect()
 }
 
-fn parse_modifier_opt(tok: &str) -> Option<KeyModifiers> {
+fn parse_modifier_opt(tok: &str) -> Option<Mods> {
     match tok.to_ascii_lowercase().as_str() {
-        "ctrl" => Some(KeyModifiers::CONTROL),
-        "alt" => Some(KeyModifiers::ALT),
-        "shift" => Some(KeyModifiers::SHIFT),
-        "super" => Some(KeyModifiers::SUPER),
+        "ctrl" => Some(Mods::CONTROL),
+        "alt" => Some(Mods::ALT),
+        "shift" => Some(Mods::SHIFT),
+        "super" => Some(Mods::SUPER),
         _ => None,
     }
 }
 
-/// Parse the keyname segment of a chord. Returns `(KeyCode, implied_mods)`.
+/// Parse the keyname segment of a chord. Returns `(Key, implied_mods)`.
 /// The only mod ever implied here is Shift, when the keyname is a single
 /// uppercase letter.
-fn parse_keyname(tok: &str) -> Result<(KeyCode, KeyModifiers), ChordParseError> {
+fn parse_keyname(tok: &str) -> Result<(Key, Mods), ChordParseError> {
     // Single character key — case matters (uppercase → Shift).
     if tok.chars().count() == 1 {
         let ch = tok.chars().next().unwrap();
         if ch.is_ascii_uppercase() {
-            return Ok((KeyCode::Char(ch.to_ascii_lowercase()), KeyModifiers::SHIFT));
+            return Ok((Key::Char(ch.to_ascii_lowercase()), Mods::SHIFT));
         }
-        return Ok((KeyCode::Char(ch), KeyModifiers::NONE));
+        return Ok((Key::Char(ch), Mods::NONE));
     }
 
     // Multi-char keyname — must be one of the named keys. Lowercase only.
@@ -289,25 +262,25 @@ fn parse_keyname(tok: &str) -> Result<(KeyCode, KeyModifiers), ChordParseError> 
     // always come from misuse like `gg` (multi-key sequence) — surface that
     // distinct error so the user knows why it failed.
     let code = match tok {
-        "up" => KeyCode::Up,
-        "down" => KeyCode::Down,
-        "left" => KeyCode::Left,
-        "right" => KeyCode::Right,
-        "enter" => KeyCode::Enter,
-        "space" => KeyCode::Char(' '),
-        "esc" => KeyCode::Esc,
-        "tab" => KeyCode::Tab,
-        "back-tab" => KeyCode::BackTab,
-        "backspace" => KeyCode::Backspace,
-        "delete" => KeyCode::Delete,
-        "insert" => KeyCode::Insert,
-        "home" => KeyCode::Home,
-        "end" => KeyCode::End,
-        "page-up" => KeyCode::PageUp,
-        "page-down" => KeyCode::PageDown,
+        "up" => Key::Up,
+        "down" => Key::Down,
+        "left" => Key::Left,
+        "right" => Key::Right,
+        "enter" => Key::Enter,
+        "space" => Key::Char(' '),
+        "esc" => Key::Esc,
+        "tab" => Key::Tab,
+        "back-tab" => Key::BackTab,
+        "backspace" => Key::Backspace,
+        "delete" => Key::Delete,
+        "insert" => Key::Insert,
+        "home" => Key::Home,
+        "end" => Key::End,
+        "page-up" => Key::PageUp,
+        "page-down" => Key::PageDown,
         // Function keys f1..f12.
         f if f.starts_with('f') && f.len() <= 3 => match f[1..].parse::<u8>() {
-            Ok(n) if (1..=12).contains(&n) => KeyCode::F(n),
+            Ok(n) if (1..=12).contains(&n) => Key::F(n),
             _ => return Err(ChordParseError::UnknownKey(tok.to_string())),
         },
         _ => {
@@ -319,64 +292,36 @@ fn parse_keyname(tok: &str) -> Result<(KeyCode, KeyModifiers), ChordParseError> 
             return Err(ChordParseError::UnknownKey(tok.to_string()));
         }
     };
-    Ok((code, KeyModifiers::NONE))
+    Ok((code, Mods::NONE))
 }
 
-/// Inverse of [`parse_keyname`]: render a [`KeyCode`] back to its
-/// canonical token. Unknown / unsupported codes fall through to a `?`
-/// marker; callers that surface this should map it to a parse error so
-/// the bad value can't silently survive a round-trip.
-fn keyname(code: KeyCode) -> String {
+/// Inverse of [`parse_keyname`]: render a [`Key`] back to its canonical
+/// token. Every [`Key`] variant is in the chord vocabulary, so this is
+/// total.
+fn keyname(code: Key) -> String {
     match code {
-        KeyCode::Char(' ') => "space".to_string(),
-        KeyCode::Char(c) => c.to_string(),
-        KeyCode::Up => "up".to_string(),
-        KeyCode::Down => "down".to_string(),
-        KeyCode::Left => "left".to_string(),
-        KeyCode::Right => "right".to_string(),
-        KeyCode::Enter => "enter".to_string(),
-        KeyCode::Esc => "esc".to_string(),
-        KeyCode::Tab => "tab".to_string(),
-        KeyCode::BackTab => "back-tab".to_string(),
-        KeyCode::Backspace => "backspace".to_string(),
-        KeyCode::Delete => "delete".to_string(),
-        KeyCode::Insert => "insert".to_string(),
-        KeyCode::Home => "home".to_string(),
-        KeyCode::End => "end".to_string(),
-        KeyCode::PageUp => "page-up".to_string(),
-        KeyCode::PageDown => "page-down".to_string(),
-        KeyCode::F(n) => format!("f{n}"),
-        other => format!("?{other:?}"),
+        Key::Char(' ') => "space".to_string(),
+        Key::Char(c) => c.to_string(),
+        Key::Up => "up".to_string(),
+        Key::Down => "down".to_string(),
+        Key::Left => "left".to_string(),
+        Key::Right => "right".to_string(),
+        Key::Enter => "enter".to_string(),
+        Key::Esc => "esc".to_string(),
+        Key::Tab => "tab".to_string(),
+        Key::BackTab => "back-tab".to_string(),
+        Key::Backspace => "backspace".to_string(),
+        Key::Delete => "delete".to_string(),
+        Key::Insert => "insert".to_string(),
+        Key::Home => "home".to_string(),
+        Key::End => "end".to_string(),
+        Key::PageUp => "page-up".to_string(),
+        Key::PageDown => "page-down".to_string(),
+        Key::F(n) => format!("f{n}"),
     }
 }
 
-/// Render a [`KeyCode`] in tmux's `bind-key` syntax. Returns `None` for
-/// codes tmux can't bind (e.g. media keys reported by the kitty protocol
-/// — we don't carry those in our chord vocabulary today, but the safety
-/// net keeps a future addition from silently producing junk tmux input).
-fn tmux_keyname(code: KeyCode) -> Option<String> {
-    Some(match code {
-        KeyCode::Char(' ') => "Space".to_string(),
-        KeyCode::Char(c) => c.to_string(),
-        KeyCode::Up => "Up".to_string(),
-        KeyCode::Down => "Down".to_string(),
-        KeyCode::Left => "Left".to_string(),
-        KeyCode::Right => "Right".to_string(),
-        KeyCode::Enter => "Enter".to_string(),
-        KeyCode::Esc => "Escape".to_string(),
-        KeyCode::Tab => "Tab".to_string(),
-        KeyCode::BackTab => "BTab".to_string(),
-        KeyCode::Backspace => "BSpace".to_string(),
-        KeyCode::Delete => "DC".to_string(),
-        KeyCode::Insert => "IC".to_string(),
-        KeyCode::Home => "Home".to_string(),
-        KeyCode::End => "End".to_string(),
-        KeyCode::PageUp => "PageUp".to_string(),
-        KeyCode::PageDown => "PageDown".to_string(),
-        KeyCode::F(n) => format!("F{n}"),
-        _ => return None,
-    })
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -389,15 +334,15 @@ mod tests {
     #[test]
     fn parses_plain_char() {
         let c = parse("j");
-        assert_eq!(c.code, KeyCode::Char('j'));
-        assert_eq!(c.mods, KeyModifiers::NONE);
+        assert_eq!(c.code, Key::Char('j'));
+        assert_eq!(c.mods, Mods::NONE);
     }
 
     #[test]
     fn uppercase_char_implies_shift() {
         let c = parse("J");
-        assert_eq!(c.code, KeyCode::Char('j'));
-        assert_eq!(c.mods, KeyModifiers::SHIFT);
+        assert_eq!(c.code, Key::Char('j'));
+        assert_eq!(c.mods, Mods::SHIFT);
         assert_eq!(c.canonical(), "shift-j");
     }
 
@@ -443,16 +388,16 @@ mod tests {
         }
         for n in 1..=12 {
             let c = parse(&format!("f{n}"));
-            assert_eq!(c.code, KeyCode::F(n));
+            assert_eq!(c.code, Key::F(n));
         }
     }
 
     #[test]
     fn parses_every_modifier() {
-        assert!(parse("ctrl-x").mods.contains(KeyModifiers::CONTROL));
-        assert!(parse("alt-x").mods.contains(KeyModifiers::ALT));
-        assert!(parse("shift-x").mods.contains(KeyModifiers::SHIFT));
-        assert!(parse("super-x").mods.contains(KeyModifiers::SUPER));
+        assert!(parse("ctrl-x").mods.contains(Mods::CONTROL));
+        assert!(parse("alt-x").mods.contains(Mods::ALT));
+        assert!(parse("shift-x").mods.contains(Mods::SHIFT));
+        assert!(parse("super-x").mods.contains(Mods::SUPER));
     }
 
     #[test]
@@ -538,10 +483,10 @@ mod tests {
     #[test]
     fn parses_dash_as_keyname() {
         let c = parse("-");
-        assert_eq!(c.code, KeyCode::Char('-'));
+        assert_eq!(c.code, Key::Char('-'));
         let c = parse("ctrl--");
-        assert_eq!(c.code, KeyCode::Char('-'));
-        assert!(c.mods.contains(KeyModifiers::CONTROL));
+        assert_eq!(c.code, Key::Char('-'));
+        assert!(c.mods.contains(Mods::CONTROL));
     }
 
     #[test]
@@ -558,90 +503,29 @@ mod tests {
     fn canonical_round_trips_uppercase_char_from_event() {
         // A terminal can hand us `Char('J')` with the SHIFT bit already set.
         // `canonical()` must normalize to `shift-j` so the round-trip holds.
-        let ev = KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT);
-        let c = KeyChord::from_event(ev);
+        let c = KeyChord::new(Key::Char('J'), Mods::SHIFT);
         assert_eq!(c.canonical(), "shift-j");
         assert_eq!(parse(&c.canonical()), parse("shift-j"));
 
         // And with no SHIFT bit (terminals that report only the glyph): the
         // canonical form still parses back to an equal chord.
-        let ev = KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE);
-        let c = KeyChord::from_event(ev);
+        let c = KeyChord::new(Key::Char('J'), Mods::NONE);
         assert_eq!(c.canonical(), "shift-j");
         assert_eq!(parse(&c.canonical()), parse(&c.canonical()));
     }
 
     #[test]
-    fn from_event_preserves_code_and_mods() {
-        let ev = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
-        let c = KeyChord::from_event(ev);
-        assert_eq!(c.code, KeyCode::Char('x'));
-        assert!(c.mods.contains(KeyModifiers::CONTROL));
+    fn new_preserves_code_and_mods() {
+        let c = KeyChord::new(Key::Char('x'), Mods::CONTROL);
+        assert_eq!(c.code, Key::Char('x'));
+        assert!(c.mods.contains(Mods::CONTROL));
     }
 
-    #[test]
-    fn to_tmux_key_renders_each_mapping_row() {
-        // Cases pulled directly from the task's mapping table.
-        let cases: &[(&str, &str)] = &[
-            ("ctrl-p", "C-p"),
-            ("alt-z", "M-z"),
-            ("ctrl-shift-space", "C-S-Space"),
-            ("f1", "F1"),
-            ("f12", "F12"),
-            ("enter", "Enter"),
-            ("space", "Space"),
-            ("esc", "Escape"),
-            ("up", "Up"),
-            ("backspace", "BSpace"),
-            ("tab", "Tab"),
-        ];
-        for (chord_str, expected) in cases {
-            let c = parse(chord_str);
-            assert_eq!(
-                c.to_tmux_key().as_deref(),
-                Some(*expected),
-                "to_tmux_key({chord_str}) → {expected}",
-            );
-        }
-    }
 
-    #[test]
-    fn to_tmux_key_returns_none_for_super_modifier() {
-        // The parser-friendly form: bind a chord with super-, ensure it
-        // refuses to translate. tmux has no way to express Super.
-        let c = parse("super-x");
-        assert_eq!(c.to_tmux_key(), None);
-        let c = parse("ctrl-super-p");
-        assert_eq!(c.to_tmux_key(), None);
-    }
 
-    #[test]
-    fn to_tmux_key_handles_remaining_named_keys() {
-        // Coverage for the keynames the mapping table doesn't enumerate,
-        // so a regression in tmux_keyname() can't slip through.
-        let extras = [
-            ("down", "Down"),
-            ("left", "Left"),
-            ("right", "Right"),
-            ("back-tab", "BTab"),
-            ("delete", "DC"),
-            ("insert", "IC"),
-            ("home", "Home"),
-            ("end", "End"),
-            ("page-up", "PageUp"),
-            ("page-down", "PageDown"),
-        ];
-        for (chord_str, expected) in extras {
-            let c = parse(chord_str);
-            assert_eq!(c.to_tmux_key().as_deref(), Some(expected));
-        }
-    }
 
-    #[test]
-    fn to_tmux_key_orders_modifiers_ctrl_alt_shift() {
-        // Even if the source string lists modifiers differently, tmux output
-        // canonicalizes to C-M-S- order.
-        let c = parse("shift-alt-ctrl-a");
-        assert_eq!(c.to_tmux_key().as_deref(), Some("C-M-S-a"));
-    }
+
+
+
+
 }

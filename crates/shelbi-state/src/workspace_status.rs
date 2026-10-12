@@ -294,6 +294,18 @@ pub fn hub_socket_path() -> Result<PathBuf> {
     Ok(shelbi_home()?.join("hub.sock"))
 }
 
+/// Local Unix-domain socket the hub daemon listens on for the **mutation
+/// control protocol** (`shelbi_proto::control`), separate from the worker/event
+/// `hub.sock`. `$SHELBI_CONTROL_SOCK` wins when set, mirroring
+/// [`hub_socket_path`]; default is `~/.shelbi/control.sock`. The daemon binds
+/// both in one process.
+pub fn control_socket_path() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("SHELBI_CONTROL_SOCK") {
+        return Ok(PathBuf::from(p));
+    }
+    Ok(shelbi_home()?.join("control.sock"))
+}
+
 /// Last observed state for a workspace — persisted to disk so a fresh hub
 /// process can see the prior state without re-deriving it from the pane
 /// title (which may have rolled past the marker).

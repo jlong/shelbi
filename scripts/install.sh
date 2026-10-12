@@ -15,9 +15,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INSTALL_PATH="${SHELBI_INSTALL_PATH:-$HOME/bin/shelbi}"
 
-# Parse flags. The only one we care about is --no-daemon, which skips the
-# `shelbi daemon install` step at the end (useful in CI, containers, or
-# anywhere the user wants to drive the daemon manually).
+# Parse flags. --no-daemon leaves the daemon untouched; by default we restart
+# an already-running daemon onto the freshly built binary (useful in CI,
+# containers, or anywhere the user wants to drive the daemon manually).
 install_daemon=1
 for arg in "$@"; do
   case "$arg" in
@@ -27,14 +27,17 @@ for arg in "$@"; do
 Usage: scripts/install.sh [--no-daemon]
 
 Builds shelbi in release mode and installs it to $SHELBI_INSTALL_PATH
-(default: $HOME/bin/shelbi). After installing the binary, registers the
-hub daemon with the platform supervisor (launchd on macOS, systemd --user
-on Linux) so it auto-starts at login and is restarted on crash.
+(default: $HOME/bin/shelbi).
+
+The hub daemon is started on demand (the first time you open a project) and
+exits when no project is open, so there is no service to register. If a daemon
+is already running when you upgrade, it keeps serving the OLD binary until it
+restarts, so this script restarts it onto the new binary.
 
 Options:
-  --no-daemon   Skip `shelbi daemon install` at the end. A daemon that is
-                already running is still restarted onto the new binary; one
-                that isn't running stays down (nothing is registered).
+  --no-daemon   Leave the daemon completely untouched. An already-running
+                daemon keeps serving the previous binary until it next
+                restarts (or you run `shelbi daemon restart`).
   -h, --help    Show this message.
 USAGE
       exit 0
@@ -137,56 +140,31 @@ fi
 echo "==> $("$INSTALL_PATH" --version)"
 
 # ----------------------------------------------------------------------------
-# Register the hub daemon with the platform supervisor so it auto-starts at
-# login and is restarted on crash. Skipped when --no-daemon was passed, or
-# on platforms `shelbi daemon install` knows it can't handle (it emits its
-# own warning and exits 0 in that case).
-
-if [[ $install_daemon -eq 1 ]]; then
-  echo
-  echo "==> registering daemon with platform supervisor"
-  # `daemon install` is idempotent: it boots out any prior instance and
-  # (re)loads the freshly built binary's unit, riding out launchd's transient
-  # EIO on bootstrap. A genuine, repeated failure exits non-zero, which the
-  # `set -e` above turns into a loud install failure. On success the daemon is
-  # running; we print its status so the outcome is visible.
-  "$INSTALL_PATH" daemon install
-
-  echo
-  echo "==> daemon status"
-  "$INSTALL_PATH" daemon status || true
-
-  if [[ "$(uname -s)" == "Linux" ]] && [[ -z "${DISPLAY:-}" ]] && [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
-    cat <<'LINGER'
-
-  note: this looks like a headless Linux box. The systemd --user service
-  stops when you log out unless lingering is enabled for the user. Run
-  this once (requires sudo — system-wide change, so this install script
-  does not do it for you):
-
-    sudo loginctl enable-linger "$USER"
-
-  Once lingering is on, the daemon survives logout and reboots.
-LINGER
+# The hub daemon is started on demand and has no installed service. The only
+# thing an upgrade needs to do is restart an already-running daemon onto the
+# freshly built binary — otherwise it keeps serving the OLD binary we just
+# replaced (the "stale binary hides merged fixes" failure mode) until it next
+# restarts. A daemon that isn't running is left down; it starts on demand the
+# next time a project is opened. `--no-daemon` skips even the restart.
+#
+# `daemon status` always exits 0, so we key off its printed marker:
+# `shelbi daemon: running`. A not-running daemon matches neither and is left be.
+daemon_status="$("$INSTALL_PATH" daemon status 2>/dev/null || true)"
+if [[ "$daemon_status" =~ shelbi\ daemon:\ running ]]; then
+  if [[ $install_daemon -eq 1 ]]; then
+    echo
+    echo "==> restarting the running daemon onto the new binary"
+    # `daemon restart` stops the running daemon and starts a fresh one on this
+    # binary directly (no supervisor), also retiring any leftover launchd/
+    # systemd unit from a previous install so it can't respawn the old binary.
+    "$INSTALL_PATH" daemon restart
+  else
+    echo
+    echo "note: a hub daemon is running on the previous binary; it will keep"
+    echo "      serving it until it restarts. Run \`shelbi daemon restart\` to"
+    echo "      put it on the new binary (--no-daemon: not touching it)."
   fi
 else
-  # --no-daemon: the caller does not want us to register/supervise a daemon,
-  # so we never *start* one here. But if a daemon is already running it is now
-  # serving the OLD binary we just replaced — the "stale binary hides merged
-  # fixes" failure mode. Detect that via the daemon's own status surface (not
-  # raw pgrep) and, only when one is actually running, restart it onto the
-  # freshly installed binary. `daemon status` always exits 0, so we key off its
-  # printed running marker: `state:  running` on macOS (launchd), `Active:
-  # active (running)` on Linux (systemd). A not-installed / inactive / "not
-  # running" / loaded-but-unspawned daemon matches neither, so we leave it be.
-  daemon_status="$("$INSTALL_PATH" daemon status 2>/dev/null || true)"
-  if [[ "$daemon_status" =~ state:[[:space:]]+running ]] ||
-     [[ "$daemon_status" =~ Active:[[:space:]]+active[[:space:]]+\(running\) ]]; then
-    echo
-    echo "==> restarting already-running daemon onto the new binary (--no-daemon: not registering one)"
-    # Prefer the first-class restart path: it refreshes the unit and relaunches
-    # on this binary, matching the default path's effect without registering a
-    # supervisor for a daemon that wasn't running before.
-    "$INSTALL_PATH" daemon restart
-  fi
+  echo
+  echo "==> hub daemon is on-demand; it starts the next time you open a project"
 fi

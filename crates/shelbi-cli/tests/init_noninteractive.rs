@@ -24,7 +24,6 @@ struct FakePath {
     git: bool,
     claude: bool,
     codex: bool,
-    tmux: bool,
     /// A fake `gh` that passes the GitHub issue-tracker preflight (installed,
     /// authenticated, Issues enabled, push access).
     gh_ok: bool,
@@ -36,7 +35,6 @@ impl FakePath {
             git: true,
             claude: true,
             codex: false,
-            tmux: true,
             gh_ok: false,
         }
     }
@@ -74,9 +72,6 @@ fn fake_path(root: &Path, tools: FakePath) -> PathBuf {
     }
     if tools.codex {
         executable(&bin.join("codex"), "#!/bin/sh\nprintf 'codex 0.101.0\\n'\n");
-    }
-    if tools.tmux {
-        executable(&bin.join("tmux"), "#!/bin/sh\nprintf 'tmux 3.5a\\n'\n");
     }
     if tools.gh_ok {
         executable(
@@ -423,7 +418,6 @@ fn ambiguous_runners_fail_without_state_until_runner_flag_resolves_them() {
             git: true,
             claude: true,
             codex: true,
-            tmux: true,
             gh_ok: false,
         },
     );
@@ -467,7 +461,6 @@ fn missing_prerequisites_do_not_initialize_git_or_scaffold_state() {
             git: true,
             claude: false,
             codex: false,
-            tmux: true,
             gh_ok: false,
         },
     );
@@ -482,25 +475,6 @@ fn missing_prerequisites_do_not_initialize_git_or_scaffold_state() {
     assert!(!no_runner_home.exists());
     assert!(!no_runner_repo.join(".git").exists());
 
-    let no_tmux_repo = temp.path().join("no-tmux");
-    fs::create_dir_all(&no_tmux_repo).unwrap();
-    let no_tmux_home = temp.path().join("no-tmux-home");
-    let no_tmux_bin = fake_path(
-        &temp.path().join("no-tmux-path"),
-        FakePath {
-            git: true,
-            claude: true,
-            codex: false,
-            tmux: false,
-            gh_ok: false,
-        },
-    );
-    let no_tmux = run_init(&no_tmux_repo, &no_tmux_home, &no_tmux_bin, &["init", "-y"]);
-    assert!(!no_tmux.status.success());
-    assert!(no_tmux.stderr.contains("tmux was not found"));
-    assert!(!no_tmux_home.exists());
-    assert!(!no_tmux_repo.join(".git").exists());
-
     let no_git_repo = temp.path().join("no-git");
     fs::create_dir_all(&no_git_repo).unwrap();
     let no_git_home = temp.path().join("no-git-home");
@@ -510,7 +484,6 @@ fn missing_prerequisites_do_not_initialize_git_or_scaffold_state() {
             git: false,
             claude: true,
             codex: false,
-            tmux: true,
             gh_ok: false,
         },
     );
@@ -576,7 +549,6 @@ fn all_explicit_plan_flags_override_detected_defaults() {
             git: true,
             claude: true,
             codex: true,
-            tmux: true,
             gh_ok: false,
         },
     );
@@ -646,7 +618,6 @@ fn configured_repository_is_a_write_free_success_even_without_prerequisites() {
             git: false,
             claude: false,
             codex: false,
-            tmux: false,
             gh_ok: false,
         },
     );
@@ -672,7 +643,6 @@ fn yes_mode_rejects_legacy_prompting_flows_while_stdin_is_open() {
             git: false,
             claude: false,
             codex: false,
-            tmux: false,
             gh_ok: false,
         },
     );

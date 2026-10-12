@@ -15,11 +15,11 @@ export function Hero() {
         <h2 className="max-w-2xl text-base font-normal leading-relaxed text-gray-7 sm:text-lg">
           Tired of managing agents in terminal tabs? Struggling to keep track
           of which one needs attention and which one&apos;s stalled? Try
-          Shelbi, an open source, personal agent orchestrator built on tmux.
+          Shelbi, an open source, personal agent orchestrator for your terminal.
         </h2>
 
         <p className="-my-2.5 font-mono text-xs uppercase tracking-[0.25em] text-accent sm:text-sm">
-          open source · made with tmux · multi-machine
+          open source · one binary · multi-machine
         </p>
 
         <div className="mt-2 flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:gap-3">
