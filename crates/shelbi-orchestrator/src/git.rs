@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::process::Output;
 
+use chrono::{DateTime, Utc};
 use shelbi_core::{Error, Host, MachineKind, MergeStrategy, Project, Result, Issue};
 
 use crate::workspace::workspace_worktree;
@@ -727,11 +728,24 @@ pub(crate) fn lookup_pr_base(host: &Host, wt: &str, pr: u64) -> Result<String> {
 /// merge commit SHA GitHub recorded (`None` only in the rare window before
 /// GitHub materializes it), and the branch it merged into (`base`) so a
 /// restack cascade lands children on the ref GitHub actually used.
+///
+/// `head` and `merged_at` are the provenance the GitHub-merge reconcile pass
+/// (`crate::zen::github_merge_reconcile`) needs to reject a *stale* PR on a
+/// **reused** branch: the exact commit the PR merged (`headRefOid`) so it can
+/// check the branch's current tip is actually contained in it, and when the
+/// merge happened (`mergedAt`) so a PR from a previous cycle of the same
+/// branch — one that merged before the issue was reopened and re-dispatched —
+/// never finalizes the new cycle. `merged_at` is `None` only in the rare
+/// window before GitHub materializes it (or if it fails to parse).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MergedPr {
     pub(crate) pr: u64,
     pub(crate) sha: Option<String>,
     pub(crate) base: String,
+    /// The PR's `headRefOid` — the branch tip GitHub integrated.
+    pub(crate) head: String,
+    /// When GitHub recorded the merge (`mergedAt`).
+    pub(crate) merged_at: Option<DateTime<Utc>>,
 }
 
 /// Detect a *merged* GitHub PR for `branch`, returning the most recent one if
@@ -765,12 +779,17 @@ pub(crate) fn lookup_merged_pr(host: &Host, wt: &str, branch: &str) -> Result<Op
             "--limit",
             "1",
             "--json",
-            "number,mergeCommit,baseRefName",
+            "number,mergeCommit,headRefOid,mergedAt,baseRefName",
             // `.[0] // empty` yields nothing for an empty array (jq would
             // otherwise choke on indexing `null`), so no merged PR prints a
-            // blank line that [`parse_merged_pr`] reads as `None`.
+            // blank line that [`parse_merged_pr`] reads as `None`. `baseRefName`
+            // is emitted last because it is the only field that could (in
+            // principle) be read as the rest of the line — the OID / timestamp
+            // fields never contain spaces — so [`parse_merged_pr`]'s
+            // `splitn(5, ' ')` recovers the leading four cleanly and the branch
+            // name is whatever remains.
             "--jq",
-            r#".[0] // empty | "\(.number) \(.mergeCommit.oid // "") \(.baseRefName)""#,
+            r#".[0] // empty | "\(.number) \(.mergeCommit.oid // "") \(.headRefOid) \(.mergedAt // "") \(.baseRefName)""#,
         ],
     )?;
     if !out.status.success() {
@@ -789,19 +808,22 @@ pub(crate) fn lookup_merged_pr(host: &Host, wt: &str, branch: &str) -> Result<Op
     parse_merged_pr(&String::from_utf8_lossy(&out.stdout), branch)
 }
 
-/// Parse the single `"<number> <mergeCommitOid> <baseRefName>"` line
-/// [`lookup_merged_pr`]'s `--jq` emits. Split out so the empty / populated
-/// cases are unit-testable without gh. Git branch names and SHAs never
-/// contain spaces, so `splitn(3, ' ')` recovers the three fields even when
-/// the OID slot is empty (`"564  main"` → `["564", "", "main"]`).
+/// Parse the single `"<number> <mergeCommitOid> <headRefOid> <mergedAt> <baseRefName>"`
+/// line [`lookup_merged_pr`]'s `--jq` emits. Split out so the empty / populated
+/// cases are unit-testable without gh. SHAs and an RFC3339 timestamp never
+/// contain spaces, so `splitn(5, ' ')` recovers the leading four fields even
+/// when the merge-commit OID or `mergedAt` slot is empty, and the branch name
+/// (which also never contains a space in practice) is whatever remains.
 fn parse_merged_pr(stdout: &str, branch: &str) -> Result<Option<MergedPr>> {
     let line = stdout.trim();
     if line.is_empty() {
         return Ok(None);
     }
-    let mut parts = line.splitn(3, ' ');
+    let mut parts = line.splitn(5, ' ');
     let number = parts.next().unwrap_or("");
     let oid = parts.next().unwrap_or("");
+    let head = parts.next().unwrap_or("").trim();
+    let merged_at_raw = parts.next().unwrap_or("").trim();
     let base = parts.next().unwrap_or("").trim();
     let pr = number.parse::<u64>().map_err(|_| {
         Error::Other(format!(
@@ -814,11 +836,83 @@ fn parse_merged_pr(stdout: &str, branch: &str) -> Result<Option<MergedPr>> {
         )));
     }
     let sha = (!oid.is_empty()).then(|| oid.to_string());
+    // A merged PR always has a `headRefOid`; a blank slot means a malformed /
+    // truncated row. Fail loud rather than silently finalizing against an
+    // empty head the reconcile containment check can't trust.
+    if head.is_empty() {
+        return Err(Error::Other(format!(
+            "gh pr list --state merged: merged PR #{pr} for branch `{branch}` has an empty headRefOid"
+        )));
+    }
+    // `mergedAt` is best-effort: a blank slot (the pre-materialize window) or
+    // an unparseable value yields `None`, and the reconcile pass treats a
+    // missing merge time as "can't prove this PR is fresh" rather than erroring.
+    let merged_at = (!merged_at_raw.is_empty())
+        .then(|| DateTime::parse_from_rfc3339(merged_at_raw).ok())
+        .flatten()
+        .map(|dt| dt.with_timezone(&Utc));
     Ok(Some(MergedPr {
         pr,
         sha,
         base: base.to_string(),
+        head: head.to_string(),
+        merged_at,
     }))
+}
+
+/// Resolve the branch's **current** tip in the hub worktree: the local
+/// `refs/heads/<branch>` if present (worktrees share the common object store
+/// and refs, so a task branch an agent worktree committed to resolves here),
+/// else the `origin/<branch>` remote-tracking ref. `None` when neither exists —
+/// the merged-and-deleted finished state, where there is no un-integrated work
+/// to protect.
+///
+/// Used by [`crate::zen::github_merge_reconcile`] to decide whether a merged
+/// PR actually covers the work the branch currently points at, which is how a
+/// reopened issue re-dispatched on the same branch (new, un-merged tip) is told
+/// apart from the finished case the reconcile is meant to close.
+pub(crate) fn resolve_branch_tip(host: &Host, wt: &str, branch: &str) -> Result<Option<String>> {
+    for refspec in [
+        format!("refs/heads/{branch}"),
+        format!("refs/remotes/origin/{branch}"),
+    ] {
+        let out = run_in_dir(
+            host,
+            wt,
+            &["git", "rev-parse", "--verify", "--quiet", &refspec],
+        )?;
+        if out.status.success() {
+            let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !oid.is_empty() {
+                return Ok(Some(oid));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Is `tip` contained in the merged PR head `pr_head` — i.e. does the PR
+/// already integrate the branch's current tip? True when they are the same
+/// commit (the common case: the merged PR head IS the current branch tip) or
+/// when `tip` is an ancestor of `pr_head`. A non-zero `merge-base
+/// --is-ancestor` (tip is a *descendant* — new work beyond the merged PR — or
+/// `pr_head` isn't resolvable locally) yields `false`: the conservative answer
+/// that leaves the task in review rather than finalizing against a stale PR.
+pub(crate) fn pr_head_contains_tip(
+    host: &Host,
+    wt: &str,
+    tip: &str,
+    pr_head: &str,
+) -> Result<bool> {
+    if tip == pr_head {
+        return Ok(true);
+    }
+    let out = run_in_dir(
+        host,
+        wt,
+        &["git", "merge-base", "--is-ancestor", tip, pr_head],
+    )?;
+    Ok(out.status.success())
 }
 
 /// Backoff schedule for [`wait_for_merge_commit_sha`] — ~15s total, enough
@@ -1191,30 +1285,50 @@ mod tests {
     }
 
     #[test]
-    fn merged_pr_parses_number_sha_and_base() {
+    fn merged_pr_parses_number_sha_head_merged_at_and_base() {
         assert_eq!(
-            parse_merged_pr("564 feedfacecafebeef main\n", "b").unwrap(),
+            parse_merged_pr(
+                "564 feedfacecafebeef deadbeefcafe 2026-10-05T12:00:00Z main\n",
+                "b"
+            )
+            .unwrap(),
             Some(MergedPr {
                 pr: 564,
                 sha: Some("feedfacecafebeef".into()),
                 base: "main".into(),
+                head: "deadbeefcafe".into(),
+                merged_at: Some(
+                    DateTime::parse_from_rfc3339("2026-10-05T12:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc)
+                ),
             })
         );
     }
 
     #[test]
-    fn merged_pr_tolerates_empty_merge_commit_oid() {
-        // GitHub can report MERGED before recording the commit; the OID slot
-        // is blank (`"564  main"`) and we surface `sha: None` rather than
-        // mis-parsing the base as the SHA.
+    fn merged_pr_tolerates_empty_merge_commit_oid_and_merged_at() {
+        // GitHub can report MERGED before recording the merge commit; the OID
+        // slot is blank (`"564  <head> <mergedAt> main"`) and we surface
+        // `sha: None` rather than mis-parsing the head as the SHA. A blank
+        // `mergedAt` slot likewise surfaces `merged_at: None`.
         assert_eq!(
-            parse_merged_pr("564  main", "b").unwrap(),
+            parse_merged_pr("564  deadbeefcafe  main", "b").unwrap(),
             Some(MergedPr {
                 pr: 564,
                 sha: None,
                 base: "main".into(),
+                head: "deadbeefcafe".into(),
+                merged_at: None,
             })
         );
+    }
+
+    #[test]
+    fn merged_pr_errors_on_empty_head() {
+        // A merged PR always has a headRefOid; a blank slot is a malformed row
+        // and must fail loud rather than finalize against an unknown head.
+        assert!(parse_merged_pr("564 feedface  2026-10-05T12:00:00Z main", "b").is_err());
     }
 
     #[test]
