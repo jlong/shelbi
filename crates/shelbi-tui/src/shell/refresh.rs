@@ -34,25 +34,32 @@ pub struct ShellSnapshot {
     pub machines: Option<MachinesData>,
 }
 
-/// A handle to the running refresh worker. Dropping it stops the worker and joins
-/// its thread.
-pub struct ShellRefresher {
+/// A handle to a running refresh worker, generic over the payload `T` it
+/// publishes. Dropping it stops the worker and joins its thread.
+///
+/// The shell runs two: the core refresher ([`ShellSnapshot`] — sidebar, board,
+/// machines, all read from the daemon index / disk) and a separate activity
+/// refresher ([`crate::activity::ActivityData`]). Splitting them is what keeps a
+/// slow activity-title hydration pass from delaying the sidebar: the core
+/// snapshot publishes on its own worker, untouched by the activity read.
+pub struct Refresher<T> {
     request_tx: Option<Sender<()>>,
-    snapshot_rx: Receiver<ShellSnapshot>,
+    snapshot_rx: Receiver<T>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
-/// Spawn the refresh worker driven by `reader`. The worker blocks until
-/// [`ShellRefresher::request`] asks for a refresh, then calls `reader(gen)` off
-/// the UI thread and publishes the returned [`ShellSnapshot`]. Requests that pile
-/// up while a read is in flight coalesce into a single refresh.
-pub fn spawn<F>(reader: F) -> ShellRefresher
+/// Spawn a refresh worker driven by `reader`. The worker blocks until
+/// [`Refresher::request`] asks for a refresh, then calls `reader(gen)` off the UI
+/// thread and publishes the returned value. Requests that pile up while a read is
+/// in flight coalesce into a single refresh.
+pub fn spawn<T, F>(reader: F) -> Refresher<T>
 where
-    F: Fn(u64) -> ShellSnapshot + Send + 'static,
+    T: Send + 'static,
+    F: Fn(u64) -> T + Send + 'static,
 {
     let (request_tx, request_rx) = mpsc::channel::<()>();
-    let (snapshot_tx, snapshot_rx) = mpsc::channel::<ShellSnapshot>();
+    let (snapshot_tx, snapshot_rx) = mpsc::channel::<T>();
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
 
@@ -75,7 +82,7 @@ where
         })
         .expect("spawn shell refresh worker thread");
 
-    ShellRefresher {
+    Refresher {
         request_tx: Some(request_tx),
         snapshot_rx,
         stop,
@@ -83,7 +90,7 @@ where
     }
 }
 
-impl ShellRefresher {
+impl<T> Refresher<T> {
     /// Ask for a refresh. Returns immediately — the read happens on the worker.
     /// Returns `false` if the worker has stopped.
     pub fn request(&self) -> bool {
@@ -96,7 +103,7 @@ impl ShellRefresher {
     /// The most recent snapshot available without blocking, draining older queued
     /// ones so the caller always gets the freshest. `None` when nothing new has
     /// arrived since the last call.
-    pub fn latest(&self) -> Option<ShellSnapshot> {
+    pub fn latest(&self) -> Option<T> {
         let mut newest = None;
         while let Ok(s) = self.snapshot_rx.try_recv() {
             newest = Some(s);
@@ -118,7 +125,7 @@ impl ShellRefresher {
     }
 }
 
-impl Drop for ShellRefresher {
+impl<T> Drop for Refresher<T> {
     fn drop(&mut self) {
         self.stop();
     }

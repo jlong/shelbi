@@ -65,7 +65,7 @@ use shelbi_orchestrator::project_create::{self, ResolvedProjectRoot};
 use shelbi_state::keymap::{load_keymaps, DisplayStyle, GlobalAction, KeyChord, Keymaps};
 use shelbi_term::Size;
 
-use crate::activity::ActivityApp;
+use crate::activity::{ActivityApp, ActivityData, ActivityMetaCache};
 use crate::kanban::{ExecutorMovePersister, KanbanApp};
 use crate::machines::MachinesApp;
 use caps::Caps;
@@ -254,6 +254,23 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
     refresher.request();
     let mut last_refresh = Instant::now();
 
+    // The activity feed resolves task titles, which on a remote (github) board is
+    // live `gh` traffic that can take seconds on a large closed history. It runs
+    // on its **own** refresher so a slow title-hydration pass never delays the
+    // sidebar/board snapshot above, and carries a persistent metadata cache so
+    // resolution is incremental and terminates (closed-history titles resolve
+    // once, then freeze) instead of re-sweeping done issues forever — the
+    // sidebar-never-loads / endless-refetch incident.
+    let activity_cache = Arc::new(Mutex::new(ActivityMetaCache::default()));
+    let proj_activity = project.to_string();
+    let activity_refresher: refresh::Refresher<ActivityData> = {
+        let cache = Arc::clone(&activity_cache);
+        refresh::spawn(move |_generation| {
+            ActivityApp::read_activity_data(&proj_activity, &cache)
+        })
+    };
+    activity_refresher.request();
+
     // Daemon change notifications drive refreshes (the native views don't poll);
     // the periodic request below is the fallback for a hubless project.
     let (_changes, change_rx) = changes::spawn(project);
@@ -347,10 +364,18 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         }
         if changed || last_refresh.elapsed() >= REFRESH_INTERVAL {
             refresher.request();
+            // Drive the activity worker on the same cadence so its incremental
+            // title hydration keeps making progress (and keeps picking up new
+            // events) without ever gating the core snapshot below.
+            activity_refresher.request();
             last_refresh = Instant::now();
         }
         if let Some(snap) = refresher.latest() {
             state.apply_snapshot(snap);
+        }
+        if let Some(activity) = activity_refresher.latest() {
+            state.activity.apply_activity_data(activity);
+            state.dirty = true;
         }
         // A change arrived for the workspace the main area is showing: if its
         // attach was idle or failed (no session yet), retry so a session that
@@ -3628,18 +3653,22 @@ fn render_notice(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
 
 // --- the background model reader -------------------------------------------
 
-/// Read a fresh snapshot of every view's data for `project`. Runs on the
-/// refresher thread (never the UI thread): the sidebar model plus the opaque
-/// data bundles the embedded native views fold in. The board read goes through
-/// the daemon-owned index (no per-pane `gh` sweep); the activity read is served
-/// from the store's TTL cache; machines reads the poller's persisted state. A
-/// slow read here never blocks the event loop — the loop only polls
-/// [`ShellRefresher::latest`].
+/// Read a fresh core snapshot for `project`. Runs on the core refresher thread
+/// (never the UI thread): the sidebar model plus the opaque data bundles the
+/// embedded board and machines views fold in. The board read goes through the
+/// daemon-owned index (no per-pane `gh` sweep); machines reads the poller's
+/// persisted state — both fast, disk/index reads. A slow read here never blocks
+/// the event loop (the loop only polls [`refresh::Refresher::latest`]).
+///
+/// The activity feed is **not** read here: its title resolution is live `gh`
+/// traffic that can take seconds on a large closed history, so it runs on a
+/// separate refresher (see [`run_with`]) and never gates this snapshot — the fix
+/// for the sidebar stalling behind a done-history hydration sweep.
 fn read_snapshot(project: &str, _generation: u64) -> ShellSnapshot {
     ShellSnapshot {
         sidebar: sidebar_model::read_sidebar_model(project),
         board: Some(KanbanApp::read_board_data(project)),
-        activity: Some(ActivityApp::read_activity_data(project)),
+        activity: None,
         machines: Some(MachinesApp::read_data(project)),
     }
 }

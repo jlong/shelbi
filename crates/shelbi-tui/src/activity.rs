@@ -30,6 +30,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Datelike, Local, Utc};
@@ -267,11 +268,14 @@ struct TaskMeta {
 /// time-to-live (`REMOTE_META_TTL`).
 ///
 /// `meta` is `None` for a **confirmed miss** — an id the store resolved to
-/// nothing (a done task the open index doesn't carry, or a deleted one). Caching
-/// the miss (a *negative cache*, with the same TTL) is what stops the feed from
-/// re-resolving an unresolvable id on every render frame: the storm the
-/// 2026-09-08 incident attributed to the Activity view (`GitHubStore::get` per
-/// event, id-search + issue-fetch per tick, no negative cache).
+/// nothing (a pre-GitHub slug task id the board doesn't carry as an issue, a done
+/// task the open index doesn't carry, or a deleted one). A miss is *frozen* for
+/// the session (see [`entry_stale`]): searched at most once, never re-resolved on
+/// a TTL. That is what stops the feed from re-resolving an unresolvable id — both
+/// the per-render-frame storm the 2026-09-08 incident attributed to the Activity
+/// view (`GitHubStore::get` per event, id-search + issue-fetch per tick, no
+/// negative cache) and the per-sweep `id-search` re-run the sidebar-never-loads
+/// rework flagged (a short-TTL miss going stale every 15s, forever).
 #[derive(Debug, Clone)]
 struct TaskCacheEntry {
     /// Resolved metadata, or `None` for a confirmed miss (negative cache).
@@ -282,6 +286,14 @@ struct TaskCacheEntry {
     /// When this entry was last resolved from the store — drives the TTL refresh
     /// for entries that have no `mtime` to compare against (and every miss).
     fetched: Instant,
+    /// Whether the resolved issue sits in a terminal (done/canceled) column. A
+    /// resolved terminal issue is **frozen**: closed history doesn't change, so
+    /// the feed never re-resolves it on the remote TTL. This is what stops a
+    /// remote board from re-sweeping hundreds of done issues every tick — the
+    /// done-history refetch loop (sidebar-never-loads incident). `false` for a
+    /// miss (frozen on its own rule) and for open issues (which keep the short
+    /// TTL so edits show up).
+    terminal: bool,
 }
 
 /// How long a task-metadata cache entry with no local file (a remote backend)
@@ -300,40 +312,181 @@ pub(crate) struct ActivityData {
     status: Option<String>,
 }
 
-/// Resolve task metadata for every id referenced by `events`, building a fresh
-/// cache (resolved entries + negatively-cached misses). The free-function form of
-/// [`ActivityApp::resolve_task_meta`] used by the off-thread
-/// [`ActivityApp::read_activity_data`] path: it takes no `&self`, so it is safe on
-/// a background worker. Since it builds the cache from scratch it fetches every
-/// referenced id (the store's own TTL cache keeps that cheap).
-fn resolve_task_meta_for(project_name: &str, events: &[Event]) -> HashMap<String, TaskCacheEntry> {
-    use std::collections::HashSet;
-    let mut cache: HashMap<String, TaskCacheEntry> = HashMap::new();
-    let mut wanted: Vec<String> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    for ev in events {
-        if let Some(id) = event_task_id(ev) {
-            if seen.insert(id) {
-                wanted.push(id.to_string());
+/// How many previously-unresolved ids one off-thread activity read resolves.
+///
+/// The shell reads the feed on a background worker and re-requests it on the
+/// refresh cadence, so resolution is **incremental**: each pass resolves at most
+/// this many still-unknown ids, then publishes the growing cache; the next pass
+/// picks up where it left off. That bounds the work (and the GraphQL spend) per
+/// pass and lets closed-history titles fill in progressively instead of the
+/// worker grinding through hundreds of issues in one blocking call before the
+/// feed shows a single title. One batch maps to one aliased `fetch_many` request
+/// on the `github` backend. Once every referenced id is cached (and the terminal
+/// ones frozen) a pass resolves nothing and the loop goes quiet — the exit
+/// condition the done-history refetch incident lacked.
+const MAX_META_RESOLVE_PER_PASS: usize = 50;
+
+/// Whether a resolved issue in `col` has a frozen title — a terminal
+/// (done/canceled) column. Closed history doesn't change, so such an entry is
+/// never re-resolved once cached. A custom status that doesn't map to
+/// `Done`/`Archived` is treated as live (conservative: it just keeps the short
+/// TTL).
+fn is_frozen_column(col: &Column) -> bool {
+    matches!(col.category(), StatusCategory::Done | StatusCategory::Archived)
+}
+
+/// Whether `entry` needs re-resolving. The free-function twin of
+/// [`ActivityApp::task_meta_stale`] so the on-`&self` render path and the
+/// off-thread worker path share one rule:
+///
+/// * an unknown id (no entry) is always wanted;
+/// * a **confirmed miss** is frozen — searched at most once per session (the
+///   steady-state fix: see below);
+/// * a **resolved terminal** issue is frozen — never re-fetched (the loop fix);
+/// * the filesystem backend invalidates exactly on the task file's `mtime`;
+/// * a resolved *open* remote entry (no `mtime`) falls back to the short TTL.
+///
+/// A confirmed miss (`meta: None`) is an id the store resolved to nothing: a
+/// pre-GitHub slug task id the board carries in its event history but that is not
+/// a GitHub issue, or a deleted one. Such an id will practically never resolve,
+/// so re-searching it once the short TTL lapses — every pass, forever — is the
+/// endless GraphQL spend the sidebar-never-loads rework flagged (a feed full of
+/// slug ids re-ran ~234 `id-search` queries per sweep). Freezing it means an
+/// unresolvable id costs at most one search per session. Misses are recorded
+/// only after a *successful* fetch (a transient fetch error leaves the id
+/// unknown, so a later pass retries it — see the resolve paths), so a real
+/// outage never permanently hides a live title.
+fn entry_stale(entry: Option<&TaskCacheEntry>, mtime: Option<SystemTime>) -> bool {
+    match entry {
+        None => true,
+        Some(entry) => {
+            // A confirmed miss: frozen for the session (never re-searched).
+            if entry.meta.is_none() {
+                return false;
+            }
+            // A resolved terminal (done/canceled) issue: closed history is frozen.
+            if entry.terminal {
+                return false;
+            }
+            if mtime.is_some() || entry.mtime.is_some() {
+                entry.mtime != mtime
+            } else {
+                entry.fetched.elapsed() >= REMOTE_META_TTL
             }
         }
     }
-    if wanted.is_empty() {
-        return cache;
+}
+
+/// The persistent task-metadata cache the shell carries **across** background
+/// activity reads. Keeping it (rather than rebuilding from scratch each pass) is
+/// what makes resolution incremental: a pass only fetches ids that are unknown or
+/// stale, so once closed history has loaded once the feed stops re-sweeping it.
+/// Owned by the shell, locked for the duration of each off-thread read.
+#[derive(Default)]
+pub(crate) struct ActivityMetaCache {
+    entries: HashMap<String, TaskCacheEntry>,
+    /// Logged `true` once the first hydration pass has run, so the start line is
+    /// emitted exactly once per process (not on every quiet pass).
+    hydration_started: bool,
+    /// Logged `true` once a pass finds nothing left to resolve after at least one
+    /// fetch, so the finish line is emitted exactly once.
+    hydration_finished: bool,
+}
+
+/// Resolve task metadata for the ids referenced by `events`, folding the result
+/// into the persistent `cache` and returning a snapshot the feed renders from.
+///
+/// Incremental and bounded (see [`MAX_META_RESOLVE_PER_PASS`]): only ids that are
+/// unknown or stale ([`entry_stale`]) are candidates, at most a batch per pass.
+/// Resolved terminal issues are frozen so an idle board with hundreds of done
+/// cards makes **no** repeat requests — the done-history refetch loop fix. The
+/// store's own TTL/negative caches back the rare live fetch that remains.
+fn resolve_task_meta_into(
+    project_name: &str,
+    events: &[Event],
+    cache: &mut ActivityMetaCache,
+) -> HashMap<String, TaskCacheEntry> {
+    use std::collections::HashSet;
+    // Candidate ids: unique, referenced, and unknown-or-stale against the cache.
+    let mut wanted: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for ev in events {
+        let Some(id) = event_task_id(ev) else { continue };
+        if !seen.insert(id) {
+            continue;
+        }
+        let mtime = task_file_mtime(project_name, id);
+        if entry_stale(cache.entries.get(id), mtime) {
+            wanted.push(id.to_string());
+        }
     }
+
+    if wanted.is_empty() {
+        // Fully hydrated (every referenced id cached and fresh): announce it once
+        // so the next loop like this is diagnosable from `tui.log`, then make no
+        // request. This is the quiet steady state the incident never reached.
+        if cache.hydration_started && !cache.hydration_finished {
+            cache.hydration_finished = true;
+            tracing::info!(
+                project = %project_name,
+                cached = cache.entries.len(),
+                "activity title hydration complete; feed is quiet"
+            );
+        }
+        return cache.entries.clone();
+    }
+
+    let total_wanted = wanted.len();
+    // Resolve at most one batch this pass; the next pass continues.
+    wanted.truncate(MAX_META_RESOLVE_PER_PASS);
+
+    if !cache.hydration_started {
+        cache.hydration_started = true;
+        tracing::info!(
+            project = %project_name,
+            pending = total_wanted,
+            batch = wanted.len(),
+            "activity title hydration started"
+        );
+    } else {
+        tracing::debug!(
+            project = %project_name,
+            pending = total_wanted,
+            batch = wanted.len(),
+            "activity title hydration pass"
+        );
+    }
+    // A new batch means a later pass will reach the "complete" line again.
+    cache.hydration_finished = false;
+
     let store = match shelbi_state::issue_store_for(project_name) {
         Ok(s) => s,
-        Err(_) => return cache,
+        Err(_) => return cache.entries.clone(),
     };
     let refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
-    let fetched = store.fetch_many(&refs).unwrap_or_default();
+    // A fetch *error* is not a miss: it means the store couldn't answer (a
+    // GraphQL/connection blip, a rate-limit park), not that these ids resolve to
+    // nothing. Leave them unknown so a later pass retries — negative-caching them
+    // here would freeze live titles as misses for the whole session on one blip.
+    let fetched = match store.fetch_many(&refs) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!(
+                project = %project_name,
+                error = %e,
+                "activity title fetch failed; leaving ids unresolved to retry next pass"
+            );
+            return cache.entries.clone();
+        }
+    };
     let now = Instant::now();
     let mut resolved: HashSet<String> = HashSet::new();
     for tf in fetched {
         let id = tf.task.id.clone();
         let mtime = task_file_mtime(project_name, &id);
+        let terminal = is_frozen_column(&tf.task.column);
         resolved.insert(id.clone());
-        cache.insert(
+        cache.entries.insert(
             id,
             TaskCacheEntry {
                 meta: Some(TaskMeta {
@@ -343,23 +496,27 @@ fn resolve_task_meta_for(project_name: &str, events: &[Event]) -> HashMap<String
                 }),
                 mtime,
                 fetched: now,
+                terminal,
             },
         );
     }
-    // Negative-cache the misses so an unresolvable id isn't re-searched.
+    // Negative-cache the misses. An id absent from a *successful* fetch resolved
+    // to nothing (a pre-GitHub slug id, a deleted issue); `entry_stale` freezes it
+    // for the session so it is searched at most once — not re-run every sweep.
     for id in wanted {
         if !resolved.contains(&id) {
-            cache.insert(
+            cache.entries.insert(
                 id,
                 TaskCacheEntry {
                     meta: None,
                     mtime: None,
                     fetched: now,
+                    terminal: false,
                 },
             );
         }
     }
-    cache
+    cache.entries.clone()
 }
 
 /// Active filter pills above the feed. Both flags off means "All" — the
@@ -680,15 +837,22 @@ impl ActivityApp {
     /// Read the activity feed off the UI thread — the IO half of a refresh for
     /// the single-process TUI shell, which cannot afford a blocking disk / `gh`
     /// read on its event loop. Unlike [`refresh`](Self::refresh) (the standalone
-    /// process's incremental, tail-reading path) this does a full re-read of
-    /// `events.log` and resolves task metadata for every referenced id into a
-    /// fresh cache, so it is self-contained — it takes only the project name and
-    /// is safe to run on a background worker. The result is folded in by
+    /// process's tail-reading path) this does a full re-read of `events.log`, but
+    /// task metadata is resolved **incrementally** into the shell-owned persistent
+    /// `cache`: a pass only fetches ids that are unknown or stale, at most a batch
+    /// at a time ([`MAX_META_RESOLVE_PER_PASS`]), and resolved terminal issues are
+    /// frozen. So once closed history has loaded once the feed stops re-sweeping
+    /// it, instead of the per-pass full re-fetch that looped forever on a large
+    /// remote board (the sidebar-never-loads incident). The result is folded in by
     /// [`apply_activity_data`](Self::apply_activity_data).
     ///
-    /// A full re-read is cheap (the log is small) and `fetch_many` is served from
-    /// the store's own TTL cache, so repeated reads do not spam the tracker.
-    pub(crate) fn read_activity_data(project_name: &str) -> ActivityData {
+    /// Runs on the shell's dedicated activity worker, *separate* from the
+    /// sidebar/board read, so even the first cold hydration pass never delays the
+    /// sidebar painting.
+    pub(crate) fn read_activity_data(
+        project_name: &str,
+        cache: &Mutex<ActivityMetaCache>,
+    ) -> ActivityData {
         let path = match events_log_path() {
             Ok(p) => p,
             Err(e) => {
@@ -716,7 +880,10 @@ impl ActivityApp {
             .filter(|l| !l.trim().is_empty())
             .map(parse_event_line)
             .collect();
-        let task_cache = resolve_task_meta_for(project_name, &events);
+        let task_cache = {
+            let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+            resolve_task_meta_into(project_name, &events, &mut guard)
+        };
         ActivityData {
             events,
             task_cache,
@@ -793,20 +960,12 @@ impl ActivityApp {
         self.task_cache.get(id).and_then(|e| e.meta.as_ref())
     }
 
-    /// Whether `id`'s cache entry needs re-resolving. Backend-aware: the
-    /// filesystem board invalidates exactly on the task file's `mtime`; a remote
-    /// backend (no local file) and every confirmed miss fall back to the TTL.
+    /// Whether `id`'s cache entry needs re-resolving — delegates to the shared
+    /// [`entry_stale`] rule: the filesystem board invalidates on the task file's
+    /// `mtime`; a resolved terminal issue is frozen; a remote entry and every
+    /// confirmed miss fall back to the TTL.
     fn task_meta_stale(&self, id: &str, mtime: Option<SystemTime>) -> bool {
-        match self.task_cache.get(id) {
-            None => true,
-            Some(entry) => {
-                if mtime.is_some() || entry.mtime.is_some() {
-                    entry.mtime != mtime
-                } else {
-                    entry.fetched.elapsed() >= REMOTE_META_TTL
-                }
-            }
-        }
+        entry_stale(self.task_cache.get(id), mtime)
     }
 
     /// Resolve every task id the loaded feed references that is stale or unknown,
@@ -844,14 +1003,20 @@ impl ActivityApp {
             Err(_) => return,
         };
         let refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
-        // One aliased request for every miss; ids that don't resolve are simply
-        // absent from the result (the `fetch_many` contract).
-        let fetched = store.fetch_many(&refs).unwrap_or_default();
+        // One aliased request for every stale id; ids that don't resolve are
+        // simply absent from the result (the `fetch_many` contract). A fetch
+        // *error*, though, is not a miss — leave those ids unknown so a later pass
+        // retries, rather than freezing live titles as misses on a blip.
+        let fetched = match store.fetch_many(&refs) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
         let now = Instant::now();
         let mut resolved: HashSet<String> = HashSet::new();
         for tf in fetched {
             let id = tf.task.id.clone();
             let mtime = task_file_mtime(&self.project_name, &id);
+            let terminal = is_frozen_column(&tf.task.column);
             resolved.insert(id.clone());
             self.task_cache.insert(
                 id,
@@ -863,11 +1028,13 @@ impl ActivityApp {
                     }),
                     mtime,
                     fetched: now,
+                    terminal,
                 },
             );
         }
-        // Negative-cache the misses so an unresolvable id isn't re-searched until
-        // the TTL — the fix for "no negative/closed-id cache".
+        // Negative-cache the misses: an id absent from a successful fetch is
+        // frozen for the session by `entry_stale`, so it is searched at most once
+        // — the fix for "no negative/closed-id cache" and the per-sweep re-search.
         for id in wanted {
             if !resolved.contains(&id) {
                 self.task_cache.insert(
@@ -876,6 +1043,7 @@ impl ActivityApp {
                         meta: None,
                         mtime: None,
                         fetched: now,
+                        terminal: false,
                     },
                 );
             }
@@ -4338,6 +4506,302 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             calls.load(std::sync::atomic::Ordering::SeqCst),
             after_first,
             "an unresolvable id is negative-cached, not re-searched every tick"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // --- done-history refetch loop: the exit condition --------------------
+
+    fn resolved_entry(terminal: bool, age: Duration) -> TaskCacheEntry {
+        TaskCacheEntry {
+            meta: Some(TaskMeta {
+                title: "T".into(),
+                branch: None,
+                assigned_to: None,
+            }),
+            mtime: None,
+            fetched: Instant::now() - age,
+            terminal,
+        }
+    }
+
+    /// The loop's exit condition, isolated: a resolved **terminal** (done/
+    /// canceled) issue AND a confirmed **miss** are both frozen — never
+    /// re-resolved, even long past the remote TTL — so an idle board full of done
+    /// cards and unresolvable slug ids stops generating `fetch_many` traffic. An
+    /// *open* issue past the TTL still re-resolves (edits must show). This is
+    /// exactly the asymmetry the endless-refetch incident (and its rework) missed.
+    #[test]
+    fn resolved_terminal_entries_and_misses_are_frozen_past_the_ttl() {
+        let long_ago = REMOTE_META_TTL + Duration::from_secs(3600);
+
+        // A done issue resolved an hour ago: frozen, not stale (no re-fetch).
+        assert!(
+            !entry_stale(Some(&resolved_entry(true, long_ago)), None),
+            "a resolved terminal issue is frozen and never re-resolved"
+        );
+        // An open issue resolved an hour ago: stale (titles can still change).
+        assert!(
+            entry_stale(Some(&resolved_entry(false, long_ago)), None),
+            "a resolved open issue past the TTL is re-resolved"
+        );
+        // A confirmed miss, even far past the old 15s TTL, is frozen: searched at
+        // most once per session, not re-run every sweep (the rework fix).
+        let miss = TaskCacheEntry {
+            meta: None,
+            mtime: None,
+            fetched: Instant::now() - long_ago,
+            terminal: false,
+        };
+        assert!(
+            !entry_stale(Some(&miss), None),
+            "a confirmed miss is frozen past the TTL, not re-searched every sweep"
+        );
+        // An unknown id (no entry at all) is still always wanted — the freeze only
+        // applies once an id has been searched and confirmed to resolve to nothing.
+        assert!(entry_stale(None, None), "an unknown id is wanted");
+
+        // is_frozen_column classifies the terminal columns and nothing else.
+        assert!(is_frozen_column(&Column::done()));
+        assert!(is_frozen_column(&Column::canceled()));
+        assert!(!is_frozen_column(&Column::in_progress()));
+        assert!(!is_frozen_column(&Column::todo()));
+    }
+
+    /// The shell's off-thread activity path (the one that looped): with a
+    /// persistent [`ActivityMetaCache`] carried across reads, a board of done
+    /// tasks hydrates its titles **once** and every subsequent read makes no
+    /// further GraphQL request — the loop terminates and does not restart on each
+    /// refresh. (Before the fix this path rebuilt the cache from scratch every
+    /// pass and re-fetched every done issue forever.)
+    #[test]
+    fn done_history_hydration_terminates_and_does_not_restart_each_pass() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-activity-loop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "actv-loop");
+
+        // Index numbers so resolution takes the fast path (no per-id search) and
+        // the batch is a single aliased IssuesByNumber request.
+        let mut idx = shelbi_state::BoardIndex::fresh(Vec::new());
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("actv-loop", &idx).unwrap();
+        for (id, n) in [("d1", 1), ("d2", 2), ("d3", 3)] {
+            shelbi_state::record_board_index_number("actv-loop", id, n).unwrap();
+        }
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rec = std::sync::Arc::clone(&calls);
+        shelbi_state::set_test_gh_runner(move |args: &[&str]| {
+            let joined = args.join(" ");
+            if joined.contains("graphql") {
+                rec.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if joined.contains("IssuesByNumber") {
+                Ok(r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T12:00:00Z"},
+                "repository":{
+                  "i0":{"number":1,"title":"Done One","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-02T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/d1"},{"name":"shelbi:status/done"}]}},
+                  "i1":{"number":2,"title":"Done Two","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-02T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/d2"},{"name":"shelbi:status/done"}]}},
+                  "i2":{"number":3,"title":"Done Three","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-02T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/d3"},{"name":"shelbi:status/done"}]}}
+                }}}"#.to_string())
+            } else {
+                Ok(String::new())
+            }
+        });
+
+        let events = vec![
+            done_issue_event("d1"),
+            done_issue_event("d2"),
+            done_issue_event("d3"),
+        ];
+        let mut cache = ActivityMetaCache::default();
+
+        // First pass: one aliased request resolves all three done titles.
+        let snap = resolve_task_meta_into("actv-loop", &events, &mut cache);
+        let after_first = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(after_first, 1, "done history hydrates in ONE aliased request");
+        assert_eq!(snap.get("d1").and_then(|e| e.meta.as_ref()).map(|m| m.title.as_str()), Some("Done One"));
+        assert!(cache.entries["d1"].terminal, "a done issue is cached as terminal (frozen)");
+        assert!(cache.hydration_started, "the start was recorded");
+
+        // Every subsequent pass is quiet: the frozen done entries are never
+        // re-resolved, so the loop does not restart on each refresh.
+        for _ in 0..10 {
+            resolve_task_meta_into("actv-loop", &events, &mut cache);
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            after_first,
+            "done-history hydration terminates: no further requests once resolved"
+        );
+        assert!(cache.hydration_finished, "the quiet steady state was recorded");
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The rework's steady-state fix: a feed full of **unresolvable** ids — the
+    /// slug task ids from before the GitHub board (`rt-merge-main-into-umbrella`
+    /// and friends) that are not GitHub issues — is searched at most *once per id*
+    /// across many passes, including passes long after the old 15s TTL would have
+    /// expired. Before the fix each miss went stale on the short TTL every sweep,
+    /// so an idle board re-ran ~234 `id-search` queries forever (over budget).
+    /// After hydration the worker makes **zero** GitHub requests per pass.
+    #[test]
+    fn unresolvable_slug_ids_are_searched_once_per_session_not_every_sweep() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-activity-slug-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "actv-slug");
+
+        // Unique slug ids (no index number → resolution falls to the label
+        // search). A nonce keeps them out of the process-global id→number miss
+        // cache a sibling test might have warmed, so the first pass genuinely
+        // searches each one.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let slug_ids: Vec<String> = (0..5)
+            .map(|i| format!("rt-legacy-slug-{nonce}-{i}"))
+            .collect();
+
+        // A fake `gh` that counts GraphQL calls and answers every id-search empty
+        // — each slug resolves to nothing (it names no GitHub issue).
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rec = std::sync::Arc::clone(&calls);
+        shelbi_state::set_test_gh_runner(move |args: &[&str]| {
+            if args.join(" ").contains("graphql") {
+                rec.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(r#"{"data":{"search":{"nodes":[]}}}"#.to_string())
+        });
+
+        let events: Vec<Event> = slug_ids.iter().map(|id| done_issue_event(id)).collect();
+        let mut cache = ActivityMetaCache::default();
+
+        // First pass: one label search per slug, then every id is negative-cached.
+        resolve_task_meta_into("actv-slug", &events, &mut cache);
+        let after_first = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            after_first,
+            slug_ids.len(),
+            "the first pass searches each unresolvable id exactly once"
+        );
+        for id in &slug_ids {
+            assert!(
+                cache.entries.get(id).is_some_and(|e| e.meta.is_none()),
+                "{id} is negative-cached as a confirmed miss"
+            );
+        }
+
+        // Age every cached miss well past the old 15s remote TTL, simulating many
+        // minutes of sweeps. Under the old rule each would now be re-searched; the
+        // frozen-miss rule holds, so the next passes make NO further request.
+        let long_ago = Instant::now() - (REMOTE_META_TTL + Duration::from_secs(3600));
+        for entry in cache.entries.values_mut() {
+            entry.fetched = long_ago;
+        }
+
+        for _ in 0..10 {
+            resolve_task_meta_into("actv-slug", &events, &mut cache);
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            after_first,
+            "a confirmed miss is frozen for the session: no re-search after the TTL lapses"
+        );
+        assert!(
+            cache.hydration_finished,
+            "an idle board of unresolvable ids reaches the quiet steady state"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A transient fetch *error* must not be mistaken for a miss: the ids stay
+    /// unknown (not frozen), so a later pass retries them once the store recovers.
+    /// Freezing a live id as a miss on one GraphQL blip would hide its title for
+    /// the whole session — the safety valve on the steady-state freeze.
+    #[test]
+    fn a_fetch_error_does_not_negative_cache_ids() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-activity-err-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "actv-err");
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let id = format!("rt-transient-{nonce}");
+
+        // First: the search transport fails (a connection blip / rate-limit park).
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fail_rt = std::sync::Arc::clone(&fail);
+        shelbi_state::set_test_gh_runner(move |_args: &[&str]| {
+            if fail_rt.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(shelbi_core::Error::Other("transient".into()))
+            } else {
+                Ok(r#"{"data":{"search":{"nodes":[]}}}"#.to_string())
+            }
+        });
+
+        let events = vec![done_issue_event(&id)];
+        let mut cache = ActivityMetaCache::default();
+        resolve_task_meta_into("actv-err", &events, &mut cache);
+        assert!(
+            !cache.entries.contains_key(&id),
+            "a fetch error leaves the id unknown, not negative-cached"
+        );
+        assert!(entry_stale(cache.entries.get(&id), None), "the id is still wanted");
+
+        // The store recovers and now answers (empty → a genuine miss this time).
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        resolve_task_meta_into("actv-err", &events, &mut cache);
+        assert!(
+            cache.entries.get(&id).is_some_and(|e| e.meta.is_none()),
+            "once the store answers, the unresolvable id is negative-cached"
+        );
+        assert!(
+            !entry_stale(cache.entries.get(&id), None),
+            "and the confirmed miss is then frozen"
         );
 
         shelbi_state::clear_test_gh_runner();

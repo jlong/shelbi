@@ -6,7 +6,7 @@
 //! board or workspace change it publishes a [`shelbi_state::ChangeNotification`]
 //! on the hub's `subscribe` stream; this subscriber forwards a wake signal onto a
 //! channel the shell drains each tick and turns into a
-//! [`ShellRefresher::request`](super::refresh::ShellRefresher::request). A short
+//! [`Refresher::request`](super::refresh::Refresher::request). A short
 //! periodic refresh in the event loop is the fallback for when no daemon is
 //! running (so a bare project still updates).
 //!
