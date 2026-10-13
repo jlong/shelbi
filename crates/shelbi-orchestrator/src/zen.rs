@@ -65,6 +65,19 @@ use crate::workspace::{rebase_workspace_branch_onto_default, workspace_worktree,
 /// pending bucket to clear. Matches gh's own `--watch` default.
 const CI_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long a no-required-checks PR whose head shows *no GitHub Actions check
+/// runs at all* must be observed before an otherwise-passing snapshot is graded
+/// green. This closes the premature-green race: in the seconds right after a
+/// force-push, GitHub has not yet created the head commit's `app-ci` run, so the
+/// only reported context can be an already-green third-party status (e.g.
+/// Vercel). Until GitHub attaches an Actions run — or this grace elapses, which
+/// means the repo/PR genuinely has no Actions CI (a docs-only diff that skips
+/// every path filter) — the verdict stays pending instead of green. The grace
+/// only ever delays a PR with zero Actions runs; a real code PR leaves the grace
+/// window the instant its first Actions run attaches and is then graded on that
+/// run's progress, so it adds no latency to normal CI.
+const CI_SETTLE_GRACE: Duration = Duration::from_secs(60);
+
 /// Which set of checks [`ci_watch`] is watching on this poll loop.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -935,7 +948,7 @@ pub fn ci_watch(
     expected: &PinnedPrIdentity,
     timeout: Duration,
 ) -> Result<CiVerdict> {
-    ci_watch_with_poll_interval(project, pr, expected, timeout, CI_POLL_INTERVAL)
+    ci_watch_with_poll_interval(project, pr, expected, timeout, CI_POLL_INTERVAL, CI_SETTLE_GRACE)
 }
 
 fn ci_watch_with_poll_interval(
@@ -944,19 +957,25 @@ fn ci_watch_with_poll_interval(
     expected: &PinnedPrIdentity,
     timeout: Duration,
     poll_interval: Duration,
+    settle_grace: Duration,
 ) -> Result<CiVerdict> {
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
     let repository = lookup_origin_repository(&host, &wt)?;
     expected.verify_repository(&repository, "before CI watch")?;
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
     loop {
         // This single response is the preflight, the poll, and the final
         // green authority. There is no interval in which checks can be read
         // from a transient B while both surrounding head reads see A.
         let snapshot = ci_snapshot(&host, &wt, &repository, pr)?;
         verify_ci_watch_snapshot(&snapshot, pr, expected, "while polling checks")?;
-        if let Some(verdict) = classify_ci_snapshot(&snapshot) {
+        // `started` tracks the pinned head: `ci_watch` runs immediately after
+        // `pr-create` publishes this exact commit, and head movement is rejected
+        // above, so elapsed-since-start is the age of the commit under watch.
+        let settle_satisfied = started.elapsed() >= settle_grace;
+        if let Some(verdict) = classify_ci_snapshot(&snapshot, settle_satisfied) {
             return Ok(verdict);
         }
 
@@ -983,6 +1002,12 @@ fn ci_watch_with_poll_interval(
 #[derive(Debug, Default)]
 pub struct ScopedCiState {
     seen: std::collections::BTreeMap<String, (String, String)>,
+    /// `task_id -> (head_sha, first observed)` for the head currently under
+    /// watch. The scoped poll is a single sample per tick, so it keeps its own
+    /// clock here: the settle grace that guards against premature green
+    /// (see [`CI_SETTLE_GRACE`]) is measured from the first tick that saw this
+    /// head. Reset when the head moves; dropped when the task leaves review.
+    first_seen: std::collections::BTreeMap<String, (String, Instant)>,
 }
 
 impl ScopedCiState {
@@ -1008,11 +1033,23 @@ impl ScopedCiState {
 /// that the blocking command loops to a deadline while this takes one sample
 /// per hub tick.
 pub fn scoped_ci_poll(project: &Project, state: &mut ScopedCiState) -> Result<()> {
+    scoped_ci_poll_at(project, state, Instant::now(), CI_SETTLE_GRACE)
+}
+
+/// Clock-injectable core of [`scoped_ci_poll`]. `now` and `settle_grace` make
+/// the premature-green settle window deterministic under test.
+fn scoped_ci_poll_at(
+    project: &Project,
+    state: &mut ScopedCiState,
+    now: Instant,
+    settle_grace: Duration,
+) -> Result<()> {
     let in_review = in_review_tasks_with_branch(project)?;
     if in_review.is_empty() {
         // Conditional: no PR is awaiting CI, so run no clock and forget prior
         // transitions (a task can re-enter review later with a fresh head).
         state.seen.clear();
+        state.first_seen.clear();
         return Ok(());
     }
     let (host, dir) = locate_hub_workdir(project)?;
@@ -1024,6 +1061,7 @@ pub fn scoped_ci_poll(project: &Project, state: &mut ScopedCiState) -> Result<()
     let live: std::collections::BTreeSet<&str> =
         in_review.iter().map(|(id, _)| id.as_str()).collect();
     state.seen.retain(|id, _| live.contains(id.as_str()));
+    state.first_seen.retain(|id, _| live.contains(id.as_str()));
 
     for (task_id, branch) in &in_review {
         let pr = match lookup_open_pr_in_repository(&host, &wt, branch, &repository.selector) {
@@ -1047,7 +1085,21 @@ pub fn scoped_ci_poll(project: &Project, state: &mut ScopedCiState) -> Result<()
                 continue;
             }
         };
-        let (conclusion, check) = match classify_ci_snapshot(&snapshot) {
+        let head_sha = snapshot.head_oid.clone();
+        // Measure the settle grace from the first tick that saw this exact head.
+        // A moved head restarts the clock: the new commit's Actions runs have
+        // their own race to win before an all-passing snapshot is trusted.
+        let first_seen = state
+            .first_seen
+            .entry(task_id.clone())
+            .and_modify(|entry| {
+                if entry.0 != head_sha {
+                    *entry = (head_sha.clone(), now);
+                }
+            })
+            .or_insert_with(|| (head_sha.clone(), now));
+        let settle_satisfied = now.saturating_duration_since(first_seen.1) >= settle_grace;
+        let (conclusion, check) = match classify_ci_snapshot(&snapshot, settle_satisfied) {
             Some(CiVerdict::Green) => ("success", "all".to_string()),
             Some(CiVerdict::Red { check, .. }) => ("failure", check),
             // `None` = still pending / not yet mergeable; `Timeout` is only
@@ -1055,7 +1107,6 @@ pub fn scoped_ci_poll(project: &Project, state: &mut ScopedCiState) -> Result<()
             // way there's no terminal transition to emit this tick.
             Some(CiVerdict::Timeout) | None => continue,
         };
-        let head_sha = snapshot.head_oid;
         if ci_should_emit(state.seen.get(task_id), &head_sha, conclusion) {
             shelbi_state::append_ci_event(
                 &project.name,
@@ -1467,6 +1518,14 @@ struct CiSnapshotCheck {
     state: SnapshotCheckState,
     raw_state: String,
     is_required: bool,
+    /// Whether this row is a GitHub Actions check run (as opposed to a legacy
+    /// commit status like Vercel's `Vercel Preview Comments`). The
+    /// no-required-checks fallback uses this as positive evidence that the
+    /// repository's Actions CI has actually attached its runs to this head:
+    /// right after a push the only reported context can be an already-green
+    /// third-party status, and treating that as a complete, passing check set
+    /// is exactly the premature-green bug.
+    is_github_actions: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1506,6 +1565,7 @@ query ShelbiCiSnapshot($owner: String!, $name: String!, $number: Int!) {
                     conclusion
                     detailsUrl
                     isRequired(pullRequestNumber: $number)
+                    checkSuite { app { slug } }
                   }
                   ... on StatusContext {
                     context
@@ -1716,6 +1776,9 @@ fn ci_snapshot(
                 .iter()
                 .map(|check| parse_snapshot_check(pr, check))
                 .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect()
         }
         None => {
             return Err(Error::Other(format!(
@@ -1753,18 +1816,22 @@ fn repository_owner_and_name<'a>(
     Ok((owner, name))
 }
 
-fn parse_snapshot_check(pr: u64, check: &serde_json::Value) -> Result<CiSnapshotCheck> {
-    let name = check
+/// Parse one status-rollup node. Returns `Ok(None)` for an empty/unnamed
+/// rollup placeholder (GitHub occasionally emits `{"name":null,"status":null}`
+/// rows); those are ignored rather than counted as a passing check or treated
+/// as a fatal snapshot error. A node that *does* carry a name but is otherwise
+/// unparseable still fails closed.
+fn parse_snapshot_check(pr: u64, check: &serde_json::Value) -> Result<Option<CiSnapshotCheck>> {
+    let Some(name) = check
         .get("name")
         .or_else(|| check.get("context"))
         .and_then(serde_json::Value::as_str)
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            Error::Other(format!(
-                "PR #{pr} CI snapshot contains a check without a name; refusing an unprovable verdict"
-            ))
-        })?
-        .to_string();
+        .map(str::to_string)
+    else {
+        // No name and no context: a null rollup placeholder. Skip it.
+        return Ok(None);
+    };
     let link = check
         .get("detailsUrl")
         .or_else(|| check.get("targetUrl"))
@@ -1805,13 +1872,21 @@ fn parse_snapshot_check(pr: u64, check: &serde_json::Value) -> Result<CiSnapshot
                 "PR #{pr} CI snapshot check `{name}` has no requiredness; refusing an unprovable verdict"
             ))
         })?;
-    Ok(CiSnapshotCheck {
+    // A `checkSuite.app.slug` of `github-actions` marks a CheckRun that a
+    // workflow in this repository produced. Legacy commit statuses
+    // (StatusContext — e.g. Vercel) have no checkSuite and are not Actions.
+    let is_github_actions = check
+        .pointer("/checkSuite/app/slug")
+        .and_then(serde_json::Value::as_str)
+        == Some("github-actions");
+    Ok(Some(CiSnapshotCheck {
         name,
         link,
         state,
         raw_state,
         is_required,
-    })
+        is_github_actions,
+    }))
 }
 
 /// Grade an atomic snapshot. If GitHub identifies any required contexts, only
@@ -1819,7 +1894,16 @@ fn parse_snapshot_check(pr: u64, check: &serde_json::Value) -> Result<CiSnapshot
 /// that has not reported, while `UNSTABLE` is allowed after all reported
 /// required rows pass because it can reflect only an optional failure. Without
 /// any required rows, every reported context gates and the PR must be CLEAN.
-fn classify_ci_snapshot(snapshot: &CiSnapshot) -> Option<CiVerdict> {
+///
+/// `settle_satisfied` only matters on the no-required-checks fallback: it says
+/// the caller has observed this head long enough ([`CI_SETTLE_GRACE`]) that an
+/// all-passing-but-Actions-free snapshot can be trusted as "no Actions CI
+/// applies" rather than "the Actions run has not attached yet". While it is
+/// false, an otherwise-green fallback snapshot with no GitHub Actions run stays
+/// pending — the premature-green guard. It is ignored when GitHub Actions runs
+/// are already attached (they are the authoritative in-band signal) and when the
+/// repo configures required contexts (the required set plus merge state gate).
+fn classify_ci_snapshot(snapshot: &CiSnapshot, settle_satisfied: bool) -> Option<CiVerdict> {
     let required: Vec<_> = snapshot
         .checks
         .iter()
@@ -1852,7 +1936,28 @@ fn classify_ci_snapshot(snapshot: &CiSnapshot) -> Option<CiVerdict> {
     } else {
         merge_state == "CLEAN"
     };
-    if merge_ready {
+    if !merge_ready {
+        return None;
+    }
+    if has_required {
+        // A configured required set that all passed, on a merge-ready PR, is the
+        // authoritative verdict — GitHub keeps the PR BLOCKED until every
+        // required context reports, so there is no premature-green window here.
+        return Some(CiVerdict::Green);
+    }
+    // No required contexts: this is the premature-green-vulnerable path. An
+    // all-passing snapshot right after a push can simply be missing the
+    // repository's `app-ci` run, which GitHub has not created yet — the only
+    // reported context so far might be an already-green third-party status.
+    // Require positive evidence that GitHub Actions attached a run to this head,
+    // or that the settle grace has elapsed (the PR genuinely triggers no Actions
+    // workflow, e.g. a docs-only diff). An empty or partial check set before
+    // that is pending, not green.
+    let actions_attached = snapshot
+        .checks
+        .iter()
+        .any(|check| check.is_github_actions);
+    if actions_attached || settle_satisfied {
         Some(CiVerdict::Green)
     } else {
         None
@@ -2776,11 +2881,12 @@ mod tests {
                 state: SnapshotCheckState::Pass,
                 raw_state: "SUCCESS".into(),
                 is_required: true,
+                is_github_actions: true,
             }],
         };
 
         assert_eq!(
-            classify_ci_snapshot(&snapshot),
+            classify_ci_snapshot(&snapshot, true),
             None,
             "GitHub BLOCKED can mean another configured required context has not reported yet"
         );
@@ -2802,6 +2908,7 @@ mod tests {
                     state: SnapshotCheckState::Pass,
                     raw_state: "SUCCESS".into(),
                     is_required: true,
+                    is_github_actions: true,
                 },
                 CiSnapshotCheck {
                     name: "optional-preview".into(),
@@ -2809,11 +2916,167 @@ mod tests {
                     state: SnapshotCheckState::Fail,
                     raw_state: "FAILURE".into(),
                     is_required: false,
+                    is_github_actions: false,
                 },
             ],
         };
 
-        assert_eq!(classify_ci_snapshot(&snapshot), Some(CiVerdict::Green));
+        assert_eq!(classify_ci_snapshot(&snapshot, true), Some(CiVerdict::Green));
+    }
+
+    /// Build a single rollup check for the premature-green fallback tests.
+    fn fallback_check(
+        name: &str,
+        state: SnapshotCheckState,
+        is_github_actions: bool,
+    ) -> CiSnapshotCheck {
+        CiSnapshotCheck {
+            name: name.into(),
+            link: format!("https://example/{name}"),
+            state,
+            raw_state: match state {
+                SnapshotCheckState::Pass => "SUCCESS",
+                SnapshotCheckState::Pending => "IN_PROGRESS",
+                SnapshotCheckState::Fail => "FAILURE",
+            }
+            .into(),
+            // None of these fallback checks are branch-protection required — the
+            // repo is unprotected, which is exactly the vulnerable path.
+            is_required: false,
+            is_github_actions,
+        }
+    }
+
+    /// A CLEAN, no-required-checks snapshot carrying `checks` — the shape a
+    /// freshly-pushed PR on an unprotected repo presents to the grader.
+    fn fallback_snapshot(checks: Vec<CiSnapshotCheck>) -> CiSnapshot {
+        CiSnapshot {
+            repository_id: "R_origin".into(),
+            base_ref: "main".into(),
+            base_oid: TEST_BASE_SHA.into(),
+            head_oid: "reviewed".into(),
+            head_repository_id: "R_origin".into(),
+            merge_state: "CLEAN".into(),
+            checks,
+        }
+    }
+
+    #[test]
+    fn fallback_third_party_only_is_pending_until_the_actions_run_or_grace() {
+        // The premature-green race: seconds after a push the only reported
+        // context is an already-green third-party status (Vercel). The repo's
+        // `app-ci` run has not been created yet.
+        let snapshot = fallback_snapshot(vec![fallback_check(
+            "Vercel Preview Comments",
+            SnapshotCheckState::Pass,
+            false,
+        )]);
+        assert_eq!(
+            classify_ci_snapshot(&snapshot, false),
+            None,
+            "an all-passing but Actions-free snapshot right after a push is pending, not green"
+        );
+        // Once the settle grace elapses, this is a PR that genuinely triggers no
+        // Actions workflow (a docs-only diff) — grade it green on merge state.
+        assert_eq!(
+            classify_ci_snapshot(&snapshot, true),
+            Some(CiVerdict::Green),
+            "after the settle grace a no-Actions PR is green on CLEAN merge state"
+        );
+    }
+
+    #[test]
+    fn fallback_empty_check_set_is_pending_until_grace() {
+        // No checks at all right after a push: still pending, never immediate
+        // green.
+        let snapshot = fallback_snapshot(vec![]);
+        assert_eq!(classify_ci_snapshot(&snapshot, false), None);
+        assert_eq!(
+            classify_ci_snapshot(&snapshot, true),
+            Some(CiVerdict::Green)
+        );
+    }
+
+    #[test]
+    fn fallback_attached_actions_run_is_green_before_the_grace() {
+        // The authoritative signal: GitHub Actions has attached a completed run
+        // for this head. That is green immediately — no need to wait out the
+        // grace that only guards the Actions-free window.
+        let snapshot = fallback_snapshot(vec![
+            fallback_check("build", SnapshotCheckState::Pass, true),
+            fallback_check("Vercel Preview Comments", SnapshotCheckState::Pass, false),
+        ]);
+        assert_eq!(
+            classify_ci_snapshot(&snapshot, false),
+            Some(CiVerdict::Green),
+            "a completed Actions run is positive evidence; no settle wait needed"
+        );
+    }
+
+    #[test]
+    fn fallback_partial_actions_jobs_stay_pending() {
+        // app-ci has attached but one job is still running. Pending regardless of
+        // how long we have observed the head — the grace never promotes a
+        // partial-but-present check set.
+        let snapshot = fallback_snapshot(vec![
+            fallback_check("msrv", SnapshotCheckState::Pass, true),
+            fallback_check("build", SnapshotCheckState::Pass, true),
+            fallback_check("smoke", SnapshotCheckState::Pending, true),
+            fallback_check("Vercel Preview Comments", SnapshotCheckState::Pass, false),
+        ]);
+        assert_eq!(classify_ci_snapshot(&snapshot, false), None);
+        assert_eq!(classify_ci_snapshot(&snapshot, true), None);
+    }
+
+    #[test]
+    fn fallback_failed_actions_job_is_red() {
+        let snapshot = fallback_snapshot(vec![
+            fallback_check("build", SnapshotCheckState::Fail, true),
+            fallback_check("Vercel Preview Comments", SnapshotCheckState::Pass, false),
+        ]);
+        assert_eq!(
+            classify_ci_snapshot(&snapshot, true),
+            Some(CiVerdict::Red {
+                check: "build".into(),
+                summary: "FAILURE".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_snapshot_check_skips_null_rollup_placeholders() {
+        // GitHub occasionally emits a nameless rollup placeholder. It must be
+        // ignored, not counted as a passing check and not a fatal error.
+        let null_node = serde_json::json!({ "name": null, "status": null });
+        assert_eq!(parse_snapshot_check(1, &null_node).unwrap(), None);
+
+        // A GitHub Actions CheckRun is tagged as such via its check suite's app.
+        let actions = serde_json::json!({
+            "__typename": "CheckRun",
+            "name": "build",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "detailsUrl": "https://example/build",
+            "isRequired": false,
+            "checkSuite": { "app": { "slug": "github-actions" } },
+        });
+        let parsed = parse_snapshot_check(1, &actions).unwrap().unwrap();
+        assert!(parsed.is_github_actions, "an Actions CheckRun must be tagged");
+        assert_eq!(parsed.state, SnapshotCheckState::Pass);
+
+        // A legacy commit status (Vercel) has no check suite and is not Actions.
+        let status = serde_json::json!({
+            "__typename": "StatusContext",
+            "context": "Vercel Preview Comments",
+            "state": "SUCCESS",
+            "targetUrl": "https://example/vercel",
+            "isRequired": false,
+        });
+        let parsed = parse_snapshot_check(1, &status).unwrap().unwrap();
+        assert!(
+            !parsed.is_github_actions,
+            "a legacy commit status is not a GitHub Actions run"
+        );
     }
 
     #[test]
@@ -5608,6 +5871,7 @@ esac
                 &identity,
                 Duration::from_secs(1),
                 Duration::ZERO,
+                Duration::ZERO,
             )
         };
 
@@ -5616,6 +5880,40 @@ esac
         assert!(
             calls.ends_with("api graphql --hostname github.com\n"),
             "the atomic clean/no-check snapshot must be the final green authority: {calls}"
+        );
+    }
+
+    #[test]
+    fn ci_watch_keeps_waiting_when_only_a_third_party_check_is_attached() {
+        // Right after a push, before GitHub creates the head commit's `app-ci`
+        // run, the only reported context can be an already-green third-party
+        // status on a CLEAN (unprotected) PR. ci-watch must keep waiting, not
+        // print green: with a settle grace far longer than the short deadline,
+        // the all-passing-but-Actions-free snapshot never settles and the watch
+        // times out instead of declaring a premature green.
+        let _lock = crate::test_lock::acquire();
+        let (base, _origin, worktree) = setup_repo(false);
+        let reviewed_head = task_branch_head(&worktree);
+        let stub = tempfile::tempdir().unwrap();
+        install_scoped_ci_third_party_only_stub(stub.path(), &reviewed_head, 379);
+        let identity = ci_identity(&reviewed_head);
+
+        let result = {
+            let _env = EnvGuard::install(stub.path());
+            ci_watch_with_poll_interval(
+                &ci_project(base.path(), &worktree),
+                379,
+                &identity,
+                Duration::from_millis(50),
+                Duration::ZERO,
+                Duration::from_secs(3600),
+            )
+        };
+
+        assert_eq!(
+            result.unwrap(),
+            CiVerdict::Timeout,
+            "a third-party-only snapshot inside the settle window must keep waiting, not go green"
         );
     }
 
@@ -5669,6 +5967,7 @@ esac
                 &identity,
                 Duration::from_secs(1),
                 Duration::ZERO,
+                Duration::ZERO,
             )
         };
 
@@ -5702,6 +6001,7 @@ esac
                 &identity,
                 Duration::from_secs(1),
                 Duration::ZERO,
+                Duration::ZERO,
             )
         };
 
@@ -5732,6 +6032,7 @@ esac
                 &ci_project(base.path(), &worktree),
                 379,
                 &identity,
+                Duration::ZERO,
                 Duration::ZERO,
                 Duration::ZERO,
             )
@@ -5937,6 +6238,137 @@ esac
             second.len(),
             1,
             "a settled green must not re-emit on the next sweep (transition dedup): {second:?}"
+        );
+    }
+
+    /// A scoped-poll `gh` stub whose atomic snapshot is the premature-green
+    /// shape: an unprotected PR (no required checks) whose only reported context
+    /// is an already-green third-party status — no GitHub Actions run has
+    /// attached to the head yet. CLEAN merge state, exactly as GitHub reports in
+    /// the seconds after a force-push.
+    fn install_scoped_ci_third_party_only_stub(stub_home: &Path, head: &str, pr: u64) -> PathBuf {
+        let bin = stub_home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log_file = stub_home.join("gh.log");
+        let snapshot_file = stub_home.join("snapshot.json");
+        let snapshot = serde_json::json!({
+            "data": { "repository": {
+                "id": ORIGIN_REPOSITORY_ID,
+                "pullRequest": {
+                    "state": "OPEN",
+                    "baseRefName": "main",
+                    "baseRefOid": CI_BASE_SHA,
+                    "headRefOid": head,
+                    "headRepository": { "id": ORIGIN_REPOSITORY_ID },
+                    "mergeStateStatus": "CLEAN",
+                    "commits": { "nodes": [{ "commit": {
+                        "oid": head,
+                        "statusCheckRollup": { "contexts": {
+                            "totalCount": 1,
+                            "pageInfo": { "hasNextPage": false },
+                            "nodes": [{
+                                "__typename": "StatusContext",
+                                "context": "Vercel Preview Comments",
+                                "state": "SUCCESS",
+                                "targetUrl": "https://example/vercel",
+                                "isRequired": false,
+                            }],
+                        }},
+                    }}]},
+                },
+            }},
+        });
+        std::fs::write(&snapshot_file, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let q = shelbi_agent::shell_escape;
+        let script = format!(
+            r#"#!/bin/sh
+case "$1 $2" in
+  "api graphql") printf 'api graphql --hostname %s\n' "$4" >> {log} ;;
+  *) printf '%s\n' "$*" >> {log} ;;
+esac
+case "$1 $2" in
+  "repo view")
+    printf '%s\n' {origin_repository_id} {origin_repository_name} {origin_repository_url}
+    ;;
+  "pr list")
+    printf '%s\n' {pr}
+    ;;
+  "api graphql")
+    cat {snapshot}
+    printf '\n'
+    ;;
+  *)
+    printf 'unexpected gh invocation: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+"#,
+            log = q(&log_file.to_string_lossy()),
+            snapshot = q(&snapshot_file.to_string_lossy()),
+            pr = q(&pr.to_string()),
+            origin_repository_id = q(ORIGIN_REPOSITORY_ID),
+            origin_repository_name = q(ORIGIN_REPOSITORY_NAME),
+            origin_repository_url = q("https://github.com/example/repo"),
+        );
+        let gh = bin.join("gh");
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            stub_home.join(".profile"),
+            format!("export PATH=\"{}:$PATH\"\n", bin.display()),
+        )
+        .unwrap();
+        log_file
+    }
+
+    #[test]
+    fn scoped_ci_poll_withholds_green_until_the_settle_grace_on_a_third_party_only_head() {
+        // The hub's `ci … conclusion=success` event must follow the same
+        // premature-green rule as `ci-watch`: a freshly-pushed head whose only
+        // reported check is an already-green third-party status must not emit a
+        // success transition until GitHub Actions attaches (not modeled here) or
+        // the settle grace elapses.
+        let _lock = crate::test_lock::acquire();
+        let (base, _origin, worktree) = setup_repo(false);
+        let reviewed_head = task_branch_head(&worktree);
+        let stub = tempfile::tempdir().unwrap();
+        let _log = install_scoped_ci_third_party_only_stub(stub.path(), &reviewed_head, 379);
+        let project = ci_project(base.path(), &worktree);
+
+        let (within_grace, after_grace) = {
+            let _env = EnvGuard::install(stub.path());
+            shelbi_state::save_task(PROJECT_NAME, &task(), "").unwrap();
+
+            let grace = Duration::from_secs(60);
+            let start = Instant::now();
+            let mut state = ScopedCiState::new();
+
+            // First observation of this head, inside the settle window: the
+            // all-passing-but-Actions-free snapshot is pending, so no event.
+            scoped_ci_poll_at(&project, &mut state, start, grace).unwrap();
+            let within_grace = scoped_ci_event_lines();
+
+            // A later tick, past the grace: the head genuinely carries no Actions
+            // CI, so it settles green and emits exactly one success line.
+            scoped_ci_poll_at(&project, &mut state, start + grace + Duration::from_secs(1), grace)
+                .unwrap();
+            let after_grace = scoped_ci_event_lines();
+            (within_grace, after_grace)
+        };
+
+        assert!(
+            within_grace.is_empty(),
+            "no ci success event may be emitted inside the settle window: {within_grace:?}"
+        );
+        assert_eq!(
+            after_grace.len(),
+            1,
+            "past the settle grace a no-Actions head settles to one success line: {after_grace:?}"
+        );
+        assert!(
+            after_grace[0].contains("conclusion=success"),
+            "the settled transition must record success: {}",
+            after_grace[0]
         );
     }
 
