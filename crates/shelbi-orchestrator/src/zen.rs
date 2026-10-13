@@ -6489,6 +6489,20 @@ pub fn probe_in_workflow(
     let shared_node_cache = machine.work_dir.join(".shelbi/cache/zen-node");
     let branch = normalize_probe_branch(branch)?;
     let task_ref = format!("refs/heads/{branch}");
+
+    // Fail fast if a *linked* workspace worktree (an active worker) already
+    // holds the branch. `finalize_probed_task_ref` re-runs this same guard
+    // under the Git-worktrees lock as the authoritative, mid-run-safe check —
+    // but only at the very end, after the rebase and every local check have
+    // run. On a loaded hub that is ~10 minutes of `cargo build` + `cargo test`
+    // thrown away per refusal. Refusing here, before any worktree is added or
+    // any check runs, turns that into a seconds-long failure with the same
+    // actionable message. Advisory only (the state can change during the run,
+    // which the late check still catches); when nothing or only the hub's
+    // primary checkout holds the branch this is a no-op and the probe proceeds
+    // exactly as before.
+    ensure_no_linked_worktree_holds_branch(&host, &repository_anchor, &branch, &task_ref)?;
+
     let initial_head =
         probe_head_sha(&host, &repository_anchor, &format!("{task_ref}^{{commit}}"))?;
 
@@ -7420,6 +7434,61 @@ fn probe_main_worktree_path(
         })
 }
 
+/// Fail fast if a *linked* workspace worktree already holds `task_ref`. Read
+/// the current holders and the primary checkout, then defer to
+/// [`refuse_if_linked_worktree_holds`] for the verdict and the message.
+///
+/// Returns `Ok(())` when nothing holds the branch, or when only the hub's
+/// primary checkout does — those cases are handled later (the primary is
+/// detached in place during finalization), so this preflight stays silent and
+/// the probe proceeds unchanged. It is advisory: the authoritative check runs
+/// in [`free_task_ref_for_advance`] under the Git-worktrees lock, which also
+/// catches a worktree that claims the branch mid-run.
+fn ensure_no_linked_worktree_holds_branch(
+    host: &Host,
+    repository_anchor: &std::path::Path,
+    branch: &str,
+    task_ref: &str,
+) -> Result<()> {
+    let checked_out = task_ref_checkout_paths(host, repository_anchor, task_ref)?;
+    if checked_out.is_empty() {
+        return Ok(());
+    }
+    let main_worktree = probe_main_worktree_path(host, repository_anchor)?;
+    refuse_if_linked_worktree_holds(branch, &checked_out, &main_worktree)
+}
+
+/// Verdict + message for the "branch checked out elsewhere" guard, factored out
+/// so the early preflight and the late advance path share one source of truth.
+///
+/// Git allows a branch to be checked out in at most one worktree, but treat the
+/// set generally: any holder that is not the primary checkout is a linked worker
+/// worktree and blocks. Returns `Ok(())` when no linked worktree holds it.
+fn refuse_if_linked_worktree_holds(
+    branch: &str,
+    checked_out: &[String],
+    main_worktree: &str,
+) -> Result<()> {
+    let linked: Vec<&String> = checked_out
+        .iter()
+        .filter(|path| path.as_str() != main_worktree)
+        .collect();
+    if linked.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Other(format!(
+        "task branch `{branch}` is still checked out in another workspace worktree ({}); \
+         refusing to advance it from an isolated Zen probe because that would disturb an \
+         active worker. Detach or reassign that worktree (e.g. `git -C <worktree> switch \
+         --detach`) and re-probe.",
+        linked
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
 /// Clear the way to advance the durable task ref when a rebase moved `branch`.
 ///
 /// If nothing holds `branch`, this is a no-op. If the only holder is the hub's
@@ -7442,26 +7511,9 @@ fn free_task_ref_for_advance(
 
     let main_worktree = probe_main_worktree_path(host, repository_anchor)?;
 
-    // Git allows a branch to be checked out in at most one worktree, but treat
-    // the set generally: any holder that is not the primary checkout is a
-    // linked worker worktree and blocks.
-    let linked: Vec<&String> = checked_out
-        .iter()
-        .filter(|path| **path != main_worktree)
-        .collect();
-    if !linked.is_empty() {
-        return Err(Error::Other(format!(
-            "task branch `{branch}` is still checked out in another workspace worktree ({}); \
-             refusing to advance it from an isolated Zen probe because that would disturb an \
-             active worker. Detach or reassign that worktree (e.g. `git -C <worktree> switch \
-             --detach`) and re-probe.",
-            linked
-                .iter()
-                .map(|p| p.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    }
+    // A linked (non-primary) worktree holding the branch is an active worker:
+    // blocks with a structured error naming the worktree and the remedy.
+    refuse_if_linked_worktree_holds(branch, &checked_out, &main_worktree)?;
 
     // Only the hub's primary checkout holds the branch. Detach it in place if
     // it carries no user-authored changes.
@@ -10937,6 +10989,95 @@ mod probe_tests {
             before,
             "a blocked probe must not advance the branch ref"
         );
+    }
+
+    #[test]
+    fn probe_refuses_linked_worktree_before_running_any_local_check() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        // A linked workspace worktree holds the branch, exactly as above — but
+        // here `origin/main` is NOT advanced, so the probe's rebase is a no-op
+        // and the branch ref never moves. The late guard only runs on the
+        // ref-advance path, so without the early preflight this probe would
+        // sail past the collision, run every local check (~10 minutes of
+        // `cargo build` + `cargo test` on a real hub), and only then notice.
+        // The early preflight must refuse up front, before any check runs.
+        let (base, _origin, wt) = setup_origin_and_worktree();
+
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-q", "-m", "task work"]);
+        let before = branch_sha(&wt, "shelbi/task1");
+
+        // Free the branch from the primary, then hand it to a linked worktree.
+        run_git(&wt, &["checkout", "-q", "--detach"]);
+        let linked = base.path().join("linked-ws");
+        run_git(
+            &wt,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                linked.to_str().unwrap(),
+                "shelbi/task1",
+            ],
+        );
+
+        // The one local check records that it ran by creating this sentinel.
+        // A genuine early refusal never reaches it, so the file must be absent.
+        let sentinel = base.path().join("check-ran.sentinel");
+        let check = format!("touch {}", sentinel.to_str().unwrap());
+        let project = probe_project(base.path(), &[check.as_str()]);
+        let task = probe_task("shelbi/task1");
+        let err = probe_in_workflow(
+            &project,
+            None,
+            &task,
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("another workspace worktree"),
+            "error must name the collision class: {err}"
+        );
+        assert!(
+            err.contains("linked-ws"),
+            "error must name the blocking worktree: {err}"
+        );
+        assert!(
+            !sentinel.exists(),
+            "no local check must run when the probe refuses up front"
+        );
+        assert_eq!(
+            branch_sha(&wt, "shelbi/task1"),
+            before,
+            "a blocked probe must not advance the branch ref"
+        );
+    }
+
+    #[test]
+    fn refuse_if_linked_worktree_holds_blocks_only_non_primary_holders() {
+        let primary = "/repo/main".to_string();
+        let linked = "/repo/.shelbi/wt/other".to_string();
+
+        // Nothing checked out, or only the primary: a no-op the probe proceeds
+        // through (the primary is detached in place later).
+        assert!(refuse_if_linked_worktree_holds("b", &[], &primary).is_ok());
+        assert!(
+            refuse_if_linked_worktree_holds("b", std::slice::from_ref(&primary), &primary)
+                .is_ok()
+        );
+
+        // A linked holder blocks, naming itself in the message.
+        let err = refuse_if_linked_worktree_holds("b", std::slice::from_ref(&linked), &primary)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another workspace worktree"), "{err}");
+        assert!(err.contains(&linked), "{err}");
     }
 
     #[test]
