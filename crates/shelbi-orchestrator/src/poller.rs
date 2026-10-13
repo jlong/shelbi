@@ -5081,7 +5081,7 @@ fn maybe_resume_stranded_review_slots(
             continue;
         }
 
-        // A TUI reopen of a gave-up review slot ("Chat with Reviewer") drops a
+        // A TUI reopen of a gave-up review slot ("Reviewer") drops a
         // relaunch marker; re-arm the budget so the slot resumes with a fresh
         // count instead of staying down behind a latched give-up.
         if shelbi_state::supervision_relaunch::consume_supervision_relaunch(

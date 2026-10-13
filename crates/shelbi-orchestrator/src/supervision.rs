@@ -3,7 +3,7 @@
 //! The daemon poller is the one persistent process that watches every
 //! *persistent* pane shelbi owns and relaunches it on an unexpected death:
 //! the workspace agent panes, the orchestrator pane, and the review agent
-//! ("Chat with Reviewer") slot. These must come back on their own even when
+//! ("Reviewer") slot. These must come back on their own even when
 //! no TUI is attached, so the daemon — not a client — owns their restart.
 //! When one dies *unexpectedly* (a crash, not a deliberate `workspace stop` /
 //! project close / clean user exit) it relaunches it, re-dispatching the

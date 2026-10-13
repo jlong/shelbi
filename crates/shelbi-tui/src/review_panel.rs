@@ -14,7 +14,7 @@
 //!   opens the full task-description popover — see [`PanelEffect::ShowDescription`],
 //! - the review worktree's folder name (left-truncated to fit; click to reveal
 //!   it in the OS file manager),
-//! - a **view-switcher** action group — *Chat with Reviewer* (default) /
+//! - a **view-switcher** action group — *Reviewer* (default) /
 //!   *View Diff* / *Edit in <editor>* / *Open Browser* (the last only when the
 //!   workflow declares a review URL), the active content view highlighted, and
 //! - an **Approve** / **Reject** action row (no brackets, green / red in the
@@ -484,7 +484,7 @@ fn switch_entry(app: &ReviewPanel, item: SwitchItem) -> NavEntry {
     let (glyph, label, active) = match item {
         SwitchItem::Chat => (
             "🤓",
-            "Chat with Reviewer".to_string(),
+            "Reviewer".to_string(),
             app.active_view == ActiveView::Chat,
         ),
         SwitchItem::Diff => (
@@ -690,7 +690,7 @@ mod tests {
         assert!(out.contains("Warm the application cache"), "description preview: {out}");
         assert!(out.contains("More"), "More link: {out}");
         assert!(out.contains("wt/review"), "worktree folder shown: {out}");
-        assert!(out.contains("Chat with Reviewer"), "chat switch: {out}");
+        assert!(out.contains("Reviewer"), "chat switch: {out}");
         assert!(out.contains("View Diff"), "diff switch: {out}");
         assert!(out.contains("Edit in Vim"), "editor switch reflects name: {out}");
         assert!(out.contains("Open Browser"), "browser switch when url set: {out}");
@@ -835,7 +835,7 @@ mod tests {
         let mut moved = panel(true);
         moved.nav_down();
         let moved_rows = render_lines(&mut moved, 30, 24);
-        for label in ["Chat with Reviewer", "View Diff", "Edit in Vim", "Open Browser"] {
+        for label in ["Reviewer", "View Diff", "Edit in Vim", "Open Browser"] {
             assert_eq!(
                 row_y(&chat_rows, label),
                 row_y(&moved_rows, label),
@@ -843,7 +843,7 @@ mod tests {
             );
         }
         assert_eq!(
-            row_y(&chat_rows, "View Diff") - row_y(&chat_rows, "Chat with Reviewer"),
+            row_y(&chat_rows, "View Diff") - row_y(&chat_rows, "Reviewer"),
             2,
             "one separator line always sits between Chat and View Diff"
         );
@@ -857,7 +857,7 @@ mod tests {
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
         let rows = dump(&term).split('\n').map(str::to_string).collect::<Vec<_>>();
-        let chat_y = row_y(&rows, "Chat with Reviewer") as u16;
+        let chat_y = row_y(&rows, "Reviewer") as u16;
         // The selection fill is inset one column from each edge, exactly like the
         // main sidebar: gutter columns transparent, the inner region filled.
         assert_eq!(buf[(0, chat_y)].bg, Color::Reset, "left gutter is transparent");
@@ -874,7 +874,7 @@ mod tests {
         let mut app = panel(false);
         let out = render(&mut app, 30, 24);
         assert!(!out.contains("Open Browser"), "no browser action when no url: {out}");
-        assert!(out.contains("Chat with Reviewer") && out.contains("Approve"));
+        assert!(out.contains("Reviewer") && out.contains("Approve"));
     }
 
     #[test]
@@ -909,7 +909,7 @@ mod tests {
     fn view_diff_renders_directly_below_chat() {
         let mut app = panel(true);
         let rows = render_lines(&mut app, 44, 24);
-        let chat_y = row_y(&rows, "Chat with Reviewer");
+        let chat_y = row_y(&rows, "Reviewer");
         let diff_y = row_y(&rows, "View Diff");
         assert_eq!(diff_y - chat_y, 2, "View Diff sits immediately below Chat");
         assert!(diff_y < row_y(&rows, "Edit in Vim"), "View Diff precedes Edit");
@@ -1041,7 +1041,7 @@ mod tests {
         // and each nav switch's icon). Here we check the first switch's glyph.
         let mut app = panel(true);
         let rows = render_lines(&mut app, 44, 24);
-        let chat_y = row_y(&rows, "Chat with Reviewer");
+        let chat_y = row_y(&rows, "Reviewer");
         let col = rows[chat_y].chars().take_while(|c| *c == ' ').count();
         assert_eq!(col, 2, "the switch icon starts at col 2, got row {:?}", rows[chat_y]);
     }
@@ -1210,7 +1210,7 @@ mod tests {
         let out = rows.join("\n");
         assert!(out.contains("Ready"), "status (possibly clipped) still renders: {out}");
         assert!(out.contains("Cold-start cache"), "title: {out}");
-        assert!(out.contains("Chat with Reviewer"), "nav: {out}");
+        assert!(out.contains("Reviewer"), "nav: {out}");
         let ay = row_y(&rows, "Approve");
         assert_eq!(ay, row_y(&rows, "Reject"), "actions share a row even at 24 cols");
         let line = &rows[ay];
