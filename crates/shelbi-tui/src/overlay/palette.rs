@@ -461,8 +461,8 @@ fn build_result_lines(
 }
 
 /// Render the Projects column into `area`: a dim "Projects" heading, then one
-/// row per project — a dim `·` bullet, the status glyph, and the name — closed
-/// by a trailing "+ Add project" row. Separated from the commands by
+/// row per project — the status glyph and the name, with no leading bullet —
+/// closed by a trailing "+ Add project" row. Separated from the commands by
 /// whitespace, with no border line.
 fn render_projects_column(f: &mut Frame, area: Rect, col: &ProjectsColumn) {
     let rows = Layout::default()
@@ -508,16 +508,15 @@ fn render_projects_column(f: &mut Frame, area: Rect, col: &ProjectsColumn) {
     f.render_stateful_widget(list, rows[1], &mut s);
 }
 
-/// One Projects-column row: `· <glyph> <label>`, padded to `width` so a focused
-/// selection bar spans the whole column.
+/// One Projects-column row: `<glyph> <label>`, padded to `width` so a focused
+/// selection bar spans the whole column. The leading status glyph keeps its
+/// tint; there is no decorative bullet in front of it.
 fn project_row_line(glyph: &str, glyph_color: Color, label: &str, width: usize) -> ListItem<'static> {
-    let text_w = 2 // "· "
-        + UnicodeWidthStr::width(glyph)
+    let text_w = UnicodeWidthStr::width(glyph)
         + 1 // space
         + UnicodeWidthStr::width(label);
     let pad = width.saturating_sub(text_w);
     ListItem::new(Line::from(vec![
-        Span::styled("· ", Style::default().fg(theme::PALETTE_MUTED)),
         Span::styled(glyph.to_string(), Style::default().fg(glyph_color)),
         Span::styled(format!(" {label}"), Style::default().fg(theme::PALETTE_FG)),
         Span::raw(" ".repeat(pad)),
@@ -1313,8 +1312,9 @@ mod tests {
     }
 
     #[test]
-    fn projects_column_renders_glyphs_the_bullet_and_the_add_row() {
-        // All three status glyphs plus the add row and the `·` bullets.
+    fn projects_column_renders_glyphs_without_a_bullet_plus_the_add_row() {
+        // All three status glyphs plus the add row — and no leading `·` bullet
+        // in front of any project row.
         let buf = draw_projects(ProjectsColumn {
             rows: vec![
                 ProjectRow {
@@ -1336,7 +1336,7 @@ mod tests {
         let dumped = dump(&buf);
         assert!(dumped.contains('●'), "active disc: {dumped}");
         assert!(dumped.contains('○'), "idle/unloaded ring: {dumped}");
-        assert!(dumped.contains('·'), "row bullets: {dumped}");
+        assert!(!dumped.contains('·'), "no leading bullet: {dumped}");
         assert!(dumped.contains("Website"), "project row: {dumped}");
         assert!(dumped.contains("Add project"), "Add project row: {dumped}");
         assert!(dumped.contains('+'), "Add row glyph: {dumped}");

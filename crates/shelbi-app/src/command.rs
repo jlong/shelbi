@@ -378,7 +378,9 @@ impl CommandRegistry {
             hidden_until_query: false,
         });
 
-        // Workspaces.
+        // Workspaces. Hidden until the user types: the default (empty-query)
+        // list stays commands + projects, and a workspace only surfaces once a
+        // query matches its name (e.g. `alp` → `alpha`).
         for w in &model.workspaces {
             out.push(Command {
                 id: format!("workspace:{}", w.name),
@@ -390,7 +392,7 @@ impl CommandRegistry {
                 decoration: w.decoration.clone(),
                 subtitle: w.subtitle.clone(),
                 shortcut: None,
-                hidden_until_query: false,
+                hidden_until_query: true,
             });
         }
 
@@ -912,17 +914,43 @@ mod tests {
         let m = model();
         let cmds = reg.commands(&m);
         let hidden = |id: &str| cmds.iter().find(|c| c.id() == id).unwrap().hidden_until_query();
-        // Power-user shortcuts are hidden until a query is typed.
+        // Power-user shortcuts are hidden until a query is typed. Workspaces
+        // join this tier: the empty-query list stays commands + projects, and a
+        // workspace only surfaces once a query matches its name.
         assert!(hidden("action:switch-project"));
         assert!(hidden("action:switch-project:beta"));
         assert!(hidden("action:add-project"));
         assert!(hidden("edit:project"));
+        assert!(hidden("workspace:alpha-1"));
         // Everyday entries stay visible on a blank query.
         assert!(!hidden("view:tasks"));
         assert!(!hidden("action:toggle-zen"));
-        assert!(!hidden("workspace:alpha-1"));
         assert!(!hidden("review:T-12"));
         assert!(!hidden("action:quit-shelbi"));
+    }
+
+    #[test]
+    fn empty_query_excludes_workspaces_but_typing_surfaces_them() {
+        // End-to-end through the matcher the palette uses: a blank query leaves
+        // the workspace out of the default list, and typing a prefix of its
+        // name brings it back, scored like any other entry.
+        let reg = CommandRegistry::new();
+        let entries = reg.entries(&model());
+
+        let blank = shelbi_palette::search(&entries, "");
+        assert!(
+            blank.iter().all(|(e, _)| e.id != "workspace:alpha-1"),
+            "a blank query must not list workspaces"
+        );
+        // ...while the everyday commands and reviews still show.
+        assert!(blank.iter().any(|(e, _)| e.id == "view:tasks"));
+        assert!(blank.iter().any(|(e, _)| e.id == "review:T-12"));
+
+        let typed = shelbi_palette::search(&entries, "alph");
+        assert!(
+            typed.iter().any(|(e, _)| e.id == "workspace:alpha-1"),
+            "typing a workspace-name prefix must surface the workspace"
+        );
     }
 
     #[test]
