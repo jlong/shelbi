@@ -175,6 +175,50 @@ pub fn current_state(project: &str, id: &str) -> Result<ExpectedState, MutateErr
     }
 }
 
+/// Did the issue move on in a way that should abort a mutation as stale, given
+/// the `(status, revision)` the client was looking at (`expected`) and the
+/// current one (`actual`)?
+///
+/// The **status** is the authoritative, client-controlled dimension: a real
+/// concurrent change that matters — someone else moving the card to another
+/// column — changes it, and a status change always counts as stale.
+///
+/// The **revision** (`updated_at`) is a trustworthy concurrency token only on a
+/// local filesystem board, where it is bumped exactly when a field changes. On
+/// a remote (GitHub) board it is the issue's server-side `updatedAt`, which
+/// Shelbi's *own* writes bump out of band: `issue move` writes the status back
+/// to GitHub (and the board refresh picks that write up) ~15-30s *after* the
+/// command returns, so a follow-up `issue start` that reads the issue in that
+/// window sees the revision tick forward with the status unchanged. That is a
+/// self-write, not a conflict. So on a remote board a pure revision bump with an
+/// unchanged status is NOT stale — only a status change is. (This is the
+/// "`issue start` right after `issue move` fails with a stale-revision
+/// conflict" bug.)
+pub fn is_stale_change(project: &str, expected: &ExpectedState, actual: &ExpectedState) -> bool {
+    if actual.status != expected.status {
+        return true;
+    }
+    if actual.updated_at == expected.updated_at {
+        return false;
+    }
+    // Same status, revision moved. Count it stale only where the revision is a
+    // reliable token (a local board); on a remote board it is a self-write.
+    revision_is_authoritative(project)
+}
+
+/// Is the issue `updated_at` a reliable concurrency token for `project`? True
+/// for a local filesystem board (bumped exactly on a field change), false for a
+/// remote board whose `updatedAt` Shelbi's own writes bump out of band. On a
+/// config-read error, fall back to the strict (historical) behavior and treat
+/// the revision as authoritative — but the caller reaches here only after
+/// [`current_state`] already loaded the store, so a load failure is unlikely.
+fn revision_is_authoritative(project: &str) -> bool {
+    match shelbi_state::load_project(project) {
+        Ok(p) => !p.issue_tracker.backend.is_remote(),
+        Err(_) => true,
+    }
+}
+
 /// Build the `Changed` notification for a completed mutation by re-reading the
 /// issue's post-change state (best-effort; empty status/rev if it is gone).
 fn change_note(store: &dyn IssueStore, project: &str, id: &str, verb: &str) -> ChangeNote {

@@ -529,10 +529,12 @@ fn run_job(origin: u64, req: MutationRequest, state: ControlState, tx: Sender<Se
     let lock = state.issue_lock(&req.project, &req.id);
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
-    // Expected-state gate: refuse up front if the issue already moved on.
+    // Expected-state gate: refuse up front if the issue already moved on. A
+    // pure revision bump with an unchanged status on a remote board is a
+    // self-write, not a conflict — see `mutate::is_stale_change`.
     if let Some(expected) = req.expected.clone() {
         match mutate::current_state(&req.project, &req.id) {
-            Ok(actual) if actual != expected => {
+            Ok(actual) if mutate::is_stale_change(&req.project, &expected, &actual) => {
                 let _ = tx.send(ServerMsg::Failed {
                     request_id,
                     error: MutationError::Stale { expected, actual },
@@ -564,7 +566,7 @@ fn run_job(origin: u64, req: MutationRequest, state: ControlState, tx: Sender<Se
             return Ok(());
         };
         let actual = mutate::current_state(&project, &id)?;
-        if actual != expected {
+        if mutate::is_stale_change(&project, &expected, &actual) {
             return Err(mutate::MutateError::Stale { expected, actual });
         }
         Ok(())
