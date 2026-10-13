@@ -4036,17 +4036,46 @@ mod tests {
     fn palette_lists_the_registry_commands_from_the_sidebar_model() {
         // The open palette's entries come from the shelbi-app command registry,
         // built from the shell's sidebar model — so the nav views, the Zen
-        // toggle, workspaces, and the error-log action are all reachable.
+        // toggle, and the error-log action are all reachable on an empty query.
+        // Workspaces are hidden until the user types (they carry
+        // `hidden_until_query`), so the empty-query default list leaves them out
+        // but a matching query surfaces them.
         let mut st = test_state();
         st.open_palette();
-        let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
-            panic!("palette should be open");
-        };
-        let ids: Vec<String> = p.results().into_iter().map(|(e, _)| e.id).collect();
-        assert!(ids.contains(&"view:tasks".to_string()), "Issues view reachable");
-        assert!(ids.contains(&"action:toggle-zen".to_string()), "Zen toggle reachable");
-        assert!(ids.contains(&"workspace:alpha".to_string()), "workspace reachable");
-        assert!(ids.contains(&"action:error-log".to_string()), "error log reachable");
+        {
+            let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+                panic!("palette should be open");
+            };
+            let ids: Vec<String> = p.results().into_iter().map(|(e, _)| e.id).collect();
+            assert!(ids.contains(&"view:tasks".to_string()), "Issues view reachable");
+            assert!(
+                ids.contains(&"action:toggle-zen".to_string()),
+                "Zen toggle reachable"
+            );
+            assert!(
+                ids.contains(&"action:error-log".to_string()),
+                "error log reachable"
+            );
+            assert!(
+                !ids.contains(&"workspace:alpha".to_string()),
+                "an empty query must not list workspaces"
+            );
+        }
+
+        // Typing a query that matches the workspace surfaces it in the results.
+        {
+            let Some(ActiveOverlay::Palette(p)) = &mut st.overlay else {
+                panic!("palette should be open");
+            };
+            for c in "alp".chars() {
+                p.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), None);
+            }
+            let ids: Vec<String> = p.results().into_iter().map(|(e, _)| e.id).collect();
+            assert!(
+                ids.contains(&"workspace:alpha".to_string()),
+                "typing a matching query surfaces the workspace, got: {ids:?}"
+            );
+        }
     }
 
     #[test]
