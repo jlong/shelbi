@@ -426,6 +426,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
     } else if id.ends_with(".agent.orchestrator.instructions") {
         sniff_orchestrator_instructions(entry, &text, out);
         sniff_orchestrator_active_dispatch(entry, &text, out);
+        sniff_reporting_subject(entry, &text, out);
         sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_merge_reason_format(entry, &text, out);
@@ -802,6 +803,79 @@ fn sniff_tmux_commands(entry: &InventoryEntry, text: &str, out: &mut Vec<Upgrade
              `shelbi session send`, and drop any `tmux new-window` serve alternative (background \
              the command directly). Mirror the shipped default template.",
             locate_line_containing(text, "tmux"),
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrator "Reporting" passage — workspace-subject -> issue-subject
+
+/// Code for the orchestrator `Reporting` passage rewrite: the old shipped
+/// wording made the *workspace* the subject of every activity line; the new
+/// one leads with the *issue*, named by its prefix-free branch name.
+pub(crate) const REPORTING_SUBJECT_AUTOHEAL_CODE: &str = "INSTRUCTIONS_REPORTING_WORKSPACE_SUBJECT";
+
+/// The exact legacy `Reporting` passage shipped in past orchestrator-instruction
+/// defaults, paired with its rewrite. Back when an agent and its workspace were
+/// tightly bound, making the workspace the subject of each activity delta
+/// ("alpha -> palette issue") read fine; now that workspaces are interchangeable
+/// slots, that wording led the orchestrator to treat a workspace as the owner of
+/// work long after the issue left it. The rewrite leads with the issue, named by
+/// its branch name minus the user prefix, and leaves the workspace incidental.
+///
+/// An UNEDITED orchestrator copy contains the legacy substring verbatim, so the
+/// swap is deterministic and non-lossy — an auto-heal. A copy whose wording the
+/// user edited no longer matches verbatim; this is a purely cosmetic reporting
+/// change, so a customized copy is left alone (no needs-judgment finding).
+///
+/// Kept in sync with the shipped default template by the drift guard in this
+/// module's tests: the replacement appears in the shipped template and no
+/// shipped template carries the legacy substring.
+pub(crate) const REPORTING_SUBJECT_REWRITE: (&str, &str) = (
+    "has changed since your last reply. Format: comma-separated workspace → issue\n\
+     deltas, e.g.\n\n    \
+     alpha -> palette issue, bravo finished workspace-auto -> handoff, charlie idle no ready issues",
+    "has changed since your last reply. Format: comma-separated issue deltas,\n\
+     naming each issue by its branch name without the user prefix\n\
+     (`jlong/palette-icons` -> `palette-icons`), e.g.\n\n    \
+     palette-icons started on alpha, fetch-loop -> handoff, no ready issues for charlie",
+);
+
+/// Rewrite the legacy orchestrator `Reporting` passage to its issue-subject form
+/// if present, returning the rewritten text (unchanged otherwise). Shared by the
+/// sniffer and the healer's write-back so the two can never diverge.
+pub(crate) fn apply_reporting_subject_rewrite(text: &str) -> String {
+    let (legacy, replacement) = REPORTING_SUBJECT_REWRITE;
+    if text.contains(legacy) {
+        text.replace(legacy, replacement)
+    } else {
+        text.to_string()
+    }
+}
+
+/// Sniff an orchestrator `instructions.md` whose `Reporting` passage still
+/// carries the old workspace-subject wording. An **exact-match** auto-heal: a
+/// forked copy that edited the passage no longer matches verbatim and is left
+/// untouched (the change is cosmetic, so no needs-judgment finding is raised).
+///
+/// A default change only reaches NEW projects via the shipped template; existing
+/// projects carry their own copy, so this sniffer heals them on next boot (per
+/// the AGENTS.md "Changing shipped defaults" guardrail). Idempotent: after the
+/// heal the file carries the replacement and a second pass finds nothing.
+fn sniff_reporting_subject(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    let (legacy, _) = REPORTING_SUBJECT_REWRITE;
+    if text.contains(legacy) {
+        out.push(finding(
+            entry,
+            Classification::AutoHeal,
+            REPORTING_SUBJECT_AUTOHEAL_CODE,
+            "orchestrator `Reporting` passage makes the workspace the subject of each activity \
+             line — workspaces are now interchangeable slots, so the issue should lead, named by \
+             its prefix-free branch name",
+            "Rewrite the Reporting format line and example to lead with the issue (named by its \
+             branch name without the user prefix), leaving the workspace incidental. Mirror the \
+             shipped default template.",
+            locate_line_containing(text, "comma-separated workspace"),
         ));
     }
 }
@@ -4026,6 +4100,67 @@ mod tests {
             .is_some(),
             "shipped default template no longer has a `{FREE_WORKSPACE_SECTION_HEADING}` \
              section — the sniffer's absence check is now dead",
+        );
+    }
+
+    // ---- orchestrator Reporting passage (workspace-subject -> issue) ----
+
+    #[test]
+    fn exact_legacy_reporting_passage_is_auto_healed() {
+        // A forked copy still carrying the exact shipped-then-legacy Reporting
+        // passage: a deterministic swap, so one AutoHeal finding and no
+        // needs-judgment, and the shared rewrite produces the new wording.
+        let (legacy, replacement) = REPORTING_SUBJECT_REWRITE;
+        let text = format!("# Orchestrator\n\n## Reporting\n\n{legacy}\n\nmore prose\n");
+        let mut out = Vec::new();
+        sniff_reporting_subject(&orch_entry(), &text, &mut out);
+        assert_eq!(codes(&out), vec![REPORTING_SUBJECT_AUTOHEAL_CODE]);
+        assert_eq!(out[0].classification, Classification::AutoHeal);
+
+        let healed = apply_reporting_subject_rewrite(&text);
+        assert!(healed.contains(replacement), "rewrite didn't apply the new wording");
+        assert!(!healed.contains(legacy), "rewrite left the legacy passage behind");
+        // Idempotent: a second pass over the healed text finds nothing.
+        let mut again = Vec::new();
+        sniff_reporting_subject(&orch_entry(), &healed, &mut again);
+        assert!(again.is_empty(), "healed text still trips the sniffer: {:?}", codes(&again));
+    }
+
+    #[test]
+    fn customized_reporting_passage_is_left_alone() {
+        // A copy the user edited away from the shipped wording: no exact match,
+        // so no finding at all (the change is cosmetic — never needs-judgment),
+        // and the shared rewrite is a no-op.
+        let text = "# Orchestrator\n\n## Reporting\n\nLead each reply with a one-line summary. \
+                    Format: whatever the user likes, e.g.\n\n    my-issue is done\n";
+        let mut out = Vec::new();
+        sniff_reporting_subject(&orch_entry(), text, &mut out);
+        assert!(out.is_empty(), "a customized Reporting passage should not be flagged: {:?}", codes(&out));
+        assert_eq!(apply_reporting_subject_rewrite(text), text, "rewrite mangled a customized copy");
+    }
+
+    /// Drift guard: the shipped default orchestrator template must carry the
+    /// new issue-subject Reporting wording and none of the legacy workspace-
+    /// subject wording, so a freshly-materialized project never trips this
+    /// sniffer and the rewrite table can never diverge from what Shelbi ships.
+    #[test]
+    fn shipped_default_template_carries_the_new_reporting_wording() {
+        let (legacy, replacement) = REPORTING_SUBJECT_REWRITE;
+        let shipped = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        assert!(
+            shipped.contains(replacement),
+            "shipped orchestrator template lacks the new Reporting wording",
+        );
+        assert!(
+            !shipped.contains(legacy),
+            "shipped orchestrator template still carries the legacy Reporting wording",
+        );
+        let mut out = Vec::new();
+        sniff_reporting_subject(&orch_entry(), shipped, &mut out);
+        assert!(
+            out.is_empty(),
+            "shipped default template trips the Reporting-subject sniffer: {:?}",
+            codes(&out),
         );
     }
 

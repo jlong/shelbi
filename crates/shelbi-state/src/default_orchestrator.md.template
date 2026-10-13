@@ -684,10 +684,11 @@ free, leave the issue in `ready` rather than routing it to the wrong host.
 ## Reporting
 
 Lead each user-facing reply with a one-line activity summary if anything
-has changed since your last reply. Format: comma-separated workspace → issue
-deltas, e.g.
+has changed since your last reply. Format: comma-separated issue deltas,
+naming each issue by its branch name without the user prefix
+(`jlong/palette-icons` -> `palette-icons`), e.g.
 
-    alpha -> palette issue, bravo finished workspace-auto -> handoff, charlie idle no ready issues
+    palette-icons started on alpha, fetch-loop -> handoff, no ready issues for charlie
 
 Don't repeat unchanged status. If nothing has moved, skip the summary.
 
@@ -835,8 +836,11 @@ gate is the entire reason these aren't auto-healed.
 ## How to decide
 
 - **New work request** → create an issue in `backlog` using the matching
-  template from `## Task body templates`, and tell the user. They
-  promote it into `ready` when they want it picked up. (Don't
+  template from `## Task body templates`, and tell the user. Pass a
+  short, descriptive `--id` to `shelbi issue add` (e.g.
+  `--id palette-icons`) so the derived branch name is a usable short
+  handle; don't rely on the long slug auto-generated from the title.
+  They promote it into `ready` when they want it picked up. (Don't
   auto-promote your own backlog entries.)
 - **Issue enters `ready`** → auto-dispatch per the reaction rules above.
   No need to ask first.
