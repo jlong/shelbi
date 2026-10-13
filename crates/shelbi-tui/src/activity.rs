@@ -268,11 +268,14 @@ struct TaskMeta {
 /// time-to-live (`REMOTE_META_TTL`).
 ///
 /// `meta` is `None` for a **confirmed miss** — an id the store resolved to
-/// nothing (a done task the open index doesn't carry, or a deleted one). Caching
-/// the miss (a *negative cache*, with the same TTL) is what stops the feed from
-/// re-resolving an unresolvable id on every render frame: the storm the
-/// 2026-09-08 incident attributed to the Activity view (`GitHubStore::get` per
-/// event, id-search + issue-fetch per tick, no negative cache).
+/// nothing (a pre-GitHub slug task id the board doesn't carry as an issue, a done
+/// task the open index doesn't carry, or a deleted one). A miss is *frozen* for
+/// the session (see [`entry_stale`]): searched at most once, never re-resolved on
+/// a TTL. That is what stops the feed from re-resolving an unresolvable id — both
+/// the per-render-frame storm the 2026-09-08 incident attributed to the Activity
+/// view (`GitHubStore::get` per event, id-search + issue-fetch per tick, no
+/// negative cache) and the per-sweep `id-search` re-run the sidebar-never-loads
+/// rework flagged (a short-TTL miss going stale every 15s, forever).
 #[derive(Debug, Clone)]
 struct TaskCacheEntry {
     /// Resolved metadata, or `None` for a confirmed miss (negative cache).
@@ -288,7 +291,8 @@ struct TaskCacheEntry {
     /// the feed never re-resolves it on the remote TTL. This is what stops a
     /// remote board from re-sweeping hundreds of done issues every tick — the
     /// done-history refetch loop (sidebar-never-loads incident). `false` for a
-    /// miss and for open issues (which keep the short TTL so edits show up).
+    /// miss (frozen on its own rule) and for open issues (which keep the short
+    /// TTL so edits show up).
     terminal: bool,
 }
 
@@ -336,14 +340,32 @@ fn is_frozen_column(col: &Column) -> bool {
 /// off-thread worker path share one rule:
 ///
 /// * an unknown id (no entry) is always wanted;
+/// * a **confirmed miss** is frozen — searched at most once per session (the
+///   steady-state fix: see below);
 /// * a **resolved terminal** issue is frozen — never re-fetched (the loop fix);
 /// * the filesystem backend invalidates exactly on the task file's `mtime`;
-/// * a remote entry (no `mtime`) and every miss fall back to the short TTL.
+/// * a resolved *open* remote entry (no `mtime`) falls back to the short TTL.
+///
+/// A confirmed miss (`meta: None`) is an id the store resolved to nothing: a
+/// pre-GitHub slug task id the board carries in its event history but that is not
+/// a GitHub issue, or a deleted one. Such an id will practically never resolve,
+/// so re-searching it once the short TTL lapses — every pass, forever — is the
+/// endless GraphQL spend the sidebar-never-loads rework flagged (a feed full of
+/// slug ids re-ran ~234 `id-search` queries per sweep). Freezing it means an
+/// unresolvable id costs at most one search per session. Misses are recorded
+/// only after a *successful* fetch (a transient fetch error leaves the id
+/// unknown, so a later pass retries it — see the resolve paths), so a real
+/// outage never permanently hides a live title.
 fn entry_stale(entry: Option<&TaskCacheEntry>, mtime: Option<SystemTime>) -> bool {
     match entry {
         None => true,
         Some(entry) => {
-            if entry.terminal && entry.meta.is_some() {
+            // A confirmed miss: frozen for the session (never re-searched).
+            if entry.meta.is_none() {
+                return false;
+            }
+            // A resolved terminal (done/canceled) issue: closed history is frozen.
+            if entry.terminal {
                 return false;
             }
             if mtime.is_some() || entry.mtime.is_some() {
@@ -442,7 +464,21 @@ fn resolve_task_meta_into(
         Err(_) => return cache.entries.clone(),
     };
     let refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
-    let fetched = store.fetch_many(&refs).unwrap_or_default();
+    // A fetch *error* is not a miss: it means the store couldn't answer (a
+    // GraphQL/connection blip, a rate-limit park), not that these ids resolve to
+    // nothing. Leave them unknown so a later pass retries — negative-caching them
+    // here would freeze live titles as misses for the whole session on one blip.
+    let fetched = match store.fetch_many(&refs) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!(
+                project = %project_name,
+                error = %e,
+                "activity title fetch failed; leaving ids unresolved to retry next pass"
+            );
+            return cache.entries.clone();
+        }
+    };
     let now = Instant::now();
     let mut resolved: HashSet<String> = HashSet::new();
     for tf in fetched {
@@ -464,8 +500,9 @@ fn resolve_task_meta_into(
             },
         );
     }
-    // Negative-cache the misses so an unresolvable id isn't re-searched until the
-    // TTL (a done task whose issue was deleted, a stale marker).
+    // Negative-cache the misses. An id absent from a *successful* fetch resolved
+    // to nothing (a pre-GitHub slug id, a deleted issue); `entry_stale` freezes it
+    // for the session so it is searched at most once — not re-run every sweep.
     for id in wanted {
         if !resolved.contains(&id) {
             cache.entries.insert(
@@ -966,9 +1003,14 @@ impl ActivityApp {
             Err(_) => return,
         };
         let refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
-        // One aliased request for every miss; ids that don't resolve are simply
-        // absent from the result (the `fetch_many` contract).
-        let fetched = store.fetch_many(&refs).unwrap_or_default();
+        // One aliased request for every stale id; ids that don't resolve are
+        // simply absent from the result (the `fetch_many` contract). A fetch
+        // *error*, though, is not a miss — leave those ids unknown so a later pass
+        // retries, rather than freezing live titles as misses on a blip.
+        let fetched = match store.fetch_many(&refs) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
         let now = Instant::now();
         let mut resolved: HashSet<String> = HashSet::new();
         for tf in fetched {
@@ -990,8 +1032,9 @@ impl ActivityApp {
                 },
             );
         }
-        // Negative-cache the misses so an unresolvable id isn't re-searched until
-        // the TTL — the fix for "no negative/closed-id cache".
+        // Negative-cache the misses: an id absent from a successful fetch is
+        // frozen for the session by `entry_stale`, so it is searched at most once
+        // — the fix for "no negative/closed-id cache" and the per-sweep re-search.
         for id in wanted {
             if !resolved.contains(&id) {
                 self.task_cache.insert(
@@ -4486,13 +4529,13 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
     }
 
     /// The loop's exit condition, isolated: a resolved **terminal** (done/
-    /// canceled) issue is frozen — never re-resolved, even long past the remote
-    /// TTL — so an idle board full of done cards stops generating `fetch_many`
-    /// traffic. An *open* issue past the TTL still re-resolves (edits must show),
-    /// and a miss / unknown id is still wanted. This is exactly the asymmetry the
-    /// endless-refetch incident was missing.
+    /// canceled) issue AND a confirmed **miss** are both frozen — never
+    /// re-resolved, even long past the remote TTL — so an idle board full of done
+    /// cards and unresolvable slug ids stops generating `fetch_many` traffic. An
+    /// *open* issue past the TTL still re-resolves (edits must show). This is
+    /// exactly the asymmetry the endless-refetch incident (and its rework) missed.
     #[test]
-    fn resolved_terminal_entries_are_frozen_past_the_ttl() {
+    fn resolved_terminal_entries_and_misses_are_frozen_past_the_ttl() {
         let long_ago = REMOTE_META_TTL + Duration::from_secs(3600);
 
         // A done issue resolved an hour ago: frozen, not stale (no re-fetch).
@@ -4505,14 +4548,20 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             entry_stale(Some(&resolved_entry(false, long_ago)), None),
             "a resolved open issue past the TTL is re-resolved"
         );
-        // A miss past the TTL is re-searched; an unknown id is always wanted.
+        // A confirmed miss, even far past the old 15s TTL, is frozen: searched at
+        // most once per session, not re-run every sweep (the rework fix).
         let miss = TaskCacheEntry {
             meta: None,
             mtime: None,
             fetched: Instant::now() - long_ago,
             terminal: false,
         };
-        assert!(entry_stale(Some(&miss), None), "a stale miss is re-searched");
+        assert!(
+            !entry_stale(Some(&miss), None),
+            "a confirmed miss is frozen past the TTL, not re-searched every sweep"
+        );
+        // An unknown id (no entry at all) is still always wanted — the freeze only
+        // applies once an id has been searched and confirmed to resolve to nothing.
         assert!(entry_stale(None, None), "an unknown id is wanted");
 
         // is_frozen_column classifies the terminal columns and nothing else.
@@ -4599,6 +4648,161 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             "done-history hydration terminates: no further requests once resolved"
         );
         assert!(cache.hydration_finished, "the quiet steady state was recorded");
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The rework's steady-state fix: a feed full of **unresolvable** ids — the
+    /// slug task ids from before the GitHub board (`rt-merge-main-into-umbrella`
+    /// and friends) that are not GitHub issues — is searched at most *once per id*
+    /// across many passes, including passes long after the old 15s TTL would have
+    /// expired. Before the fix each miss went stale on the short TTL every sweep,
+    /// so an idle board re-ran ~234 `id-search` queries forever (over budget).
+    /// After hydration the worker makes **zero** GitHub requests per pass.
+    #[test]
+    fn unresolvable_slug_ids_are_searched_once_per_session_not_every_sweep() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-activity-slug-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "actv-slug");
+
+        // Unique slug ids (no index number → resolution falls to the label
+        // search). A nonce keeps them out of the process-global id→number miss
+        // cache a sibling test might have warmed, so the first pass genuinely
+        // searches each one.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let slug_ids: Vec<String> = (0..5)
+            .map(|i| format!("rt-legacy-slug-{nonce}-{i}"))
+            .collect();
+
+        // A fake `gh` that counts GraphQL calls and answers every id-search empty
+        // — each slug resolves to nothing (it names no GitHub issue).
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rec = std::sync::Arc::clone(&calls);
+        shelbi_state::set_test_gh_runner(move |args: &[&str]| {
+            if args.join(" ").contains("graphql") {
+                rec.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(r#"{"data":{"search":{"nodes":[]}}}"#.to_string())
+        });
+
+        let events: Vec<Event> = slug_ids.iter().map(|id| done_issue_event(id)).collect();
+        let mut cache = ActivityMetaCache::default();
+
+        // First pass: one label search per slug, then every id is negative-cached.
+        resolve_task_meta_into("actv-slug", &events, &mut cache);
+        let after_first = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            after_first,
+            slug_ids.len(),
+            "the first pass searches each unresolvable id exactly once"
+        );
+        for id in &slug_ids {
+            assert!(
+                cache.entries.get(id).is_some_and(|e| e.meta.is_none()),
+                "{id} is negative-cached as a confirmed miss"
+            );
+        }
+
+        // Age every cached miss well past the old 15s remote TTL, simulating many
+        // minutes of sweeps. Under the old rule each would now be re-searched; the
+        // frozen-miss rule holds, so the next passes make NO further request.
+        let long_ago = Instant::now() - (REMOTE_META_TTL + Duration::from_secs(3600));
+        for entry in cache.entries.values_mut() {
+            entry.fetched = long_ago;
+        }
+
+        for _ in 0..10 {
+            resolve_task_meta_into("actv-slug", &events, &mut cache);
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            after_first,
+            "a confirmed miss is frozen for the session: no re-search after the TTL lapses"
+        );
+        assert!(
+            cache.hydration_finished,
+            "an idle board of unresolvable ids reaches the quiet steady state"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A transient fetch *error* must not be mistaken for a miss: the ids stay
+    /// unknown (not frozen), so a later pass retries them once the store recovers.
+    /// Freezing a live id as a miss on one GraphQL blip would hide its title for
+    /// the whole session — the safety valve on the steady-state freeze.
+    #[test]
+    fn a_fetch_error_does_not_negative_cache_ids() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-activity-err-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "actv-err");
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let id = format!("rt-transient-{nonce}");
+
+        // First: the search transport fails (a connection blip / rate-limit park).
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fail_rt = std::sync::Arc::clone(&fail);
+        shelbi_state::set_test_gh_runner(move |_args: &[&str]| {
+            if fail_rt.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(shelbi_core::Error::Other("transient".into()))
+            } else {
+                Ok(r#"{"data":{"search":{"nodes":[]}}}"#.to_string())
+            }
+        });
+
+        let events = vec![done_issue_event(&id)];
+        let mut cache = ActivityMetaCache::default();
+        resolve_task_meta_into("actv-err", &events, &mut cache);
+        assert!(
+            !cache.entries.contains_key(&id),
+            "a fetch error leaves the id unknown, not negative-cached"
+        );
+        assert!(entry_stale(cache.entries.get(&id), None), "the id is still wanted");
+
+        // The store recovers and now answers (empty → a genuine miss this time).
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        resolve_task_meta_into("actv-err", &events, &mut cache);
+        assert!(
+            cache.entries.get(&id).is_some_and(|e| e.meta.is_none()),
+            "once the store answers, the unresolvable id is negative-cached"
+        );
+        assert!(
+            !entry_stale(cache.entries.get(&id), None),
+            "and the confirmed miss is then frozen"
+        );
 
         shelbi_state::clear_test_gh_runner();
         std::env::remove_var("SHELBI_HOME");
