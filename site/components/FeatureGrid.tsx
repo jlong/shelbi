@@ -301,7 +301,7 @@ function AttachVignette() {
  * Review flow: the left column of the real review window
  * (`crates/shelbi-tui/src/review_panel.rs`) — a square back button, the
  * `Ready for review` status (cyan) over the review worktree folder, the
- * view-switcher nav block (🤓 Chat with Reviewer active, 🔀 View Diff, ✍️ Edit
+ * view-switcher nav block (🤓 Reviewer active, 🔀 View Diff, ✍️ Edit
  * in Vim, 🌐 Open Browser), then the `— Actions —` group with green Approve /
  * red Reject. At rest Chat holds the nav selection (white on the selection
  * fill). On hover the selection moves to Approve, which fills green
@@ -314,7 +314,7 @@ function ReviewVignette() {
   // The view-switcher entries, in the real panel's order. Chat is the active
   // (and initially selected) view; the rest are the other middle-pane views.
   const nav = [
-    { glyph: "🤓", label: "Chat with Reviewer" },
+    { glyph: "🤓", label: "Reviewer" },
     { glyph: "🔀", label: "View Diff" },
     { glyph: "✍️", label: "Edit in Vim" },
     { glyph: "🌐", label: "Open Browser" },
