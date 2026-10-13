@@ -150,6 +150,76 @@ fn apply_move_aborts_before_writing_when_the_recheck_reports_stale() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Write a second project `g` into the current `SHELBI_HOME` whose board is the
+/// GitHub (remote) backend, so a test can exercise the remote-vs-local branch of
+/// [`is_stale_change`]. The YAML otherwise mirrors `fresh_home`'s project `p`.
+fn write_github_project() {
+    let projects = shelbi_state::projects_dir().unwrap();
+    std::fs::write(
+        projects.join("g.yaml"),
+        "name: g\nrepo: /tmp/g\ndefault_branch: main\n\
+         orchestrator:\n  runner: claude\n\
+         agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+         machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/g\n\
+         workspaces:\n  - { name: dev, machine: local, runner: claude }\n\
+         issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n",
+    )
+    .unwrap();
+}
+
+fn at(status: &str, updated_at: &str) -> ExpectedState {
+    ExpectedState {
+        status: status.into(),
+        updated_at: updated_at.into(),
+    }
+}
+
+#[test]
+fn is_stale_change_ignores_a_self_write_rev_bump_on_a_remote_board() {
+    // The bug: `issue move <id> --to todo` then `issue start <id>` on a
+    // GitHub-backed board. The move's write-back bumps `updated_at` ~15-30s
+    // after the command returns, so `start` sees the same status at a newer
+    // revision. That self-write must NOT read as a conflict.
+    //
+    // But on a LOCAL board the revision is a reliable token, so the same
+    // same-status bump there IS stale; and a real status change is stale on
+    // either backend.
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    write_github_project();
+
+    let rev_a = "2026-10-13T01:48:25+00:00";
+    let rev_b = "2026-10-13T01:48:53+00:00";
+
+    // Remote (GitHub) board: a same-status revision bump is a self-write, not
+    // a conflict — `issue start` right after `issue move` succeeds.
+    assert!(
+        !is_stale_change("g", &at("todo", rev_a), &at("todo", rev_b)),
+        "a same-status rev bump on a remote board must not read as stale"
+    );
+    // Identical state is never stale.
+    assert!(!is_stale_change("g", &at("todo", rev_a), &at("todo", rev_a)));
+    // A real concurrent status change still raises the conflict on a remote
+    // board (someone else moved the card).
+    assert!(
+        is_stale_change("g", &at("todo", rev_a), &at("in_progress", rev_b)),
+        "a concurrent status change on a remote board must read as stale"
+    );
+
+    // Local (filesystem) board: the revision is authoritative, so a
+    // same-status bump IS a real change and reads as stale (no regression).
+    assert!(
+        is_stale_change("p", &at("todo", rev_a), &at("todo", rev_b)),
+        "a rev bump on a local board must still read as stale"
+    );
+    assert!(!is_stale_change("p", &at("todo", rev_a), &at("todo", rev_a)));
+    assert!(is_stale_change("p", &at("todo", rev_a), &at("in_progress", rev_a)));
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn apply_add_into_a_ready_status_wakes_the_orchestrator_but_backlog_stays_quiet() {
     let _g = crate::test_lock::acquire();
