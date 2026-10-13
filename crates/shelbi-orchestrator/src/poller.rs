@@ -3932,12 +3932,28 @@ impl PushRetryLedger {
         )
     }
 
-    /// True when a recorded ledger says the push is terminally blocked for
-    /// exactly `tip` — the poller then skips the push without re-attempting or
-    /// re-emitting.
-    fn blocks(prior: Option<&PushRetryLedger>, tip: &str) -> bool {
+    /// True when a recorded ledger says the push was already surfaced as blocked
+    /// for exactly `tip`. The poller still *re-attempts* the push on later ticks
+    /// (so an out-of-band origin fix completes the handoff), but treats this as
+    /// "quiet mode": it does not re-emit the `push status=blocked` event or
+    /// re-nudge the worker. A different tip (the worker committed a fix) is not
+    /// quiet — its fresh attempt reports normally.
+    fn already_surfaced(prior: Option<&PushRetryLedger>, tip: &str) -> bool {
         matches!(prior, Some(p) if p.blocked && p.tip == tip)
     }
+}
+
+/// Parse a [`workspace_pushed_tip_marker`] body (`<branch> <sha>`), returning
+/// the recorded sha **only** when its branch matches `branch`. A workspace
+/// reused for a later task on a different branch must not inherit a stale
+/// branch's pushed tip (which would let a force-push over a tip that is not
+/// this branch's own earlier push), so a branch mismatch — or any malformed
+/// body — yields `None` and the push falls back to blocking a non-ff remote.
+fn parse_pushed_tip(body: &str, branch: &str) -> Option<String> {
+    let mut it = body.split_whitespace();
+    let recorded_branch = it.next()?;
+    let sha = it.next()?;
+    (recorded_branch == branch && !sha.is_empty()).then(|| sha.to_string())
 }
 
 /// What the poller should do with a failed handoff push. Pure decision over the
@@ -4033,11 +4049,17 @@ fn push_blocked_message(branch: &str, cap: bool, reason: &str) -> String {
 ///   marker in place and retries next tick, but only up to
 ///   [`MAX_HANDOFF_PUSH_ATTEMPTS`] times for the same local tip — then it is
 ///   declared blocked rather than looped forever (the incident this fixes).
-/// - A **terminal block** (origin carries foreign commits a force would clobber,
-///   or the retry cap was hit) emits `push status=blocked`, nudges the worker,
-///   and stops re-attempting: subsequent ticks skip the push entirely until the
-///   worker changes the branch tip. The retry/block state is tracked in the
-///   per-workspace [`workspace_push_blocked_marker`] sidecar.
+/// - A **terminal block** (origin carries a tip Shelbi did not push — foreign
+///   work a force would clobber — or the retry cap was hit) emits
+///   `push status=blocked` and nudges the worker — exactly **once** per tip.
+///   Subsequent ticks still re-attempt the push (cheap: an `ls-remote` + a local
+///   provenance check, no actual push while it stays blocked) but stay quiet (no
+///   re-emit, no re-nudge). That self-heals the handoff: if a human reconciles
+///   `origin/<branch>` out of band so it now equals the local tip, the next
+///   tick's re-attempt hands off and the task advances — the incident where an
+///   out-of-band fix never completed. The retry/block state is tracked in the
+///   per-workspace [`workspace_push_blocked_marker`] sidecar; the last tip Shelbi
+///   pushed (the force-provenance) in the [`workspace_pushed_tip_marker`] one.
 ///
 /// Every outcome is written to `events.log` so a blocked handoff is traceable.
 ///
@@ -4079,6 +4101,7 @@ fn push_workspace_branch_before_handoff(
 
     let worktree = crate::workspace::workspace_worktree(machine, workspace);
     let marker = crate::workspace::workspace_push_blocked_marker(machine, workspace);
+    let pushed_tip_marker = crate::workspace::workspace_pushed_tip_marker(machine, workspace);
 
     // Key the retry ledger on the exact local tip we're about to push, so a
     // worker that commits a fix gets a fresh retry budget (its new tip won't
@@ -4091,31 +4114,51 @@ fn push_workspace_branch_before_handoff(
         .flatten()
         .and_then(|s| PushRetryLedger::parse(&s));
 
-    // Already terminally blocked for this exact tip: don't re-attempt the push
-    // (no tight loop) and don't re-emit — it was surfaced once already. Leave
-    // the card in-progress with the ready marker in place; a new commit resets
-    // the ledger and the handoff retries.
-    if PushRetryLedger::blocks(prior.as_ref(), &tip) {
-        tracing::debug!(
-            workspace = %workspace.name,
-            task = %task_id,
-            branch = %branch,
-            "handoff push terminally blocked for the current tip; skipping (surfaced earlier)",
-        );
-        return false;
-    }
+    // Provenance: the last commit Shelbi itself pushed for this branch (if any).
+    // It is what makes a non-fast-forward force safe — we may overwrite a remote
+    // tip only when it is that recorded commit, now reworked by the worker. A
+    // body for a *different* branch (a reused workspace) is ignored.
+    let last_pushed_tip = crate::workspace::read_deferred_marker(host, &pushed_tip_marker)
+        .ok()
+        .flatten()
+        .and_then(|body| parse_pushed_tip(&body, &branch));
+
+    // Whether this exact tip was already surfaced as blocked on a prior tick.
+    // We still re-attempt the push below (so an out-of-band origin fix completes
+    // the handoff), but if it fails/blocks again we stay quiet — no re-emit, no
+    // re-nudge — so a genuinely-stuck block is one event, not a tight loop.
+    let already_surfaced = PushRetryLedger::already_surfaced(prior.as_ref(), &tip);
 
     let outcome = crate::workspace::push_workspace_branch_to_origin(
-        host, &worktree, &branch,
+        host,
+        &worktree,
+        &branch,
+        last_pushed_tip.as_deref(),
     );
 
     let status = outcome.status_token();
     let detail = outcome.detail();
 
     if outcome.handed_off_local_tip() {
-        // Success (or no-remote): the local tip is on origin. Clear any retry
-        // ledger so a future failure starts fresh.
+        // Success (or no-remote): the local tip is on origin. This is also how a
+        // previously-blocked tip self-heals — if origin was reconciled out of
+        // band so it now equals the local tip, the re-attempt lands here and the
+        // handoff completes. Clear any retry ledger so a future failure starts
+        // fresh.
         let _ = crate::workspace::clear_deferred_marker(host, &marker);
+        // Record what we just put on origin as Shelbi's pushed tip, so a later
+        // rework of this exact commit (the bounce-and-rework case) is recognised
+        // as our own push and force-pushes rather than blocking. Every
+        // handed-off outcome that carries a concrete sha means origin now holds
+        // that sha (`Pushed` pushed it; `UpToDate` already matched it);
+        // `NoRemote` has nothing to record.
+        if let Some(sha) = outcome.handed_off_sha() {
+            let _ = crate::workspace::write_deferred_marker(
+                host,
+                &pushed_tip_marker,
+                &format!("{branch} {sha}"),
+            );
+        }
         if let Err(e) = append_push_event(task_id, &workspace.name, &branch, status, &detail) {
             tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_push_event failed");
         }
@@ -4130,8 +4173,24 @@ fn push_workspace_branch_before_handoff(
         return true;
     }
 
-    // Failed or Blocked. Drive the retry ledger: a transient failure retries
-    // (capped), a terminal block (foreign commits) stops immediately.
+    // Still not handed off, and this tip was already surfaced as blocked: don't
+    // re-emit or re-nudge (the one-event guarantee). Keep the ledger as-is and
+    // leave the card in-progress with the ready marker — a later tick re-attempts
+    // (self-healing on an out-of-band fix), and a new commit resets the ledger.
+    if already_surfaced {
+        tracing::debug!(
+            workspace = %workspace.name,
+            task = %task_id,
+            branch = %branch,
+            detail = %detail,
+            "handoff push still blocked for the current tip; re-attempted quietly (surfaced earlier)",
+        );
+        return false;
+    }
+
+    // Failed or Blocked, first time for this tip. Drive the retry ledger: a
+    // transient failure retries (capped), a terminal block (foreign content)
+    // stops immediately and surfaces once.
     let action = decide_push_failure(prior.as_ref(), &tip, outcome.is_blocked());
     match action {
         PushFailureAction::Retry(ledger) => {
@@ -11878,23 +11937,25 @@ transitions:
     }
 
     #[test]
-    fn push_blocks_only_a_matching_blocked_tip() {
+    fn push_surfaces_quietly_only_for_a_matching_blocked_tip() {
         let blocked = PushRetryLedger {
             tip: "abc".into(),
             attempts: 5,
             blocked: true,
         };
-        assert!(PushRetryLedger::blocks(Some(&blocked), "abc"));
-        // A different tip (worker committed a fix) is NOT blocked.
-        assert!(!PushRetryLedger::blocks(Some(&blocked), "xyz"));
-        // A non-blocked (still-retrying) ledger never short-circuits.
+        // A matching blocked tip is "already surfaced": the poller re-attempts
+        // quietly (no re-emit) rather than announcing the block again.
+        assert!(PushRetryLedger::already_surfaced(Some(&blocked), "abc"));
+        // A different tip (worker committed a fix) reports normally again.
+        assert!(!PushRetryLedger::already_surfaced(Some(&blocked), "xyz"));
+        // A non-blocked (still-retrying) ledger was never surfaced as blocked.
         let retrying = PushRetryLedger {
             tip: "abc".into(),
             attempts: 2,
             blocked: false,
         };
-        assert!(!PushRetryLedger::blocks(Some(&retrying), "abc"));
-        assert!(!PushRetryLedger::blocks(None, "abc"));
+        assert!(!PushRetryLedger::already_surfaced(Some(&retrying), "abc"));
+        assert!(!PushRetryLedger::already_surfaced(None, "abc"));
     }
 
     #[test]
@@ -11942,6 +12003,24 @@ transitions:
             }
             other => panic!("expected an immediate Block, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_pushed_tip_trusts_only_a_matching_branch() {
+        // A well-formed body for the SAME branch yields its sha.
+        assert_eq!(
+            parse_pushed_tip("jlong/feat abc1234", "jlong/feat").as_deref(),
+            Some("abc1234"),
+        );
+        // A body recorded for a DIFFERENT branch (a reused workspace) must be
+        // ignored, so a stale branch's pushed tip can never authorise a force
+        // over this branch's remote.
+        assert_eq!(parse_pushed_tip("jlong/other abc1234", "jlong/feat"), None);
+        // Malformed bodies (missing sha, empty, blank) yield None → fall back to
+        // blocking a non-ff remote rather than forcing on garbage.
+        assert_eq!(parse_pushed_tip("jlong/feat", "jlong/feat"), None);
+        assert_eq!(parse_pushed_tip("", "jlong/feat"), None);
+        assert_eq!(parse_pushed_tip("   ", "jlong/feat"), None);
     }
 
     #[test]
