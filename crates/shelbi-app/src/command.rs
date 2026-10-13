@@ -22,7 +22,7 @@
 //! back into a [`Command`]. Both are what let the existing palette read the
 //! registry instead of its own hand-rolled table.
 
-use shelbi_palette::{Decoration, Entry, EntryKind};
+use shelbi_palette::{Decoration, DecorationColor, Entry, EntryKind};
 
 use crate::exec::{EditTarget, Effect, Mutation};
 use crate::nav::View;
@@ -432,7 +432,10 @@ impl CommandRegistry {
             title: "Open error log".to_string(),
             kind: CommandKind::OpenErrorLog,
             entry_kind: EntryKind::Action,
-            decoration: None,
+            decoration: Some(Decoration {
+                glyph: "📜".into(),
+                color: DecorationColor::Default,
+            }),
             subtitle: Some("Review recent errors and warnings".to_string()),
             shortcut: None,
             hidden_until_query: false,
@@ -504,7 +507,10 @@ impl CommandRegistry {
             title: "Detach".to_string(),
             kind: CommandKind::Detach,
             entry_kind: EntryKind::Action,
-            decoration: None,
+            decoration: Some(Decoration {
+                glyph: "🛸".into(),
+                color: DecorationColor::Default,
+            }),
             subtitle: Some("Leave Shelbi running in the background".to_string()),
             shortcut: None,
             hidden_until_query: false,
@@ -532,7 +538,10 @@ impl CommandRegistry {
                 title: "Quit Project".to_string(),
                 kind: CommandKind::QuitProject,
                 entry_kind: EntryKind::Action,
-                decoration: None,
+                decoration: Some(Decoration {
+                    glyph: "🏁".into(),
+                    color: DecorationColor::Default,
+                }),
                 subtitle: Some("Stop this project's agents and close it".to_string()),
                 shortcut: None,
                 hidden_until_query: false,
@@ -543,7 +552,10 @@ impl CommandRegistry {
             title: "Quit Shelbi".to_string(),
             kind: CommandKind::QuitShelbi,
             entry_kind: EntryKind::Action,
-            decoration: None,
+            decoration: Some(Decoration {
+                glyph: "🏎️".into(),
+                color: DecorationColor::Default,
+            }),
             subtitle: Some("Stop every agent and shut Shelbi down".to_string()),
             shortcut: None,
             hidden_until_query: false,
@@ -733,6 +745,46 @@ mod tests {
         ] {
             assert!(ids.contains(&want.to_string()), "missing command id {want}");
         }
+    }
+
+    #[test]
+    fn detach_and_quit_actions_carry_their_emoji_glyphs() {
+        // The four action rows show the same twemoji-style icons the nav views
+        // do: a scroll, a flying saucer, a chequered flag, and a racing car.
+        // Their color is `Default` so the emoji renders in its own colors.
+        let reg = CommandRegistry::new();
+        let cmds = reg.commands(&model());
+        let glyph = |id: &str| -> Decoration {
+            cmds.iter()
+                .find(|c| c.id() == id)
+                .unwrap_or_else(|| panic!("missing command {id}"))
+                .decoration
+                .clone()
+                .unwrap_or_else(|| panic!("command {id} has no decoration"))
+        };
+        for (id, want) in [
+            ("action:error-log", "📜"),
+            ("action:detach", "🛸"),
+            ("action:quit-project", "🏁"),
+            ("action:quit-shelbi", "🏎️"),
+        ] {
+            let dec = glyph(id);
+            assert_eq!(dec.glyph, want, "glyph for {id}");
+            assert_eq!(dec.color, DecorationColor::Default, "color for {id}");
+        }
+
+        // "Detach Other Clients" is deliberately left without an icon.
+        assert!(
+            glyph_is_none(&cmds, "action:detach-others"),
+            "detach-others stays undecorated"
+        );
+    }
+
+    fn glyph_is_none(cmds: &[Command], id: &str) -> bool {
+        cmds.iter()
+            .find(|c| c.id() == id)
+            .map(|c| c.decoration.is_none())
+            .unwrap_or(false)
     }
 
     #[test]

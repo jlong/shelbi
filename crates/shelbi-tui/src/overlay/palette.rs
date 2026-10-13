@@ -842,6 +842,7 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shelbi_palette::{Decoration, DecorationColor};
 
     fn entry(id: &str, label: &str) -> Entry {
         Entry {
@@ -911,6 +912,48 @@ mod tests {
             }
         }
         None
+    }
+
+    fn entry_with_glyph(id: &str, label: &str, glyph: &str) -> Entry {
+        Entry {
+            id: id.into(),
+            label: label.into(),
+            kind: EntryKind::Action,
+            subtitle: None,
+            shortcut: None,
+            decoration: Some(Decoration {
+                glyph: glyph.into(),
+                color: DecorationColor::Default,
+            }),
+            hidden_until_query: false,
+        }
+    }
+
+    #[test]
+    fn emoji_icon_fields_stay_one_slot_wide_including_the_vs16_sequence() {
+        // Each action emoji — scroll / flying saucer / chequered flag / racing
+        // car — must occupy exactly `ICON_FIELD_W` display columns so every
+        // label starts at the same x. The racing car (`🏎️`, U+1F3CE + U+FE0F)
+        // is the risky one: its base code point measures a single column and
+        // only the VS16 sequence widens it to an emoji's two cells. Measuring
+        // the glyph as a whole string (not per code point) keeps the slot at
+        // four columns; a per-char measurement would render it three columns
+        // wide and shove the label one cell left.
+        for (glyph, name) in [
+            ("📜", "scroll"),
+            ("🛸", "flying saucer"),
+            ("🏁", "chequered flag"),
+            ("🏎️", "racing car"),
+        ] {
+            let results = vec![(entry_with_glyph("action:x", "Quit Shelbi", glyph), 0u16)];
+            let lines = build_result_lines(&results, 60, None);
+            let icon_field = lines[0].spans[0].content.as_ref();
+            assert_eq!(
+                UnicodeWidthStr::width(icon_field),
+                ICON_FIELD_W,
+                "{name} icon field must be {ICON_FIELD_W} cols wide, got {icon_field:?}"
+            );
+        }
     }
 
     #[test]
