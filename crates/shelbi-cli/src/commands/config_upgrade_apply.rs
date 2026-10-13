@@ -47,9 +47,10 @@ use shelbi_core::StatusCategory;
 
 use super::config_surfaces::{live_entries, InventoryEntry, SurfaceFormat};
 use super::config_upgrade::{
-    apply_tmux_instruction_rewrites, cargo_test_without_no_fail_fast, get, insert_no_fail_fast,
-    is_inert, legacy_status_id, scope_label, Classification, UpgradeFinding, UpgradeReport,
-    PR_TEMPLATE_MISSING, REMOVED_PROJECT_KEYS, TMUX_INSTRUCTION_AUTOHEAL_CODE,
+    apply_reporting_subject_rewrite, apply_tmux_instruction_rewrites,
+    cargo_test_without_no_fail_fast, get, insert_no_fail_fast, is_inert, legacy_status_id,
+    scope_label, Classification, UpgradeFinding, UpgradeReport, PR_TEMPLATE_MISSING,
+    REMOVED_PROJECT_KEYS, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
 };
 
 /// One auto-heal write-back that landed on disk this run. Returned to the
@@ -203,6 +204,13 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
     // match the YAML/JSON branches below, so handled independently.
     if codes.contains(TMUX_INSTRUCTION_AUTOHEAL_CODE) {
         heal_tmux_instructions(entry, applied);
+    }
+
+    // Rewrite the orchestrator `Reporting` passage from its workspace-subject
+    // wording to the issue-subject form. A Markdown surface, handled
+    // independently of the YAML/JSON content healers below.
+    if codes.contains(REPORTING_SUBJECT_AUTOHEAL_CODE) {
+        heal_reporting_subject(entry, applied);
     }
 
     // Add `--no-fail-fast` to fail-fast `cargo test` local checks. A surgical,
@@ -994,6 +1002,34 @@ fn heal_tmux_instructions(entry: &InventoryEntry, applied: &mut Vec<AppliedChang
     );
 }
 
+/// Rewrite the orchestrator `Reporting` passage from its workspace-subject form
+/// to the issue-subject form via the shared [`apply_reporting_subject_rewrite`]
+/// table (the same one the sniffer keys the `INSTRUCTIONS_REPORTING_WORKSPACE_SUBJECT`
+/// auto-heal on). Deterministic and non-lossy — only the exact shipped passage
+/// matches, so an edited copy (never flagged) is never touched here. A no-op
+/// write is skipped so the file mtime and the events.log disclosure stay honest.
+fn heal_reporting_subject(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
+    let path = &entry.canonical_path;
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let out = apply_reporting_subject_rewrite(&text);
+    if out == text {
+        return;
+    }
+    if let Err(e) = write_atomic(path, &out) {
+        eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
+        return;
+    }
+    record(
+        applied,
+        entry,
+        REPORTING_SUBJECT_AUTOHEAL_CODE,
+        path,
+        "reporting-workspace-subject->issue-subject".into(),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 
@@ -1513,6 +1549,92 @@ zen:
         );
         let applied2 = apply_auto_heal(&["demo".to_string()], &report2);
         assert!(applied2.is_empty(), "second pass wrote: {applied2:?}");
+    }
+
+    #[test]
+    fn reporting_passage_auto_heals_on_start_idempotently_and_discloses() {
+        // An existing project whose forked orchestrator `instructions.md` still
+        // carries the exact legacy workspace-subject Reporting passage: the boot
+        // pass rewrites it to the issue-subject form, discloses it, and a second
+        // pass is a no-op.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        std::fs::write(home.join("projects/demo.yaml"), "repo: /tmp/demo\n").unwrap();
+        let orch_dir = home.join("projects/demo/agents/orchestrator");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        let (legacy, replacement) =
+            crate::commands::config_upgrade::REPORTING_SUBJECT_REWRITE;
+        let path = orch_dir.join("instructions.md");
+        std::fs::write(&path, format!("# Orchestrator\n\n## Reporting\n\n{legacy}\n")).unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            report.findings.iter().any(|f| f.code == REPORTING_SUBJECT_AUTOHEAL_CODE
+                && f.classification == Classification::AutoHeal),
+            "expected an INSTRUCTIONS_REPORTING_WORKSPACE_SUBJECT auto-heal: {:?}",
+            report.findings.iter().map(|f| &f.code).collect::<Vec<_>>(),
+        );
+
+        let applied = apply_auto_heal(&["demo".to_string()], &report);
+        assert!(
+            applied.iter().any(|c| c.code == REPORTING_SUBJECT_AUTOHEAL_CODE),
+            "nothing applied: {applied:?}",
+        );
+
+        let healed = std::fs::read_to_string(&path).unwrap();
+        assert!(healed.contains(replacement), "new wording missing: {healed}");
+        assert!(!healed.contains(legacy), "legacy wording survived: {healed}");
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default();
+        assert!(log.contains("config-upgrade"), "no disclosure line: {log}");
+        assert!(log.contains(REPORTING_SUBJECT_AUTOHEAL_CODE), "{log}");
+
+        // Idempotent: a second pass detects no auto-heal and writes nothing.
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report2.findings.iter().any(|f| f.code == REPORTING_SUBJECT_AUTOHEAL_CODE),
+            "residual reporting auto-heal: {report2:?}",
+        );
+        let applied2 = apply_auto_heal(&["demo".to_string()], &report2);
+        assert!(applied2.is_empty(), "second pass wrote: {applied2:?}");
+    }
+
+    #[test]
+    fn edited_reporting_passage_is_left_untouched_and_unflagged() {
+        // A forked copy whose Reporting passage the user edited: no exact match,
+        // so nothing is reported (the change is cosmetic — never needs-judgment)
+        // and the file is left byte-for-byte intact.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        std::fs::write(home.join("projects/demo.yaml"), "repo: /tmp/demo\n").unwrap();
+        let orch_dir = home.join("projects/demo/agents/orchestrator");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        let path = orch_dir.join("instructions.md");
+        let edited = "# Orchestrator\n\n## Reporting\n\nLead with my own custom summary line.\n";
+        std::fs::write(&path, edited).unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report.findings.iter().any(|f| f.code == REPORTING_SUBJECT_AUTOHEAL_CODE),
+            "an edited Reporting passage must not auto-heal: {:?}",
+            report.findings.iter().map(|f| &f.code).collect::<Vec<_>>(),
+        );
+
+        let applied = apply_auto_heal(&["demo".to_string()], &report);
+        assert!(
+            !applied.iter().any(|c| c.code == REPORTING_SUBJECT_AUTOHEAL_CODE),
+            "an edited Reporting passage was auto-applied: {applied:?}",
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited, "file was modified");
     }
 
     #[test]
