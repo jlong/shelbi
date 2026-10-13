@@ -490,6 +490,13 @@ impl IssueStore for CachedIssueStore {
         self.inner.fetch_many(ids)
     }
 
+    /// Straight to the backend, same as [`CachedIssueStore::fetch_many`] — so the
+    /// `github` backend's per-id-isolating override (not the trait default over
+    /// `get`) is the one the Activity feed's hydration reaches through the cache.
+    fn fetch_many_partial(&self, ids: &[&str]) -> Result<(Vec<IssueFile>, Vec<String>)> {
+        self.inner.fetch_many_partial(ids)
+    }
+
     fn add(&self, spec: NewIssue) -> Result<Issue> {
         let out = self.inner.add(spec)?;
         self.invalidate();

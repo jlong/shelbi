@@ -914,6 +914,45 @@ impl IssueStore for GitHubStore {
         Ok(fetched.into_iter().map(|(tf, _)| tf).collect())
     }
 
+    fn fetch_many_partial(&self, ids: &[&str]) -> Result<(Vec<IssueFile>, Vec<String>)> {
+        // Resolve each id to a number **independently** so one failing id-search
+        // can't abort the batch (the retry-storm the Activity feed hit): a failed
+        // resolve lands in `failed` (the caller retries it under backoff), an id
+        // that resolves to nothing is a miss (absent from both lists), and the
+        // numbers that did resolve are pulled in one aliased request.
+        let mut numbers: Vec<i64> = Vec::with_capacity(ids.len());
+        let mut num_to_id: BTreeMap<i64, String> = BTreeMap::new();
+        let mut failed: Vec<String> = Vec::new();
+        for id in ids {
+            match self.resolve_number(id) {
+                Ok(Some(n)) => {
+                    numbers.push(n);
+                    num_to_id.entry(n).or_insert_with(|| (*id).to_string());
+                }
+                Ok(None) => {}
+                Err(_) => failed.push((*id).to_string()),
+            }
+        }
+        numbers.sort_unstable();
+        numbers.dedup();
+        let fetched = match self.fetch_many_numbers(&numbers) {
+            Ok(f) => f,
+            Err(_) => {
+                // The ids resolved to numbers but the aliased body read failed as
+                // a whole: those ids didn't come back, so they're failures to
+                // retry under backoff, never misses to freeze. Report them failed
+                // and resolve nothing this call.
+                failed.extend(num_to_id.into_values());
+                return Ok((Vec::new(), failed));
+            }
+        };
+        for (tf, number) in &fetched {
+            self.cache_issue(*number, tf);
+            self.remember_number(&tf.task.id, *number);
+        }
+        Ok((fetched.into_iter().map(|(tf, _)| tf).collect(), failed))
+    }
+
     fn add(&self, spec: NewIssue) -> Result<Issue> {
         shelbi_core::validate_task_id(&spec.id)?;
         // A card that already exists (same shelbi id) must not be silently

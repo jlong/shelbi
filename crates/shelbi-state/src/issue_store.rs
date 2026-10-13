@@ -587,6 +587,37 @@ pub trait IssueStore {
         Ok(out)
     }
 
+    /// Like [`fetch_many`](IssueStore::fetch_many), but **isolates per-id
+    /// failures**: returns the issues that resolved *and* the ids whose fetch
+    /// errored (a transient blip, a rate-limit park, a query GitHub rejected).
+    /// An id that resolved to no issue is a miss — absent from both lists, same
+    /// as `fetch_many`.
+    ///
+    /// The distinction matters to a caller that caches results and retries
+    /// failures: one failing id must neither discard the others' results nor be
+    /// mistaken for a confirmed miss. The caller caches the resolved ids,
+    /// negative-caches the misses, and retries only the failed ids under its own
+    /// backoff. This is the read the Activity feed's title hydration uses so a
+    /// single bad id can't send it into a per-pass retry storm.
+    ///
+    /// The default resolves each id through [`get`](IssueStore::get) one at a
+    /// time, catching its error into the failed list — correct for the
+    /// `file_system` backend and the process cache. The `github` backend
+    /// overrides it to resolve each id to a number independently (failures
+    /// isolated) and pull the resolved numbers in one aliased request.
+    fn fetch_many_partial(&self, ids: &[&str]) -> Result<(Vec<IssueFile>, Vec<String>)> {
+        let mut out = Vec::with_capacity(ids.len());
+        let mut failed = Vec::new();
+        for id in ids {
+            match self.get(id) {
+                Ok(Some(tf)) => out.push(tf),
+                Ok(None) => {}
+                Err(_) => failed.push((*id).to_string()),
+            }
+        }
+        Ok((out, failed))
+    }
+
     /// Every issue in a single status column, in priority order.
     fn list_in_status(&self, status: &Column) -> Result<Vec<IssueFile>>;
 
