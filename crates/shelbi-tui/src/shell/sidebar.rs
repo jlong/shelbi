@@ -36,6 +36,7 @@ use crate::keymap::format_chord_or_unbound;
 use crate::sidebar::{decoration_to_color, nav_lines, BLEED_ABOVE, BLEED_BELOW};
 use crate::theme::{ACCENT, BUSY_GREEN, MUTED, SEARCH_BG, SELECTION_BG, TEXT, TEXT_SELECTED};
 use shelbi_palette::DecorationColor;
+use unicode_width::UnicodeWidthStr;
 
 /// Exact one-time orientation copy shown in the sidebar footer after the first
 /// project scaffold. One constant so persistence and wrapping paths can't drift
@@ -986,15 +987,14 @@ fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
             .render(Rect { y: bottom, height: 1, ..area }, buf);
     }
 
-    // Label row, on the solid search fill.
+    // Label row, on the solid search fill. Measure in *display* columns, not
+    // chars: the `🔍` is one `char` but two cells wide, so a char count would
+    // undercount the label by a column and push the right-aligned chord one cell
+    // past where the padding math intends — clipping the trailing inset and
+    // leaving the chord flush against the box's right edge.
     let label = " 🔍 Search";
-    let label_w = label.chars().count();
-    let chord_hint = if chord.is_empty() {
-        String::new()
-    } else {
-        format!("{chord} ")
-    };
-    let chord_w = chord_hint.chars().count();
+    let label_w = UnicodeWidthStr::width(label);
+    let chord_w = UnicodeWidthStr::width(chord);
 
     // Both the label and the shortcut are the normal `color/gray` (#bababa), not
     // dimmed — the Figma search box reads them at the same weight.
@@ -1002,14 +1002,18 @@ fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
         label.to_string(),
         Style::default().fg(TEXT).bg(SEARCH_BG),
     )];
-    // Append the chord hint only when the label and it both fit. The trailing
-    // space in `chord_hint` keeps ~1 col of right padding inside the box.
-    if chord_w > 0 && label_w + chord_w < width {
-        let pad = width - label_w - chord_w;
+    // Append the chord hint only when the label, the chord, and a one-column
+    // right inset all fit. The chord sits one column in from the box's right
+    // edge, mirroring the label's one-column inset on the left; that final
+    // column is a blank fill cell (RIGHT_INSET wide).
+    const RIGHT_INSET: usize = 1;
+    if chord_w > 0 && label_w + chord_w + RIGHT_INSET <= width {
+        let pad = width - label_w - chord_w - RIGHT_INSET;
         spans.push(Span::styled(" ".repeat(pad), Style::default().bg(SEARCH_BG)));
+        spans.push(Span::styled(chord.to_string(), Style::default().fg(TEXT).bg(SEARCH_BG)));
         spans.push(Span::styled(
-            chord_hint,
-            Style::default().fg(TEXT).bg(SEARCH_BG),
+            " ".repeat(RIGHT_INSET),
+            Style::default().bg(SEARCH_BG),
         ));
     }
     Paragraph::new(Line::from(spans)).render(Rect { y: label_y, height: 1, ..area }, buf);
@@ -1772,6 +1776,57 @@ mod tests {
         }
         // A blank half-row margin sits above the box (below the title).
         assert!(rows[(top_y - 1) as usize].trim().is_empty(), "blank margin above the box, got: {:?}", rows[(top_y - 1) as usize]);
+    }
+
+    /// The palette-chord hint sits one column in from the search box's right
+    /// edge, mirroring the label's one-column inset on the left — it is never
+    /// flush against the edge. (A char-count of the double-width `🔍` used to
+    /// mis-size the padding by a column and push the chord's last glyph onto the
+    /// box's final column.)
+    #[test]
+    fn search_chord_is_inset_one_column_from_the_box_right_edge() {
+        let view = SidebarView::build(&empty_model());
+        let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            view.render(f.buffer_mut(), area, 1, true, &default_chrome())
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term);
+        let sy = row_y(&rows, "Search") as u16;
+
+        // The chord still renders (mac `⌃P` / linux `Ctrl+P`).
+        let want_chord = match DisplayStyle::detect() {
+            DisplayStyle::Mac => "⌃P",
+            DisplayStyle::Linux => "Ctrl+P",
+        };
+        assert!(rows[sy as usize].contains(want_chord), "chord renders: {:?}", rows[sy as usize]);
+
+        // The box fills cols 1..=38 on a 40-wide sidebar (a one-column gutter on
+        // each side); col 38 is its right edge. The chord's last glyph must land
+        // on col 37 — one column in — and col 38 must be a blank fill cell.
+        let box_right = 38u16;
+        let last_glyph_x = (0..buf.area.width)
+            .rev()
+            .find(|&x| !buf[(x, sy)].symbol().trim().is_empty())
+            .expect("the chord renders a glyph on the search row");
+        assert_eq!(
+            last_glyph_x,
+            box_right - 1,
+            "the chord's last glyph is one column in from the box's right edge (col {}), got col {last_glyph_x}",
+            box_right - 1
+        );
+        assert_eq!(
+            buf[(box_right, sy)].symbol().trim(),
+            "",
+            "the box's right-edge column is a blank inset"
+        );
+        assert_eq!(
+            buf[(box_right, sy)].bg,
+            SEARCH_BG,
+            "the one-column right inset is part of the box fill"
+        );
     }
 
     /// A click anywhere in the 2-row box — including the `▄` / `▀` half-block
