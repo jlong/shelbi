@@ -302,6 +302,20 @@ struct TaskCacheEntry {
 /// that a remote title / branch / assignment edit shows up promptly.
 const REMOTE_META_TTL: Duration = Duration::from_secs(15);
 
+/// First retry delay after a title fetch *errors* (not a miss — a GraphQL blip, a
+/// rejected query, a rate-limit park). An errored id is held out of the wanted
+/// set until this elapses, then retried once; each further failure doubles the
+/// delay up to [`FETCH_BACKOFF_MAX`]. This is what keeps a persistently-failing
+/// fetch to a few calls per hour instead of one per refresh pass — the storm the
+/// "a fetch error is not a miss" change opened (one bad id re-searched every
+/// 750ms forever). Reset on the id's first success.
+const FETCH_BACKOFF_BASE: Duration = Duration::from_secs(30);
+
+/// Ceiling on the exponential fetch-error backoff. A fetch that keeps failing
+/// (an id GitHub always rejects, a long rate-limit park) retries at most this
+/// often, so it costs ~6 calls/hour at the cap rather than growing unbounded.
+const FETCH_BACKOFF_MAX: Duration = Duration::from_secs(600);
+
 /// Everything one activity refresh reads. Produced by
 /// [`ActivityApp::read_activity_data`] (off the UI thread in the shell) and
 /// folded in by [`ActivityApp::apply_activity_data`].
@@ -335,9 +349,9 @@ fn is_frozen_column(col: &Column) -> bool {
     matches!(col.category(), StatusCategory::Done | StatusCategory::Archived)
 }
 
-/// Whether `entry` needs re-resolving. The free-function twin of
-/// [`ActivityApp::task_meta_stale`] so the on-`&self` render path and the
-/// off-thread worker path share one rule:
+/// Whether `entry` needs re-resolving. Shared by the standalone and shell
+/// resolve paths (both route through [`resolve_task_meta_into`]) so they apply
+/// one rule:
 ///
 /// * an unknown id (no entry) is always wanted;
 /// * a **confirmed miss** is frozen — searched at most once per session (the
@@ -391,23 +405,84 @@ pub(crate) struct ActivityMetaCache {
     /// Logged `true` once a pass finds nothing left to resolve after at least one
     /// fetch, so the finish line is emitted exactly once.
     hydration_finished: bool,
+    /// Per-id retry backoff for ids whose *fetch errored* — distinct from a
+    /// resolved entry (cached) and a confirmed miss (frozen in `entries`). A
+    /// transient error leaves the id unknown so a later pass retries it, but
+    /// **bounded**: an errored id is held here until its `retry_at`, then tried
+    /// once; each further failure pushes `retry_at` out exponentially (see
+    /// [`FETCH_BACKOFF_BASE`]/[`FETCH_BACKOFF_MAX`]). Cleared on the id's first
+    /// success. Without this, one id GitHub keeps rejecting (or a rate-limit
+    /// park) is re-fetched every 750ms pass — a faster 403 than the loop this
+    /// whole task fixes.
+    backoff: HashMap<String, FetchBackoff>,
+}
+
+/// One id's fetch-error backoff state (see [`ActivityMetaCache::backoff`]).
+#[derive(Debug, Clone)]
+struct FetchBackoff {
+    /// The earliest instant the id may be fetched again.
+    retry_at: Instant,
+    /// Consecutive failures so far — drives the exponential delay.
+    attempts: u32,
+}
+
+impl ActivityMetaCache {
+    /// Whether `id` is inside an active fetch-error backoff window at `now`: its
+    /// last fetch errored and the next retry time hasn't arrived. Such an id is
+    /// held out of the wanted set so a persistently-failing fetch doesn't re-run
+    /// every pass.
+    fn in_backoff(&self, id: &str, now: Instant) -> bool {
+        self.backoff.get(id).is_some_and(|b| now < b.retry_at)
+    }
+
+    /// Record a failed fetch for `id`, advancing its backoff. The delay doubles
+    /// with each consecutive failure from [`FETCH_BACKOFF_BASE`], capped at
+    /// [`FETCH_BACKOFF_MAX`].
+    fn note_fetch_failure(&mut self, id: &str, now: Instant) {
+        let entry = self
+            .backoff
+            .entry(id.to_string())
+            .or_insert(FetchBackoff { retry_at: now, attempts: 0 });
+        entry.attempts = entry.attempts.saturating_add(1);
+        // 2^(attempts-1) * base, saturating and capped. `min(31)` keeps the shift
+        // in range; `saturating_mul` + `.min` cap the product at the ceiling.
+        let shift = entry.attempts.saturating_sub(1).min(31);
+        let delay = FETCH_BACKOFF_BASE
+            .saturating_mul(1u32 << shift)
+            .min(FETCH_BACKOFF_MAX);
+        entry.retry_at = now + delay;
+    }
+
+    /// Drop any backoff for `id` — called when a fetch for it finally succeeds or
+    /// it resolves to a confirmed miss, so a future transient error starts the
+    /// backoff fresh at the base delay rather than wherever it left off.
+    fn clear_backoff(&mut self, id: &str) {
+        self.backoff.remove(id);
+    }
 }
 
 /// Resolve task metadata for the ids referenced by `events`, folding the result
 /// into the persistent `cache` and returning a snapshot the feed renders from.
+/// `now` is the clock the TTL and fetch-error backoff read (injected so a test
+/// can advance it); production passes [`Instant::now`].
 ///
 /// Incremental and bounded (see [`MAX_META_RESOLVE_PER_PASS`]): only ids that are
-/// unknown or stale ([`entry_stale`]) are candidates, at most a batch per pass.
-/// Resolved terminal issues are frozen so an idle board with hundreds of done
-/// cards makes **no** repeat requests — the done-history refetch loop fix. The
-/// store's own TTL/negative caches back the rare live fetch that remains.
+/// unknown or stale ([`entry_stale`]) **and not in a fetch-error backoff window**
+/// are candidates, at most a batch per pass. Resolved terminal issues are frozen
+/// so an idle board with hundreds of done cards makes **no** repeat requests (the
+/// done-history refetch loop fix); confirmed misses are frozen too (the slug-id
+/// re-search fix); and an id whose fetch *errors* is retried under an exponential
+/// backoff (the retry-storm fix), never every pass. The store's own TTL/negative
+/// caches back the rare live fetch that remains.
 fn resolve_task_meta_into(
     project_name: &str,
     events: &[Event],
     cache: &mut ActivityMetaCache,
+    now: Instant,
 ) -> HashMap<String, TaskCacheEntry> {
     use std::collections::HashSet;
-    // Candidate ids: unique, referenced, and unknown-or-stale against the cache.
+    // Candidate ids: unique, referenced, unknown-or-stale, and not currently
+    // backing off from a recent fetch error.
     let mut wanted: Vec<String> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
     for ev in events {
@@ -416,16 +491,18 @@ fn resolve_task_meta_into(
             continue;
         }
         let mtime = task_file_mtime(project_name, id);
-        if entry_stale(cache.entries.get(id), mtime) {
+        if entry_stale(cache.entries.get(id), mtime) && !cache.in_backoff(id, now) {
             wanted.push(id.to_string());
         }
     }
 
     if wanted.is_empty() {
-        // Fully hydrated (every referenced id cached and fresh): announce it once
-        // so the next loop like this is diagnosable from `tui.log`, then make no
-        // request. This is the quiet steady state the incident never reached.
-        if cache.hydration_started && !cache.hydration_finished {
+        // Nothing to fetch this pass. If every referenced id is truly settled
+        // (cached or a confirmed miss, and nothing waiting on a retry) announce
+        // the quiet steady state once so the next loop like this is diagnosable
+        // from `tui.log`. While an errored id is still backing off we stay silent
+        // but don't claim "complete" — a retry pass is still pending.
+        if cache.hydration_started && !cache.hydration_finished && cache.backoff.is_empty() {
             cache.hydration_finished = true;
             tracing::info!(
                 project = %project_name,
@@ -464,28 +541,35 @@ fn resolve_task_meta_into(
         Err(_) => return cache.entries.clone(),
     };
     let refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
-    // A fetch *error* is not a miss: it means the store couldn't answer (a
-    // GraphQL/connection blip, a rate-limit park), not that these ids resolve to
-    // nothing. Leave them unknown so a later pass retries — negative-caching them
-    // here would freeze live titles as misses for the whole session on one blip.
-    let fetched = match store.fetch_many(&refs) {
-        Ok(f) => f,
+    // `fetch_many_partial` isolates per-id failures: it returns the ids that
+    // resolved *and* the ids whose fetch errored, keeping the two apart so one
+    // bad id neither discards the others' results nor is mistaken for a miss. A
+    // fetch *error* is not a miss (the store couldn't answer — a GraphQL blip, a
+    // rate-limit park); such ids back off and retry later rather than freezing as
+    // misses. A hard failure of the whole call backs off the entire batch.
+    let (fetched, failed) = match store.fetch_many_partial(&refs) {
+        Ok(result) => result,
         Err(e) => {
             tracing::debug!(
                 project = %project_name,
                 error = %e,
-                "activity title fetch failed; leaving ids unresolved to retry next pass"
+                "activity title fetch failed; backing off this batch to retry later"
             );
+            for id in &wanted {
+                cache.note_fetch_failure(id, now);
+            }
             return cache.entries.clone();
         }
     };
-    let now = Instant::now();
     let mut resolved: HashSet<String> = HashSet::new();
     for tf in fetched {
         let id = tf.task.id.clone();
         let mtime = task_file_mtime(project_name, &id);
         let terminal = is_frozen_column(&tf.task.column);
         resolved.insert(id.clone());
+        // A success clears any prior backoff so the next transient error on this
+        // id starts fresh at the base delay.
+        cache.clear_backoff(&id);
         cache.entries.insert(
             id,
             TaskCacheEntry {
@@ -500,21 +584,31 @@ fn resolve_task_meta_into(
             },
         );
     }
-    // Negative-cache the misses. An id absent from a *successful* fetch resolved
-    // to nothing (a pre-GitHub slug id, a deleted issue); `entry_stale` freezes it
-    // for the session so it is searched at most once — not re-run every sweep.
+    // The ids whose fetch errored: back them off (bounded retry), and keep them
+    // out of the negative cache below so they stay retryable once the backoff
+    // lapses.
+    let failed_set: HashSet<&str> = failed.iter().map(String::as_str).collect();
+    for id in &failed {
+        cache.note_fetch_failure(id, now);
+    }
+    // Negative-cache the genuine misses: a wanted id that neither resolved nor
+    // errored was absent from a *successful* fetch, so it resolved to nothing (a
+    // pre-GitHub slug id, a deleted issue). `entry_stale` freezes it for the
+    // session so it is searched at most once — not re-run every sweep.
     for id in wanted {
-        if !resolved.contains(&id) {
-            cache.entries.insert(
-                id,
-                TaskCacheEntry {
-                    meta: None,
-                    mtime: None,
-                    fetched: now,
-                    terminal: false,
-                },
-            );
+        if resolved.contains(&id) || failed_set.contains(id.as_str()) {
+            continue;
         }
+        cache.clear_backoff(&id);
+        cache.entries.insert(
+            id,
+            TaskCacheEntry {
+                meta: None,
+                mtime: None,
+                fetched: now,
+                terminal: false,
+            },
+        );
     }
     cache.entries.clone()
 }
@@ -596,7 +690,17 @@ pub struct ActivityApp {
     /// read the tail on subsequent ticks.
     log_offset: u64,
     log_mtime: Option<SystemTime>,
+    /// The render snapshot — the latest resolved metadata the feed draws from. On
+    /// the shell path it is folded in by [`apply_activity_data`](Self::apply_activity_data);
+    /// on the standalone path it is the snapshot [`resolve_task_meta`](Self::resolve_task_meta)
+    /// produces from `meta_cache`.
     task_cache: HashMap<String, TaskCacheEntry>,
+    /// The persistent title-resolution cache for the **standalone** process path
+    /// (`shelbi __activity`): the incremental/frozen/backoff state that
+    /// [`resolve_task_meta_into`] carries across passes. The single-process shell
+    /// keeps its own equivalent cache (see [`read_activity_data`](Self::read_activity_data))
+    /// and never touches this field.
+    meta_cache: ActivityMetaCache,
     pub last_refresh: Instant,
     pub status_line: String,
     /// Vertical scroll offset, in lines from the top of the rendered
@@ -647,6 +751,7 @@ impl ActivityApp {
             log_offset: 0,
             log_mtime: None,
             task_cache: HashMap::new(),
+            meta_cache: ActivityMetaCache::default(),
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
             scroll: 0,
@@ -882,7 +987,7 @@ impl ActivityApp {
             .collect();
         let task_cache = {
             let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
-            resolve_task_meta_into(project_name, &events, &mut guard)
+            resolve_task_meta_into(project_name, &events, &mut guard, Instant::now())
         };
         ActivityData {
             events,
@@ -960,94 +1065,23 @@ impl ActivityApp {
         self.task_cache.get(id).and_then(|e| e.meta.as_ref())
     }
 
-    /// Whether `id`'s cache entry needs re-resolving — delegates to the shared
-    /// [`entry_stale`] rule: the filesystem board invalidates on the task file's
-    /// `mtime`; a resolved terminal issue is frozen; a remote entry and every
-    /// confirmed miss fall back to the TTL.
-    fn task_meta_stale(&self, id: &str, mtime: Option<SystemTime>) -> bool {
-        entry_stale(self.task_cache.get(id), mtime)
-    }
-
     /// Resolve every task id the loaded feed references that is stale or unknown,
-    /// in **one** batched [`shelbi_state::IssueStore::fetch_many`] request (the
-    /// `github` backend collapses it into a single aliased GraphQL call), then
-    /// cache the hits *and* the misses. Called on the refresh cadence rather than
-    /// per render frame, so:
-    ///
-    /// * a draw never issues an API call (the per-event `get` storm is gone), and
-    /// * an unresolvable id (a done task the open index doesn't carry) is
-    ///   negative-cached for the TTL instead of re-searched every tick.
-    ///
-    /// On an idle feed (no new events, entries still within their TTL) this
-    /// resolves nothing and makes no request — O(1) per tick, not O(N).
+    /// folding the result into the standalone process's persistent `meta_cache`
+    /// and republishing the render snapshot. Delegates to the shared
+    /// [`resolve_task_meta_into`] so this standalone path and the single-process
+    /// shell's [`read_activity_data`](Self::read_activity_data) share **one** rule:
+    /// the incremental batch bound, the frozen terminal/miss entries, and the
+    /// exponential backoff on an errored fetch. Called on the refresh cadence, not
+    /// per render frame, so a draw never issues an API call and an idle feed makes
+    /// no request (O(1) per tick, not O(N)).
     fn resolve_task_meta(&mut self) {
-        use std::collections::HashSet;
-        // Collect the unique, stale/unknown ids referenced by the loaded events.
-        let mut wanted: Vec<String> = Vec::new();
-        let mut seen: HashSet<&str> = HashSet::new();
-        for ev in &self.events {
-            let Some(id) = event_task_id(ev) else { continue };
-            if !seen.insert(id) {
-                continue;
-            }
-            let mtime = task_file_mtime(&self.project_name, id);
-            if self.task_meta_stale(id, mtime) {
-                wanted.push(id.to_string());
-            }
-        }
-        if wanted.is_empty() {
-            return;
-        }
-        let store = match shelbi_state::issue_store_for(&self.project_name) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let refs: Vec<&str> = wanted.iter().map(String::as_str).collect();
-        // One aliased request for every stale id; ids that don't resolve are
-        // simply absent from the result (the `fetch_many` contract). A fetch
-        // *error*, though, is not a miss — leave those ids unknown so a later pass
-        // retries, rather than freezing live titles as misses on a blip.
-        let fetched = match store.fetch_many(&refs) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        let now = Instant::now();
-        let mut resolved: HashSet<String> = HashSet::new();
-        for tf in fetched {
-            let id = tf.task.id.clone();
-            let mtime = task_file_mtime(&self.project_name, &id);
-            let terminal = is_frozen_column(&tf.task.column);
-            resolved.insert(id.clone());
-            self.task_cache.insert(
-                id,
-                TaskCacheEntry {
-                    meta: Some(TaskMeta {
-                        title: tf.task.title,
-                        branch: tf.task.branch,
-                        assigned_to: tf.task.assigned_to,
-                    }),
-                    mtime,
-                    fetched: now,
-                    terminal,
-                },
-            );
-        }
-        // Negative-cache the misses: an id absent from a successful fetch is
-        // frozen for the session by `entry_stale`, so it is searched at most once
-        // — the fix for "no negative/closed-id cache" and the per-sweep re-search.
-        for id in wanted {
-            if !resolved.contains(&id) {
-                self.task_cache.insert(
-                    id,
-                    TaskCacheEntry {
-                        meta: None,
-                        mtime: None,
-                        fetched: now,
-                        terminal: false,
-                    },
-                );
-            }
-        }
+        let snapshot = resolve_task_meta_into(
+            &self.project_name,
+            &self.events,
+            &mut self.meta_cache,
+            Instant::now(),
+        );
+        self.task_cache = snapshot;
     }
 
     /// Find the matching `* -> in_progress` event preceding `idx` for
@@ -4630,7 +4664,8 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         let mut cache = ActivityMetaCache::default();
 
         // First pass: one aliased request resolves all three done titles.
-        let snap = resolve_task_meta_into("actv-loop", &events, &mut cache);
+        let now = Instant::now();
+        let snap = resolve_task_meta_into("actv-loop", &events, &mut cache, now);
         let after_first = calls.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(after_first, 1, "done history hydrates in ONE aliased request");
         assert_eq!(snap.get("d1").and_then(|e| e.meta.as_ref()).map(|m| m.title.as_str()), Some("Done One"));
@@ -4640,7 +4675,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         // Every subsequent pass is quiet: the frozen done entries are never
         // re-resolved, so the loop does not restart on each refresh.
         for _ in 0..10 {
-            resolve_task_meta_into("actv-loop", &events, &mut cache);
+            resolve_task_meta_into("actv-loop", &events, &mut cache, now);
         }
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -4705,7 +4740,8 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         let mut cache = ActivityMetaCache::default();
 
         // First pass: one label search per slug, then every id is negative-cached.
-        resolve_task_meta_into("actv-slug", &events, &mut cache);
+        let now = Instant::now();
+        resolve_task_meta_into("actv-slug", &events, &mut cache, now);
         let after_first = calls.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             after_first,
@@ -4728,7 +4764,8 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         }
 
         for _ in 0..10 {
-            resolve_task_meta_into("actv-slug", &events, &mut cache);
+            let now = Instant::now();
+        resolve_task_meta_into("actv-slug", &events, &mut cache, now);
         }
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -4785,16 +4822,29 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
 
         let events = vec![done_issue_event(&id)];
         let mut cache = ActivityMetaCache::default();
-        resolve_task_meta_into("actv-err", &events, &mut cache);
+        let t0 = Instant::now();
+        resolve_task_meta_into("actv-err", &events, &mut cache, t0);
         assert!(
             !cache.entries.contains_key(&id),
             "a fetch error leaves the id unknown, not negative-cached"
         );
         assert!(entry_stale(cache.entries.get(&id), None), "the id is still wanted");
+        // But it is now in a backoff window, so the very next pass does not retry.
+        assert!(cache.in_backoff(&id, t0), "a failed fetch backs the id off");
 
-        // The store recovers and now answers (empty → a genuine miss this time).
+        // The store recovers, but while still inside the backoff window no retry
+        // fires — the id stays unknown rather than resolving immediately.
         fail.store(false, std::sync::atomic::Ordering::SeqCst);
-        resolve_task_meta_into("actv-err", &events, &mut cache);
+        resolve_task_meta_into("actv-err", &events, &mut cache, t0);
+        assert!(
+            !cache.entries.contains_key(&id),
+            "inside the backoff window the recovered store is not yet consulted"
+        );
+
+        // Once the backoff elapses the id is retried; the store answers (empty →
+        // a genuine miss this time) and the backoff is cleared.
+        let after_backoff = t0 + FETCH_BACKOFF_BASE + Duration::from_secs(1);
+        resolve_task_meta_into("actv-err", &events, &mut cache, after_backoff);
         assert!(
             cache.entries.get(&id).is_some_and(|e| e.meta.is_none()),
             "once the store answers, the unresolvable id is negative-cached"
@@ -4802,6 +4852,143 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         assert!(
             !entry_stale(cache.entries.get(&id), None),
             "and the confirmed miss is then frozen"
+        );
+        assert!(
+            !cache.in_backoff(&id, after_backoff),
+            "a resolved (even to a miss) id has its backoff cleared"
+        );
+
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Round-2 storm path: one id whose fetch keeps erroring must NOT drag the
+    /// whole batch into a per-pass retry loop. A fake `gh` resolves three ids from
+    /// the index (one aliased batch, never a search) and errors every search for a
+    /// fourth, unresolvable slug id. The good ids are cached after the first pass
+    /// and never re-fetched; the failing id is retried only as its exponential
+    /// backoff windows elapse, so total GraphQL traffic stays bounded across
+    /// hundreds of passes (with an injected clock) instead of ~65 calls/s.
+    #[test]
+    fn a_failing_id_is_retried_under_backoff_not_every_pass() {
+        let _g = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-activity-backoff-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_github_project(&home, "actv-bo");
+
+        // Three good ids with index numbers → the fast path (one aliased
+        // IssuesByNumber, no search). The fourth is an unresolvable slug with no
+        // number, so it falls to a label search — which the fake always errors.
+        let mut idx = shelbi_state::BoardIndex::fresh(Vec::new());
+        idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        shelbi_state::write_board_index("actv-bo", &idx).unwrap();
+        for (id, n) in [("g1", 1), ("g2", 2), ("g3", 3)] {
+            shelbi_state::record_board_index_number("actv-bo", id, n).unwrap();
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let bad = format!("rt-bad-slug-{nonce}");
+
+        let batches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let searches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let batches_rt = std::sync::Arc::clone(&batches);
+        let searches_rt = std::sync::Arc::clone(&searches);
+        shelbi_state::set_test_gh_runner(move |args: &[&str]| {
+            let joined = args.join(" ");
+            if joined.contains("IssuesByNumber") {
+                batches_rt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(r#"{"data":{"rateLimit":{"remaining":4999,"resetAt":"2026-09-08T12:00:00Z"},
+                "repository":{
+                  "i0":{"number":1,"title":"Good One","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-02T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/g1"},{"name":"shelbi:status/done"}]}},
+                  "i1":{"number":2,"title":"Good Two","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-02T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/g2"},{"name":"shelbi:status/done"}]}},
+                  "i2":{"number":3,"title":"Good Three","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-06-01T00:00:00Z","updatedAt":"2026-06-02T00:00:00Z","body":"","labels":{"nodes":[{"name":"shelbi:id/g3"},{"name":"shelbi:status/done"}]}}
+                }}}"#.to_string())
+            } else if joined.contains("graphql") {
+                // A label search (for the unresolvable slug) — always errors.
+                searches_rt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(shelbi_core::Error::Other("query rejected".into()))
+            } else {
+                Ok(String::new())
+            }
+        });
+
+        let events = vec![
+            done_issue_event("g1"),
+            done_issue_event("g2"),
+            done_issue_event("g3"),
+            done_issue_event(&bad),
+        ];
+        let mut cache = ActivityMetaCache::default();
+        let t0 = Instant::now();
+
+        // Pass 1: good ids resolve in one aliased batch; the bad id is searched
+        // once (errors) and backed off — one bad id does not discard the good ones.
+        resolve_task_meta_into("actv-bo", &events, &mut cache, t0);
+        assert_eq!(batches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(searches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for g in ["g1", "g2", "g3"] {
+            assert!(
+                cache.entries.get(g).and_then(|e| e.meta.as_ref()).is_some(),
+                "{g} is cached after the first pass despite the sibling failure"
+            );
+        }
+        assert!(
+            !cache.entries.contains_key(&bad),
+            "the failing id is not cached as a miss"
+        );
+        assert!(cache.in_backoff(&bad, t0), "the failing id is backed off");
+
+        // Many passes inside the first backoff window: no new requests at all.
+        for i in 0..20u64 {
+            resolve_task_meta_into(
+                "actv-bo",
+                &events,
+                &mut cache,
+                t0 + Duration::from_millis(i),
+            );
+        }
+        assert_eq!(
+            batches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cached good ids are never re-fetched"
+        );
+        assert_eq!(
+            searches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failing id is not re-searched inside the backoff window"
+        );
+
+        // Step a fake clock forward ~33 minutes in 10s increments. The backoff
+        // doubles (30s, 60s, 120s, …, capped at 600s), so the failing id is
+        // retried only a handful of times across 200 passes, never per pass.
+        let mut now = t0;
+        for _ in 0..200 {
+            now += Duration::from_secs(10);
+            resolve_task_meta_into("actv-bo", &events, &mut cache, now);
+        }
+        let total = searches.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (2..=12).contains(&total),
+            "over ~33 min the failing id retried {total} times — bounded by backoff, \
+             not once per pass (would be 200+)"
+        );
+        assert_eq!(
+            batches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the good ids never trigger another batch request"
         );
 
         shelbi_state::clear_test_gh_runner();
