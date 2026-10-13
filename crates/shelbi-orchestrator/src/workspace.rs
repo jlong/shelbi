@@ -368,9 +368,11 @@ pub fn workspace_ready_refused_marker(machine: &Machine, workspace: &WorkspaceSp
 /// bounds that: it records the current local tip, the transient-failure attempt
 /// count, and whether the push is terminally blocked (a [`PushOutcome::Blocked`]
 /// foreign-commit refusal, or the retry cap exceeded). While a tip stays blocked
-/// the poller skips re-attempting the push entirely (no tight loop) and re-emits
-/// nothing; a *new* local tip (the worker committed a fix) resets the ledger so
-/// the next tip gets a fresh budget. A successful push clears it. Lives under
+/// the poller still re-attempts the push each tick (cheaply, so an out-of-band
+/// origin reconcile completes the handoff) but stays quiet — it re-emits nothing
+/// and does not re-nudge (no tight loop); a *new* local tip (the worker
+/// committed a fix) resets the ledger so the next tip gets a fresh budget. A
+/// successful push clears it. Lives under
 /// `.shelbi/` for the same gitignore reason as the ready marker itself, and uses
 /// the [`read_deferred_marker`] / [`write_deferred_marker`] / [`clear_deferred_marker`]
 /// trio.
@@ -378,6 +380,36 @@ pub fn workspace_push_blocked_marker(machine: &Machine, workspace: &WorkspaceSpe
     workspace_worktree(machine, workspace)
         .join(".shelbi")
         .join("shelbi-push-blocked")
+}
+
+/// The handoff-push **provenance** marker for a workspace:
+/// `<worktree>/.shelbi/shelbi-pushed-tip`, body `<branch> <sha>`.
+///
+/// It records the last commit *Shelbi itself pushed* to `origin/<branch>` for
+/// this workspace. [`push_workspace_branch_to_origin`] uses it to decide whether
+/// a non-fast-forward force is safe: the only remote tip we may overwrite is one
+/// Shelbi put there and the worker has since rewritten (rebase / amend / squash)
+/// — then nothing foreign can be lost. A live remote tip that is *not* the
+/// recorded one is foreign work from another clone, and the push blocks.
+///
+/// Why provenance and not a content/tree comparison: a re-dispatched worker that
+/// folds a review fix into its existing commit commonly *edits* an existing line
+/// (not only adds), and often rebases onto a moved base too. Neither is
+/// distinguishable from a foreign push by tree content alone (an edited line and
+/// a base move both make the remote side carry lines the local tip lacks), so a
+/// content check would wrongly block the exact rework this must allow. Recording
+/// what Shelbi pushed sidesteps that entirely.
+///
+/// The body is branch-qualified so a workspace reused for a later task on a
+/// different branch does not inherit a stale branch's pushed tip (the recorded
+/// branch must match before the sha is trusted). Lives under `.shelbi/` for the
+/// same gitignore reason as the ready marker, and uses the
+/// [`read_deferred_marker`] / [`write_deferred_marker`] / [`clear_deferred_marker`]
+/// trio.
+pub fn workspace_pushed_tip_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
+    workspace_worktree(machine, workspace)
+        .join(".shelbi")
+        .join("shelbi-pushed-tip")
 }
 
 /// Read the deferral sidecar, returning the recorded error-class token (trimmed)
@@ -1437,6 +1469,20 @@ impl PushOutcome {
         !matches!(self, PushOutcome::Failed { .. } | PushOutcome::Blocked { .. })
     }
 
+    /// The commit `origin/<branch>` now carries as a result of this outcome, for
+    /// the caller to record as Shelbi's pushed tip (see
+    /// [`workspace_pushed_tip_marker`]). `Some` for [`PushOutcome::Pushed`] (we
+    /// pushed it) and [`PushOutcome::UpToDate`] (origin already matched it);
+    /// `None` for [`PushOutcome::NoRemote`] (no origin) and the non-handed-off
+    /// [`PushOutcome::Failed`] / [`PushOutcome::Blocked`] (origin unchanged).
+    pub fn handed_off_sha(&self) -> Option<&str> {
+        match self {
+            PushOutcome::UpToDate { local_sha } => Some(local_sha),
+            PushOutcome::Pushed { local_sha, .. } => Some(local_sha),
+            PushOutcome::NoRemote | PushOutcome::Failed { .. } | PushOutcome::Blocked { .. } => None,
+        }
+    }
+
     /// True for the *terminal* [`PushOutcome::Blocked`] — the push can never
     /// succeed by retrying (the remote carries foreign commits), so the caller
     /// must stop retrying and surface it for a human, rather than looping.
@@ -1528,37 +1574,6 @@ fn origin_branch_tip(host: &Host, wt: &str, branch: &str) -> std::result::Result
     Ok(None)
 }
 
-/// Decide whether `remote` is safe to overwrite with a force-push of `local`:
-/// true when every commit reachable from `remote` but not from `local` has a
-/// patch-equivalent commit in `local` — i.e. `local` is a rebase/amend of
-/// `remote`'s work, so overwriting the remote tip loses no commit. False when
-/// `remote` carries at least one commit with no patch-equivalent in `local`
-/// (foreign work pushed by another clone): forcing would clobber it.
-///
-/// Implemented with `git cherry <local> <remote>`, which lists the commits
-/// reachable from `remote` but not from `local`, each prefixed `-` when `local`
-/// already has an equivalent patch (so it was rebased) or `+` when it does not
-/// (foreign). Any `+` line means the remote has unrebased work → not safe.
-///
-/// Conservative on error: a git failure (or output we can't parse) returns
-/// `false` so we refuse to force when we cannot *prove* containment. This runs
-/// entirely on local refs (no network) just after the live remote tip was
-/// fetched into the worktree, so an error here is a real local-git problem, not
-/// a transient, and blocking (never clobbering) is the safe default.
-fn remote_tip_contained_in_local(host: &Host, wt: &str, remote: &str, local: &str) -> bool {
-    let out = match shelbi_ssh::run(host, ["git", "-C", wt, "cherry", local, remote]) {
-        Ok(o) if o.status.success() => o,
-        _ => return false,
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // Every listed commit must be `-` (patch-equivalent present in `local`).
-    // A single `+` line is a foreign commit → not contained.
-    !stdout
-        .lines()
-        .map(str::trim)
-        .any(|l| l.starts_with('+'))
-}
-
 /// Push `worktree`'s local `branch` tip to `origin` so a handoff hands off the
 /// reconciled commit — never the stale remote tip.
 ///
@@ -1572,23 +1587,35 @@ fn remote_tip_contained_in_local(host: &Host, wt: &str, remote: &str, local: &st
 ///
 /// Behaviour:
 ///
+/// `last_pushed_tip` is the commit Shelbi recorded as its own last push for this
+/// branch (the [`workspace_pushed_tip_marker`] the caller reads and, on a
+/// successful push, rewrites). It is the **provenance** gate on a force: the
+/// only remote tip Shelbi may overwrite is one it put there itself, which the
+/// worker has since rewritten.
+///
 /// - Local tip already on origin → [`PushOutcome::UpToDate`], no push.
 /// - Remote tip is an ancestor of the local tip (ordinary progress) or the
 ///   branch is new on origin → fast-forward `git push`.
-/// - Remote tip is *not* an ancestor (rebase/amend rewrote the branch), **and**
-///   the local branch patch-contains the remote tip's commits (it is a rebase
-///   of that work — see [`remote_tip_contained_in_local`]) →
+/// - Remote tip is *not* an ancestor (rebase/amend/squash rewrote the branch),
+///   **and** the live remote tip equals `last_pushed_tip` (it is Shelbi's own
+///   earlier push, now reworked) →
 ///   `git push --force-with-lease=<branch>:<freshly-read-remote-tip>` on the
-///   **first** attempt. Leasing against the live tip just read means the lease
+///   **first** attempt. This covers the common bounce-and-rework case where a
+///   worker folds a review fix into its existing commit — even one that *edits*
+///   an existing line, or that also rebased onto a moved base — and re-pushes:
+///   the amended commit's patch and tree differ from the pushed one, but the
+///   remote still carries only Shelbi's own commit, so forcing over it loses
+///   nothing foreign. Leasing against the live tip just read means the lease
 ///   matches immediately on a quiescent remote, so the force lands at once
-///   instead of looping. The containment check — not the lease — is what makes
+///   instead of looping. The provenance check — not the lease — is what makes
 ///   the force safe against a foreign push; the lease only guards the tiny
 ///   read→push window (if origin changes in it, the lease aborts → `Failed`,
 ///   retried next tick).
-/// - Remote tip is *not* an ancestor and carries commits the local branch does
-///   NOT patch-contain (foreign work from another clone) → [`PushOutcome::Blocked`];
-///   we refuse to force (forcing would clobber it) and the caller stops retrying
-///   and surfaces it for a human.
+/// - Remote tip is *not* an ancestor and is *not* `last_pushed_tip` (foreign
+///   work from another clone, or a tip Shelbi never recorded pushing) →
+///   [`PushOutcome::Blocked`]; we refuse to force (forcing could clobber it) and
+///   the caller surfaces it for a human once, then re-attempts quietly so an
+///   out-of-band fix completes.
 /// - Any transient failure (rejected push, lease race, git error) →
 ///   [`PushOutcome::Failed`]; the caller must NOT hand the task off on the
 ///   stale remote tip, and retries it (capped) next tick.
@@ -1604,7 +1631,12 @@ fn remote_tip_contained_in_local(host: &Host, wt: &str, remote: &str, local: &st
 /// Pushes the durable branch ref (`refs/heads/<branch>`), not `HEAD` — a prior
 /// step may have detached the worktree's HEAD, but the branch ref is what the
 /// review checkout and PR read.
-pub fn push_workspace_branch_to_origin(host: &Host, worktree: &Path, branch: &str) -> PushOutcome {
+pub fn push_workspace_branch_to_origin(
+    host: &Host,
+    worktree: &Path,
+    branch: &str,
+    last_pushed_tip: Option<&str>,
+) -> PushOutcome {
     let wt = worktree.to_string_lossy().into_owned();
 
     // A repo with no `origin` remote is local-only — there's no remote tip to
@@ -1679,17 +1711,18 @@ pub fn push_workspace_branch_to_origin(host: &Host, worktree: &Path, branch: &st
     let mut argv: Vec<String> = vec!["git".into(), "-C".into(), wt.clone(), "push".into()];
     if forced {
         // The remote tip was rewritten out from under us. Only overwrite it if
-        // the local branch *patch-contains* that tip — i.e. the local branch is
-        // a rebase/amend of the remote's commits, not a divergent branch that
-        // dropped foreign work. If the remote carries commits the local branch
-        // doesn't contain, refuse to force (forcing would clobber them) and let
-        // the caller surface it to a human. This content check — not the lease —
-        // is the real safety guard against clobbering a concurrent push.
+        // it is *Shelbi's own earlier push* for this branch (recorded in
+        // `last_pushed_tip`) that the worker has since reworked — then forcing
+        // over it loses nothing foreign, because the only commit there is ours.
+        // Any other remote tip is foreign work from another clone (or a tip we
+        // never recorded pushing): refuse to force and let the caller surface it
+        // to a human. This provenance check — not the lease — is the real safety
+        // guard against clobbering a concurrent push.
         let remote = remote_sha.as_deref().unwrap_or_default();
-        if !remote_tip_contained_in_local(host, &wt, remote, &local_sha) {
+        if last_pushed_tip != Some(remote) {
             return PushOutcome::Blocked {
                 reason: format!(
-                    "remote_has_unrebased_commits:origin_tip_{}_not_contained_in_local",
+                    "remote_has_unrebased_commits:origin_tip_{}_not_pushed_by_shelbi",
                     remote.get(..7).unwrap_or(remote),
                 ),
             };
@@ -11350,7 +11383,11 @@ mod push_git_tests {
         let reworked = head_sha(&repo);
         assert_ne!(reworked, stale_remote, "rebase must rewrite the tip");
 
-        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        // Provenance: Shelbi's recorded pushed tip for this branch is the commit
+        // the rebase rewrote, and it is still the live remote tip — so the force
+        // is over our own earlier push and lands.
+        let outcome =
+            push_workspace_branch_to_origin(&Host::Local, &repo, "feature", Some(&stale_remote));
         match &outcome {
             PushOutcome::Pushed {
                 local_sha,
@@ -11390,7 +11427,9 @@ mod push_git_tests {
         commit_file(&repo, "feature.txt", "v1\n", "feature v1");
         let local = head_sha(&repo);
 
-        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        // Ordinary fast-forward: the force path (and its provenance gate) is not
+        // reached, so no recorded pushed tip is needed.
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature", None);
         assert!(
             matches!(&outcome, PushOutcome::Pushed { forced: false, .. }),
             "expected non-forced Pushed, got {outcome:?}"
@@ -11416,7 +11455,7 @@ mod push_git_tests {
             .success());
         let local = head_sha(&repo);
 
-        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature", None);
         match &outcome {
             PushOutcome::UpToDate { local_sha } => assert_eq!(local_sha, &local),
             other => panic!("expected UpToDate, got {other:?}"),
@@ -11439,7 +11478,9 @@ mod push_git_tests {
         commit_file(&repo, "feature.txt", "v0\n", "feature v0");
         let local = head_sha(&repo);
 
-        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        // A new branch is a plain push: the force path (and its provenance gate)
+        // is never reached, so no recorded pushed tip is needed.
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature", None);
         match &outcome {
             PushOutcome::Pushed {
                 remote_before,
@@ -11469,7 +11510,7 @@ mod push_git_tests {
         run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
         commit_file(&repo, "feature.txt", "v0\n", "feature v0");
 
-        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature", None);
         assert_eq!(outcome, PushOutcome::NoRemote);
         assert!(outcome.handed_off_local_tip(), "no-remote must not block");
 
@@ -11486,11 +11527,12 @@ mod push_git_tests {
 
     #[test]
     fn blocks_rather_than_clobbering_a_remote_with_foreign_commits() {
-        // A *different* clone pushed real work onto origin/feature that our
-        // local branch does not contain. Force-pushing would clobber it, so the
-        // push must refuse to force — returning `Blocked` (terminal, surfaced to
-        // a human) rather than attempting the push at all — and leave origin
-        // exactly as the concurrent push left it.
+        // A *different* clone pushed real work onto origin/feature on top of the
+        // commit Shelbi pushed. The live remote tip is therefore NOT the tip
+        // Shelbi recorded pushing, so the provenance gate refuses to force —
+        // returning `Blocked` (terminal, surfaced to a human) rather than
+        // attempting the push at all — and leaves origin exactly as the
+        // concurrent push left it.
         if !git_available() {
             eprintln!("skipping: git not on PATH");
             return;
@@ -11502,6 +11544,9 @@ mod push_git_tests {
         assert!(run_git_in(&repo, &["push", "-q", "-u", "origin", "feature"])
             .status
             .success());
+        // The tip Shelbi pushed — the only remote tip a force would be allowed
+        // to overwrite.
+        let shelbi_pushed = origin_tip(&bare, "feature");
 
         // Rewrite our local branch so a push would need to force.
         run_git_in(&repo, &["checkout", "-q", "main"]);
@@ -11529,13 +11574,22 @@ mod push_git_tests {
             .status
             .success());
         let concurrent_tip = origin_tip(&bare, "feature");
+        assert_ne!(
+            concurrent_tip, shelbi_pushed,
+            "the foreign push must have moved the remote tip off Shelbi's"
+        );
 
-        // The remote carries a commit our local branch doesn't contain → block,
-        // don't force.
-        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        // The live remote tip is the foreign commit, not the one Shelbi pushed →
+        // block, don't force.
+        let outcome = push_workspace_branch_to_origin(
+            &Host::Local,
+            &repo,
+            "feature",
+            Some(&shelbi_pushed),
+        );
         assert!(
             matches!(&outcome, PushOutcome::Blocked { .. }),
-            "a remote with foreign commits must block, got {outcome:?}"
+            "a remote carrying a tip Shelbi didn't push must block, got {outcome:?}"
         );
         assert!(outcome.is_blocked() && !outcome.handed_off_local_tip());
         assert_eq!(
@@ -11543,6 +11597,219 @@ mod push_git_tests {
             concurrent_tip,
             "the concurrent push must be preserved, not clobbered"
         );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn force_pushes_an_amended_commit_that_edited_a_line() {
+        // The actual incident: a bounced worker folds its review fix into the
+        // ALREADY-PUSHED commit (`commit --amend`), and the fix *edits an
+        // existing line* (e.g. "Chat with Reviewer" -> "Reviewer"), not just
+        // adds one. A `git diff --numstat` content check sees the edit as
+        // 1 removed + 1 added, so the remote side carries a line the local tip
+        // lacks and it wrongly blocks. The provenance gate only asks whether the
+        // live remote tip is the commit Shelbi pushed — it is — so the force
+        // lands and the handoff proceeds.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, bare) = init_repo_with_origin("amend-edited-line");
+
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "doc.md", "Chat with Reviewer\nkeep\n", "feature work");
+        assert!(run_git_in(&repo, &["push", "-q", "-u", "origin", "feature"])
+            .status
+            .success());
+        let pushed = origin_tip(&bare, "feature");
+
+        // Amend the pushed commit: edit the first line (a review fix), fold into
+        // the same commit. The result rewrites the tip and is not a fast-forward.
+        std::fs::write(repo.join("doc.md"), "Reviewer\nkeep\n").unwrap();
+        assert!(run_git_in(&repo, &["add", "doc.md"]).status.success());
+        assert!(run_git_in(&repo, &["commit", "-q", "--amend", "--no-edit"])
+            .status
+            .success());
+        let amended = head_sha(&repo);
+        assert_ne!(amended, pushed, "amend must rewrite the tip");
+        assert!(
+            !run_git_in(&repo, &["merge-base", "--is-ancestor", &pushed, &amended])
+                .status
+                .success(),
+            "the pushed tip must not be an ancestor of the amended tip",
+        );
+
+        // Provenance: the live remote tip is exactly what Shelbi pushed, so the
+        // force over it is safe regardless of how the content changed.
+        let outcome =
+            push_workspace_branch_to_origin(&Host::Local, &repo, "feature", Some(&pushed));
+        match &outcome {
+            PushOutcome::Pushed {
+                local_sha,
+                remote_before,
+                forced,
+            } => {
+                assert!(*forced, "an amended (rewritten) branch must force-push");
+                assert_eq!(local_sha, &amended);
+                assert_eq!(remote_before.as_deref(), Some(pushed.as_str()));
+            }
+            other => panic!("expected a forced Pushed for an edited amend, got {other:?}"),
+        }
+        assert_eq!(
+            origin_tip(&bare, "feature"),
+            amended,
+            "origin must now carry the amended tip",
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn force_pushes_an_edited_amend_rebased_onto_a_moved_base() {
+        // The incident's full shape: the rework both *edits* a line of the
+        // pushed commit AND rebases onto a main that advanced since the push.
+        // A whole-tree local->remote content check breaks here twice over — the
+        // edit and the base move both make the remote side carry lines the local
+        // tip lacks — yet nothing foreign is on origin: the live remote tip is
+        // still the commit Shelbi pushed. The provenance gate allows the force.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, bare) = init_repo_with_origin("amend-edit-and-rebase");
+
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "doc.md", "Chat with Reviewer\nkeep\n", "feature work");
+        assert!(run_git_in(&repo, &["push", "-q", "-u", "origin", "feature"])
+            .status
+            .success());
+        let pushed = origin_tip(&bare, "feature");
+
+        // main advances after the push (a sibling landed), and the rework rebases
+        // feature onto it...
+        run_git_in(&repo, &["checkout", "-q", "main"]);
+        commit_file(&repo, "prereq.txt", "prereq\n", "prereq landed");
+        run_git_in(&repo, &["checkout", "-q", "feature"]);
+        assert!(run_git_in(&repo, &["rebase", "-q", "main"]).status.success());
+        // ...and edits a line of the (now reparented) commit.
+        std::fs::write(repo.join("doc.md"), "Reviewer\nkeep\n").unwrap();
+        assert!(run_git_in(&repo, &["add", "doc.md"]).status.success());
+        assert!(run_git_in(&repo, &["commit", "-q", "--amend", "--no-edit"])
+            .status
+            .success());
+        let reworked = head_sha(&repo);
+        assert_ne!(reworked, pushed);
+
+        // The live remote tip is still Shelbi's push (no one else touched it).
+        assert_eq!(origin_tip(&bare, "feature"), pushed);
+        let outcome =
+            push_workspace_branch_to_origin(&Host::Local, &repo, "feature", Some(&pushed));
+        match &outcome {
+            PushOutcome::Pushed {
+                local_sha,
+                remote_before,
+                forced,
+            } => {
+                assert!(*forced, "an edited + rebased branch must force-push");
+                assert_eq!(local_sha, &reworked);
+                assert_eq!(remote_before.as_deref(), Some(pushed.as_str()));
+            }
+            other => panic!("expected a forced Pushed, got {other:?}"),
+        }
+        assert_eq!(origin_tip(&bare, "feature"), reworked);
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    #[test]
+    fn blocked_push_self_heals_once_origin_is_reconciled_out_of_band() {
+        // A foreign-commit block is terminal, but it must not wedge forever: if
+        // a human reconciles `origin/<branch>` out of band so it equals the
+        // local tip, the very next push attempt completes the handoff (it reads
+        // the live remote each call). This is what lets the poller — which now
+        // re-attempts a blocked tip quietly — finish the handoff after the fix,
+        // rather than staying stuck until the card is moved by hand.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (repo, bare) = init_repo_with_origin("block-self-heal");
+
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "v0\n", "feature v0");
+        assert!(run_git_in(&repo, &["push", "-q", "-u", "origin", "feature"])
+            .status
+            .success());
+        let shelbi_pushed = origin_tip(&bare, "feature");
+
+        // Rewrite our local branch so a push would need to force.
+        run_git_in(&repo, &["checkout", "-q", "main"]);
+        commit_file(&repo, "prereq.txt", "prereq\n", "prereq");
+        run_git_in(&repo, &["checkout", "-q", "feature"]);
+        assert!(run_git_in(&repo, &["rebase", "-q", "main"]).status.success());
+        let local = head_sha(&repo);
+
+        // A second clone pushes genuine foreign work onto origin/feature.
+        let other = repo.with_file_name(format!(
+            "{}-other",
+            repo.file_name().unwrap().to_string_lossy()
+        ));
+        let bare_str = bare.to_string_lossy().into_owned();
+        assert!(std::process::Command::new("git")
+            .args(["clone", "-q", &bare_str])
+            .arg(&other)
+            .output()
+            .expect("git clone failed")
+            .status
+            .success());
+        run_git_in(&other, &["checkout", "-q", "feature"]);
+        commit_file(&other, "concurrent.txt", "other\n", "concurrent work");
+        assert!(run_git_in(&other, &["push", "-q", "origin", "feature"])
+            .status
+            .success());
+
+        // First attempt blocks: the live remote tip is the foreign commit, not
+        // the one Shelbi pushed. Origin is left untouched.
+        let blocked = push_workspace_branch_to_origin(
+            &Host::Local,
+            &repo,
+            "feature",
+            Some(&shelbi_pushed),
+        );
+        assert!(
+            matches!(&blocked, PushOutcome::Blocked { .. }),
+            "a foreign remote tip must block first, got {blocked:?}"
+        );
+
+        // Out-of-band reconciliation: a human force-pushes the local branch to
+        // origin (resolving the divergence). Origin now equals the local tip.
+        assert!(
+            run_git_in(&repo, &["push", "-q", "--force", "origin", "feature"])
+                .status
+                .success(),
+            "the manual reconciling force-push must succeed",
+        );
+        assert_eq!(origin_tip(&bare, "feature"), local);
+
+        // The next attempt sees origin == local and completes the handoff
+        // (UpToDate) before the force/provenance path is even reached, instead
+        // of staying blocked.
+        let healed = push_workspace_branch_to_origin(
+            &Host::Local,
+            &repo,
+            "feature",
+            Some(&shelbi_pushed),
+        );
+        match &healed {
+            PushOutcome::UpToDate { local_sha } => assert_eq!(local_sha, &local),
+            other => panic!("expected UpToDate after the out-of-band fix, got {other:?}"),
+        }
+        assert!(healed.handed_off_local_tip());
 
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&bare);
@@ -11586,7 +11853,10 @@ mod push_git_tests {
         let tracked = branch_sha(&repo, "origin/feature");
         assert_eq!(tracked, remote_tip, "tracking ref starts at the pushed tip");
 
-        let outcome = push_workspace_branch_to_origin(&Host::Local, &repo, "feature");
+        // Provenance: the recorded pushed tip is the live remote tip, so the
+        // force is over Shelbi's own earlier push and lands on the first attempt.
+        let outcome =
+            push_workspace_branch_to_origin(&Host::Local, &repo, "feature", Some(&remote_tip));
         match &outcome {
             PushOutcome::Pushed { forced, local_sha, remote_before } => {
                 assert!(*forced, "a rebased branch must force");
