@@ -572,6 +572,15 @@ pub fn run(args: RunArgs) -> Result<()> {
     // Reap the whole group in case the child left anything behind.
     shared.kill_child_group(Some(libc::SIGTERM));
 
+    // Mark the session as exiting on disk *before* anyone hears `exited`: from
+    // here until `exit.json` lands (after the flush grace and `final.txt`) the
+    // lock is still held and the socket still accepts, so without the marker a
+    // client reattaching across a relaunch could pick this dying session over
+    // its replacement, be dropped a moment later, and count a second death
+    // (`client-connect-skips-exited-sessions`). Best-effort: a failed write
+    // only reopens that narrow window.
+    let _ = std::fs::write(paths.exiting(), b"");
+
     // Push the frozen-core `exited` event, then give writers a moment to flush.
     shared.clients.broadcast_exited(shelbi_proto::Exited {
         code: exit.code,
