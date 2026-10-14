@@ -50,7 +50,7 @@ use super::config_upgrade::{
     apply_reporting_subject_rewrite, apply_tmux_instruction_rewrites,
     cargo_test_without_no_fail_fast, get, insert_no_fail_fast, is_inert, legacy_status_id,
     scope_label, Classification, UpgradeFinding, UpgradeReport, PR_TEMPLATE_MISSING,
-    REMOVED_PROJECT_KEYS, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
+    REMOVED_PROJECT_KEYS, SHARED_PREAMBLE_MISSING, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
 };
 
 /// One auto-heal write-back that landed on disk this run. Returned to the
@@ -197,6 +197,16 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
     // `pr-template.md`). Independent of the content healers below.
     if codes.contains(PR_TEMPLATE_MISSING) {
         heal_missing_pr_template(entry, applied);
+    }
+    // Same shape for the shared agent preamble that carries the hub-safety
+    // rules (`agents/_shared/preamble.md`).
+    if codes.contains(SHARED_PREAMBLE_MISSING) {
+        heal_missing_default(
+            entry,
+            shelbi_state::DEFAULT_SHARED_PREAMBLE,
+            SHARED_PREAMBLE_MISSING,
+            applied,
+        );
     }
 
     // Rewrite legacy tmux-command passages in an agent's instructions / the
@@ -948,11 +958,24 @@ fn heal_rename(entry: &InventoryEntry, finding: &UpgradeFinding, applied: &mut V
 // Missing lifecycle-owned shipped default
 
 /// Materialize the shipped default `pr-template.md` at the entry's canonical
-/// path. Guarded on non-existence so a file created between detection and apply
-/// (or a custom one) is never clobbered — the finding stays reported instead.
+/// path (via [`heal_missing_default`]). Guarded on non-existence so a file
+/// created between detection and apply (or a custom one) is never clobbered —
+/// the finding stays reported instead.
 /// The canonical path was resolved config-mode-aware by the inventory, so this
 /// lands in `<repo>/.shelbi/` or `~/.shelbi/projects/<name>/` as appropriate.
 fn heal_missing_pr_template(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
+    heal_missing_default(entry, shelbi_state::DEFAULT_PR_TEMPLATE, PR_TEMPLATE_MISSING, applied);
+}
+
+/// Materialize `default` at the entry's canonical path for the missing-default
+/// finding `code`. Guarded on non-existence, so a file created between detection
+/// and apply is never clobbered.
+fn heal_missing_default(
+    entry: &InventoryEntry,
+    default: &str,
+    code: &str,
+    applied: &mut Vec<AppliedChange>,
+) {
     let path = &entry.canonical_path;
     if path.exists() {
         return;
@@ -966,11 +989,11 @@ fn heal_missing_pr_template(entry: &InventoryEntry, applied: &mut Vec<AppliedCha
             return;
         }
     }
-    if let Err(e) = write_atomic(path, shelbi_state::DEFAULT_PR_TEMPLATE) {
+    if let Err(e) = write_atomic(path, default) {
         eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
         return;
     }
-    record(applied, entry, PR_TEMPLATE_MISSING, path, "materialize-shipped-default".into());
+    record(applied, entry, code, path, "materialize-shipped-default".into());
 }
 
 /// Rewrite every exact legacy tmux-command passage in an agent's instructions /

@@ -432,6 +432,8 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_zen_merge_reason_format(entry, &text, out);
         sniff_zen_assignee_scope(entry, &text, out);
         sniff_tmux_commands(entry, &text, out);
+    } else if id.ends_with(SHARED_PREAMBLE_SURFACE_SUFFIX) {
+        sniff_shared_preamble(entry, &text, out);
     } else if id.ends_with(".zenmode") {
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_pr_create_published_head(entry, &text, out);
@@ -2180,7 +2182,61 @@ fn sniff_missing_lifecycle_defaults(entries: &[InventoryEntry], out: &mut Vec<Up
                 Location { line: 1, column: 1 },
             ));
         }
+        if entry.logical_id.ends_with(SHARED_PREAMBLE_SURFACE_SUFFIX) && !entry.exists {
+            out.push(finding(
+                entry,
+                Classification::AutoHeal,
+                SHARED_PREAMBLE_MISSING,
+                "the project has no `agents/_shared/preamble.md`, so its agents never see the \
+                 hub-safety rules (no daemon/session stop or name-pattern kill from a worker pane)",
+                "Materialize the shipped default shared preamble (the hub-safety rules).",
+                Location { line: 1, column: 1 },
+            ));
+        }
     }
+}
+
+/// Logical-id suffix of the per-project shared-preamble surface
+/// (`agents/_shared/preamble.md`).
+const SHARED_PREAMBLE_SURFACE_SUFFIX: &str = ".agents.shared-preamble";
+
+/// The stable code for "the project has no shared preamble, so no agent sees the
+/// hub-safety rules". The apply layer materializes the shipped default for it.
+pub(crate) const SHARED_PREAMBLE_MISSING: &str = "SHARED_PREAMBLE_MISSING";
+
+/// The stable code for "the project's own shared preamble predates the
+/// hub-safety rules".
+const SHARED_PREAMBLE_HUB_SAFETY_MISSING: &str = "SHARED_PREAMBLE_HUB_SAFETY_MISSING";
+
+/// Sniff an existing `agents/_shared/preamble.md` for the hub-safety rules.
+///
+/// The rules (never stop the daemon or a session, or kill by name pattern, from
+/// a worker pane; sandbox daemon tests under a temp root with the hub-socket env
+/// unset) ship in the default preamble, which only reaches NEW projects and
+/// projects with no preamble at all ([`SHARED_PREAMBLE_MISSING`]). A project
+/// that already wrote its own preamble owns that prose, so a missing section
+/// routes to [`Classification::NeedsJudgment`]: the orchestrator merges the
+/// rules into the project's copy rather than a rewrite clobbering it.
+fn sniff_shared_preamble(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    let lower = text.to_ascii_lowercase();
+    if shelbi_state::HUB_SAFETY_MARKERS.iter().any(|m| lower.contains(m)) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        SHARED_PREAMBLE_HUB_SAFETY_MISSING,
+        "the shared agent preamble has no hub-safety rules: nothing tells a worker that \
+         stopping the daemon, killing a session, or a name-pattern `pkill` from its pane can \
+         take down every agent on the hub",
+        "Add the shipped `## Hub safety (every agent)` section to `agents/_shared/preamble.md` \
+         (keep the project's own prose): never run `shelbi daemon stop/restart`, `shelbi \
+         reload`, `shelbi quit`, `shelbi session kill`, or `shelbi workspace stop` from a \
+         worker pane; never kill shelbi/agent processes by name pattern; exercise daemon or \
+         session start/stop only under a temp `SHELBI_ROOT` with `SHELBI_HUB_SOCK` and \
+         `SHELBI_CONTROL_SOCK` unset.",
+        Location { line: 1, column: 1 },
+    ));
 }
 
 fn sibling_finding(
@@ -2638,6 +2694,11 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
             "These are prose instructions a project may have forked and customized, so the \
              fresh-primary base discipline can't be merged in mechanically without risking \
              local edits — the orchestrator refreshes its own copy instead."
+        }
+        "SHARED_PREAMBLE_HUB_SAFETY_MISSING" => {
+            "The shared preamble is prose the project wrote itself, so the hub-safety \
+             rules can't be merged in mechanically without risking its own content — the \
+             orchestrator adds the section to its copy instead."
         }
         "DEV_INSTRUCTIONS_MSRV_CHECK_MISSING" => {
             "These are prose instructions a project may have forked and customized, so the \
@@ -4650,13 +4711,19 @@ workspaces:
 ";
         std::fs::write(home.join("projects/demo.yaml"), clean).unwrap();
         // A fully-current project also carries the shipped lifecycle-owned
-        // pr-template.md — without it the missing-default sniffer would (rightly)
-        // flag it, which isn't what this "no legacy forms" case is testing.
+        // pr-template.md and shared preamble — without them the missing-default
+        // sniffer would (rightly) flag them, which isn't what this "no legacy
+        // forms" case is testing.
         let project_dir = home.join("projects/demo");
-        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(project_dir.join("agents/_shared")).unwrap();
         std::fs::write(
             project_dir.join("pr-template.md"),
             shelbi_state::DEFAULT_PR_TEMPLATE,
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("agents/_shared/preamble.md"),
+            shelbi_state::DEFAULT_SHARED_PREAMBLE,
         )
         .unwrap();
         let report = detect(&["demo".to_string()]).unwrap();
@@ -5162,6 +5229,117 @@ Finalize by moving the card: `shelbi task move <task> --to done`.
         assert_eq!(
             std::fs::read_to_string(dir.join("pr-template.md")).unwrap(),
             custom
+        );
+    }
+
+    const DEMO_YAML: &str = "name: demo\nrepo: /tmp/demo\nmachines:\n- name: hub\n  kind: local\n  work_dir: /tmp/demo\norchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\nworkspaces:\n- name: w1\n  machine: hub\n";
+
+    #[test]
+    fn shipped_shared_preamble_carries_the_hub_safety_markers() {
+        // Drift guard: the sniffer keys on these markers, so the shipped default
+        // must carry them or a fresh project would be flagged as missing its own
+        // rules.
+        let lower = shelbi_state::DEFAULT_SHARED_PREAMBLE.to_ascii_lowercase();
+        for m in shelbi_state::HUB_SAFETY_MARKERS {
+            assert!(lower.contains(m), "default preamble lacks marker {m:?}");
+        }
+        for cmd in ["shelbi daemon stop", "pkill", "SHELBI_HUB_SOCK", "SHELBI_CONTROL_SOCK"] {
+            assert!(
+                shelbi_state::DEFAULT_SHARED_PREAMBLE.contains(cmd),
+                "default preamble lacks {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_shared_preamble_is_detected_and_materialized_on_start() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+        std::fs::write(home.join("projects/demo.yaml"), DEMO_YAML).unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.code == SHARED_PREAMBLE_MISSING)
+            .expect("missing shared preamble not detected");
+        assert_eq!(f.classification, Classification::AutoHeal);
+
+        let outcome = run_for_project("demo");
+        assert!(
+            outcome.applied.iter().any(|c| c.code == SHARED_PREAMBLE_MISSING),
+            "shared preamble not materialized: {:?}",
+            outcome.applied
+        );
+        let path = home.join("projects/demo/agents/_shared/preamble.md");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            shelbi_state::DEFAULT_SHARED_PREAMBLE
+        );
+
+        // Idempotent, and the materialized default satisfies the content sniff.
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report2.findings.iter().any(|f| f.code == SHARED_PREAMBLE_MISSING
+                || f.code == SHARED_PREAMBLE_HUB_SAFETY_MISSING),
+            "shared preamble still reported after materialize: {:?}",
+            report2.findings
+        );
+    }
+
+    #[test]
+    fn custom_shared_preamble_without_hub_safety_needs_judgment_and_is_untouched() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+        std::fs::write(home.join("projects/demo.yaml"), DEMO_YAML).unwrap();
+        let dir = home.join("projects/demo/agents/_shared");
+        std::fs::create_dir_all(&dir).unwrap();
+        let custom = "# Monorepo notes\n\nThe API lives in services/api.\n";
+        std::fs::write(dir.join("preamble.md"), custom).unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(!report.findings.iter().any(|f| f.code == SHARED_PREAMBLE_MISSING));
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.code == SHARED_PREAMBLE_HUB_SAFETY_MISSING)
+            .expect("custom preamble without hub-safety rules not flagged");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty());
+
+        // The on-start pass never rewrites the project's own prose.
+        run_for_project("demo");
+        assert_eq!(std::fs::read_to_string(dir.join("preamble.md")).unwrap(), custom);
+    }
+
+    #[test]
+    fn custom_shared_preamble_with_hub_safety_is_clean() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+        std::fs::write(home.join("projects/demo.yaml"), DEMO_YAML).unwrap();
+        let dir = home.join("projects/demo/agents/_shared");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("preamble.md"),
+            "# Notes\n\n## Hub Safety\n\nNever stop the daemon from a pane.\n",
+        )
+        .unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report.findings.iter().any(|f| f.code == SHARED_PREAMBLE_MISSING
+                || f.code == SHARED_PREAMBLE_HUB_SAFETY_MISSING),
+            "{:?}",
+            report.findings
         );
     }
 }

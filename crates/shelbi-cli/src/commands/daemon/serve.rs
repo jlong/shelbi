@@ -826,7 +826,8 @@ fn handle_client(stream: UnixStream, daemon: &Daemon) {
                 // Empty, half-closed connection: explicit hello probe. This
                 // reply happens only after EOF, never ahead of a legacy event
                 // frame whose client expects `ok\n` as the first three bytes.
-                let hello = shelbi_state::DaemonHello::new(env!("CARGO_PKG_VERSION"));
+                let hello = shelbi_state::DaemonHello::new(env!("CARGO_PKG_VERSION"))
+                    .with_pid(std::process::id());
                 let _ = (&stream).write_all(hello.to_line().as_bytes());
             }
             break; // EOF

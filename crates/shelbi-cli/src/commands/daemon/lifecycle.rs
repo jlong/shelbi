@@ -208,8 +208,32 @@ impl RetireHost for RealSystemd {
 }
 
 // --------------------------------------------------------------------------
-// restart / status
+// stop / restart / status
 // --------------------------------------------------------------------------
+
+/// Stop this root's daemon without starting a new one. Signals only the pid in
+/// this root's `shelbi.pid` (see [`shelbi_state::stop_daemon`]). Sessions keep
+/// running: they outlive the daemon, and the next client (or a session's
+/// watchdog, while a project is open) starts a fresh daemon that finds them.
+pub(super) fn stop() -> Result<()> {
+    let pid_file = shelbi_state::daemon_pid_file_path()?;
+    match shelbi_state::stop_daemon().context("stopping the hub daemon")? {
+        shelbi_state::StopOutcome::Stopped { pid } => {
+            println!("✓ stopped the hub daemon (pid {pid}, from {})", pid_file.display());
+            Ok(())
+        }
+        shelbi_state::StopOutcome::NotRunning => {
+            println!(
+                "shelbi daemon: not running under {}",
+                pid_file.parent().unwrap_or(&pid_file).display()
+            );
+            Ok(())
+        }
+        shelbi_state::StopOutcome::Refused { reason } => {
+            anyhow::bail!("not stopping the hub daemon: {reason}")
+        }
+    }
+}
 
 /// Stop the running daemon and start a fresh one on the current binary, with no
 /// supervisor. Retires any leftover unit first so its respawn loop can't bring
@@ -220,9 +244,14 @@ pub(super) fn restart() -> Result<()> {
         println!("✓ retired leftover supervisor unit {}", path.display());
     }
 
-    let stopped = shelbi_state::stop_daemon().context("stopping the running hub daemon")?;
-    if stopped {
-        println!("✓ stopped the running hub daemon");
+    match shelbi_state::stop_daemon().context("stopping the running hub daemon")? {
+        shelbi_state::StopOutcome::Stopped { pid } => {
+            println!("✓ stopped the running hub daemon (pid {pid})");
+        }
+        shelbi_state::StopOutcome::NotRunning => {}
+        shelbi_state::StopOutcome::Refused { reason } => {
+            anyhow::bail!("not restarting the hub daemon: {reason}");
+        }
     }
 
     shelbi_state::ensure_daemon_running().context("starting the hub daemon")?;
