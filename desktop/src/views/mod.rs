@@ -17,6 +17,8 @@
 //!   `workspace_layout.rs`; the attach/restart/reconnect machine both it and
 //!   the chat use is `session_view.rs`)
 //! - review panel with the editor and diff sessions: **`dt-review-view`**
+//!   (landed: `review.rs`, over `shelbi_app::review`'s panel model, its
+//!   navigation, and the load flow the window drives)
 //! - command palette and overlays (error log, review load, reject reason,
 //!   Zen intro, add project): **`dt-palette-overlays`** (landed: `palette.rs`
 //!   and `overlay/`, over the shared `shelbi_app::overlay` state machines)
@@ -43,6 +45,7 @@ pub mod machines_state;
 pub mod markdown;
 pub mod overlay;
 pub mod palette;
+pub mod review;
 pub mod task_detail;
 pub mod settings;
 pub mod sidebar;

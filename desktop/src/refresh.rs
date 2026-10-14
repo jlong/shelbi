@@ -9,6 +9,9 @@
 //!   publishes immutable [`Snapshot`]s;
 //! - the hub-socket change subscriber ([`shelbi_app::changes`]), which wakes a
 //!   refresh whenever the daemon's poller sees a board or workspace change;
+//! - the hub-socket layout subscriber ([`shelbi_app::layout_sub`]), whose
+//!   events (a review slot opening or closing) cross to the window as
+//!   [`FeedEvent::Layout`];
 //! - a polling fallback: while that subscription is down (no daemon), the feed
 //!   refreshes on the TUI's cadence and reports [`DaemonLink::Polling`] so the
 //!   sidebar can show it; when the daemon comes back the subscription
@@ -121,6 +124,9 @@ pub enum FeedEvent {
     /// A session's title changed or it exited.
     #[allow(dead_code)] // see `SessionNoticeKind`
     Session(SessionNotice),
+    /// The daemon published a layout event for the project (a review slot
+    /// came up or was freed).
+    Layout(shelbi_state::LayoutEvent),
 }
 
 /// Timing for a [`ProjectFeed`].
@@ -160,13 +166,15 @@ impl ProjectFeed {
         let connected = Arc::new(AtomicBool::new(false));
         let (subscription, changes) =
             shelbi_app::changes::spawn_observed(project, connected.clone());
+        let (layout_subscription, layout) = shelbi_app::layout_sub::spawn(project);
         Self::spawn_with(
             project,
             sidebar_reader(),
             FeedSources {
                 connected,
                 changes: Some(changes),
-                keep_alive: Some(Box::new(subscription)),
+                layout: Some(layout),
+                keep_alive: Some(Box::new((subscription, layout_subscription))),
                 orchestrator: Some(Arc::new(orchestrator_title)),
             },
             FeedTiming::default(),
@@ -228,6 +236,8 @@ pub struct FeedSources {
     pub connected: Arc<AtomicBool>,
     /// Change wakes from the daemon; `None` for a feed with no subscription.
     pub changes: Option<Receiver<shelbi_app::changes::ChangeWake>>,
+    /// Layout events from the daemon, forwarded to the window.
+    pub layout: Option<Receiver<shelbi_state::LayoutEvent>>,
     /// Kept alive by the feed thread and dropped there, so a subscription's
     /// joining `Drop` never runs on the UI thread.
     pub keep_alive: Option<Box<dyn Send>>,
@@ -248,6 +258,7 @@ fn feed_loop(
     let FeedSources {
         connected,
         changes,
+        layout,
         keep_alive,
         orchestrator,
     } = sources;
@@ -271,6 +282,15 @@ fn feed_loop(
         if let Some(changes) = &changes {
             while changes.try_recv().is_ok() {
                 wake = true;
+            }
+        }
+        if let Some(layout) = &layout {
+            while let Ok(event) = layout.try_recv() {
+                // A slot opening or closing changes the review rows too.
+                wake = true;
+                if events.unbounded_send(FeedEvent::Layout(event)).is_err() {
+                    return finish(refresher, keep_alive);
+                }
             }
         }
 
@@ -446,6 +466,7 @@ mod tests {
         FeedSources {
             connected: connected.clone(),
             changes: None,
+            layout: None,
             keep_alive: None,
             orchestrator: None,
         }
@@ -551,6 +572,7 @@ mod tests {
             FeedSources {
                 connected,
                 changes: Some(change_rx),
+                layout: None,
                 keep_alive: None,
                 orchestrator: None,
             },
@@ -602,6 +624,35 @@ mod tests {
             title(next_matching(&mut rx, is_title)),
             ("orch".to_string(), "shelbi:idle".to_string())
         );
+    }
+
+    #[test]
+    fn a_layout_event_reaches_the_window_and_refreshes() {
+        let connected = Arc::new(AtomicBool::new(true));
+        let (layout_tx, layout_rx) = mpsc::channel();
+        let (_feed, mut rx) = ProjectFeed::spawn_with(
+            "demo",
+            canned("a"),
+            FeedSources {
+                connected,
+                changes: None,
+                layout: Some(layout_rx),
+                keep_alive: None,
+                orchestrator: None,
+            },
+            fast(),
+        );
+        next_matching(&mut rx, is_snapshot);
+        let opened = shelbi_state::LayoutEvent::ReviewOpened {
+            workspace: "review-1".into(),
+            task: "t-1".into(),
+        };
+        layout_tx.send(opened.clone()).unwrap();
+        let ev = next_matching(&mut rx, |e| matches!(e, FeedEvent::Layout(_)));
+        let FeedEvent::Layout(event) = ev else { unreachable!() };
+        assert_eq!(event, opened);
+        // The slot's row changed too: the event also wakes a refresh.
+        next_matching(&mut rx, is_snapshot);
     }
 
     #[test]

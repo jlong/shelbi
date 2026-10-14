@@ -16,6 +16,8 @@
 //! - [`view`] — plain-data view models for the sidebar, issues board,
 //!   activity feed, machines list, review panel, and error log, built from
 //!   the existing `shelbi-state` readers.
+//! - [`review`] — the review interface: the panel's model and navigation,
+//!   and the load / queue flow that opens a review.
 //! - [`overlay`] — the overlays' state machines (palette, error log,
 //!   review load, reject reason, Zen intro, add project), keyed on
 //!   toolkit-free chords so both clients drive the same decision tables;
@@ -26,7 +28,8 @@
 //!   state off the caller's thread and publishes immutable snapshots over a
 //!   channel. Threads and channels only, so a gpui client can consume it
 //!   without tokio. [`changes`] is its wake source: a hub-socket subscriber
-//!   for the daemon's board/workspace change notifications.
+//!   for the daemon's board/workspace change notifications; [`layout_sub`]
+//!   is the same for its layout events (a review slot opening or closing).
 //! - [`session`] — showing a session in a main area: naming
 //!   ([`session::SessionRef`]), attach with the relaunch-tolerant connect
 //!   classification, and the per-pane restart controller over
@@ -48,10 +51,12 @@ pub mod command;
 pub mod command_model;
 pub mod exec;
 pub mod exec_daemon;
+pub mod layout_sub;
 pub mod nav;
 pub mod overlay;
 pub mod reachability;
 pub mod refresh;
+pub mod review;
 pub mod session;
 pub mod supervision;
 pub mod theme;

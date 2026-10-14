@@ -104,6 +104,15 @@ pub struct ReviewOpenInfo {
     pub editor_name: String,
     /// Whether the workflow declares a review URL (gates the Browser entry).
     pub has_review_url: bool,
+    /// The review URL itself (the workflow's `review:` template with the
+    /// slot's `$PORT` / `$SLOT` substituted), when declared.
+    pub review_url: Option<String>,
+    /// Whether the workflow declares a `ready:` health check for the review
+    /// server (`crate::workspace::workflow_declares_health_check`).
+    pub has_health_check: bool,
+    /// The slot's machine when it is remote (reached over SSH), `None` for a
+    /// local slot.
+    pub remote_machine: Option<String>,
     /// The reviewed task as read from the issue store, for the panel's title /
     /// description preview and the full-description popover. `None` when the
     /// store couldn't produce it (the panel degrades to no task info).
@@ -147,22 +156,53 @@ fn review_open_info_for_slot(
     // info (title / description preview / popover).
     let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
     let task = store.get(task_id)?;
-    let has_review_url = task
+    let workflow = task
         .as_ref()
-        .map(|tf| {
-            shelbi_state::load_task_workflow(project_name, project, &tf.task)
-                .ok()
-                .map(|wf| wf.review_url_for_status(tf.task.column.as_str()).is_some())
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
+        .and_then(|tf| shelbi_state::load_task_workflow(project_name, project, &tf.task).ok());
+    let review_url = task.as_ref().zip(workflow.as_ref()).and_then(|(tf, wf)| {
+        wf.review_url_for_status(tf.task.column.as_str())
+            .map(|template| substitute_slot_url(template, ws))
+    });
+    let has_health_check = workflow
+        .as_ref()
+        .is_some_and(crate::workspace::workflow_declares_health_check);
+    let remote_machine = (machine.host() != Host::Local).then(|| ws.machine.clone());
     Ok(ReviewOpenInfo {
         slot: slot.to_string(),
         worktree,
         editor_name,
-        has_review_url,
+        has_review_url: review_url.is_some(),
+        review_url,
+        has_health_check,
+        remote_machine,
         task: task.map(Box::new),
     })
+}
+
+/// The review URL to open for `task_id` (the workflow's `review:` template,
+/// with the `$PORT` / `$SLOT` of the slot it is assigned to substituted), or
+/// `None` when none is configured. Read fresh at click time by the TUI's Open
+/// Browser.
+pub fn review_url(project_name: &str, task_id: &str) -> Option<String> {
+    let project = shelbi_state::load_project(project_name).ok()?;
+    let store = shelbi_state::issue_store_for_project(&project).ok()?;
+    let tf = store.get(task_id).ok().flatten()?;
+    let workflow = shelbi_state::load_task_workflow(project_name, &project, &tf.task).ok()?;
+    let template = workflow.review_url_for_status(tf.task.column.as_str())?;
+    let port = tf
+        .task
+        .assigned_to
+        .as_deref()
+        .and_then(|ws| project.workspace(ws))
+        .and_then(|ws| ws.slot)
+        .and_then(|s| u16::try_from(s).ok());
+    Some(shelbi_core::substitute_review_url(template, port))
+}
+
+/// `template` with `ws`'s slot port substituted.
+fn substitute_slot_url(template: &str, ws: &shelbi_core::WorkspaceSpec) -> String {
+    let port = ws.slot.and_then(|s| u16::try_from(s).ok());
+    shelbi_core::substitute_review_url(template, port)
 }
 
 /// How the single-process TUI should open a review-column task, resolved from

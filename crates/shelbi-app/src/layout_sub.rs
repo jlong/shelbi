@@ -1,20 +1,18 @@
 //! Hub-socket subscriber for pushed layout events (Phase 3,
-//! `rt-daemon-layout-split`; `docs/removing-tmux/phase3-daemon.md`).
+//! `rt-daemon-layout-split`; `docs/removing-tmux/phase3-daemon.md`). Shared by
+//! the TUI shell and the desktop app (moved here from `shelbi-tui` by
+//! `dt-review-view`).
 //!
-//! When the daemon runs the poller (the default on this branch), the poller
-//! drives the *session* half of a layout split and publishes a typed
-//! [`shelbi_state::LayoutEvent`] to the daemon's change bus. The sidebar — the
-//! always-present layout client on the tmux runtime — subscribes to that bus
-//! over the hub socket and reacts by doing the pane/window work the poller used
-//! to do inline. This module owns the connection: a background thread that
-//! keeps a `subscribe` stream open, forwards each layout notification for this
-//! project onto an [`std::sync::mpsc`] channel, and reconnects with backoff so a
-//! daemon that is still starting, idle-exits, or restarts is tolerated.
-//!
-//! The in-sidebar poller (the setting-off fallback) publishes to this process's
-//! *own* change bus instead, which the sidebar drains directly
-//! ([`crate::app::App::poll_layout_events`]); this socket path is the other
-//! half, for when the producing poller lives in the daemon.
+//! The daemon's poller and control socket publish a typed
+//! [`shelbi_state::LayoutEvent`] to the daemon's change bus when a review slot
+//! opens or closes (`ReviewOpened` after a load health-checks its server,
+//! `ReviewClosed` when an out-of-band merge frees a slot), and a client reacts
+//! by opening or dropping its review interface. This module owns the
+//! connection: a background thread that keeps a `subscribe` stream open,
+//! forwards each layout notification for this project onto an
+//! [`std::sync::mpsc`] channel, and reconnects with backoff so a daemon that is
+//! still starting, idle-exits, or restarts is tolerated. [`crate::changes`] is
+//! its board/workspace twin.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -28,12 +26,11 @@ use shelbi_state::{ChangeNotification, LayoutEvent};
 
 /// How long a connect attempt / idle read waits before the thread re-checks the
 /// stop flag, and the pause between reconnect attempts. Short enough that the
-/// sidebar notices a stop promptly and picks up a just-started daemon quickly.
+/// client notices a stop promptly and picks up a just-started daemon quickly.
 const POLL_SLICE: Duration = Duration::from_millis(500);
 
 /// A live hub-socket layout subscription. Dropping it stops the thread (sets the
-/// flag and joins), so it shuts down whichever way the sidebar exits — mirroring
-/// the [`WorkspacePoller`](crate::WorkspacePoller) RAII handle.
+/// flag and joins), so it shuts down whichever way the client exits.
 pub struct LayoutSubscription {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -49,7 +46,7 @@ impl Drop for LayoutSubscription {
 }
 
 /// Spawn the subscriber thread for `project`, returning the RAII handle and the
-/// receiver the sidebar drains each tick. Layout events for other projects (the
+/// receiver the client drains. Layout events for other projects (the
 /// bus is hub-global) are filtered out thread-side, so the receiver only ever
 /// carries this project's events.
 pub fn spawn(project: &str) -> (LayoutSubscription, Receiver<LayoutEvent>) {
@@ -69,7 +66,7 @@ pub fn spawn(project: &str) -> (LayoutSubscription, Receiver<LayoutEvent>) {
 fn subscriber_loop(project: &str, tx: &Sender<LayoutEvent>, stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
         match connect_and_stream(project, tx, stop) {
-            // The receiver was dropped (the sidebar is gone) — nothing left to
+            // The receiver was dropped (the client is gone) — nothing left to
             // feed, so exit instead of reconnecting.
             StreamEnd::ReceiverGone => return,
             // A disconnect / connect failure: pause briefly, then reconnect. The
@@ -83,7 +80,7 @@ fn subscriber_loop(project: &str, tx: &Sender<LayoutEvent>, stop: &AtomicBool) {
 enum StreamEnd {
     /// The stream closed or could not be opened — reconnect.
     Disconnected,
-    /// The sidebar's receiver was dropped — stop for good.
+    /// The client's receiver was dropped — stop for good.
     ReceiverGone,
 }
 

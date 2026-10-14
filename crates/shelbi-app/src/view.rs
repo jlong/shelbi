@@ -1321,58 +1321,9 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
 // Review panel
 // ---------------------------------------------------------------------------
 
-/// The review interface's left panel for one ready-for-review task.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewPanelModel {
-    pub task_id: String,
-    pub title: String,
-    pub worktree: String,
-    pub status_label: String,
-    pub editor_name: String,
-    pub has_review_url: bool,
-    /// The view-switcher nav items, in order.
-    pub switch_items: Vec<ReviewSwitch>,
-}
-
-/// A review view-switcher entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewSwitch {
-    /// Chat with the reviewer agent (default).
-    Chat,
-    /// The diff view.
-    Diff,
-    /// Open the worktree in the user's editor.
-    Editor,
-    /// Open the PR / review URL in a browser (only when one exists).
-    Browser,
-}
-
-impl ReviewPanelModel {
-    /// Build the panel for a ready-for-review task. `editor_name` is the
-    /// resolved editor display name; the Browser switch is included only
-    /// when `has_review_url`.
-    pub fn new(
-        task_id: impl Into<String>,
-        title: impl Into<String>,
-        worktree: impl Into<String>,
-        editor_name: impl Into<String>,
-        has_review_url: bool,
-    ) -> ReviewPanelModel {
-        let mut switch_items = vec![ReviewSwitch::Chat, ReviewSwitch::Diff, ReviewSwitch::Editor];
-        if has_review_url {
-            switch_items.push(ReviewSwitch::Browser);
-        }
-        ReviewPanelModel {
-            task_id: task_id.into(),
-            title: title.into(),
-            worktree: worktree.into(),
-            status_label: "Ready for review".to_string(),
-            editor_name: editor_name.into(),
-            has_review_url,
-            switch_items,
-        }
-    }
-}
+// The review panel's model lives with its state machine in [`crate::review`];
+// re-exported here so `view::ReviewPanelModel` keeps naming it.
+pub use crate::review::{ReviewPanelModel, ReviewSwitch};
 
 // ---------------------------------------------------------------------------
 // Error log
@@ -1955,18 +1906,6 @@ mod tests {
             workspace_state_badge(Some(WorkspaceState::Serving)),
             ("serving", Tone::Cyan)
         );
-    }
-
-    #[test]
-    fn review_panel_includes_browser_only_with_url() {
-        let no_url = ReviewPanelModel::new("T-1", "Fix", "/wt/alpha", "nvim", false);
-        assert_eq!(no_url.status_label, "Ready for review");
-        assert!(!no_url.switch_items.contains(&ReviewSwitch::Browser));
-        assert_eq!(no_url.switch_items.len(), 3);
-
-        let with_url = ReviewPanelModel::new("T-1", "Fix", "/wt/alpha", "nvim", true);
-        assert!(with_url.switch_items.contains(&ReviewSwitch::Browser));
-        assert_eq!(with_url.switch_items.len(), 4);
     }
 
     #[test]
